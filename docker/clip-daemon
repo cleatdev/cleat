@@ -1,0 +1,62 @@
+#!/bin/bash
+# clip-daemon -- OSC 52 clipboard fallback.  Listens on a Unix socket and
+# relays clipboard data to the terminal via OSC 52 escape sequences.
+#
+# This is a FALLBACK for when the file-based clipboard bridge is not available
+# (e.g. manual docker exec without the cleat wrapper).  The primary clipboard
+# mechanism is the file bridge in /tmp/cleat-clip/.
+#
+# Uses socat in fork mode so the socket stays alive permanently.
+#
+# Usage (started automatically by cleat before launching Claude Code):
+#   clip-daemon &
+
+SOCK="/tmp/clip.sock"
+PIDFILE="/tmp/clip-daemon.pid"
+HANDLER="/tmp/clip-handler"
+MAX_CHILDREN=5         # cap concurrent socat forks (prevents PID exhaustion)
+MAX_PAYLOAD=102400     # 100KB -- matches typical terminal OSC 52 limits
+
+cleanup() {
+  [ -n "${SOCAT_PID:-}" ] && kill "$SOCAT_PID" 2>/dev/null && wait "$SOCAT_PID" 2>/dev/null
+  rm -f "$SOCK" "$PIDFILE" "$HANDLER"
+  exit 0
+}
+trap cleanup EXIT INT TERM HUP
+
+# Kill any previous instance
+if [ -f "$PIDFILE" ]; then
+  old_pid="$(cat "$PIDFILE" 2>/dev/null)"
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    # Verify the PID is actually a clip-daemon before killing
+    if grep -qs clip-daemon "/proc/$old_pid/cmdline" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null
+      sleep 0.1
+    fi
+  fi
+  rm -f "$SOCK" "$PIDFILE" "$HANDLER"
+fi
+
+echo $$ > "$PIDFILE"
+
+# Write the per-connection handler as a standalone script.  This avoids
+# fragile nested quoting inside socat's SYSTEM:"..." argument and ensures
+# POSIX-compatible escape sequences (\033 not \e, \007 not \a).
+# Note: unquoted heredoc so $MAX_PAYLOAD is expanded from the variable above.
+cat > "$HANDLER" <<EOF
+#!/bin/sh
+d=\$(head -c $MAX_PAYLOAD)
+[ -n "\$d" ] || exit 0
+enc=\$(printf '%s' "\$d" | base64 | tr -d '\n')
+printf '\033]52;c;%s\007' "\$enc" > /dev/tty 2>/dev/null
+EOF
+chmod +x "$HANDLER"
+
+# socat fork mode: keeps the socket alive permanently, forks a handler for
+# each connection.  max-children caps concurrent forks to prevent PID
+# exhaustion under rapid-fire usage.
+socat -u "UNIX-LISTEN:$SOCK,mode=666,fork,max-children=$MAX_CHILDREN" "EXEC:$HANDLER" &
+SOCAT_PID=$!
+
+# Wait for socat -- if it exits unexpectedly, cleanup runs via the trap
+wait "$SOCAT_PID" 2>/dev/null

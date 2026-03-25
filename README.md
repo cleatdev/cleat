@@ -1,0 +1,459 @@
+# Cleat
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-supported-brightgreen)](https://github.com/cleatdev/cleat)
+[![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)](https://github.com/cleatdev/cleat)
+
+**Run anything. Break nothing.**
+
+Run AI coding agents with full autonomous permissions — safely sandboxed in Docker.
+
+One command. Per-project isolation. Zero risk to your host.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cleatdev/cleat/main/install.sh | bash
+```
+
+```bash
+cd ~/your-project && cleat
+```
+
+That's it. First run builds the Docker image (~2 min), starts an isolated container for your project, and drops you into Claude Code with full permissions, all sandboxed.
+
+```
+┌─────────────────────┐      ┌─────────────────────────────────┐
+│  Your machine        │      │  Docker container                │
+│                      │      │                                  │
+│  ~/my-project ───────────>  │  /workspace                      │
+│  ~/.claude ──────────────>  │  /home/coder/.claude             │
+│                      │      │                                  │
+│  Everything else     │      │  Claude Code runs free here:     │
+│  is untouched.       │      │  install, build, delete, run     │
+│                      │      │  anything. Fully sandboxed.      │
+└─────────────────────┘      └─────────────────────────────────┘
+```
+
+---
+
+## Requirements
+
+- **[Docker](https://docs.docker.com/get-docker/)** -- must be installed and running
+- **macOS or Linux** (Windows support via WSL2)
+- **An [Anthropic](https://www.anthropic.com/) account** -- team or Pro plan
+- **git** -- used by the installer
+
+---
+
+## Why Cleat?
+
+### The problem
+
+Claude Code with `--dangerously-skip-permissions` is the fastest way to build software with AI. No confirmation dialogs, no permission prompts. Claude just does what you ask. But on your actual machine, that means:
+
+- System files and configs can be modified or deleted
+- Packages can be installed, upgraded, or removed system-wide
+- Dotfiles, SSH keys, or credentials can be read or overwritten
+- Other projects on your machine can be accessed or changed
+- A single bad command can render your OS unbootable
+
+### The solution
+
+Cleat gives you the best of both worlds:
+
+| | Without isolation | With Cleat |
+|---|---|---|
+| Claude can edit project files | Yes | Yes |
+| Claude can install packages | Yes (on your system) | Yes (in container) |
+| Claude can run any command | Yes (on your system) | Yes (in container) |
+| Claude can access other projects | Yes | **No** |
+| Claude can modify your system | Yes | **No** |
+| Claude can read ~/.ssh, credentials | Yes | **No** |
+| Safe to leave running overnight | No | **Yes** |
+| File ownership issues | N/A | **None** (UID/GID mapped) |
+| Copy to host clipboard | Yes | **Yes** (via clipboard bridge) |
+
+### Key features
+
+- **One command** -- `cleat` builds, starts, and launches everything
+- **Per-project isolation** -- each project gets its own container, run multiple projects in parallel
+- **Session persistence** -- stop and resume sessions without losing context
+- **Safe for unattended use** -- let Claude work overnight without risking your system
+- **Zero file permission issues** -- container user matches your host UID/GID automatically
+- **Shared auth** -- log in once, all containers use the same credentials
+- **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
+- **Lightweight** -- Debian-slim-based image with Node.js, Python, Git, build-essential, vim, jq, and socat
+- **Auto-upgrade notifications** -- checks for updates once per day and notifies you before launching Claude
+
+---
+
+## The story behind this
+
+I was deep into vibe coding. Shipping features fast, letting Claude Code run with `--dangerously-skip-permissions` so it could execute anything without interrupting my flow. It was incredible. I'd kick off tasks, step away, come back to working code. I was running multiple projects on my Mac, sometimes leaving Claude running overnight while it worked through larger refactors.
+
+Then one morning I opened my laptop and nothing worked. The system was completely broken. Apps wouldn't launch, the terminal was unusable, core system files had been modified. Claude had been working autonomously through the night, and somewhere along the way it had started making changes outside the project directory. It tried to fix a dependency issue by modifying system-level configs, which cascaded into more "fixes" across the filesystem. By the time it was done, macOS was unrecoverable.
+
+I had to restore my entire machine from a Time Machine backup. Hours of setup, re-authenticating everything, recreating local state that wasn't backed up. All because I gave an AI unrestricted access to my actual system.
+
+The thing is, I didn't want to stop using `--dangerously-skip-permissions`. The productivity gain is real. Claude Code without permission gates is a different experience entirely: it moves fast, installs what it needs, runs builds and tests, iterates on errors, all without waiting for you to click "allow" fifty times. Going back to the default permission mode felt like putting the brakes back on.
+
+So I built Cleat. Same unrestricted power, but inside a Docker container where the blast radius is zero. Claude can `rm -rf /` inside the sandbox and my Mac won't even notice. Each project gets its own container, my host system is completely untouched, and I never have to worry about what Claude does when I'm not looking.
+
+I haven't restored from a backup since.
+
+---
+
+## Install
+
+### Quick install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cleatdev/cleat/main/install.sh | bash
+```
+
+This clones the repo to `~/.cleat`, checks out the latest stable release tag, and symlinks `cleat` into your PATH.
+
+### Manual install
+
+```bash
+git clone https://github.com/cleatdev/cleat.git
+cd cleat
+git checkout "$(git tag -l | grep -E '^v[0-9]' | sort -V | tail -1)"
+./bin/cleat install
+```
+
+### Update
+
+Releases are published as git tags (e.g. `v0.1.0`). The updater fetches tags and checks out the latest one:
+
+```bash
+cleat update
+```
+
+To also update Claude Code inside the container:
+
+```bash
+cleat rebuild
+```
+
+---
+
+## Getting started
+
+### 1. Authenticate (first time only)
+
+```bash
+cd ~/your-project
+cleat                # starts the container + launches Claude
+# Claude will prompt you to log in on first run
+```
+
+Or authenticate separately:
+
+```bash
+cleat start          # start the container
+cleat login          # opens a browser URL to sign in
+```
+
+Credentials are saved to `~/.claude` on your host and shared across all containers automatically. Log in once, every container picks it up.
+
+### 2. Use it
+
+```bash
+cd ~/your-project
+cleat
+```
+
+That's it. You're inside Claude Code with full autonomous permissions, sandboxed in Docker.
+
+---
+
+## Usage
+
+### Daily workflow
+
+```bash
+# Start a new session
+cd ~/my-project
+cleat
+
+# Resume your last session
+cleat resume
+
+# Check what's running
+cleat ps
+
+# Stop when done (keeps container for resume)
+cleat stop
+```
+
+### Multiple projects at once
+
+Each project gets its own isolated container:
+
+```bash
+# Terminal 1
+cd ~/backend && cleat
+
+# Terminal 2
+cd ~/frontend && cleat
+
+# See all running containers
+cleat ps
+```
+
+```
+  Cleat containers:
+
+    ● cleat-backend-1a2b3c4d
+      Up 12 minutes
+      /Users/you/backend
+
+    ● cleat-frontend-5e6f7a8b
+      Up 3 minutes
+      /Users/you/frontend
+```
+
+### Command reference
+
+#### Quick start
+| Command | Description |
+|---|---|
+| `cleat` | Build + run + launch Claude Code (all-in-one) |
+| `cleat resume` | Resume the most recent session |
+
+#### Lifecycle
+| Command | Description |
+|---|---|
+| `cleat stop [path]` | Stop this project's container (keeps it for resume) |
+| `cleat rm [path]` | Stop and remove container permanently |
+| `cleat stop-all` | Stop all Cleat containers |
+| `cleat build` | Build the Docker image |
+| `cleat rebuild` | Force rebuild the image from scratch |
+| `cleat clean` | Stop everything and remove the image |
+| `cleat nuke` | Remove **all** containers, images, and build cache |
+
+#### Interact
+| Command | Description |
+|---|---|
+| `cleat claude [path]` | Attach Claude Code to a running container |
+| `cleat shell [path]` | Open bash inside the container |
+| `cleat login [path]` | Authenticate with Anthropic (OAuth) |
+| `cleat logs [path]` | Tail container logs |
+
+#### Info
+| Command | Description |
+|---|---|
+| `cleat status [path]` | Show container, image, and auth status |
+| `cleat ps` | List all Cleat containers (running and stopped) |
+| `cleat update` | Check for updates and install the latest version |
+| `cleat version` | Show current version |
+
+All commands default to the current working directory if `[path]` is omitted.
+
+---
+
+## How it works
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Your machine                                                │
+│                                                              │
+│   ~/.claude ──────────────┐  (auth, sessions, settings)      │
+│   ~/.claude.json ─────────┼── (config)                       │
+│   ~/my-project ───────────┼──────────────────────┐           │
+│                           │                      │           │
+│  ┌────────────────────────┼──────────────────────┼───────┐   │
+│  │  Docker container      │                      │       │   │
+│  │                        v                      v       │   │
+│  │  /home/coder/.claude        /workspace                │   │
+│  │  /home/coder/.claude.json                             │   │
+│  │                                                       │   │
+│  │  Claude Code (--dangerously-skip-permissions)         │   │
+│  │                                                       │   │
+│  │  Can: read/write project, install packages, run cmds  │   │
+│  │  Cannot: touch host system, access other projects     │   │
+│  └───────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Components
+
+| File | Purpose |
+|---|---|
+| `bin/cleat` | CLI script (symlinked as `cleat`) |
+| `docker/Dockerfile` | Debian slim image with Claude Code (native installer) |
+| `docker/entrypoint.sh` | Maps host UID/GID into the container so files are owned by you |
+| `docker/clip` | Clipboard shim -- writes to file bridge (primary) or OSC 52 daemon (fallback). Symlinked as `pbcopy`, `xclip`, `xsel` |
+| `docker/clip-daemon` | Background daemon -- relays clipboard data to the host terminal via OSC 52 (fallback for terminals that support it) |
+| `docker/CLAUDE.md` | User-level instructions for Claude Code (clipboard usage, paste limitations) |
+| `install.sh` | One-line installer (`curl \| bash`) |
+
+### What happens when you run `cleat`
+
+1. **Builds the Docker image** (first run only) -- Debian slim with Node.js, Python, Git, build-essential, vim, jq, socat, and Claude Code CLI
+2. **Starts a container** named `cleat-<dirname>-<hash>` (hash derived from the full project path) with your project mounted at `/workspace`
+3. **Maps your UID/GID** into the container so files created by Claude are owned by you on the host
+4. **Mounts `~/.claude`** for shared authentication across all containers
+5. **Starts the clipboard bridge** -- a host-side watcher and a shared file mount so `pbcopy`/`xclip`/`xsel` relay to your host clipboard
+6. **Launches Claude Code** with `--dangerously-skip-permissions` inside the sandbox
+
+### Security hardening
+
+Containers run with these protections by default:
+
+- `--pids-limit 1024` -- prevents fork bombs from affecting the host
+- `--memory 8g` -- prevents runaway processes from exhausting host memory
+- Numeric UID/GID validation in the entrypoint to prevent injection attacks
+- Debian slim base image with minimal attack surface
+
+---
+
+## Auto-upgrade notifications
+
+Cleat checks for new release tags once every 24 hours via `git ls-remote --tags` (a lightweight network call that fetches no objects). When a newer version is available, you'll see a notice before Claude Code launches:
+
+```
+  ┌──────────────────────────────────────────────────────┐
+  │  Update available  v0.2.0 → v0.3.0                   │
+  │  Run cleat update to install the latest version.      │
+  └──────────────────────────────────────────────────────┘
+```
+
+- The check runs at most **once per day** — it will not slow down subsequent launches.
+- The result is cached in `.update_check` inside the installation directory (`~/.cleat`).
+- The notification is informational only — it will never interrupt or block your workflow.
+- To upgrade, run `cleat update`. To also update Claude Code inside containers, follow up with `cleat rebuild`.
+
+---
+
+## Clipboard support
+
+Clipboard works out of the box. When Claude Code (or any tool) calls `pbcopy`, `xclip`, or `xsel` inside the container, the text is copied to your **host machine's clipboard** -- no X11, display server, or special terminal features required.
+
+### How it works
+
+A host-side clipboard watcher starts automatically alongside every Claude Code session. The container writes clipboard data to a shared file via a bind mount, and the watcher detects changes and copies the content to your real clipboard using `pbcopy` (macOS), `xclip`, `xsel`, or `wl-copy` (Linux).
+
+```
+┌─────────────────────────────┐      ┌──────────────────────────────┐
+│  Docker container            │      │  Host                         │
+│                              │      │                               │
+│  Claude Code                 │      │                               │
+│    └─ echo "text" | pbcopy   │      │                               │
+│         └─ writes to ────────────>  │  /tmp/cleat-clip-*/clipboard  │
+│           /tmp/cleat-clip/   │      │    └─ watcher detects change  │
+│                              │      │         └─ pbcopy / xclip     │
+│                              │      │              └─ ✔ clipboard!  │
+└─────────────────────────────┘      └──────────────────────────────┘
+```
+
+An [OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands) fallback is available for terminals that support it, used automatically when the file bridge is not active.
+
+```bash
+# These all work inside the container -- including from Claude Code:
+echo "hello" | clip              # dedicated helper
+echo "hello" | pbcopy            # macOS-style
+echo "hello" | xclip -selection clipboard  # Linux-style
+echo "hello" | xsel --clipboard  # Linux-style (alternative)
+git log -1 --format=%B | clip    # copy last commit message
+```
+
+**Limits:** Payloads are capped at 100KB. Paste (`xclip -o`, `xsel --output`, `pbpaste`) is not supported -- clipboard is copy-only.
+
+---
+
+## Troubleshooting
+
+### Clipboard not working
+
+If `pbcopy`/`xclip`/`xsel` inside the container doesn't copy to your host clipboard:
+
+1. **Check the bridge is active** -- inside the container, run `ls /tmp/cleat-clip/.host-ready`. If the file exists, the host watcher is running.
+2. **Check clipboard commands on the host** -- the watcher needs `pbcopy` (macOS), `xclip`, `xsel`, or `wl-copy` (Linux) available on your PATH.
+3. **Rebuild the container** -- if you upgraded from an older version, run `cleat rm && cleat start` so the new clipboard mount is created.
+4. **Large payloads** -- clipboard is capped at 100KB. For larger content, write it to a file in `/workspace` and copy from the host.
+
+### Docker not running
+
+```
+Cannot connect to the Docker daemon
+```
+
+Start Docker Desktop or the Docker daemon, then retry.
+
+### Permission denied on install
+
+```bash
+# If /usr/local/bin is not writable, the installer uses sudo automatically.
+# You can also install to a custom location:
+ln -sf "$(pwd)/bin/cleat" ~/.local/bin/cleat
+```
+
+### Container naming
+
+Each container is named `cleat-<dirname>-<hash>` where the hash is derived from the full absolute path of the project directory. This means two projects with the same directory name (e.g. `~/code/client-a/api` and `~/code/client-b/api`) get separate containers automatically. The container name is printed before every session so you always know which sandbox you're in.
+
+### Rebuilding after Claude Code updates
+
+The Claude Code CLI is baked into the Docker image. To get the latest version:
+
+```bash
+cleat rebuild
+```
+
+### Files created as root
+
+This shouldn't happen. The entrypoint maps your host UID/GID. If it does, check that Docker is passing through `HOST_UID` and `HOST_GID` correctly:
+
+```bash
+cleat shell
+id    # should show your UID/GID
+```
+
+---
+
+## Uninstall
+
+```bash
+cleat clean       # remove all containers + image
+cleat uninstall   # remove CLI symlinks
+rm -rf ~/.cleat   # remove the repo clone
+```
+
+Your project files and `~/.claude` credentials are never touched.
+
+---
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.
+
+```bash
+git clone https://github.com/cleatdev/cleat.git
+cd cleat
+# Make your changes on main, test locally
+./bin/cleat start ~/some-test-project
+```
+
+### Releasing
+
+Releases are cut by tagging a commit on `main`:
+
+```bash
+git tag v0.3.0
+git push --tags
+```
+
+The installer and updater both resolve the latest semver tag automatically. No release branch is needed.
+
+---
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+<sub>Cleat — Run anything. Break nothing. | Docker sandbox for AI coding agents | cleat.sh</sub>

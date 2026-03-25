@@ -1,0 +1,94 @@
+#!/bin/bash
+# clip -- copy stdin or arguments to the host clipboard
+#
+# Primary: writes to the clipboard bridge file (host watcher copies to real
+#          clipboard).  Falls back to OSC 52 via clip-daemon socket.
+#
+# Also installed as pbcopy, xclip, and xsel shims so that tools expecting
+# standard clipboard commands work transparently.
+#
+# Usage:
+#   echo "hello" | clip        # copy stdin
+#   clip "some text"           # copy argument
+#   git log -1 --format=%B | clip
+
+set -euo pipefail
+
+BRIDGE="/tmp/cleat-clip"
+SOCK="/tmp/clip.sock"
+MAX_PAYLOAD=102400  # 100KB
+
+# Detect which name we were called as
+self="$(basename "$0")"
+
+# --- xsel compatibility ---
+if [ "$self" = "xsel" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      -o|--output)
+        # OSC 52 is write-only; paste is not supported.
+        # Exit 0 silently so tools that verify clipboard don't think copy failed.
+        exit 0 ;;
+    esac
+  done
+  set --
+fi
+
+# --- xclip compatibility ---
+if [ "$self" = "xclip" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      -o)
+        exit 0 ;;
+    esac
+  done
+  set --
+fi
+
+# --- pbcopy compatibility ---
+if [ "$self" = "pbcopy" ]; then
+  set --
+fi
+
+# --- Read data into a temp file (preserves trailing newlines, caps size) ---
+tmpfile="$(mktemp /tmp/clip.XXXXXX)"
+trap 'rm -f "$tmpfile"' EXIT
+
+if [ $# -gt 0 ]; then
+  printf '%s' "$*" | head -c "$MAX_PAYLOAD" > "$tmpfile"
+else
+  head -c "$MAX_PAYLOAD" > "$tmpfile"
+fi
+
+if [ ! -s "$tmpfile" ]; then
+  echo "clip: nothing to copy" >&2
+  exit 1
+fi
+
+# --- Primary: file-based clipboard bridge ---
+# The host watcher creates .host-ready when it is running.
+if [ -f "$BRIDGE/.host-ready" ]; then
+  # cp then mv: ensures atomic same-filesystem rename (bridge is a bind mount,
+  # so direct mv from /tmp would be a cross-filesystem copy, not atomic).
+  # PID suffix avoids races between concurrent clip invocations.
+  cp "$tmpfile" "$BRIDGE/.clipboard.$$"
+  mv "$BRIDGE/.clipboard.$$" "$BRIDGE/clipboard"
+  exit 0
+fi
+
+# --- Fallback: OSC 52 via clip-daemon socket ---
+if [ -S "$SOCK" ]; then
+  socat -u -T 2 "OPEN:$tmpfile" "UNIX-CONNECT:$SOCK" 2>/dev/null || {
+    echo "clip: failed to send to clipboard daemon" >&2
+    exit 1
+  }
+  exit 0
+fi
+
+# --- Last resort: direct TTY (works in interactive shells) ---
+encoded="$(base64 < "$tmpfile" | tr -d '\n')"
+printf '\033]52;c;%s\007' "$encoded" > /dev/tty 2>/dev/null || {
+  echo "clip: no clipboard bridge or daemon available" >&2
+  echo "clip: start a session with 'cleat' to enable clipboard" >&2
+  exit 1
+}

@@ -1,0 +1,768 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Config ──────────────────────────────────────────────────────────────────
+VERSION="0.1.0"
+IMAGE_NAME="cleat"
+REPO_URL="https://github.com/cleatdev/cleat"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ── Colors & Formatting ────────────────────────────────────────────────────
+BOLD='\033[1m'
+DIM='\033[2m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+RESET='\033[0m'
+
+header() {
+  echo ""
+  echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────┐${RESET}"
+  echo -e "${BOLD}${CYAN}  │   Cleat — Run anything. Break nothing.  │${RESET}"
+  echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────┘${RESET}"
+  echo ""
+}
+
+info()    { echo -e "  ${BLUE}▸${RESET} $1"; }
+success() { echo -e "  ${GREEN}✔${RESET} $1"; }
+warn()    { echo -e "  ${YELLOW}!${RESET} $1"; }
+error()   { echo -e "  ${RED}✖${RESET} $1"; }
+
+# ── Project-scoped container naming ─────────────────────────────────────────
+# Each project dir gets its own container so you can run multiple in parallel.
+# Name is cleat-<dirname>-<hash> where hash is derived from the full absolute
+# path, so projects with the same dirname are never confused.
+container_name_for() {
+  local project_path="$1"
+  local dir_name hash
+  dir_name="$(basename "$project_path" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  hash="$(echo -n "$project_path" | md5sum | head -c 8)"
+  echo "cleat-${dir_name}-${hash}"
+}
+
+resolve_project() {
+  local project="${1:-$PWD}"
+  # Resolve to absolute path
+  if [[ -d "$project" ]]; then
+    (cd "$project" && pwd)
+  else
+    echo "$project"
+  fi
+}
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+is_running() {
+  docker ps --filter "name=^${1}$" --format '{{.Names}}' 2>/dev/null | grep -q "^${1}$"
+}
+
+container_exists() {
+  docker ps -a --filter "name=^${1}$" --format '{{.Names}}' 2>/dev/null | grep -q "^${1}$"
+}
+
+image_exists() {
+  docker images --format '{{.Repository}}' 2>/dev/null | grep -q "^${IMAGE_NAME}$"
+}
+
+require_running() {
+  local cname="$1"
+  if ! is_running "$cname"; then
+    error "Container ${BOLD}${cname}${RESET} is not running."
+    echo -e "    ${DIM}Start it with: cleat start${RESET}"
+    exit 1
+  fi
+}
+
+# Launch Claude Code with clipboard bridge.  A host-side watcher monitors a
+# shared file and copies content to the real clipboard -- no OSC 52 required.
+CLAUDE_ENV=(-e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
+# Detect host clipboard command once
+_host_clip_cmd() {
+  if command -v pbcopy &>/dev/null; then echo pbcopy
+  elif command -v xclip &>/dev/null; then echo "xclip -selection clipboard"
+  elif command -v xsel &>/dev/null; then echo "xsel --clipboard"
+  elif command -v wl-copy &>/dev/null; then echo wl-copy
+  else echo ""
+  fi
+}
+
+# Background watcher: monitors the clipboard file and copies to host clipboard.
+# Uses inotifywait (Linux) or fswatch (macOS) for event-driven, zero-CPU
+# blocking.  Falls back to 1-second polling when neither is available.
+#
+# Process safety: inotifywait runs in one-shot mode (no long-lived pipe
+# children).  fswatch uses a pipe but _cleanup_clipboard kills all children
+# via pkill -P.  The polling fallback has no children at all.
+_clipboard_watcher() {
+  local clip_dir="$1"
+  local clip_cmd="$2"
+
+  # Sentinel tells the container the bridge is active
+  touch "$clip_dir/.host-ready"
+
+  _do_copy() {
+    [ -f "$clip_dir/clipboard" ] && eval "$clip_cmd" < "$clip_dir/clipboard" 2>/dev/null || true
+  }
+
+  # --- Event-driven: inotifywait (Linux) ---
+  # One-shot mode: inotifywait exits after each event, so there is no
+  # long-lived child that could become an orphan on kill.
+  if command -v inotifywait &>/dev/null; then
+    while inotifywait -qq -e moved_to "$clip_dir" 2>/dev/null; do
+      _do_copy
+    done
+    return
+  fi
+
+  # --- Event-driven: fswatch (macOS, Homebrew) ---
+  # Pipe mode: fswatch runs continuously.  _cleanup_clipboard uses pkill -P
+  # to kill it when the watcher is torn down.
+  if command -v fswatch &>/dev/null; then
+    fswatch --event Updated --event Created -0 "$clip_dir" 2>/dev/null \
+      | while IFS= read -r -d '' path; do
+          case "$(basename "$path")" in clipboard) _do_copy ;; esac
+        done
+    return
+  fi
+
+  # --- Fallback: poll at 1-second intervals (no child processes) ---
+  local last_ts=""
+  while true; do
+    if [ -f "$clip_dir/clipboard" ]; then
+      local cur_ts
+      # Nanosecond mtime on Linux, second precision on macOS
+      cur_ts=$(stat -c '%Y%N' "$clip_dir/clipboard" 2>/dev/null \
+            || stat -f '%m' "$clip_dir/clipboard" 2>/dev/null || echo "")
+      if [ -n "$cur_ts" ] && [ "$cur_ts" != "$last_ts" ]; then
+        last_ts="$cur_ts"
+        _do_copy
+      fi
+    fi
+    sleep 1
+  done
+}
+
+exec_claude() {
+  local cname="$1"
+  shift
+
+  # Set up clipboard bridge -- variables are intentionally NOT local so the
+  # trap handler can access them even after this function's locals are gone.
+  _CLIP_DIR="/tmp/cleat-clip-${cname}"
+  _CLIP_WATCHER_PID=""
+  mkdir -p "$_CLIP_DIR"
+
+  _cleanup_clipboard() {
+    if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
+      # Kill children first (inotifywait, fswatch, etc.) then the watcher
+      pkill -P "$_CLIP_WATCHER_PID" 2>/dev/null || true
+      kill "$_CLIP_WATCHER_PID" 2>/dev/null || true
+      wait "$_CLIP_WATCHER_PID" 2>/dev/null || true
+      _CLIP_WATCHER_PID=""
+    fi
+    rm -f "${_CLIP_DIR:?}/.clipboard."*
+    # Reference counting: remove our session marker and only tear down the
+    # sentinel if no other session is watching the same directory.
+    rm -f "$_CLIP_DIR/.watcher.$$"
+    if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
+      rm -f "$_CLIP_DIR/.host-ready"
+    fi
+  }
+
+  local clip_cmd
+  clip_cmd="$(_host_clip_cmd)"
+  if [ -n "$clip_cmd" ]; then
+    # Session marker for reference counting (safe multi-session cleanup)
+    touch "$_CLIP_DIR/.watcher.$$"
+    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" &
+    _CLIP_WATCHER_PID=$!
+    # Ensure watcher is killed on ANY exit (Ctrl+C, set -e, signals)
+    trap _cleanup_clipboard EXIT INT TERM HUP
+  fi
+
+  # Capture exit code so cleanup always runs (set -e safe), but report errors
+  local rc=0
+  docker exec -it --user coder "${CLAUDE_ENV[@]}" "$cname" \
+    bash -c '
+      clip-daemon &
+      _MY_CLIP_DAEMON=$!
+      # Wait for the socket to be ready before launching Claude
+      for i in 1 2 3 4 5; do [ -S /tmp/clip.sock ] && break; sleep 0.1; done
+      claude "$@"
+      # Only kill the daemon WE started (not one from another session)
+      kill "$_MY_CLIP_DAEMON" 2>/dev/null
+      wait "$_MY_CLIP_DAEMON" 2>/dev/null
+    ' _ "$@" || rc=$?
+
+  _cleanup_clipboard
+  trap - EXIT INT TERM HUP
+
+  # 130 = SIGINT (Ctrl+C), normal exit -- anything else is unexpected
+  if [[ $rc -ne 0 && $rc -ne 130 ]]; then
+    warn "Claude exited with code $rc"
+  fi
+}
+
+
+# ── Update check (once per day) ─────────────────────────────────────────────
+UPDATE_CHECK_FILE="$REPO_DIR/.update_check"
+UPDATE_CHECK_INTERVAL=86400  # 24 hours in seconds
+
+# Return the latest semver tag from remote (e.g. "0.2.0"), without cloning or fetching objects.
+# Uses git ls-remote --tags which is a lightweight network call.
+latest_remote_tag() {
+  git -C "$REPO_DIR" ls-remote --tags --refs origin 2>/dev/null \
+    | awk '{print $2}' \
+    | sed 's|refs/tags/v\{0,1\}||' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | tail -1
+}
+
+check_for_update() {
+  # Only check from git installations
+  [[ -d "$REPO_DIR/.git" ]] || return 0
+
+  local now
+  now=$(date +%s)
+
+  local last_check=0
+  local cached_version=""
+
+  if [[ -f "$UPDATE_CHECK_FILE" ]]; then
+    last_check=$(awk 'NR==1 {print $1}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)
+    cached_version=$(awk 'NR==1 {print $2}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo "")
+  fi
+
+  # Query remote tags if the cache is stale
+  if (( now - last_check >= UPDATE_CHECK_INTERVAL )); then
+    cached_version=$(latest_remote_tag || true)
+    echo "$now $cached_version" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
+  fi
+
+  # Display notification if a newer version is available
+  if [[ -n "$cached_version" && "$cached_version" != "$VERSION" ]]; then
+    echo ""
+    echo -e "  ${CYAN}┌──────────────────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│${RESET}  ${BOLD}Update available${RESET}  ${DIM}v${VERSION}${RESET} → ${GREEN}v${cached_version}${RESET}             ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET}  Run ${BOLD}cleat update${RESET} to install the latest version.  ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────────────────┘${RESET}"
+    echo ""
+  fi
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+cmd_build() {
+  if image_exists; then
+    info "Image ${BOLD}${IMAGE_NAME}${RESET} already exists. Use ${BOLD}cleat rebuild${RESET} to force."
+    return
+  fi
+  info "Building Docker image ${BOLD}${IMAGE_NAME}${RESET} ..."
+  docker build -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" "$REPO_DIR/docker"
+  success "Image built."
+}
+
+cmd_rebuild() {
+  info "Rebuilding Docker image ${BOLD}${IMAGE_NAME}${RESET} ..."
+  docker build --no-cache -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" "$REPO_DIR/docker"
+  success "Image rebuilt."
+}
+
+cmd_run() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  if is_running "$cname"; then
+    warn "Container ${BOLD}${cname}${RESET} already running for this project."
+    return
+  fi
+
+  if container_exists "$cname"; then
+    docker rm "$cname" > /dev/null
+  fi
+
+  if ! image_exists; then
+    cmd_build
+  fi
+
+  if [[ ! -d "$project" ]]; then
+    error "Project directory does not exist: ${BOLD}${project}${RESET}"
+    exit 1
+  fi
+
+  info "Starting ${BOLD}${cname}${RESET}"
+  echo -e "  ${DIM}Project: ${project}${RESET}"
+
+  # Clipboard bridge: shared directory for host ↔ container clipboard
+  local clip_dir="/tmp/cleat-clip-${cname}"
+  mkdir -p "$clip_dir"
+
+  local mount_args=(
+    -v "$project":/workspace
+    -v "${HOME}/.claude:/home/coder/.claude"
+    -v "$clip_dir":/tmp/cleat-clip
+  )
+
+  # Mount .claude.json if it exists on host
+  if [[ -f "${HOME}/.claude.json" ]]; then
+    mount_args+=(-v "${HOME}/.claude.json:/home/coder/.claude.json")
+  fi
+
+  docker run -d \
+    --name "$cname" \
+    "${mount_args[@]}" \
+    -e "HOST_UID=$(id -u)" \
+    -e "HOST_GID=$(id -g)" \
+    -e "HOME=/home/coder" \
+    --pids-limit 1024 \
+    --memory 8g \
+    -it \
+    "$IMAGE_NAME" > /dev/null
+
+  success "Container is up."
+}
+
+cmd_start() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  # Build image if needed
+  if ! image_exists; then
+    cmd_build
+  fi
+
+  # Start container if not running (restart stopped ones)
+  if ! is_running "$cname"; then
+    if container_exists "$cname"; then
+      info "Restarting stopped container ${BOLD}${cname}${RESET}..."
+      docker start "$cname" > /dev/null
+    else
+      cmd_run "$project"
+    fi
+  fi
+
+  check_for_update
+  info "Container ${BOLD}${cname}${RESET}"
+  info "Launching Claude Code ${YELLOW}--dangerously-skip-permissions${RESET}"
+  echo ""
+  exec_claude "$cname" --dangerously-skip-permissions
+}
+
+cmd_resume() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  # Start container if stopped
+  if ! is_running "$cname"; then
+    if container_exists "$cname"; then
+      info "Restarting stopped container ${BOLD}${cname}${RESET}..."
+      docker start "$cname" > /dev/null
+    else
+      error "No container found for this project. Use ${BOLD}cleat start${RESET} first."
+      exit 1
+    fi
+  fi
+
+  check_for_update
+  info "Container ${BOLD}${cname}${RESET}"
+  info "Resuming Claude Code session ${YELLOW}--dangerously-skip-permissions${RESET}"
+  echo ""
+  exec_claude "$cname" --dangerously-skip-permissions --continue
+}
+
+cmd_stop() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  if is_running "$cname"; then
+    info "Stopping ${BOLD}${cname}${RESET} ..."
+    docker stop "$cname" > /dev/null
+    success "Stopped. Resume later with ${BOLD}cleat resume${RESET}"
+  else
+    info "Container not running."
+  fi
+}
+
+cmd_rm() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  if is_running "$cname"; then
+    docker stop "$cname" > /dev/null
+  fi
+  if container_exists "$cname"; then
+    docker rm "$cname" > /dev/null
+    success "Removed ${BOLD}${cname}${RESET}."
+  else
+    info "No container to remove."
+  fi
+}
+
+cmd_shell() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  require_running "$cname"
+  info "Container ${BOLD}${cname}${RESET}"
+  docker exec -it --user coder -e HOME=/home/coder "$cname" bash
+}
+
+cmd_login() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  require_running "$cname"
+  info "Authenticating with your Anthropic team account..."
+  echo -e "  ${DIM}A URL will appear — open it in your browser to sign in.${RESET}"
+  echo ""
+  docker exec -it --user coder -e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$cname" claude login
+  success "Auth saved to ~/.claude (shared across all containers)."
+}
+
+cmd_claude() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  require_running "$cname"
+  check_for_update
+  info "Container ${BOLD}${cname}${RESET}"
+  info "Launching Claude Code ${YELLOW}--dangerously-skip-permissions${RESET}"
+  echo ""
+  exec_claude "$cname" --dangerously-skip-permissions
+}
+
+cmd_logs() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+  require_running "$cname"
+  docker logs -f "$cname"
+}
+
+cmd_ps() {
+  echo ""
+  echo -e "  ${BOLD}Cleat containers:${RESET}"
+  echo ""
+  local found=false
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      found=true
+      local name status project_path color
+      name="$(echo "$line" | awk -F'\t' '{print $1}' | xargs)"
+      status="$(echo "$line" | awk -F'\t' '{print $2}' | xargs)"
+
+      # Get the mounted project path from the container
+      project_path=$(docker inspect "$name" --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+
+      if docker ps --filter "name=^${name}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+        color="$GREEN"
+      else
+        color="$YELLOW"
+      fi
+
+      echo -e "    ${color}●${RESET} ${BOLD}${name}${RESET}"
+      echo -e "      ${DIM}${status}${RESET}"
+      if [[ -n "$project_path" ]]; then
+        echo -e "      ${DIM}${project_path}${RESET}"
+      fi
+    fi
+  done < <(docker ps -a --filter "name=^cleat-" --format "{{.Names}}\t{{.Status}}" 2>/dev/null)
+
+  if ! $found; then
+    echo -e "    ${DIM}No containers found.${RESET}"
+  fi
+  echo ""
+  echo -e "  ${DIM}Resume with: cd <project-dir> && cleat resume${RESET}"
+  echo ""
+}
+
+cmd_stop_all() {
+  info "Stopping all Cleat containers..."
+  local containers
+  containers=$(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null)
+  if [[ -z "$containers" ]]; then
+    info "Nothing to stop."
+    return
+  fi
+  echo "$containers" | while read -r c; do
+    docker stop "$c" > /dev/null 2>&1 || true
+    docker rm "$c" > /dev/null 2>&1 || true
+    echo -e "    ${DIM}removed ${c}${RESET}"
+  done
+  success "All stopped."
+}
+
+cmd_status() {
+  local project
+  project="$(resolve_project "${1:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+
+  echo ""
+  echo -e "  ${BOLD}Project:${RESET}   ${project}"
+  echo -e "  ${BOLD}Container:${RESET} ${cname}"
+
+  if is_running "$cname"; then
+    echo -e "  ${BOLD}Status:${RESET}    ${GREEN}● running${RESET}"
+  elif container_exists "$cname"; then
+    echo -e "  ${BOLD}Status:${RESET}    ${YELLOW}● stopped${RESET}"
+  else
+    echo -e "  ${BOLD}Status:${RESET}    ${DIM}○ not created${RESET}"
+  fi
+
+  if image_exists; then
+    local size
+    size=$(docker images "$IMAGE_NAME" --format '{{.Size}}' | head -1)
+    echo -e "  ${BOLD}Image:${RESET}     ${GREEN}● ${IMAGE_NAME}${RESET} ${DIM}(${size})${RESET}"
+  else
+    echo -e "  ${BOLD}Image:${RESET}     ${DIM}○ not built${RESET}"
+  fi
+
+  if [[ -d "${HOME}/.claude" ]] && find "${HOME}/.claude" -name '.credentials*' -o -name 'credentials*' 2>/dev/null | grep -q .; then
+    echo -e "  ${BOLD}Auth:${RESET}      ${GREEN}● logged in${RESET} ${DIM}(via ~/.claude)${RESET}"
+  else
+    echo -e "  ${BOLD}Auth:${RESET}      ${YELLOW}○ not configured${RESET} ${DIM}(cleat login)${RESET}"
+  fi
+  echo ""
+}
+
+cmd_clean() {
+  cmd_stop_all
+  if image_exists; then
+    info "Removing image..."
+    docker rmi "$IMAGE_NAME" > /dev/null
+    success "Image removed."
+  else
+    info "No image to remove."
+  fi
+}
+
+cmd_nuke() {
+  echo ""
+  warn "This will remove ${BOLD}ALL${RESET} Cleat containers, images, and volumes."
+  echo -e "  ${DIM}Your project files and ~/.claude auth are safe (they live on the host).${RESET}"
+  echo ""
+  read -rp "  Type 'nuke' to confirm: " confirm
+  if [[ "$confirm" != "nuke" ]]; then
+    info "Aborted."
+    return
+  fi
+  echo ""
+
+  # Stop and remove all cleat containers
+  local containers
+  containers=$(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null)
+  if [[ -n "$containers" ]]; then
+    info "Removing containers..."
+    echo "$containers" | while read -r c; do
+      docker rm -f "$c" > /dev/null 2>&1
+      echo -e "    ${DIM}removed ${c}${RESET}"
+    done
+  fi
+
+  # Remove the image
+  if image_exists; then
+    info "Removing image..."
+    docker rmi -f "$IMAGE_NAME" > /dev/null 2>&1
+  fi
+
+  # Remove any dangling images from failed builds
+  local dangling
+  dangling=$(docker images -f "dangling=true" -q 2>/dev/null)
+  if [[ -n "$dangling" ]]; then
+    info "Pruning dangling images..."
+    docker image prune -f > /dev/null 2>&1
+  fi
+
+  # Remove build cache for this image
+  info "Pruning build cache..."
+  docker builder prune -f > /dev/null 2>&1 || true
+
+  echo ""
+  success "Nuked. Everything Cleat-related is gone from Docker."
+  echo -e "  ${DIM}Run ${BOLD}cleat start${RESET}${DIM} to rebuild from scratch.${RESET}"
+  echo ""
+}
+
+cmd_install() {
+  local target="/usr/local/bin"
+  local script_path
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  info "Installing CLI symlink..."
+
+  if [[ -w "$target" ]]; then
+    ln -sf "$script_path" "$target/cleat"
+  else
+    sudo ln -sf "$script_path" "$target/cleat"
+  fi
+
+  success "Installed! You can now use ${BOLD}cleat${RESET} from anywhere."
+  echo ""
+  echo -e "  ${DIM}Try it:${RESET}"
+  echo -e "    ${BOLD}cd ~/some-project && cleat start${RESET}"
+  echo ""
+}
+
+cmd_uninstall() {
+  local target="/usr/local/bin"
+  info "Removing CLI symlinks..."
+  if [[ -w "$target" ]]; then
+    rm -f "$target/cleat"
+  else
+    sudo rm -f "$target/cleat"
+  fi
+  success "Uninstalled."
+}
+
+# ── Version & Update ──────────────────────────────────────────────────────
+cmd_version() {
+  echo -e "  ${BOLD}cleat${RESET} ${DIM}v${VERSION}${RESET}"
+}
+
+cmd_update() {
+  info "Checking for updates..."
+
+  # Check if this is a git repo
+  if [[ ! -d "$REPO_DIR/.git" ]]; then
+    error "Cannot auto-update: not a git installation."
+    echo -e "    ${DIM}Re-install with: curl -fsSL https://raw.githubusercontent.com/cleatdev/cleat/main/install.sh | bash${RESET}"
+    exit 1
+  fi
+
+  # Fetch all tags from remote
+  git -C "$REPO_DIR" fetch --tags --force --quiet 2>/dev/null || {
+    error "Failed to fetch updates. Check your internet connection."
+    exit 1
+  }
+
+  local remote_version
+  remote_version=$(latest_remote_tag)
+
+  if [[ -z "$remote_version" ]]; then
+    error "Could not determine remote version. No tags found."
+    exit 1
+  fi
+
+  if [[ "$VERSION" == "$remote_version" ]]; then
+    success "Already on the latest version (v${VERSION})."
+    return
+  fi
+
+  info "Updating v${VERSION} -> v${remote_version}..."
+  git -C "$REPO_DIR" checkout "v${remote_version}" --quiet 2>/dev/null || {
+    error "Failed to checkout v${remote_version}."
+    exit 1
+  }
+  success "Updated to v${remote_version}."
+
+  # Clear the update check cache so the notification disappears
+  rm -f "$UPDATE_CHECK_FILE" 2>/dev/null || true
+
+  echo ""
+  echo -e "  ${DIM}To also update Claude Code inside containers:${RESET}"
+  echo -e "    ${BOLD}cleat rebuild${RESET}"
+  echo ""
+}
+
+# ── Help ────────────────────────────────────────────────────────────────────
+cmd_help() {
+  header
+  echo -e "  ${BOLD}USAGE${RESET}"
+  echo -e "    cleat ${DIM}<command>${RESET} ${DIM}[project-path]${RESET}"
+  echo -e "    ${DIM}Defaults to current directory if no path given.${RESET}"
+  echo ""
+  echo -e "  ${BOLD}QUICK START${RESET}"
+  echo -e "    ${GREEN}start${RESET}   ${DIM}[path]${RESET}     Build + run + launch Claude (all-in-one)"
+  echo -e "    ${GREEN}resume${RESET}  ${DIM}[path]${RESET}     Resume the last Claude Code session"
+  echo ""
+  echo -e "  ${BOLD}LIFECYCLE${RESET}"
+  echo -e "    ${GREEN}build${RESET}              Build the Docker image (shared across projects)"
+  echo -e "    ${GREEN}rebuild${RESET}            Force rebuild the image from scratch"
+  echo -e "    ${GREEN}run${RESET}     ${DIM}[path]${RESET}     Start a container for this project"
+  echo -e "    ${GREEN}stop${RESET}    ${DIM}[path]${RESET}     Stop container (keeps it for resume)"
+  echo -e "    ${GREEN}rm${RESET}      ${DIM}[path]${RESET}     Stop + remove container permanently"
+  echo -e "    ${GREEN}stop-all${RESET}           Stop all Cleat containers"
+  echo -e "    ${GREEN}clean${RESET}              Stop everything + remove image"
+  echo -e "    ${RED}nuke${RESET}               Remove ALL containers, images, and build cache"
+  echo ""
+  echo -e "  ${BOLD}INTERACT${RESET}"
+  echo -e "    ${GREEN}claude${RESET}  ${DIM}[path]${RESET}     Attach Claude Code (--dangerously-skip-permissions)"
+  echo -e "    ${GREEN}shell${RESET}   ${DIM}[path]${RESET}     Open bash in the container"
+  echo -e "    ${GREEN}login${RESET}   ${DIM}[path]${RESET}     Authenticate with Anthropic team account"
+  echo -e "    ${GREEN}logs${RESET}    ${DIM}[path]${RESET}     Tail container logs"
+  echo ""
+  echo -e "  ${BOLD}INFO${RESET}"
+  echo -e "    ${GREEN}status${RESET}  ${DIM}[path]${RESET}     Show project container & auth status"
+  echo -e "    ${GREEN}ps${RESET}                 List all Cleat containers (running & stopped)"
+  echo ""
+  echo -e "  ${BOLD}SETUP${RESET}"
+  echo -e "    ${GREEN}update${RESET}             Check for updates and install the latest version"
+  echo -e "    ${GREEN}version${RESET}            Show current version"
+  echo -e "    ${GREEN}install${RESET}            Symlink ${BOLD}cleat${RESET} to /usr/local/bin"
+  echo -e "    ${GREEN}uninstall${RESET}          Remove symlinks"
+  echo ""
+  echo -e "  ${BOLD}EXAMPLES${RESET}"
+  echo -e "    ${DIM}cd ~/code/my-app && cleat start${RESET}   ${DIM}# first time${RESET}"
+  echo -e "    ${DIM}cleat resume${RESET}                      ${DIM}# pick up where you left off${RESET}"
+  echo -e "    ${DIM}cleat ps${RESET}                          ${DIM}# see all containers${RESET}"
+  echo -e "    ${DIM}cleat stop${RESET}                        ${DIM}# pause (keeps container)${RESET}"
+  echo ""
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-start}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    start)     cmd_start "$@" ;;
+    resume|r)  cmd_resume "$@" ;;
+    build)     cmd_build "$@" ;;
+    rebuild)   cmd_rebuild "$@" ;;
+    run)       cmd_run "$@" ;;
+    stop)      cmd_stop "$@" ;;
+    rm)        cmd_rm "$@" ;;
+    stop-all)  cmd_stop_all "$@" ;;
+    shell|sh)  cmd_shell "$@" ;;
+    login)     cmd_login "$@" ;;
+    claude)    cmd_claude "$@" ;;
+    logs)      cmd_logs "$@" ;;
+    ps)        cmd_ps "$@" ;;
+    status|st) cmd_status "$@" ;;
+    clean)     cmd_clean "$@" ;;
+    nuke)      cmd_nuke "$@" ;;
+    update)    cmd_update "$@" ;;
+    version|-v|--version) cmd_version ;;
+    install)   cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      error "Unknown command: ${cmd}"
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

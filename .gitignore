@@ -1,0 +1,8 @@
+.idea/
+.vscode/
+concept
+*.swp
+*.swo
+*~
+.DS_Store
+.update_check

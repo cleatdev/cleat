@@ -1,3 +1,21 @@
+## v0.2.0
+
+**Run anything. Break nothing.**
+
+### Features
+
+- **Test suite** — 121 behavioral tests covering every CLI command, the clipboard shim, container naming, update logic, and the Docker entrypoint. Mutation-tested: 12/12 code mutations caught.
+- **Test runner** — `./test.sh` with per-file pass/fail summary, skip counts, timing, and failure details. Auto-initializes BATS submodules if missing.
+- **Sourceable CLI** — `bin/cleat` can now be sourced without executing `main`, enabling direct function testing via a `BASH_SOURCE` guard.
+
+### Changes
+
+- Added BATS framework (bats-core, bats-assert, bats-support) as git submodules
+- Added Docker stub with file-based mock responses and function-override mocks
+- Added 14 test files covering: argument parsing, clipboard (shim + bridge + detection), container naming, all docker commands, exec_claude, helpers, version resolution, nuke, resolve_project, start/resume lifecycle, update, and version/update-check
+
+---
+
 ## v0.1.0
 
 **Run anything. Break nothing.**

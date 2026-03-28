@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Docker stub — records calls and returns canned responses via files.
+#
+# Mock responses are read from files in DOCKER_MOCK_DIR (set by _common_setup):
+#   ps_output      — for "docker ps --filter ..."
+#   ps_a_output    — for "docker ps -a --filter ..."
+#   images_output  — for "docker images ..."
+#
+# Every call is appended to $DOCKER_CALLS file.
+
+echo "docker $*" >> "${DOCKER_CALLS:-/dev/null}"
+
+_mock() {
+  local f="${DOCKER_MOCK_DIR:-}/$1"
+  [[ -f "$f" ]] && cat "$f"
+}
+
+case "$1" in
+  ps)
+    if [[ "$*" == *"-a"* ]]; then
+      _mock "ps_a_output"
+    else
+      _mock "ps_output"
+    fi
+    ;;
+  images)
+    _mock "images_output"
+    ;;
+  inspect)
+    _mock "inspect_output"
+    ;;
+  build|run|start|stop|rm|exec|logs|rmi|image|builder)
+    ;;
+esac
+
+exit "${DOCKER_EXIT_CODE:-0}"

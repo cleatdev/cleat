@@ -67,7 +67,7 @@ Cleat gives you the best of both worlds:
 | Claude can run any command | Yes (on your system) | Yes (in container) |
 | Claude can access other projects | Yes | **No** |
 | Claude can modify your system | Yes | **No** |
-| Claude can read ~/.ssh, credentials | Yes | **No** |
+| Claude can read ~/.ssh, credentials | Yes | **Opt-in** (via `cleat config`) |
 | Safe to leave running overnight | No | **Yes** |
 | File ownership issues | N/A | **None** (UID/GID mapped) |
 | Copy to host clipboard | Yes | **Yes** (via clipboard bridge) |
@@ -82,6 +82,8 @@ Cleat gives you the best of both worlds:
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
 - **Lightweight** -- Debian-slim-based image with Node.js, Python, Git, build-essential, vim, jq, and socat
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), all disabled by default
+- **Configuration drift detection** -- notifies when config has changed since container creation
 - **Auto-upgrade notifications** -- checks for updates once per day and notifies you before launching Claude
 
 ---
@@ -232,6 +234,23 @@ cleat ps
 | `cleat clean` | Stop everything and remove the image |
 | `cleat nuke` | Remove **all** containers, images, and build cache |
 
+#### Capabilities
+| Command | Description |
+|---|---|
+| `cleat config` | Interactive capability wizard |
+| `cleat config --list` | List capabilities and their status |
+| `cleat config --enable <cap>` | Enable a capability (e.g. `git`, `ssh`, `env`) |
+| `cleat config --disable <cap>` | Disable a capability |
+| `cleat config --project --enable <cap>` | Project-level config (saved to `.cleat`) |
+
+#### Flags (apply to `start`, `run`, `resume`, `claude`)
+| Flag | Description |
+|---|---|
+| `--cap <name>` | Enable a capability for this session only |
+| `--env KEY=VALUE` | Pass environment variable to container |
+| `--env KEY` | Inherit from host environment |
+| `--env-file PATH` | Load env vars from file |
+
 #### Interact
 | Command | Description |
 |---|---|
@@ -307,6 +326,74 @@ Containers run with these protections by default:
 - `--memory 8g` -- prevents runaway processes from exhausting host memory
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
 - Debian slim base image with minimal attack surface
+
+---
+
+## Capabilities
+
+Capabilities are opt-in features that extend what the container can access from the host. They are **disabled by default** — the baseline container is locked down, and each capability explicitly widens the boundary.
+
+### Enable capabilities
+
+```bash
+# Interactive wizard
+cleat config
+
+# Direct mode
+cleat config --enable git
+cleat config --enable ssh
+cleat config --enable env
+
+# One-off (session only, no config change)
+cleat --cap ssh start
+```
+
+### Available capabilities
+
+| Capability | What it does |
+|---|---|
+| `git` | Mounts `~/.gitconfig` (read-only). Commits inside the container use your host identity. |
+| `ssh` | Mounts `~/.ssh` (read-only). SSH agent forwarding if `SSH_AUTH_SOCK` is set. |
+| `env` | Auto-loads env vars from `~/.config/cleat/env` (global) and `.cleat.env` (project). |
+
+### Environment variables
+
+The `env` capability controls automatic loading of env files. The `--env` and `--env-file` flags always work, regardless of whether the capability is enabled:
+
+```bash
+# These always work (bypass capability gate)
+cleat --env GH_TOKEN=abc123 start
+cleat --env GH_TOKEN start              # inherit from host
+cleat --env-file .env.local start
+
+# These require the env capability
+# ~/.config/cleat/env     ← global
+# .cleat.env              ← project-specific
+```
+
+### Configuration drift detection
+
+When you change capabilities after a container was created, Cleat detects the mismatch and shows a notice:
+
+```
+  ┌──────────────────────────────────────────────────────┐
+  │  Configuration changed since this container was       │
+  │  created. Recreate to apply the new settings.         │
+  │                                                       │
+  │  Run: cleat rm && cleat                               │
+  └──────────────────────────────────────────────────────┘
+```
+
+Drift detection is informational only — Cleat never auto-destroys containers.
+
+### Config files
+
+```
+~/.config/cleat/config    ← global capabilities
+~/.config/cleat/env       ← global env vars
+<project>/.cleat          ← project-level capabilities (extends global)
+<project>/.cleat.env      ← project-level env vars
+```
 
 ---
 

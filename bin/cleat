@@ -2,11 +2,24 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.2.0"
+VERSION="0.3.0"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# XDG-compliant config directory
+CLEAT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cleat"
+CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
+CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
+
+# Known capabilities (order matters for display)
+KNOWN_CAPS=(git ssh env)
+
+# Session-scoped state (populated by parse_global_flags)
+_CLI_CAPS=()
+_CLI_ENVS=()
+_CLI_ENV_FILES=()
 
 # ── Colors & Formatting ────────────────────────────────────────────────────
 BOLD='\033[1m'
@@ -32,20 +45,21 @@ warn()    { echo -e "  ${YELLOW}!${RESET} $1"; }
 error()   { echo -e "  ${RED}✖${RESET} $1"; }
 
 # ── Project-scoped container naming ─────────────────────────────────────────
-# Each project dir gets its own container so you can run multiple in parallel.
-# Name is cleat-<dirname>-<hash> where hash is derived from the full absolute
-# path, so projects with the same dirname are never confused.
 container_name_for() {
   local project_path="$1"
   local dir_name hash
   dir_name="$(basename "$project_path" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  # Truncate dir_name to keep total under Docker's 63-char limit
+  # Format: cleat-<dir_name>-<hash8> → 15 fixed chars, 48 for dir_name
+  dir_name="${dir_name:0:48}"
+  # Remove trailing dash from truncation
+  dir_name="${dir_name%-}"
   hash="$(echo -n "$project_path" | md5sum | head -c 8)"
   echo "cleat-${dir_name}-${hash}"
 }
 
 resolve_project() {
   local project="${1:-$PWD}"
-  # Resolve to absolute path
   if [[ -d "$project" ]]; then
     (cd "$project" && pwd)
   else
@@ -75,11 +89,380 @@ require_running() {
   fi
 }
 
-# Launch Claude Code with clipboard bridge.  A host-side watcher monitors a
-# shared file and copies content to the real clipboard -- no OSC 52 required.
+# ── Capabilities: config file reading ──────────────────────────────────────
+# Read capabilities from a config file. Returns newline-separated cap names.
+# Config format: [caps] section header, then one cap name per line.
+_read_caps_from_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local in_caps=false
+  while IFS= read -r line; do
+    # Strip carriage return (CRLF from Windows editors)
+    line="${line%$'\r'}"
+    # Strip leading/trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    # Section header
+    if [[ "$line" == "["*"]" ]]; then
+      [[ "$line" == "[caps]" ]] && in_caps=true || in_caps=false
+      continue
+    fi
+    if $in_caps; then
+      echo "$line"
+    fi
+  done < "$file"
+}
+
+# Write capabilities to a config file. Preserves non-[caps] sections.
+_write_caps_to_file() {
+  local file="$1"
+  shift
+  local caps=("$@")
+
+  mkdir -p "$(dirname "$file")"
+
+  # If file exists, preserve everything outside [caps] section
+  local preserved=""
+  if [[ -f "$file" ]]; then
+    local in_caps=false
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      if [[ "$line" == "[caps]" ]]; then
+        in_caps=true
+        continue
+      fi
+      if $in_caps; then
+        # Skip lines in old [caps] section until next section or EOF
+        if [[ "$line" == "["*"]" ]]; then
+          in_caps=false
+          preserved+="$line"$'\n'
+        fi
+        continue
+      fi
+      preserved+="$line"$'\n'
+    done < "$file"
+  fi
+
+  # Write preserved content + new [caps] section
+  {
+    if [[ -n "$preserved" ]]; then
+      printf '%s' "$preserved"
+    fi
+    if [[ ${#caps[@]} -gt 0 ]]; then
+      echo "[caps]"
+      for cap in "${caps[@]}"; do
+        echo "$cap"
+      done
+    fi
+  } > "$file"
+}
+
+# Resolve active capabilities: global config + project config + CLI flags.
+# Sets the global ACTIVE_CAPS array.
+resolve_caps() {
+  local project="${1:-}"
+  ACTIVE_CAPS=()
+
+  # 1. Global config
+  local global_caps
+  global_caps="$(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")"
+
+  # 2. Project config (union with global)
+  local project_caps=""
+  if [[ -n "$project" && -f "$project/.cleat" ]]; then
+    project_caps="$(_read_caps_from_file "$project/.cleat")"
+  fi
+
+  # 3. Merge: global + project (union, deduplicated)
+  local seen=""
+  local cap
+  while IFS= read -r cap; do
+    [[ -z "$cap" ]] && continue
+    case ",$seen," in
+      *,"$cap",*) ;;
+      *) seen="${seen:+$seen,}$cap"; ACTIVE_CAPS+=("$cap") ;;
+    esac
+  done <<< "${global_caps}${global_caps:+$'\n'}${project_caps}"
+
+  # 4. Add CLI --cap flags (session-scoped additions)
+  for cap in "${_CLI_CAPS[@]+"${_CLI_CAPS[@]}"}"; do
+    case ",$seen," in
+      *,"$cap",*) ;;
+      *) seen="${seen:+$seen,}$cap"; ACTIVE_CAPS+=("$cap") ;;
+    esac
+  done
+}
+
+# Check if a specific capability is active
+cap_is_active() {
+  local target="$1"
+  local cap
+  for cap in "${ACTIVE_CAPS[@]+"${ACTIVE_CAPS[@]}"}"; do
+    [[ "$cap" == "$target" ]] && return 0
+  done
+  return 1
+}
+
+# ── Capabilities: env file parsing ─────────────────────────────────────────
+# Parse an env file and output KEY=VALUE lines (resolved).
+# Bare KEY entries are resolved from the host environment.
+_parse_env_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line; do
+    # Strip carriage return (CRLF from Windows editors)
+    line="${line%$'\r'}"
+    # Strip leading/trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == *=* ]]; then
+      # KEY=VALUE — validate key is non-empty
+      local _key="${line%%=*}"
+      [[ -z "$_key" ]] && continue
+      echo "$line"
+    else
+      # Bare KEY — resolve from host environment
+      # Validate variable name to prevent indirect expansion of invalid names
+      if [[ ! "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        continue
+      fi
+      local val="${!line:-}"
+      if [[ -n "$val" ]]; then
+        echo "${line}=${val}"
+      fi
+    fi
+  done < "$file"
+}
+
+# Resolve all env vars to pass to the container.
+# Returns an array of -e KEY=VALUE docker arguments via _RESOLVED_ENV_ARGS.
+resolve_env_args() {
+  local project="${1:-}"
+  _RESOLVED_ENV_ARGS=()
+  # Parallel arrays: _ek[i] holds the key, _ev[i] holds the value
+  local _ek=() _ev=()
+  local key val line i
+
+  _env_set() {
+    local k="$1" v="$2"
+    # Replace existing or append
+    for ((i=0; i<${#_ek[@]}; i++)); do
+      if [[ "${_ek[$i]}" == "$k" ]]; then
+        _ev[$i]="$v"
+        return
+      fi
+    done
+    _ek+=("$k")
+    _ev+=("$v")
+  }
+
+  # 1. If env capability is active, read env files
+  if cap_is_active env 2>/dev/null; then
+    # Global env file
+    if [[ -f "$CLEAT_GLOBAL_ENV" ]]; then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        key="${line%%=*}"; val="${line#*=}"
+        _env_set "$key" "$val"
+      done < <(_parse_env_file "$CLEAT_GLOBAL_ENV")
+    fi
+
+    # Project env file
+    if [[ -n "$project" && -f "$project/.cleat.env" ]]; then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        key="${line%%=*}"; val="${line#*=}"
+        _env_set "$key" "$val"
+      done < <(_parse_env_file "$project/.cleat.env")
+    fi
+  fi
+
+  # 2. --env-file flags (always work, bypass capability gate)
+  for file in "${_CLI_ENV_FILES[@]+"${_CLI_ENV_FILES[@]}"}"; do
+    if [[ ! -f "$file" ]]; then
+      error "Env file not found: $file"
+      exit 1
+    fi
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      key="${line%%=*}"; val="${line#*=}"
+      _env_set "$key" "$val"
+    done < <(_parse_env_file "$file")
+  done
+
+  # 3. --env flags (always work, bypass capability gate)
+  for entry in "${_CLI_ENVS[@]+"${_CLI_ENVS[@]}"}"; do
+    if [[ "$entry" == *=* ]]; then
+      key="${entry%%=*}"; val="${entry#*=}"
+      _env_set "$key" "$val"
+    else
+      # Bare key — resolve from host
+      val="${!entry:-}"
+      if [[ -n "$val" ]]; then
+        _env_set "$entry" "$val"
+      fi
+    fi
+  done
+
+  # 4. Build -e arguments (sorted for deterministic fingerprinting)
+  if [[ ${#_ek[@]} -gt 0 ]]; then
+    while IFS= read -r key; do
+      for ((i=0; i<${#_ek[@]}; i++)); do
+        if [[ "${_ek[$i]}" == "$key" ]]; then
+          _RESOLVED_ENV_ARGS+=(-e "${key}=${_ev[$i]}")
+          break
+        fi
+      done
+    done < <(printf '%s\n' "${_ek[@]}" | sort)
+  fi
+
+  unset -f _env_set
+}
+
+# Count env vars loaded from each source (for startup feedback)
+_env_summary() {
+  local project="${1:-}"
+  local global_count=0
+  local project_count=0
+
+  if cap_is_active env 2>/dev/null; then
+    if [[ -f "$CLEAT_GLOBAL_ENV" ]]; then
+      global_count=$(_parse_env_file "$CLEAT_GLOBAL_ENV" | wc -l)
+      global_count=$((global_count + 0))  # force integer
+    fi
+    if [[ -n "$project" && -f "$project/.cleat.env" ]]; then
+      project_count=$(_parse_env_file "$project/.cleat.env" | wc -l)
+      project_count=$((project_count + 0))
+    fi
+  fi
+
+  if (( global_count + project_count > 0 )); then
+    local msg="Env:"
+    if (( global_count > 0 )); then
+      msg+=" ${global_count} from ~/.config/cleat/env"
+    fi
+    if (( project_count > 0 )); then
+      [[ "$msg" != "Env:" ]] && msg+=","
+      msg+=" ${project_count} from .cleat.env"
+    fi
+    info "$msg"
+  fi
+}
+
+# ── Configuration drift detection ──────────────────────────────────────────
+# Compute a fingerprint from: sorted caps, sorted env keys, version.
+# Env VALUES are intentionally excluded — only structural changes (adding/removing
+# keys or capabilities) trigger drift. Value changes don't require container
+# recreation since env vars are passed at exec time, not baked into the container.
+compute_config_fingerprint() {
+  local project="${1:-}"
+  local fingerprint_input=""
+
+  # Caps (sorted)
+  fingerprint_input+="caps:"
+  if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
+    fingerprint_input+="$(printf '%s\n' "${ACTIVE_CAPS[@]}" | sort | tr '\n' ',')"
+  fi
+  fingerprint_input+=$'\n'
+
+  # Env keys (sorted, values excluded)
+  fingerprint_input+="env-keys:"
+  if [[ ${#_RESOLVED_ENV_ARGS[@]} -gt 0 ]]; then
+    for arg in "${_RESOLVED_ENV_ARGS[@]}"; do
+      [[ "$arg" == -e ]] && continue
+      fingerprint_input+="${arg%%=*},"
+    done
+  fi
+  fingerprint_input+=$'\n'
+
+  # Version
+  fingerprint_input+="version:${VERSION}"
+
+  if command -v sha256sum &>/dev/null; then
+    echo -n "$fingerprint_input" | sha256sum | head -c 16
+  elif command -v md5sum &>/dev/null; then
+    echo -n "$fingerprint_input" | md5sum | head -c 16
+  else
+    echo -n "$fingerprint_input" | cksum | head -c 16
+  fi
+}
+
+# Read config hash stored on a container's Docker label
+_container_config_hash() {
+  local cname="$1"
+  docker inspect "$cname" --format '{{index .Config.Labels "sh.cleat.config-hash"}}' 2>/dev/null || echo ""
+}
+
+# Read Cleat version stored on the Docker image label
+_image_cleat_version() {
+  docker inspect "$IMAGE_NAME" --format '{{index .Config.Labels "sh.cleat.version"}}' 2>/dev/null || echo ""
+}
+
+# Check for configuration drift and show notices
+check_drift() {
+  local cname="$1"
+  local project="${2:-}"
+
+  # Config drift
+  local stored_hash current_hash
+  stored_hash="$(_container_config_hash "$cname")"
+  current_hash="$(compute_config_fingerprint "$project")"
+
+  if [[ -n "$stored_hash" && "$stored_hash" != "$current_hash" ]]; then
+    echo ""
+    echo -e "  ${CYAN}┌──────────────────────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│${RESET}  Configuration changed since this container was       ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET}  created. Recreate to apply the new settings.         ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET}                                                       ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET}  Run: ${BOLD}cleat rm && cleat${RESET}                               ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────────────────────┘${RESET}"
+    echo ""
+  fi
+
+  # Image version drift
+  local image_version
+  image_version="$(_image_cleat_version)"
+  if [[ -n "$image_version" && "$image_version" != "$VERSION" ]]; then
+    echo ""
+    echo -e "  ${CYAN}┌──────────────────────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│${RESET}  Cleat image was built with ${BOLD}v${image_version}${RESET} but CLI is        ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET}  ${BOLD}v${VERSION}${RESET}. Rebuild to get the latest container setup.   ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET}                                                       ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET}  Run: ${BOLD}cleat rebuild${RESET}                                    ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────────────────────┘${RESET}"
+    echo ""
+  fi
+}
+
+# ── First-run tip ──────────────────────────────────────────────────────────
+_first_run_tip_file="$CLEAT_CONFIG_DIR/.tip-shown"
+
+show_first_run_tip() {
+  # Show tip if no config file and tip hasn't been shown
+  if [[ ! -f "$CLEAT_GLOBAL_CONFIG" && ! -f "$_first_run_tip_file" ]]; then
+    info "Tip: run ${BOLD}cleat config${RESET} to enable git access, env passthrough, and more"
+    mkdir -p "$CLEAT_CONFIG_DIR"
+    touch "$_first_run_tip_file"
+  fi
+}
+
+# ── Startup output ─────────────────────────────────────────────────────────
+_print_startup_caps() {
+  if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
+    local caps_str
+    caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
+    caps_str="${caps_str%, }"
+    info "Caps: ${BOLD}${caps_str}${RESET}"
+  fi
+}
+
+# ── Clipboard bridge ──────────────────────────────────────────────────────
 CLAUDE_ENV=(-e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 
-# Detect host clipboard command once
 _host_clip_cmd() {
   if command -v pbcopy &>/dev/null; then echo pbcopy
   elif command -v xclip &>/dev/null; then echo "xclip -selection clipboard"
@@ -89,27 +472,16 @@ _host_clip_cmd() {
   fi
 }
 
-# Background watcher: monitors the clipboard file and copies to host clipboard.
-# Uses inotifywait (Linux) or fswatch (macOS) for event-driven, zero-CPU
-# blocking.  Falls back to 1-second polling when neither is available.
-#
-# Process safety: inotifywait runs in one-shot mode (no long-lived pipe
-# children).  fswatch uses a pipe but _cleanup_clipboard kills all children
-# via pkill -P.  The polling fallback has no children at all.
 _clipboard_watcher() {
   local clip_dir="$1"
   local clip_cmd="$2"
 
-  # Sentinel tells the container the bridge is active
   touch "$clip_dir/.host-ready"
 
   _do_copy() {
     [ -f "$clip_dir/clipboard" ] && eval "$clip_cmd" < "$clip_dir/clipboard" 2>/dev/null || true
   }
 
-  # --- Event-driven: inotifywait (Linux) ---
-  # One-shot mode: inotifywait exits after each event, so there is no
-  # long-lived child that could become an orphan on kill.
   if command -v inotifywait &>/dev/null; then
     while inotifywait -qq -e moved_to "$clip_dir" 2>/dev/null; do
       _do_copy
@@ -117,9 +489,6 @@ _clipboard_watcher() {
     return
   fi
 
-  # --- Event-driven: fswatch (macOS, Homebrew) ---
-  # Pipe mode: fswatch runs continuously.  _cleanup_clipboard uses pkill -P
-  # to kill it when the watcher is torn down.
   if command -v fswatch &>/dev/null; then
     fswatch --event Updated --event Created -0 "$clip_dir" 2>/dev/null \
       | while IFS= read -r -d '' path; do
@@ -128,12 +497,10 @@ _clipboard_watcher() {
     return
   fi
 
-  # --- Fallback: poll at 1-second intervals (no child processes) ---
   local last_ts=""
   while true; do
     if [ -f "$clip_dir/clipboard" ]; then
       local cur_ts
-      # Nanosecond mtime on Linux, second precision on macOS
       cur_ts=$(stat -c '%Y%N' "$clip_dir/clipboard" 2>/dev/null \
             || stat -f '%m' "$clip_dir/clipboard" 2>/dev/null || echo "")
       if [ -n "$cur_ts" ] && [ "$cur_ts" != "$last_ts" ]; then
@@ -149,23 +516,18 @@ exec_claude() {
   local cname="$1"
   shift
 
-  # Set up clipboard bridge -- variables are intentionally NOT local so the
-  # trap handler can access them even after this function's locals are gone.
   _CLIP_DIR="/tmp/cleat-clip-${cname}"
   _CLIP_WATCHER_PID=""
   mkdir -p "$_CLIP_DIR"
 
   _cleanup_clipboard() {
     if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
-      # Kill children first (inotifywait, fswatch, etc.) then the watcher
       pkill -P "$_CLIP_WATCHER_PID" 2>/dev/null || true
       kill "$_CLIP_WATCHER_PID" 2>/dev/null || true
       wait "$_CLIP_WATCHER_PID" 2>/dev/null || true
       _CLIP_WATCHER_PID=""
     fi
     rm -f "${_CLIP_DIR:?}/.clipboard."*
-    # Reference counting: remove our session marker and only tear down the
-    # sentinel if no other session is watching the same directory.
     rm -f "$_CLIP_DIR/.watcher.$$"
     if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
       rm -f "$_CLIP_DIR/.host-ready"
@@ -175,24 +537,19 @@ exec_claude() {
   local clip_cmd
   clip_cmd="$(_host_clip_cmd)"
   if [ -n "$clip_cmd" ]; then
-    # Session marker for reference counting (safe multi-session cleanup)
     touch "$_CLIP_DIR/.watcher.$$"
     _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" &
     _CLIP_WATCHER_PID=$!
-    # Ensure watcher is killed on ANY exit (Ctrl+C, set -e, signals)
     trap _cleanup_clipboard EXIT INT TERM HUP
   fi
 
-  # Capture exit code so cleanup always runs (set -e safe), but report errors
   local rc=0
   docker exec -it --user coder "${CLAUDE_ENV[@]}" "$cname" \
     bash -c '
       clip-daemon &
       _MY_CLIP_DAEMON=$!
-      # Wait for the socket to be ready before launching Claude
       for i in 1 2 3 4 5; do [ -S /tmp/clip.sock ] && break; sleep 0.1; done
       claude "$@"
-      # Only kill the daemon WE started (not one from another session)
       kill "$_MY_CLIP_DAEMON" 2>/dev/null
       wait "$_MY_CLIP_DAEMON" 2>/dev/null
     ' _ "$@" || rc=$?
@@ -200,19 +557,15 @@ exec_claude() {
   _cleanup_clipboard
   trap - EXIT INT TERM HUP
 
-  # 130 = SIGINT (Ctrl+C), normal exit -- anything else is unexpected
   if [[ $rc -ne 0 && $rc -ne 130 ]]; then
     warn "Claude exited with code $rc"
   fi
 }
 
-
 # ── Update check (once per day) ─────────────────────────────────────────────
 UPDATE_CHECK_FILE="$REPO_DIR/.update_check"
-UPDATE_CHECK_INTERVAL=86400  # 24 hours in seconds
+UPDATE_CHECK_INTERVAL=86400
 
-# Return the latest semver tag from remote (e.g. "0.2.0"), without cloning or fetching objects.
-# Uses git ls-remote --tags which is a lightweight network call.
 latest_remote_tag() {
   git -C "$REPO_DIR" ls-remote --tags --refs origin 2>/dev/null \
     | awk '{print $2}' \
@@ -223,7 +576,6 @@ latest_remote_tag() {
 }
 
 check_for_update() {
-  # Only check from git installations
   [[ -d "$REPO_DIR/.git" ]] || return 0
 
   local now
@@ -237,13 +589,11 @@ check_for_update() {
     cached_version=$(awk 'NR==1 {print $2}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo "")
   fi
 
-  # Query remote tags if the cache is stale
   if (( now - last_check >= UPDATE_CHECK_INTERVAL )); then
     cached_version=$(latest_remote_tag || true)
     echo "$now $cached_version" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
   fi
 
-  # Display notification if a newer version is available
   if [[ -n "$cached_version" && "$cached_version" != "$VERSION" ]]; then
     echo ""
     echo -e "  ${CYAN}┌──────────────────────────────────────────────────┐${RESET}"
@@ -261,13 +611,15 @@ cmd_build() {
     return
   fi
   info "Building Docker image ${BOLD}${IMAGE_NAME}${RESET} ..."
-  docker build -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" "$REPO_DIR/docker"
+  docker build -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" \
+    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker"
   success "Image built."
 }
 
 cmd_rebuild() {
   info "Rebuilding Docker image ${BOLD}${IMAGE_NAME}${RESET} ..."
-  docker build --no-cache -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" "$REPO_DIR/docker"
+  docker build --no-cache -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" \
+    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker"
   success "Image rebuilt."
 }
 
@@ -295,10 +647,14 @@ cmd_run() {
     exit 1
   fi
 
+  # Resolve capabilities and env for this run
+  resolve_caps "$project"
+  resolve_env_args "$project"
+
   info "Starting ${BOLD}${cname}${RESET}"
   echo -e "  ${DIM}Project: ${project}${RESET}"
 
-  # Clipboard bridge: shared directory for host ↔ container clipboard
+  # Clipboard bridge
   local clip_dir="/tmp/cleat-clip-${cname}"
   mkdir -p "$clip_dir"
 
@@ -313,9 +669,40 @@ cmd_run() {
     mount_args+=(-v "${HOME}/.claude.json:/home/coder/.claude.json")
   fi
 
+  # ── git capability: mount gitconfig (read-only) for commit identity
+  if cap_is_active git; then
+    if [[ -f "${HOME}/.gitconfig" ]]; then
+      mount_args+=(-v "${HOME}/.gitconfig:/home/coder/.gitconfig:ro")
+    fi
+  fi
+
+  # ── ssh capability: mount SSH keys (read-only) and forward agent
+  if cap_is_active ssh; then
+    if [[ -d "${HOME}/.ssh" ]]; then
+      mount_args+=(-v "${HOME}/.ssh:/home/coder/.ssh:ro")
+    fi
+  fi
+
+  local ssh_args=()
+  if cap_is_active ssh && [[ -S "${SSH_AUTH_SOCK:-}" ]]; then
+    ssh_args+=(-v "${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
+  fi
+
+  # ── Compute config fingerprint and store as label
+  local config_hash
+  config_hash="$(compute_config_fingerprint "$project")"
+
+  local label_args=(
+    --label "sh.cleat.config-hash=$config_hash"
+    --label "sh.cleat.version=$VERSION"
+  )
+
   docker run -d \
     --name "$cname" \
     "${mount_args[@]}" \
+    "${ssh_args[@]+"${ssh_args[@]}"}" \
+    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
+    "${label_args[@]}" \
     -e "HOST_UID=$(id -u)" \
     -e "HOST_GID=$(id -g)" \
     -e "HOME=/home/coder" \
@@ -338,6 +725,10 @@ cmd_start() {
     cmd_build
   fi
 
+  # Resolve caps early for startup output and drift detection
+  resolve_caps "$project"
+  resolve_env_args "$project"
+
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
@@ -349,7 +740,16 @@ cmd_start() {
   fi
 
   check_for_update
+  show_first_run_tip
+
+  # Drift detection on existing containers
+  if container_exists "$cname"; then
+    check_drift "$cname" "$project"
+  fi
+
   info "Container ${BOLD}${cname}${RESET}"
+  _print_startup_caps
+  _env_summary "$project"
   info "Launching Claude Code ${YELLOW}--dangerously-skip-permissions${RESET}"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions
@@ -360,6 +760,10 @@ cmd_resume() {
   project="$(resolve_project "${1:-}")"
   local cname
   cname="$(container_name_for "$project")"
+
+  # Resolve caps for startup output and drift detection
+  resolve_caps "$project"
+  resolve_env_args "$project"
 
   # Start container if stopped
   if ! is_running "$cname"; then
@@ -373,7 +777,13 @@ cmd_resume() {
   fi
 
   check_for_update
+
+  # Drift detection
+  check_drift "$cname" "$project"
+
   info "Container ${BOLD}${cname}${RESET}"
+  _print_startup_caps
+  _env_summary "$project"
   info "Resuming Claude Code session ${YELLOW}--dangerously-skip-permissions${RESET}"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions --continue
@@ -443,8 +853,10 @@ cmd_claude() {
   cname="$(container_name_for "$project")"
 
   require_running "$cname"
+  resolve_caps "$project"
   check_for_update
   info "Container ${BOLD}${cname}${RESET}"
+  _print_startup_caps
   info "Launching Claude Code ${YELLOW}--dangerously-skip-permissions${RESET}"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions
@@ -471,7 +883,6 @@ cmd_ps() {
       name="$(echo "$line" | awk -F'\t' '{print $1}' | xargs)"
       status="$(echo "$line" | awk -F'\t' '{print $2}' | xargs)"
 
-      # Get the mounted project path from the container
       project_path=$(docker inspect "$name" --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
 
       if docker ps --filter "name=^${name}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
@@ -518,6 +929,9 @@ cmd_status() {
   local cname
   cname="$(container_name_for "$project")"
 
+  # Resolve caps for display
+  resolve_caps "$project"
+
   echo ""
   echo -e "  ${BOLD}Project:${RESET}   ${project}"
   echo -e "  ${BOLD}Container:${RESET} ${cname}"
@@ -542,6 +956,16 @@ cmd_status() {
     echo -e "  ${BOLD}Auth:${RESET}      ${GREEN}● logged in${RESET} ${DIM}(via ~/.claude)${RESET}"
   else
     echo -e "  ${BOLD}Auth:${RESET}      ${YELLOW}○ not configured${RESET} ${DIM}(cleat login)${RESET}"
+  fi
+
+  # Show active capabilities
+  if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
+    local caps_str
+    caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
+    caps_str="${caps_str%, }"
+    echo -e "  ${BOLD}Caps:${RESET}      ${GREEN}${caps_str}${RESET}"
+  else
+    echo -e "  ${BOLD}Caps:${RESET}      ${DIM}none${RESET} ${DIM}(cleat config)${RESET}"
   fi
   echo ""
 }
@@ -569,7 +993,6 @@ cmd_nuke() {
   fi
   echo ""
 
-  # Stop and remove all cleat containers
   local containers
   containers=$(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null)
   if [[ -n "$containers" ]]; then
@@ -580,13 +1003,11 @@ cmd_nuke() {
     done
   fi
 
-  # Remove the image
   if image_exists; then
     info "Removing image..."
     docker rmi -f "$IMAGE_NAME" > /dev/null 2>&1
   fi
 
-  # Remove any dangling images from failed builds
   local dangling
   dangling=$(docker images -f "dangling=true" -q 2>/dev/null)
   if [[ -n "$dangling" ]]; then
@@ -594,7 +1015,6 @@ cmd_nuke() {
     docker image prune -f > /dev/null 2>&1
   fi
 
-  # Remove build cache for this image
   info "Pruning build cache..."
   docker builder prune -f > /dev/null 2>&1 || true
 
@@ -635,6 +1055,245 @@ cmd_uninstall() {
   success "Uninstalled."
 }
 
+# ── cleat config ────────────────────────────────────────────────────────────
+_cap_description() {
+  case "$1" in
+    git) echo "Mount ~/.gitconfig (read-only) for commit identity" ;;
+    ssh) echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
+    env) echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
+    *)   echo "(unknown capability)" ;;
+  esac
+}
+
+_scaffold_cleat_env() {
+  local project="${1:-$PWD}"
+  local env_file="$project/.cleat.env"
+  [[ -f "$env_file" ]] && return 0
+  cat > "$env_file" << 'ENVEOF'
+# .cleat.env — project environment variables for Cleat
+# Loaded when the "env" capability is enabled.
+# Add to .gitignore — do not commit secrets.
+#
+# KEY=VALUE  set explicitly
+# KEY        inherit from host environment
+#
+# Example:
+# GH_TOKEN
+# DATABASE_URL=postgres://localhost:5432/myapp
+ENVEOF
+  success "Created ${DIM}${env_file}${RESET} (add to .gitignore)"
+}
+
+cmd_config() {
+  local scope="global"
+  local action=""
+  local cap_name=""
+
+  # Parse config subcommand flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)  scope="project"; shift ;;
+      --enable)
+        action="enable"
+        if [[ $# -lt 2 ]]; then cap_name=""; shift; else cap_name="$2"; shift 2; fi
+        ;;
+      --disable)
+        action="disable"
+        if [[ $# -lt 2 ]]; then cap_name=""; shift; else cap_name="$2"; shift 2; fi
+        ;;
+      --list)     action="list"; shift ;;
+      *)
+        error "Unknown config option: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  local config_file
+  if [[ "$scope" == "project" ]]; then
+    config_file="$(pwd)/.cleat"
+  else
+    config_file="$CLEAT_GLOBAL_CONFIG"
+  fi
+
+  # ── Direct mode: --list
+  if [[ "$action" == "list" ]]; then
+    echo ""
+    echo -e "  ${BOLD}Capabilities${RESET}"
+    echo ""
+    # Read current caps
+    local _active_list=""
+    local cap
+    while IFS= read -r cap; do
+      [[ -n "$cap" ]] && _active_list="${_active_list:+${_active_list},}${cap}"
+    done < <(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")
+    # Also read project caps if available
+    if [[ -f "$(pwd)/.cleat" ]]; then
+      while IFS= read -r cap; do
+        [[ -n "$cap" ]] && case ",${_active_list}," in *,"$cap",*) ;; *) _active_list="${_active_list:+${_active_list},}${cap}" ;; esac
+      done < <(_read_caps_from_file "$(pwd)/.cleat")
+    fi
+
+    for cap in "${KNOWN_CAPS[@]}"; do
+      local marker="${DIM}·${RESET}"
+      case ",${_active_list}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
+      echo -e "    [${marker}] ${BOLD}${cap}${RESET}  ${DIM}$(_cap_description "$cap")${RESET}"
+    done
+    echo ""
+    echo -e "  ${DIM}Config: ${config_file}${RESET}"
+    echo ""
+    return
+  fi
+
+  # ── Direct mode: --enable / --disable
+  if [[ -n "$action" ]]; then
+    if [[ -z "$cap_name" ]]; then
+      error "Missing capability name. Usage: cleat config --${action} <name>"
+      exit 1
+    fi
+
+    # Validate capability name
+    local valid=false
+    for known in "${KNOWN_CAPS[@]}"; do
+      [[ "$known" == "$cap_name" ]] && valid=true
+    done
+    if ! $valid; then
+      error "Unknown capability: ${BOLD}${cap_name}${RESET}"
+      echo -e "    ${DIM}Available: ${KNOWN_CAPS[*]}${RESET}"
+      exit 1
+    fi
+
+    # Read current caps
+    local current_caps=()
+    while IFS= read -r cap; do
+      [[ -n "$cap" ]] && current_caps+=("$cap")
+    done < <(_read_caps_from_file "$config_file")
+
+    if [[ "$action" == "enable" ]]; then
+      # Check if already enabled
+      local already=false
+      for cap in "${current_caps[@]}"; do
+        [[ "$cap" == "$cap_name" ]] && already=true
+      done
+      if ! $already; then
+        current_caps+=("$cap_name")
+      fi
+      _write_caps_to_file "$config_file" "${current_caps[@]}"
+      success "${cap_name} enabled"
+      echo -e "    ${DIM}$(_cap_description "$cap_name")${RESET}"
+
+      # Scaffold .cleat.env when enabling env capability
+      if [[ "$cap_name" == "env" ]]; then
+        _scaffold_cleat_env "$(pwd)"
+      fi
+    else
+      # Disable: remove from list
+      local new_caps=()
+      for cap in "${current_caps[@]}"; do
+        [[ "$cap" != "$cap_name" ]] && new_caps+=("$cap")
+      done
+      _write_caps_to_file "$config_file" "${new_caps[@]}"
+      success "${cap_name} disabled"
+    fi
+    return
+  fi
+
+  # ── Interactive mode (no flags)
+  echo ""
+  echo -e "  ${BOLD}Cleat — Capabilities${RESET}"
+  echo ""
+  local scope_label
+  if [[ "$scope" == "project" ]]; then
+    scope_label="project ($(pwd)/.cleat)"
+  else
+    scope_label="global (~/.config/cleat/config)"
+  fi
+  echo -e "  ${DIM}Scope: ${scope_label}${RESET}"
+  echo ""
+
+  # Read current caps into a comma-delimited string
+  local _active=""
+  local cap
+  while IFS= read -r cap; do
+    [[ -n "$cap" ]] && _active="${_active:+${_active},}${cap}"
+  done < <(_read_caps_from_file "$config_file")
+
+  # Show current state
+  for cap in "${KNOWN_CAPS[@]}"; do
+    local marker="${DIM}·${RESET}"
+    case ",${_active}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
+    echo -e "    [${marker}] ${BOLD}${cap}${RESET}     $(_cap_description "$cap")"
+  done
+
+  echo ""
+  echo -e "  ${DIM}Toggle: type name to flip, \"done\" to save, \"q\" to cancel${RESET}"
+
+  while true; do
+    echo -n "  > "
+    local input
+    read -r input
+    # Strip whitespace
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+
+    case "$input" in
+      done)
+        # Save
+        local final_caps=()
+        for cap in "${KNOWN_CAPS[@]}"; do
+          case ",${_active}," in *,"$cap",*) final_caps+=("$cap") ;; esac
+        done
+        _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
+        success "Saved to ${config_file}"
+
+        # Scaffold .cleat.env if env was just enabled
+        case ",${_active}," in
+          *,env,*)
+            if [[ ! -f "$(pwd)/.cleat.env" ]]; then
+              echo ""
+              echo -n "  Create .cleat.env in current project? [Y/n] "
+              local yn
+              read -r yn
+              if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+                _scaffold_cleat_env "$(pwd)"
+              fi
+            fi
+            ;;
+        esac
+        return
+        ;;
+      q|quit)
+        info "Cancelled."
+        return
+        ;;
+      *)
+        # Check if it's a known cap name
+        local found=false
+        for known in "${KNOWN_CAPS[@]}"; do
+          if [[ "$known" == "$input" ]]; then
+            found=true
+            case ",${_active}," in
+              *,"$input",*)
+                # Remove from _active
+                _active=$(printf '%s\n' "$_active" | tr ',' '\n' | grep -v "^${input}$" | paste -sd ',' -)
+                success "${input} disabled"
+                ;;
+              *)
+                _active="${_active:+${_active},}${input}"
+                success "${input} enabled"
+                ;;
+            esac
+            break
+          fi
+        done
+        if ! $found; then
+          warn "Unknown capability: ${input}. Available: ${KNOWN_CAPS[*]}"
+        fi
+        ;;
+    esac
+  done
+}
+
 # ── Version & Update ──────────────────────────────────────────────────────
 cmd_version() {
   echo -e "  ${BOLD}cleat${RESET} ${DIM}v${VERSION}${RESET}"
@@ -643,14 +1302,12 @@ cmd_version() {
 cmd_update() {
   info "Checking for updates..."
 
-  # Check if this is a git repo
   if [[ ! -d "$REPO_DIR/.git" ]]; then
     error "Cannot auto-update: not a git installation."
     echo -e "    ${DIM}Re-install with: curl -fsSL https://raw.githubusercontent.com/cleatdev/cleat/main/install.sh | bash${RESET}"
     exit 1
   fi
 
-  # Fetch all tags from remote
   git -C "$REPO_DIR" fetch --tags --force --quiet 2>/dev/null || {
     error "Failed to fetch updates. Check your internet connection."
     exit 1
@@ -676,7 +1333,6 @@ cmd_update() {
   }
   success "Updated to v${remote_version}."
 
-  # Clear the update check cache so the notification disappears
   rm -f "$UPDATE_CHECK_FILE" 2>/dev/null || true
 
   echo ""
@@ -689,7 +1345,7 @@ cmd_update() {
 cmd_help() {
   header
   echo -e "  ${BOLD}USAGE${RESET}"
-  echo -e "    cleat ${DIM}<command>${RESET} ${DIM}[project-path]${RESET}"
+  echo -e "    cleat ${DIM}<command>${RESET} ${DIM}[options] [project-path]${RESET}"
   echo -e "    ${DIM}Defaults to current directory if no path given.${RESET}"
   echo ""
   echo -e "  ${BOLD}QUICK START${RESET}"
@@ -705,6 +1361,12 @@ cmd_help() {
   echo -e "    ${GREEN}stop-all${RESET}           Stop all Cleat containers"
   echo -e "    ${GREEN}clean${RESET}              Stop everything + remove image"
   echo -e "    ${RED}nuke${RESET}               Remove ALL containers, images, and build cache"
+  echo ""
+  echo -e "  ${BOLD}CAPABILITIES${RESET}"
+  echo -e "    ${GREEN}config${RESET}             Interactive capability wizard"
+  echo -e "    ${GREEN}config${RESET} --list       List capabilities and their status"
+  echo -e "    ${GREEN}config${RESET} --enable ${DIM}<cap>${RESET}   Enable a capability"
+  echo -e "    ${GREEN}config${RESET} --disable ${DIM}<cap>${RESET}  Disable a capability"
   echo ""
   echo -e "  ${BOLD}INTERACT${RESET}"
   echo -e "    ${GREEN}claude${RESET}  ${DIM}[path]${RESET}     Attach Claude Code (--dangerously-skip-permissions)"
@@ -722,16 +1384,80 @@ cmd_help() {
   echo -e "    ${GREEN}install${RESET}            Symlink ${BOLD}cleat${RESET} to /usr/local/bin"
   echo -e "    ${GREEN}uninstall${RESET}          Remove symlinks"
   echo ""
-  echo -e "  ${BOLD}EXAMPLES${RESET}"
-  echo -e "    ${DIM}cd ~/code/my-app && cleat start${RESET}   ${DIM}# first time${RESET}"
-  echo -e "    ${DIM}cleat resume${RESET}                      ${DIM}# pick up where you left off${RESET}"
-  echo -e "    ${DIM}cleat ps${RESET}                          ${DIM}# see all containers${RESET}"
-  echo -e "    ${DIM}cleat stop${RESET}                        ${DIM}# pause (keeps container)${RESET}"
+  echo -e "  ${BOLD}FLAGS${RESET} ${DIM}(apply to start, run, resume, claude)${RESET}"
+  echo -e "    ${GREEN}--cap${RESET} ${DIM}<name>${RESET}       Enable a capability for this session only"
+  echo -e "    ${GREEN}--env${RESET} ${DIM}KEY=VALUE${RESET}    Pass environment variable to container"
+  echo -e "    ${GREEN}--env${RESET} ${DIM}KEY${RESET}          Inherit from host environment"
+  echo -e "    ${GREEN}--env-file${RESET} ${DIM}PATH${RESET}    Load env vars from file"
   echo ""
+  echo -e "  ${BOLD}EXAMPLES${RESET}"
+  echo -e "    ${DIM}cd ~/code/my-app && cleat start${RESET}           ${DIM}# first time${RESET}"
+  echo -e "    ${DIM}cleat resume${RESET}                              ${DIM}# pick up where you left off${RESET}"
+  echo -e "    ${DIM}cleat config --enable git${RESET}                 ${DIM}# enable git identity${RESET}"
+  echo -e "    ${DIM}cleat --cap ssh --env GH_TOKEN start${RESET}      ${DIM}# one-off session${RESET}"
+  echo -e "    ${DIM}cleat ps${RESET}                                  ${DIM}# see all containers${RESET}"
+  echo -e "    ${DIM}cleat stop${RESET}                                ${DIM}# pause (keeps container)${RESET}"
+  echo ""
+}
+
+# ── Global flag parsing ────────────────────────────────────────────────────
+# Extract --cap, --env, --env-file flags before dispatching to subcommands.
+# Remaining args are returned in _REMAINING_ARGS.
+parse_global_flags() {
+  _CLI_CAPS=()
+  _CLI_ENVS=()
+  _CLI_ENV_FILES=()
+  _REMAINING_ARGS=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cap)
+        if [[ -z "${2:-}" ]]; then
+          error "Missing capability name after --cap"
+          exit 1
+        fi
+        # Validate against known capabilities
+        local _cap_valid=false
+        for _known in "${KNOWN_CAPS[@]}"; do
+          [[ "$_known" == "$2" ]] && _cap_valid=true
+        done
+        if ! $_cap_valid; then
+          error "Unknown capability: ${BOLD}$2${RESET}"
+          echo -e "    ${DIM}Available: ${KNOWN_CAPS[*]}${RESET}"
+          exit 1
+        fi
+        _CLI_CAPS+=("$2")
+        shift 2
+        ;;
+      --env)
+        if [[ -z "${2:-}" ]]; then
+          error "Missing value after --env"
+          exit 1
+        fi
+        _CLI_ENVS+=("$2")
+        shift 2
+        ;;
+      --env-file)
+        if [[ -z "${2:-}" ]]; then
+          error "Missing path after --env-file"
+          exit 1
+        fi
+        _CLI_ENV_FILES+=("$2")
+        shift 2
+        ;;
+      *)
+        _REMAINING_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
 main() {
+  parse_global_flags "$@"
+  set -- "${_REMAINING_ARGS[@]+"${_REMAINING_ARGS[@]}"}"
+
   local cmd="${1:-start}"
   shift 2>/dev/null || true
 
@@ -750,6 +1476,7 @@ main() {
     logs)      cmd_logs "$@" ;;
     ps)        cmd_ps "$@" ;;
     status|st) cmd_status "$@" ;;
+    config)    cmd_config "$@" ;;
     clean)     cmd_clean "$@" ;;
     nuke)      cmd_nuke "$@" ;;
     update)    cmd_update "$@" ;;

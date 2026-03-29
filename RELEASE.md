@@ -1,3 +1,35 @@
+## v0.3.0
+
+**Opt-in capabilities that extend container access to host resources.**
+
+All disabled by default — the baseline sandbox is unchanged from v0.1.0.
+
+### Features
+
+- **Capability system** — `cleat config` interactive wizard and direct mode (`--enable`, `--disable`, `--list`) to toggle host access per capability
+- **`git` capability** — mount `~/.gitconfig` (read-only) so commits use your host identity
+- **`ssh` capability** — mount `~/.ssh` (read-only) with SSH agent forwarding for private repos
+- **`env` capability** — auto-load environment variables from `~/.config/cleat/env` (global) and `.cleat.env` (project)
+- **CLI flags** — `--cap`, `--env KEY=VALUE`, `--env-file PATH` for session-scoped overrides
+- **Configuration drift detection** — config fingerprint stored as Docker label; warns on mismatch instead of silently using stale settings
+- **Image version detection** — CLI version stored on image; suggests `cleat rebuild` when mismatched
+- **Project-level config** — `cleat config --project` saves to `<project>/.cleat`, merged with global
+
+### Fixes
+
+- **Bash 3.2 compatibility** — removed all associative arrays (`local -A`), which require bash 4.0+ (macOS ships 3.2)
+- **Empty array expansion** — protected against `set -u` failures on empty arrays in bash < 4.4
+- **Env resolution** — replaced grep/sed pipeline that silently exited under `set -euo pipefail` with indexed array approach
+
+### Changes
+
+- 216 behavioral tests (95 new for capabilities, config, hardening, bash compat)
+- 21 mutation tests covering security-critical behaviors — all mutations caught
+- Source-level scans for forbidden bash 4+ patterns
+- Strict-mode regression tests that run the actual binary
+
+---
+
 ## v0.2.0
 
 **Run anything. Break nothing.**

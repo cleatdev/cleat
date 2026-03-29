@@ -56,3 +56,27 @@ teardown() { _common_teardown; }
     [[ "$hash" =~ ^[0-9a-f]{8}$ ]]  || return 1
   done
 }
+
+@test "container name never exceeds Docker's 63-char limit" {
+  # Create a path with a very long directory name (80+ chars)
+  local long_dir
+  long_dir="$(printf 'a%.0s' {1..80})"
+  local result
+  result="$(container_name_for "/home/user/${long_dir}")"
+  [[ ${#result} -le 63 ]]  || return 1
+  # Verify it still has the expected format
+  [[ "$result" =~ ^cleat-.*-[0-9a-f]{8}$ ]]  || return 1
+}
+
+@test "truncated name doesn't end with trailing dash" {
+  # Create a name that after truncation would end with a dash
+  # 48 chars of 'a' followed by a dash — truncation at 48 should strip the trailing dash
+  local dir_name
+  dir_name="$(printf 'a%.0s' {1..47})-b"
+  local result
+  result="$(container_name_for "/home/user/${dir_name}")"
+  # Extract the middle part (between cleat- and -hash)
+  local middle="${result#cleat-}"
+  middle="${middle%-????????}"
+  [[ "$middle" != *- ]]  || return 1
+}

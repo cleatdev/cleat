@@ -84,6 +84,7 @@ Cleat gives you the best of both worlds:
 - **Lightweight** -- Debian-slim-based image with Node.js, Python, Git, build-essential, vim, jq, and socat
 - **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), all disabled by default
 - **Configuration drift detection** -- notifies when config has changed since container creation
+- **Clean terminal output** -- braille spinners for slow operations, suppressed Docker noise, canonical startup/exit sequences
 - **Auto-upgrade notifications** -- checks for updates once per day and notifies you before launching Claude
 
 ---
@@ -114,14 +115,15 @@ curl -fsSL https://raw.githubusercontent.com/cleatdev/cleat/main/install.sh | ba
 
 This clones the repo to `~/.cleat`, checks out the latest stable release tag, and symlinks `cleat` into your PATH.
 
-### Manual install
+### Dev install (from local clone)
 
 ```bash
 git clone https://github.com/cleatdev/cleat.git
 cd cleat
-git checkout "$(git tag -l | grep -E '^v[0-9]' | sort -V | tail -1)"
-./bin/cleat install
+./install.sh --local
 ```
+
+This symlinks your working copy into PATH. Edits to `bin/cleat` take effect immediately — no reinstall needed. Switch back to the official release at any time with `./install.sh` (without `--local`).
 
 ### Update
 
@@ -397,13 +399,42 @@ Drift detection is informational only — Cleat never auto-destroys containers.
 
 ---
 
+## Terminal output
+
+Cleat uses a clean, consistent output format with no Docker noise.
+
+### Startup
+
+```
+  ✔ Image ready (cached)
+  ✔ Container started
+  ✔ Auth shared
+  ✔ Claude launched
+
+  Container:  cleat-backend-a1b2c3d4
+  Project:    ~/backend → /workspace
+  Caps:       git, ssh
+```
+
+Slow operations (image build, container start) show animated braille spinners that resolve to checkmarks. When stdout is not a TTY (piped, CI), spinners degrade to static lines.
+
+### Exit
+
+```
+  ✔ Session ended — resume with: cleat resume
+```
+
+Docker's "What's next?" promo text and clipboard watcher cleanup messages are suppressed.
+
+---
+
 ## Auto-upgrade notifications
 
 Cleat checks for new release tags once every 24 hours via `git ls-remote --tags` (a lightweight network call that fetches no objects). When a newer version is available, you'll see a notice before Claude Code launches:
 
 ```
   ┌──────────────────────────────────────────────────────┐
-  │  Update available  v0.2.0 → v0.3.0                   │
+  │  Update available  v0.4.0 → v0.5.0                   │
   │  Run cleat update to install the latest version.      │
   └──────────────────────────────────────────────────────┘
 ```

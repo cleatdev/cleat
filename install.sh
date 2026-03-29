@@ -4,6 +4,25 @@ set -euo pipefail
 REPO="https://github.com/cleatdev/cleat.git"
 INSTALL_DIR="$HOME/.cleat"
 BIN_NAME="cleat"
+LOCAL_MODE=false
+
+# Parse flags
+for arg in "$@"; do
+  case "$arg" in
+    --local) LOCAL_MODE=true ;;
+    --help|-h)
+      echo "Usage: install.sh [--local]"
+      echo ""
+      echo "  --local    Install from current directory (dev mode)"
+      echo "             Without --local: clones from GitHub"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg (try --help)" >&2
+      exit 1
+      ;;
+  esac
+done
 
 # Colors
 BOLD='\033[1m'
@@ -15,13 +34,80 @@ RED='\033[0;31m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-info()    { echo -e "  ${BLUE}>${RESET} $1"; }
-success() { echo -e "  ${GREEN}+${RESET} $1"; }
+info()    { echo -e "  ${BLUE}▸${RESET} $1"; }
+success() { echo -e "  ${GREEN}✔${RESET} $1"; }
 warn()    { echo -e "  ${YELLOW}!${RESET} $1"; }
-error()   { echo -e "  ${RED}x${RESET} $1"; }
+error()   { echo -e "  ${RED}✖${RESET} $1"; }
 
+# ── Spinner ────────────────────────────────────────────────────────────────
+_SPIN_PID=""
+
+_is_tty() { [[ -t 1 ]]; }
+
+_has_unicode() {
+  local lang="${LANG:-}${LC_ALL:-}${LC_CTYPE:-}"
+  [[ "$lang" == *UTF-8* ]] || [[ "$lang" == *utf8* ]]
+}
+
+spin() {
+  local msg="$1"
+  if ! _is_tty; then
+    info "$msg"
+    return
+  fi
+  local frames
+  if _has_unicode; then
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  else
+    frames=('-' '\' '|' '/')
+  fi
+  command -v tput &>/dev/null && tput civis 2>/dev/null
+  (
+    local i=0
+    while true; do
+      printf "\r  ${BLUE}%s${RESET} %s" "${frames[$i]}" "$msg"
+      i=$(( (i + 1) % ${#frames[@]} ))
+      sleep 0.08
+    done
+  ) &
+  _SPIN_PID=$!
+  disown "$_SPIN_PID" 2>/dev/null
+}
+
+spin_stop() {
+  local code="$1" ok_msg="$2" fail_msg="${3:-$2}"
+  if [[ -n "$_SPIN_PID" ]]; then
+    kill "$_SPIN_PID" 2>/dev/null || true
+    wait "$_SPIN_PID" 2>/dev/null || true
+    _SPIN_PID=""
+    command -v tput &>/dev/null && tput cnorm 2>/dev/null
+  fi
+  if ! _is_tty; then
+    [[ "$code" -eq 0 ]] && success "$ok_msg" || error "$fail_msg"
+    return
+  fi
+  if [[ "$code" -eq 0 ]]; then
+    printf "\r  ${GREEN}✔${RESET} %s\n" "$ok_msg"
+  else
+    printf "\r  ${RED}✖${RESET} %s\n" "$fail_msg"
+  fi
+}
+
+_cleanup_spin() {
+  if [[ -n "${_SPIN_PID:-}" ]]; then
+    kill "$_SPIN_PID" 2>/dev/null || true
+    wait "$_SPIN_PID" 2>/dev/null || true
+    _SPIN_PID=""
+  fi
+  command -v tput &>/dev/null && tput cnorm 2>/dev/null
+}
+trap _cleanup_spin EXIT
+
+# ── Header ─────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}${CYAN}  Cleat - Installer${RESET}"
+echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────┐${RESET}"
+echo -e "${BOLD}${CYAN}  │   Cleat — Run anything. Break nothing.  │${RESET}"
+echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────┘${RESET}"
 echo ""
 
 # Check dependencies
@@ -41,6 +127,51 @@ if [[ -z "${HOME:-}" ]] || [[ "$HOME" != /* ]]; then
   error "HOME must be set to an absolute path."
   exit 1
 fi
+
+# ── Local mode: install from current directory ─────────────────────────────
+if $LOCAL_MODE; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  if [[ ! -f "$SCRIPT_DIR/bin/cleat" ]]; then
+    error "bin/cleat not found in ${BOLD}${SCRIPT_DIR}${RESET}"
+    echo -e "    ${DIM}Run this from the cleat repo root directory.${RESET}"
+    exit 1
+  fi
+
+  chmod +x "$SCRIPT_DIR/bin/cleat"
+  LOCAL_SOURCE="$SCRIPT_DIR/bin/cleat"
+
+  # Read version from local source
+  local_version=$(grep -m1 '^VERSION=' "$LOCAL_SOURCE" | cut -d'"' -f2)
+  success "Using local source ${DIM}(v${local_version:-dev})${RESET}"
+
+  # Symlink to PATH
+  BIN_DIR="/usr/local/bin"
+  if [ -w "$BIN_DIR" ]; then
+    ln -sf "$LOCAL_SOURCE" "$BIN_DIR/$BIN_NAME"
+    success "Linked ${BOLD}$BIN_NAME${RESET} → ${DIM}${LOCAL_SOURCE}${RESET}"
+  elif command -v sudo &>/dev/null; then
+    info "Needs sudo to symlink to $BIN_DIR"
+    sudo ln -sf "$LOCAL_SOURCE" "$BIN_DIR/$BIN_NAME"
+    success "Linked ${BOLD}$BIN_NAME${RESET} → ${DIM}${LOCAL_SOURCE}${RESET}"
+  else
+    BIN_DIR="$HOME/.local/bin"
+    mkdir -p -m 0755 "$BIN_DIR"
+    ln -sf "$LOCAL_SOURCE" "$BIN_DIR/$BIN_NAME"
+    success "Linked ${BOLD}$BIN_NAME${RESET} → ${DIM}${LOCAL_SOURCE}${RESET}"
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+      warn "Add $BIN_DIR to your PATH:"
+      echo -e "    ${DIM}export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}"
+    fi
+  fi
+
+  echo ""
+  echo -e "  ${DIM}Local dev install — changes to ${SCRIPT_DIR}/bin/cleat take effect immediately.${RESET}"
+  echo -e "  ${DIM}Switch to official release: ${BOLD}./install.sh${RESET}${DIM} (without --local)${RESET}"
+  exit 0
+fi
+
+# ── Remote mode: install from GitHub ───────────────────────────────────────
 
 # Detect existing installation via symlink
 for check_path in /usr/local/bin/cleat "$HOME/.local/bin/cleat"; do
@@ -79,21 +210,23 @@ latest_tag_local() {
 # Clone or update
 if [ -d "$INSTALL_DIR" ] && [ ! -L "$INSTALL_DIR" ]; then
   if [ -d "$INSTALL_DIR/.git" ]; then
-    info "Updating existing installation..."
+    spin "Updating existing installation..."
+    local_rc=0
     git -C "$INSTALL_DIR" fetch --tags --force --quiet 2>/dev/null || {
-      warn "Fetch failed. Resetting remote and retrying..."
+      spin_stop 0 "Fetch retry..."
       git -C "$INSTALL_DIR" remote set-url origin "$REPO"
       git -C "$INSTALL_DIR" fetch --tags --force --quiet || {
-        error "Failed to fetch updates. Check your internet connection."
+        spin_stop 1 "" "Failed to fetch updates"
+        error "Check your internet connection."
         exit 1
       }
     }
     local_tag=$(latest_tag_local "$INSTALL_DIR")
     if [[ -n "$local_tag" ]]; then
-      info "Checking out v${local_tag}..."
       git -C "$INSTALL_DIR" checkout "v${local_tag}" --quiet 2>/dev/null
-      success "Updated to v${local_tag}."
+      spin_stop 0 "Updated to v${local_tag}"
     else
+      spin_stop 0 "Up to date"
       warn "No tags found. Staying on current version."
     fi
   else
@@ -108,14 +241,18 @@ else
   # Determine the latest tag before cloning
   latest_tag=$(latest_tag_from_remote "$REPO")
 
-  info "Downloading Cleat..."
-  git clone "$REPO" "$INSTALL_DIR" --quiet
-  success "Downloaded to ${BOLD}$INSTALL_DIR${RESET}"
+  spin "Downloading Cleat..."
+  local_rc=0
+  git clone "$REPO" "$INSTALL_DIR" --quiet 2>/dev/null || local_rc=$?
+  spin_stop "$local_rc" "Downloaded to ${BOLD}$INSTALL_DIR${RESET}" "Download failed"
+  if [[ $local_rc -ne 0 ]]; then
+    exit 1
+  fi
 
   if [[ -n "$latest_tag" ]]; then
-    info "Checking out v${latest_tag}..."
+    spin "Checking out latest release..."
     git -C "$INSTALL_DIR" checkout "v${latest_tag}" --quiet 2>/dev/null
-    success "Pinned to stable release v${latest_tag}."
+    spin_stop 0 "Pinned to v${latest_tag}"
   else
     warn "No release tags found. Using latest commit on main."
   fi
@@ -133,21 +270,23 @@ chmod +x "$INSTALL_DIR/bin/cleat"
 BIN_DIR="/usr/local/bin"
 if [ -w "$BIN_DIR" ]; then
   ln -sf "$INSTALL_DIR/bin/cleat" "$BIN_DIR/$BIN_NAME"
+  echo ""
   success "Installed ${BOLD}$BIN_NAME${RESET} to $BIN_DIR"
 elif command -v sudo &>/dev/null; then
   info "Needs sudo to symlink to $BIN_DIR"
   sudo ln -sf "$INSTALL_DIR/bin/cleat" "$BIN_DIR/$BIN_NAME"
+  echo ""
   success "Installed ${BOLD}$BIN_NAME${RESET} to $BIN_DIR"
 else
   # Fallback to ~/.local/bin
   BIN_DIR="$HOME/.local/bin"
   mkdir -p -m 0755 "$BIN_DIR"
   ln -sf "$INSTALL_DIR/bin/cleat" "$BIN_DIR/$BIN_NAME"
+  echo ""
   success "Installed ${BOLD}$BIN_NAME${RESET} to $BIN_DIR"
   if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     warn "Add $BIN_DIR to your PATH:"
     echo -e "    ${DIM}export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}"
-    echo ""
   fi
 fi
 
@@ -158,4 +297,3 @@ echo -e "    ${BOLD}cd ~/your-project${RESET}"
 echo -e "    ${BOLD}cleat${RESET}"
 echo ""
 echo -e "  ${DIM}First run builds the Docker image (~2 min), then you're in.${RESET}"
-echo ""

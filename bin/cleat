@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.3.0"
+VERSION="0.4.0"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -43,6 +43,69 @@ info()    { echo -e "  ${BLUE}▸${RESET} $1"; }
 success() { echo -e "  ${GREEN}✔${RESET} $1"; }
 warn()    { echo -e "  ${YELLOW}!${RESET} $1"; }
 error()   { echo -e "  ${RED}✖${RESET} $1"; }
+
+# ── Spinner ────────────────────────────────────────────────────────────────
+_SPIN_PID=""
+
+_is_tty() { [[ -t 1 ]]; }
+
+_has_unicode() {
+  local lang="${LANG:-}${LC_ALL:-}${LC_CTYPE:-}"
+  [[ "$lang" == *UTF-8* ]] || [[ "$lang" == *utf8* ]]
+}
+
+spin() {
+  local msg="$1"
+  if ! _is_tty; then
+    info "$msg"
+    return
+  fi
+  local frames
+  if _has_unicode; then
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  else
+    frames=('-' '\' '|' '/')
+  fi
+  command -v tput &>/dev/null && tput civis 2>/dev/null
+  (
+    local i=0
+    while true; do
+      printf "\r  ${BLUE}%s${RESET} %s" "${frames[$i]}" "$msg"
+      i=$(( (i + 1) % ${#frames[@]} ))
+      sleep 0.08
+    done
+  ) &
+  _SPIN_PID=$!
+  disown "$_SPIN_PID" 2>/dev/null
+}
+
+spin_stop() {
+  local code="$1" ok_msg="$2" fail_msg="${3:-$2}"
+  if [[ -n "$_SPIN_PID" ]]; then
+    kill "$_SPIN_PID" 2>/dev/null || true
+    wait "$_SPIN_PID" 2>/dev/null || true
+    _SPIN_PID=""
+    command -v tput &>/dev/null && tput cnorm 2>/dev/null
+  fi
+  if ! _is_tty; then
+    [[ "$code" -eq 0 ]] && success "$ok_msg" || error "$fail_msg"
+    return
+  fi
+  if [[ "$code" -eq 0 ]]; then
+    printf "\r  ${GREEN}✔${RESET} %s\n" "$ok_msg"
+  else
+    printf "\r  ${RED}✖${RESET} %s\n" "$fail_msg"
+  fi
+}
+
+_cleanup_spin() {
+  if [[ -n "${_SPIN_PID:-}" ]]; then
+    kill "$_SPIN_PID" 2>/dev/null || true
+    wait "$_SPIN_PID" 2>/dev/null || true
+    _SPIN_PID=""
+  fi
+  command -v tput &>/dev/null && tput cnorm 2>/dev/null
+}
 
 # ── Project-scoped container naming ─────────────────────────────────────────
 container_name_for() {
@@ -460,6 +523,53 @@ _print_startup_caps() {
   fi
 }
 
+_print_summary_block() {
+  local cname="$1"
+  local project="${2:-}"
+  echo ""
+  echo -e "  ${DIM}Container:${RESET}  ${BLUE}${cname}${RESET}"
+  if [[ -n "$project" ]]; then
+    local display_path="${project/#$HOME/\~}"
+    echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
+  fi
+  if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
+    local caps_str
+    caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
+    caps_str="${caps_str%, }"
+    echo -e "  ${DIM}Caps:${RESET}       ${BOLD}${caps_str}${RESET}"
+  fi
+  _env_summary_inline "$project"
+}
+
+_env_summary_inline() {
+  local project="${1:-}"
+  local global_count=0
+  local project_count=0
+
+  if cap_is_active env 2>/dev/null; then
+    if [[ -f "$CLEAT_GLOBAL_ENV" ]]; then
+      global_count=$(_parse_env_file "$CLEAT_GLOBAL_ENV" | wc -l)
+      global_count=$((global_count + 0))
+    fi
+    if [[ -n "$project" && -f "$project/.cleat.env" ]]; then
+      project_count=$(_parse_env_file "$project/.cleat.env" | wc -l)
+      project_count=$((project_count + 0))
+    fi
+  fi
+
+  if (( global_count + project_count > 0 )); then
+    local msg=""
+    if (( global_count > 0 )); then
+      msg+="${global_count} from ~/.config/cleat/env"
+    fi
+    if (( project_count > 0 )); then
+      [[ -n "$msg" ]] && msg+=", "
+      msg+="${project_count} from .cleat.env"
+    fi
+    echo -e "  ${DIM}Env:${RESET}        ${msg}"
+  fi
+}
+
 # ── Clipboard bridge ──────────────────────────────────────────────────────
 CLAUDE_ENV=(-e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 
@@ -475,6 +585,7 @@ _host_clip_cmd() {
 _clipboard_watcher() {
   local clip_dir="$1"
   local clip_cmd="$2"
+  trap 'exit 0' TERM INT HUP
 
   touch "$clip_dir/.host-ready"
 
@@ -522,11 +633,10 @@ exec_claude() {
 
   _cleanup_clipboard() {
     if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
-      pkill -P "$_CLIP_WATCHER_PID" 2>/dev/null || true
       kill "$_CLIP_WATCHER_PID" 2>/dev/null || true
-      wait "$_CLIP_WATCHER_PID" 2>/dev/null || true
       _CLIP_WATCHER_PID=""
     fi
+    _cleanup_spin
     rm -f "${_CLIP_DIR:?}/.clipboard."*
     rm -f "$_CLIP_DIR/.watcher.$$"
     if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
@@ -540,6 +650,7 @@ exec_claude() {
     touch "$_CLIP_DIR/.watcher.$$"
     _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" &
     _CLIP_WATCHER_PID=$!
+    disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
     trap _cleanup_clipboard EXIT INT TERM HUP
   fi
 
@@ -552,12 +663,15 @@ exec_claude() {
       claude "$@"
       kill "$_MY_CLIP_DAEMON" 2>/dev/null
       wait "$_MY_CLIP_DAEMON" 2>/dev/null
-    ' _ "$@" || rc=$?
+    ' _ "$@" 2>/dev/null || rc=$?
 
   _cleanup_clipboard
   trap - EXIT INT TERM HUP
 
-  if [[ $rc -ne 0 && $rc -ne 130 ]]; then
+  if [[ $rc -eq 0 ]]; then
+    printf '\033[A\033[2K\r\n'
+    success "Session ended — resume with: ${BOLD}cleat resume${RESET}"
+  elif [[ $rc -ne 130 ]]; then
     warn "Claude exited with code $rc"
   fi
 }
@@ -607,20 +721,46 @@ check_for_update() {
 # ── Commands ────────────────────────────────────────────────────────────────
 cmd_build() {
   if image_exists; then
-    info "Image ${BOLD}${IMAGE_NAME}${RESET} already exists. Use ${BOLD}cleat rebuild${RESET} to force."
+    success "Image ready (cached)"
     return
   fi
-  info "Building Docker image ${BOLD}${IMAGE_NAME}${RESET} ..."
+  _do_build
+}
+
+_do_build() {
+  local build_log
+  build_log="$(mktemp)"
+  spin "Building image..."
+  local rc=0
   docker build -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" \
-    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker"
-  success "Image built."
+    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker" >"$build_log" 2>&1 || rc=$?
+  spin_stop "$rc" "Image ready" "Image build failed"
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    echo -e "  ${DIM}Build log:${RESET}"
+    tail -20 "$build_log" | sed 's/^/    /'
+    rm -f "$build_log"
+    exit 1
+  fi
+  rm -f "$build_log"
 }
 
 cmd_rebuild() {
-  info "Rebuilding Docker image ${BOLD}${IMAGE_NAME}${RESET} ..."
+  local build_log
+  build_log="$(mktemp)"
+  spin "Rebuilding image..."
+  local rc=0
   docker build --no-cache -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" \
-    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker"
-  success "Image rebuilt."
+    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker" >"$build_log" 2>&1 || rc=$?
+  spin_stop "$rc" "Image rebuilt" "Image build failed"
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    echo -e "  ${DIM}Build log:${RESET}"
+    tail -20 "$build_log" | sed 's/^/    /'
+    rm -f "$build_log"
+    exit 1
+  fi
+  rm -f "$build_log"
 }
 
 cmd_run() {
@@ -639,7 +779,9 @@ cmd_run() {
   fi
 
   if ! image_exists; then
-    cmd_build
+    _do_build
+  else
+    success "Image ready (cached)"
   fi
 
   if [[ ! -d "$project" ]]; then
@@ -651,8 +793,7 @@ cmd_run() {
   resolve_caps "$project"
   resolve_env_args "$project"
 
-  info "Starting ${BOLD}${cname}${RESET}"
-  echo -e "  ${DIM}Project: ${project}${RESET}"
+  spin "Starting container..."
 
   # Clipboard bridge
   local clip_dir="/tmp/cleat-clip-${cname}"
@@ -709,9 +850,12 @@ cmd_run() {
     --pids-limit 1024 \
     --memory 8g \
     -it \
-    "$IMAGE_NAME" > /dev/null
-
-  success "Container is up."
+    "$IMAGE_NAME" > /dev/null 2>&1
+  local run_rc=$?
+  spin_stop "$run_rc" "Container started" "Container failed to start"
+  if [[ $run_rc -ne 0 ]]; then
+    exit 1
+  fi
 }
 
 cmd_start() {
@@ -720,11 +864,6 @@ cmd_start() {
   local cname
   cname="$(container_name_for "$project")"
 
-  # Build image if needed
-  if ! image_exists; then
-    cmd_build
-  fi
-
   # Resolve caps early for startup output and drift detection
   resolve_caps "$project"
   resolve_env_args "$project"
@@ -732,12 +871,20 @@ cmd_start() {
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      info "Restarting stopped container ${BOLD}${cname}${RESET}..."
-      docker start "$cname" > /dev/null
+      # Restarting a stopped container — image already exists
+      success "Image ready (cached)"
+      spin "Starting container..."
+      docker start "$cname" > /dev/null 2>&1
+      spin_stop $? "Container started" "Container failed to start"
     else
       cmd_run "$project"
     fi
+  else
+    success "Image ready (cached)"
+    success "Container started"
   fi
+
+  success "Auth shared"
 
   check_for_update
   show_first_run_tip
@@ -747,10 +894,8 @@ cmd_start() {
     check_drift "$cname" "$project"
   fi
 
-  info "Container ${BOLD}${cname}${RESET}"
-  _print_startup_caps
-  _env_summary "$project"
-  info "Launching Claude Code ${YELLOW}--dangerously-skip-permissions${RESET}"
+  success "Claude launched"
+  _print_summary_block "$cname" "$project"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions
 }
@@ -768,8 +913,7 @@ cmd_resume() {
   # Start container if stopped
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      info "Restarting stopped container ${BOLD}${cname}${RESET}..."
-      docker start "$cname" > /dev/null
+      docker start "$cname" > /dev/null 2>&1
     else
       error "No container found for this project. Use ${BOLD}cleat start${RESET} first."
       exit 1
@@ -781,10 +925,8 @@ cmd_resume() {
   # Drift detection
   check_drift "$cname" "$project"
 
-  info "Container ${BOLD}${cname}${RESET}"
-  _print_startup_caps
-  _env_summary "$project"
-  info "Resuming Claude Code session ${YELLOW}--dangerously-skip-permissions${RESET}"
+  success "Session resumed"
+  _print_summary_block "$cname" "$project"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions --continue
 }
@@ -796,9 +938,8 @@ cmd_stop() {
   cname="$(container_name_for "$project")"
 
   if is_running "$cname"; then
-    info "Stopping ${BOLD}${cname}${RESET} ..."
-    docker stop "$cname" > /dev/null
-    success "Stopped. Resume later with ${BOLD}cleat resume${RESET}"
+    docker stop "$cname" > /dev/null 2>&1
+    success "Session ended — resume with: ${BOLD}cleat resume${RESET}"
   else
     info "Container not running."
   fi
@@ -854,10 +995,10 @@ cmd_claude() {
 
   require_running "$cname"
   resolve_caps "$project"
+  resolve_env_args "$project"
   check_for_update
-  info "Container ${BOLD}${cname}${RESET}"
-  _print_startup_caps
-  info "Launching Claude Code ${YELLOW}--dangerously-skip-permissions${RESET}"
+  success "Claude launched"
+  _print_summary_block "$cname" "$project"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions
 }

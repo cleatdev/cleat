@@ -204,7 +204,7 @@ mutate \
 # ── Mutation 15: Break version string
 mutate \
   "version: wrong version number" \
-  's/^VERSION="0.3.0"/VERSION="9.9.9"/' \
+  's/^VERSION="0.4.0"/VERSION="9.9.9"/' \
   "$PROJECT_ROOT/test/unit/version.bats" \
   "version: prints current version"
 

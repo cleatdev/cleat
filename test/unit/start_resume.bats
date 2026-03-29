@@ -30,7 +30,7 @@ teardown() { _common_teardown; }
   mock_docker_ps_a "$cname"
 
   run cmd_start "$TEST_TEMP/project"
-  assert_output --partial "Restarting stopped container"
+  assert_output --partial "Container started"
   run docker_calls
   assert_output --partial "docker start $cname"
 }
@@ -71,7 +71,7 @@ teardown() { _common_teardown; }
   mock_docker_ps_a "$cname"
 
   run cmd_resume "$TEST_TEMP/project"
-  assert_output --partial "Restarting"
+  assert_output --partial "Session resumed"
   run assert_docker_exec_has "--continue"
   assert_success
   run assert_docker_exec_has "--dangerously-skip-permissions"

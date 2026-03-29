@@ -1,3 +1,32 @@
+## v0.4.0
+
+**Clean, quiet output that matches the landing page tone.**
+
+No Docker noise — just concise status lines with color and spinners.
+
+### Features
+
+- **Terminal design system** — unified symbols (`✔ ▸ ! ✖`), 8-color ANSI palette, and formatting rules shared across CLI, installer, and landing page
+- **Braille spinner** — 10-frame braille animation (80ms/frame) for slow operations (image build, container start), with ASCII fallback for non-Unicode terminals
+- **Clean startup sequence** — step-by-step `✔ Image ready` / `✔ Container started` / `✔ Auth shared` / `✔ Claude launched` output
+- **Summary block** — post-launch block showing container name, project path, active capabilities, and env var counts
+- **Docker output suppression** — build logs captured and hidden on success, shown (last 20 lines) on failure; container IDs and promo text suppressed
+- **Clean exit** — session end shows `✔ Session ended — resume with: cleat resume`; Ctrl-C exits silently; Docker promo text and `Terminated` messages suppressed via `disown`
+- **TTY detection** — spinners degrade to static `▸` info lines when stdout is not a terminal (piped, CI, redirected)
+
+### Fixes
+
+- **Clipboard watcher cleanup** — added `trap` on TERM/INT/HUP and `disown` to prevent `Terminated` messages and ensure clean process cleanup
+- **Exit cursor restoration** — spinner cleanup restores cursor visibility (`tput cnorm`) on unexpected exit via EXIT trap
+
+### Changes
+
+- 269 behavioral tests (12 new for terminal UX, output suppression, and canonical message hardening)
+- Terminal design system documented in `concept/12-terminal-design-system.md`
+- Site CSS mapping documented for HTML terminal mockups matching CLI output
+
+---
+
 ## v0.3.0
 
 **Opt-in capabilities that extend container access to host resources.**

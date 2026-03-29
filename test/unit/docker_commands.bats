@@ -23,7 +23,7 @@ teardown() { _common_teardown; }
   mock_docker_images "cleat"
   run cmd_build
   assert_success
-  assert_output --partial "already exists"
+  assert_output --partial "Image ready (cached)"
 }
 
 @test "rebuild: always builds with --no-cache" {
@@ -149,7 +149,7 @@ teardown() { _common_teardown; }
 
   run cmd_stop "$TEST_TEMP/project"
   assert_success
-  assert_output --partial "Stopped"
+  assert_output --partial "Session ended"
   assert_output --partial "cleat resume"
 }
 

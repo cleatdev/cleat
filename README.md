@@ -82,7 +82,10 @@ Cleat gives you the best of both worlds:
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
 - **Lightweight** -- Debian-slim-based image with Node.js, Python, Git, build-essential, vim, jq, and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), all disabled by default
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), hook event logging (`--cap hooks`), all disabled by default
+- **Hook event forwarding** -- Claude Code hook events logged to JSONL, host-defined hooks executed on the host (not in the container)
+- **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
+- **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
 - **Configuration drift detection** -- notifies when config has changed since container creation
 - **Clean terminal output** -- braille spinners for slow operations, suppressed Docker noise, canonical startup/exit sequences
 - **Auto-upgrade notifications** -- checks for updates once per day and notifies you before launching Claude
@@ -260,6 +263,7 @@ cleat ps
 | `cleat shell [path]` | Open bash inside the container |
 | `cleat login [path]` | Authenticate with Anthropic (OAuth) |
 | `cleat logs [path]` | Tail container logs |
+| `cleat hooks [path]` | View hook events (`--json`, `--follow`, `--clear`) |
 
 #### Info
 | Command | Description |
@@ -357,6 +361,7 @@ cleat --cap ssh start
 | `git` | Mounts `~/.gitconfig` (read-only). Commits inside the container use your host identity. |
 | `ssh` | Mounts `~/.ssh` (read-only). SSH agent forwarding if `SSH_AUTH_SOCK` is set. |
 | `env` | Auto-loads env vars from `~/.config/cleat/env` (global) and `.cleat.env` (project). |
+| `hooks` | Logs Claude Code hook events to JSONL for host-side access. |
 
 ### Environment variables
 
@@ -425,6 +430,55 @@ Slow operations (image build, container start) show animated braille spinners th
 ```
 
 Docker's "What's next?" promo text and clipboard watcher cleanup messages are suppressed.
+
+---
+
+## Hook event forwarding
+
+When the `hooks` capability is enabled, Claude Code hook events are logged to a JSONL file observable from the host.
+
+```bash
+cleat config --enable hooks    # enable persistently
+cleat --cap hooks start        # enable for one session
+```
+
+### View events
+
+```bash
+cleat hooks              # Pretty-printed timeline
+cleat hooks --json       # Raw JSONL (pipe to jq)
+cleat hooks -f           # Follow in real time
+cleat hooks --clear      # Clear the log
+```
+
+### How it works
+
+1. The Docker image includes `cleat-hook-logger` — a script that appends each hook event with a timestamp to `/var/log/cleat/hooks.jsonl`
+2. At container startup, the entrypoint configures Claude Code to call the logger for all non-blocking events
+3. The log directory is mounted to the host, so `cleat hooks` reads directly from `/tmp/cleat-hooks-<container>/hooks.jsonl`
+
+### Host hook execution
+
+User-defined hooks in `~/.claude/settings.json` run **on the host**, not inside the container. Cleat strips the `hooks` section from the container's copy of settings.json and executes matching hooks on the host via a bridge watcher. The event JSON is piped to stdin. Commands like `osascript`, local scripts, and anything host-specific work transparently.
+
+---
+
+## Browser bridge
+
+When Claude Code or any tool inside the container calls `open` or `xdg-open` with a URL, it opens in your host browser. OAuth callbacks are automatically proxied back to the container — `cleat login` and any auth flow work seamlessly without manual URL copy-paste. No capability needed.
+
+---
+
+## Host connectivity
+
+Containers can always reach services on the host via `host.docker.internal` — no capability needed. User-defined hooks, MCP servers, and HTTP endpoints on the host work out of the box.
+
+```bash
+# In .cleat.env (with env capability enabled)
+CLAUDE_VISUAL_URL=http://host.docker.internal:3200
+```
+
+On Linux (Docker Engine), Cleat adds `--add-host host.docker.internal:host-gateway` automatically. Docker Desktop (macOS/Windows) provides this natively.
 
 ---
 

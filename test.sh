@@ -26,6 +26,7 @@ DIM='\033[2m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
@@ -40,7 +41,9 @@ start_time=$(date +%s)
 files=("$SCRIPT_DIR"/test/unit/*.bats)
 
 echo ""
-echo -e "${BOLD}${CYAN}  Cleat CLI Test Suite${RESET}"
+echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────┐${RESET}"
+echo -e "${BOLD}${CYAN}  │   Cleat CLI Test Suite                  │${RESET}"
+echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────┘${RESET}"
 echo -e "  ${DIM}Running ${#files[@]} test files...${RESET}"
 echo ""
 
@@ -58,7 +61,7 @@ for f in "${files[@]}"; do
   total_skip=$((total_skip + file_skip))
 
   if [[ "$file_fail" -gt 0 ]]; then
-    echo -e "  ${RED}✗${RESET} ${fname}  ${DIM}(${file_pass} passed, ${RED}${file_fail} failed${RESET}${DIM})${RESET}"
+    echo -e "  ${RED}✖${RESET} ${fname}  ${DIM}(${file_pass} passed, ${RED}${file_fail} failed${RESET}${DIM})${RESET}"
     failed_files+=("$fname")
     # Show failure details indented
     echo "$output" | grep -A5 "^not ok" | sed 's/^/      /'
@@ -67,7 +70,7 @@ for f in "${files[@]}"; do
     if [[ "$file_skip" -gt 0 ]]; then
       local_info="  ${DIM}(${file_skip} skipped)${RESET}"
     fi
-    echo -e "  ${GREEN}✓${RESET} ${fname}  ${DIM}(${file_pass} passed)${RESET}${local_info}"
+    echo -e "  ${GREEN}✔${RESET} ${fname}  ${DIM}(${file_pass} passed)${RESET}${local_info}"
   fi
 done
 

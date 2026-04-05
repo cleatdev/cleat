@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.4.0"
+VERSION="0.5.0"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -14,7 +14,7 @@ CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
 CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 
 # Known capabilities (order matters for display)
-KNOWN_CAPS=(git ssh env)
+KNOWN_CAPS=(git ssh env hooks)
 
 # Session-scoped state (populated by parse_global_flags)
 _CLI_CAPS=()
@@ -150,6 +150,21 @@ require_running() {
     echo -e "    ${DIM}Start it with: cleat start${RESET}"
     exit 1
   fi
+}
+
+# ── Host connectivity ────────────────────────────────────────────────────
+# Docker Desktop (macOS/Windows) provides host.docker.internal automatically.
+# On Linux with Docker Engine, we need --add-host for it.
+_is_docker_desktop() {
+  docker info 2>/dev/null | grep -q "Operating System:.*Docker Desktop"
+}
+
+_host_connectivity_args() {
+  local args=()
+  if ! _is_docker_desktop 2>/dev/null; then
+    args+=(--add-host "host.docker.internal:host-gateway")
+  fi
+  echo "${args[@]+"${args[@]}"}"
 }
 
 # ── Capabilities: config file reading ──────────────────────────────────────
@@ -623,21 +638,321 @@ _clipboard_watcher() {
   done
 }
 
+# ── Browser bridge ────────────────────────────────────────────────────────
+# Watches for URLs written by the container's open-bridge shim and opens them
+# on the host. Reuses the clipboard bridge mount (/tmp/cleat-clip-*).
+
+_host_open_cmd() {
+  if command -v open &>/dev/null; then echo "open"
+  elif command -v xdg-open &>/dev/null; then echo "xdg-open"
+  else echo ""
+  fi
+}
+
+# Extracts the localhost port from a redirect_uri in an OAuth URL.
+# Returns 0 and prints the port if found, returns 1 otherwise.
+_extract_callback_port() {
+  local url="$1"
+
+  case "$url" in
+    *redirect_uri=*) ;;
+    *) return 1 ;;
+  esac
+
+  # Isolate the redirect_uri value
+  local encoded="${url#*redirect_uri=}"
+  encoded="${encoded%%&*}"
+  encoded="${encoded%%#*}"
+
+  # URL-decode (%XX → bytes)
+  local decoded
+  decoded=$(printf '%b' "${encoded//%/\\x}" 2>/dev/null) || return 1
+
+  # Extract port from localhost:PORT or 127.0.0.1:PORT
+  local port=""
+  case "$decoded" in
+    *localhost:*)  port="${decoded#*localhost:}" ;;
+    *127.0.0.1:*) port="${decoded#*127.0.0.1:}" ;;
+    *) return 1 ;;
+  esac
+  port="${port%%[^0-9]*}"
+
+  [ -n "$port" ] && echo "$port" && return 0
+  return 1
+}
+
+# TCP proxy: forwards one connection from host:PORT to container:PORT.
+# Enables OAuth callbacks to reach Claude Code's HTTP server inside Docker.
+# Uses socat on host if available, falls back to python3.
+_auth_callback_proxy() {
+  local port="$1"
+  local cname="$2"
+
+  trap 'exit 0' TERM INT HUP
+
+  # Prefer socat on host → docker exec socat in container
+  if command -v socat &>/dev/null; then
+    socat "TCP-LISTEN:${port},bind=127.0.0.1,reuseaddr" \
+      "EXEC:docker exec -i ${cname} socat - TCP\\:localhost\\:${port}" 2>/dev/null || true
+    return
+  fi
+
+  # Fallback: python3 TCP proxy via docker exec socat
+  if command -v python3 &>/dev/null; then
+    python3 - "$port" "$cname" 2>/dev/null <<'PYEOF' || true
+import socket, subprocess, threading, sys, signal, os
+_child = [None]
+def _term(*_):
+    if _child[0]: _child[0].terminate()
+    os._exit(0)
+signal.signal(signal.SIGTERM, _term)
+signal.signal(signal.SIGINT, _term)
+port, cname = int(sys.argv[1]), sys.argv[2]
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    srv.bind(('127.0.0.1', port))
+except OSError:
+    sys.exit(0)
+srv.listen(1)
+srv.settimeout(300)
+try:
+    cli, _ = srv.accept()
+    proc = subprocess.Popen(
+        ['docker', 'exec', '-i', cname, 'socat', '-', 'TCP:localhost:' + str(port)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    _child[0] = proc
+    def fwd(src, dst):
+        try:
+            while True:
+                data = src.read(4096)
+                if not data: break
+                dst.write(data); dst.flush()
+        except Exception: pass
+        try: dst.close()
+        except Exception: pass
+    t1 = threading.Thread(target=fwd, args=(cli.makefile('rb'), proc.stdin), daemon=True)
+    t2 = threading.Thread(target=fwd, args=(proc.stdout, cli.makefile('wb')), daemon=True)
+    t1.start(); t2.start()
+    proc.wait(timeout=30)
+    cli.close()
+except Exception: pass
+finally: srv.close()
+PYEOF
+    return
+  fi
+}
+
+_browser_watcher() {
+  local clip_dir="$1"
+  local open_cmd="$2"
+  local cname="${3:-}"
+  local bridge_file="$clip_dir/.browser-open"
+  local _proxy_pid=""
+
+  _bw_cleanup() {
+    if [ -n "$_proxy_pid" ]; then
+      kill "$_proxy_pid" 2>/dev/null || true
+      wait "$_proxy_pid" 2>/dev/null || true
+      _proxy_pid=""
+    fi
+  }
+  trap '_bw_cleanup; exit 0' TERM INT HUP
+
+  local last_ts=""
+  while true; do
+    if [ -f "$bridge_file" ]; then
+      local cur_ts
+      cur_ts=$(stat -c '%Y%N' "$bridge_file" 2>/dev/null \
+            || stat -f '%m' "$bridge_file" 2>/dev/null || echo "")
+      if [ -n "$cur_ts" ] && [ "$cur_ts" != "$last_ts" ]; then
+        last_ts="$cur_ts"
+        local url
+        url="$(cat "$bridge_file" 2>/dev/null)" || true
+        if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
+          # Start auth callback proxy if URL has a localhost redirect_uri
+          if [ -n "$cname" ]; then
+            local cb_port
+            cb_port=$(_extract_callback_port "$url" 2>/dev/null) && {
+              _bw_cleanup  # kill any previous proxy
+              _auth_callback_proxy "$cb_port" "$cname" &
+              _proxy_pid=$!
+              sleep 0.2  # let proxy bind before opening browser
+            }
+          fi
+          $open_cmd "$url" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+    sleep 0.5
+  done
+}
+
+# ── Host-side hook bridge ─────────────────────────────────────────────────
+# Tails the JSONL hooks log and executes the user's host-defined command hooks.
+# This is the counterpart to the settings overlay in cmd_run — host hooks are
+# stripped from the container's settings.json and executed here instead.
+_HOOK_BRIDGE_PID=""
+_HOOK_BRIDGE_CHILDREN=()
+
+_has_host_hooks() {
+  [[ -s "${HOME}/.claude/settings.json" ]] && \
+    jq -e '.hooks // empty | length > 0' "${HOME}/.claude/settings.json" >/dev/null 2>&1
+}
+
+_hook_bridge_watcher() {
+  local hooks_file="$1"
+  local settings="${HOME}/.claude/settings.json"
+  # On exit: kill all child hook processes
+  trap '_hook_bridge_cleanup; exit 0' TERM INT HUP
+  trap '_hook_bridge_cleanup' EXIT
+
+  # Wait for hooks file to appear
+  local waited=0
+  while [[ ! -f "$hooks_file" ]] && [[ $waited -lt 30 ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [[ -f "$hooks_file" ]] || return 0
+
+  # Tail new lines and execute matching host hooks.
+  # We track our byte offset to avoid wc -l / tail race conditions.
+  local byte_offset=0
+  while true; do
+    local file_size
+    file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
+    file_size=$((file_size + 0))
+
+    if [[ $file_size -gt $byte_offset ]]; then
+      # Reap finished children
+      _hook_bridge_reap
+
+      # Read new lines since last offset
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _execute_host_hook_bg "$line" "$settings"
+      done < <(tail -c +"$((byte_offset + 1))" "$hooks_file" 2>/dev/null)
+
+      byte_offset=$file_size
+    fi
+    sleep 0.5
+  done
+}
+
+# Reap finished child processes from the tracking array
+_hook_bridge_reap() {
+  local alive=()
+  for pid in "${_HOOK_BRIDGE_CHILDREN[@]+"${_HOOK_BRIDGE_CHILDREN[@]}"}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    else
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  _HOOK_BRIDGE_CHILDREN=("${alive[@]+"${alive[@]}"}")
+}
+
+# Kill all tracked children.
+# These run inside the bridge's process group (which is disowned from the parent).
+# We kill them directly — no wait needed since they're in our own process tree.
+_hook_bridge_cleanup() {
+  for pid in "${_HOOK_BRIDGE_CHILDREN[@]+"${_HOOK_BRIDGE_CHILDREN[@]}"}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  # Brief pause to let children exit, then reap
+  sleep 0.1 2>/dev/null || true
+  for pid in "${_HOOK_BRIDGE_CHILDREN[@]+"${_HOOK_BRIDGE_CHILDREN[@]}"}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  _HOOK_BRIDGE_CHILDREN=()
+}
+
+# Execute a single event's host hooks in a tracked background subprocess.
+_execute_host_hook_bg() {
+  local event_json="$1"
+  local settings="$2"
+
+  ( _execute_host_hooks "$event_json" "$settings" ) &
+  _HOOK_BRIDGE_CHILDREN+=("$!")
+}
+
+_execute_host_hooks() {
+  local event_json="$1"
+  local settings="$2"
+
+  local event_name
+  event_name="$(echo "$event_json" | jq -r '.hook_event_name // empty' 2>/dev/null)" || return 0
+  [[ -n "$event_name" ]] || return 0
+
+  # Get the tool name for matcher support
+  local tool_name
+  tool_name="$(echo "$event_json" | jq -r '.tool_name // empty' 2>/dev/null)" || true
+
+  # Read hook config once for this event
+  local hook_entries
+  hook_entries="$(jq -c ".hooks.\"$event_name\" // [] | .[]" "$settings" 2>/dev/null)" || return 0
+  [[ -n "$hook_entries" ]] || return 0
+
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+
+    # Check matcher (regex against tool_name for tool events)
+    local matcher
+    matcher="$(echo "$entry" | jq -r '.matcher // empty' 2>/dev/null)" || true
+    if [[ -n "$matcher" && -n "$tool_name" ]]; then
+      echo "$tool_name" | grep -qE "$matcher" 2>/dev/null || continue
+    fi
+
+    # Execute each command hook in the entry
+    while IFS= read -r hook; do
+      [[ -n "$hook" ]] || continue
+      local cmd
+      cmd="$(echo "$hook" | jq -r '.command // empty' 2>/dev/null)" || continue
+      [[ -n "$cmd" ]] || continue
+
+      # Execute on the host with event JSON on stdin.
+      # Timeout after 30s to prevent hung hooks from blocking the bridge.
+      if command -v timeout >/dev/null 2>&1; then
+        echo "$event_json" | timeout 30 bash -c "$cmd" >/dev/null 2>&1 || true
+      else
+        echo "$event_json" | bash -c "$cmd" >/dev/null 2>&1 || true
+      fi
+    done < <(echo "$entry" | jq -c '.hooks // [] | .[] | select(.type == "command")' 2>/dev/null)
+  done <<< "$hook_entries"
+}
+
 exec_claude() {
   local cname="$1"
   shift
 
   _CLIP_DIR="/tmp/cleat-clip-${cname}"
   _CLIP_WATCHER_PID=""
+  _BROWSER_WATCHER_PID=""
+  _HOOK_BRIDGE_PID=""
   mkdir -p "$_CLIP_DIR"
 
-  _cleanup_clipboard() {
+  _cleanup_session() {
+    # Kill clipboard watcher
     if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
       kill "$_CLIP_WATCHER_PID" 2>/dev/null || true
+      wait "$_CLIP_WATCHER_PID" 2>/dev/null || true
       _CLIP_WATCHER_PID=""
+    fi
+    # Kill browser watcher (and its callback proxy child)
+    if [ -n "${_BROWSER_WATCHER_PID:-}" ]; then
+      kill "$_BROWSER_WATCHER_PID" 2>/dev/null || true
+      wait "$_BROWSER_WATCHER_PID" 2>/dev/null || true
+      _BROWSER_WATCHER_PID=""
+    fi
+    # Kill hook bridge — its EXIT/TERM trap kills child hook processes
+    if [ -n "${_HOOK_BRIDGE_PID:-}" ]; then
+      kill "$_HOOK_BRIDGE_PID" 2>/dev/null || true
+      wait "$_HOOK_BRIDGE_PID" 2>/dev/null || true
+      _HOOK_BRIDGE_PID=""
     fi
     _cleanup_spin
     rm -f "${_CLIP_DIR:?}/.clipboard."*
+    rm -f "${_CLIP_DIR:?}/.browser-open"
     rm -f "$_CLIP_DIR/.watcher.$$"
     if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
       rm -f "$_CLIP_DIR/.host-ready"
@@ -651,8 +966,26 @@ exec_claude() {
     _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" &
     _CLIP_WATCHER_PID=$!
     disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
-    trap _cleanup_clipboard EXIT INT TERM HUP
   fi
+
+  # Start browser watcher (always-on, like host connectivity)
+  local open_cmd
+  open_cmd="$(_host_open_cmd)"
+  if [ -n "$open_cmd" ]; then
+    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" &
+    _BROWSER_WATCHER_PID=$!
+    disown "$_BROWSER_WATCHER_PID" 2>/dev/null || true
+  fi
+
+  # Start host-side hook bridge if user has hooks and hooks cap is active
+  local hooks_file="/tmp/cleat-hooks-${cname}/hooks.jsonl"
+  if cap_is_active hooks 2>/dev/null && _has_host_hooks 2>/dev/null; then
+    _hook_bridge_watcher "$hooks_file" &
+    _HOOK_BRIDGE_PID=$!
+    disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
+  fi
+
+  trap _cleanup_session EXIT INT TERM HUP
 
   local rc=0
   docker exec -it --user coder "${CLAUDE_ENV[@]}" "$cname" \
@@ -665,7 +998,7 @@ exec_claude() {
       wait "$_MY_CLIP_DAEMON" 2>/dev/null
     ' _ "$@" 2>/dev/null || rc=$?
 
-  _cleanup_clipboard
+  _cleanup_session
   trap - EXIT INT TERM HUP
 
   if [[ $rc -eq 0 ]]; then
@@ -799,11 +1132,43 @@ cmd_run() {
   local clip_dir="/tmp/cleat-clip-${cname}"
   mkdir -p "$clip_dir"
 
+  # ── Settings overlay: strip host hooks from container settings
+  # User hooks in ~/.claude/settings.json are meant to run on the host (osascript,
+  # local scripts, etc.) — they'll fail inside the container. We overlay settings.json
+  # with a copy that has the hooks section removed. The host-side hook bridge
+  # (started in exec_claude) executes them on the host instead.
+  local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+  mkdir -p "$settings_overlay_dir"
+  # Generate the overlay: host settings with .hooks removed.
+  # Handles: missing file, empty file, invalid JSON, no jq.
+  local _overlay_ok=false
+  if [[ -f "${HOME}/.claude/settings.json" ]] && [[ -s "${HOME}/.claude/settings.json" ]]; then
+    if command -v jq &>/dev/null; then
+      local _stripped
+      _stripped="$(jq 'del(.hooks)' "${HOME}/.claude/settings.json" 2>/dev/null)" || true
+      if [[ -n "$_stripped" ]]; then
+        echo "$_stripped" > "$settings_overlay_dir/settings.json"
+        _overlay_ok=true
+      fi
+    fi
+  fi
+  if ! $_overlay_ok; then
+    echo '{}' > "$settings_overlay_dir/settings.json"
+  fi
+
   local mount_args=(
     -v "$project":/workspace
     -v "${HOME}/.claude:/home/coder/.claude"
+    -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
     -v "$clip_dir":/tmp/cleat-clip
   )
+
+  # ── hooks capability: mount hooks log directory for host-side access
+  if cap_is_active hooks; then
+    local hooks_dir="/tmp/cleat-hooks-${cname}"
+    mkdir -p "$hooks_dir"
+    mount_args+=(-v "$hooks_dir":/var/log/cleat)
+  fi
 
   # Mount .claude.json if it exists on host
   if [[ -f "${HOME}/.claude.json" ]]; then
@@ -838,10 +1203,25 @@ cmd_run() {
     --label "sh.cleat.version=$VERSION"
   )
 
+  # ── Host connectivity: always-on so user-defined hooks and MCP servers work
+  local host_args=()
+  if ! _is_docker_desktop 2>/dev/null; then
+    host_args+=(--add-host "host.docker.internal:host-gateway")
+  fi
+
+  # ── hooks capability: cleat event forwarding (opt-in)
+  local hooks_env=()
+  if ! cap_is_active hooks; then
+    hooks_env=(-e "CLEAT_NO_HOOKS=1")
+  fi
+
+  local run_rc=0
   docker run -d \
     --name "$cname" \
     "${mount_args[@]}" \
     "${ssh_args[@]+"${ssh_args[@]}"}" \
+    "${host_args[@]+"${host_args[@]}"}" \
+    "${hooks_env[@]+"${hooks_env[@]}"}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
     "${label_args[@]}" \
     -e "HOST_UID=$(id -u)" \
@@ -850,8 +1230,7 @@ cmd_run() {
     --pids-limit 1024 \
     --memory 8g \
     -it \
-    "$IMAGE_NAME" > /dev/null 2>&1
-  local run_rc=$?
+    "$IMAGE_NAME" > /dev/null 2>&1 || run_rc=$?
   spin_stop "$run_rc" "Container started" "Container failed to start"
   if [[ $run_rc -ne 0 ]]; then
     exit 1
@@ -874,8 +1253,12 @@ cmd_start() {
       # Restarting a stopped container — image already exists
       success "Image ready (cached)"
       spin "Starting container..."
-      docker start "$cname" > /dev/null 2>&1
-      spin_stop $? "Container started" "Container failed to start"
+      local start_rc=0
+      docker start "$cname" > /dev/null 2>&1 || start_rc=$?
+      spin_stop "$start_rc" "Container started" "Container failed to start"
+      if [[ $start_rc -ne 0 ]]; then
+        exit 1
+      fi
     else
       cmd_run "$project"
     fi
@@ -910,10 +1293,23 @@ cmd_resume() {
   resolve_caps "$project"
   resolve_env_args "$project"
 
+  # Refresh settings overlay (user may have changed hooks between stop/resume)
+  local settings_overlay="/tmp/cleat-settings-${cname}/settings.json"
+  if [[ -d "/tmp/cleat-settings-${cname}" ]]; then
+    if [[ -f "${HOME}/.claude/settings.json" ]] && command -v jq &>/dev/null; then
+      jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay" 2>/dev/null || true
+    fi
+  fi
+
   # Start container if stopped
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      docker start "$cname" > /dev/null 2>&1
+      local resume_rc=0
+      docker start "$cname" > /dev/null 2>&1 || resume_rc=$?
+      if [[ $resume_rc -ne 0 ]]; then
+        error "Container failed to start. Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET}."
+        exit 1
+      fi
     else
       error "No container found for this project. Use ${BOLD}cleat start${RESET} first."
       exit 1
@@ -956,6 +1352,10 @@ cmd_rm() {
   fi
   if container_exists "$cname"; then
     docker rm "$cname" > /dev/null
+    # Clean up temp dirs
+    rm -rf "/tmp/cleat-hooks-${cname}" 2>/dev/null || true
+    rm -rf "/tmp/cleat-clip-${cname}" 2>/dev/null || true
+    rm -rf "/tmp/cleat-settings-${cname}" 2>/dev/null || true
     success "Removed ${BOLD}${cname}${RESET}."
   else
     info "No container to remove."
@@ -981,10 +1381,37 @@ cmd_login() {
 
   require_running "$cname"
   info "Authenticating with your Anthropic team account..."
-  echo -e "  ${DIM}A URL will appear — open it in your browser to sign in.${RESET}"
+
+  # Start browser bridge so auth URL opens automatically and callback works
+  local _login_clip_dir="/tmp/cleat-clip-${cname}"
+  local _login_browser_pid=""
+  local _login_open_cmd
+  _login_open_cmd="$(_host_open_cmd)"
+
+  if [ -n "$_login_open_cmd" ]; then
+    mkdir -p "$_login_clip_dir"
+    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" &
+    _login_browser_pid=$!
+    disown "$_login_browser_pid" 2>/dev/null || true
+    echo -e "  ${DIM}Your browser will open automatically for sign-in.${RESET}"
+  else
+    echo -e "  ${DIM}A URL will appear — open it in your browser to sign in.${RESET}"
+  fi
   echo ""
-  docker exec -it --user coder -e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$cname" claude login
-  success "Auth saved to ~/.claude (shared across all containers)."
+
+  local login_rc=0
+  docker exec -it --user coder -e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$cname" claude login || login_rc=$?
+
+  # Cleanup browser bridge
+  if [ -n "$_login_browser_pid" ]; then
+    kill "$_login_browser_pid" 2>/dev/null || true
+    wait "$_login_browser_pid" 2>/dev/null || true
+  fi
+  rm -f "$_login_clip_dir/.browser-open"
+
+  if [[ $login_rc -eq 0 ]]; then
+    success "Auth saved to ~/.claude (shared across all containers)."
+  fi
 }
 
 cmd_claude() {
@@ -1010,6 +1437,105 @@ cmd_logs() {
   cname="$(container_name_for "$project")"
   require_running "$cname"
   docker logs -f "$cname"
+}
+
+cmd_hooks() {
+  # Parse flags first, collect non-flag args as path
+  local json_mode=false
+  local clear_mode=false
+  local follow_mode=false
+  local path_arg=""
+  for arg in "$@"; do
+    case "$arg" in
+      --json) json_mode=true ;;
+      --clear) clear_mode=true ;;
+      -f|--follow) follow_mode=true ;;
+      -*) warn "Unknown flag: $arg" ;;
+      *) path_arg="$arg" ;;
+    esac
+  done
+
+  local project
+  project="$(resolve_project "${path_arg:-}")"
+  local cname
+  cname="$(container_name_for "$project")"
+  local hooks_dir="/tmp/cleat-hooks-${cname}"
+  local hooks_file="$hooks_dir/hooks.jsonl"
+
+  if $clear_mode; then
+    if [[ -f "$hooks_file" ]]; then
+      : > "$hooks_file"
+      success "Hook log cleared"
+    else
+      info "No hook log to clear."
+    fi
+    return
+  fi
+
+  if [[ ! -f "$hooks_file" ]]; then
+    info "No hook events yet."
+    echo -e "    ${DIM}Events appear when Claude Code runs inside the container.${RESET}"
+    return
+  fi
+
+  if $follow_mode; then
+    if $json_mode; then
+      tail -f "$hooks_file"
+    else
+      tail -f "$hooks_file" | _hooks_pretty_print
+    fi
+    return
+  fi
+
+  if $json_mode; then
+    cat "$hooks_file"
+  else
+    _hooks_pretty_print < "$hooks_file"
+  fi
+}
+
+_hooks_pretty_print() {
+  while IFS= read -r line; do
+    local ts event tool
+    ts="$(echo "$line" | jq -r '._cleat_ts // empty' 2>/dev/null)" || true
+    event="$(echo "$line" | jq -r '.hook_event_name // empty' 2>/dev/null)" || true
+    tool="$(echo "$line" | jq -r '.tool_name // empty' 2>/dev/null)" || true
+
+    if [[ -z "$event" ]]; then
+      # Raw or unparseable line
+      echo -e "  ${DIM}${line}${RESET}"
+      continue
+    fi
+
+    # Format timestamp (strip date, keep time)
+    local time_str=""
+    if [[ -n "$ts" ]]; then
+      time_str="${ts#*T}"
+      time_str="${time_str%Z}"
+      time_str="${time_str%.*}"
+    fi
+
+    # Color-code by event type
+    local color="$BLUE"
+    case "$event" in
+      SessionStart)         color="$GREEN" ;;
+      SessionEnd|Stop)      color="$YELLOW" ;;
+      PostToolUse)          color="$BLUE" ;;
+      PostToolUseFailure|StopFailure) color="$RED" ;;
+      Notification)         color="$CYAN" ;;
+    esac
+
+    local detail=""
+    if [[ -n "$tool" ]]; then
+      detail=" ${DIM}(${tool})${RESET}"
+    fi
+
+    if [[ -n "$time_str" ]]; then
+      echo -e "  ${DIM}${time_str}${RESET}  ${color}${event}${RESET}${detail}"
+    else
+      echo -e "  ${color}${event}${RESET}${detail}"
+    fi
+  done
 }
 
 cmd_ps() {
@@ -1199,10 +1725,11 @@ cmd_uninstall() {
 # ── cleat config ────────────────────────────────────────────────────────────
 _cap_description() {
   case "$1" in
-    git) echo "Mount ~/.gitconfig (read-only) for commit identity" ;;
-    ssh) echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
-    env) echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
-    *)   echo "(unknown capability)" ;;
+    git)   echo "Mount ~/.gitconfig (read-only) for commit identity" ;;
+    ssh)   echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
+    env)   echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
+    hooks) echo "Log Claude Code hook events to JSONL for host-side access" ;;
+    *)     echo "(unknown capability)" ;;
   esac
 }
 
@@ -1514,6 +2041,7 @@ cmd_help() {
   echo -e "    ${GREEN}shell${RESET}   ${DIM}[path]${RESET}     Open bash in the container"
   echo -e "    ${GREEN}login${RESET}   ${DIM}[path]${RESET}     Authenticate with Anthropic team account"
   echo -e "    ${GREEN}logs${RESET}    ${DIM}[path]${RESET}     Tail container logs"
+  echo -e "    ${GREEN}hooks${RESET}   ${DIM}[path]${RESET}     View hook events (--json, --follow, --clear)"
   echo ""
   echo -e "  ${BOLD}INFO${RESET}"
   echo -e "    ${GREEN}status${RESET}  ${DIM}[path]${RESET}     Show project container & auth status"
@@ -1596,6 +2124,10 @@ parse_global_flags() {
 
 # ── Main ────────────────────────────────────────────────────────────────────
 main() {
+  # Defense-in-depth: always kill spinner and restore cursor on exit.
+  # exec_claude sets its own trap (which calls _cleanup_spin internally).
+  trap '_cleanup_spin' EXIT
+
   parse_global_flags "$@"
   set -- "${_REMAINING_ARGS[@]+"${_REMAINING_ARGS[@]}"}"
 
@@ -1615,6 +2147,7 @@ main() {
     login)     cmd_login "$@" ;;
     claude)    cmd_claude "$@" ;;
     logs)      cmd_logs "$@" ;;
+    hooks)     cmd_hooks "$@" ;;
     ps)        cmd_ps "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;

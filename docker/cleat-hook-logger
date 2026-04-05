@@ -1,0 +1,42 @@
+#!/bin/bash
+# cleat-hook-logger — Append Claude Code hook events to JSONL log
+# Reads hook event JSON from stdin, adds timestamp, writes to log file.
+# Designed to be called as an async command hook (non-blocking).
+
+LOG_DIR="/var/log/cleat"
+LOG_FILE="$LOG_DIR/hooks.jsonl"
+LOCK_FILE="$LOG_DIR/.hooks.lock"
+
+# Read all stdin into a variable (hook event JSON)
+input="$(cat)"
+
+# Skip empty input
+if [ -z "$input" ]; then
+  exit 0
+fi
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+# Generate timestamp once
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Build the JSONL line
+if echo "$input" | jq empty 2>/dev/null; then
+  line="$(echo "$input" | jq -c --arg ts "$ts" '. + {_cleat_ts: $ts}')"
+else
+  line="$(jq -nc --arg ts "$ts" --arg raw "$input" '{_cleat_ts: $ts, _cleat_raw: $raw}')"
+fi
+
+# Append with file locking to prevent interleaved writes from concurrent hooks.
+# flock is available on Debian (util-linux). Fall back to unlocked append if missing.
+if command -v flock >/dev/null 2>&1; then
+  (
+    flock 9
+    printf '%s\n' "$line" >> "$LOG_FILE"
+  ) 9>"$LOCK_FILE" 2>/dev/null
+else
+  printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null
+fi
+
+exit 0

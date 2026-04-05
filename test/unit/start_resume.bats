@@ -92,6 +92,36 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+@test "start: docker start failure does not orphan spinner (set -e safe)" {
+  # Regression test: when docker start fails under set -euo pipefail,
+  # the spinner must be stopped and not left running in the background.
+  # The actual binary runs with set -e (unlike sourced tests).
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  export DOCKER_EXIT_CODE=1  # docker start will fail
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Container failed to start"
+}
+
+@test "resume: docker start failure shows helpful error" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  export DOCKER_EXIT_CODE=1  # docker start will fail
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Container failed to start"
+}
+
 @test "no arguments to main defaults to start" {
   mock_docker_images "cleat"
   run bash -c '

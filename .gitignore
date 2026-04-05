@@ -1,3 +1,4 @@
+.claude
 .idea/
 .vscode/
 concept
@@ -7,3 +8,4 @@ concept
 .DS_Store
 .update_check
 .cleat.env
+coverage/

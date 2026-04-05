@@ -41,8 +41,67 @@ teardown() { _common_teardown; }
   assert_failure
 }
 
+@test "source: all docker commands in spin contexts use || rc protection" {
+  # Regression guard: docker start/run/build followed by > /dev/null must
+  # use || rc=$? to prevent set -e from orphaning the spinner.
+  # Without this, a failed docker command kills the script and the disowned
+  # spinner keeps writing to the terminal forever.
+  local unsafe
+  unsafe=$(grep -n 'docker \(start\|run -d\|build\) ' "$CLI" \
+    | grep '/dev/null' \
+    | grep -v '|| ' \
+    | grep -v '^ *#' || true)
+  if [[ -n "$unsafe" ]]; then
+    echo "Docker commands missing || rc=\$? protection (spinner orphan risk):" >&2
+    echo "$unsafe" >&2
+    return 1
+  fi
+}
+
 # ── Strict mode (rule 13) ─────────────────────────────────────────────────
 # These run the actual binary, not sourced, to catch set -euo pipefail issues.
+
+@test "strict mode: docker start failure exits cleanly under set -e" {
+  # Runs the ACTUAL binary (not sourced) to verify set -euo pipefail
+  # does not orphan the spinner when docker start fails.
+  mkdir -p "$TEST_TEMP/strict-project" "$TEST_TEMP/strict-bin" "$TEST_TEMP/strict-config"
+
+  # Compute the exact container name the CLI will generate
+  local project_path="$TEST_TEMP/strict-project"
+  local dir_name
+  dir_name="$(basename "$project_path" | tr '[:upper:]' '[:lower:]')"
+  local hash
+  hash="$(printf '%s' "$project_path" | md5sum 2>/dev/null | head -c 8)"
+  local expected_cname="cleat-${dir_name}-${hash}"
+
+  # Mock docker: image exists, container exists (stopped), start fails
+  cat > "$TEST_TEMP/strict-bin/docker" << MOCK
+#!/bin/bash
+case "\$1" in
+  images) echo "cleat" ;;
+  ps)
+    case "\$*" in
+      *-a*) echo "$expected_cname" ;;
+      *) ;;
+    esac
+    ;;
+  start) exit 1 ;;
+  info) echo "Server Version: 24.0.0" ;;
+  *) ;;
+esac
+MOCK
+  chmod +x "$TEST_TEMP/strict-bin/docker"
+
+  # Run actual binary — set -euo pipefail is active
+  run env PATH="$TEST_TEMP/strict-bin:$PATH" \
+    HOME="$TEST_TEMP" \
+    XDG_CONFIG_HOME="$TEST_TEMP/strict-config" \
+    bash "$CLI" start "$TEST_TEMP/strict-project"
+
+  # Must fail with proper message (spin_stop was reached, not set -e abort)
+  assert_failure
+  assert_output --partial "Container failed to start"
+}
 
 @test "strict mode: cleat --help runs without error" {
   run bash "$CLI" --help

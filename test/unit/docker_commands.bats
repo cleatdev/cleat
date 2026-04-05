@@ -67,6 +67,16 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+@test "run: docker run failure is handled (spinner not orphaned)" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1  # docker run will fail
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Container failed to start"
+}
+
 @test "run: fails for nonexistent project directory" {
   mock_docker_images "cleat"
   run cmd_run "/nonexistent/project"

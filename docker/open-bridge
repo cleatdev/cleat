@@ -1,0 +1,38 @@
+#!/bin/bash
+# open-bridge — forward URLs from inside the container to the host browser.
+#
+# Installed as `open`, `xdg-open`, and `sensible-browser` shims so that
+# tools expecting standard browser commands work transparently.
+#
+# Writes URLs to a bridge file at /tmp/cleat-clip/.browser-open.
+# The host-side watcher detects the file and opens the URL in the real browser.
+#
+# Usage:
+#   open https://example.com
+#   xdg-open https://example.com
+
+BRIDGE="/tmp/cleat-clip"
+BRIDGE_FILE="$BRIDGE/.browser-open"
+
+url="${1:-}"
+
+# If no argument, read from stdin
+if [ -z "$url" ]; then
+  url="$(cat)"
+fi
+
+if [ -z "$url" ]; then
+  echo "Usage: open <url>" >&2
+  exit 1
+fi
+
+# Only forward URLs (not local files)
+case "$url" in
+  http://*|https://*)
+    printf '%s' "$url" > "$BRIDGE_FILE" 2>/dev/null
+    ;;
+  *)
+    echo "open-bridge: only http/https URLs are forwarded to host" >&2
+    exit 1
+    ;;
+esac

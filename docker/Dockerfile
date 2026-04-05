@@ -42,6 +42,18 @@ RUN chmod +x /usr/local/bin/clip /usr/local/bin/clip-daemon && \
     ln -s clip /usr/local/bin/xclip && \
     ln -s clip /usr/local/bin/xsel
 
+# Browser bridge: forward URLs to the host browser
+COPY open-bridge /usr/local/bin/open-bridge
+RUN chmod +x /usr/local/bin/open-bridge && \
+    ln -sf open-bridge /usr/local/bin/open && \
+    ln -sf open-bridge /usr/local/bin/xdg-open && \
+    ln -sf open-bridge /usr/local/bin/sensible-browser
+
+# Hook event logger: logs Claude Code hook events to JSONL for host-side access
+COPY cleat-hook-logger /usr/local/bin/cleat-hook-logger
+RUN chmod +x /usr/local/bin/cleat-hook-logger && \
+    mkdir -p /var/log/cleat && chown coder:coder /var/log/cleat
+
 # User-level CLAUDE.md (won't conflict with project-level CLAUDE.md files)
 COPY CLAUDE.md /home/coder/.claude/CLAUDE.md
 RUN chown coder:coder /home/coder/.claude/CLAUDE.md

@@ -16,7 +16,7 @@ teardown() { _common_teardown; }
 
 @test "version: prints current version" {
   run cmd_version
-  assert_output --partial "v0.5.0"
+  assert_output --partial "v0.5.1"
 }
 
 # ── check_for_update ────────────────────────────────────────────────────────
@@ -50,6 +50,35 @@ teardown() { _common_teardown; }
   assert_output --partial "v${VERSION}"
   assert_output --partial "v99.0.0"
   assert_output --partial "cleat update"
+}
+
+@test "update check: no banner when local version is newer than remote" {
+  mkdir -p "$TEST_TEMP/.git"
+  REPO_DIR="$TEST_TEMP"
+  UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
+  echo "$(date +%s) 0.0.1" > "$UPDATE_CHECK_FILE"
+
+  run check_for_update
+  assert_success
+  assert_output ""
+}
+
+@test "update check: banner box borders are aligned" {
+  mkdir -p "$TEST_TEMP/.git"
+  REPO_DIR="$TEST_TEMP"
+  UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
+  echo "$(date +%s) 99.0.0" > "$UPDATE_CHECK_FILE"
+
+  run check_for_update
+  # Strip ANSI codes and measure display width of │-delimited content lines
+  local clean
+  clean=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
+  # All lines containing │ should have the same display width
+  local lengths
+  lengths=$(echo "$clean" | grep '│' | LC_ALL=C awk '{ gsub(/[^\x00-\x7f]/, "X"); print length }' | sort -u)
+  local count
+  count=$(echo "$lengths" | wc -l | tr -d ' ')
+  [[ "$count" -eq 1 ]] || { echo "Unequal box line lengths:"; echo "$clean" | grep '│'; return 1; }
 }
 
 @test "update check: handles corrupted cache gracefully" {

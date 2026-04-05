@@ -82,8 +82,8 @@ Cleat gives you the best of both worlds:
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
 - **Lightweight** -- Debian-slim-based image with Node.js, Python, Git, build-essential, vim, jq, and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), hook event logging (`--cap hooks`), all disabled by default
-- **Hook event forwarding** -- Claude Code hook events logged to JSONL, host-defined hooks executed on the host (not in the container)
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), all disabled by default
+- **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
 - **Configuration drift detection** -- notifies when config has changed since container creation
@@ -263,7 +263,6 @@ cleat ps
 | `cleat shell [path]` | Open bash inside the container |
 | `cleat login [path]` | Authenticate with Anthropic (OAuth) |
 | `cleat logs [path]` | Tail container logs |
-| `cleat hooks [path]` | View hook events (`--json`, `--follow`, `--clear`) |
 
 #### Info
 | Command | Description |
@@ -361,7 +360,7 @@ cleat --cap ssh start
 | `git` | Mounts `~/.gitconfig` (read-only). Commits inside the container use your host identity. |
 | `ssh` | Mounts `~/.ssh` (read-only). SSH agent forwarding if `SSH_AUTH_SOCK` is set. |
 | `env` | Auto-loads env vars from `~/.config/cleat/env` (global) and `.cleat.env` (project). |
-| `hooks` | Logs Claude Code hook events to JSONL for host-side access. |
+| `hooks` | Runs your Claude Code hooks on the host (global and project-level). |
 
 ### Environment variables
 
@@ -433,33 +432,26 @@ Docker's "What's next?" promo text and clipboard watcher cleanup messages are su
 
 ---
 
-## Hook event forwarding
+## Hooks
 
-When the `hooks` capability is enabled, Claude Code hook events are logged to a JSONL file observable from the host.
+When the `hooks` capability is enabled, your Claude Code hooks run on the host — exactly as if you weren't using a container. Hooks from all three settings locations are supported:
+
+- `~/.claude/settings.json` (global)
+- `.claude/settings.json` (project, committed)
+- `.claude/settings.local.json` (project, local)
 
 ```bash
 cleat config --enable hooks    # enable persistently
 cleat --cap hooks start        # enable for one session
 ```
 
-### View events
-
-```bash
-cleat hooks              # Pretty-printed timeline
-cleat hooks --json       # Raw JSONL (pipe to jq)
-cleat hooks -f           # Follow in real time
-cleat hooks --clear      # Clear the log
-```
-
 ### How it works
 
-1. The Docker image includes `cleat-hook-logger` — a script that appends each hook event with a timestamp to `/var/log/cleat/hooks.jsonl`
-2. At container startup, the entrypoint configures Claude Code to call the logger for all non-blocking events
-3. The log directory is mounted to the host, so `cleat hooks` reads directly from `/tmp/cleat-hooks-<container>/hooks.jsonl`
-
-### Host hook execution
-
-User-defined hooks in `~/.claude/settings.json` run **on the host**, not inside the container. Cleat strips the `hooks` section from the container's copy of settings.json and executes matching hooks on the host via a bridge watcher. The event JSON is piped to stdin. Commands like `osascript`, local scripts, and anything host-specific work transparently.
+1. Cleat creates a settings overlay that replaces hook commands with an event forwarder inside the container
+2. Project-level hook settings are also overlaid to prevent double-execution
+3. A host-side bridge reads forwarded events and executes the original hook commands on the host
+4. Event JSON is piped to stdin, matchers are respected, 30s timeout per command
+5. Commands like `osascript`, local scripts, and anything host-specific work transparently
 
 ---
 

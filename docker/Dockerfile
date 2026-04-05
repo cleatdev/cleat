@@ -49,10 +49,8 @@ RUN chmod +x /usr/local/bin/open-bridge && \
     ln -sf open-bridge /usr/local/bin/xdg-open && \
     ln -sf open-bridge /usr/local/bin/sensible-browser
 
-# Hook event logger: logs Claude Code hook events to JSONL for host-side access
-COPY cleat-hook-logger /usr/local/bin/cleat-hook-logger
-RUN chmod +x /usr/local/bin/cleat-hook-logger && \
-    mkdir -p /var/log/cleat && chown coder:coder /var/log/cleat
+# Hook event forwarder directory (used when hooks capability is active)
+RUN mkdir -p /var/log/cleat && chown coder:coder /var/log/cleat
 
 # User-level CLAUDE.md (won't conflict with project-level CLAUDE.md files)
 COPY CLAUDE.md /home/coder/.claude/CLAUDE.md

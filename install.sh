@@ -211,20 +211,27 @@ latest_tag_local() {
 if [ -d "$INSTALL_DIR" ] && [ ! -L "$INSTALL_DIR" ]; then
   if [ -d "$INSTALL_DIR/.git" ]; then
     spin "Updating existing installation..."
-    local_rc=0
-    git -C "$INSTALL_DIR" fetch --tags --force --quiet 2>/dev/null || {
-      spin_stop 0 "Fetch retry..."
+    fetch_rc=0
+    git -C "$INSTALL_DIR" fetch --tags --force --quiet 2>/dev/null || fetch_rc=$?
+    if [[ $fetch_rc -ne 0 ]]; then
       git -C "$INSTALL_DIR" remote set-url origin "$REPO"
-      git -C "$INSTALL_DIR" fetch --tags --force --quiet || {
+      git -C "$INSTALL_DIR" fetch --tags --force --quiet 2>/dev/null || fetch_rc=$?
+      if [[ $fetch_rc -ne 0 ]]; then
         spin_stop 1 "" "Failed to fetch updates"
         error "Check your internet connection."
         exit 1
-      }
-    }
-    local_tag=$(latest_tag_local "$INSTALL_DIR")
+      fi
+    fi
+    local_tag=$(latest_tag_local "$INSTALL_DIR" || true)
     if [[ -n "$local_tag" ]]; then
-      git -C "$INSTALL_DIR" checkout "v${local_tag}" --quiet 2>/dev/null
-      spin_stop 0 "Updated to v${local_tag}"
+      checkout_rc=0
+      git -C "$INSTALL_DIR" checkout "v${local_tag}" --quiet 2>/dev/null || checkout_rc=$?
+      if [[ $checkout_rc -eq 0 ]]; then
+        spin_stop 0 "Updated to v${local_tag}"
+      else
+        spin_stop 1 "" "Failed to checkout v${local_tag}"
+        exit 1
+      fi
     else
       spin_stop 0 "Up to date"
       warn "No tags found. Staying on current version."
@@ -239,20 +246,26 @@ elif [ -e "$INSTALL_DIR" ]; then
   exit 1
 else
   # Determine the latest tag before cloning
-  latest_tag=$(latest_tag_from_remote "$REPO")
+  latest_tag=$(latest_tag_from_remote "$REPO" || true)
 
   spin "Downloading Cleat..."
-  local_rc=0
-  git clone "$REPO" "$INSTALL_DIR" --quiet 2>/dev/null || local_rc=$?
-  spin_stop "$local_rc" "Downloaded to ${BOLD}$INSTALL_DIR${RESET}" "Download failed"
-  if [[ $local_rc -ne 0 ]]; then
+  clone_rc=0
+  git clone "$REPO" "$INSTALL_DIR" --quiet 2>/dev/null || clone_rc=$?
+  spin_stop "$clone_rc" "Downloaded to ${BOLD}$INSTALL_DIR${RESET}" "Download failed"
+  if [[ $clone_rc -ne 0 ]]; then
     exit 1
   fi
 
   if [[ -n "$latest_tag" ]]; then
     spin "Checking out latest release..."
-    git -C "$INSTALL_DIR" checkout "v${latest_tag}" --quiet 2>/dev/null
-    spin_stop 0 "Pinned to v${latest_tag}"
+    checkout_rc=0
+    git -C "$INSTALL_DIR" checkout "v${latest_tag}" --quiet 2>/dev/null || checkout_rc=$?
+    if [[ $checkout_rc -eq 0 ]]; then
+      spin_stop 0 "Pinned to v${latest_tag}"
+    else
+      spin_stop 1 "" "Failed to checkout v${latest_tag}"
+      warn "Using latest commit on main instead."
+    fi
   else
     warn "No release tags found. Using latest commit on main."
   fi

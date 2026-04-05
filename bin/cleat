@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.5.0"
+VERSION="0.5.1"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -16,8 +16,9 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 # Known capabilities (order matters for display)
 KNOWN_CAPS=(git ssh env hooks)
 
-# Session-scoped state (populated by parse_global_flags)
+# Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
+_RESOLVED_PROJECT=""
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 
@@ -789,20 +790,30 @@ _browser_watcher() {
 }
 
 # ── Host-side hook bridge ─────────────────────────────────────────────────
-# Tails the JSONL hooks log and executes the user's host-defined command hooks.
-# This is the counterpart to the settings overlay in cmd_run — host hooks are
-# stripped from the container's settings.json and executed here instead.
+# Tails forwarded events and executes the user's host-defined command hooks.
+# The settings overlay replaces hook commands with an event forwarder inside
+# the container; this bridge reads those events and runs the real commands.
 _HOOK_BRIDGE_PID=""
 _HOOK_BRIDGE_CHILDREN=()
 
 _has_host_hooks() {
-  [[ -s "${HOME}/.claude/settings.json" ]] && \
-    jq -e '.hooks // empty | length > 0' "${HOME}/.claude/settings.json" >/dev/null 2>&1
+  local f
+  for f in "${HOME}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.local.json"; do
+    if [[ -s "$f" ]] && jq -e '.hooks // empty | length > 0' "$f" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 _hook_bridge_watcher() {
   local hooks_file="$1"
-  local settings="${HOME}/.claude/settings.json"
+  # Collect all settings files that define hooks (global + project)
+  local settings_files=()
+  local f
+  for f in "${HOME}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.local.json"; do
+    [[ -s "$f" ]] && settings_files+=("$f")
+  done
   # On exit: kill all child hook processes
   trap '_hook_bridge_cleanup; exit 0' TERM INT HUP
   trap '_hook_bridge_cleanup' EXIT
@@ -830,7 +841,7 @@ _hook_bridge_watcher() {
       # Read new lines since last offset
       while IFS= read -r line; do
         [[ -n "$line" ]] || continue
-        _execute_host_hook_bg "$line" "$settings"
+        _execute_host_hook_bg "$line" "${settings_files[@]}"
       done < <(tail -c +"$((byte_offset + 1))" "$hooks_file" 2>/dev/null)
 
       byte_offset=$file_size
@@ -870,15 +881,17 @@ _hook_bridge_cleanup() {
 # Execute a single event's host hooks in a tracked background subprocess.
 _execute_host_hook_bg() {
   local event_json="$1"
-  local settings="$2"
+  shift
+  local settings_files=("$@")
 
-  ( _execute_host_hooks "$event_json" "$settings" ) &
+  ( _execute_host_hooks "$event_json" "${settings_files[@]}" ) &
   _HOOK_BRIDGE_CHILDREN+=("$!")
 }
 
 _execute_host_hooks() {
   local event_json="$1"
-  local settings="$2"
+  shift
+  local settings_files=("$@")
 
   local event_name
   event_name="$(echo "$event_json" | jq -r '.hook_event_name // empty' 2>/dev/null)" || return 0
@@ -888,37 +901,40 @@ _execute_host_hooks() {
   local tool_name
   tool_name="$(echo "$event_json" | jq -r '.tool_name // empty' 2>/dev/null)" || true
 
-  # Read hook config once for this event
-  local hook_entries
-  hook_entries="$(jq -c ".hooks.\"$event_name\" // [] | .[]" "$settings" 2>/dev/null)" || return 0
-  [[ -n "$hook_entries" ]] || return 0
+  # Process hooks from all settings files (global + project)
+  local settings
+  for settings in "${settings_files[@]}"; do
+    local hook_entries
+    hook_entries="$(jq -c ".hooks.\"$event_name\" // [] | .[]" "$settings" 2>/dev/null)" || continue
+    [[ -n "$hook_entries" ]] || continue
 
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] || continue
 
-    # Check matcher (regex against tool_name for tool events)
-    local matcher
-    matcher="$(echo "$entry" | jq -r '.matcher // empty' 2>/dev/null)" || true
-    if [[ -n "$matcher" && -n "$tool_name" ]]; then
-      echo "$tool_name" | grep -qE "$matcher" 2>/dev/null || continue
-    fi
-
-    # Execute each command hook in the entry
-    while IFS= read -r hook; do
-      [[ -n "$hook" ]] || continue
-      local cmd
-      cmd="$(echo "$hook" | jq -r '.command // empty' 2>/dev/null)" || continue
-      [[ -n "$cmd" ]] || continue
-
-      # Execute on the host with event JSON on stdin.
-      # Timeout after 30s to prevent hung hooks from blocking the bridge.
-      if command -v timeout >/dev/null 2>&1; then
-        echo "$event_json" | timeout 30 bash -c "$cmd" >/dev/null 2>&1 || true
-      else
-        echo "$event_json" | bash -c "$cmd" >/dev/null 2>&1 || true
+      # Check matcher (regex against tool_name for tool events)
+      local matcher
+      matcher="$(echo "$entry" | jq -r '.matcher // empty' 2>/dev/null)" || true
+      if [[ -n "$matcher" && -n "$tool_name" ]]; then
+        echo "$tool_name" | grep -qE "$matcher" 2>/dev/null || continue
       fi
-    done < <(echo "$entry" | jq -c '.hooks // [] | .[] | select(.type == "command")' 2>/dev/null)
-  done <<< "$hook_entries"
+
+      # Execute each command hook in the entry
+      while IFS= read -r hook; do
+        [[ -n "$hook" ]] || continue
+        local cmd
+        cmd="$(echo "$hook" | jq -r '.command // empty' 2>/dev/null)" || continue
+        [[ -n "$cmd" ]] || continue
+
+        # Execute on the host with event JSON on stdin.
+        # Timeout after 30s to prevent hung hooks from blocking the bridge.
+        if command -v timeout >/dev/null 2>&1; then
+          echo "$event_json" | timeout 30 bash -c "$cmd" >/dev/null 2>&1 || true
+        else
+          echo "$event_json" | bash -c "$cmd" >/dev/null 2>&1 || true
+        fi
+      done < <(echo "$entry" | jq -c '.hooks // [] | .[] | select(.type == "command")' 2>/dev/null)
+    done <<< "$hook_entries"
+  done
 }
 
 exec_claude() {
@@ -978,7 +994,7 @@ exec_claude() {
   fi
 
   # Start host-side hook bridge if user has hooks and hooks cap is active
-  local hooks_file="/tmp/cleat-hooks-${cname}/hooks.jsonl"
+  local hooks_file="/tmp/cleat-hooks-${cname}/events.jsonl"
   if cap_is_active hooks 2>/dev/null && _has_host_hooks 2>/dev/null; then
     _hook_bridge_watcher "$hooks_file" &
     _HOOK_BRIDGE_PID=$!
@@ -1041,13 +1057,29 @@ check_for_update() {
     echo "$now $cached_version" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
   fi
 
+  # Only show banner when remote version is strictly newer
   if [[ -n "$cached_version" && "$cached_version" != "$VERSION" ]]; then
-    echo ""
-    echo -e "  ${CYAN}┌──────────────────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET}  ${BOLD}Update available${RESET}  ${DIM}v${VERSION}${RESET} → ${GREEN}v${cached_version}${RESET}             ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET}  Run ${BOLD}cleat update${RESET} to install the latest version.  ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}└──────────────────────────────────────────────────┘${RESET}"
-    echo ""
+    local latest
+    latest=$(printf '%s\n%s\n' "$VERSION" "$cached_version" \
+      | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+    if [[ "$latest" = "$cached_version" ]]; then
+      local line1="Update available  v${VERSION} → v${cached_version}"
+      local line2="Run cleat update to install the latest version."
+      local len1=${#line1} len2=${#line2}
+      local width=$(( len1 > len2 ? len1 : len2 ))
+      local pad1="" pad2=""
+      local i
+      for (( i = len1; i < width; i++ )); do pad1+=" "; done
+      for (( i = len2; i < width; i++ )); do pad2+=" "; done
+      local border=""
+      for (( i = 0; i < width + 4; i++ )); do border+="─"; done
+      echo ""
+      echo -e "  ${CYAN}┌${border}┐${RESET}"
+      echo -e "  ${CYAN}│${RESET}  ${BOLD}Update available${RESET}  ${DIM}v${VERSION}${RESET} → ${GREEN}v${cached_version}${RESET}${pad1}  ${CYAN}│${RESET}"
+      echo -e "  ${CYAN}│${RESET}  Run ${BOLD}cleat update${RESET} to install the latest version.${pad2}  ${CYAN}│${RESET}"
+      echo -e "  ${CYAN}└${border}┘${RESET}"
+      echo ""
+    fi
   fi
 }
 
@@ -1099,6 +1131,7 @@ cmd_rebuild() {
 cmd_run() {
   local project
   project="$(resolve_project "${1:-}")"
+  _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project")"
 
@@ -1132,23 +1165,38 @@ cmd_run() {
   local clip_dir="/tmp/cleat-clip-${cname}"
   mkdir -p "$clip_dir"
 
-  # ── Settings overlay: strip host hooks from container settings
-  # User hooks in ~/.claude/settings.json are meant to run on the host (osascript,
-  # local scripts, etc.) — they'll fail inside the container. We overlay settings.json
-  # with a copy that has the hooks section removed. The host-side hook bridge
-  # (started in exec_claude) executes them on the host instead.
+  # ── Settings overlay ──────────────────────────────────────────────────────
+  # When hooks OFF: strip hooks from settings (they'd fail in the container).
+  # When hooks ON:  replace hook commands with an event forwarder — the host-side
+  #                 bridge reads forwarded events and executes the real commands.
   local settings_overlay_dir="/tmp/cleat-settings-${cname}"
   mkdir -p "$settings_overlay_dir"
-  # Generate the overlay: host settings with .hooks removed.
-  # Handles: missing file, empty file, invalid JSON, no jq.
   local _overlay_ok=false
   if [[ -f "${HOME}/.claude/settings.json" ]] && [[ -s "${HOME}/.claude/settings.json" ]]; then
     if command -v jq &>/dev/null; then
-      local _stripped
-      _stripped="$(jq 'del(.hooks)' "${HOME}/.claude/settings.json" 2>/dev/null)" || true
-      if [[ -n "$_stripped" ]]; then
-        echo "$_stripped" > "$settings_overlay_dir/settings.json"
-        _overlay_ok=true
+      if cap_is_active hooks; then
+        # Replace hook commands with forwarder; preserve event types and matchers
+        local _forwarded
+        _forwarded="$(jq '
+          if .hooks then
+            .hooks |= with_entries(.value |= [.[] |
+              .hooks = [.hooks[] | select(.type == "command") |
+                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+              ]
+            ])
+          else . end
+        ' "${HOME}/.claude/settings.json" 2>/dev/null)" || true
+        if [[ -n "$_forwarded" ]]; then
+          echo "$_forwarded" > "$settings_overlay_dir/settings.json"
+          _overlay_ok=true
+        fi
+      else
+        local _stripped
+        _stripped="$(jq 'del(.hooks)' "${HOME}/.claude/settings.json" 2>/dev/null)" || true
+        if [[ -n "$_stripped" ]]; then
+          echo "$_stripped" > "$settings_overlay_dir/settings.json"
+          _overlay_ok=true
+        fi
       fi
     fi
   fi
@@ -1163,11 +1211,32 @@ cmd_run() {
     -v "$clip_dir":/tmp/cleat-clip
   )
 
-  # ── hooks capability: mount hooks log directory for host-side access
+  # ── hooks capability: shared directory for event forwarding to host bridge
   if cap_is_active hooks; then
     local hooks_dir="/tmp/cleat-hooks-${cname}"
     mkdir -p "$hooks_dir"
     mount_args+=(-v "$hooks_dir":/var/log/cleat)
+
+    # Overlay project-level hook settings — replace commands with event forwarder
+    # so Claude Code still fires hook events, which the host bridge then executes.
+    local pf
+    for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+      if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
+        local _base _proj_forwarded
+        _base="$(basename "$pf")"
+        _proj_forwarded="$(jq '
+          if .hooks then
+            .hooks |= with_entries(.value |= [.[] |
+              .hooks = [.hooks[] | select(.type == "command") |
+                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+              ]
+            ])
+          else . end
+        ' "$pf" 2>/dev/null)" || continue
+        echo "$_proj_forwarded" > "$settings_overlay_dir/$_base"
+        mount_args+=(-v "$settings_overlay_dir/$_base:/workspace/.claude/$_base")
+      fi
+    done
   fi
 
   # Mount .claude.json if it exists on host
@@ -1209,19 +1278,12 @@ cmd_run() {
     host_args+=(--add-host "host.docker.internal:host-gateway")
   fi
 
-  # ── hooks capability: cleat event forwarding (opt-in)
-  local hooks_env=()
-  if ! cap_is_active hooks; then
-    hooks_env=(-e "CLEAT_NO_HOOKS=1")
-  fi
-
   local run_rc=0
   docker run -d \
     --name "$cname" \
     "${mount_args[@]}" \
     "${ssh_args[@]+"${ssh_args[@]}"}" \
     "${host_args[@]+"${host_args[@]}"}" \
-    "${hooks_env[@]+"${hooks_env[@]}"}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
     "${label_args[@]}" \
     -e "HOST_UID=$(id -u)" \
@@ -1240,6 +1302,7 @@ cmd_run() {
 cmd_start() {
   local project
   project="$(resolve_project "${1:-}")"
+  _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project")"
 
@@ -1286,6 +1349,7 @@ cmd_start() {
 cmd_resume() {
   local project
   project="$(resolve_project "${1:-}")"
+  _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project")"
 
@@ -1293,11 +1357,43 @@ cmd_resume() {
   resolve_caps "$project"
   resolve_env_args "$project"
 
-  # Refresh settings overlay (user may have changed hooks between stop/resume)
-  local settings_overlay="/tmp/cleat-settings-${cname}/settings.json"
-  if [[ -d "/tmp/cleat-settings-${cname}" ]]; then
-    if [[ -f "${HOME}/.claude/settings.json" ]] && command -v jq &>/dev/null; then
-      jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay" 2>/dev/null || true
+  # Refresh settings overlays (user may have changed hooks between stop/resume)
+  local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+  if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null; then
+    # Global settings overlay
+    if [[ -f "${HOME}/.claude/settings.json" ]]; then
+      if cap_is_active hooks; then
+        jq '
+          if .hooks then
+            .hooks |= with_entries(.value |= [.[] |
+              .hooks = [.hooks[] | select(.type == "command") |
+                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+              ]
+            ])
+          else . end
+        ' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
+      else
+        jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
+      fi
+    fi
+    # Project-level settings overlays — replace commands with event forwarder
+    if cap_is_active hooks; then
+      local pf
+      for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+        if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
+          local _base
+          _base="$(basename "$pf")"
+          jq '
+            if .hooks then
+              .hooks |= with_entries(.value |= [.[] |
+                .hooks = [.hooks[] | select(.type == "command") |
+                  .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+                ]
+              ])
+            else . end
+          ' "$pf" > "$settings_overlay_dir/$_base" 2>/dev/null || true
+        fi
+      done
     fi
   fi
 
@@ -1421,6 +1517,7 @@ cmd_claude() {
   cname="$(container_name_for "$project")"
 
   require_running "$cname"
+  _RESOLVED_PROJECT="$project"
   resolve_caps "$project"
   resolve_env_args "$project"
   check_for_update
@@ -1437,105 +1534,6 @@ cmd_logs() {
   cname="$(container_name_for "$project")"
   require_running "$cname"
   docker logs -f "$cname"
-}
-
-cmd_hooks() {
-  # Parse flags first, collect non-flag args as path
-  local json_mode=false
-  local clear_mode=false
-  local follow_mode=false
-  local path_arg=""
-  for arg in "$@"; do
-    case "$arg" in
-      --json) json_mode=true ;;
-      --clear) clear_mode=true ;;
-      -f|--follow) follow_mode=true ;;
-      -*) warn "Unknown flag: $arg" ;;
-      *) path_arg="$arg" ;;
-    esac
-  done
-
-  local project
-  project="$(resolve_project "${path_arg:-}")"
-  local cname
-  cname="$(container_name_for "$project")"
-  local hooks_dir="/tmp/cleat-hooks-${cname}"
-  local hooks_file="$hooks_dir/hooks.jsonl"
-
-  if $clear_mode; then
-    if [[ -f "$hooks_file" ]]; then
-      : > "$hooks_file"
-      success "Hook log cleared"
-    else
-      info "No hook log to clear."
-    fi
-    return
-  fi
-
-  if [[ ! -f "$hooks_file" ]]; then
-    info "No hook events yet."
-    echo -e "    ${DIM}Events appear when Claude Code runs inside the container.${RESET}"
-    return
-  fi
-
-  if $follow_mode; then
-    if $json_mode; then
-      tail -f "$hooks_file"
-    else
-      tail -f "$hooks_file" | _hooks_pretty_print
-    fi
-    return
-  fi
-
-  if $json_mode; then
-    cat "$hooks_file"
-  else
-    _hooks_pretty_print < "$hooks_file"
-  fi
-}
-
-_hooks_pretty_print() {
-  while IFS= read -r line; do
-    local ts event tool
-    ts="$(echo "$line" | jq -r '._cleat_ts // empty' 2>/dev/null)" || true
-    event="$(echo "$line" | jq -r '.hook_event_name // empty' 2>/dev/null)" || true
-    tool="$(echo "$line" | jq -r '.tool_name // empty' 2>/dev/null)" || true
-
-    if [[ -z "$event" ]]; then
-      # Raw or unparseable line
-      echo -e "  ${DIM}${line}${RESET}"
-      continue
-    fi
-
-    # Format timestamp (strip date, keep time)
-    local time_str=""
-    if [[ -n "$ts" ]]; then
-      time_str="${ts#*T}"
-      time_str="${time_str%Z}"
-      time_str="${time_str%.*}"
-    fi
-
-    # Color-code by event type
-    local color="$BLUE"
-    case "$event" in
-      SessionStart)         color="$GREEN" ;;
-      SessionEnd|Stop)      color="$YELLOW" ;;
-      PostToolUse)          color="$BLUE" ;;
-      PostToolUseFailure|StopFailure) color="$RED" ;;
-      Notification)         color="$CYAN" ;;
-    esac
-
-    local detail=""
-    if [[ -n "$tool" ]]; then
-      detail=" ${DIM}(${tool})${RESET}"
-    fi
-
-    if [[ -n "$time_str" ]]; then
-      echo -e "  ${DIM}${time_str}${RESET}  ${color}${event}${RESET}${detail}"
-    else
-      echo -e "  ${color}${event}${RESET}${detail}"
-    fi
-  done
 }
 
 cmd_ps() {
@@ -1728,7 +1726,7 @@ _cap_description() {
     git)   echo "Mount ~/.gitconfig (read-only) for commit identity" ;;
     ssh)   echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
     env)   echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
-    hooks) echo "Log Claude Code hook events to JSONL for host-side access" ;;
+    hooks) echo "Run your Claude Code hooks on the host (global + project)" ;;
     *)     echo "(unknown capability)" ;;
   esac
 }
@@ -2041,7 +2039,6 @@ cmd_help() {
   echo -e "    ${GREEN}shell${RESET}   ${DIM}[path]${RESET}     Open bash in the container"
   echo -e "    ${GREEN}login${RESET}   ${DIM}[path]${RESET}     Authenticate with Anthropic team account"
   echo -e "    ${GREEN}logs${RESET}    ${DIM}[path]${RESET}     Tail container logs"
-  echo -e "    ${GREEN}hooks${RESET}   ${DIM}[path]${RESET}     View hook events (--json, --follow, --clear)"
   echo ""
   echo -e "  ${BOLD}INFO${RESET}"
   echo -e "    ${GREEN}status${RESET}  ${DIM}[path]${RESET}     Show project container & auth status"
@@ -2147,7 +2144,6 @@ main() {
     login)     cmd_login "$@" ;;
     claude)    cmd_claude "$@" ;;
     logs)      cmd_logs "$@" ;;
-    hooks)     cmd_hooks "$@" ;;
     ps)        cmd_ps "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;

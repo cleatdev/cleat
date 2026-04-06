@@ -329,13 +329,60 @@ EOF
   assert_success
 
   # Overlay should contain forwarder command, not the original hook command
-  local overlay="/tmp/cleat-settings-${cname}/settings.json"
+  local overlay="/tmp/cleat-settings-${cname}/project-settings.json"
   run jq -r '.hooks.PostToolUse[0].hooks[0].command' "$overlay"
   assert_output "cat >> /var/log/cleat/events.jsonl"
 
   # Non-hook fields should be preserved
   run jq -r '.permissions.allow[0]' "$overlay"
   assert_output "Read"
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "run: always mounts project overlay even when no hooks yet" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  echo '{"permissions":{"allow":["Read"]}}' > "$TEST_TEMP/project/.claude/settings.json"
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # Overlay should be mounted even though file has no hooks
+  run assert_docker_run_has "$cname" "settings.json:/workspace/.claude/settings.json"
+  assert_success
+
+  # Overlay should be a copy of the original (no hooks to replace)
+  local overlay="/tmp/cleat-settings-${cname}/project-settings.json"
+  run jq -r '.permissions.allow[0]' "$overlay"
+  assert_output "Read"
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "run: mounts empty overlay for missing project settings files" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  # No .claude/ directory at all
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # Both overlays should be mounted
+  run assert_docker_run_has "$cname" "settings.json:/workspace/.claude/settings.json"
+  assert_success
+  run assert_docker_run_has "$cname" "settings.local.json:/workspace/.claude/settings.local.json"
+  assert_success
+
+  # Both should be empty JSON
+  run cat "/tmp/cleat-settings-${cname}/project-settings.json"
+  assert_output "{}"
+  run cat "/tmp/cleat-settings-${cname}/project-settings.local.json"
+  assert_output "{}"
 
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
@@ -393,6 +440,37 @@ EOF
   assert_success
 }
 
+# ── cmd_claude refreshes project-level overlays ────────────────────────
+
+@test "claude: refreshes project overlay when hooks added after creation" {
+  mkdir -p "$TEST_TEMP/project/.claude"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  # Simulate overlay dir from original cmd_run (no hooks at creation time)
+  local overlay_dir="/tmp/cleat-settings-${cname}"
+  mkdir -p "$overlay_dir"
+  echo '{}' > "$overlay_dir/settings.json"
+  echo '{}' > "$overlay_dir/project-settings.json"
+  echo '{}' > "$overlay_dir/project-settings.local.json"
+
+  # User adds hooks after container was created
+  cat > "$TEST_TEMP/project/.claude/settings.local.json" << 'EOF'
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"osascript -e 'display notification'"}]}]}}
+EOF
+
+  mock_docker_ps "$cname"
+  exec_claude() { return 0; }
+
+  cmd_claude "$TEST_TEMP/project"
+
+  # Overlay should now have forwarder
+  run jq -r '.hooks.Stop[0].hooks[0].command' "$overlay_dir/project-settings.local.json"
+  assert_output "cat >> /var/log/cleat/events.jsonl"
+
+  rm -rf "$overlay_dir" "/tmp/cleat-hooks-${cname}"
+}
+
 # ── Resume refreshes project-level overlays ────────────────────────────
 
 @test "resume: refreshes project-level settings overlay when hooks ON" {
@@ -418,7 +496,7 @@ EOF
   cmd_resume "$TEST_TEMP/project"
 
   # Project overlay should now exist with forwarder
-  local project_overlay="$overlay_dir/settings.local.json"
+  local project_overlay="$overlay_dir/project-settings.local.json"
   [[ -f "$project_overlay" ]] || {
     echo "Project overlay not created at $project_overlay"
     return 1
@@ -426,6 +504,35 @@ EOF
   # Overlay should have forwarder command, not original
   run jq -r '.hooks.PostToolUse[0].hooks[0].command' "$project_overlay"
   assert_output "cat >> /var/log/cleat/events.jsonl"
+
+  rm -rf "$overlay_dir" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "resume: copies project settings as-is when hooks removed" {
+  mkdir -p "$TEST_TEMP/project/.claude"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  # Simulate overlay dir with old forwarder
+  local overlay_dir="/tmp/cleat-settings-${cname}"
+  mkdir -p "$overlay_dir"
+  echo '{}' > "$overlay_dir/settings.json"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cat >> /var/log/cleat/events.jsonl"}]}]}}' \
+    > "$overlay_dir/project-settings.local.json"
+
+  # User removed hooks, file now has only permissions
+  echo '{"permissions":{"allow":["Read"]}}' > "$TEST_TEMP/project/.claude/settings.local.json"
+
+  mock_docker_ps "$cname"
+  exec_claude() { return 0; }
+
+  cmd_resume "$TEST_TEMP/project"
+
+  # Overlay should be a copy with no hooks
+  run jq -r '.permissions.allow[0]' "$overlay_dir/project-settings.local.json"
+  assert_output "Read"
+  run jq -e '.hooks // empty | length > 0' "$overlay_dir/project-settings.local.json"
+  assert_failure
 
   rm -rf "$overlay_dir" "/tmp/cleat-hooks-${cname}"
 }

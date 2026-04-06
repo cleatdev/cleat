@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.5.1"
+VERSION="0.5.2"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -1217,14 +1217,17 @@ cmd_run() {
     mkdir -p "$hooks_dir"
     mount_args+=(-v "$hooks_dir":/var/log/cleat)
 
-    # Overlay project-level hook settings — replace commands with event forwarder
-    # so Claude Code still fires hook events, which the host bridge then executes.
+    # Always mount project-level settings overlays so hook changes take effect
+    # without container recreation. Files with hooks get event forwarders;
+    # files without hooks are copied as-is; missing files get empty {}.
+    # Prefixed with "project-" to avoid collision with global settings overlay.
     local pf
     for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+      local _base _overlay_name
+      _base="$(basename "$pf")"
+      _overlay_name="project-$_base"
       if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
-        local _base _proj_forwarded
-        _base="$(basename "$pf")"
-        _proj_forwarded="$(jq '
+        jq '
           if .hooks then
             .hooks |= with_entries(.value |= [.[] |
               .hooks = [.hooks[] | select(.type == "command") |
@@ -1232,10 +1235,13 @@ cmd_run() {
               ]
             ])
           else . end
-        ' "$pf" 2>/dev/null)" || continue
-        echo "$_proj_forwarded" > "$settings_overlay_dir/$_base"
-        mount_args+=(-v "$settings_overlay_dir/$_base:/workspace/.claude/$_base")
+        ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
+      elif [[ -f "$pf" ]]; then
+        cp "$pf" "$settings_overlay_dir/$_overlay_name"
+      else
+        echo '{}' > "$settings_overlay_dir/$_overlay_name"
       fi
+      mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
     done
   fi
 
@@ -1376,13 +1382,14 @@ cmd_resume() {
         jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
       fi
     fi
-    # Project-level settings overlays — replace commands with event forwarder
+    # Project-level settings overlays
     if cap_is_active hooks; then
       local pf
       for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+        local _base _overlay_name
+        _base="$(basename "$pf")"
+        _overlay_name="project-$_base"
         if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
-          local _base
-          _base="$(basename "$pf")"
           jq '
             if .hooks then
               .hooks |= with_entries(.value |= [.[] |
@@ -1391,7 +1398,11 @@ cmd_resume() {
                 ]
               ])
             else . end
-          ' "$pf" > "$settings_overlay_dir/$_base" 2>/dev/null || true
+          ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        elif [[ -f "$pf" ]]; then
+          cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        else
+          echo '{}' > "$settings_overlay_dir/$_overlay_name"
         fi
       done
     fi
@@ -1520,6 +1531,33 @@ cmd_claude() {
   _RESOLVED_PROJECT="$project"
   resolve_caps "$project"
   resolve_env_args "$project"
+
+  # Refresh project-level settings overlays (hooks may have changed)
+  local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+  if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null && cap_is_active hooks; then
+    local pf
+    for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+      local _base _overlay_name
+      _base="$(basename "$pf")"
+      _overlay_name="project-$_base"
+      if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
+        jq '
+          if .hooks then
+            .hooks |= with_entries(.value |= [.[] |
+              .hooks = [.hooks[] | select(.type == "command") |
+                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+              ]
+            ])
+          else . end
+        ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
+      elif [[ -f "$pf" ]]; then
+        cp "$pf" "$settings_overlay_dir/$_overlay_name"
+      else
+        echo '{}' > "$settings_overlay_dir/$_overlay_name"
+      fi
+    done
+  fi
+
   check_for_update
   success "Claude launched"
   _print_summary_block "$cname" "$project"

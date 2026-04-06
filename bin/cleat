@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.5.2"
+VERSION="0.6.0"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -106,6 +106,31 @@ _cleanup_spin() {
     _SPIN_PID=""
   fi
   command -v tput &>/dev/null && tput cnorm 2>/dev/null
+}
+
+# ── Keypress reader for TUI ────────────────────────────────────────────────
+_read_keypress() {
+  local key
+  IFS= read -rsn1 key 2>/dev/null || true
+  if [[ "$key" == $'\e' ]]; then
+    # Read the rest of the escape sequence in one call.
+    # Arrow keys send \e[A/B/C/D — read up to 2 chars with a timeout.
+    local seq=""
+    IFS= read -rsn2 -t 1 seq 2>/dev/null || true
+    case "$seq" in
+      "[A") echo "UP" ;;
+      "[B") echo "DOWN" ;;
+      *)    echo "ESC" ;;
+    esac
+  elif [[ "$key" == " " ]]; then
+    echo "SPACE"
+  elif [[ "$key" == "" ]]; then
+    echo "ENTER"
+  elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+    echo "QUIT"
+  else
+    echo "OTHER"
+  fi
 }
 
 # ── Project-scoped container naming ─────────────────────────────────────────
@@ -481,6 +506,41 @@ _image_cleat_version() {
   docker inspect "$IMAGE_NAME" --format '{{index .Config.Labels "sh.cleat.version"}}' 2>/dev/null || echo ""
 }
 
+# Print a notice box with dynamic width. Each argument is a line of plain text.
+# Supports {BOLD}...{/BOLD} for bold spans within lines.
+_notice_box() {
+  local lines=("$@")
+  local width=0
+  local i line stripped
+
+  # Find widest line
+  for line in "${lines[@]}"; do
+    stripped="${line//{BOLD\}/}"
+    stripped="${stripped//{\/BOLD\}/}"
+    local len=${#stripped}
+    [[ $len -gt $width ]] && width=$len
+  done
+
+  # Draw box
+  local border=""
+  for (( i = 0; i < width + 4; i++ )); do border+="─"; done
+
+  echo ""
+  echo -e "  ${CYAN}┌${border}┐${RESET}"
+  for line in "${lines[@]}"; do
+    stripped="${line//{BOLD\}/}"
+    stripped="${stripped//{\/BOLD\}/}"
+    local pad=""
+    for (( i = ${#stripped}; i < width; i++ )); do pad+=" "; done
+    # Replace {BOLD}/{/BOLD} with actual escape codes
+    local formatted="${line//\{BOLD\}/${BOLD}}"
+    formatted="${formatted//\{\/BOLD\}/${RESET}}"
+    echo -e "  ${CYAN}│${RESET}  ${formatted}${pad}  ${CYAN}│${RESET}"
+  done
+  echo -e "  ${CYAN}└${border}┘${RESET}"
+  echo ""
+}
+
 # Check for configuration drift and show notices
 check_drift() {
   local cname="$1"
@@ -492,28 +552,22 @@ check_drift() {
   current_hash="$(compute_config_fingerprint "$project")"
 
   if [[ -n "$stored_hash" && "$stored_hash" != "$current_hash" ]]; then
-    echo ""
-    echo -e "  ${CYAN}┌──────────────────────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET}  Configuration changed since this container was       ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET}  created. Recreate to apply the new settings.         ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET}                                                       ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET}  Run: ${BOLD}cleat rm && cleat${RESET}                               ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}└──────────────────────────────────────────────────────┘${RESET}"
-    echo ""
+    _notice_box \
+      "Configuration changed since this container was" \
+      "created. Recreate to apply the new settings." \
+      "" \
+      "Run: {BOLD}cleat rm && cleat{/BOLD}"
   fi
 
   # Image version drift
   local image_version
   image_version="$(_image_cleat_version)"
   if [[ -n "$image_version" && "$image_version" != "$VERSION" ]]; then
-    echo ""
-    echo -e "  ${CYAN}┌──────────────────────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET}  Cleat image was built with ${BOLD}v${image_version}${RESET} but CLI is        ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET}  ${BOLD}v${VERSION}${RESET}. Rebuild to get the latest container setup.   ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET}                                                       ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET}  Run: ${BOLD}cleat rebuild${RESET}                                    ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}└──────────────────────────────────────────────────────┘${RESET}"
-    echo ""
+    _notice_box \
+      "Cleat image was built with {BOLD}v${image_version}{/BOLD} but CLI is" \
+      "{BOLD}v${VERSION}{/BOLD}. Rebuild to get the latest container setup." \
+      "" \
+      "Run: {BOLD}cleat rebuild{/BOLD}"
   fi
 }
 
@@ -760,7 +814,12 @@ _browser_watcher() {
   }
   trap '_bw_cleanup; exit 0' TERM INT HUP
 
+  # Skip any URL left over from a previous session
   local last_ts=""
+  if [ -f "$bridge_file" ]; then
+    last_ts=$(stat -c '%Y%N' "$bridge_file" 2>/dev/null \
+           || stat -f '%m' "$bridge_file" 2>/dev/null || echo "")
+  fi
   while true; do
     if [ -f "$bridge_file" ]; then
       local cur_ts
@@ -828,7 +887,10 @@ _hook_bridge_watcher() {
 
   # Tail new lines and execute matching host hooks.
   # We track our byte offset to avoid wc -l / tail race conditions.
-  local byte_offset=0
+  # Start from the current end of the file to skip events from prior sessions.
+  local byte_offset
+  byte_offset=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
+  byte_offset=$((byte_offset + 0))
   while true; do
     local file_size
     file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
@@ -1063,22 +1125,9 @@ check_for_update() {
     latest=$(printf '%s\n%s\n' "$VERSION" "$cached_version" \
       | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
     if [[ "$latest" = "$cached_version" ]]; then
-      local line1="Update available  v${VERSION} → v${cached_version}"
-      local line2="Run cleat update to install the latest version."
-      local len1=${#line1} len2=${#line2}
-      local width=$(( len1 > len2 ? len1 : len2 ))
-      local pad1="" pad2=""
-      local i
-      for (( i = len1; i < width; i++ )); do pad1+=" "; done
-      for (( i = len2; i < width; i++ )); do pad2+=" "; done
-      local border=""
-      for (( i = 0; i < width + 4; i++ )); do border+="─"; done
-      echo ""
-      echo -e "  ${CYAN}┌${border}┐${RESET}"
-      echo -e "  ${CYAN}│${RESET}  ${BOLD}Update available${RESET}  ${DIM}v${VERSION}${RESET} → ${GREEN}v${cached_version}${RESET}${pad1}  ${CYAN}│${RESET}"
-      echo -e "  ${CYAN}│${RESET}  Run ${BOLD}cleat update${RESET} to install the latest version.${pad2}  ${CYAN}│${RESET}"
-      echo -e "  ${CYAN}└${border}┘${RESET}"
-      echo ""
+      _notice_box \
+        "{BOLD}Update available{/BOLD}  v${VERSION} → v${cached_version}" \
+        "Run {BOLD}cleat update{/BOLD} to install the latest version."
     fi
   fi
 }
@@ -1217,32 +1266,34 @@ cmd_run() {
     mkdir -p "$hooks_dir"
     mount_args+=(-v "$hooks_dir":/var/log/cleat)
 
-    # Always mount project-level settings overlays so hook changes take effect
-    # without container recreation. Files with hooks get event forwarders;
-    # files without hooks are copied as-is; missing files get empty {}.
-    # Prefixed with "project-" to avoid collision with global settings overlay.
-    local pf
-    for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
-      local _base _overlay_name
-      _base="$(basename "$pf")"
-      _overlay_name="project-$_base"
-      if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
-        jq '
-          if .hooks then
-            .hooks |= with_entries(.value |= [.[] |
-              .hooks = [.hooks[] | select(.type == "command") |
-                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
-              ]
-            ])
-          else . end
-        ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
-      elif [[ -f "$pf" ]]; then
-        cp "$pf" "$settings_overlay_dir/$_overlay_name"
-      else
-        echo '{}' > "$settings_overlay_dir/$_overlay_name"
-      fi
-      mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
-    done
+    # Mount project-level settings overlays when .claude/ exists.
+    # Files with hooks get event forwarders; files without hooks are copied as-is;
+    # missing files get empty {} so hooks added later take effect on resume.
+    # Skip entirely when .claude/ doesn't exist — Docker would create it as root.
+    if [[ -d "$project/.claude" ]]; then
+      local pf
+      for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+        local _base _overlay_name
+        _base="$(basename "$pf")"
+        _overlay_name="project-$_base"
+        if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
+          jq '
+            if .hooks then
+              .hooks |= with_entries(.value |= [.[] |
+                .hooks = [.hooks[] | select(.type == "command") |
+                  .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+                ]
+              ])
+            else . end
+          ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        elif [[ -f "$pf" ]]; then
+          cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        else
+          echo '{}' > "$settings_overlay_dir/$_overlay_name"
+        fi
+        mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
+      done
+    fi
   fi
 
   # Mount .claude.json if it exists on host
@@ -1382,8 +1433,8 @@ cmd_resume() {
         jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
       fi
     fi
-    # Project-level settings overlays
-    if cap_is_active hooks; then
+    # Project-level settings overlays (only when .claude/ exists)
+    if cap_is_active hooks && [[ -d "$project/.claude" ]]; then
       local pf
       for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
         local _base _overlay_name
@@ -1534,7 +1585,7 @@ cmd_claude() {
 
   # Refresh project-level settings overlays (hooks may have changed)
   local settings_overlay_dir="/tmp/cleat-settings-${cname}"
-  if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null && cap_is_active hooks; then
+  if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null && cap_is_active hooks && [[ -d "$project/.claude" ]]; then
     local pf
     for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
       local _base _overlay_name
@@ -1788,6 +1839,230 @@ ENVEOF
   success "Created ${DIM}${env_file}${RESET} (add to .gitignore)"
 }
 
+# ── TUI config picker ──────────────────────────────────────────────────────
+
+_config_picker_draw() {
+  local cursor="$1"
+  local toggled="$2"
+  local cap_count=${#KNOWN_CAPS[@]}
+  local i=0
+  while [[ $i -lt $cap_count ]]; do
+    local cap="${KNOWN_CAPS[$i]}"
+    local marker="${DIM}·${RESET}"
+    case ",${toggled}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
+    printf '\033[2K' # clear line
+    if [[ $i -eq $cursor ]]; then
+      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}${cap}${RESET}  $(_cap_description "$cap")"
+    else
+      echo -e "    [${marker}] ${cap}  ${DIM}$(_cap_description "$cap")${RESET}"
+    fi
+    i=$((i + 1))
+  done
+}
+
+_config_picker_tui() {
+  local config_file="$1"
+  local scope="$2"
+
+  echo ""
+  echo -e "  ${BOLD}Cleat — Capabilities${RESET}"
+  echo ""
+  local scope_label
+  if [[ "$scope" == "project" ]]; then
+    scope_label="project ($(pwd)/.cleat)"
+  else
+    scope_label="global (~/.config/cleat/config)"
+  fi
+  echo -e "  ${DIM}Scope: ${scope_label}${RESET}"
+  echo ""
+
+  local toggled=""
+  local cap
+  while IFS= read -r cap; do
+    [[ -n "$cap" ]] && toggled="${toggled:+${toggled},}${cap}"
+  done < <(_read_caps_from_file "$config_file")
+
+  local cursor=0
+  local cap_count=${#KNOWN_CAPS[@]}
+
+  tput civis 2>/dev/null || true
+
+  _config_picker_draw "$cursor" "$toggled"
+  echo ""
+  echo -e "  ${DIM}↑/↓ navigate  ␣ toggle  ⏎ save  q cancel${RESET}"
+
+  # Move back above list for redraw
+  printf '\033[%dA' "$((cap_count + 2))"
+
+  while true; do
+    local key
+    key="$(_read_keypress)"
+
+    case "$key" in
+      UP)
+        [[ $cursor -gt 0 ]] && cursor=$((cursor - 1))
+        ;;
+      DOWN)
+        [[ $cursor -lt $((cap_count - 1)) ]] && cursor=$((cursor + 1))
+        ;;
+      SPACE)
+        local current_cap="${KNOWN_CAPS[$cursor]}"
+        case ",${toggled}," in
+          *,"$current_cap",*)
+            local _new=""
+            local _c
+            for _c in $(echo "$toggled" | tr ',' ' '); do
+              [[ "$_c" == "$current_cap" ]] && continue
+              _new="${_new:+${_new},}${_c}"
+            done
+            toggled="$_new"
+            ;;
+          *)
+            toggled="${toggled:+${toggled},}${current_cap}"
+            ;;
+        esac
+        ;;
+      ENTER)
+        tput cnorm 2>/dev/null || true
+        printf '\033[%dB' "$((cap_count + 2))"
+        printf '\033[2K'
+        echo ""
+
+        local final_caps=()
+        for cap in "${KNOWN_CAPS[@]}"; do
+          case ",${toggled}," in *,"$cap",*) final_caps+=("$cap") ;; esac
+        done
+        _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
+        success "Saved to ${config_file}"
+
+        case ",${toggled}," in
+          *,env,*)
+            if [[ ! -f "$(pwd)/.cleat.env" ]]; then
+              echo ""
+              echo -n "  Create .cleat.env in current project? [Y/n] "
+              local yn
+              read -r yn
+              if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+                _scaffold_cleat_env "$(pwd)"
+              fi
+            fi
+            ;;
+        esac
+        return
+        ;;
+      QUIT|ESC)
+        tput cnorm 2>/dev/null || true
+        printf '\033[%dB' "$((cap_count + 2))"
+        printf '\033[2K'
+        echo ""
+        info "Cancelled."
+        return
+        ;;
+    esac
+
+    _config_picker_draw "$cursor" "$toggled"
+    printf '\033[%dA' "$cap_count"
+  done
+}
+
+_config_picker_text() {
+  local config_file="$1"
+  local scope="$2"
+
+  echo ""
+  echo -e "  ${BOLD}Cleat — Capabilities${RESET}"
+  echo ""
+  local scope_label
+  if [[ "$scope" == "project" ]]; then
+    scope_label="project ($(pwd)/.cleat)"
+  else
+    scope_label="global (~/.config/cleat/config)"
+  fi
+  echo -e "  ${DIM}Scope: ${scope_label}${RESET}"
+  echo ""
+
+  local _active=""
+  local cap
+  while IFS= read -r cap; do
+    [[ -n "$cap" ]] && _active="${_active:+${_active},}${cap}"
+  done < <(_read_caps_from_file "$config_file")
+
+  for cap in "${KNOWN_CAPS[@]}"; do
+    local marker="${DIM}·${RESET}"
+    case ",${_active}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
+    echo -e "    [${marker}] ${BOLD}${cap}${RESET}     $(_cap_description "$cap")"
+  done
+
+  echo ""
+  echo -e "  ${DIM}Toggle: type name to flip, \"done\" to save, \"q\" to cancel${RESET}"
+
+  while true; do
+    echo -n "  > "
+    local input
+    read -r input
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+
+    case "$input" in
+      done)
+        local final_caps=()
+        for cap in "${KNOWN_CAPS[@]}"; do
+          case ",${_active}," in *,"$cap",*) final_caps+=("$cap") ;; esac
+        done
+        _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
+        success "Saved to ${config_file}"
+
+        case ",${_active}," in
+          *,env,*)
+            if [[ ! -f "$(pwd)/.cleat.env" ]]; then
+              echo ""
+              echo -n "  Create .cleat.env in current project? [Y/n] "
+              local yn
+              read -r yn
+              if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+                _scaffold_cleat_env "$(pwd)"
+              fi
+            fi
+            ;;
+        esac
+        return
+        ;;
+      q|quit)
+        info "Cancelled."
+        return
+        ;;
+      *)
+        local found=false
+        for known in "${KNOWN_CAPS[@]}"; do
+          if [[ "$known" == "$input" ]]; then
+            found=true
+            case ",${_active}," in
+              *,"$input",*)
+                local _new_active=""
+                local _c
+                for _c in $(echo "$_active" | tr ',' ' '); do
+                  [[ "$_c" == "$input" ]] && continue
+                  _new_active="${_new_active:+${_new_active},}${_c}"
+                done
+                _active="$_new_active"
+                success "${input} disabled"
+                ;;
+              *)
+                _active="${_active:+${_active},}${input}"
+                success "${input} enabled"
+                ;;
+            esac
+            break
+          fi
+        done
+        if ! $found; then
+          warn "Unknown capability: ${input}. Available: ${KNOWN_CAPS[*]}"
+        fi
+        ;;
+    esac
+  done
+}
+
 cmd_config() {
   local scope="global"
   local action=""
@@ -1903,99 +2178,11 @@ cmd_config() {
   fi
 
   # ── Interactive mode (no flags)
-  echo ""
-  echo -e "  ${BOLD}Cleat — Capabilities${RESET}"
-  echo ""
-  local scope_label
-  if [[ "$scope" == "project" ]]; then
-    scope_label="project ($(pwd)/.cleat)"
+  if [[ -t 0 ]] && [[ -t 1 ]]; then
+    _config_picker_tui "$config_file" "$scope"
   else
-    scope_label="global (~/.config/cleat/config)"
+    _config_picker_text "$config_file" "$scope"
   fi
-  echo -e "  ${DIM}Scope: ${scope_label}${RESET}"
-  echo ""
-
-  # Read current caps into a comma-delimited string
-  local _active=""
-  local cap
-  while IFS= read -r cap; do
-    [[ -n "$cap" ]] && _active="${_active:+${_active},}${cap}"
-  done < <(_read_caps_from_file "$config_file")
-
-  # Show current state
-  for cap in "${KNOWN_CAPS[@]}"; do
-    local marker="${DIM}·${RESET}"
-    case ",${_active}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
-    echo -e "    [${marker}] ${BOLD}${cap}${RESET}     $(_cap_description "$cap")"
-  done
-
-  echo ""
-  echo -e "  ${DIM}Toggle: type name to flip, \"done\" to save, \"q\" to cancel${RESET}"
-
-  while true; do
-    echo -n "  > "
-    local input
-    read -r input
-    # Strip whitespace
-    input="${input#"${input%%[![:space:]]*}"}"
-    input="${input%"${input##*[![:space:]]}"}"
-
-    case "$input" in
-      done)
-        # Save
-        local final_caps=()
-        for cap in "${KNOWN_CAPS[@]}"; do
-          case ",${_active}," in *,"$cap",*) final_caps+=("$cap") ;; esac
-        done
-        _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
-        success "Saved to ${config_file}"
-
-        # Scaffold .cleat.env if env was just enabled
-        case ",${_active}," in
-          *,env,*)
-            if [[ ! -f "$(pwd)/.cleat.env" ]]; then
-              echo ""
-              echo -n "  Create .cleat.env in current project? [Y/n] "
-              local yn
-              read -r yn
-              if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-                _scaffold_cleat_env "$(pwd)"
-              fi
-            fi
-            ;;
-        esac
-        return
-        ;;
-      q|quit)
-        info "Cancelled."
-        return
-        ;;
-      *)
-        # Check if it's a known cap name
-        local found=false
-        for known in "${KNOWN_CAPS[@]}"; do
-          if [[ "$known" == "$input" ]]; then
-            found=true
-            case ",${_active}," in
-              *,"$input",*)
-                # Remove from _active
-                _active=$(printf '%s\n' "$_active" | tr ',' '\n' | grep -v "^${input}$" | paste -sd ',' -)
-                success "${input} disabled"
-                ;;
-              *)
-                _active="${_active:+${_active},}${input}"
-                success "${input} enabled"
-                ;;
-            esac
-            break
-          fi
-        done
-        if ! $found; then
-          warn "Unknown capability: ${input}. Available: ${KNOWN_CAPS[*]}"
-        fi
-        ;;
-    esac
-  done
 }
 
 # ── Version & Update ──────────────────────────────────────────────────────

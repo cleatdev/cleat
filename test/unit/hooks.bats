@@ -362,7 +362,7 @@ EOF
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
 
-@test "run: mounts empty overlay for missing project settings files" {
+@test "run: skips project overlay when no .claude/ directory" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
   # No .claude/ directory at all
@@ -372,17 +372,11 @@ EOF
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  # Both overlays should be mounted
-  run assert_docker_run_has "$cname" "settings.json:/workspace/.claude/settings.json"
+  # Should NOT mount project overlays (would create .claude/ as root on host)
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
   assert_success
-  run assert_docker_run_has "$cname" "settings.local.json:/workspace/.claude/settings.local.json"
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.local.json"
   assert_success
-
-  # Both should be empty JSON
-  run cat "/tmp/cleat-settings-${cname}/project-settings.json"
-  assert_output "{}"
-  run cat "/tmp/cleat-settings-${cname}/project-settings.local.json"
-  assert_output "{}"
 
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
@@ -721,6 +715,45 @@ EOF
   assert_failure
 }
 
+@test "_hook_bridge_watcher: skips pre-existing events in log file" {
+  mkdir -p "$TEST_TEMP/hooks"
+  local hooks_file="$TEST_TEMP/hooks/events.jsonl"
+  local processed="$TEST_TEMP/processed"
+
+  # Pre-existing events from a previous session
+  echo '{"hook_event_name":"Stop","_cleat_ts":"old1"}' > "$hooks_file"
+  echo '{"hook_event_name":"Stop","_cleat_ts":"old2"}' >> "$hooks_file"
+
+  # Override execution to log which events are processed
+  _execute_host_hook_bg() { echo "$1" >> "$processed"; }
+
+  # Provide settings files for the watcher
+  _RESOLVED_PROJECT="$TEST_TEMP"
+  mkdir -p "${HOME}/.claude"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' \
+    > "${HOME}/.claude/settings.json"
+
+  # Start watcher in background
+  _hook_bridge_watcher "$hooks_file" &
+  local pid=$!
+  sleep 0.3
+
+  # Append a new event
+  echo '{"hook_event_name":"Stop","_cleat_ts":"new1"}' >> "$hooks_file"
+  sleep 1
+
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+
+  # New event should have been processed
+  [[ -f "$processed" ]] || { echo "No events processed at all"; return 1; }
+  grep -q "new1" "$processed" || { echo "New event not processed"; return 1; }
+
+  # Old events must NOT have been processed
+  if grep -q "old" "$processed"; then
+    echo "Old events replayed (regression)"; return 1
+  fi
+}
+
 @test "_execute_host_hooks: runs matching command hook" {
   local settings="$TEST_TEMP/host-settings.json"
   local marker="$TEST_TEMP/hook-ran"
@@ -986,6 +1019,45 @@ SCRIPT
   [[ -f "$marker" ]] || return 1
   run cat "$marker"
   assert_output "https://example.com/auth"
+}
+
+@test "browser watcher: skips pre-existing URL from previous session" {
+  local clip_dir="$TEST_TEMP/clip"
+  local marker="$TEST_TEMP/browser-should-not-open-old"
+  mkdir -p "$clip_dir"
+
+  # Simulate a leftover URL from a previous session
+  printf 'https://old-session.example.com' > "$clip_dir/.browser-open"
+  sleep 0.1  # ensure stable timestamp
+
+  local mock_open="$TEST_TEMP/mock-open-old"
+  cat > "$mock_open" << 'SCRIPT'
+#!/bin/bash
+echo "$1" >> MARKER_PATH
+SCRIPT
+  sed -i "s|MARKER_PATH|$marker|" "$mock_open"
+  chmod +x "$mock_open"
+
+  _browser_watcher "$clip_dir" "$mock_open" &
+  local watcher_pid=$!
+  sleep 1
+
+  # Write a new URL (touch to ensure timestamp changes)
+  printf 'https://new-session.example.com' > "$clip_dir/.browser-open"
+  touch "$clip_dir/.browser-open"
+  sleep 1.5
+
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+
+  # New URL should have been opened
+  [[ -f "$marker" ]] || { echo "No URLs opened at all"; return 1; }
+  grep -q "new-session" "$marker" || { echo "New URL not opened"; return 1; }
+
+  # Old URL should NOT have been opened
+  if grep -q "old-session" "$marker"; then
+    echo "Old URL was replayed (regression)"; return 1
+  fi
 }
 
 @test "browser watcher: ignores non-http URLs" {

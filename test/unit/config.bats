@@ -316,3 +316,104 @@ EOF
   run cat "$TEST_TEMP/.cleat.env"
   assert_output "MY_VAR=test"
 }
+
+# ── Interactive text fallback ─────────────────────────────────────────────
+
+@test "config text: non-TTY falls back to text mode" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" <<< "done"
+  assert_success
+  assert_output --partial "Capabilities"
+  assert_output --partial "Saved"
+}
+
+@test "config text: toggle and save writes to config" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" <<< $'git\ndone'
+  assert_success
+  assert_output --partial "git enabled"
+  run _read_caps_from_file "$CLEAT_GLOBAL_CONFIG"
+  assert_output "git"
+}
+
+@test "config text: q cancels without saving" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" <<< $'git\nq'
+  assert_success
+  assert_output --partial "Cancelled"
+  # Should not have saved
+  run _read_caps_from_file "$CLEAT_GLOBAL_CONFIG"
+  assert_output ""
+}
+
+@test "config text: unknown cap shows warning" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" <<< $'foobar\nq'
+  assert_success
+  assert_output --partial "Unknown capability"
+}
+
+@test "config text: toggle on then off" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" <<< $'ssh\nssh\ndone'
+  assert_success
+  assert_output --partial "ssh enabled"
+  assert_output --partial "ssh disabled"
+  run _read_caps_from_file "$CLEAT_GLOBAL_CONFIG"
+  assert_output ""
+}
+
+# ── TUI picker draw ──────────────────────────────────────────────────────
+
+@test "config draw: shows checkmark for enabled cap" {
+  run _config_picker_draw 0 "git,env"
+  assert_output --partial "git"
+  assert_output --partial "env"
+}
+
+@test "config draw: shows pointer on cursor row" {
+  run _config_picker_draw 2 ""
+  # Row 2 is env — should have the pointer
+  assert_output --partial "▸"
+}
+
+@test "config draw: shows all capabilities" {
+  run _config_picker_draw 0 ""
+  assert_output --partial "git"
+  assert_output --partial "ssh"
+  assert_output --partial "env"
+  assert_output --partial "hooks"
+}
+
+# ── Keypress reader ───────────────────────────────────────────────────────
+
+@test "_read_keypress: space returns SPACE" {
+  local result
+  result="$(_read_keypress <<< " ")"
+  [[ "$result" == "SPACE" ]] || { echo "got: $result"; return 1; }
+}
+
+@test "_read_keypress: q returns QUIT" {
+  local result
+  result="$(printf 'q' | _read_keypress)"
+  [[ "$result" == "QUIT" ]] || { echo "got: $result"; return 1; }
+}
+
+@test "_read_keypress: enter returns ENTER" {
+  local result
+  result="$(_read_keypress <<< "")"
+  [[ "$result" == "ENTER" ]] || { echo "got: $result"; return 1; }
+}
+
+@test "_read_keypress: up arrow returns UP" {
+  local result
+  result="$(printf '\033[A' | _read_keypress)"
+  [[ "$result" == "UP" ]] || { echo "got: $result"; return 1; }
+}
+
+@test "_read_keypress: down arrow returns DOWN" {
+  local result
+  result="$(printf '\033[B' | _read_keypress)"
+  [[ "$result" == "DOWN" ]] || { echo "got: $result"; return 1; }
+}
+
+@test "_read_keypress: bare escape returns ESC" {
+  local result
+  result="$(printf '\033' | _read_keypress)"
+  [[ "$result" == "ESC" ]] || { echo "got: $result"; return 1; }
+}

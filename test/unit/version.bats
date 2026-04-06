@@ -16,7 +16,7 @@ teardown() { _common_teardown; }
 
 @test "version: prints current version" {
   run cmd_version
-  assert_output --partial "v0.5.1"
+  assert_output --partial "v${VERSION}"
 }
 
 # ── check_for_update ────────────────────────────────────────────────────────

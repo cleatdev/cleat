@@ -242,7 +242,7 @@ cleat ps
 #### Capabilities
 | Command | Description |
 |---|---|
-| `cleat config` | Interactive capability wizard |
+| `cleat config` | Interactive capability picker (keyboard TUI) |
 | `cleat config --list` | List capabilities and their status |
 | `cleat config --enable <cap>` | Enable a capability (e.g. `git`, `ssh`, `env`) |
 | `cleat config --disable <cap>` | Disable a capability |

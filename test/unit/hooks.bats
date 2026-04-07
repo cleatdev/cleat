@@ -1060,6 +1060,45 @@ SCRIPT
   fi
 }
 
+@test "browser watcher: opens new URL even when written in same second as stale file" {
+  local clip_dir="$TEST_TEMP/clip"
+  local marker="$TEST_TEMP/browser-same-second"
+  mkdir -p "$clip_dir"
+
+  # Simulate a leftover URL from a previous session
+  printf 'https://stale.example.com' > "$clip_dir/.browser-open"
+
+  local mock_open="$TEST_TEMP/mock-open-same-second"
+  cat > "$mock_open" << 'SCRIPT'
+#!/bin/bash
+echo "$1" >> MARKER_PATH
+SCRIPT
+  sed -i "s|MARKER_PATH|$marker|" "$mock_open"
+  chmod +x "$mock_open"
+
+  # Start watcher — the stale file exists at startup
+  _browser_watcher "$clip_dir" "$mock_open" &
+  local watcher_pid=$!
+  sleep 0.3
+
+  # Write a new URL immediately (no touch to force timestamp change)
+  printf 'https://new.example.com/auth' > "$clip_dir/.browser-open"
+  sleep 1.5
+
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+
+  # New URL must have been opened (regression: same-second write was missed)
+  [[ -f "$marker" ]] || { echo "URL not opened — same-second regression"; return 1; }
+  run cat "$marker"
+  assert_output --partial "new.example.com/auth"
+
+  # Stale URL must NOT have been opened
+  if grep -q "stale.example.com" "$marker"; then
+    echo "Stale URL was replayed"; return 1
+  fi
+}
+
 @test "browser watcher: ignores non-http URLs" {
   local clip_dir="$TEST_TEMP/clip"
   local marker="$TEST_TEMP/browser-should-not-open"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.6.0"
+VERSION="0.6.1"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -814,12 +814,9 @@ _browser_watcher() {
   }
   trap '_bw_cleanup; exit 0' TERM INT HUP
 
-  # Skip any URL left over from a previous session
+  # Remove any URL left over from a previous session
+  rm -f "$bridge_file"
   local last_ts=""
-  if [ -f "$bridge_file" ]; then
-    last_ts=$(stat -c '%Y%N' "$bridge_file" 2>/dev/null \
-           || stat -f '%m' "$bridge_file" 2>/dev/null || echo "")
-  fi
   while true; do
     if [ -f "$bridge_file" ]; then
       local cur_ts

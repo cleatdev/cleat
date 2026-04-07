@@ -109,17 +109,37 @@ teardown() { _common_teardown; }
   assert_output --partial "Container failed to start"
 }
 
-@test "resume: docker start failure shows helpful error" {
+@test "start: docker start failure shows docker error and recovery hint" {
+  mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
   is_running() { return 1; }
   mock_docker_ps_a "$cname"
-  export DOCKER_EXIT_CODE=1  # docker start will fail
+  export DOCKER_EXIT_CODE=1
+  export DOCKER_STDERR="Error response from daemon: network bridge not found"
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Container failed to start"
+  assert_output --partial "network bridge not found"
+  assert_output --partial "cleat rm"
+}
+
+@test "resume: docker start failure shows helpful error with reason" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  export DOCKER_EXIT_CODE=1
+  export DOCKER_STDERR="Error response from daemon: OCI runtime create failed"
 
   run cmd_resume "$TEST_TEMP/project"
   assert_failure
   assert_output --partial "Container failed to start"
+  assert_output --partial "OCI runtime create failed"
+  assert_output --partial "cleat rm"
 }
 
 @test "no arguments to main defaults to start" {

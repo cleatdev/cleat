@@ -23,7 +23,8 @@ teardown() { _common_teardown; }
   mock_docker_images "cleat"
   run cmd_build
   assert_success
-  assert_output --partial "Image ready (cached)"
+  assert_output --partial "Image ready"
+  assert_output --partial "(cached)"
 }
 
 @test "rebuild: always builds with --no-cache" {
@@ -75,6 +76,18 @@ teardown() { _common_teardown; }
   run cmd_run "$TEST_TEMP/project"
   assert_failure
   assert_output --partial "Container failed to start"
+}
+
+@test "run: docker run failure shows docker error reason" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1
+  export DOCKER_STDERR="Error response from daemon: Conflict"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Container failed to start"
+  assert_output --partial "Conflict"
 }
 
 @test "run: fails for nonexistent project directory" {

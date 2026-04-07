@@ -331,7 +331,8 @@ EOF
   mock_docker_ps_a "$cname"
   run cmd_start "$TEST_TEMP/project"
   assert_success
-  assert_output --partial "Image ready (cached)"
+  assert_output --partial "Image ready"
+  assert_output --partial "(cached)"
 }
 
 @test "resume: outputs summary block with container name" {

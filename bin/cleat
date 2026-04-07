@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.6.1"
+VERSION="0.6.2"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -41,7 +41,7 @@ header() {
 }
 
 info()    { echo -e "  ${BLUE}▸${RESET} $1"; }
-success() { echo -e "  ${GREEN}✔${RESET} $1"; }
+success() { echo -e "  ${GREEN}✔ $1${RESET}"; }
 warn()    { echo -e "  ${YELLOW}!${RESET} $1"; }
 error()   { echo -e "  ${RED}✖${RESET} $1"; }
 
@@ -93,7 +93,7 @@ spin_stop() {
     return
   fi
   if [[ "$code" -eq 0 ]]; then
-    printf "\r  ${GREEN}✔${RESET} %s\n" "$ok_msg"
+    printf "\r  ${GREEN}✔ %s${RESET}\n" "$ok_msg"
   else
     printf "\r  ${RED}✖${RESET} %s\n" "$fail_msg"
   fi
@@ -599,7 +599,8 @@ _print_summary_block() {
   echo ""
   echo -e "  ${DIM}Container:${RESET}  ${BLUE}${cname}${RESET}"
   if [[ -n "$project" ]]; then
-    local display_path="${project/#$HOME/\~}"
+    local _tilde='~'
+    local display_path="${project/#$HOME/$_tilde}"
     echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
   fi
   if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
@@ -1132,7 +1133,7 @@ check_for_update() {
 # ── Commands ────────────────────────────────────────────────────────────────
 cmd_build() {
   if image_exists; then
-    success "Image ready (cached)"
+    success "Image ready ${RESET}${DIM}(cached)"
     return
   fi
   _do_build
@@ -1193,7 +1194,7 @@ cmd_run() {
   if ! image_exists; then
     _do_build
   else
-    success "Image ready (cached)"
+    success "Image ready ${RESET}${DIM}(cached)"
   fi
 
   if [[ ! -d "$project" ]]; then
@@ -1216,6 +1217,7 @@ cmd_run() {
   # When hooks ON:  replace hook commands with an event forwarder — the host-side
   #                 bridge reads forwarded events and executes the real commands.
   local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+  rm -rf "$settings_overlay_dir"
   mkdir -p "$settings_overlay_dir"
   local _overlay_ok=false
   if [[ -f "${HOME}/.claude/settings.json" ]] && [[ -s "${HOME}/.claude/settings.json" ]]; then
@@ -1332,6 +1334,7 @@ cmd_run() {
     host_args+=(--add-host "host.docker.internal:host-gateway")
   fi
 
+  local _docker_err="/tmp/cleat-err.$$"
   local run_rc=0
   docker run -d \
     --name "$cname" \
@@ -1346,11 +1349,14 @@ cmd_run() {
     --pids-limit 1024 \
     --memory 8g \
     -it \
-    "$IMAGE_NAME" > /dev/null 2>&1 || run_rc=$?
+    "$IMAGE_NAME" > /dev/null 2>"$_docker_err" || run_rc=$?
   spin_stop "$run_rc" "Container started" "Container failed to start"
   if [[ $run_rc -ne 0 ]]; then
+    [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
+    rm -f "$_docker_err"
     exit 1
   fi
+  rm -f "$_docker_err"
 }
 
 cmd_start() {
@@ -1368,19 +1374,38 @@ cmd_start() {
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
       # Restarting a stopped container — image already exists
-      success "Image ready (cached)"
+      success "Image ready ${RESET}${DIM}(cached)"
       spin "Starting container..."
+      local _docker_err="/tmp/cleat-err.$$"
       local start_rc=0
-      docker start "$cname" > /dev/null 2>&1 || start_rc=$?
+      docker start "$cname" > /dev/null 2>"$_docker_err" || start_rc=$?
       spin_stop "$start_rc" "Container started" "Container failed to start"
       if [[ $start_rc -ne 0 ]]; then
-        exit 1
+        [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
+        rm -f "$_docker_err"
+        if _is_tty; then
+          echo ""
+          echo -n "  Remove container and start fresh? [Y/n] "
+          local yn
+          read -r yn
+          if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+            docker rm -f "$cname" > /dev/null 2>&1 || true
+            success "Removed ${BOLD}$cname${RESET}."
+            cmd_run "$project"
+          else
+            exit 1
+          fi
+        else
+          error "Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET} to recreate."
+          exit 1
+        fi
       fi
+      rm -f "$_docker_err" 2>/dev/null
     else
       cmd_run "$project"
     fi
   else
-    success "Image ready (cached)"
+    success "Image ready ${RESET}${DIM}(cached)"
     success "Container started"
   fi
 
@@ -1459,12 +1484,17 @@ cmd_resume() {
   # Start container if stopped
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
+      local _docker_err="/tmp/cleat-err.$$"
       local resume_rc=0
-      docker start "$cname" > /dev/null 2>&1 || resume_rc=$?
+      docker start "$cname" > /dev/null 2>"$_docker_err" || resume_rc=$?
       if [[ $resume_rc -ne 0 ]]; then
-        error "Container failed to start. Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET}."
+        error "Container failed to start."
+        [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
+        rm -f "$_docker_err"
+        error "Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET} to recreate."
         exit 1
       fi
+      rm -f "$_docker_err" 2>/dev/null
     else
       error "No container found for this project. Use ${BOLD}cleat start${RESET} first."
       exit 1

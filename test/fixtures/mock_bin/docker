@@ -33,4 +33,6 @@ case "$1" in
     ;;
 esac
 
+[[ -n "${DOCKER_STDERR:-}" ]] && echo "$DOCKER_STDERR" >&2
+
 exit "${DOCKER_EXIT_CODE:-0}"

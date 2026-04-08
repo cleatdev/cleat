@@ -74,6 +74,10 @@ teardown() { _common_teardown; }
   hash="$(printf '%s' "$project_path" | md5sum 2>/dev/null | head -c 8)"
   local expected_cname="cleat-${dir_name}-${hash}"
 
+  # Create settings overlay dir so stale-mount check doesn't trigger
+  mkdir -p "/tmp/cleat-settings-${expected_cname}"
+  echo '{}' > "/tmp/cleat-settings-${expected_cname}/settings.json"
+
   # Mock docker: image exists, container exists (stopped), start fails
   cat > "$TEST_TEMP/strict-bin/docker" << MOCK
 #!/bin/bash
@@ -101,6 +105,7 @@ MOCK
   # Must fail with proper message (spin_stop was reached, not set -e abort)
   assert_failure
   assert_output --partial "Container failed to start"
+  rm -rf "/tmp/cleat-settings-${expected_cname}"
 }
 
 @test "strict mode: cleat --help runs without error" {

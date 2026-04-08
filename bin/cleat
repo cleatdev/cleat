@@ -1373,34 +1373,44 @@ cmd_start() {
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      # Restarting a stopped container — image already exists
-      success "Image ready ${RESET}${DIM}(cached)"
-      spin "Starting container..."
-      local _docker_err="/tmp/cleat-err.$$"
-      local start_rc=0
-      docker start "$cname" > /dev/null 2>"$_docker_err" || start_rc=$?
-      spin_stop "$start_rc" "Container started" "Container failed to start"
-      if [[ $start_rc -ne 0 ]]; then
-        [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
-        rm -f "$_docker_err"
-        if _is_tty; then
-          echo ""
-          echo -n "  Remove container and start fresh? [Y/n] "
-          local yn
-          read -r yn
-          if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-            docker rm -f "$cname" > /dev/null 2>&1 || true
-            success "Removed ${BOLD}$cname${RESET}."
-            cmd_run "$project"
+      # Detect stale mounts (e.g., after host reboot clears /tmp and
+      # rotates the SSH agent socket path).  The container's bind mounts
+      # are baked in at creation time and cannot be updated — recreate.
+      local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+      if [[ ! -d "$settings_overlay_dir" ]]; then
+        info "Recreating container ${DIM}(host paths changed)"
+        docker rm -f "$cname" > /dev/null 2>&1 || true
+        cmd_run "$project"
+      else
+        # Restarting a stopped container — image already exists
+        success "Image ready ${RESET}${DIM}(cached)"
+        spin "Starting container..."
+        local _docker_err="/tmp/cleat-err.$$"
+        local start_rc=0
+        docker start "$cname" > /dev/null 2>"$_docker_err" || start_rc=$?
+        spin_stop "$start_rc" "Container started" "Container failed to start"
+        if [[ $start_rc -ne 0 ]]; then
+          [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
+          rm -f "$_docker_err"
+          if _is_tty; then
+            echo ""
+            echo -n "  Remove container and start fresh? [Y/n] "
+            local yn
+            read -r yn
+            if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+              docker rm -f "$cname" > /dev/null 2>&1 || true
+              success "Removed ${BOLD}$cname${RESET}."
+              cmd_run "$project"
+            else
+              exit 1
+            fi
           else
+            error "Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET} to recreate."
             exit 1
           fi
-        else
-          error "Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET} to recreate."
-          exit 1
         fi
+        rm -f "$_docker_err" 2>/dev/null
       fi
-      rm -f "$_docker_err" 2>/dev/null
     else
       cmd_run "$project"
     fi
@@ -1484,6 +1494,14 @@ cmd_resume() {
   # Start container if stopped
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
+      # Detect stale mounts (e.g., after host reboot clears /tmp and
+      # rotates the SSH agent socket path).  Can't docker-start with
+      # broken bind sources — tell user to recreate.
+      if [[ ! -d "$settings_overlay_dir" ]]; then
+        error "Container mounts are stale ${DIM}(host was rebooted)${RESET}."
+        error "Run ${BOLD}cleat${RESET} to recreate the container."
+        exit 1
+      fi
       local _docker_err="/tmp/cleat-err.$$"
       local resume_rc=0
       docker start "$cname" > /dev/null 2>"$_docker_err" || resume_rc=$?

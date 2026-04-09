@@ -248,7 +248,7 @@ cleat ps
 | `cleat config --disable <cap>` | Disable a capability |
 | `cleat config --project --enable <cap>` | Project-level config (saved to `.cleat`) |
 
-#### Flags (apply to `start`, `run`, `resume`, `claude`)
+#### Flags (apply to `start`, `run`, `resume`, `claude`, `shell`, `login`)
 | Flag | Description |
 |---|---|
 | `--cap <name>` | Enable a capability for this session only |

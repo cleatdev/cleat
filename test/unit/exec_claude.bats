@@ -41,6 +41,30 @@ teardown() { _common_teardown; }
   rm -rf "/tmp/cleat-clip-my-ctr"
 }
 
+@test "passes resolved env args to docker exec" {
+  _RESOLVED_ENV_ARGS=(-e "DATABASE_URL=postgres://localhost/mydb" -e "SECRET=abc")
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  run assert_docker_exec_has "DATABASE_URL=postgres://localhost/mydb"
+  assert_success
+  run assert_docker_exec_has "SECRET=abc"
+  assert_success
+}
+
+@test "handles empty resolved env args without error" {
+  _RESOLVED_ENV_ARGS=()
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  run assert_docker_exec_has "test-ctr"
+  assert_success
+}
+
+@test "env args with special characters are preserved" {
+  _RESOLVED_ENV_ARGS=(-e "DSN=postgres://user:p@ss@host/db?opt=1&x=2")
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  run assert_docker_exec_has "DSN=postgres://user:p@ss@host/db?opt=1&x=2"
+  assert_success
+}
+
 @test "exit 0 and 130 (Ctrl-C) produce no warning" {
   for code in 0 130; do
     export DOCKER_EXIT_CODE=$code

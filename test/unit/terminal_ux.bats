@@ -298,6 +298,18 @@ EOF
   assert_output ""
 }
 
+@test "env summary inline: shows line with 0 count when file exists but has only comments" {
+  ACTIVE_CAPS=(env)
+  mkdir -p "$TEST_TEMP/project"
+  cat > "$TEST_TEMP/project/.cleat.env" << 'EOF'
+# only comments
+# GH_TOKEN
+EOF
+  run _env_summary_inline "$TEST_TEMP/project"
+  assert_output --partial "Env:"
+  assert_output --partial "0 from .cleat.env"
+}
+
 # ── Canonical startup messages ────────────────────────────────────────────
 
 @test "start: outputs Auth shared message" {

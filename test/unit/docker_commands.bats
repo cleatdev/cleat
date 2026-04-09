@@ -215,7 +215,7 @@ teardown() { _common_teardown; }
   assert_output --partial "not running"
 }
 
-@test "shell: execs bash as coder with HOME set" {
+@test "shell: execs bash as coder with HOME and PATH set" {
   mkdir -p "$TEST_TEMP/project"
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
@@ -227,7 +227,32 @@ teardown() { _common_teardown; }
   assert_success
   run assert_docker_exec_has "HOME=/home/coder"
   assert_success
+  run assert_docker_exec_has "PATH="
+  assert_success
   run assert_docker_exec_has "bash"
+  assert_success
+}
+
+@test "shell: passes resolved env args to docker exec" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+
+  cat > "$TEST_TEMP/project/.cleat.env" << 'EOF'
+DATABASE_URL=postgres://localhost/mydb
+API_KEY=secret123
+EOF
+  cat > "$TEST_TEMP/project/.cleat" << 'EOF'
+[caps]
+env
+EOF
+
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "DATABASE_URL=postgres://localhost/mydb"
+  assert_success
+  run assert_docker_exec_has "API_KEY=secret123"
   assert_success
 }
 
@@ -253,6 +278,26 @@ teardown() { _common_teardown; }
   run assert_docker_exec_has "--user coder"
   assert_success
   run assert_docker_exec_has ".local/bin"
+  assert_success
+}
+
+@test "login: passes resolved env args to docker exec" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+
+  cat > "$TEST_TEMP/project/.cleat.env" << 'EOF'
+API_BASE=https://custom.api.example.com
+EOF
+  cat > "$TEST_TEMP/project/.cleat" << 'EOF'
+[caps]
+env
+EOF
+
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "API_BASE=https://custom.api.example.com"
   assert_success
 }
 

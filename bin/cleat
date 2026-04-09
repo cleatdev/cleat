@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.6.2"
+VERSION="0.6.3"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -315,7 +315,7 @@ cap_is_active() {
 _parse_env_file() {
   local file="$1"
   [[ -f "$file" ]] || return 0
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip carriage return (CRLF from Windows editors)
     line="${line%$'\r'}"
     # Strip leading/trailing whitespace
@@ -616,24 +616,28 @@ _env_summary_inline() {
   local project="${1:-}"
   local global_count=0
   local project_count=0
+  local global_exists=false
+  local project_exists=false
 
   if cap_is_active env 2>/dev/null; then
     if [[ -f "$CLEAT_GLOBAL_ENV" ]]; then
+      global_exists=true
       global_count=$(_parse_env_file "$CLEAT_GLOBAL_ENV" | wc -l)
       global_count=$((global_count + 0))
     fi
     if [[ -n "$project" && -f "$project/.cleat.env" ]]; then
+      project_exists=true
       project_count=$(_parse_env_file "$project/.cleat.env" | wc -l)
       project_count=$((project_count + 0))
     fi
   fi
 
-  if (( global_count + project_count > 0 )); then
+  if $global_exists || $project_exists; then
     local msg=""
-    if (( global_count > 0 )); then
+    if $global_exists; then
       msg+="${global_count} from ~/.config/cleat/env"
     fi
-    if (( project_count > 0 )); then
+    if $project_exists; then
       [[ -n "$msg" ]] && msg+=", "
       msg+="${project_count} from .cleat.env"
     fi
@@ -1064,7 +1068,8 @@ exec_claude() {
   trap _cleanup_session EXIT INT TERM HUP
 
   local rc=0
-  docker exec -it --user coder "${CLAUDE_ENV[@]}" "$cname" \
+  docker exec -it --user coder "${CLAUDE_ENV[@]}" \
+    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
     bash -c '
       clip-daemon &
       _MY_CLIP_DAEMON=$!
@@ -1572,8 +1577,11 @@ cmd_shell() {
   cname="$(container_name_for "$project")"
 
   require_running "$cname"
+  resolve_caps "$project"
+  resolve_env_args "$project"
   info "Container ${BOLD}${cname}${RESET}"
-  docker exec -it --user coder -e HOME=/home/coder "$cname" bash
+  docker exec -it --user coder "${CLAUDE_ENV[@]}" \
+    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" bash
 }
 
 cmd_login() {
@@ -1583,6 +1591,8 @@ cmd_login() {
   cname="$(container_name_for "$project")"
 
   require_running "$cname"
+  resolve_caps "$project"
+  resolve_env_args "$project"
   info "Authenticating with your Anthropic team account..."
 
   # Start browser bridge so auth URL opens automatically and callback works
@@ -1603,7 +1613,8 @@ cmd_login() {
   echo ""
 
   local login_rc=0
-  docker exec -it --user coder -e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$cname" claude login || login_rc=$?
+  docker exec -it --user coder "${CLAUDE_ENV[@]}" \
+    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" claude login || login_rc=$?
 
   # Cleanup browser bridge
   if [ -n "$_login_browser_pid" ]; then

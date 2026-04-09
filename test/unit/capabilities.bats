@@ -380,6 +380,14 @@ EOF
   assert_line --index 1 "BAZ=qux"
 }
 
+@test "parse_env_file: reads last line without trailing newline" {
+  printf 'FOO=bar\nBAZ=qux' > "$TEST_TEMP/envfile"
+  run _parse_env_file "$TEST_TEMP/envfile"
+  assert_success
+  assert_line --index 0 "FOO=bar"
+  assert_line --index 1 "BAZ=qux"
+}
+
 @test "parse_env_file: skips empty key (=VALUE line)" {
   cat > "$TEST_TEMP/envfile" << 'EOF'
 =should_skip

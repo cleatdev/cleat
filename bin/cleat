@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.6.3"
+VERSION="0.6.4"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -589,7 +589,7 @@ _print_startup_caps() {
     local caps_str
     caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
     caps_str="${caps_str%, }"
-    info "Caps: ${BOLD}${caps_str}${RESET}"
+    info "Caps: ${GREEN}${BOLD}${caps_str}${RESET}"
   fi
 }
 
@@ -607,7 +607,7 @@ _print_summary_block() {
     local caps_str
     caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
     caps_str="${caps_str%, }"
-    echo -e "  ${DIM}Caps:${RESET}       ${BOLD}${caps_str}${RESET}"
+    echo -e "  ${DIM}Caps:${RESET}       ${GREEN}${BOLD}${caps_str}${RESET}"
   fi
   _env_summary_inline "$project"
 }
@@ -747,60 +747,156 @@ _extract_callback_port() {
 _auth_callback_proxy() {
   local port="$1"
   local cname="$2"
+  local log_file="${3:-}"
+
+  _proxy_log() { [ -n "$log_file" ] && echo "[proxy $(date +%H:%M:%S)] $*" >> "$log_file"; }
 
   trap 'exit 0' TERM INT HUP
 
+  _proxy_log "starting: port=$port container=$cname"
+
   # Prefer socat on host → docker exec socat in container
+  # Try IPv6 first (Node.js binds to ::1 when given "localhost"), fall back to IPv4
+  # Use ignoreeof on the container side so stdin EOF doesn't kill the TCP read
+  # Retry bind up to 30s if the port is temporarily busy
   if command -v socat &>/dev/null; then
-    socat "TCP-LISTEN:${port},bind=127.0.0.1,reuseaddr" \
-      "EXEC:docker exec -i ${cname} socat - TCP\\:localhost\\:${port}" 2>/dev/null || true
+    _proxy_log "using socat on host"
+    local socat_rc=0 _attempt
+    for _attempt in $(seq 1 30); do
+      socat "TCP-LISTEN:${port},bind=127.0.0.1,reuseaddr" \
+        "EXEC:sh -c 'docker exec -i ${cname} socat -,ignoreeof TCP6\\:localhost\\:${port} 2>/dev/null || docker exec -i ${cname} socat -,ignoreeof TCP\\:localhost\\:${port}'" \
+        2>>"${log_file:-/dev/null}" && { socat_rc=0; break; } || socat_rc=$?
+      [[ $socat_rc -eq 1 ]] || break
+      [[ $_attempt -eq 1 ]] && _proxy_log "socat bind failed, retrying..."
+      sleep 1
+    done
+    _proxy_log "socat exited with status $socat_rc"
     return
   fi
 
-  # Fallback: python3 TCP proxy via docker exec socat
+  # Fallback: python3 HTTP-aware proxy with retry
   if command -v python3 &>/dev/null; then
-    python3 - "$port" "$cname" 2>/dev/null <<'PYEOF' || true
-import socket, subprocess, threading, sys, signal, os
-_child = [None]
-def _term(*_):
-    if _child[0]: _child[0].terminate()
-    os._exit(0)
+    _proxy_log "using python3 fallback"
+    local py_rc=0
+    python3 - "$port" "$cname" "$log_file" <<'PYEOF' || py_rc=$?
+import socket, subprocess, sys, signal, os, time
+log_file = sys.argv[3] if len(sys.argv) > 3 else None
+def _log(msg):
+    if log_file:
+        try:
+            with open(log_file, 'a') as f: f.write(f"[proxy-py {msg}]\n")
+        except: pass
+def _term(*_): os._exit(0)
 signal.signal(signal.SIGTERM, _term)
 signal.signal(signal.SIGINT, _term)
+def _send_generic_success(conn):
+    body = (b"<!doctype html><html><head><title>Authentication Successful</title>"
+            b"<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:32em;"
+            b"margin:4em auto;padding:2em;text-align:center;color:#222}"
+            b"h1{color:#22863a}</style></head><body>"
+            b"<h1>Authentication Successful</h1>"
+            b"<p>You can close this window and return to Claude Code.</p>"
+            b"</body></html>")
+    resp = (b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body)
+    try: conn.sendall(resp)
+    except Exception: pass
 port, cname = int(sys.argv[1]), sys.argv[2]
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    srv.bind(('127.0.0.1', port))
-except OSError:
+if hasattr(socket, 'SO_REUSEPORT'):
+    try: srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except OSError: pass
+# Retry bind — the port may be briefly held by another process
+bound = False
+for bind_attempt in range(30):
+    try:
+        srv.bind(('127.0.0.1', port))
+        bound = True
+        break
+    except OSError as e:
+        if bind_attempt == 0:
+            _log(f"bind attempt 1 failed: {e}, retrying...")
+        time.sleep(1)
+if not bound:
+    _log(f"bind failed after 30 attempts, giving up")
     sys.exit(0)
+_log(f"listening on 127.0.0.1:{port}")
 srv.listen(1)
 srv.settimeout(300)
 try:
-    cli, _ = srv.accept()
-    proc = subprocess.Popen(
-        ['docker', 'exec', '-i', cname, 'socat', '-', 'TCP:localhost:' + str(port)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    _child[0] = proc
-    def fwd(src, dst):
+    cli, addr = srv.accept()
+    _log(f"accepted connection from {addr}")
+    # Read the full HTTP request from the browser
+    cli.settimeout(5)
+    req_data = b""
+    while True:
         try:
-            while True:
-                data = src.read(4096)
-                if not data: break
-                dst.write(data); dst.flush()
-        except Exception: pass
-        try: dst.close()
-        except Exception: pass
-    t1 = threading.Thread(target=fwd, args=(cli.makefile('rb'), proc.stdin), daemon=True)
-    t2 = threading.Thread(target=fwd, args=(proc.stdout, cli.makefile('wb')), daemon=True)
-    t1.start(); t2.start()
-    proc.wait(timeout=30)
+            chunk = cli.recv(4096)
+            if not chunk: break
+            req_data += chunk
+            # HTTP request ends with \r\n\r\n (GET has no body)
+            if b"\r\n\r\n" in req_data: break
+        except socket.timeout: break
+    _log(f"got {len(req_data)} bytes from browser")
+    # Rewrite Connection: keep-alive → close so the container's server will
+    # close the TCP connection after its response.
+    req_data = req_data.replace(b"Connection: keep-alive", b"Connection: close      ")
+    req_data = req_data.replace(b"connection: keep-alive", b"connection: close      ")
+    # Forward to the container — try IPv6 first (Node.js binds to ::1), fall back to IPv4
+    # Use `-,ignoreeof` so socat doesn't propagate stdin EOF to the TCP socket,
+    # giving the container server time to write its response before closing.
+    ok = False
+    for proto in ['TCP6', 'TCP']:
+        proc = subprocess.Popen(
+            ['docker', 'exec', '-i', cname, 'socat', '-,ignoreeof', f'{proto}:localhost:{port}'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            stdout, stderr = proc.communicate(input=req_data, timeout=30)
+            errtxt = stderr.decode(errors='replace').strip() if stderr else ''
+            if stdout:
+                _log(f"forwarded OK via {proto}, got {len(stdout)} bytes back")
+                cli.sendall(stdout)
+                ok = True
+                break
+            if proc.returncode == 0:
+                # Connection succeeded, request delivered, but no response bytes.
+                _log(f"delivered via {proto} (empty response, assuming success)")
+                _send_generic_success(cli)
+                ok = True
+                break
+            if 'refused' in errtxt.lower():
+                _log(f"{proto} connection refused, trying next")
+                continue
+            _log(f"{proto} failed rc={proc.returncode} stderr={errtxt}")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try: proc.wait(timeout=2)
+            except subprocess.TimeoutExpired: pass
+            _log(f"{proto} timed out — assuming code was delivered")
+            _send_generic_success(cli)
+            ok = True
+            break
+    if not ok:
+        _log("forwarding failed on both IPv6 and IPv4")
+        cli.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\n\r\n"
+                    b"<h1>Cleat: callback forwarding failed</h1>"
+                    b"<p>Could not reach Claude Code's auth server inside the container.</p>"
+                    b"<p>Check <code>/tmp/cleat-clip/.proxy-log</code> for details.</p>")
     cli.close()
-except Exception: pass
+except socket.timeout:
+    _log("timeout waiting for callback (300s)")
+except Exception as e:
+    _log(f"error: {e}")
 finally: srv.close()
 PYEOF
+    _proxy_log "python3 proxy exited with status $py_rc"
     return
   fi
+
+  _proxy_log "FAILED: neither socat nor python3 available on host"
 }
 
 _browser_watcher() {
@@ -834,12 +930,15 @@ _browser_watcher() {
         if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
           # Start auth callback proxy if URL has a localhost redirect_uri
           if [ -n "$cname" ]; then
-            local cb_port
+            local cb_port proxy_log="$clip_dir/.proxy-log"
             cb_port=$(_extract_callback_port "$url" 2>/dev/null) && {
               _bw_cleanup  # kill any previous proxy
-              _auth_callback_proxy "$cb_port" "$cname" &
+              echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
+              _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" &
               _proxy_pid=$!
-              sleep 0.2  # let proxy bind before opening browser
+              sleep 0.5  # let proxy bind before opening browser
+            } || {
+              echo "[browser-watcher $(date +%H:%M:%S)] no redirect_uri port found in URL" >> "$clip_dir/.proxy-log"
             }
           fi
           $open_cmd "$url" >/dev/null 2>&1 || true

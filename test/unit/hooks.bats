@@ -1221,7 +1221,7 @@ SCRIPT
 
   local proxy_marker="$TEST_TEMP/proxy-started"
   _auth_callback_proxy() {
-    echo "$1 $2" > "$proxy_marker"
+    echo "$1 $2 $3" > "$proxy_marker"
   }
 
   _browser_watcher "$clip_dir" "$mock_open" "test-container" &
@@ -1237,7 +1237,51 @@ SCRIPT
   [[ -f "$marker" ]] || { echo "URL was not opened in browser"; return 1; }
   [[ -f "$proxy_marker" ]] || { echo "Callback proxy was not started"; return 1; }
   run cat "$proxy_marker"
-  assert_output "34063 test-container"
+  assert_output "34063 test-container $clip_dir/.proxy-log"
+}
+
+@test "_auth_callback_proxy: writes diagnostic start line to log file" {
+  local log_file="$TEST_TEMP/proxy-diag.log"
+  # Stub tools lookup so neither socat nor python3 branch executes — we only
+  # want to verify the start-of-run diagnostic is emitted.
+  command() {
+    if [[ "$1" == "-v" ]]; then return 1; fi
+    builtin command "$@"
+  }
+
+  _auth_callback_proxy 12345 fake-container "$log_file"
+
+  [[ -f "$log_file" ]] || { echo "proxy log not written"; return 1; }
+  run cat "$log_file"
+  assert_output --partial "starting: port=12345 container=fake-container"
+  assert_output --partial "FAILED: neither socat nor python3 available on host"
+}
+
+@test "browser watcher: writes diagnostic log with extracted port" {
+  local clip_dir="$TEST_TEMP/clip-log"
+  local marker="$TEST_TEMP/browser-opened-log"
+  mkdir -p "$clip_dir"
+
+  local mock_open="$TEST_TEMP/mock-open-log"
+  printf '#!/bin/bash\necho "$1" > %s\n' "$marker" > "$mock_open"
+  chmod +x "$mock_open"
+
+  # Stub proxy — succeed silently
+  _auth_callback_proxy() { :; }
+
+  _browser_watcher "$clip_dir" "$mock_open" "test-container" &
+  local watcher_pid=$!
+  sleep 0.3
+
+  printf 'https://auth.example.com/login?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A49152%%2Fcallback&state=xyz' > "$clip_dir/.browser-open"
+  sleep 1.5
+
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+
+  [[ -f "$clip_dir/.proxy-log" ]] || { echo "proxy log was not created"; return 1; }
+  run cat "$clip_dir/.proxy-log"
+  assert_output --partial "extracted callback port=49152"
 }
 
 @test "browser watcher: no proxy for non-OAuth URL" {

@@ -1370,12 +1370,14 @@ cmd_run() {
     mount_args+=(-v "$hooks_dir":/var/log/cleat)
 
     # Mount project-level settings overlays when .claude/ exists.
-    # Files with hooks get event forwarders; files without hooks are copied as-is;
-    # missing files get empty {} so hooks added later take effect on resume.
-    # Skip entirely when .claude/ doesn't exist — Docker would create it as root.
+    # Only mount files that already exist on the host — Docker Desktop virtiofs
+    # can't create new files at bind-mount targets inside another bind mount
+    # (/workspace is bind-mounted from the project, so the target must exist).
+    # Files added later need `cleat rm && cleat` to pick up.
     if [[ -d "$project/.claude" ]]; then
       local pf
       for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+        [[ -f "$pf" ]] || continue
         local _base _overlay_name
         _base="$(basename "$pf")"
         _overlay_name="project-$_base"
@@ -1389,10 +1391,8 @@ cmd_run() {
               ])
             else . end
           ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
-        elif [[ -f "$pf" ]]; then
-          cp "$pf" "$settings_overlay_dir/$_overlay_name"
         else
-          echo '{}' > "$settings_overlay_dir/$_overlay_name"
+          cp "$pf" "$settings_overlay_dir/$_overlay_name"
         fi
         mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
       done
@@ -1458,6 +1458,8 @@ cmd_run() {
   if [[ $run_rc -ne 0 ]]; then
     [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
     rm -f "$_docker_err"
+    # Clean up any partial container state so the next attempt starts fresh
+    docker rm -f "$cname" > /dev/null 2>&1 || true
     exit 1
   fi
   rm -f "$_docker_err"

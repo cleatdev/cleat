@@ -362,6 +362,55 @@ EOF
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
 
+@test "run: skips project overlay for files that don't exist on host" {
+  # Regression: writing empty {} and mounting for missing files fails on
+  # macOS Docker Desktop virtiofs (can't create target file at bind-mount
+  # target inside another bind mount). Only mount files that exist.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  # .claude/ exists but neither settings.json nor settings.local.json
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # Should NOT mount overlays for missing files
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.local.json"
+  assert_success
+
+  # Overlay files should not be created for missing host files
+  [[ ! -f "/tmp/cleat-settings-${cname}/project-settings.json" ]] || {
+    echo "project-settings.json overlay should not exist for missing host file"
+    return 1
+  }
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "run: mounts only existing overlay files when one of two exists" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  # Only settings.local.json exists, settings.json does not
+  echo '{"permissions":{"allow":["Read"]}}' > "$TEST_TEMP/project/.claude/settings.local.json"
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # Existing file is mounted
+  run assert_docker_run_has "$cname" "settings.local.json:/workspace/.claude/settings.local.json"
+  assert_success
+  # Missing file is not mounted
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
 @test "run: skips project overlay when no .claude/ directory" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

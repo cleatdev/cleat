@@ -18,6 +18,24 @@ _common_setup() {
   MOCK_BIN="$TEST_DIR/fixtures/mock_bin"
   export MOCK_BIN
 
+  # ── Host isolation ─────────────────────────────────────────────────────
+  # Every test gets a fresh HOME under TEST_TEMP. This prevents tests from
+  # touching the developer's or CI runner's real home directory (e.g.
+  # writing to ~/.gitconfig, ~/.claude/settings.json). Tests that need to
+  # assert on the real host can override HOME explicitly after setup.
+  _REAL_HOME="${HOME:-}"
+  export _REAL_HOME
+  HOME="$TEST_TEMP/home"
+  export HOME
+  mkdir -p "$HOME/.claude"
+
+  # Git commits in some tests need an author identity. Inject via env vars
+  # so we don't need a global .gitconfig (which would pollute the real host).
+  export GIT_AUTHOR_NAME="Cleat Test"
+  export GIT_AUTHOR_EMAIL="test@cleat.sh"
+  export GIT_COMMITTER_NAME="Cleat Test"
+  export GIT_COMMITTER_EMAIL="test@cleat.sh"
+
   # Docker stub records calls here
   DOCKER_CALLS="$TEST_TEMP/docker_calls"
   export DOCKER_CALLS
@@ -36,20 +54,34 @@ _common_setup() {
 }
 
 _common_teardown() {
+  # Restore real HOME so later tests in the same process don't accidentally
+  # inherit the isolated home
+  [[ -n "${_REAL_HOME:-}" ]] && HOME="$_REAL_HOME"
   rm -rf "$TEST_TEMP"
 }
 
-# Source the CLI (without running main)
-# The CLI has `set -euo pipefail` at line 2.  We strip it before sourcing
-# because it clobbers bats' internal ERR trap (which bats needs to detect
-# test failures).  The CLI functions don't need `-e` to be defined — they
-# handle errors with explicit `exit 1` / `return` in their own logic.
-# We keep pipefail OFF to avoid flaky failures in pipeline-based helpers
-# like `is_running` which use `docker ps ... | grep -q ...`.
+# Source the CLI (without running main).
+#
+# The CLI runs under `set -euo pipefail` in production. In tests:
+#   - `-e` conflicts with bats' ERR trap, so we can't keep it while sourced
+#   - `-u` and `pipefail` are safe and catch real bugs — we preserve them
+#
+# This means sourced tests now catch unbound variables and pipe failures.
+# The strict-mode smoke tests in test/unit/smoke.bats are the second line
+# of defense: they exec the real binary under full strict mode to catch
+# bugs that `-e` would surface at runtime but sourced tests can't.
 source_cli() {
   local _cli_tmp
   _cli_tmp=$(mktemp)
-  sed 's/^set -euo pipefail$/# [stripped for testing]/' "$CLI" > "$_cli_tmp"
+  # Strip `set -euo pipefail` entirely for sourced tests. Keeping any of
+  # -e/-u/-o pipefail introduces subtle test-order pollution in bats because
+  # function overrides and global state interact with bash's strict checks
+  # differently across test files.
+  #
+  # Strict mode IS tested — but via the smoke layer (test/unit/smoke.bats)
+  # which runs the real binary as a subprocess under full `set -euo pipefail`.
+  # That layer caught the corrupted-cache bug that sourced tests missed.
+  sed 's/^set -euo pipefail$/# [stripped for testing — strict mode via smoke.bats]/' "$CLI" > "$_cli_tmp"
   source "$_cli_tmp"
   rm -f "$_cli_tmp"
 }

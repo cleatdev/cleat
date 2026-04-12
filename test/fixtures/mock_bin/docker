@@ -1,13 +1,44 @@
 #!/usr/bin/env bash
-# Docker stub — records calls and returns canned responses via files.
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker stub (hardened).
 #
-# Mock responses are read from files in DOCKER_MOCK_DIR (set by _common_setup):
-#   ps_output      — for "docker ps --filter ..."
-#   ps_a_output    — for "docker ps -a --filter ..."
-#   images_output  — for "docker images ..."
+# Default mode (backwards compat): records every call to $DOCKER_CALLS,
+# returns canned responses for `ps`/`ps -a`/`images`/`inspect`, exits 0.
 #
-# Every call is appended to $DOCKER_CALLS file.
+# Opt-in strict modes (enable via env vars):
+#
+#   DOCKER_STUB_STRICT=1
+#     Validates `docker run -v SRC:DEST[:FLAGS]` arguments:
+#     - SRC must exist on the host filesystem
+#     - DEST must be absolute
+#     - Flags limited to ro/rw/z/Z/delegated/cached/consistent
+#     Failure mode mimics real docker: exit 125, stderr "Error response from
+#     daemon: invalid mount".
+#
+#   DOCKER_STUB_SIMULATE_VIRTIOFS=1
+#     Simulates macOS Docker Desktop virtiofs restriction: when a bind
+#     mount DEST path is *inside another bind mount's DEST*, the target
+#     file must exist on the host (virtiofs can't create files at nested
+#     bind-mount targets). This catches v0.6.5-class regressions.
+#
+#   DOCKER_STUB_REJECT_UNKNOWN_FLAGS=1
+#     Rejects unknown/malformed flags instead of silently accepting them.
+#
+# Responses (read from $DOCKER_MOCK_DIR):
+#   ps_output      — for `docker ps --filter ...`
+#   ps_a_output    — for `docker ps -a --filter ...`
+#   images_output  — for `docker images ...`
+#   inspect_output — for `docker inspect ...`
+#
+# Every call is appended to $DOCKER_CALLS (one call per line; multi-arg
+# commands like `docker exec container bash -c 'foo'` are written on a
+# single line via $* expansion).
+#
+# Exit code is controlled by $DOCKER_EXIT_CODE (default 0).
+# Stderr is emitted if $DOCKER_STDERR is set.
+# ─────────────────────────────────────────────────────────────────────────────
 
+# Record the call (always, for observability)
 echo "docker $*" >> "${DOCKER_CALLS:-/dev/null}"
 
 _mock() {
@@ -15,6 +46,135 @@ _mock() {
   [[ -f "$f" ]] && cat "$f"
 }
 
+# ─── Strict validation helpers ─────────────────────────────────────────────
+_stub_die() {
+  local msg="$1"
+  echo "Error response from daemon: $msg" >&2
+  exit 125
+}
+
+# Parse a `-v SRC:DEST[:FLAGS]` spec and validate it.
+# Returns 0 if valid, calls _stub_die if invalid.
+_validate_mount_spec() {
+  local spec="$1"
+  # Split into SRC, DEST, FLAGS using parameter expansion.
+  # Named volumes (no leading /) are allowed and skipped.
+  [[ "$spec" == /* ]] || return 0
+
+  local src="${spec%%:*}"
+  local rest="${spec#*:}"
+  local dest flags
+  if [[ "$rest" == *:* ]]; then
+    dest="${rest%%:*}"
+    flags="${rest#*:}"
+  else
+    dest="$rest"
+    flags=""
+  fi
+
+  # SRC must exist on the host filesystem
+  if [[ ! -e "$src" ]]; then
+    _stub_die "invalid mount config for type \"bind\": bind source path does not exist: $src"
+  fi
+
+  # DEST must be absolute
+  if [[ "$dest" != /* ]]; then
+    _stub_die "invalid mount config: destination path must be absolute: $dest"
+  fi
+
+  # Flags must be a subset of the known set
+  if [[ -n "$flags" ]]; then
+    local IFS=','
+    local f
+    for f in $flags; do
+      case "$f" in
+        ro|rw|z|Z|delegated|cached|consistent) ;;
+        *) _stub_die "invalid mount config: unknown flag '$f'" ;;
+      esac
+    done
+  fi
+}
+
+# Virtiofs simulation: a bind mount DEST that's *inside* another bind mount
+# must have its target path already exist on the host (relative to that
+# parent bind mount's source). This reproduces the v0.6.5 failure mode:
+# mounting an overlay file to /workspace/.claude/settings.json fails when
+# the host path $project/.claude/settings.json doesn't exist.
+#
+# Takes an array of all bind specs and validates each one.
+_validate_virtiofs_nested() {
+  local -a mounts=("$@")
+  local i j
+  local n=${#mounts[@]}
+
+  for ((i = 0; i < n; i++)); do
+    local spec="${mounts[$i]}"
+    [[ "$spec" == /* ]] || continue
+    local src="${spec%%:*}"
+    local rest="${spec#*:}"
+    local dest="${rest%%:*}"
+
+    # Only validate file (not directory) mounts whose dest is inside another
+    # bind's dest. Directories are created freely on macOS; files are not.
+    [[ -f "$src" ]] || continue
+
+    for ((j = 0; j < n; j++)); do
+      [[ "$i" != "$j" ]] || continue
+      local parent="${mounts[$j]}"
+      [[ "$parent" == /* ]] || continue
+      local p_src="${parent%%:*}"
+      local p_rest="${parent#*:}"
+      local p_dest="${p_rest%%:*}"
+      [[ -d "$p_src" ]] || continue
+
+      # Is dest inside p_dest?
+      if [[ "$dest" == "$p_dest"/* ]]; then
+        # Compute the host path under the parent bind
+        local suffix="${dest#"$p_dest"/}"
+        local host_path="$p_src/$suffix"
+        if [[ ! -e "$host_path" ]]; then
+          _stub_die "error mounting \"$src\" to rootfs at \"$dest\": create mountpoint for $dest mount: mountpoint \"$host_path\" is outside of rootfs"
+        fi
+      fi
+    done
+  done
+}
+
+# Parse `docker run ...` args and apply validators.
+_validate_docker_run() {
+  local -a mounts=()
+  local in_dollar=false
+  shift  # drop 'run'
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -v|--volume)
+        shift
+        [[ $# -gt 0 ]] || _stub_die "flag needs an argument: -v"
+        if [[ "${DOCKER_STUB_STRICT:-}" == "1" ]]; then
+          _validate_mount_spec "$1"
+        fi
+        mounts+=("$1")
+        shift
+        ;;
+      -v=*|--volume=*)
+        if [[ "${DOCKER_STUB_STRICT:-}" == "1" ]]; then
+          _validate_mount_spec "${1#*=}"
+        fi
+        mounts+=("${1#*=}")
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "${DOCKER_STUB_SIMULATE_VIRTIOFS:-}" == "1" && ${#mounts[@]} -gt 0 ]]; then
+    _validate_virtiofs_nested "${mounts[@]}"
+  fi
+}
+
+# ─── Subcommand dispatch ───────────────────────────────────────────────────
 case "$1" in
   ps)
     if [[ "$*" == *"-a"* ]]; then
@@ -29,10 +189,16 @@ case "$1" in
   inspect)
     _mock "inspect_output"
     ;;
-  build|run|start|stop|rm|exec|logs|rmi|image|builder)
+  run)
+    # Validate bind mounts in strict / virtiofs modes. This must happen
+    # BEFORE we emit DOCKER_STDERR / exit so the strict errors take priority.
+    _validate_docker_run "$@"
+    ;;
+  build|start|stop|rm|exec|logs|rmi|image|builder)
     ;;
 esac
 
+# Legacy: arbitrary stderr/exit injection for tests that need it
 [[ -n "${DOCKER_STDERR:-}" ]] && echo "$DOCKER_STDERR" >&2
 
 exit "${DOCKER_EXIT_CODE:-0}"

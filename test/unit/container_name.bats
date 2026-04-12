@@ -80,3 +80,81 @@ teardown() { _common_teardown; }
   middle="${middle%-????????}"
   [[ "$middle" != *- ]]  || return 1
 }
+
+# ── Shell metacharacter handling ────────────────────────────────────────────
+# Paths that contain shell metacharacters must not break container_name_for
+# or leak through as Docker container names. Docker rejects names with most
+# special chars, so we sanitize to [a-z0-9-] and rely on the hash for unique
+# identification.
+
+@test "handles path with dollar sign" {
+  local result
+  result="$(container_name_for "/tmp/my\$project")"
+  [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
+  # No $ should appear in the name
+  [[ "$result" != *\$* ]]  || return 1
+}
+
+@test "handles path with ampersand" {
+  local result
+  result="$(container_name_for "/tmp/my&proj")"
+  [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
+  [[ "$result" != *\&* ]]  || return 1
+}
+
+@test "handles path with semicolons and pipes" {
+  local result
+  result="$(container_name_for "/tmp/my;pro|j")"
+  [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
+  [[ "$result" != *\;* ]]  || return 1
+  [[ "$result" != *\|* ]]  || return 1
+}
+
+@test "handles path with backticks and quotes" {
+  local result
+  result="$(container_name_for "/tmp/my\`proj'x\"")"
+  [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
+  [[ "$result" != *\`* ]]  || return 1
+  [[ "$result" != *\'* ]]  || return 1
+  [[ "$result" != *\"* ]]  || return 1
+}
+
+@test "handles path with parentheses and braces" {
+  local result
+  result="$(container_name_for "/tmp/my(proj){x}")"
+  [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
+}
+
+@test "handles path with unicode characters" {
+  local result
+  result="$(container_name_for "/tmp/прожект")"
+  [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
+  # All chars should be ASCII after sanitization
+  [[ "$result" =~ ^[a-z0-9-]+$ ]]  || return 1
+}
+
+@test "handles empty basename (path ending with /)" {
+  # `basename /tmp/project/` → `project`, same as `/tmp/project`
+  local a b
+  a="$(container_name_for "/tmp/myproj")"
+  b="$(container_name_for "/tmp/myproj/")"
+  # Hash is computed from full path (with or without trailing slash), so
+  # these produce DIFFERENT hashes. The dir_name portion is the same.
+  [[ "${a%-*}" == "${b%-*}" ]] || {
+    echo "dirname portion should match (got $a vs $b)"
+    return 1
+  }
+}
+
+@test "path is a single char" {
+  local result
+  result="$(container_name_for "/")"
+  [[ "$result" =~ ^cleat-.*-[0-9a-f]{8}$ ]]  || return 1
+  [[ ${#result} -le 63 ]]  || return 1
+}
+
+@test "path with only special chars produces valid name" {
+  local result
+  result="$(container_name_for "/tmp/\$\$\$\$")"
+  [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
+}

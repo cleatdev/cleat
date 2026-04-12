@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.6.4"
+VERSION="0.7.0"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -1214,6 +1214,9 @@ check_for_update() {
   if [[ -f "$UPDATE_CHECK_FILE" ]]; then
     last_check=$(awk 'NR==1 {print $1}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)
     cached_version=$(awk 'NR==1 {print $2}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo "")
+    # Defensive: corrupted cache files can yield non-numeric last_check,
+    # which would crash the arithmetic expression below under set -u.
+    [[ "$last_check" =~ ^[0-9]+$ ]] || last_check=0
   fi
 
   if (( now - last_check >= UPDATE_CHECK_INTERVAL )); then

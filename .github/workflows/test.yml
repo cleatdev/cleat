@@ -1,0 +1,96 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Only need to read the repo. No write access for CI.
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref — avoid wasting minutes on
+# superseded pushes. For main branch, this rarely fires.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Static analysis: shellcheck (advisory — does not block merge) ─────────
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint bin/cleat (errors only)
+        run: shellcheck --severity=error --shell=bash bin/cleat
+      - name: Lint docker/entrypoint.sh (errors only)
+        run: shellcheck --severity=error --shell=bash docker/entrypoint.sh
+      - name: Lint install.sh (errors only)
+        run: shellcheck --severity=error --shell=bash install.sh
+
+  # ── Full test suite on Linux ──────────────────────────────────────────────
+  test-linux:
+    name: test (ubuntu, bash 5.x)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Bash version
+        run: bash --version
+      - name: Run full BATS suite
+        run: ./test.sh
+      - name: Mutation test the regression registry
+        run: ./test/mutation_regressions.sh
+
+  # ── Full test suite on macOS via /bin/bash (bash 3.2, catches bash 4+ bugs) ─
+  # GitHub's macos-latest ships both /bin/bash (Apple's 3.2.57, unchanged
+  # since 2009 due to the bash 4 GPLv3 switch) and Homebrew bash 5. We run
+  # the suite through /bin/bash explicitly so we're actually testing the
+  # version that real macOS users have as default.
+  test-macos-bash32:
+    name: test (macos, bash 3.2)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Bash version (must be 3.2)
+        run: |
+          bash --version
+          /bin/bash --version
+          /bin/bash -c 'echo "BASH_VERSION=$BASH_VERSION"' | grep -E '^BASH_VERSION=3\.2\.' \
+            || { echo "Expected /bin/bash to be 3.2.x"; exit 1; }
+      - name: Run full BATS suite via /bin/bash
+        run: /bin/bash ./test.sh
+      - name: Mutation test the regression registry via /bin/bash
+        run: /bin/bash ./test/mutation_regressions.sh
+
+  # ── Integration tests against real Docker (Linux only — runners have it) ──
+  test-integration:
+    name: integration (real docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test-linux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Verify docker available
+        run: docker version
+      - name: Run integration suite
+        run: ./test/integration/run.sh

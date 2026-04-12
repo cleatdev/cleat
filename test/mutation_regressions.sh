@@ -224,6 +224,16 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.6.5_cleanup_fail" "cmd_run cleans up partial container"
 
+# v0.8.0 — per-project session overlay must be present in docker run
+cat > "$SED_TMP" << 'SED'
+/project_session_key=/d
+/project_session_dir=/d
+/mkdir -p "\$project_session_dir"/d
+/mkdir -p "\${HOME}\/.claude\/projects\/-workspace"/d
+/\$project_session_dir.*projects\/-workspace/d
+SED
+try "v0.8.0_session_isolation" "session overlay mount isolates projects"
+
 # bash-3.2 — grep guard must catch associative arrays
 cat > "$SED_TMP" << 'SED'
 1a\

@@ -21,9 +21,6 @@
 #     file must exist on the host (virtiofs can't create files at nested
 #     bind-mount targets). This catches v0.6.5-class regressions.
 #
-#   DOCKER_STUB_REJECT_UNKNOWN_FLAGS=1
-#     Rejects unknown/malformed flags instead of silently accepting them.
-#
 # Responses (read from $DOCKER_MOCK_DIR):
 #   ps_output      — for `docker ps --filter ...`
 #   ps_a_output    — for `docker ps -a --filter ...`
@@ -143,7 +140,6 @@ _validate_virtiofs_nested() {
 # Parse `docker run ...` args and apply validators.
 _validate_docker_run() {
   local -a mounts=()
-  local in_dollar=false
   shift  # drop 'run'
   while [[ $# -gt 0 ]]; do
     case "$1" in

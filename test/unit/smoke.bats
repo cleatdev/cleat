@@ -52,20 +52,6 @@ teardown() {
   _common_teardown
 }
 
-# Helper: build the env prefix for invoking the real cleat binary.
-# We use a variable rather than a function so `timeout N env ...` can
-# exec the real binary directly (timeout rejects shell functions).
-_cleat_env() {
-  printf '%s\0' \
-    "PATH=$MOCK_BIN:$PATH" \
-    "HOME=$HOME" \
-    "DOCKER_CALLS=$DOCKER_CALLS" \
-    "DOCKER_MOCK_DIR=$DOCKER_MOCK_DIR" \
-    "DOCKER_EXIT_CODE=${DOCKER_EXIT_CODE:-0}" \
-    "DOCKER_STDERR=${DOCKER_STDERR:-}" \
-    "CLEAT_CONFIG_DIR=$CLEAT_CONFIG_DIR"
-}
-
 # Run cleat as a real subprocess. Signature: cleat_bin [ARGS...]
 cleat_bin() {
   env \
@@ -379,6 +365,35 @@ EOF
     echo "Status: $status"
     echo "Output: $output"
     echo "Docker calls:"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}
+
+# ── Config drift and version label ──────────────────────────────────────────
+
+# ── Session isolation ──────────────────────────────────────────────────────
+
+@test "smoke: cleat start mounts per-project session overlay" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  local _bn _h project_key
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  project_key="${_bn}-${_h}"
+
+  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  grep -q "projects/-workspace" "$DOCKER_CALLS" || {
+    echo "Session overlay mount missing from docker run"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  # Use -F for literal match (project_key starts with - which grep reads as a flag)
+  grep -qF -- "${project_key}:/home/coder/.claude/projects/-workspace" "$DOCKER_CALLS" || {
+    echo "Session overlay source doesn't match project key"
     cat "$DOCKER_CALLS"
     return 1
   }

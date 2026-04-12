@@ -37,9 +37,6 @@ setup() {
 }
 
 teardown() {
-  local cname
-  for cname in "$TEST_TEMP"/cleat-*; do :; done
-  # Clean up any overlay/hook dirs the tests may have created
   rm -rf /tmp/cleat-settings-cleat-project-* 2>/dev/null || true
   rm -rf /tmp/cleat-hooks-cleat-project-* 2>/dev/null || true
   rm -rf /tmp/cleat-clip-cleat-project-* 2>/dev/null || true
@@ -802,14 +799,12 @@ _run_cleat() {
 }
 
 @test "regression strict-mode: cleat --help exits 0 under set -euo pipefail" {
-  mkdir -p "$TEST_TEMP/home"
   run _run_cleat --help
   assert_success
   assert_output --partial "Cleat"
 }
 
 @test "regression strict-mode: cleat --version exits 0 under set -euo pipefail" {
-  mkdir -p "$TEST_TEMP/home"
   run _run_cleat --version
   assert_success
   assert_output --partial "cleat"
@@ -835,6 +830,36 @@ _run_cleat() {
   assert_success
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.8.0 — Per-project session isolation. Without the overlay mount, all
+# containers write sessions to ~/.claude/projects/-workspace/ on the host,
+# mixing histories across projects. The fix mounts a per-project directory
+# at /home/coder/.claude/projects/-workspace inside each container.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.8.0: session overlay mount isolates projects" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # Must have the per-project overlay mount
+  run assert_docker_run_has "$cname" "projects/-workspace"
+  assert_success
+
+  # The mount source must include the project-specific hash key
+  local _bn _h project_key
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  project_key="${_bn}-${_h}"
+  run assert_docker_run_has "$cname" "${project_key}:/home/coder/.claude/projects/-workspace"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

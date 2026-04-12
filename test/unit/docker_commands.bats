@@ -68,6 +68,205 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+# ── Session isolation ───────────────────────────────────────────────────────
+
+@test "run: mounts per-project session overlay at projects/-workspace" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # The overlay mount must map the host's per-project dir to -workspace inside the container
+  run assert_docker_run_has "$cname" "/home/coder/.claude/projects/-workspace"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "run: different projects get different session overlay sources" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project-a" "$TEST_TEMP/project-b"
+
+  run cmd_run "$TEST_TEMP/project-a"
+  assert_success
+  local calls_a
+  calls_a="$(cat "$DOCKER_CALLS")"
+
+  # Reset for second run
+  true > "$DOCKER_CALLS"
+  run cmd_run "$TEST_TEMP/project-b"
+  assert_success
+  local calls_b
+  calls_b="$(cat "$DOCKER_CALLS")"
+
+  # Extract the session overlay source path from each run.
+  # Format: .../.claude/projects/<key>:/home/coder/.claude/projects/-workspace
+  local src_a src_b
+  src_a="$(echo "$calls_a" | grep -o '[^ ]*/\.claude/projects/[^:]*:/home/coder/\.claude/projects/-workspace' | head -1)"
+  src_b="$(echo "$calls_b" | grep -o '[^ ]*/\.claude/projects/[^:]*:/home/coder/\.claude/projects/-workspace' | head -1)"
+
+  [[ -n "$src_a" ]] || { echo "No session overlay in project-a docker run"; return 1; }
+  [[ -n "$src_b" ]] || { echo "No session overlay in project-b docker run"; return 1; }
+  [[ "$src_a" != "$src_b" ]] || {
+    echo "Both projects got the same session overlay: $src_a"
+    return 1
+  }
+
+  # Clean up
+  local cname_a cname_b
+  cname_a="$(container_name_for "$TEST_TEMP/project-a")"
+  cname_b="$(container_name_for "$TEST_TEMP/project-b")"
+  rm -rf "/tmp/cleat-settings-${cname_a}" "/tmp/cleat-settings-${cname_b}"
+  rm -rf "/tmp/cleat-hooks-${cname_a}" "/tmp/cleat-hooks-${cname_b}"
+}
+
+@test "run: session overlay creates host project dir if missing" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+
+  # Compute the expected hash-based key (same logic as bin/cleat)
+  local _bn _h session_key
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  session_key="${_bn}-${_h}"
+
+  # Ensure the project session dir does NOT exist yet
+  rm -rf "${HOME}/.claude/projects/${session_key}"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # cmd_run must have created it
+  [[ -d "${HOME}/.claude/projects/${session_key}" ]] || {
+    echo "Project session dir not created at ~/.claude/projects/${session_key}"
+    return 1
+  }
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "run: session key avoids collision for paths with similar names" {
+  mock_docker_images "cleat"
+  # Two paths that would collide under simple tr '/' '-': /a-b/c vs /a/b-c
+  mkdir -p "$TEST_TEMP/a-b" "$TEST_TEMP/a/b-c"
+  # Create a project inside each
+  mkdir -p "$TEST_TEMP/a-b/c" "$TEST_TEMP/a/b-c"
+
+  run cmd_run "$TEST_TEMP/a-b/c"
+  assert_success
+  local calls_1
+  calls_1="$(cat "$DOCKER_CALLS")"
+  true > "$DOCKER_CALLS"
+
+  run cmd_run "$TEST_TEMP/a/b-c"
+  assert_success
+  local calls_2
+  calls_2="$(cat "$DOCKER_CALLS")"
+
+  # Extract the session mount source from each
+  local mount_1 mount_2
+  mount_1="$(echo "$calls_1" | grep -o '[^ ]*/\.claude/projects/[^:]*' | grep -v '\-workspace$' | head -1)"
+  mount_2="$(echo "$calls_2" | grep -o '[^ ]*/\.claude/projects/[^:]*' | grep -v '\-workspace$' | head -1)"
+
+  [[ -n "$mount_1" && -n "$mount_2" ]] || {
+    echo "Could not extract session mounts"
+    return 1
+  }
+  [[ "$mount_1" != "$mount_2" ]] || {
+    echo "COLLISION: both projects got the same session key"
+    echo "  path 1: $TEST_TEMP/a-b/c → $mount_1"
+    echo "  path 2: $TEST_TEMP/a/b-c → $mount_2"
+    return 1
+  }
+
+  local c1 c2
+  c1="$(container_name_for "$TEST_TEMP/a-b/c")"
+  c2="$(container_name_for "$TEST_TEMP/a/b-c")"
+  rm -rf "/tmp/cleat-settings-${c1}" "/tmp/cleat-settings-${c2}"
+  rm -rf "/tmp/cleat-hooks-${c1}" "/tmp/cleat-hooks-${c2}"
+}
+
+@test "run: session key handles root path" {
+  mock_docker_images "cleat"
+  # Simulate root path (don't actually use /, use a single-char dir)
+  mkdir -p "$TEST_TEMP/x"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/x")"
+
+  run cmd_run "$TEST_TEMP/x"
+  assert_success
+  run assert_docker_run_has "$cname" "projects/-workspace"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "run: session key basename is case-normalized" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/MyProject"
+
+  run cmd_run "$TEST_TEMP/MyProject"
+  assert_success
+
+  # The session key basename must be lowercased (macOS HFS+ safety).
+  # On case-sensitive FS, /MyProject and /myproject are different dirs
+  # and get different hashes — but the basename portion is always lowercase.
+  local all_calls
+  all_calls="$(cat "$DOCKER_CALLS")"
+
+  # Check the mount uses lowercase basename in the key
+  echo "$all_calls" | grep -q '/\.claude/projects/myproject-' || {
+    echo "Session key basename not lowercased"
+    echo "$all_calls" | grep 'projects/' || true
+    return 1
+  }
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/MyProject")"
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "run: cmd_rm preserves session directory on host" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  # Find the session key to check afterward
+  local _basename _hash session_key
+  _basename="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _hash="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  session_key="${_basename}-${_hash}"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [[ -d "${HOME}/.claude/projects/${session_key}" ]] || {
+    echo "Session dir not created"
+    return 1
+  }
+
+  # Write a sentinel file to the session dir
+  echo "session-data" > "${HOME}/.claude/projects/${session_key}/sentinel.txt"
+
+  # Now remove the container
+  mock_docker_ps "$cname"
+  run cmd_rm "$TEST_TEMP/project"
+  assert_success
+
+  # Session dir must still exist with our data
+  [[ -f "${HOME}/.claude/projects/${session_key}/sentinel.txt" ]] || {
+    echo "REGRESSION: cmd_rm deleted the session directory"
+    return 1
+  }
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
 @test "run: docker run failure is handled (spinner not orphaned)" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

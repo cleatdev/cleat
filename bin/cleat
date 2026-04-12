@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.7.0"
+VERSION="0.8.0"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -1359,10 +1359,26 @@ cmd_run() {
     echo '{}' > "$settings_overlay_dir/settings.json"
   fi
 
+  # ── Per-project session isolation ──────────────────────────────────────
+  # Claude Code stores sessions under ~/.claude/projects/<key>/ where key
+  # is derived from the CWD. Inside containers CWD is always /workspace,
+  # so all containers write to ~/.claude/projects/-workspace/. We overlay
+  # that path with a per-project directory so each container sees only its
+  # own sessions. The base ~/.claude mount provides auth and global config.
+  local project_session_key _session_basename _session_hash
+  _session_basename="$(basename "$project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _session_hash="$(echo -n "$project" | md5sum | head -c 8)"
+  project_session_key="${_session_basename}-${_session_hash}"
+  local project_session_dir="${HOME}/.claude/projects/${project_session_key}"
+  mkdir -p "$project_session_dir"
+  # Also ensure the overlay target exists in the base mount (Docker needs it)
+  mkdir -p "${HOME}/.claude/projects/-workspace"
+
   local mount_args=(
     -v "$project":/workspace
     -v "${HOME}/.claude:/home/coder/.claude"
     -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
+    -v "${project_session_dir}:/home/coder/.claude/projects/-workspace"
     -v "$clip_dir":/tmp/cleat-clip
   )
 

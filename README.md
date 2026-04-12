@@ -76,7 +76,7 @@ Cleat gives you the best of both worlds:
 
 - **One command** -- `cleat` builds, starts, and launches everything
 - **Per-project isolation** -- each project gets its own container, run multiple projects in parallel
-- **Session persistence** -- stop and resume sessions without losing context
+- **Session persistence** -- stop and resume sessions without losing context, each project's history is isolated
 - **Safe for unattended use** -- let Claude work overnight without risking your system
 - **Zero file permission issues** -- container user matches your host UID/GID automatically
 - **Shared auth** -- log in once, all containers use the same credentials

@@ -80,7 +80,7 @@ spin_stop() {
     kill "$_SPIN_PID" 2>/dev/null || true
     wait "$_SPIN_PID" 2>/dev/null || true
     _SPIN_PID=""
-    command -v tput &>/dev/null && tput cnorm 2>/dev/null
+    { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
   fi
   if ! _is_tty; then
     [[ "$code" -eq 0 ]] && success "$ok_msg" || error "$fail_msg"
@@ -99,7 +99,7 @@ _cleanup_spin() {
     wait "$_SPIN_PID" 2>/dev/null || true
     _SPIN_PID=""
   fi
-  command -v tput &>/dev/null && tput cnorm 2>/dev/null
+  { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
 }
 trap _cleanup_spin EXIT
 

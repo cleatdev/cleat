@@ -86,6 +86,30 @@ teardown() { _common_teardown; }
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
 
+@test "run: mounts per-project history overlay at history.jsonl" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # history.jsonl must be overlaid with the per-project copy
+  run assert_docker_run_has "$cname" "history.jsonl:/home/coder/.claude/history.jsonl"
+  assert_success
+
+  # The history mount source must be inside the project session dir (same hash key)
+  local _bn _h project_key
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  project_key="${_bn}-${_h}"
+  run assert_docker_run_has "$cname" "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
 @test "run: different projects get different session overlay sources" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project-a" "$TEST_TEMP/project-b"

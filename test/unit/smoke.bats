@@ -399,6 +399,30 @@ EOF
   }
 }
 
+@test "smoke: cleat start mounts per-project history overlay" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  local _bn _h project_key
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  project_key="${_bn}-${_h}"
+
+  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  grep -qF -- "history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
+    echo "History overlay mount missing from docker run"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  grep -qF -- "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
+    echo "History overlay source doesn't match project key"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}
+
 # ── Config drift and version label ──────────────────────────────────────────
 
 @test "smoke: cleat start stores config-hash label on run" {

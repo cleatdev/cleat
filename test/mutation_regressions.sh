@@ -234,6 +234,12 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.8.0_session_isolation" "session overlay mount isolates projects"
 
+# v0.8.0 — history.jsonl must be overlaid per-project. Remove the history mount.
+cat > "$SED_TMP" << 'SED'
+/history\.jsonl:\/home\/coder\/\.claude\/history\.jsonl/d
+SED
+try "v0.8.0_history_isolation" "history.jsonl overlay isolates per-project history"
+
 # bash-3.2 — grep guard must catch associative arrays
 cat > "$SED_TMP" << 'SED'
 1a\

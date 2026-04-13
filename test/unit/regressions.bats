@@ -863,6 +863,53 @@ _run_cleat() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v0.8.0 — When hooks cap is OFF, project-level settings with hooks were
+# NOT overlaid. Claude Code saw the raw host hook commands (like osascript)
+# via the workspace bind mount and tried to run them inside the container.
+# Fix: always overlay project settings — strip hooks when OFF, replace with
+# forwarder when ON.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.8.0: project hooks stripped when hooks cap OFF" {
+  # Hooks cap is OFF for this test
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+git
+EOF
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  cat > "$TEST_TEMP/project/.claude/settings.local.json" << 'EOF'
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"osascript -e 'display notification'"}]}]},"permissions":{"allow":["Read"]}}
+EOF
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # The overlay must be mounted even when hooks cap is OFF
+  run assert_docker_run_has "$cname" "settings.local.json:/workspace/.claude/settings.local.json"
+  assert_success
+
+  # The overlay must NOT contain the original hook command
+  local overlay="/tmp/cleat-settings-${cname}/project-settings.local.json"
+  [[ -f "$overlay" ]] || { echo "Overlay file missing"; return 1; }
+
+  # Hooks must be stripped (not present at all)
+  if command -v jq &>/dev/null; then
+    run jq -e '.hooks // empty | length > 0' "$overlay"
+    assert_failure  # hooks should be gone
+  fi
+
+  # Non-hook fields must be preserved
+  if command -v jq &>/dev/null; then
+    run jq -r '.permissions.allow[0]' "$overlay"
+    assert_output "Read"
+  fi
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Hook bridge safety — hooks execute untrusted commands from user config
 # files. They must be wrapped in timeout, their output suppressed, and their
 # exit code ignored (so a failing hook can't block the bridge).
@@ -976,6 +1023,36 @@ _run_cleat() {
     echo "REGRESSION: cmd_run must guard jq usage with command -v"
     return 1
   }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.8.0 — Per-project history isolation. The base ~/.claude mount shares
+# history.jsonl across all containers, so arrow-up in Claude shows commands
+# from other projects. Fix: overlay history.jsonl with a per-project copy
+# from the same session directory used for projects/-workspace.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.8.0: history.jsonl overlay isolates per-project history" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # The docker run must include a history.jsonl bind mount targeting the container path
+  run assert_docker_run_has "$cname" "history.jsonl:/home/coder/.claude/history.jsonl"
+  assert_success
+
+  # The source must be inside the per-project session dir (not the global one)
+  local _bn _h project_key
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  project_key="${_bn}-${_h}"
+  run assert_docker_run_has "$cname" "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

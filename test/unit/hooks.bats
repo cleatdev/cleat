@@ -430,11 +430,11 @@ EOF
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
 
-@test "run: does not overlay project settings when hooks OFF" {
+@test "run: strips hooks from project settings overlay when hooks OFF" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project/.claude"
   cat > "$TEST_TEMP/project/.claude/settings.json" << 'EOF'
-{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"my-hook"}]}]}}
+{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"my-hook"}]}]},"permissions":{"allow":["Read"]}}
 EOF
   cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
 [caps]
@@ -446,9 +446,18 @@ EOF
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  # Should NOT mount project settings overlay
-  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  # Project settings overlay SHOULD be mounted (to strip hooks)
+  run assert_docker_run_has "$cname" "/workspace/.claude/settings.json"
   assert_success
+
+  # Overlay must have hooks stripped but preserve other fields
+  local overlay="/tmp/cleat-settings-${cname}/project-settings.json"
+  if command -v jq &>/dev/null; then
+    run jq -e '.hooks // empty | length > 0' "$overlay"
+    assert_failure  # hooks should be gone
+    run jq -r '.permissions.allow[0]' "$overlay"
+    assert_output "Read"
+  fi
 
   rm -rf "/tmp/cleat-settings-${cname}"
 }

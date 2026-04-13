@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.8.0"
+VERSION="0.8.1"
 IMAGE_NAME="cleat"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
@@ -86,7 +86,7 @@ spin_stop() {
     kill "$_SPIN_PID" 2>/dev/null || true
     wait "$_SPIN_PID" 2>/dev/null || true
     _SPIN_PID=""
-    command -v tput &>/dev/null && tput cnorm 2>/dev/null
+    { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
   fi
   if ! _is_tty; then
     [[ "$code" -eq 0 ]] && success "$ok_msg" || error "$fail_msg"
@@ -105,7 +105,7 @@ _cleanup_spin() {
     wait "$_SPIN_PID" 2>/dev/null || true
     _SPIN_PID=""
   fi
-  command -v tput &>/dev/null && tput cnorm 2>/dev/null
+  { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
 }
 
 # ── Keypress reader for TUI ────────────────────────────────────────────────
@@ -1364,13 +1364,20 @@ cmd_run() {
   # is derived from the CWD. Inside containers CWD is always /workspace,
   # so all containers write to ~/.claude/projects/-workspace/. We overlay
   # that path with a per-project directory so each container sees only its
-  # own sessions. The base ~/.claude mount provides auth and global config.
+  # own sessions. Input history (arrow-up) lives in ~/.claude/history.jsonl
+  # — we overlay that too so each project has its own history.
+  # The base ~/.claude mount provides auth and global config.
   local project_session_key _session_basename _session_hash
   _session_basename="$(basename "$project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
   _session_hash="$(echo -n "$project" | md5sum | head -c 8)"
   project_session_key="${_session_basename}-${_session_hash}"
   local project_session_dir="${HOME}/.claude/projects/${project_session_key}"
   mkdir -p "$project_session_dir"
+  # Ensure per-project history file exists (Docker needs the source for bind mounts)
+  touch "$project_session_dir/history.jsonl"
+  # Also ensure host history.jsonl exists (macOS virtiofs rejects nested mounts
+  # when the target file is missing inside the parent bind mount's source)
+  touch "${HOME}/.claude/history.jsonl"
   # Also ensure the overlay target exists in the base mount (Docker needs it)
   mkdir -p "${HOME}/.claude/projects/-workspace"
 
@@ -1379,6 +1386,7 @@ cmd_run() {
     -v "${HOME}/.claude:/home/coder/.claude"
     -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
     -v "${project_session_dir}:/home/coder/.claude/projects/-workspace"
+    -v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"
     -v "$clip_dir":/tmp/cleat-clip
   )
 
@@ -1387,19 +1395,23 @@ cmd_run() {
     local hooks_dir="/tmp/cleat-hooks-${cname}"
     mkdir -p "$hooks_dir"
     mount_args+=(-v "$hooks_dir":/var/log/cleat)
+  fi
 
-    # Mount project-level settings overlays when .claude/ exists.
-    # Only mount files that already exist on the host — Docker Desktop virtiofs
-    # can't create new files at bind-mount targets inside another bind mount
-    # (/workspace is bind-mounted from the project, so the target must exist).
-    # Files added later need `cleat rm && cleat` to pick up.
-    if [[ -d "$project/.claude" ]]; then
-      local pf
-      for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
-        [[ -f "$pf" ]] || continue
-        local _base _overlay_name
-        _base="$(basename "$pf")"
-        _overlay_name="project-$_base"
+  # ── Project-level settings overlays ──────────────────────────────────────
+  # When hooks ON:  replace hook commands with forwarder (host bridge executes originals)
+  # When hooks OFF: strip hooks entirely (prevent container from running host commands)
+  # Without an overlay, project .claude/settings*.json files are visible via the
+  # workspace bind mount and Claude Code would try to run host commands (like
+  # osascript) inside the container where they don't exist.
+  if [[ -d "$project/.claude" ]]; then
+    local pf
+    for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+      [[ -f "$pf" ]] || continue
+      local _base _overlay_name
+      _base="$(basename "$pf")"
+      _overlay_name="project-$_base"
+      if cap_is_active hooks; then
+        # Replace hook commands with event forwarder
         if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
           jq '
             if .hooks then
@@ -1413,9 +1425,16 @@ cmd_run() {
         else
           cp "$pf" "$settings_overlay_dir/$_overlay_name"
         fi
-        mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
-      done
-    fi
+      else
+        # Strip hooks so container can't run host-specific commands
+        if [[ -s "$pf" ]] && command -v jq &>/dev/null && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
+          jq 'del(.hooks)' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        else
+          cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        fi
+      fi
+      mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
+    done
   fi
 
   # Mount .claude.json if it exists on host

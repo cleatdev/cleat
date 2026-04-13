@@ -71,16 +71,19 @@ teardown() { _common_teardown; }
   local dir_name
   dir_name="$(basename "$project_path" | tr '[:upper:]' '[:lower:]')"
   local hash
-  hash="$(printf '%s' "$project_path" | md5sum 2>/dev/null | head -c 8)"
+  hash="$(printf '%s' "$project_path" | _md5 2>/dev/null | head -c 8)"
   local expected_cname="cleat-${dir_name}-${hash}"
 
   # Create settings overlay dir so stale-mount check doesn't trigger
   mkdir -p "/tmp/cleat-settings-${expected_cname}"
   echo '{}' > "/tmp/cleat-settings-${expected_cname}/settings.json"
 
-  # Mock docker: image exists, container exists (stopped), start fails
+  # Mock docker: image exists, container exists (stopped), start fails, run fails
+  # Both start and run fail so the test verifies failure handling regardless
+  # of whether the CLI takes the interactive recovery path (macOS TTY) or not.
   cat > "$TEST_TEMP/strict-bin/docker" << MOCK
 #!/bin/bash
+echo "docker \$*" >> "$TEST_TEMP/strict-docker-calls"
 case "\$1" in
   images) echo "cleat" ;;
   ps)
@@ -90,17 +93,20 @@ case "\$1" in
     esac
     ;;
   start) exit 1 ;;
+  run) exit 125 ;;
   info) echo "Server Version: 24.0.0" ;;
   *) ;;
 esac
 MOCK
   chmod +x "$TEST_TEMP/strict-bin/docker"
 
-  # Run actual binary — set -euo pipefail is active
+  # Run actual binary — set -euo pipefail is active.
+  # Redirect stdin from /dev/null to ensure non-interactive mode
+  # (macOS CI runners may report TTY=true, triggering interactive recovery).
   run env PATH="$TEST_TEMP/strict-bin:$PATH" \
     HOME="$TEST_TEMP" \
     XDG_CONFIG_HOME="$TEST_TEMP/strict-config" \
-    bash "$CLI" start "$TEST_TEMP/strict-project"
+    bash "$CLI" start "$TEST_TEMP/strict-project" < /dev/null
 
   # Must fail with proper message (spin_stop was reached, not set -e abort)
   assert_failure

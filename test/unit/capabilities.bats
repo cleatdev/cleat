@@ -276,6 +276,70 @@ EOF
   assert_success
 }
 
+# ── gh capability: docker run mounts ─────────────────────────────────────
+
+@test "gh cap: mounts ~/.config/gh read-write when enabled" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+gh
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # Read-write (no :ro) so `gh auth login` writes tokens back to host
+  run assert_docker_run_has "$cname" ".config/gh:/home/coder/.config/gh"
+  assert_success
+  # Must NOT have :ro flag
+  run assert_docker_run_lacks "$cname" ".config/gh:/home/coder/.config/gh:ro"
+  assert_success
+}
+
+@test "gh cap: creates ~/.config/gh if missing" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  local orig_home="$HOME"
+  HOME="$TEST_TEMP/fakehome"
+  mkdir -p "$HOME"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+gh
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # Dir should be created by cmd_run
+  [[ -d "$HOME/.config/gh" ]] || {
+    echo "~/.config/gh was not created"
+    return 1
+  }
+  run assert_docker_run_has "$cname" ".config/gh:/home/coder/.config/gh"
+  assert_success
+
+  HOME="$orig_home"
+}
+
+@test "no gh cap: does not mount gh config" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  mkdir -p "$HOME/.config/gh"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".config/gh:/home/coder/.config/gh"
+  assert_success
+}
+
 # ── --cap CLI flag ─────────────────────────────────────────────────────────
 
 @test "--cap flag: enables cap for session without config" {

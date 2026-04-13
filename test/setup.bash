@@ -53,6 +53,31 @@ _common_setup() {
   _MOCK_PS_A_MATCH=""
 }
 
+# Portable MD5 — available to all tests regardless of whether CLI is sourced.
+# macOS has `md5 -q`, Linux has `md5sum`.
+_md5() {
+  if command -v md5sum &>/dev/null; then
+    md5sum
+  elif command -v md5 &>/dev/null; then
+    md5 -q
+  else
+    cksum | awk '{print $1}'
+  fi
+}
+
+# Portable timeout — GNU timeout on Linux, perl alarm on macOS.
+# Available to all test files via setup.bash.
+_portable_timeout() {
+  local secs="$1"; shift
+  if command -v timeout &>/dev/null; then
+    timeout "$secs" "$@"
+  elif command -v perl &>/dev/null; then
+    perl -e 'alarm shift @ARGV; exec @ARGV' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
 _common_teardown() {
   # Restore real HOME so later tests in the same process don't accidentally
   # inherit the isolated home

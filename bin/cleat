@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.8.1"
+VERSION="0.9.0"
 IMAGE_NAME="cleat"
+REGISTRY_IMAGE="ghcr.io/cleatdev/cleat:latest"
 REPO_URL="https://github.com/cleatdev/cleat"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -14,7 +15,7 @@ CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
 CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 
 # Known capabilities (order matters for display)
-KNOWN_CAPS=(git ssh env hooks)
+KNOWN_CAPS=(git ssh env hooks gh)
 
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
@@ -133,6 +134,17 @@ _read_keypress() {
   fi
 }
 
+# Portable MD5 — works on both Linux (md5sum) and macOS (md5 -q)
+_md5() {
+  if command -v md5sum &>/dev/null; then
+    md5sum
+  elif command -v md5 &>/dev/null; then
+    md5 -q
+  else
+    cksum | awk '{print $1}'
+  fi
+}
+
 # ── Project-scoped container naming ─────────────────────────────────────────
 container_name_for() {
   local project_path="$1"
@@ -143,7 +155,7 @@ container_name_for() {
   dir_name="${dir_name:0:48}"
   # Remove trailing dash from truncation
   dir_name="${dir_name%-}"
-  hash="$(echo -n "$project_path" | md5sum | head -c 8)"
+  hash="$(echo -n "$project_path" | _md5 | head -c 8)"
   echo "cleat-${dir_name}-${hash}"
 }
 
@@ -488,10 +500,8 @@ compute_config_fingerprint() {
 
   if command -v sha256sum &>/dev/null; then
     echo -n "$fingerprint_input" | sha256sum | head -c 16
-  elif command -v md5sum &>/dev/null; then
-    echo -n "$fingerprint_input" | md5sum | head -c 16
   else
-    echo -n "$fingerprint_input" | cksum | head -c 16
+    echo -n "$fingerprint_input" | _md5 | head -c 16
   fi
 }
 
@@ -1243,7 +1253,19 @@ cmd_build() {
     success "Image ready ${RESET}${DIM}(cached)"
     return
   fi
-  _do_build
+  _do_pull || _do_build
+}
+
+_do_pull() {
+  spin "Pulling image..."
+  local rc=0
+  docker pull "$REGISTRY_IMAGE" > /dev/null 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    spin_stop 1 "" "Pull unavailable, building locally"
+    return 1
+  fi
+  docker tag "$REGISTRY_IMAGE" "$IMAGE_NAME" > /dev/null 2>&1 || true
+  spin_stop 0 "Image ready ${RESET}${DIM}(pulled)"
 }
 
 _do_build() {
@@ -1369,7 +1391,7 @@ cmd_run() {
   # The base ~/.claude mount provides auth and global config.
   local project_session_key _session_basename _session_hash
   _session_basename="$(basename "$project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _session_hash="$(echo -n "$project" | md5sum | head -c 8)"
+  _session_hash="$(echo -n "$project" | _md5 | head -c 8)"
   project_session_key="${_session_basename}-${_session_hash}"
   local project_session_dir="${HOME}/.claude/projects/${project_session_key}"
   mkdir -p "$project_session_dir"
@@ -1459,6 +1481,15 @@ cmd_run() {
   local ssh_args=()
   if cap_is_active ssh && [[ -S "${SSH_AUTH_SOCK:-}" ]]; then
     ssh_args+=(-v "${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
+  fi
+
+  # ── gh capability: mount GitHub CLI config (read-write) for token auth
+  # Read-write so `gh auth login` inside the container writes tokens back to the
+  # host, same model as ~/.claude. Create dir if missing so users can auth from
+  # inside the container even without gh installed on the host.
+  if cap_is_active gh; then
+    mkdir -p "${HOME}/.config/gh"
+    mount_args+=(-v "${HOME}/.config/gh:/home/coder/.config/gh")
   fi
 
   # ── Compute config fingerprint and store as label
@@ -2011,6 +2042,7 @@ _cap_description() {
     ssh)   echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
     env)   echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
     hooks) echo "Run your Claude Code hooks on the host (global + project)" ;;
+    gh)    echo "GitHub CLI — authenticate once, persists across rm/nuke/rebuild" ;;
     *)     echo "(unknown capability)" ;;
   esac
 }
@@ -2346,7 +2378,7 @@ cmd_config() {
     if [[ "$action" == "enable" ]]; then
       # Check if already enabled
       local already=false
-      for cap in "${current_caps[@]}"; do
+      for cap in "${current_caps[@]+"${current_caps[@]}"}"; do
         [[ "$cap" == "$cap_name" ]] && already=true
       done
       if ! $already; then
@@ -2363,10 +2395,10 @@ cmd_config() {
     else
       # Disable: remove from list
       local new_caps=()
-      for cap in "${current_caps[@]}"; do
+      for cap in "${current_caps[@]+"${current_caps[@]}"}"; do
         [[ "$cap" != "$cap_name" ]] && new_caps+=("$cap")
       done
-      _write_caps_to_file "$config_file" "${new_caps[@]}"
+      _write_caps_to_file "$config_file" "${new_caps[@]+"${new_caps[@]}"}"
       success "${cap_name} disabled"
     fi
     return
@@ -2421,9 +2453,15 @@ cmd_update() {
 
   rm -f "$UPDATE_CHECK_FILE" 2>/dev/null || true
 
-  echo ""
-  echo -e "  ${DIM}To also update Claude Code inside containers:${RESET}"
-  echo -e "    ${BOLD}cleat rebuild${RESET}"
+  # Pull latest pre-built image if available
+  if docker pull "$REGISTRY_IMAGE" > /dev/null 2>&1; then
+    docker tag "$REGISTRY_IMAGE" "$IMAGE_NAME" > /dev/null 2>&1 || true
+    success "Image updated ${RESET}${DIM}(pulled latest)"
+  else
+    echo ""
+    echo -e "  ${DIM}To also update Claude Code inside containers:${RESET}"
+    echo -e "    ${BOLD}cleat rebuild${RESET}"
+  fi
   echo ""
 }
 

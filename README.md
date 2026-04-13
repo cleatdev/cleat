@@ -81,8 +81,9 @@ Cleat gives you the best of both worlds:
 - **Zero file permission issues** -- container user matches your host UID/GID automatically
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
-- **Lightweight** -- Debian-slim-based image with Node.js, Python, Git, build-essential, vim, jq, and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), all disabled by default
+- **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq, and socat
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), all disabled by default
+- **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
@@ -307,7 +308,7 @@ All commands default to the current working directory if `[path]` is omitted.
 | File | Purpose |
 |---|---|
 | `bin/cleat` | CLI script (symlinked as `cleat`) |
-| `docker/Dockerfile` | Debian slim image with Claude Code (native installer) |
+| `docker/Dockerfile` | Node.js bookworm-slim image with Claude Code (native installer) |
 | `docker/entrypoint.sh` | Maps host UID/GID into the container so files are owned by you |
 | `docker/clip` | Clipboard shim -- writes to file bridge (primary) or OSC 52 daemon (fallback). Symlinked as `pbcopy`, `xclip`, `xsel` |
 | `docker/clip-daemon` | Background daemon -- relays clipboard data to the host terminal via OSC 52 (fallback for terminals that support it) |
@@ -316,7 +317,7 @@ All commands default to the current working directory if `[path]` is omitted.
 
 ### What happens when you run `cleat`
 
-1. **Builds the Docker image** (first run only) -- Debian slim with Node.js, Python, Git, build-essential, vim, jq, socat, and Claude Code CLI
+1. **Pulls or builds the Docker image** (first run only) -- pulls pre-built image from registry (~30s), falls back to local build if unavailable. Image includes Node.js, Python, Git, GitHub CLI, jq, socat, and Claude Code CLI
 2. **Starts a container** named `cleat-<dirname>-<hash>` (hash derived from the full project path) with your project mounted at `/workspace`
 3. **Maps your UID/GID** into the container so files created by Claude are owned by you on the host
 4. **Mounts `~/.claude`** for shared authentication across all containers
@@ -330,7 +331,7 @@ Containers run with these protections by default:
 - `--pids-limit 1024` -- prevents fork bombs from affecting the host
 - `--memory 8g` -- prevents runaway processes from exhausting host memory
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
-- Debian slim base image with minimal attack surface
+- Node.js bookworm-slim base image with minimal attack surface
 
 ---
 
@@ -361,6 +362,7 @@ cleat --cap ssh start
 | `ssh` | Mounts `~/.ssh` (read-only). SSH agent forwarding if `SSH_AUTH_SOCK` is set. |
 | `env` | Auto-loads env vars from `~/.config/cleat/env` (global) and `.cleat.env` (project). |
 | `hooks` | Runs your Claude Code hooks on the host (global and project-level). |
+| `gh` | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
 
 ### Environment variables
 

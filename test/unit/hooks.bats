@@ -1061,7 +1061,7 @@ EOF
 #!/bin/bash
 echo "$1" > MARKER_PATH
 SCRIPT
-  sed -i "s|MARKER_PATH|$marker|" "$mock_open"
+  sed -i.bak "s|MARKER_PATH|$marker|" "$mock_open" && rm -f "$mock_open.bak"
   chmod +x "$mock_open"
 
   _browser_watcher "$clip_dir" "$mock_open" &
@@ -1093,7 +1093,7 @@ SCRIPT
 #!/bin/bash
 echo "$1" >> MARKER_PATH
 SCRIPT
-  sed -i "s|MARKER_PATH|$marker|" "$mock_open"
+  sed -i.bak "s|MARKER_PATH|$marker|" "$mock_open" && rm -f "$mock_open.bak"
   chmod +x "$mock_open"
 
   _browser_watcher "$clip_dir" "$mock_open" &
@@ -1131,7 +1131,7 @@ SCRIPT
 #!/bin/bash
 echo "$1" >> MARKER_PATH
 SCRIPT
-  sed -i "s|MARKER_PATH|$marker|" "$mock_open"
+  sed -i.bak "s|MARKER_PATH|$marker|" "$mock_open" && rm -f "$mock_open.bak"
   chmod +x "$mock_open"
 
   # Start watcher — the stale file exists at startup

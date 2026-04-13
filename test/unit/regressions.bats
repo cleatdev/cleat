@@ -854,7 +854,7 @@ _run_cleat() {
   # The mount source must include the project-specific hash key
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   project_key="${_bn}-${_h}"
   run assert_docker_run_has "$cname" "${project_key}:/home/coder/.claude/projects/-workspace"
   assert_success
@@ -1047,7 +1047,7 @@ EOF
   # The source must be inside the per-project session dir (not the global one)
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   project_key="${_bn}-${_h}"
   run assert_docker_run_has "$cname" "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl"
   assert_success

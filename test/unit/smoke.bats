@@ -41,11 +41,14 @@ setup() {
 # smoke-test process (which must remain a real subprocess caller).
 _compute_cname() {
   local project="$1"
-  (
-    # shellcheck disable=SC1090
-    source <(sed 's/^set -euo pipefail$/# stripped/' "$CLI")
-    container_name_for "$project"
-  )
+  # Reimplement container_name_for inline rather than sourcing the entire CLI
+  # (sourcing can fail on bash 3.2 due to strict-mode interactions).
+  local dir_name hash
+  dir_name="$(basename "$project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  dir_name="${dir_name:0:48}"
+  dir_name="${dir_name%-}"
+  hash="$(echo -n "$project" | _md5 | head -c 8)"
+  echo "cleat-${dir_name}-${hash}"
 }
 
 teardown() {
@@ -66,11 +69,10 @@ cleat_bin() {
 }
 
 # Run cleat with a hard timeout (seconds). Used for subcommands that would
-# otherwise block on interactive input. Execs env+cleat directly so the
-# `timeout` program can wrap a real process, not a shell function.
+# otherwise block on interactive input. Uses _portable_timeout from setup.bash.
 cleat_bin_timeout() {
   local secs="$1"; shift
-  timeout "$secs" env \
+  _portable_timeout "$secs" env \
     PATH="$MOCK_BIN:$PATH" \
     HOME="$HOME" \
     XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
@@ -183,6 +185,17 @@ cleat_bin_timeout() {
   }
   grep -q "^git$" "$CLEAT_CONFIG_DIR/config" || {
     echo "git cap not persisted"
+    cat "$CLEAT_CONFIG_DIR/config"
+    return 1
+  }
+}
+
+@test "smoke: cleat config --enable gh persists to config file" {
+  run cleat_bin config --enable gh
+  assert_success
+  assert_output --partial "gh"
+  grep -q "^gh$" "$CLEAT_CONFIG_DIR/config" || {
+    echo "gh cap not persisted"
     cat "$CLEAT_CONFIG_DIR/config"
     return 1
   }
@@ -370,6 +383,25 @@ EOF
   }
 }
 
+@test "smoke: cleat start with gh cap mounts ~/.config/gh" {
+  mkdir -p "$TEST_TEMP/project"
+  mkdir -p "$HOME/.config/gh"
+  cat > "$TEST_TEMP/project/.cleat" << 'EOF'
+[caps]
+gh
+EOF
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  grep -qF ".config/gh:/home/coder/.config/gh" "$DOCKER_CALLS" || {
+    echo "gh config mount missing from docker run"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}
+
 # ── Config drift and version label ──────────────────────────────────────────
 
 # ── Session isolation ──────────────────────────────────────────────────────
@@ -382,7 +414,7 @@ EOF
 
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   project_key="${_bn}-${_h}"
 
   run cleat_bin_timeout 5 start "$TEST_TEMP/project"
@@ -407,7 +439,7 @@ EOF
 
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   project_key="${_bn}-${_h}"
 
   run cleat_bin_timeout 5 start "$TEST_TEMP/project"

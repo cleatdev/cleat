@@ -34,6 +34,45 @@ teardown() { _common_teardown; }
   assert_output --partial "docker/Dockerfile"
 }
 
+@test "build: tries pull before local build when image missing" {
+  # Pull fails (default stub behavior) → should fall back to build
+  run cmd_build
+  assert_success
+  # Docker pull was attempted with the registry image
+  run grep "pull" "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "$REGISTRY_IMAGE"
+  # Build was also called (fallback after pull failure)
+  run docker_build_calls
+  assert_output --partial "-t cleat"
+}
+
+@test "build: successful pull skips local build" {
+  # Make pull succeed
+  export DOCKER_PULL_EXIT_CODE=0
+  run cmd_build
+  assert_success
+  # Pull was called
+  run grep "pull" "$DOCKER_CALLS"
+  assert_success
+  # Build was NOT called (pull succeeded)
+  run docker_build_calls
+  assert_output ""
+  unset DOCKER_PULL_EXIT_CODE
+}
+
+@test "build: pull tags registry image as local image name" {
+  export DOCKER_PULL_EXIT_CODE=0
+  run cmd_build
+  assert_success
+  # Tag was called to rename the pulled image
+  run grep "tag" "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "$REGISTRY_IMAGE"
+  assert_output --partial "$IMAGE_NAME"
+  unset DOCKER_PULL_EXIT_CODE
+}
+
 # ── run: container creation ─────────────────────────────────────────────────
 
 @test "run: creates container with correct name, mounts, env, and limits" {
@@ -102,7 +141,7 @@ teardown() { _common_teardown; }
   # The history mount source must be inside the project session dir (same hash key)
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   project_key="${_bn}-${_h}"
   run assert_docker_run_has "$cname" "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl"
   assert_success
@@ -154,7 +193,7 @@ teardown() { _common_teardown; }
   # Compute the expected hash-based key (same logic as bin/cleat)
   local _bn _h session_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _h="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   session_key="${_bn}-${_h}"
 
   # Ensure the project session dir does NOT exist yet
@@ -264,7 +303,7 @@ teardown() { _common_teardown; }
   # Find the session key to check afterward
   local _basename _hash session_key
   _basename="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _hash="$(echo -n "$TEST_TEMP/project" | md5sum | head -c 8)"
+  _hash="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   session_key="${_basename}-${_hash}"
 
   run cmd_run "$TEST_TEMP/project"

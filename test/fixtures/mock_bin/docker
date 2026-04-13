@@ -190,7 +190,12 @@ case "$1" in
     # BEFORE we emit DOCKER_STDERR / exit so the strict errors take priority.
     _validate_docker_run "$@"
     ;;
-  build|start|stop|rm|exec|logs|rmi|image|builder)
+  build|start|stop|rm|exec|logs|rmi|image|builder|tag)
+    ;;
+  pull)
+    # Pull fails by default (no registry in tests). Tests that need pull to
+    # succeed can set DOCKER_PULL_EXIT_CODE=0.
+    exit "${DOCKER_PULL_EXIT_CODE:-1}"
     ;;
 esac
 

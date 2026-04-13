@@ -100,3 +100,49 @@ teardown() { _common_teardown; }
   assert_failure
   assert_output --partial "Failed to checkout"
 }
+
+@test "update: tries docker pull after git update" {
+  mkdir -p "$TEST_TEMP/.git"
+  REPO_DIR="$TEST_TEMP"
+  UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
+  echo "12345 old" > "$UPDATE_CHECK_FILE"
+  export GIT_LS_REMOTE_OUTPUT="abc123	refs/tags/v99.0.0"
+
+  run cmd_update
+  assert_success
+
+  # Docker pull was attempted with the registry image
+  run grep "pull" "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "$REGISTRY_IMAGE"
+}
+
+@test "update: shows rebuild hint when pull fails" {
+  mkdir -p "$TEST_TEMP/.git"
+  REPO_DIR="$TEST_TEMP"
+  UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
+  echo "12345 old" > "$UPDATE_CHECK_FILE"
+  export GIT_LS_REMOTE_OUTPUT="abc123	refs/tags/v99.0.0"
+  # Pull fails (default stub behavior)
+
+  run cmd_update
+  assert_success
+  assert_output --partial "cleat rebuild"
+}
+
+@test "update: skips rebuild hint when pull succeeds" {
+  mkdir -p "$TEST_TEMP/.git"
+  REPO_DIR="$TEST_TEMP"
+  UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
+  echo "12345 old" > "$UPDATE_CHECK_FILE"
+  export GIT_LS_REMOTE_OUTPUT="abc123	refs/tags/v99.0.0"
+  export DOCKER_PULL_EXIT_CODE=0
+
+  run cmd_update
+  assert_success
+  # Should show "Image updated" not "cleat rebuild"
+  assert_output --partial "Image updated"
+  refute_output --partial "cleat rebuild"
+
+  unset DOCKER_PULL_EXIT_CODE
+}

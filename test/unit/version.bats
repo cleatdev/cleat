@@ -70,15 +70,21 @@ teardown() { _common_teardown; }
   echo "$(date +%s) 99.0.0" > "$UPDATE_CHECK_FILE"
 
   run check_for_update
-  # Strip ANSI codes and measure display width of │-delimited content lines
+  # Strip ANSI codes and check that all │-containing lines have the same
+  # length. Uses bash ${#} which matches _notice_box's padding computation —
+  # both count the same way regardless of locale (bytes vs chars).
   local clean
   clean=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
-  # All lines containing │ should have the same display width
-  local lengths
-  lengths=$(echo "$clean" | grep '│' | LC_ALL=C awk '{ gsub(/[^\x00-\x7f]/, "X"); print length }' | sort -u)
-  local count
-  count=$(echo "$lengths" | wc -l | tr -d ' ')
-  [[ "$count" -eq 1 ]] || { echo "Unequal box line lengths:"; echo "$clean" | grep '│'; return 1; }
+  local first_len="" all_same=true line
+  while IFS= read -r line; do
+    local len=${#line}
+    if [[ -z "$first_len" ]]; then
+      first_len=$len
+    elif [[ "$len" -ne "$first_len" ]]; then
+      all_same=false
+    fi
+  done < <(echo "$clean" | grep '│')
+  $all_same || { echo "Unequal box line lengths:"; echo "$clean" | grep '│'; return 1; }
 }
 
 @test "update check: handles corrupted cache gracefully" {

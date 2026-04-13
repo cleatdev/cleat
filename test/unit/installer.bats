@@ -26,8 +26,8 @@ CLIEOF
 _patch_installer() {
   local install_dir="${1:-$TEST_TEMP/dot-cleat}"
   local patched="$FAKE_REPO/install.sh"
-  sed -i "s|BIN_DIR=\"/usr/local/bin\"|BIN_DIR=\"$FAKE_BIN\"|" "$patched"
-  sed -i "s|INSTALL_DIR=\"\$HOME/.cleat\"|INSTALL_DIR=\"$install_dir\"|" "$patched"
+  sed -i.bak "s|BIN_DIR=\"/usr/local/bin\"|BIN_DIR=\"$FAKE_BIN\"|" "$patched" && rm -f "$patched.bak"
+  sed -i.bak "s|INSTALL_DIR=\"\$HOME/.cleat\"|INSTALL_DIR=\"$install_dir\"|" "$patched" && rm -f "$patched.bak"
 }
 
 # Create a fake git repo at a path with a tagged bin/cleat

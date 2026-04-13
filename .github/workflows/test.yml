@@ -75,6 +75,24 @@ jobs:
           /bin/bash --version
           /bin/bash -c 'echo "BASH_VERSION=$BASH_VERSION"' | grep -E '^BASH_VERSION=3\.2\.' \
             || { echo "Expected /bin/bash to be 3.2.x"; exit 1; }
+      - name: Diagnostic — verify cleat binary runs on bash 3.2
+        run: |
+          export HOME=/tmp/cleat-diag
+          export XDG_CONFIG_HOME=/tmp/cleat-diag-xdg
+          mkdir -p "$HOME/.claude" "$XDG_CONFIG_HOME/cleat"
+          export PATH="$(pwd)/test/fixtures/mock_bin:$PATH"
+          export DOCKER_CALLS=/tmp/docker_calls DOCKER_MOCK_DIR=/tmp/docker_mock
+          touch "$DOCKER_CALLS"; mkdir -p "$DOCKER_MOCK_DIR"
+          echo "=== cleat --help ==="
+          /bin/bash bin/cleat --help 2>&1 | head -5 || echo "EXIT: $?"
+          echo "=== cleat config --enable git ==="
+          /bin/bash bin/cleat config --enable git 2>&1 || echo "EXIT: $?"
+          echo "=== cleat config --enable git (trace last 20) ==="
+          /bin/bash -x bin/cleat config --enable git 2>&1 | tail -20 || echo "EXIT: $?"
+          echo "=== which timeout ==="
+          which timeout 2>&1 || echo "timeout not found"
+          echo "=== locale ==="
+          locale 2>&1 || true
       - name: Run full BATS suite via /bin/bash
         run: /bin/bash ./test.sh
       - name: Mutation test the regression registry via /bin/bash

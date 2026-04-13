@@ -74,3 +74,28 @@ teardown() { _common_teardown; }
   run require_running "test-container"
   assert_success
 }
+
+# ── _md5 portable hash ────────────────────────────────────────────────────
+
+@test "_md5 produces consistent 32-char hex output" {
+  local hash
+  hash="$(echo -n "test-input" | _md5)"
+  # Must be hex characters only (md5 output)
+  [[ "$hash" =~ ^[0-9a-f] ]] || { echo "Not hex: $hash"; return 1; }
+  # Must be non-empty
+  [[ -n "$hash" ]] || { echo "Empty hash"; return 1; }
+}
+
+@test "_md5 produces different hashes for different inputs" {
+  local h1 h2
+  h1="$(echo -n "input-a" | _md5 | head -c 8)"
+  h2="$(echo -n "input-b" | _md5 | head -c 8)"
+  [[ "$h1" != "$h2" ]] || { echo "Hash collision: $h1"; return 1; }
+}
+
+@test "_md5 produces same hash for same input (deterministic)" {
+  local h1 h2
+  h1="$(echo -n "stable-input" | _md5 | head -c 8)"
+  h2="$(echo -n "stable-input" | _md5 | head -c 8)"
+  [[ "$h1" == "$h2" ]] || { echo "Non-deterministic: $h1 vs $h2"; return 1; }
+}

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.9.0"
+VERSION="0.9.1"
 IMAGE_NAME="cleat"
 REGISTRY_IMAGE="ghcr.io/cleatdev/cleat:latest"
 REPO_URL="https://github.com/cleatdev/cleat"

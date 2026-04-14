@@ -1,5 +1,6 @@
 # Cleat
 
+[![Tests](https://github.com/cleatdev/cleat/actions/workflows/test.yml/badge.svg)](https://github.com/cleatdev/cleat/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-supported-brightgreen)](https://github.com/cleatdev/cleat)
 [![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)](https://github.com/cleatdev/cleat)

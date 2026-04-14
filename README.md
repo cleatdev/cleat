@@ -1,9 +1,9 @@
 # Cleat
 
 [![Tests](https://github.com/cleatdev/cleat/actions/workflows/test.yml/badge.svg)](https://github.com/cleatdev/cleat/actions/workflows/test.yml)
+[![Image](https://github.com/cleatdev/cleat/actions/workflows/publish-image.yml/badge.svg)](https://github.com/cleatdev/cleat/actions/workflows/publish-image.yml)
+[![Release](https://img.shields.io/github/v/release/cleatdev/cleat?label=release)](https://github.com/cleatdev/cleat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![macOS](https://img.shields.io/badge/macOS-supported-brightgreen)](https://github.com/cleatdev/cleat)
-[![Linux](https://img.shields.io/badge/Linux-supported-brightgreen)](https://github.com/cleatdev/cleat)
 
 **Run anything. Break nothing.**
 

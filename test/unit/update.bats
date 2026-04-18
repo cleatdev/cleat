@@ -111,10 +111,11 @@ teardown() { _common_teardown; }
   run cmd_update
   assert_success
 
-  # Docker pull was attempted with the registry image
+  # Docker pull was attempted with the version-matched registry image
+  # (v99.0.0 is the new tag cmd_update just checked out).
   run grep "pull" "$DOCKER_CALLS"
   assert_success
-  assert_output --partial "$REGISTRY_IMAGE"
+  assert_output --partial "${REGISTRY_BASE}:v99.0.0"
 }
 
 @test "update: shows rebuild hint when pull fails" {
@@ -140,8 +141,8 @@ teardown() { _common_teardown; }
 
   run cmd_update
   assert_success
-  # Should show "Image updated" not "cleat rebuild"
-  assert_output --partial "Image updated"
+  # Should show the pulled-image success line, not the rebuild hint.
+  assert_output --partial "pulled v99.0.0"
   refute_output --partial "cleat rebuild"
 
   unset DOCKER_PULL_EXIT_CODE

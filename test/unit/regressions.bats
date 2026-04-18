@@ -1124,3 +1124,57 @@ EOF
     return 1
   }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.2 — first-run path in cmd_run called _do_build directly, skipping the
+# remote pull entirely. Users got a 2-5 min local build on every clean install
+# even though ghcr.io/cleatdev/cleat was already publishing matching images.
+# The pull path only fired from `cleat build`, which no one types on first run.
+# Fix: cmd_run's missing-image branch now calls `_do_pull || _do_build`.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.9.2: cmd_run attempts pull before building on first run" {
+  # No image exists yet — mimic a clean install.
+  mock_docker_images ""
+  mkdir -p "$TEST_TEMP/project"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # docker pull must have been called (the new first-run path).
+  run grep '^docker pull ' "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "$REGISTRY_BASE"
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.2 — REGISTRY_IMAGE was hardcoded to ":latest", ignoring the installed
+# CLI's VERSION. The moment GHCR holds a newer tag than the installed CLI,
+# :latest pulls an image the CLI wasn't tested against. Concept doc
+# (14-v090-execution-plan.md) explicitly requires version tag matching.
+# Fix: REGISTRY_IMAGE is derived from $VERSION at load time.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.9.2: registry image tag matches CLI version" {
+  # REGISTRY_IMAGE should end with :v${VERSION}, not :latest or anything else.
+  [[ "$REGISTRY_IMAGE" == "${REGISTRY_BASE}:v${VERSION}" ]] || {
+    echo "REGRESSION: REGISTRY_IMAGE='$REGISTRY_IMAGE' does not match v${VERSION}"
+    return 1
+  }
+  # And the pull command in _do_pull must go against that version-tagged URL.
+  mock_docker_images ""
+  mkdir -p "$TEST_TEMP/project"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  run grep '^docker pull ' "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial ":v${VERSION}"
+  refute_output --partial ":latest"
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}

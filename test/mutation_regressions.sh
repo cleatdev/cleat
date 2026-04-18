@@ -282,6 +282,20 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.9.2_spin_stop_line_clear" "installer spin_stop renders escapes and clears line" "$INSTALLER"
 
+# v0.9.2 — cmd_run must call _do_pull before falling back to _do_build so
+# first-run users get the GHCR prebuilt image instead of a 2-5 min local build.
+cat > "$SED_TMP" << 'SED'
+s#_do_pull || _do_build#_do_build#
+SED
+try "v0.9.2_cmd_run_pull_first" "cmd_run attempts pull before building on first run"
+
+# v0.9.2 — REGISTRY_IMAGE must be derived from $VERSION, not hardcoded to
+# :latest. Revert to :latest and confirm the version-match guard fails.
+cat > "$SED_TMP" << 'SED'
+s|^REGISTRY_IMAGE=.*|REGISTRY_IMAGE="${REGISTRY_BASE}:latest"|
+SED
+try "v0.9.2_registry_tag_latest" "registry image tag matches CLI version"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

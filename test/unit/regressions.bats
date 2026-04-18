@@ -1079,3 +1079,48 @@ EOF
   run grep -nE '[^|]\|&[^|]' "$CLI"
   assert_failure
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.2 — installer spin_stop printed literal \033 escape sequences and
+# left trailing chars from longer spinner lines (e.g. "Pinned to v0.9.1est
+# release..."). Root causes:
+#   1. printf "%s" passes backslash escapes through unchanged; ok_msg/fail_msg
+#      callers embed ${BOLD}...${RESET}, so users saw literal \033[1m.
+#   2. \r alone rewinds the cursor but doesn't clear the rest of the line, so
+#      a shorter success message left the tail of the spinner text visible.
+# Fix: use %b to interpret escapes in the arg, and \r\033[K to clear the line.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.9.2: installer spin_stop renders escapes and clears line" {
+  # install.sh runs outside the CLI. Per test rule 7, extract the relevant
+  # pieces into a harness script and run it directly with _is_tty forced on.
+  local harness="$TEST_TEMP/spin_stop_harness.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '_is_tty() { true; }'
+    echo '_SPIN_PID=""'
+    sed -n '/^BOLD=/,/^RESET=/p' "$PROJECT_ROOT/install.sh"
+    sed -n '/^spin_stop()/,/^}$/p' "$PROJECT_ROOT/install.sh"
+    echo 'spin_stop 0 "Downloaded to ${BOLD}/tmp/.cleat${RESET}"'
+  } > "$harness"
+
+  run bash "$harness"
+  assert_success
+
+  # Message content must appear.
+  assert_output --partial "Downloaded to"
+  assert_output --partial "/tmp/.cleat"
+
+  # Bug 1: with %s, the arg's \033 is passed through literally. The fix uses
+  # %b which interprets it into a real ESC byte, so the 4-char sequence
+  # backslash-zero-three-three must not appear in the output.
+  refute_output --partial '\033'
+
+  # Bug 2: the output must contain the CR + "clear to EOL" byte sequence so
+  # a shorter success line fully replaces a longer spinner line.
+  local clear_seq
+  clear_seq=$'\r\033[K'
+  [[ "$output" == *"$clear_seq"* ]] || {
+    echo "REGRESSION: spin_stop output missing \\r\\033[K line-clear prefix"
+    return 1
+  }
+}

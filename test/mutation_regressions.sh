@@ -22,9 +22,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLI="$REPO_ROOT/bin/cleat"
+INSTALLER="$REPO_ROOT/install.sh"
 BATS="$REPO_ROOT/test/bats/bin/bats"
 REGRESSIONS="$REPO_ROOT/test/unit/regressions.bats"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
+INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
 
 BOLD=$'\033[1m'
 RED=$'\033[0;31m'
@@ -35,38 +37,46 @@ RESET=$'\033[0m'
 
 cleanup() {
   [[ -f "$BACKUP" ]] && cp "$BACKUP" "$CLI"
-  rm -f "$BACKUP"
+  [[ -f "$INSTALLER_BACKUP" ]] && cp "$INSTALLER_BACKUP" "$INSTALLER"
+  rm -f "$BACKUP" "$INSTALLER_BACKUP"
 }
 trap cleanup EXIT INT TERM
 
 cp "$CLI" "$BACKUP"
+cp "$INSTALLER" "$INSTALLER_BACKUP"
 filter="${1:-}"
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
-# Returns 0 if mutation caught, 1 if missed, 2 if skipped.
+# Target file defaults to $CLI; pass $INSTALLER (or any other path) to mutate
+# a companion script. Returns 0 if mutation caught, 1 if missed, 2 if skipped.
 run_mutation() {
-  local name="$1" test_filter="$2" sed_file="$3"
+  local name="$1" test_filter="$2" sed_file="$3" target="${4:-$CLI}" backup
+  if [[ "$target" == "$INSTALLER" ]]; then
+    backup="$INSTALLER_BACKUP"
+  else
+    backup="$BACKUP"
+  fi
 
-  cp "$BACKUP" "$CLI"
+  cp "$backup" "$target"
 
   # Apply the sed script. Use `-i.bak` which is portable across GNU sed
   # (Linux) and BSD sed (macOS). BSD sed's `-i` requires an explicit
   # backup extension; GNU sed accepts it too.
-  if ! sed -i.bak -f "$sed_file" "$CLI" 2>/dev/null; then
-    rm -f "$CLI.bak"
+  if ! sed -i.bak -f "$sed_file" "$target" 2>/dev/null; then
+    rm -f "$target.bak"
     echo "${YELLOW}~ $name: SKIPPED${RESET} ${DIM}(sed failed)${RESET}"
     return 2
   fi
-  rm -f "$CLI.bak"
+  rm -f "$target.bak"
 
   # Verify the mutation produced a change
-  if cmp -s "$CLI" "$BACKUP"; then
+  if cmp -s "$target" "$backup"; then
     echo "${YELLOW}~ $name: SKIPPED${RESET} ${DIM}(no change after mutation)${RESET}"
     return 2
   fi
 
   # Verify the mutated file still parses
-  if ! bash -n "$CLI" 2>/dev/null; then
+  if ! bash -n "$target" 2>/dev/null; then
     echo "${YELLOW}~ $name: SKIPPED${RESET} ${DIM}(mutation caused syntax error)${RESET}"
     return 2
   fi
@@ -95,13 +105,13 @@ skipped=0
 declare -a missed_names=()
 
 try() {
-  local name="$1" test_filter="$2"
+  local name="$1" test_filter="$2" target="${3:-$CLI}"
   if [[ -n "$filter" && "$name" != *"$filter"* ]]; then
     return
   fi
   total=$((total + 1))
   local rc=0
-  run_mutation "$name" "$test_filter" "$SED_TMP" || rc=$?
+  run_mutation "$name" "$test_filter" "$SED_TMP" "$target" || rc=$?
   case "$rc" in
     0) caught=$((caught + 1)) ;;
     1) missed=$((missed + 1)); missed_names+=("$name → $test_filter") ;;
@@ -253,6 +263,24 @@ cat > "$SED_TMP" << 'SED'
 _never_run() { readarray -t arr < /dev/null; }
 SED
 try "bash32_readarray" "no readarray or mapfile"
+
+# v0.9.2 — installer spin_stop must use %b (not %s) so escape sequences
+# embedded in ok_msg/fail_msg render instead of printing literal \033.
+cat > "$SED_TMP" << 'SED'
+/^spin_stop()/,/^}$/{
+  s|%b|%s|g
+}
+SED
+try "v0.9.2_spin_stop_pct_b" "installer spin_stop renders escapes and clears line" "$INSTALLER"
+
+# v0.9.2 — installer spin_stop must emit \r\033[K (not just \r) to clear the
+# rest of a longer spinner line before writing a shorter success message.
+cat > "$SED_TMP" << 'SED'
+/^spin_stop()/,/^}$/{
+  s|\\r\\033\[K|\\r|g
+}
+SED
+try "v0.9.2_spin_stop_line_clear" "installer spin_stop renders escapes and clears line" "$INSTALLER"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

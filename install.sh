@@ -87,9 +87,9 @@ spin_stop() {
     return
   fi
   if [[ "$code" -eq 0 ]]; then
-    printf "\r  ${GREEN}✔${RESET} %s\n" "$ok_msg"
+    printf "\r\033[K  ${GREEN}✔${RESET} %b\n" "$ok_msg"
   else
-    printf "\r  ${RED}✖${RESET} %s\n" "$fail_msg"
+    printf "\r\033[K  ${RED}✖${RESET} %b\n" "$fail_msg"
   fi
 }
 

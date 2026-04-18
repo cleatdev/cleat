@@ -12,14 +12,14 @@ Run AI coding agents with full autonomous permissions — safely sandboxed in Do
 One command. Per-project isolation. Zero risk to your host.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cleatdev/cleat/main/install.sh | bash
+curl -fsSL https://cleat.sh/install | bash
 ```
 
 ```bash
 cd ~/your-project && cleat
 ```
 
-That's it. First run builds the Docker image (~2 min), starts an isolated container for your project, and drops you into Claude Code with full permissions, all sandboxed.
+That's it. First run pulls the prebuilt image from GHCR (~30s), starts an isolated container for your project, and drops you into Claude Code with full permissions, all sandboxed. If the prebuilt image is unavailable for your CLI version, it falls back to a local build (~2 min) automatically.
 
 ```
 ┌─────────────────────┐      ┌─────────────────────────────────┐
@@ -40,7 +40,7 @@ That's it. First run builds the Docker image (~2 min), starts an isolated contai
 
 - **[Docker](https://docs.docker.com/get-docker/)** -- must be installed and running
 - **macOS or Linux** (Windows support via WSL2)
-- **An [Anthropic](https://www.anthropic.com/) account** -- team or Pro plan
+- **An [Anthropic](https://www.anthropic.com/) account** -- Pro, Max, Team, or Enterprise plan, or an API key
 - **git** -- used by the installer
 
 ---
@@ -75,7 +75,7 @@ Cleat gives you the best of both worlds:
 
 ### Key features
 
-- **One command** -- `cleat` builds, starts, and launches everything
+- **One command** -- `cleat` pulls (or builds) the image, starts a container, and launches Claude Code
 - **Per-project isolation** -- each project gets its own container, run multiple projects in parallel
 - **Session persistence** -- stop and resume sessions without losing context, each project's history is isolated
 - **Safe for unattended use** -- let Claude work overnight without risking your system
@@ -115,10 +115,10 @@ I haven't restored from a backup since.
 ### Quick install (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cleatdev/cleat/main/install.sh | bash
+curl -fsSL https://cleat.sh/install | bash
 ```
 
-This clones the repo to `~/.cleat`, checks out the latest stable release tag, and symlinks `cleat` into your PATH.
+This clones the repo to `~/.cleat`, checks out the latest stable release tag, and symlinks `cleat` into your PATH. The short URL resolves to the same `install.sh` served from the latest tagged release on GitHub.
 
 ### Dev install (from local clone)
 

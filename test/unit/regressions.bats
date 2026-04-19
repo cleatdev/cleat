@@ -1178,3 +1178,38 @@ EOF
   cname="$(container_name_for "$TEST_TEMP/project")"
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.2 — bin/cleat's spin_stop also used \r without \033[K, so a shorter
+# success message left the tail of the longer spinner line visible. Example:
+# "Starting container..." (21 chars) overwritten by "Container started"
+# (17 chars) produced "Container startedr..." with the leftover "r..." in
+# the spinner's dim color. Same bug as install.sh, different file.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.9.2: bin/cleat spin_stop clears line before writing" {
+  # Extract color vars + spin_stop from bin/cleat into an isolated harness,
+  # force _is_tty true, and call spin_stop with a shorter success message.
+  local harness="$TEST_TEMP/cleat_spin_stop_harness.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '_is_tty() { true; }'
+    echo '_has_unicode() { true; }'
+    echo '_SPIN_PID=""'
+    sed -n "/^BOLD='/,/^RESET='/p" "$CLI"
+    sed -n '/^spin_stop()/,/^}$/p' "$CLI"
+    echo 'spin_stop 0 "Container started"'
+  } > "$harness"
+
+  run bash "$harness"
+  assert_success
+  assert_output --partial "Container started"
+
+  # Output must contain CR + "clear to EOL" so a shorter success line fully
+  # replaces a longer spinner line.
+  local clear_seq
+  clear_seq=$'\r\033[K'
+  [[ "$output" == *"$clear_seq"* ]] || {
+    echo "REGRESSION: bin/cleat spin_stop output missing \\r\\033[K line-clear prefix"
+    return 1
+  }
+}

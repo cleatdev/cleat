@@ -296,6 +296,15 @@ s|^REGISTRY_IMAGE=.*|REGISTRY_IMAGE="${REGISTRY_BASE}:latest"|
 SED
 try "v0.9.2_registry_tag_latest" "registry image tag matches CLI version"
 
+# v0.9.2 — bin/cleat's spin_stop must emit \r\033[K (not just \r) to clear
+# the rest of a longer spinner line before writing a shorter success message.
+cat > "$SED_TMP" << 'SED'
+/^spin_stop()/,/^}$/{
+  s|\\r\\033\[K|\\r|g
+}
+SED
+try "v0.9.2_cli_spin_stop_line_clear" "bin/cleat spin_stop clears line before writing"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -218,6 +218,55 @@ cleat_bin_timeout() {
   assert_output --partial "docker"
 }
 
+@test "smoke: cleat trust --list shows no projects initially" {
+  run cleat_bin trust --list
+  assert_success
+  assert_output --partial "No trusted projects"
+}
+
+@test "smoke: cleat trust records a project's .cleat and --list shows it" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
+  run cleat_bin trust "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Trusted"
+  run cleat_bin trust --list
+  assert_success
+  assert_output --partial "$TEST_TEMP/proj"
+}
+
+@test "smoke: cleat untrust removes a project's trust entry" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
+  cleat_bin trust "$TEST_TEMP/proj" >/dev/null
+  run cleat_bin untrust "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Removed trust"
+}
+
+@test "smoke: cleat trust fails cleanly when .cleat is missing" {
+  mkdir -p "$TEST_TEMP/proj"
+  run cleat_bin trust "$TEST_TEMP/proj"
+  assert_failure
+  assert_output --partial "No .cleat file"
+}
+
+@test "smoke: cleat start with --trust-project auto-approves project .cleat" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\nenv\n' > "$TEST_TEMP/proj/.cleat"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  # Override the auto-trust env var from setup so we genuinely test the flag.
+  unset CLEAT_TRUST_PROJECT
+
+  run cleat_bin_timeout 5 --trust-project start "$TEST_TEMP/proj"
+  # env cap should be respected (env vars would flow into docker run when
+  # .cleat.env exists; if not, no crash either way)
+  refute_output --partial "Project .cleat skipped"
+  refute_output --partial "unbound variable"
+}
+
 @test "smoke: cleat config --enable unknown-cap exits 1" {
   run cleat_bin config --enable totally-not-a-cap
   assert_failure

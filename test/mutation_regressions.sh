@@ -326,6 +326,36 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_docker_cap_identity_mount" "docker cap mounts project at host path with workdir"
 
+# v0.10.0 — workspace trust must default-deny project .cleat caps in non-TTY
+# contexts when no opt-in is provided. Remove the trust gate so project
+# caps are applied unconditionally — the supply-chain regression guard
+# should fail.
+cat > "$SED_TMP" << 'SED'
+s|if _resolve_project_trust "\$project" "\$trust_mode"; then|if true; then|
+SED
+try "v0.10.0_trust_default_deny" "skips project .cleat caps"
+
+# v0.10.0 — cmd_status must call resolve_caps with readonly mode so it
+# never prompts. Remove the readonly argument and the "status never
+# prompts" guard should fail.
+cat > "$SED_TMP" << 'SED'
+/# Resolve caps for display only/,/resolve_caps.*readonly/{
+  s|resolve_caps "\$project" readonly|resolve_caps "\$project"|
+}
+SED
+try "v0.10.0_status_readonly_trust" "cmd_status never prompts for trust"
+
+# v0.10.0 — the trust hash must be over the *canonical* cap list, not the
+# raw .cleat file. If the hash includes comments/whitespace, comment
+# edits trigger re-approval churn. Replace canonical hashing with raw
+# file hashing and the hash-stability guard should fail.
+cat > "$SED_TMP" << 'SED'
+/^_hash_cleat_caps\(\)/,/^}$/{
+  s|caps="\$(_read_caps_from_file "\$path" \| _canonical_caps)"|caps="$(cat "$path")"|
+}
+SED
+try "v0.10.0_trust_hash_canonical" "trust hash is over canonical caps"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

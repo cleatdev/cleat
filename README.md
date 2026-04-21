@@ -250,6 +250,13 @@ cleat ps
 | `cleat config --disable <cap>` | Disable a capability |
 | `cleat config --project --enable <cap>` | Project-level config (saved to `.cleat`) |
 
+#### Workspace trust
+| Command | Description |
+|---|---|
+| `cleat trust [path]` | Record approval for a project's `.cleat` capabilities |
+| `cleat trust --list` | List trusted projects (yellow = `.cleat` changed since approval) |
+| `cleat untrust [path]` | Remove a project's trust entry |
+
 #### Flags (apply to `start`, `run`, `resume`, `claude`, `shell`, `login`)
 | Flag | Description |
 |---|---|
@@ -257,6 +264,7 @@ cleat ps
 | `--env KEY=VALUE` | Pass environment variable to container |
 | `--env KEY` | Inherit from host environment |
 | `--env-file PATH` | Load env vars from file |
+| `--trust-project` | Auto-approve the current project's `.cleat` without prompting |
 
 #### Interact
 | Command | Description |
@@ -365,6 +373,60 @@ cleat --cap ssh start
 | `hooks` | Runs your Claude Code hooks on the host (global and project-level). |
 | `gh` | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
 | `docker` | Mounts `/var/run/docker.sock`. `docker`, `docker compose`, and anything that talks to the daemon run against your host — sibling containers, zero overhead. **Sandbox-escaping — see security note below.** |
+
+### Workspace trust — project `.cleat` approval
+
+A project's `.cleat` file lives in the repo — whoever controls the repo controls that file. Cleat won't silently apply a `.cleat`'s capabilities on first run. Instead, on first launch inside a project with a `.cleat`, you'll see:
+
+```
+  ┌────────────────────────────────────────────────────────────────┐
+  │  This project's .cleat file requests capabilities               │
+  │  that extend what the sandbox can access on your host.          │
+  │                                                                 │
+  │  Requested:                                                     │
+  │                                                                 │
+  │    docker  Host Docker socket (breaks sandbox — test            │
+  │            Docker-based apps)                                   │
+  │    env     Load env vars from ~/.config/cleat/env and .cleat.env│
+  │                                                                 │
+  │  Project: /Users/you/proj                                       │
+  └────────────────────────────────────────────────────────────────┘
+
+  Trust this project's .cleat? [y/N]:
+```
+
+Say yes and the approval is stored at `~/.config/cleat/trust`. Next launch, nothing to see — Cleat silently applies the caps.
+
+Approval is keyed on the **canonical list of capabilities** declared in `.cleat`, not the raw file. Comment edits and cap reordering don't invalidate trust. Adding, removing, or changing a cap triggers a re-prompt with an "…has changed since you trusted it" framing.
+
+#### Scripting & CI
+
+Non-interactive contexts (pipes, CI, `cleat … | tee log`) can't answer a prompt, so they default-deny: project `.cleat` caps are silently dropped, global config and `--cap` flags still apply. To opt in explicitly:
+
+```bash
+cleat --trust-project                 # one-off session flag
+CLEAT_TRUST_PROJECT=1 cleat           # env var (same effect)
+cleat trust                           # persist for this project, once
+```
+
+#### Subcommands
+
+```bash
+cleat trust                  # trust the current dir's .cleat
+cleat trust ~/proj           # trust a specific project
+cleat trust --list           # show all trusted projects
+cleat untrust ~/proj         # remove a project's trust entry
+```
+
+#### What trust covers
+
+| Source | Trusted? |
+|---|---|
+| `~/.config/cleat/config` (global) | ✔ always — user's own file |
+| `--cap <name>` CLI flag | ✔ always — affirmative typed action |
+| `<project>/.cleat` | requires approval per-project, per-cap-set |
+
+`cleat status` never prompts — it's read-only and silently omits untrusted project caps when displaying.
 
 ### Docker capability — testing dockerized apps
 

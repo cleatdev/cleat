@@ -51,6 +51,13 @@ _common_setup() {
   # Reset function overrides to default (nothing running/existing)
   _MOCK_PS_MATCH=""
   _MOCK_PS_A_MATCH=""
+
+  # Workspace-trust test contract: tests aren't interactive, so the real
+  # trust flow would default-deny every project .cleat and strip caps the
+  # tests are asserting on. Opt every test into trust by default via the
+  # documented env-var escape hatch. Individual trust tests unset this to
+  # exercise the prompt / default-deny paths.
+  export CLEAT_TRUST_PROJECT=1
 }
 
 # Portable MD5 — available to all tests regardless of whether CLI is sourced.

@@ -14,6 +14,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLEAT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cleat"
 CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
 CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
+CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 
 # Known capabilities (order matters for display)
 KNOWN_CAPS=(git ssh env hooks gh docker)
@@ -23,6 +24,7 @@ _CLI_CAPS=()
 _RESOLVED_PROJECT=""
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
+_CLI_TRUST_PROJECT=0
 
 # ── Colors & Formatting ────────────────────────────────────────────────────
 BOLD='\033[1m'
@@ -276,20 +278,260 @@ _write_caps_to_file() {
   } > "$file"
 }
 
+# ── Workspace trust ─────────────────────────────────────────────────────────
+#
+# A project's .cleat file lives in the repo — it's untrusted input. Before
+# applying any capabilities it declares, the user must explicitly trust the
+# file. Approval is per-project, keyed by the project's absolute path, and
+# re-prompted whenever the set of requested caps changes (hash mismatch).
+#
+# Global config (~/.config/cleat/config) and --cap CLI flags are always
+# trusted — the user wrote those themselves.
+#
+# Full design: concept/16-workspace-trust.md.
+
+# Canonicalize a cap list for hashing: sort, deduplicate, join with commas.
+# Reads one cap per line from stdin, outputs a single canonical string.
+_canonical_caps() {
+  awk 'NF' | LC_ALL=C sort -u | paste -sd, -
+}
+
+# Hash the canonical cap list from a .cleat file. Prints empty when the
+# file is missing or declares no caps (nothing to gate).
+_hash_cleat_caps() {
+  local path="$1"
+  [[ -f "$path" ]] || return 0
+  local caps
+  caps="$(_read_caps_from_file "$path" | _canonical_caps)"
+  [[ -z "$caps" ]] && return 0
+  echo -n "$caps" | _md5
+}
+
+# Look up the stored trust hash for a project path. Empty on miss.
+_trust_lookup() {
+  local project="$1"
+  [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
+  awk -F'\t' -v p="$project" '
+    /^#/ { next }
+    $1 == p { print $2; exit }
+  ' "$CLEAT_TRUST_FILE" 2>/dev/null
+}
+
+# Append/update a trust entry. Atomic via temp+rename. 0600 permissions.
+# Refuses to write paths containing tab/newline/carriage-return.
+_trust_record() {
+  local project="$1" hash="$2"
+  case "$project" in
+    *$'\t'*|*$'\n'*|*$'\r'*)
+      error "Refusing to trust a project path containing control characters"
+      return 1 ;;
+  esac
+  [[ -z "$hash" ]] && return 1
+  mkdir -p "$(dirname "$CLEAT_TRUST_FILE")"
+  local tmp="${CLEAT_TRUST_FILE}.tmp.$$"
+  {
+    echo "# Cleat project trust file — one entry per line"
+    echo "# <absolute-project-path><TAB><hash-of-canonical-caps>"
+    if [[ -f "$CLEAT_TRUST_FILE" ]]; then
+      awk -F'\t' -v p="$project" '
+        /^#/ { next }
+        NF < 2 { next }
+        $1 != p { print }
+      ' "$CLEAT_TRUST_FILE"
+    fi
+    printf '%s\t%s\n' "$project" "$hash"
+  } > "$tmp"
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$CLEAT_TRUST_FILE"
+}
+
+# Remove a project's trust entry. Silent no-op if not present.
+_trust_remove() {
+  local project="$1"
+  [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
+  local tmp="${CLEAT_TRUST_FILE}.tmp.$$"
+  {
+    echo "# Cleat project trust file — one entry per line"
+    echo "# <absolute-project-path><TAB><hash-of-canonical-caps>"
+    awk -F'\t' -v p="$project" '
+      /^#/ { next }
+      NF < 2 { next }
+      $1 != p { print }
+    ' "$CLEAT_TRUST_FILE"
+  } > "$tmp"
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$CLEAT_TRUST_FILE"
+}
+
+# List all trusted projects (one per line).
+_trust_list() {
+  [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
+  awk -F'\t' '
+    /^#/ { next }
+    NF >= 2 { print $1 }
+  ' "$CLEAT_TRUST_FILE" 2>/dev/null
+}
+
+# Is a project trusted at its current .cleat caps hash?
+# Returns 0 when trusted, 1 when not (missing entry, stale hash, or no .cleat).
+_is_project_trusted() {
+  local project="$1"
+  local stored current
+  stored="$(_trust_lookup "$project")"
+  [[ -z "$stored" ]] && return 1
+  current="$(_hash_cleat_caps "$project/.cleat")"
+  [[ -z "$current" ]] && return 1
+  [[ "$stored" == "$current" ]]
+}
+
+# Show a trust prompt and read y/n. Returns 0 on approval.
+# $1 = project path; $2..$N = capability names being requested.
+# Must only be called when _is_tty is true.
+_trust_prompt() {
+  local project="$1"; shift
+  local caps=("$@")
+
+  # Detect if this is a re-prompt (stored hash exists but doesn't match).
+  local is_reprompt=0
+  [[ -n "$(_trust_lookup "$project")" ]] && is_reprompt=1
+
+  local -a lines=()
+  if [[ $is_reprompt -eq 1 ]]; then
+    lines+=(
+      "This project's {BOLD}.cleat{/BOLD} has changed since you trusted it."
+      ""
+      "Re-approving would grant these capabilities:"
+    )
+  else
+    lines+=(
+      "This project's {BOLD}.cleat{/BOLD} file requests capabilities"
+      "that extend what the sandbox can access on your host."
+      ""
+      "Requested:"
+    )
+  fi
+  lines+=("")
+  local cap desc
+  for cap in "${caps[@]}"; do
+    desc="$(_cap_description "$cap")"
+    if [[ "$cap" == "docker" ]]; then
+      lines+=("  {BOLD}${cap}{/BOLD}  ${desc}")
+    else
+      lines+=("  {BOLD}${cap}{/BOLD}  ${desc}")
+    fi
+  done
+  lines+=(
+    ""
+    "Project: ${project}"
+  )
+
+  _notice_box "${lines[@]}"
+
+  local answer=""
+  # Read the answer. Use /dev/tty to survive stdin redirection from callers.
+  if [[ -r /dev/tty ]]; then
+    printf "  %bTrust this project's .cleat?%b [y/N]: " "${BOLD}" "${RESET}" > /dev/tty
+    IFS= read -r answer < /dev/tty || answer=""
+    printf "\n" > /dev/tty
+  else
+    IFS= read -r -p "  Trust this project's .cleat? [y/N]: " answer || answer=""
+    printf "\n"
+  fi
+  case "${answer}" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Session-scoped decision cache: avoid prompting twice per invocation when
+# resolve_caps is called from multiple command paths in the same run.
+_TRUST_SESSION_DECISION=""   # "", "approved", "rejected"
+_TRUST_SESSION_PROJECT=""    # the project path we decided on
+
+# Decide whether to apply a project's .cleat caps. Sets _TRUST_SESSION_* on
+# first call for a given project. Returns 0 = apply, 1 = skip.
+# $1 = project path (must have a .cleat with caps — caller's responsibility).
+# $2 = "prompt" (default) or "readonly" to forbid interactive prompting.
+_resolve_project_trust() {
+  local project="$1"
+  local mode="${2:-prompt}"
+
+  # Cached decision for this session/project
+  if [[ -n "$_TRUST_SESSION_DECISION" && "$_TRUST_SESSION_PROJECT" == "$project" ]]; then
+    [[ "$_TRUST_SESSION_DECISION" == "approved" ]] && return 0 || return 1
+  fi
+
+  # Already approved at the current hash
+  if _is_project_trusted "$project"; then
+    _TRUST_SESSION_DECISION="approved"
+    _TRUST_SESSION_PROJECT="$project"
+    return 0
+  fi
+
+  # Explicit non-interactive opt-in
+  if [[ "${CLEAT_TRUST_PROJECT:-}" == "1" || "${_CLI_TRUST_PROJECT:-0}" == "1" ]]; then
+    local hash
+    hash="$(_hash_cleat_caps "$project/.cleat")"
+    _trust_record "$project" "$hash" || true
+    _TRUST_SESSION_DECISION="approved"
+    _TRUST_SESSION_PROJECT="$project"
+    return 0
+  fi
+
+  # Read-only contexts never prompt (e.g. cleat status)
+  [[ "$mode" == "readonly" ]] && return 1
+
+  # Interactive prompt
+  if _is_tty; then
+    local -a req_caps=()
+    local c
+    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$project/.cleat")
+    if _trust_prompt "$project" "${req_caps[@]}"; then
+      local hash
+      hash="$(_hash_cleat_caps "$project/.cleat")"
+      _trust_record "$project" "$hash" || true
+      _TRUST_SESSION_DECISION="approved"
+      _TRUST_SESSION_PROJECT="$project"
+      return 0
+    else
+      warn "Project .cleat ignored — not trusted ${DIM}(global config still applied)${RESET}"
+      _TRUST_SESSION_DECISION="rejected"
+      _TRUST_SESSION_PROJECT="$project"
+      return 1
+    fi
+  fi
+
+  # Non-TTY, no explicit opt-in: default-deny with an informational warning
+  warn "Project .cleat skipped in non-interactive mode ${DIM}(pass --trust-project or set CLEAT_TRUST_PROJECT=1 to approve)${RESET}"
+  _TRUST_SESSION_DECISION="rejected"
+  _TRUST_SESSION_PROJECT="$project"
+  return 1
+}
+
 # Resolve active capabilities: global config + project config + CLI flags.
 # Sets the global ACTIVE_CAPS array.
 resolve_caps() {
   local project="${1:-}"
+  local trust_mode="${2:-prompt}"
   ACTIVE_CAPS=()
 
   # 1. Global config
   local global_caps
   global_caps="$(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")"
 
-  # 2. Project config (union with global)
+  # 2. Project config — gated by workspace trust. A .cleat file sitting in
+  # the repo is untrusted input. Apply its caps only if the user has
+  # approved this project (either a persistent trust record, a one-off
+  # --trust-project flag, or an interactive "y" to the prompt).
   local project_caps=""
   if [[ -n "$project" && -f "$project/.cleat" ]]; then
-    project_caps="$(_read_caps_from_file "$project/.cleat")"
+    local _raw_project_caps
+    _raw_project_caps="$(_read_caps_from_file "$project/.cleat")"
+    if [[ -n "$_raw_project_caps" ]]; then
+      if _resolve_project_trust "$project" "$trust_mode"; then
+        project_caps="$_raw_project_caps"
+      fi
+    fi
   fi
 
   # 3. Merge: global + project (union, deduplicated)
@@ -2012,8 +2254,9 @@ cmd_status() {
   local cname
   cname="$(container_name_for "$project")"
 
-  # Resolve caps for display
-  resolve_caps "$project"
+  # Resolve caps for display only — never trigger a trust prompt from
+  # a read-only status call.
+  resolve_caps "$project" readonly
 
   echo ""
   echo -e "  ${BOLD}Project:${RESET}   ${project}"
@@ -2516,6 +2759,99 @@ cmd_config() {
   fi
 }
 
+# ── Workspace trust subcommands ────────────────────────────────────────────
+#
+# `cleat trust [path]`   — record approval for a project's .cleat caps
+# `cleat trust --list`   — list all trusted projects
+# `cleat untrust [path]` — remove approval for a project
+#
+# Normally users will be prompted automatically on first run. These
+# subcommands exist for scripting, manual approval, and inspection.
+
+cmd_trust() {
+  # Flag parsing
+  local list_mode=0
+  local -a pos_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --list) list_mode=1; shift ;;
+      --help|-h)
+        echo "Usage: cleat trust [path]      Record trust for a project's .cleat"
+        echo "       cleat trust --list      List all trusted projects"
+        return 0 ;;
+      *) pos_args+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ $list_mode -eq 1 ]]; then
+    if [[ ! -f "$CLEAT_TRUST_FILE" ]]; then
+      info "No trusted projects."
+      return 0
+    fi
+    local count
+    count="$(_trust_list | wc -l | tr -d ' ')"
+    if [[ "$count" -eq 0 ]]; then
+      info "No trusted projects."
+      return 0
+    fi
+    echo -e "  ${BOLD}Trusted projects${RESET} ${DIM}(${count})${RESET}"
+    echo ""
+    _trust_list | while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      local marker="${GREEN}●${RESET}"
+      # Indicate if the project .cleat has changed since approval
+      if [[ -f "$p/.cleat" ]] && ! _is_project_trusted "$p"; then
+        marker="${YELLOW}●${RESET}"
+      fi
+      echo -e "    ${marker} ${p}"
+    done
+    echo ""
+    echo -e "  ${DIM}${GREEN}●${DIM} trusted at current caps   ${YELLOW}●${DIM} .cleat changed since approval${RESET}"
+    return 0
+  fi
+
+  # Record trust for a specific project (default: current dir)
+  local project
+  project="$(resolve_project "${pos_args[0]:-}")"
+  if [[ ! -f "$project/.cleat" ]]; then
+    error "No .cleat file found in ${BOLD}${project}${RESET}"
+    echo -e "    ${DIM}Nothing to trust — project has no per-project capability config.${RESET}"
+    exit 1
+  fi
+  local hash
+  hash="$(_hash_cleat_caps "$project/.cleat")"
+  if [[ -z "$hash" ]]; then
+    error "Project .cleat has no capabilities to trust"
+    exit 1
+  fi
+  if _trust_record "$project" "$hash"; then
+    success "Trusted ${BOLD}${project}${RESET}"
+    local caps
+    caps="$(_read_caps_from_file "$project/.cleat" | _canonical_caps)"
+    echo -e "    ${DIM}Approved caps: ${caps}${RESET}"
+  else
+    exit 1
+  fi
+}
+
+cmd_untrust() {
+  case "${1:-}" in
+    --help|-h)
+      echo "Usage: cleat untrust [path]    Remove trust for a project"
+      return 0 ;;
+  esac
+  local project
+  project="$(resolve_project "${1:-}")"
+  local had
+  had="$(_trust_lookup "$project")"
+  _trust_remove "$project"
+  if [[ -n "$had" ]]; then
+    success "Removed trust for ${BOLD}${project}${RESET}"
+  else
+    info "${project} was not trusted"
+  fi
+}
+
 # ── Version & Update ──────────────────────────────────────────────────────
 cmd_version() {
   echo -e "  ${BOLD}cleat${RESET} ${DIM}v${VERSION}${RESET}"
@@ -2633,10 +2969,15 @@ parse_global_flags() {
   _CLI_CAPS=()
   _CLI_ENVS=()
   _CLI_ENV_FILES=()
+  _CLI_TRUST_PROJECT=0
   _REMAINING_ARGS=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --trust-project)
+        _CLI_TRUST_PROJECT=1
+        shift
+        ;;
       --cap)
         if [[ -z "${2:-}" ]]; then
           error "Missing capability name after --cap"
@@ -2707,6 +3048,8 @@ main() {
     ps)        cmd_ps "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
+    trust)     cmd_trust "$@" ;;
+    untrust)   cmd_untrust "$@" ;;
     clean)     cmd_clean "$@" ;;
     nuke)      cmd_nuke "$@" ;;
     update)    cmd_update "$@" ;;

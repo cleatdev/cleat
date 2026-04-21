@@ -1307,3 +1307,91 @@ EOF
 
   rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.10.0 — workspace trust. A project's .cleat file lives in the repo and is
+# untrusted input. Applying its caps without user approval was the original
+# supply-chain footgun (any repo could silently enable ssh/gh/docker on
+# clone+run). Workspace trust closes that: project caps require approval
+# via prompt, --trust-project flag, CLEAT_TRUST_PROJECT=1 env, or a stored
+# approval whose hash still matches the current .cleat caps.
+#
+# Core invariants:
+#   1. Non-interactive + no opt-in → project caps are DROPPED (default-deny)
+#   2. Hash is over canonical caps, not raw file — comment edits don't
+#      require re-approval
+#   3. Global config + --cap CLI flags are never gated (user's own input)
+#   4. cleat status never prompts (readonly mode)
+#   5. Trust file refuses paths with tab/newline (format corruption)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@test "regression v0.10.0: non-TTY + no opt-in skips project .cleat caps" {
+  # The supply-chain protection: a malicious repo's .cleat with docker
+  # can't silently activate in scripted/CI contexts.
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat"
+  _is_tty() { return 1; }
+
+  resolve_caps "$TEST_TEMP/proj" >/dev/null 2>&1
+  cap_is_active docker && {
+    echo "REGRESSION: docker cap leaked from untrusted .cleat in non-TTY mode"
+    return 1
+  }
+  return 0
+}
+
+@test "regression v0.10.0: global config is never gated by trust" {
+  # The trust check applies only to project-level .cleat files. The user's
+  # own global config must continue to work without any approval flow.
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/proj"
+  touch "$HOME/.gitconfig"
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+git
+EOF
+  _is_tty() { return 1; }
+  resolve_caps "$TEST_TEMP/proj" >/dev/null 2>&1
+  cap_is_active git || {
+    echo "REGRESSION: global config cap was dropped"
+    return 1
+  }
+}
+
+@test "regression v0.10.0: trust hash is over canonical caps (comment-edit safe)" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\nssh\n' > "$TEST_TEMP/proj/.cleat"
+  local h1 h2
+  h1="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  # Rewrite the file with comments and reordered caps. Same cap set.
+  printf '# this is a comment\n[caps]\nssh\n# another comment\ngit\n' > "$TEST_TEMP/proj/.cleat"
+  h2="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  [[ -n "$h1" && "$h1" == "$h2" ]] || {
+    echo "REGRESSION: comment/order-only .cleat changes altered the trust hash"
+    echo "h1=$h1 h2=$h2"
+    return 1
+  }
+}
+
+@test "regression v0.10.0: trust file refuses control chars in project path" {
+  # Tab/newline would corrupt the field- and line-oriented trust file.
+  run _trust_record "$(printf '/foo\tbar')" "hash"
+  assert_failure
+  run _trust_record "$(printf '/foo\nbar')" "hash"
+  assert_failure
+}
+
+@test "regression v0.10.0: cmd_status never prompts for trust" {
+  # cleat status is read-only. Any trust prompt from it would surprise users
+  # and could deadlock scripts that pipe through status.
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat"
+  _is_tty() { return 0; }
+  mock_docker_images ""
+  run cmd_status "$TEST_TEMP/proj"
+  assert_success
+  refute_output --partial "Trust this project"
+  refute_output --partial "Project .cleat"
+}

@@ -305,6 +305,27 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.9.2_cli_spin_stop_line_clear" "bin/cleat spin_stop clears line before writing"
 
+# v0.10.0 — docker must be in KNOWN_CAPS. Remove it, guard test should fail.
+cat > "$SED_TMP" << 'SED'
+s|^KNOWN_CAPS=(git ssh env hooks gh docker)$|KNOWN_CAPS=(git ssh env hooks gh)|
+SED
+try "v0.10.0_docker_in_known_caps" "docker listed in KNOWN_CAPS"
+
+# v0.10.0 — docker cap must mount the host docker socket when active. Remove
+# the socket mount; the regression guard for socket mount should fail.
+cat > "$SED_TMP" << 'SED'
+/mount_args+=(-v \/var\/run\/docker.sock/d
+SED
+try "v0.10.0_docker_cap_socket_mount" "docker cap mounts host socket"
+
+# v0.10.0 — docker cap must add a host-path identity mount + workdir so
+# $(pwd) inside Cleat resolves to a host-valid path. Remove the identity
+# mount; the path-remapping guard should fail.
+cat > "$SED_TMP" << 'SED'
+/mount_args+=(-v "\$project:\$project")/d
+SED
+try "v0.10.0_docker_cap_identity_mount" "docker cap mounts project at host path with workdir"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

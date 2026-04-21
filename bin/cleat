@@ -16,7 +16,7 @@ CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
 CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 
 # Known capabilities (order matters for display)
-KNOWN_CAPS=(git ssh env hooks gh)
+KNOWN_CAPS=(git ssh env hooks gh docker)
 
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
@@ -1572,6 +1572,19 @@ cmd_run() {
     mount_args+=(-v "${HOME}/.config/gh:/home/coder/.config/gh")
   fi
 
+  # ── docker capability: mount the host Docker socket so the container can
+  # build, run, and manage Docker workloads against the host daemon. Also
+  # bind-mount the project at its HOST path (in addition to /workspace) and
+  # set workdir there, so $(pwd) returns a host-valid path and bind-mount
+  # sources in `docker run -v $(pwd):/app` resolve on the host daemon.
+  # Full rationale: concept/15-docker-capability.md.
+  local docker_args=()
+  if cap_is_active docker; then
+    mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
+    mount_args+=(-v "$project:$project")
+    docker_args+=(--workdir "$project" -e "CLEAT_HOST_PROJECT=$project")
+  fi
+
   # ── Compute config fingerprint and store as label
   local config_hash
   config_hash="$(compute_config_fingerprint "$project")"
@@ -1593,6 +1606,7 @@ cmd_run() {
     --name "$cname" \
     "${mount_args[@]}" \
     "${ssh_args[@]+"${ssh_args[@]}"}" \
+    "${docker_args[@]+"${docker_args[@]}"}" \
     "${host_args[@]+"${host_args[@]}"}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
     "${label_args[@]}" \
@@ -1675,6 +1689,11 @@ cmd_start() {
   fi
 
   success "Auth shared"
+
+  # Docker cap is the only capability that breaks the sandbox — loud warning.
+  if cap_is_active docker; then
+    warn "Docker socket mounted — container can create host-level processes"
+  fi
 
   check_for_update
   show_first_run_tip
@@ -1915,6 +1934,10 @@ cmd_claude() {
     done
   fi
 
+  if cap_is_active docker; then
+    warn "Docker socket mounted — container can create host-level processes"
+  fi
+
   check_for_update
   success "Claude launched"
   _print_summary_block "$cname" "$project"
@@ -2123,6 +2146,7 @@ _cap_description() {
     env)   echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
     hooks) echo "Run your Claude Code hooks on the host (global + project)" ;;
     gh)    echo "GitHub CLI — authenticate once, persists across rm/nuke/rebuild" ;;
+    docker) echo "Host Docker socket (breaks sandbox — test Docker-based apps)" ;;
     *)     echo "(unknown capability)" ;;
   esac
 }

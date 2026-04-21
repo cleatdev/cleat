@@ -83,7 +83,7 @@ Cleat gives you the best of both worlds:
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
 - **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq, and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), all disabled by default
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), host Docker daemon for testing dockerized apps (`--cap docker`), all disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
@@ -364,6 +364,38 @@ cleat --cap ssh start
 | `env` | Auto-loads env vars from `~/.config/cleat/env` (global) and `.cleat.env` (project). |
 | `hooks` | Runs your Claude Code hooks on the host (global and project-level). |
 | `gh` | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
+| `docker` | Mounts `/var/run/docker.sock`. `docker`, `docker compose`, and anything that talks to the daemon run against your host — sibling containers, zero overhead. **Sandbox-escaping — see security note below.** |
+
+### Docker capability — testing dockerized apps
+
+When `docker` is enabled, the container mounts the host Docker socket and can build, run, and manage containers against the **host** daemon. Containers you launch from inside Cleat run as **siblings** on the host — not nested — so there's zero virtualization overhead:
+
+```bash
+cleat config --enable docker        # persistent
+cleat --cap docker                  # one-off session
+
+# Then, inside the sandbox:
+docker compose up -d
+docker compose exec app npm run test:ci
+docker build -t myapp .
+docker run -v $(pwd):/app node:20 npm install
+```
+
+Cleat also bind-mounts your project at its **host path** inside the container (in addition to `/workspace`) and sets `workdir` there, so `$(pwd)` returns a host-valid path. This makes `docker run -v $(pwd):/app …` and relative paths like `-v ./data:/data` in `docker-compose.yml` resolve correctly on the host daemon.
+
+The `CLEAT_HOST_PROJECT` environment variable is exported with your project's host path for scripts that want it explicitly.
+
+> **Security note.** The Docker socket grants root-equivalent access to your host. Any process inside the container that can reach `/var/run/docker.sock` can create a container that mounts `/` from the host and escape the sandbox (this is a property of Docker, not Cleat). When the capability is active, Cleat prints a yellow warning on startup:
+>
+> ```
+>   ! Docker socket mounted — container can create host-level processes
+> ```
+>
+> Enable this capability only in projects you trust — and disable it when you don't need it. It's off by default and every activation is explicit (`cleat config --enable docker` or `--cap docker`).
+
+Known limitations in v0.10.0:
+- Literal `/workspace/…` paths in `-v` aren't translated — Docker errors cleanly that the source doesn't exist. Use `$(pwd)` or the host path instead.
+- Paths created inside Cleat at locations that don't exist on the host (e.g. `/tmp/scratch` after `mkdir -p /tmp/scratch` inside Cleat) will be created on the host as empty directories. Keep bind-mount sources under your project path.
 
 ### Environment variables
 

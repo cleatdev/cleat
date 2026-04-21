@@ -201,6 +201,23 @@ cleat_bin_timeout() {
   }
 }
 
+@test "smoke: cleat config --enable docker persists to config file" {
+  run cleat_bin config --enable docker
+  assert_success
+  assert_output --partial "docker"
+  grep -q "^docker$" "$CLEAT_CONFIG_DIR/config" || {
+    echo "docker cap not persisted"
+    cat "$CLEAT_CONFIG_DIR/config"
+    return 1
+  }
+}
+
+@test "smoke: cleat config --list includes docker as a known cap" {
+  run cleat_bin config --list
+  assert_success
+  assert_output --partial "docker"
+}
+
 @test "smoke: cleat config --enable unknown-cap exits 1" {
   run cleat_bin config --enable totally-not-a-cap
   assert_failure
@@ -397,6 +414,34 @@ EOF
   run cleat_bin_timeout 5 start "$TEST_TEMP/project"
   grep -qF ".config/gh:/home/coder/.config/gh" "$DOCKER_CALLS" || {
     echo "gh config mount missing from docker run"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}
+
+@test "smoke: cleat start with docker cap mounts socket and host path" {
+  mkdir -p "$TEST_TEMP/project"
+  cat > "$TEST_TEMP/project/.cleat" << 'EOF'
+[caps]
+docker
+EOF
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  grep -qF "/var/run/docker.sock:/var/run/docker.sock" "$DOCKER_CALLS" || {
+    echo "docker socket mount missing from docker run"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  grep -qF "$TEST_TEMP/project:$TEST_TEMP/project" "$DOCKER_CALLS" || {
+    echo "host-path identity mount missing from docker run"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  grep -qF "CLEAT_HOST_PROJECT=$TEST_TEMP/project" "$DOCKER_CALLS" || {
+    echo "CLEAT_HOST_PROJECT env missing from docker run"
     cat "$DOCKER_CALLS"
     return 1
   }

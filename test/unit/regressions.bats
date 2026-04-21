@@ -1213,3 +1213,97 @@ EOF
     return 1
   }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.10.0 — docker capability. The headline feature: opt-in access to the
+# host Docker daemon so users can test docker-based apps (compose, exec,
+# build) without leaving the sandbox. Full design in
+# concept/15-docker-capability.md.
+#
+# The three invariants that must hold:
+#   1. `docker` is in KNOWN_CAPS (so config --list/--enable work)
+#   2. When the cap is active, /var/run/docker.sock is mounted
+#   3. When active, project is also mounted at its host path with workdir
+#      set there (so $(pwd) in Cleat == $(pwd) on host — the path-remapping
+#      ergonomic fix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@test "regression v0.10.0: docker listed in KNOWN_CAPS" {
+  # Guards against accidental removal during cap-list refactors.
+  local found=0
+  for cap in "${KNOWN_CAPS[@]}"; do
+    if [[ "$cap" == "docker" ]]; then found=1; fi
+  done
+  [[ $found -eq 1 ]] || {
+    echo "REGRESSION: docker missing from KNOWN_CAPS (${KNOWN_CAPS[*]})"
+    return 1
+  }
+}
+
+@test "regression v0.10.0: docker cap mounts host socket" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "regression v0.10.0: docker cap mounts project at host path with workdir" {
+  # This is the path-remapping fix: inside Cleat, /workspace and the host
+  # path both point to the same project, and workdir is set to the host
+  # path so $(pwd) returns something the host daemon can find.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "$TEST_TEMP/project:$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "--workdir $TEST_TEMP/project"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "regression v0.10.0: docker cap off leaves baseline mounts unchanged" {
+  # Docker cap is opt-in; enabling other caps must not accidentally add the
+  # socket or host-path mount.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  mkdir -p "$HOME/.ssh"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+ssh
+gh
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$cname" "/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_lacks "$cname" "--workdir"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}

@@ -340,6 +340,150 @@ EOF
   assert_success
 }
 
+# ── docker capability: docker run mounts ──────────────────────────────────
+#
+# Design rationale: concept/15-docker-capability.md. Opt-in only. When active,
+# the host docker socket is mounted (sibling containers), the project is
+# bind-mounted at its HOST path (in addition to /workspace) so `$(pwd)`
+# returns a host-valid path inside the container, and workdir is set to that
+# host path. Also exports CLEAT_HOST_PROJECT for scripts.
+
+@test "docker cap: mounts /var/run/docker.sock when enabled" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: bind-mounts project at its host path (identity mount)" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # Project path mounted at its host path inside the container — so
+  # $(pwd), `.`, and absolute host paths all resolve on the host daemon.
+  run assert_docker_run_has "$cname" "$TEST_TEMP/project:$TEST_TEMP/project"
+  assert_success
+}
+
+@test "docker cap: keeps /workspace mount alongside host-path mount" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # /workspace still valid — preserves existing muscle memory
+  run assert_docker_run_has "$cname" "$TEST_TEMP/project:/workspace"
+  assert_success
+}
+
+@test "docker cap: sets workdir to host path and exports CLEAT_HOST_PROJECT" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "--workdir $TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "CLEAT_HOST_PROJECT=$TEST_TEMP/project"
+  assert_success
+}
+
+@test "no docker cap: does not mount docker socket or set host workdir" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$cname" "/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_lacks "$cname" "--workdir $TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$cname" "CLEAT_HOST_PROJECT="
+  assert_success
+}
+
+@test "docker cap: via --cap flag (session-only) mounts socket" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  _CLI_CAPS=(docker)
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_has "$cname" "$TEST_TEMP/project:$TEST_TEMP/project"
+  assert_success
+}
+
+@test "docker cap: description mentions sandbox-break tradeoff" {
+  # The cap picker describes every capability; docker's description must be
+  # honest about the security tradeoff so users know what they're opting in to.
+  run _cap_description docker
+  assert_success
+  assert_output --partial "breaks sandbox"
+}
+
+@test "docker cap + git cap together: both mounts present" {
+  # Combining caps shouldn't have any cross-interaction. docker mount and
+  # git mount should both appear in docker run args.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  touch "$HOME/.gitconfig"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+git
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_has "$cname" ".gitconfig:/home/coder/.gitconfig:ro"
+  assert_success
+}
+
 # ── --cap CLI flag ─────────────────────────────────────────────────────────
 
 @test "--cap flag: enables cap for session without config" {

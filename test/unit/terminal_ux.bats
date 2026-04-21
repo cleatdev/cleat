@@ -334,6 +334,33 @@ EOF
   assert_output --partial "Claude launched"
 }
 
+@test "start: prints docker-cap security warning when cap is active" {
+  # The docker cap is the only one that can escape the sandbox, so startup
+  # prints a loud warning line when it's on. Silent when off.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Docker socket mounted"
+}
+
+@test "start: does NOT print docker warning when cap is off" {
+  # The baseline launch must stay quiet — no sandbox-break warning unless
+  # the user has explicitly opted in to the docker cap.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Docker socket mounted"
+}
+
 @test "start: outputs summary block with container name" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

@@ -1398,6 +1398,92 @@ EOF
   }
 }
 
+@test "regression v0.10.0: cleat resume after cleat rm creates container and continues" {
+  # cleat rm preserves sessions on the host — they live at
+  # ~/.claude/projects/<key>/ and aren't touched by cmd_rm. But before
+  # this fix, cleat resume errored out with "No container found" when
+  # the container was gone, so the user couldn't actually pick up their
+  # session without doing `cleat start` (which launches fresh, without
+  # --continue). Now cmd_resume auto-creates the container and exec_claude
+  # fires --continue so Claude resumes from the persisted host files.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+
+  # docker run happened — container was created fresh, not errored.
+  run grep "^docker run " "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "--name $cname"
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+@test "regression v0.10.0: cmd_rm leaves per-project session dir untouched" {
+  # The host session dir at ~/.claude/projects/<key>/ must survive cmd_rm
+  # so `cleat resume` (which now auto-creates a fresh container) can
+  # --continue from those files.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  mock_docker_ps_a "$(container_name_for "$TEST_TEMP/project")"
+
+  # Compute the session dir path the way bin/cleat does.
+  local _bn _h project_key session_dir
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
+  project_key="${_bn}-${_h}"
+  session_dir="${HOME}/.claude/projects/${project_key}"
+
+  mkdir -p "$session_dir"
+  echo '{"session":"data"}' > "$session_dir/session-abc.jsonl"
+
+  run cmd_rm "$TEST_TEMP/project"
+  assert_success
+
+  [[ -f "$session_dir/session-abc.jsonl" ]] || {
+    echo "REGRESSION: cmd_rm deleted the per-project session dir"
+    return 1
+  }
+  local content
+  content="$(cat "$session_dir/session-abc.jsonl")"
+  [[ "$content" == '{"session":"data"}' ]] || {
+    echo "REGRESSION: session content mangled by cmd_rm"
+    return 1
+  }
+}
+
+@test "regression v0.10.0: docker cap overlays session dir at host-path key" {
+  # With docker cap active, workdir is the host path, so Claude encodes
+  # its session dir from that path ('/a/b' → 'projects/-a-b/') instead
+  # of the v0.8.0-assumed 'projects/-workspace/'. Without a second
+  # overlay, sessions would split between two host dirs (one per-project,
+  # one in the base ~/.claude/projects/<host-path-encoded>/). The docker
+  # cap block must mount the per-project session dir at the host-path key
+  # so sessions always land in the same place regardless of workdir.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # Host-path key is the project path with slashes replaced by dashes.
+  local host_key="${TEST_TEMP//\//-}-project"
+  run assert_docker_run_has "$cname" ":/home/coder/.claude/projects/${host_key}"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
 @test "regression v0.10.0: cmd_status never prompts for trust" {
   # cleat status is read-only. Any trust prompt from it would surprise users
   # and could deadlock scripts that pipe through status.

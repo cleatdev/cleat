@@ -368,6 +368,33 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_trust_hash_hex_strip" "trust hash is pure hex"
 
+# v0.10.0 — cleat resume after cleat rm must auto-create the container
+# (not error out) so --continue can resume from the host-side session
+# dir. Replace the cmd_run call with a plain `exit 1` and the regression
+# test should fail (assert_success on cmd_resume).
+cat > "$SED_TMP" << 'SED'
+s#cmd_run "\$project"#exit 1#
+SED
+try "v0.10.0_resume_auto_creates" "cleat resume after cleat rm creates container"
+
+# v0.10.0 — cmd_rm must not touch the per-project session dir under
+# ~/.claude/projects/. Append an rm that clobbers the whole projects
+# dir; the "leaves session dir untouched" regression test should fail.
+cat > "$SED_TMP" << 'SED'
+/rm -rf "\/tmp\/cleat-hooks-\${cname}"/a\
+    rm -rf "${HOME}/.claude/projects" 2>/dev/null || true
+SED
+try "v0.10.0_cmd_rm_preserves_sessions" "cmd_rm leaves per-project session dir untouched"
+
+# v0.10.0 — docker cap must overlay the session dir at the host-path-
+# encoded key (so Claude's host-path-derived session dir maps to the
+# per-project overlay). Remove the second session-dir overlay under
+# the docker cap and the guard should fail.
+cat > "$SED_TMP" << 'SED'
+/mount_args+=(-v "\${project_session_dir}:\/home\/coder\/\.claude\/projects\/\${_host_project_key}")/d
+SED
+try "v0.10.0_docker_cap_session_overlay" "docker cap overlays session dir at host-path key"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

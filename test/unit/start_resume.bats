@@ -60,11 +60,23 @@ teardown() { _common_teardown; }
   refute_output --partial "docker run"
 }
 
-@test "resume: fails when no container exists" {
+@test "resume: creates container when none exists and continues" {
+  # Session files live on the host and survive cleat rm, so cleat resume
+  # now auto-creates a fresh container instead of erroring out. Claude is
+  # launched with --continue so the user picks up where they left off.
+  mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
   run cmd_resume "$TEST_TEMP/project"
-  assert_failure
-  assert_output --partial "No container found"
+  assert_success
+  assert_output --partial "No container for this project — creating fresh"
+  # docker run was invoked (container creation happened).
+  run grep "^docker run" "$DOCKER_CALLS"
+  assert_success
+
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
 }
 
 @test "resume: restarts stopped container with --continue" {

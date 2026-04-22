@@ -193,6 +193,13 @@ cleat ps
 
 # Stop when done (keeps container for resume)
 cleat stop
+
+# Remove the container when you want a fresh environment.
+# Session history lives on the host at ~/.claude/projects/<key>/
+# and is NOT touched by cleat rm — `cleat resume` after rm
+# auto-creates a fresh container and picks up where you left off.
+cleat rm
+cleat resume
 ```
 
 ### Multiple projects at once
@@ -228,13 +235,13 @@ cleat ps
 | Command | Description |
 |---|---|
 | `cleat` | Build + run + launch Claude Code (all-in-one) |
-| `cleat resume` | Resume the most recent session |
+| `cleat resume` | Resume the most recent session (recreates the container if `cleat rm` was run since — sessions persist on the host) |
 
 #### Lifecycle
 | Command | Description |
 |---|---|
 | `cleat stop [path]` | Stop this project's container (keeps it for resume) |
-| `cleat rm [path]` | Stop and remove container permanently |
+| `cleat rm [path]` | Stop and remove container permanently (session history on the host is preserved) |
 | `cleat stop-all` | Stop all Cleat containers |
 | `cleat build` | Build the Docker image |
 | `cleat rebuild` | Force rebuild the image from scratch |

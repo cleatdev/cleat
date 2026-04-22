@@ -361,6 +361,44 @@ EOF
   refute_output --partial "Docker socket mounted"
 }
 
+@test "resume: prints docker-cap security warning when cap is active" {
+  # cleat resume launches Claude attached to an existing container. If the
+  # cap is active, the warning must print here too — users should never
+  # hit Claude with a host-socket-mounted container silently.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  mock_docker_ps_a "$cname"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+docker
+EOF
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Docker socket mounted"
+
+  rm -rf "/tmp/cleat-settings-${cname}"
+}
+
+@test "resume: does NOT print docker warning when cap is off" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  mock_docker_ps_a "$cname"
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Docker socket mounted"
+
+  rm -rf "/tmp/cleat-settings-${cname}"
+}
+
 @test "start: outputs summary block with container name" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

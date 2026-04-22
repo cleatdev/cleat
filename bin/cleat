@@ -1832,6 +1832,16 @@ cmd_run() {
     mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     mount_args+=(-v "$project:$project")
     docker_args+=(--workdir "$project" -e "CLEAT_HOST_PROJECT=$project")
+    # Session-dir unification: with the docker cap, workdir is the host path
+    # (not /workspace), so Claude Code encodes its session directory from
+    # that path ('/Users/marcin/proj' → 'projects/-Users-marcin-proj/')
+    # instead of the v0.8.0-assumed 'projects/-workspace/'. Overlay the
+    # per-project session dir at the host-path-derived location too, so
+    # sessions land in the same place regardless of which cap was active
+    # when they were created. Slashes become dashes to match Claude's key.
+    local _host_project_key="${project//\//-}"
+    mkdir -p "${HOME}/.claude/projects/${_host_project_key}"
+    mount_args+=(-v "${project_session_dir}:/home/coder/.claude/projects/${_host_project_key}")
   fi
 
   # ── Compute config fingerprint and store as label
@@ -2037,9 +2047,18 @@ cmd_resume() {
       fi
       rm -f "$_docker_err" 2>/dev/null
     else
-      error "No container found for this project. Use ${BOLD}cleat start${RESET} first."
-      exit 1
+      # No container exists (e.g., after `cleat rm`). Session files live on
+      # the host at ~/.claude/projects/<key>/, so `--continue` below will
+      # pick up right where Claude left off. Create a fresh container and
+      # fall through to the resume flow.
+      info "No container for this project — creating fresh ${DIM}(sessions will resume from host)${RESET}"
+      cmd_run "$project"
     fi
+  fi
+
+  # Docker cap is the only capability that breaks the sandbox — loud warning.
+  if cap_is_active docker; then
+    warn "Docker socket mounted — container can create host-level processes"
   fi
 
   check_for_update
@@ -2078,11 +2097,13 @@ cmd_rm() {
   fi
   if container_exists "$cname"; then
     docker rm "$cname" > /dev/null
-    # Clean up temp dirs
+    # Clean up temp dirs — sessions on the host are intentionally NOT
+    # touched; they live at ~/.claude/projects/<key>/ and survive cleat rm.
     rm -rf "/tmp/cleat-hooks-${cname}" 2>/dev/null || true
     rm -rf "/tmp/cleat-clip-${cname}" 2>/dev/null || true
     rm -rf "/tmp/cleat-settings-${cname}" 2>/dev/null || true
     success "Removed ${BOLD}${cname}${RESET}."
+    echo -e "    ${DIM}Sessions preserved. Run ${BOLD}cleat resume${RESET}${DIM} to pick up where you left off.${RESET}"
   else
     info "No container to remove."
   fi

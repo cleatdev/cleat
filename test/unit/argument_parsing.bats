@@ -24,9 +24,13 @@ teardown() { _common_teardown; }
 }
 
 @test "aliases: r → resume, sh → shell, st → status" {
+  # `r` dispatches to cmd_resume, which after v0.10.0 creates the container
+  # when none exists (sessions persist on host). Verify the alias reaches
+  # cmd_resume by checking for its distinctive output line.
+  mock_docker_images "cleat"
   run main r
-  assert_failure
-  assert_output --partial "No container found"
+  assert_success
+  assert_output --partial "creating fresh"
 
   run main sh
   assert_failure

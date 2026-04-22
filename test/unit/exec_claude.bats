@@ -12,7 +12,10 @@ teardown() { _common_teardown; }
   run exec_claude "test-ctr" --dangerously-skip-permissions
   run assert_docker_exec_has "test-ctr"
   assert_success
-  run assert_docker_exec_has "--user coder"
+  # Uses `runuser -u coder` rather than `docker exec --user coder` so that
+  # supplementary groups from /etc/group are loaded via initgroups(3).
+  # Required for the docker capability (host socket group membership).
+  run assert_docker_exec_has "runuser -u coder"
   assert_success
   run assert_docker_exec_has "docker exec -it"
   assert_success

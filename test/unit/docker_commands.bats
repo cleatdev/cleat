@@ -485,7 +485,7 @@ teardown() { _common_teardown; }
 
   run cmd_shell "$TEST_TEMP/project"
   assert_success
-  run assert_docker_exec_has "--user coder"
+  run assert_docker_exec_has "runuser -u coder"
   assert_success
   run assert_docker_exec_has "HOME=/home/coder"
   assert_success
@@ -537,7 +537,7 @@ EOF
   assert_success
   run assert_docker_exec_has "claude login"
   assert_success
-  run assert_docker_exec_has "--user coder"
+  run assert_docker_exec_has "runuser -u coder"
   assert_success
   run assert_docker_exec_has ".local/bin"
   assert_success

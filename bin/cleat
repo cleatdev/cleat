@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.9.2"
+VERSION="0.10.0"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -1423,9 +1423,13 @@ exec_claude() {
   trap _cleanup_session EXIT INT TERM HUP
 
   local rc=0
-  docker exec -it --user coder "${CLAUDE_ENV[@]}" \
+  # Use `runuser -u coder` rather than `docker exec --user coder` because the
+  # latter sets UID/GID but skips initgroups(3), so supplementary groups from
+  # /etc/group aren't loaded. This matters for the docker capability, where
+  # the entrypoint adds coder to the host docker socket's owning group.
+  docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
-    bash -c '
+    runuser -u coder -- bash -c '
       clip-daemon &
       _MY_CLIP_DAEMON=$!
       for i in 1 2 3 4 5; do [ -S /tmp/clip.sock ] && break; sleep 0.1; done
@@ -2094,8 +2098,9 @@ cmd_shell() {
   resolve_caps "$project"
   resolve_env_args "$project"
   info "Container ${BOLD}${cname}${RESET}"
-  docker exec -it --user coder "${CLAUDE_ENV[@]}" \
-    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" bash
+  docker exec -it "${CLAUDE_ENV[@]}" \
+    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
+    runuser -u coder -- bash
 }
 
 cmd_login() {
@@ -2127,8 +2132,9 @@ cmd_login() {
   echo ""
 
   local login_rc=0
-  docker exec -it --user coder "${CLAUDE_ENV[@]}" \
-    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" claude login || login_rc=$?
+  docker exec -it "${CLAUDE_ENV[@]}" \
+    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
+    runuser -u coder -- claude login || login_rc=$?
 
   # Cleanup browser bridge
   if [ -n "$_login_browser_pid" ]; then

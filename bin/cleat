@@ -298,13 +298,16 @@ _canonical_caps() {
 
 # Hash the canonical cap list from a .cleat file. Prints empty when the
 # file is missing or declares no caps (nothing to gate).
+# Note: `_md5` passes stdin through `md5sum` on Linux, which appends
+# "  -" (the filename of stdin). Strip that so the stored trust hash is
+# purely hex — otherwise we write malformed tab-separated lines.
 _hash_cleat_caps() {
   local path="$1"
   [[ -f "$path" ]] || return 0
   local caps
   caps="$(_read_caps_from_file "$path" | _canonical_caps)"
   [[ -z "$caps" ]] && return 0
-  echo -n "$caps" | _md5
+  echo -n "$caps" | _md5 | awk '{print $1}'
 }
 
 # Look up the stored trust hash for a project path. Empty on miss.
@@ -2388,8 +2391,8 @@ _cap_description() {
     ssh)   echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
     env)   echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
     hooks) echo "Run your Claude Code hooks on the host (global + project)" ;;
-    gh)    echo "GitHub CLI — authenticate once, persists across rm/nuke/rebuild" ;;
-    docker) echo "Host Docker socket (breaks sandbox — test Docker-based apps)" ;;
+    gh)    echo "GitHub CLI auth (persists across rm/nuke/rebuild)" ;;
+    docker) echo "Host Docker socket (breaks sandbox) to test Docker apps" ;;
     *)     echo "(unknown capability)" ;;
   esac
 }

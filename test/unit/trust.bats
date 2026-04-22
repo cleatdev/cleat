@@ -125,6 +125,26 @@ _source_cli_silent() {
   assert_output ""
 }
 
+@test "hash: output is hex-only (no md5sum filename suffix)" {
+  # md5sum on Linux appends "  -" (the stdin "filename") — without stripping
+  # it we'd corrupt the tab-separated trust file format. The hash must be
+  # purely [0-9a-f] characters.
+  local f="$TEST_TEMP/proj/.cleat"
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\nssh\n' > "$f"
+  local h
+  h="$(_hash_cleat_caps "$f")"
+  [[ "$h" =~ ^[0-9a-f]+$ ]] || {
+    echo "hash contains non-hex characters: '$h'"
+    return 1
+  }
+  # And no trailing whitespace or "  -" artifacts.
+  [[ "$h" != *" "* && "$h" != *"	"* ]] || {
+    echo "hash contains whitespace: '$h'"
+    return 1
+  }
+}
+
 @test "hash: file with no [caps] section returns empty" {
   local f="$TEST_TEMP/project/.cleat"
   mkdir -p "$TEST_TEMP/project"

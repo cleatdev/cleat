@@ -1382,6 +1382,22 @@ EOF
   assert_failure
 }
 
+@test "regression v0.10.0: trust hash is pure hex (md5sum junk stripped)" {
+  # `md5sum` on Linux appends "  -" (the stdin "filename") after the hash.
+  # Without stripping, the stored trust hash contains spaces and "-", which
+  # corrupts the tab-separated trust file and breaks lookup. The hash in
+  # _hash_cleat_caps must be piped through `awk '{print $1}'` (or
+  # equivalent) so only hex survives.
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\nssh\n' > "$TEST_TEMP/proj/.cleat"
+  local h
+  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  [[ "$h" =~ ^[0-9a-f]+$ ]] || {
+    echo "REGRESSION: trust hash contains non-hex chars: '$h'"
+    return 1
+  }
+}
+
 @test "regression v0.10.0: cmd_status never prompts for trust" {
   # cleat status is read-only. Any trust prompt from it would surprise users
   # and could deadlock scripts that pipe through status.

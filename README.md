@@ -379,18 +379,17 @@ cleat --cap ssh start
 A project's `.cleat` file lives in the repo — whoever controls the repo controls that file. Cleat won't silently apply a `.cleat`'s capabilities on first run. Instead, on first launch inside a project with a `.cleat`, you'll see:
 
 ```
-  ┌────────────────────────────────────────────────────────────────┐
-  │  This project's .cleat file requests capabilities               │
-  │  that extend what the sandbox can access on your host.          │
-  │                                                                 │
-  │  Requested:                                                     │
-  │                                                                 │
-  │    docker  Host Docker socket (breaks sandbox — test            │
-  │            Docker-based apps)                                   │
-  │    env     Load env vars from ~/.config/cleat/env and .cleat.env│
-  │                                                                 │
-  │  Project: /Users/you/proj                                       │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  This project's .cleat file requests capabilities                   │
+  │  that extend what the sandbox can access on your host.              │
+  │                                                                     │
+  │  Requested:                                                         │
+  │                                                                     │
+  │    docker  Host Docker socket (breaks sandbox) to test Docker apps  │
+  │    env     Load env vars from ~/.config/cleat/env and .cleat.env    │
+  │                                                                     │
+  │  Project: /Users/you/proj                                           │
+  └─────────────────────────────────────────────────────────────────────┘
 
   Trust this project's .cleat? [y/N]:
 ```

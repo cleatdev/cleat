@@ -356,6 +356,18 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_trust_hash_canonical" "trust hash is over canonical caps"
 
+# v0.10.0 — _md5 on Linux uses md5sum which appends "  -" (stdin filename)
+# after the hash. The `awk '{print $1}'` strip in _hash_cleat_caps must
+# remain so the trust file stores pure hex. Removing it reintroduces the
+# junk suffix and the hex-only guard should fail. Use `#` as sed
+# delimiter since the source line contains many `|` characters.
+cat > "$SED_TMP" << 'SED'
+/^_hash_cleat_caps()/,/^}$/{
+  s#| awk .*##
+}
+SED
+try "v0.10.0_trust_hash_hex_strip" "trust hash is pure hex"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

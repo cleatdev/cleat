@@ -73,6 +73,34 @@ teardown() { _common_teardown; }
   unset DOCKER_PULL_EXIT_CODE
 }
 
+@test "build: skips network pull when registry image is already cached locally" {
+  # Registry-tagged image present on disk, but no `cleat` alias yet — mimics
+  # a host where the prebuilt image exists (manual pull, leftover from prior
+  # nuke, etc.) but cleat hasn't aliased it. The pull stub fails by default
+  # (DOCKER_PULL_EXIT_CODE=1), so if _do_pull tried the network it would
+  # fall back to a local build.
+  mock_docker_image_cached "$REGISTRY_IMAGE"
+
+  run cmd_build
+  assert_success
+  assert_output --partial "Image ready"
+  assert_output --partial "cached v${VERSION}"
+
+  # No network call.
+  run grep '^docker pull ' "$DOCKER_CALLS"
+  assert_failure
+
+  # No local build either — the cached image was reused.
+  run docker_build_calls
+  assert_output ""
+
+  # The registry image was retagged as the local IMAGE_NAME.
+  run grep '^docker tag ' "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "$REGISTRY_IMAGE"
+  assert_output --partial "$IMAGE_NAME"
+}
+
 # ── run: container creation ─────────────────────────────────────────────────
 
 @test "run: creates container with correct name, mounts, env, and limits" {

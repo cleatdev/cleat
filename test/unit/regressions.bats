@@ -1497,3 +1497,75 @@ EOF
   refute_output --partial "Trust this project"
   refute_output --partial "Project .cleat"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.10.1 — _do_pull always issued a `docker pull` against GHCR, even when
+# the version-tagged image was already on disk. A transient registry/network
+# error there (offline, GHCR hiccup, auth blip) returned non-zero from
+# `docker pull`, which the caller treated as "image unavailable" and fell
+# back to a 2-5 min local build — even though the prebuilt image was
+# sitting in the local image store waiting to be reused.
+# Fix: short-circuit at the top of _do_pull. If `docker image inspect
+# ${REGISTRY_BASE}:v${target_version}` succeeds, retag locally and return
+# without any network call.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.10.1: _do_pull reuses locally cached prebuilt without network call" {
+  # Registry-tagged image is on disk but no `cleat` alias. Pull would fail
+  # by default (DOCKER_PULL_EXIT_CODE=1), so if _do_pull touched the
+  # network it would fall back to a local build — both forbidden here.
+  mock_docker_image_cached "$REGISTRY_IMAGE"
+  mkdir -p "$TEST_TEMP/project"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  run grep '^docker pull ' "$DOCKER_CALLS"
+  assert_failure
+
+  run docker_build_calls
+  assert_output ""
+
+  # The cached registry tag was aliased to the local IMAGE_NAME.
+  run grep '^docker tag ' "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "$REGISTRY_IMAGE"
+  assert_output --partial "$IMAGE_NAME"
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.10.1 hardening — the cache short-circuit must not declare success when
+# `docker tag` silently fails. Without the fall-through guard, a tag failure
+# would leave no `cleat` alias on disk while _do_pull returned 0; the next
+# image_exists() check would say "missing" and the user would be back to a
+# local build the next time they ran `cleat start`. The guard re-checks
+# image_exists() after the tag and falls through to the pull path on
+# failure — preserving the GHCR-first contract even when the local image
+# store is in a degraded state.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.10.1: _do_pull falls through to network pull when cache-hit tag fails" {
+  # Registry-tagged image is on disk, but `docker tag` fails (simulating
+  # disk full / permission / etc.). _do_pull must not falsely claim
+  # success — it must fall through to the existing pull path. Pull is
+  # made to succeed so we can prove the fall-through fired (otherwise
+  # we'd land in _do_build and the assertion below would be ambiguous).
+  mock_docker_image_cached "$REGISTRY_IMAGE"
+  export DOCKER_TAG_EXIT_CODE=1
+  export DOCKER_PULL_EXIT_CODE=0
+
+  run cmd_build
+  assert_success
+
+  # The fall-through warning must be visible to the user.
+  assert_output --partial "could not be tagged"
+
+  # Network pull was attempted (proves we fell through past the cache hit).
+  run grep '^docker pull ' "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "$REGISTRY_IMAGE"
+
+  unset DOCKER_TAG_EXIT_CODE DOCKER_PULL_EXIT_CODE
+}

@@ -158,6 +158,13 @@ mock_docker_inspect() {
   printf '%s\n' "$1" > "$DOCKER_MOCK_DIR/inspect_output"
 }
 
+# Register an image ref as "cached locally" so `docker image inspect <ref>`
+# returns success. Used by tests that exercise _do_pull's local-cache
+# short-circuit.
+mock_docker_image_cached() {
+  printf '%s\n' "$1" >> "$DOCKER_MOCK_DIR/cached_images"
+}
+
 # Read all recorded docker calls
 docker_calls() {
   cat "$DOCKER_CALLS"

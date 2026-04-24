@@ -170,6 +170,22 @@ _validate_docker_run() {
   fi
 }
 
+# `docker image inspect <ref>...` succeeds only if every ref appears in
+# $DOCKER_MOCK_DIR/cached_images (one ref per line). Tests register cached
+# refs via mock_docker_image_cached. Default state: file absent → all refs
+# missing, exit 1 (mirrors real docker when image isn't on disk).
+_handle_image_inspect() {
+  local cached="${DOCKER_MOCK_DIR:-}/cached_images"
+  local ref
+  for ref in "$@"; do
+    [[ "$ref" == --* ]] && continue
+    if [[ ! -f "$cached" ]] || ! grep -Fxq "$ref" "$cached"; then
+      echo "Error: No such image: $ref" >&2
+      exit 1
+    fi
+  done
+}
+
 # ─── Subcommand dispatch ───────────────────────────────────────────────────
 case "$1" in
   ps)
@@ -190,7 +206,17 @@ case "$1" in
     # BEFORE we emit DOCKER_STDERR / exit so the strict errors take priority.
     _validate_docker_run "$@"
     ;;
-  build|start|stop|rm|exec|logs|rmi|image|builder|tag)
+  image)
+    # `docker image inspect <ref>` is the only image subcommand currently
+    # used. Anything else (e.g. `docker image rm`) falls through to exit 0.
+    [[ "${2:-}" == "inspect" ]] && _handle_image_inspect "${@:3}"
+    ;;
+  build|start|stop|rm|exec|logs|rmi|builder)
+    ;;
+  tag)
+    # Tag normally succeeds. Tests that need to simulate a tag failure
+    # (e.g. _do_pull's cache-hit hardening) can set DOCKER_TAG_EXIT_CODE=1.
+    exit "${DOCKER_TAG_EXIT_CODE:-0}"
     ;;
   pull)
     # Pull fails by default (no registry in tests). Tests that need pull to

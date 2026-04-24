@@ -395,6 +395,27 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_docker_cap_session_overlay" "docker cap overlays session dir at host-path key"
 
+# v0.10.1 — _do_pull must short-circuit when the version-tagged prebuilt
+# image is already on disk. Force the cache check to always-false so
+# every call hits the network, then fails (DOCKER_PULL_EXIT_CODE=1 in
+# tests), then falls back to a local build — exactly what the regression
+# test forbids.
+cat > "$SED_TMP" << 'SED'
+s|if docker image inspect "\$target_image" > /dev/null 2>&1; then|if false; then|
+SED
+try "v0.10.1_pull_local_cache_short_circuit" "_do_pull reuses locally cached prebuilt without network call"
+
+# v0.10.1 — when the cache hit fires but `docker tag` silently fails,
+# _do_pull must fall through to the network pull instead of returning
+# success. Mutate the inner tag-success guard to unconditional truth so
+# the success branch always fires regardless of the tag's exit code —
+# the hardening regression test should fail (no fall-through warning,
+# no network pull attempt).
+cat > "$SED_TMP" << 'SED'
+s|if docker tag "\$target_image" "\$IMAGE_NAME" > /dev/null 2>&1; then|if true; then|
+SED
+try "v0.10.1_pull_cache_tag_failure_fallthrough" "_do_pull falls through to network pull when cache-hit tag fails"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

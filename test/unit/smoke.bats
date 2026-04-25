@@ -306,6 +306,27 @@ cleat_bin_timeout() {
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat --cap az --help parses (lazy-install cap)" {
+  # `az` is a lazy-install cap; --help short-circuits before any docker exec
+  # is attempted. This confirms cap registration + flag parsing is clean and
+  # the LAZY_CAPS init doesn't trigger unbound-variable failures under set -u.
+  run cleat_bin --cap az --help
+  assert_success
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat config --enable az then --list shows az enabled" {
+  # End-to-end round-trip through the cap registry: az must be a known cap,
+  # writable to the global config file, and round-trippable via --list.
+  run cleat_bin config --enable az
+  assert_success
+  refute_output --partial "Unknown capability"
+
+  run cleat_bin config --list
+  assert_success
+  assert_output --partial "az"
+}
+
 @test "smoke: cleat --env KEY=VAL --help parses global flags cleanly" {
   run cleat_bin --env "FOO=bar" --help
   assert_success

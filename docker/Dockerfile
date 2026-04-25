@@ -80,6 +80,12 @@ RUN chown coder:coder /home/coder/.claude/CLAUDE.md
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Lazy-install scripts: shipped pre-built so cleat can `docker exec` them on
+# first activation of caps that need a heavy tool (e.g. azure-cli ~250 MB).
+# See concept/10-capabilities.md → "Lazy install".
+COPY cap-installs/ /usr/local/lib/cleat/cap-installs/
+RUN chmod +x /usr/local/lib/cleat/cap-installs/*.sh
+
 WORKDIR /workspace
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash"]

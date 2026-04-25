@@ -340,6 +340,158 @@ EOF
   assert_success
 }
 
+# ── az capability: docker run mounts + lazy install ─────────────────────────
+#
+# `az` is the first lazy-install cap. The mount block (~/.azure → container)
+# behaves like `gh`: read-write so `az login` writes tokens back to the host,
+# auto-creating the dir if missing. The install of the `az` binary itself is
+# triggered by _run_lazy_installs, NOT by cmd_run — see the dedicated tests.
+
+@test "az cap: mounts ~/.azure read-write when enabled" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+az
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # Read-write so `az login` can write tokens back to host
+  run assert_docker_run_has "$cname" ".azure:/home/coder/.azure"
+  assert_success
+  # Must NOT have :ro flag
+  run assert_docker_run_lacks "$cname" ".azure:/home/coder/.azure:ro"
+  assert_success
+}
+
+@test "az cap: creates ~/.azure if missing" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  rm -rf "$HOME/.azure"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+az
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [[ -d "$HOME/.azure" ]] || {
+    echo "~/.azure was not created"
+    return 1
+  }
+  run assert_docker_run_has "$cname" ".azure:/home/coder/.azure"
+  assert_success
+}
+
+@test "no az cap: does not mount azure config" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  mkdir -p "$HOME/.azure"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".azure:/home/coder/.azure"
+  assert_success
+}
+
+@test "az cap: registered as a lazy-install cap" {
+  # az is the first lazy-install cap. Future caps are added by listing them
+  # in LAZY_CAPS — that's the framework registry. This test guards the
+  # registration so a refactor that drops az can't pass tests.
+  local found=0 cap
+  for cap in "${LAZY_CAPS[@]}"; do
+    [[ "$cap" == "az" ]] && found=1
+  done
+  [[ "$found" -eq 1 ]] || {
+    echo "expected 'az' in LAZY_CAPS=(${LAZY_CAPS[*]})"
+    return 1
+  }
+}
+
+@test "az cap: description mentions lazy install" {
+  # Picker description must surface the lazy-install behavior so users
+  # know first activation is slow and roughly how big the download is.
+  run _cap_description az
+  assert_success
+  assert_output --partial "lazy install"
+}
+
+@test "_run_lazy_installs: invokes install script when probe reports missing" {
+  # Force the probe to return non-zero (tool absent) — the install script
+  # must then be executed via docker exec --user root inside the container.
+  _lazy_cap_is_installed() { return 1; }
+  ACTIVE_CAPS=(az)
+
+  # spin/spin_stop touch the terminal — silence them in tests.
+  spin() { :; }
+  spin_stop() { :; }
+
+  run _run_lazy_installs "test-cname"
+  assert_success
+  grep -qE 'exec.*test-cname.*cap-installs/az\.sh' "$DOCKER_CALLS" || {
+    echo "expected docker exec for cap-installs/az.sh; got:"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}
+
+@test "_run_lazy_installs: skips install when probe reports installed" {
+  _lazy_cap_is_installed() { return 0; }
+  ACTIVE_CAPS=(az)
+
+  spin() { :; }
+  spin_stop() { :; }
+
+  run _run_lazy_installs "test-cname"
+  assert_success
+  if grep -qE 'exec.*test-cname.*cap-installs/az\.sh' "$DOCKER_CALLS"; then
+    echo "install ran when probe reported tool already installed:"
+    cat "$DOCKER_CALLS"
+    return 1
+  fi
+}
+
+@test "_run_lazy_installs: no-op when az cap is not active" {
+  _lazy_cap_is_installed() { return 1; }  # would install if invoked
+  ACTIVE_CAPS=()
+
+  spin() { :; }
+  spin_stop() { :; }
+
+  run _run_lazy_installs "test-cname"
+  assert_success
+  if grep -qE 'cap-installs/az\.sh' "$DOCKER_CALLS"; then
+    echo "lazy install ran without az cap active"
+    cat "$DOCKER_CALLS"
+    return 1
+  fi
+}
+
+@test "_run_lazy_installs: aborts cleat when install script fails" {
+  # The user opted in to the cap; if the install fails we shouldn't silently
+  # launch claude with a half-broken environment. Force the probe to report
+  # missing, then make docker exec fail — _run_lazy_installs must propagate.
+  _lazy_cap_is_installed() { return 1; }
+  ACTIVE_CAPS=(az)
+  spin() { :; }
+  spin_stop() { :; }
+  export DOCKER_EXIT_CODE=1
+
+  run _run_lazy_installs "test-cname"
+  assert_failure
+  unset DOCKER_EXIT_CODE
+}
+
 # ── docker capability: docker run mounts ──────────────────────────────────
 #
 # Design rationale: concept/15-docker-capability.md. Opt-in only. When active,

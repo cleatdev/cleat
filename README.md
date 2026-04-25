@@ -83,7 +83,7 @@ Cleat gives you the best of both worlds:
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
 - **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq, and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), host Docker daemon for testing dockerized apps (`--cap docker`), all disabled by default
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), host Docker daemon for testing dockerized apps (`--cap docker`), Azure CLI auth via lazy install (`--cap az`), all disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
@@ -380,6 +380,15 @@ cleat --cap ssh start
 | `hooks` | Runs your Claude Code hooks on the host (global and project-level). |
 | `gh` | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
 | `docker` | Mounts `/var/run/docker.sock`. `docker`, `docker compose`, and anything that talks to the daemon run against your host — sibling containers, zero overhead. **Sandbox-escaping — see security note below.** |
+| `az` | Mounts `~/.azure` (read-write). The `az` CLI itself is **lazy-installed** inside the container on first cap activation (~250 MB, ~30s); subsequent starts are instant. Auth (`az login` tokens) persists on the host. See [Lazy install caps](#lazy-install-caps) below. |
+
+### Lazy install caps
+
+Most caps are mount-only — the tool already lives in the cleat image. **Lazy install caps** install a tool inside the container the first time the cap is active, used for tools too large to ship by default. `az` is the first one.
+
+How it works: cleat probes the container with `command -v <tool>`. If absent, it runs the install script with a spinner; if present, it skips. Subsequent `cleat resume` calls hit the fast path. The install lives inside the container — `cleat rm` removes it — but the auth dir bind-mounted from the host (e.g. `~/.azure`) survives every container lifecycle operation, so credentials are never lost.
+
+Full design and instructions for adding a new lazy cap: [`concept/10-capabilities.md`](../concept/10-capabilities.md#lazy-install-capabilities).
 
 ### Workspace trust — project `.cleat` approval
 

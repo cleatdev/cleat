@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.10.1"
+VERSION="0.11.0"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -17,7 +17,15 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 
 # Known capabilities (order matters for display)
-KNOWN_CAPS=(git ssh env hooks gh docker)
+KNOWN_CAPS=(git ssh env hooks gh docker az)
+
+# Lazy-install caps: tool not in the base image; cleat installs it inside the
+# container the first time the cap is active. Auth dirs still bind-mount from
+# the host so credentials persist across `cleat rm`. Install scripts live in
+# cli/docker/cap-installs/<cap>.sh and ship at /usr/local/lib/cleat/cap-installs/
+# inside the image. Full pattern: concept/10-capabilities.md → "Lazy install".
+LAZY_CAPS=(az)
+_LAZY_INSTALL_DIR="/usr/local/lib/cleat/cap-installs"
 
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
@@ -899,6 +907,67 @@ _env_summary_inline() {
     fi
     echo -e "  ${DIM}Env:${RESET}        ${msg}"
   fi
+}
+
+# ── Lazy-install caps ──────────────────────────────────────────────────────
+# Some caps require tools too large to bake into the base image (e.g. azure-cli
+# ~250 MB). Cleat installs them on first activation, scoped to the container.
+# After `cleat rm` the install is gone; auth dirs (mounted from host) persist.
+# Pattern documented in concept/10-capabilities.md → "Lazy install".
+
+# Display label per lazy cap — used in the install spinner.
+_lazy_cap_label() {
+  case "$1" in
+    az) echo "Azure CLI" ;;
+    *)  echo "$1" ;;
+  esac
+}
+
+# Tool name to probe with `command -v` to decide whether install is needed.
+_lazy_cap_probe() {
+  case "$1" in
+    az) echo "az" ;;
+    *)  echo "" ;;
+  esac
+}
+
+# Returns 0 if the lazy cap's tool is already installed in $cname.
+# Tests can override this function to force the install path.
+_lazy_cap_is_installed() {
+  local cname="$1" cap="$2"
+  local probe
+  probe="$(_lazy_cap_probe "$cap")"
+  [[ -z "$probe" ]] && return 0
+  docker exec --user root "$cname" sh -c "command -v $probe >/dev/null 2>&1" 2>/dev/null
+}
+
+# For each active lazy cap, install the tool if missing. Idempotent —
+# subsequent invocations no-op via the probe check. Aborts cleat on
+# install failure since the user explicitly opted in to the cap.
+_run_lazy_installs() {
+  local cname="$1"
+  local cap label rc
+  for cap in "${LAZY_CAPS[@]+"${LAZY_CAPS[@]}"}"; do
+    cap_is_active "$cap" || continue
+    if _lazy_cap_is_installed "$cname" "$cap"; then
+      continue
+    fi
+    label="$(_lazy_cap_label "$cap")"
+    spin "Installing ${label} (one-time per container, ~30s)..."
+    local _err="/tmp/cleat-cap-${cap}-$$"
+    rc=0
+    docker exec --user root "$cname" \
+      bash "${_LAZY_INSTALL_DIR}/${cap}.sh" > "$_err" 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+      spin_stop 0 "${label} installed"
+    else
+      spin_stop "$rc" "" "Failed to install ${label}"
+      [[ -s "$_err" ]] && error "${DIM}$(tail -20 "$_err")${RESET}"
+      rm -f "$_err"
+      exit 1
+    fi
+    rm -f "$_err"
+  done
 }
 
 # ── Clipboard bridge ──────────────────────────────────────────────────────
@@ -1842,6 +1911,15 @@ cmd_run() {
     mount_args+=(-v "${HOME}/.config/gh:/home/coder/.config/gh")
   fi
 
+  # ── az capability: mount Azure CLI config (read-write) so `az login` tokens
+  # persist on the host across `cleat rm`. The CLI itself is lazy-installed in
+  # the container on first use (see _run_lazy_installs); the mount is the auth
+  # boundary, the install is the tool boundary — same separation as gh.
+  if cap_is_active az; then
+    mkdir -p "${HOME}/.azure"
+    mount_args+=(-v "${HOME}/.azure:/home/coder/.azure")
+  fi
+
   # ── docker capability: mount the host Docker socket so the container can
   # build, run, and manage Docker workloads against the host daemon. Also
   # bind-mount the project at its HOST path (in addition to /workspace) and
@@ -1983,6 +2061,8 @@ cmd_start() {
     check_drift "$cname" "$project"
   fi
 
+  _run_lazy_installs "$cname"
+
   success "Claude launched"
   _print_summary_block "$cname" "$project"
   echo ""
@@ -2086,6 +2166,8 @@ cmd_resume() {
 
   # Drift detection
   check_drift "$cname" "$project"
+
+  _run_lazy_installs "$cname"
 
   success "Session resumed"
   _print_summary_block "$cname" "$project"
@@ -2232,6 +2314,9 @@ cmd_claude() {
   fi
 
   check_for_update
+
+  _run_lazy_installs "$cname"
+
   success "Claude launched"
   _print_summary_block "$cname" "$project"
   echo ""
@@ -2441,6 +2526,7 @@ _cap_description() {
     hooks) echo "Run your Claude Code hooks on the host (global + project)" ;;
     gh)    echo "GitHub CLI auth (persists across rm/nuke/rebuild)" ;;
     docker) echo "Host Docker socket (breaks sandbox) to test Docker apps" ;;
+    az)    echo "Azure CLI auth (lazy install ~250 MB on first use; auth persists)" ;;
     *)     echo "(unknown capability)" ;;
   esac
 }

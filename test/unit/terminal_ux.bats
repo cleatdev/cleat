@@ -84,11 +84,16 @@ teardown() { _common_teardown; }
   cat > "$TEST_TEMP/strict-bin/docker" << MOCK
 #!/bin/bash
 echo "docker \$*" >> "$TEST_TEMP/strict-docker-calls"
+# Match \`-a\` as a separate flag, not a substring. The previous \`*-a*\` glob
+# matched container names with hex hashes starting with 'a' (e.g. \`-a8c2...\`),
+# making \`docker ps\` (without \`-a\`) appear to find the container and the
+# cleat happy-path success-flow run instead of the start-failure recovery
+# we're trying to test. Resulted in ~1/16 macOS CI flakes.
 case "\$1" in
   images) echo "cleat" ;;
   ps)
-    case "\$*" in
-      *-a*) echo "$expected_cname" ;;
+    case " \$* " in
+      *" -a "*|*" --all "*) echo "$expected_cname" ;;
       *) ;;
     esac
     ;;

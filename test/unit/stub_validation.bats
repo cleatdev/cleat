@@ -201,3 +201,37 @@ EOF
   run run_docker_stub run -v "/nonexistent:/workspace" test-image
   assert_success
 }
+
+# ── ps / ps -a routing: token-bounded match for `-a` flag ───────────────────
+#
+# A naive `[[ "$*" == *"-a"* ]]` substring match falsely fires when the
+# container name contains '-a' (e.g. `cleat-project-a1b2c3d4` — ~1/16 of
+# random hashes start with 'a'), routing plain `docker ps` calls to
+# ps_a_output and breaking the is_running / container_exists distinction.
+# This pinned pair of tests guards the token-bounded match in the stub.
+
+@test "stub ps routing: docker ps without -a returns ps_output even when filter contains '-a' substring" {
+  printf 'this-is-ps-output\n'    > "$DOCKER_MOCK_DIR/ps_output"
+  printf 'this-is-ps-a-output\n'  > "$DOCKER_MOCK_DIR/ps_a_output"
+  # Container name with embedded '-a' — used to flake when the hash started with 'a'.
+  run run_docker_stub ps --filter 'name=^cleat-project-a1b2c3d4$' --format '{{.Names}}'
+  assert_success
+  assert_output "this-is-ps-output"
+  refute_output --partial "ps-a-output"
+}
+
+@test "stub ps routing: docker ps -a returns ps_a_output" {
+  printf 'this-is-ps-output\n'    > "$DOCKER_MOCK_DIR/ps_output"
+  printf 'this-is-ps-a-output\n'  > "$DOCKER_MOCK_DIR/ps_a_output"
+  run run_docker_stub ps -a --filter 'name=^cleat-project-a1b2c3d4$' --format '{{.Names}}'
+  assert_success
+  assert_output "this-is-ps-a-output"
+}
+
+@test "stub ps routing: docker ps --all returns ps_a_output" {
+  printf 'this-is-ps-output\n'    > "$DOCKER_MOCK_DIR/ps_output"
+  printf 'this-is-ps-a-output\n'  > "$DOCKER_MOCK_DIR/ps_a_output"
+  run run_docker_stub ps --all --filter 'name=^cleat-project-12345678$' --format '{{.Names}}'
+  assert_success
+  assert_output "this-is-ps-a-output"
+}

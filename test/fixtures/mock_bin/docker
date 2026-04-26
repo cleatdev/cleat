@@ -189,11 +189,15 @@ _handle_image_inspect() {
 # ─── Subcommand dispatch ───────────────────────────────────────────────────
 case "$1" in
   ps)
-    if [[ "$*" == *"-a"* ]]; then
-      _mock "ps_a_output"
-    else
-      _mock "ps_output"
-    fi
+    # Token-bounded match for `-a` / `--all`. A naive `*"-a"*` substring
+    # match falsely fires when the container name contains '-a' (e.g.
+    # `cleat-project-a1b2c3d4` — ~1/16 of random hashes start with 'a'),
+    # routing plain `docker ps` calls to ps_a_output and breaking the
+    # is_running / container_exists distinction.
+    case " $* " in
+      *" -a "*|*" --all "*) _mock "ps_a_output" ;;
+      *) _mock "ps_output" ;;
+    esac
     ;;
   images)
     _mock "images_output"

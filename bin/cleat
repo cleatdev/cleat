@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.11.0"
+VERSION="0.12.0"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -16,15 +16,19 @@ CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
 CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 
-# Known capabilities (order matters for display)
-KNOWN_CAPS=(git ssh env hooks gh docker az)
+# Known capabilities (order matters for display).
+# Three behavioral categories — see _cap_category for the mapping:
+#   mount   git, ssh, env, hooks, gh   auth/identity bind-mounts (no install)
+#   cloud   az, aws, gcloud            cloud CLIs, lazy-installed on first use
+#   sandbox docker                     mounts host docker socket (breaks isolation)
+KNOWN_CAPS=(git ssh env hooks gh docker az aws gcloud)
 
 # Lazy-install caps: tool not in the base image; cleat installs it inside the
 # container the first time the cap is active. Auth dirs still bind-mount from
 # the host so credentials persist across `cleat rm`. Install scripts live in
 # cli/docker/cap-installs/<cap>.sh and ship at /usr/local/lib/cleat/cap-installs/
 # inside the image. Full pattern: concept/10-capabilities.md → "Lazy install".
-LAZY_CAPS=(az)
+LAZY_CAPS=(az aws gcloud)
 _LAZY_INSTALL_DIR="/usr/local/lib/cleat/cap-installs"
 
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
@@ -33,6 +37,11 @@ _RESOLVED_PROJECT=""
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 _CLI_TRUST_PROJECT=0
+
+# Caps display buckets (populated by _caps_bucket_active for _print_caps).
+_CAPS_MOUNT=()
+_CAPS_CLOUD=()
+_CAPS_SANDBOX=()
 
 # ── Colors & Formatting ────────────────────────────────────────────────────
 BOLD='\033[1m'
@@ -848,13 +857,91 @@ show_first_run_tip() {
 }
 
 # ── Startup output ─────────────────────────────────────────────────────────
-_print_startup_caps() {
-  if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
-    local caps_str
-    caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
-    caps_str="${caps_str%, }"
-    info "Caps: ${GREEN}${BOLD}${caps_str}${RESET}"
+#
+# Caps display groups active caps by behavior — same UI on the landing page.
+#   mount   green   git, ssh, env, hooks, gh    auth/identity, no install
+#   cloud   blue    az, aws, gcloud             cloud CLIs, lazy install
+#   sandbox amber   docker                      breaks isolation (host socket)
+#
+# When only one category has active caps the line collapses to the legacy
+# single-line form (`Caps:    git, ssh`). With caps in two or more categories
+# the renderer breaks them into a labeled block — the categorization itself
+# teaches the user that docker/cloud caps behave differently.
+
+# Map a single cap name to its display category. Stdout: mount|cloud|sandbox.
+_cap_category() {
+  case "$1" in
+    docker)         echo "sandbox" ;;
+    az|aws|gcloud)  echo "cloud" ;;
+    *)              echo "mount" ;;
+  esac
+}
+
+# Bucket ACTIVE_CAPS into _CAPS_MOUNT/_CAPS_CLOUD/_CAPS_SANDBOX globals.
+_caps_bucket_active() {
+  _CAPS_MOUNT=()
+  _CAPS_CLOUD=()
+  _CAPS_SANDBOX=()
+  local cap
+  for cap in "${ACTIVE_CAPS[@]+"${ACTIVE_CAPS[@]}"}"; do
+    case "$(_cap_category "$cap")" in
+      sandbox) _CAPS_SANDBOX+=("$cap") ;;
+      cloud)   _CAPS_CLOUD+=("$cap") ;;
+      mount)   _CAPS_MOUNT+=("$cap") ;;
+    esac
+  done
+}
+
+# Render the active caps. Indent prefix, top-level label, single-line pad,
+# and label color are parameters so the same renderer drives both the
+# summary block (DIM label) and `cleat status` (BOLD label).
+_print_caps() {
+  local indent="${1:-  }"
+  local label="${2:-Caps:}"
+  local pad="${3:-      }"
+  local label_color="${4:-$DIM}"
+
+  [[ ${#ACTIVE_CAPS[@]} -eq 0 ]] && return 0
+  _caps_bucket_active
+
+  local cats=0
+  [[ ${#_CAPS_MOUNT[@]}   -gt 0 ]] && cats=$((cats + 1))
+  [[ ${#_CAPS_CLOUD[@]}   -gt 0 ]] && cats=$((cats + 1))
+  [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]] && cats=$((cats + 1))
+
+  if [[ $cats -le 1 ]]; then
+    local color s
+    if [[ ${#_CAPS_CLOUD[@]} -gt 0 ]]; then
+      color="$BLUE"; s="$(printf '%s, ' "${_CAPS_CLOUD[@]}")"
+    elif [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
+      color="$YELLOW"; s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"
+    else
+      color="$GREEN"; s="$(printf '%s, ' "${_CAPS_MOUNT[@]}")"
+    fi
+    s="${s%, }"
+    echo -e "${indent}${label_color}${label}${RESET}${pad}${color}${BOLD}${s}${RESET}"
+    return 0
   fi
+
+  echo -e "${indent}${label_color}${label}${RESET}"
+  local s
+  if [[ ${#_CAPS_MOUNT[@]} -gt 0 ]]; then
+    s="$(printf '%s, ' "${_CAPS_MOUNT[@]}")"; s="${s%, }"
+    echo -e "${indent}  ${DIM}mount:${RESET}    ${GREEN}${BOLD}${s}${RESET}"
+  fi
+  if [[ ${#_CAPS_CLOUD[@]} -gt 0 ]]; then
+    s="$(printf '%s, ' "${_CAPS_CLOUD[@]}")"; s="${s%, }"
+    echo -e "${indent}  ${DIM}cloud:${RESET}    ${BLUE}${BOLD}${s}${RESET} ${DIM}(lazy install)${RESET}"
+  fi
+  if [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
+    s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"; s="${s%, }"
+    echo -e "${indent}  ${DIM}sandbox:${RESET}  ${YELLOW}${BOLD}${s}${RESET} ${DIM}(breaks isolation)${RESET}"
+  fi
+}
+
+# Legacy entry point retained for tests and possible future inline use.
+_print_startup_caps() {
+  _print_caps "  " "Caps:" "      "
 }
 
 _print_summary_block() {
@@ -867,12 +954,7 @@ _print_summary_block() {
     local display_path="${project/#$HOME/$_tilde}"
     echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
   fi
-  if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
-    local caps_str
-    caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
-    caps_str="${caps_str%, }"
-    echo -e "  ${DIM}Caps:${RESET}       ${GREEN}${BOLD}${caps_str}${RESET}"
-  fi
+  _print_caps "  " "Caps:" "       "
   _env_summary_inline "$project"
 }
 
@@ -918,16 +1000,20 @@ _env_summary_inline() {
 # Display label per lazy cap — used in the install spinner.
 _lazy_cap_label() {
   case "$1" in
-    az) echo "Azure CLI" ;;
-    *)  echo "$1" ;;
+    az)     echo "Azure CLI" ;;
+    aws)    echo "AWS CLI" ;;
+    gcloud) echo "Google Cloud CLI" ;;
+    *)      echo "$1" ;;
   esac
 }
 
 # Tool name to probe with `command -v` to decide whether install is needed.
 _lazy_cap_probe() {
   case "$1" in
-    az) echo "az" ;;
-    *)  echo "" ;;
+    az)     echo "az" ;;
+    aws)    echo "aws" ;;
+    gcloud) echo "gcloud" ;;
+    *)      echo "" ;;
   esac
 }
 
@@ -1920,6 +2006,22 @@ cmd_run() {
     mount_args+=(-v "${HOME}/.azure:/home/coder/.azure")
   fi
 
+  # ── aws capability: mount AWS CLI config (read-write) so `aws configure`
+  # and SSO sessions persist on the host across `cleat rm`. Same pattern as
+  # az: bind-mount = auth boundary, lazy install = tool boundary.
+  if cap_is_active aws; then
+    mkdir -p "${HOME}/.aws"
+    mount_args+=(-v "${HOME}/.aws:/home/coder/.aws")
+  fi
+
+  # ── gcloud capability: mount Google Cloud SDK config (read-write) so
+  # `gcloud auth login` credentials persist on the host across `cleat rm`.
+  # Same pattern as az/aws.
+  if cap_is_active gcloud; then
+    mkdir -p "${HOME}/.config/gcloud"
+    mount_args+=(-v "${HOME}/.config/gcloud:/home/coder/.config/gcloud")
+  fi
+
   # ── docker capability: mount the host Docker socket so the container can
   # build, run, and manage Docker workloads against the host daemon. Also
   # bind-mount the project at its HOST path (in addition to /workspace) and
@@ -2420,12 +2522,10 @@ cmd_status() {
     echo -e "  ${BOLD}Auth:${RESET}      ${YELLOW}○ not configured${RESET} ${DIM}(cleat login)${RESET}"
   fi
 
-  # Show active capabilities
+  # Show active capabilities — same categorized renderer as the post-launch
+  # summary block; status passes BOLD to match the other status labels.
   if [[ ${#ACTIVE_CAPS[@]} -gt 0 ]]; then
-    local caps_str
-    caps_str="$(printf '%s, ' "${ACTIVE_CAPS[@]}")"
-    caps_str="${caps_str%, }"
-    echo -e "  ${BOLD}Caps:${RESET}      ${GREEN}${caps_str}${RESET}"
+    _print_caps "  " "Caps:" "      " "$BOLD"
   else
     echo -e "  ${BOLD}Caps:${RESET}      ${DIM}none${RESET} ${DIM}(cleat config)${RESET}"
   fi
@@ -2520,14 +2620,16 @@ cmd_uninstall() {
 # ── cleat config ────────────────────────────────────────────────────────────
 _cap_description() {
   case "$1" in
-    git)   echo "Mount ~/.gitconfig (read-only) for commit identity" ;;
-    ssh)   echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
-    env)   echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
-    hooks) echo "Run your Claude Code hooks on the host (global + project)" ;;
-    gh)    echo "GitHub CLI auth (persists across rm/nuke/rebuild)" ;;
+    git)    echo "Mount ~/.gitconfig (read-only) for commit identity" ;;
+    ssh)    echo "Mount ~/.ssh (read-only) and forward SSH agent" ;;
+    env)    echo "Load env vars from ~/.config/cleat/env and .cleat.env" ;;
+    hooks)  echo "Run your Claude Code hooks on the host (global + project)" ;;
+    gh)     echo "GitHub CLI auth (persists across rm/nuke/rebuild)" ;;
     docker) echo "Host Docker socket (breaks sandbox) to test Docker apps" ;;
-    az)    echo "Azure CLI auth (lazy install ~250 MB on first use; auth persists)" ;;
-    *)     echo "(unknown capability)" ;;
+    az)     echo "Azure CLI auth (lazy install ~250 MB on first use; auth persists)" ;;
+    aws)    echo "AWS CLI auth (lazy install ~150 MB on first use; auth persists)" ;;
+    gcloud) echo "Google Cloud CLI auth (lazy install ~200 MB on first use; auth persists)" ;;
+    *)      echo "(unknown capability)" ;;
   esac
 }
 

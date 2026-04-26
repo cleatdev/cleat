@@ -306,8 +306,9 @@ SED
 try "v0.9.2_cli_spin_stop_line_clear" "bin/cleat spin_stop clears line before writing"
 
 # v0.10.0 — docker must be in KNOWN_CAPS. Remove it, guard test should fail.
+# Pattern updated when cloud caps (az, aws, gcloud) joined the array.
 cat > "$SED_TMP" << 'SED'
-s|^KNOWN_CAPS=(git ssh env hooks gh docker)$|KNOWN_CAPS=(git ssh env hooks gh)|
+s|^KNOWN_CAPS=(git ssh env hooks gh docker az aws gcloud)$|KNOWN_CAPS=(git ssh env hooks gh az aws gcloud)|
 SED
 try "v0.10.0_docker_in_known_caps" "docker listed in KNOWN_CAPS"
 

@@ -492,6 +492,192 @@ EOF
   unset DOCKER_EXIT_CODE
 }
 
+# ── aws capability: docker run mounts + lazy install ────────────────────────
+#
+# Same lazy-install pattern as `az`: ~/.aws is bind-mounted read-write so
+# `aws configure` / SSO sessions persist on the host across `cleat rm`,
+# while the binary is installed inside the container on first activation.
+
+@test "aws cap: mounts ~/.aws read-write when enabled" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+aws
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" ".aws:/home/coder/.aws"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".aws:/home/coder/.aws:ro"
+  assert_success
+}
+
+@test "aws cap: creates ~/.aws if missing" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  rm -rf "$HOME/.aws"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+aws
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [[ -d "$HOME/.aws" ]] || {
+    echo "~/.aws was not created"
+    return 1
+  }
+  run assert_docker_run_has "$cname" ".aws:/home/coder/.aws"
+  assert_success
+}
+
+@test "no aws cap: does not mount aws config" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  mkdir -p "$HOME/.aws"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".aws:/home/coder/.aws"
+  assert_success
+}
+
+@test "aws cap: registered as a lazy-install cap" {
+  local found=0 cap
+  for cap in "${LAZY_CAPS[@]}"; do
+    [[ "$cap" == "aws" ]] && found=1
+  done
+  [[ "$found" -eq 1 ]] || {
+    echo "expected 'aws' in LAZY_CAPS=(${LAZY_CAPS[*]})"
+    return 1
+  }
+}
+
+@test "aws cap: description mentions lazy install" {
+  run _cap_description aws
+  assert_success
+  assert_output --partial "lazy install"
+}
+
+@test "_run_lazy_installs: invokes install script for aws when probe reports missing" {
+  _lazy_cap_is_installed() { return 1; }
+  ACTIVE_CAPS=(aws)
+  spin() { :; }
+  spin_stop() { :; }
+
+  run _run_lazy_installs "test-cname"
+  assert_success
+  grep -qE 'exec.*test-cname.*cap-installs/aws\.sh' "$DOCKER_CALLS" || {
+    echo "expected docker exec for cap-installs/aws.sh; got:"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}
+
+# ── gcloud capability: docker run mounts + lazy install ─────────────────────
+#
+# Same lazy-install pattern as `az`/`aws`: ~/.config/gcloud is bind-mounted
+# read-write so `gcloud auth login` credentials persist across `cleat rm`,
+# while the SDK is installed inside the container on first activation.
+
+@test "gcloud cap: mounts ~/.config/gcloud read-write when enabled" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+gcloud
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" ".config/gcloud:/home/coder/.config/gcloud"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".config/gcloud:/home/coder/.config/gcloud:ro"
+  assert_success
+}
+
+@test "gcloud cap: creates ~/.config/gcloud if missing" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  rm -rf "$HOME/.config/gcloud"
+
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+gcloud
+EOF
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [[ -d "$HOME/.config/gcloud" ]] || {
+    echo "~/.config/gcloud was not created"
+    return 1
+  }
+  run assert_docker_run_has "$cname" ".config/gcloud:/home/coder/.config/gcloud"
+  assert_success
+}
+
+@test "no gcloud cap: does not mount gcloud config" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  mkdir -p "$HOME/.config/gcloud"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".config/gcloud:/home/coder/.config/gcloud"
+  assert_success
+}
+
+@test "gcloud cap: registered as a lazy-install cap" {
+  local found=0 cap
+  for cap in "${LAZY_CAPS[@]}"; do
+    [[ "$cap" == "gcloud" ]] && found=1
+  done
+  [[ "$found" -eq 1 ]] || {
+    echo "expected 'gcloud' in LAZY_CAPS=(${LAZY_CAPS[*]})"
+    return 1
+  }
+}
+
+@test "gcloud cap: description mentions lazy install" {
+  run _cap_description gcloud
+  assert_success
+  assert_output --partial "lazy install"
+}
+
+@test "_run_lazy_installs: invokes install script for gcloud when probe reports missing" {
+  _lazy_cap_is_installed() { return 1; }
+  ACTIVE_CAPS=(gcloud)
+  spin() { :; }
+  spin_stop() { :; }
+
+  run _run_lazy_installs "test-cname"
+  assert_success
+  grep -qE 'exec.*test-cname.*cap-installs/gcloud\.sh' "$DOCKER_CALLS" || {
+    echo "expected docker exec for cap-installs/gcloud.sh; got:"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}
+
 # ── docker capability: docker run mounts ──────────────────────────────────
 #
 # Design rationale: concept/15-docker-capability.md. Opt-in only. When active,
@@ -974,6 +1160,126 @@ EOF
   hash1="$(compute_config_fingerprint)"
   hash2="$(compute_config_fingerprint)"
   [[ "$hash1" == "$hash2" ]]
+}
+
+# ── Caps categorization (mount / cloud / sandbox) ──────────────────────────
+#
+# Active caps display groups by behavior — same UI on the landing page.
+# These tests pin the category mapping and the renderer's behavior so a
+# refactor that drops a cap from its category, or breaks the multi-line
+# layout, fails loudly. The visual is part of the brand: it teaches users
+# that docker is sandbox-breaking and cloud caps lazy-install.
+
+@test "_cap_category: mount caps are mount" {
+  local cap
+  for cap in git ssh env hooks gh; do
+    run _cap_category "$cap"
+    assert_success
+    assert_output "mount"
+  done
+}
+
+@test "_cap_category: cloud caps are cloud" {
+  local cap
+  for cap in az aws gcloud; do
+    run _cap_category "$cap"
+    assert_success
+    assert_output "cloud"
+  done
+}
+
+@test "_cap_category: docker is sandbox" {
+  run _cap_category docker
+  assert_success
+  assert_output "sandbox"
+}
+
+@test "_caps_bucket_active: splits ACTIVE_CAPS by category" {
+  ACTIVE_CAPS=(git az docker aws ssh gcloud)
+  _caps_bucket_active
+  [[ "${_CAPS_MOUNT[*]}"   == "git ssh" ]]            || { echo "mount: ${_CAPS_MOUNT[*]}"; return 1; }
+  [[ "${_CAPS_CLOUD[*]}"   == "az aws gcloud" ]]      || { echo "cloud: ${_CAPS_CLOUD[*]}"; return 1; }
+  [[ "${_CAPS_SANDBOX[*]}" == "docker" ]]             || { echo "sandbox: ${_CAPS_SANDBOX[*]}"; return 1; }
+}
+
+@test "_print_caps: silent when ACTIVE_CAPS is empty" {
+  ACTIVE_CAPS=()
+  run _print_caps
+  assert_output ""
+}
+
+@test "_print_caps: single-line form when only mount caps" {
+  # Only one category active → legacy single-line layout, no per-category block.
+  ACTIVE_CAPS=(git ssh env hooks)
+  run _print_caps
+  assert_output --partial "Caps:"
+  assert_output --partial "git, ssh, env, hooks"
+  refute_output --partial "mount:"
+  refute_output --partial "cloud:"
+  refute_output --partial "sandbox:"
+}
+
+@test "_print_caps: single-line form when only cloud caps" {
+  ACTIVE_CAPS=(az aws)
+  run _print_caps
+  assert_output --partial "Caps:"
+  assert_output --partial "az, aws"
+  refute_output --partial "cloud:"
+}
+
+@test "_print_caps: single-line form when only docker (sandbox)" {
+  ACTIVE_CAPS=(docker)
+  run _print_caps
+  assert_output --partial "Caps:"
+  assert_output --partial "docker"
+  refute_output --partial "sandbox:"
+}
+
+@test "_print_caps: multi-line block when two or more categories active" {
+  ACTIVE_CAPS=(git az docker)
+  run _print_caps
+  assert_output --partial "Caps:"
+  assert_output --partial "mount:"
+  assert_output --partial "cloud:"
+  assert_output --partial "sandbox:"
+  assert_output --partial "(lazy install)"
+  assert_output --partial "(breaks isolation)"
+}
+
+@test "_print_caps: multi-line omits categories with no active caps" {
+  # Only mount + cloud here — sandbox row must NOT appear.
+  ACTIVE_CAPS=(git aws)
+  run _print_caps
+  assert_output --partial "mount:"
+  assert_output --partial "cloud:"
+  refute_output --partial "sandbox:"
+  refute_output --partial "(breaks isolation)"
+}
+
+@test "_print_caps: groups all three cloud caps under one cloud line" {
+  ACTIVE_CAPS=(git az aws gcloud)
+  run _print_caps
+  assert_output --partial "az, aws, gcloud"
+  # Cloud caps on a single line under 'cloud:', not interleaved with mount caps.
+  assert_output --partial "cloud:"
+}
+
+@test "_print_summary_block: renders categorized caps when categories span" {
+  ACTIVE_CAPS=(git docker)
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_output --partial "Caps:"
+  assert_output --partial "mount:"
+  assert_output --partial "sandbox:"
+  assert_output --partial "git"
+  assert_output --partial "docker"
+}
+
+@test "_print_summary_block: renders single-line caps when only mount" {
+  ACTIVE_CAPS=(git ssh)
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_output --partial "Caps:"
+  assert_output --partial "git, ssh"
+  refute_output --partial "mount:"
 }
 
 # ── Startup output ─────────────────────────────────────────────────────────

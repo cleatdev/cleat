@@ -327,6 +327,38 @@ cleat_bin_timeout() {
   assert_output --partial "az"
 }
 
+@test "smoke: cleat --cap aws --help parses (lazy-install cap)" {
+  run cleat_bin --cap aws --help
+  assert_success
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat config --enable aws then --list shows aws enabled" {
+  run cleat_bin config --enable aws
+  assert_success
+  refute_output --partial "Unknown capability"
+
+  run cleat_bin config --list
+  assert_success
+  assert_output --partial "aws"
+}
+
+@test "smoke: cleat --cap gcloud --help parses (lazy-install cap)" {
+  run cleat_bin --cap gcloud --help
+  assert_success
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat config --enable gcloud then --list shows gcloud enabled" {
+  run cleat_bin config --enable gcloud
+  assert_success
+  refute_output --partial "Unknown capability"
+
+  run cleat_bin config --list
+  assert_success
+  assert_output --partial "gcloud"
+}
+
 @test "smoke: cleat --env KEY=VAL --help parses global flags cleanly" {
   run cleat_bin --env "FOO=bar" --help
   assert_success

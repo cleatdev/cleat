@@ -6,6 +6,8 @@ setup() {
   source_cli
   _host_clip_cmd() { echo ""; }
   check_for_update() { true; }
+  check_drift() { true; }
+  _resolve_config_drift() { true; }
 }
 teardown() { _common_teardown; }
 

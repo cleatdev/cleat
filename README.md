@@ -503,18 +503,22 @@ cleat --env-file .env.local start
 
 ### Configuration drift detection
 
-When you change capabilities after a container was created, Cleat detects the mismatch and shows a notice:
+When you change capabilities after a container was created, Cleat detects the mismatch the next time you run `cleat`, `cleat resume`, or `cleat claude`. On a TTY it prompts you to recreate:
 
 ```
   ┌──────────────────────────────────────────────────────┐
   │  Configuration changed since this container was       │
-  │  created. Recreate to apply the new settings.         │
+  │  created. Caps or env keys differ from the running    │
+  │  setup.                                                │
   │                                                       │
-  │  Run: cleat rm && cleat                               │
+  │  Recreating will apply the new settings.              │
   └──────────────────────────────────────────────────────┘
+  Recreate cleat-<project> now? [Y/n]
 ```
 
-Drift detection is informational only — Cleat never auto-destroys containers.
+Accepting removes the container and rebuilds it with the new caps/env. Sessions persist on the host (`~/.claude/projects/<key>/`) and are never touched. Declining keeps the existing container.
+
+Non-TTY runs (CI, scripts) print the notice and continue with the existing container — they never auto-destroy.
 
 ### Config files
 

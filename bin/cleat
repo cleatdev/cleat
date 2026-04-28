@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.12.0"
+VERSION="0.12.1"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -814,25 +814,58 @@ _notice_box() {
   echo ""
 }
 
-# Check for configuration drift and show notices
+# Resolve configuration drift between current caps/env and the existing container.
+# Most-common trigger: user ran `cleat config --enable <cap>` and re-typed `cleat`.
+# On TTY: prompt to recreate; on accept, stop+rm container and clean tmp dirs so
+# the caller's existing "no container" path (cmd_run) recreates with the new caps.
+# On non-TTY or declined: print a warning and continue with the stale container.
+_resolve_config_drift() {
+  local cname="$1"
+  local project="${2:-}"
+
+  container_exists "$cname" || return 0
+
+  local stored_hash current_hash
+  stored_hash="$(_container_config_hash "$cname")"
+  current_hash="$(compute_config_fingerprint "$project")"
+  [[ -z "$stored_hash" || "$stored_hash" == "$current_hash" ]] && return 0
+
+  if _is_tty; then
+    _notice_box \
+      "Configuration changed since this container was" \
+      "created. Caps or env keys differ from the running setup." \
+      "" \
+      "Recreating will apply the new settings."
+    echo -n "  Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
+    local yn
+    read -r yn
+    if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+      info "Recreating container..."
+      if is_running "$cname"; then
+        docker stop "$cname" > /dev/null 2>&1 || true
+      fi
+      docker rm -f "$cname" > /dev/null 2>&1 || true
+      rm -rf "/tmp/cleat-hooks-${cname}" "/tmp/cleat-clip-${cname}" "/tmp/cleat-settings-${cname}" 2>/dev/null || true
+      success "Removed ${BOLD}${cname}${RESET}."
+      return 0
+    fi
+    info "Skipped — keeping existing container. Run ${BOLD}cleat rm && cleat${RESET} when ready."
+    return 0
+  fi
+
+  _notice_box \
+    "Configuration changed since this container was" \
+    "created. Recreate to apply the new settings." \
+    "" \
+    "Run: {BOLD}cleat rm && cleat{/BOLD}"
+}
+
+# Check for image-version drift and show a notice. Config drift is handled
+# earlier and interactively by _resolve_config_drift.
 check_drift() {
   local cname="$1"
   local project="${2:-}"
 
-  # Config drift
-  local stored_hash current_hash
-  stored_hash="$(_container_config_hash "$cname")"
-  current_hash="$(compute_config_fingerprint "$project")"
-
-  if [[ -n "$stored_hash" && "$stored_hash" != "$current_hash" ]]; then
-    _notice_box \
-      "Configuration changed since this container was" \
-      "created. Recreate to apply the new settings." \
-      "" \
-      "Run: {BOLD}cleat rm && cleat{/BOLD}"
-  fi
-
-  # Image version drift
   local image_version
   image_version="$(_image_cleat_version)"
   if [[ -n "$image_version" && "$image_version" != "$VERSION" ]]; then
@@ -2099,6 +2132,11 @@ cmd_start() {
   resolve_caps "$project"
   resolve_env_args "$project"
 
+  # Config drift (caps/env keys changed since container was created) — prompt
+  # to recreate before any docker operations. On accept this removes the
+  # container so the branches below fall into cmd_run with the new settings.
+  _resolve_config_drift "$cname" "$project"
+
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
@@ -2181,6 +2219,11 @@ cmd_resume() {
   # Resolve caps for startup output and drift detection
   resolve_caps "$project"
   resolve_env_args "$project"
+
+  # Config drift — prompt to recreate before refreshing overlays. If the user
+  # accepts, the container and tmp dirs are gone; the missing-container path
+  # below will call cmd_run, which rebuilds the overlay from scratch.
+  _resolve_config_drift "$cname" "$project"
 
   # Refresh settings overlays (user may have changed hooks between stop/resume)
   local settings_overlay_dir="/tmp/cleat-settings-${cname}"
@@ -2384,6 +2427,13 @@ cmd_claude() {
   _RESOLVED_PROJECT="$project"
   resolve_caps "$project"
   resolve_env_args "$project"
+
+  # Config drift — prompt to recreate. If accepted the container is gone, so
+  # call cmd_run to rebuild it before attaching.
+  _resolve_config_drift "$cname" "$project"
+  if ! container_exists "$cname"; then
+    cmd_run "$project"
+  fi
 
   # Refresh project-level settings overlays (hooks may have changed)
   local settings_overlay_dir="/tmp/cleat-settings-${cname}"

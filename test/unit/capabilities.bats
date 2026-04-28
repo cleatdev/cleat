@@ -17,6 +17,7 @@ setup() {
   _host_clip_cmd() { echo ""; }
   check_for_update() { true; }
   check_drift() { true; }
+  _resolve_config_drift() { true; }
   show_first_run_tip() { true; }
 }
 
@@ -1160,6 +1161,83 @@ EOF
   hash1="$(compute_config_fingerprint)"
   hash2="$(compute_config_fingerprint)"
   [[ "$hash1" == "$hash2" ]]
+}
+
+# ── Config drift resolution ────────────────────────────────────────────────
+#
+# _resolve_config_drift is the interactive fix path users hit after
+# `cleat config --enable <cap>` followed by `cleat`. The goal is to detect
+# the cap change, prompt to recreate, and clean up so the caller's existing
+# "no container" branch (cmd_run) rebuilds with the new caps.
+
+@test "_resolve_config_drift: no-op when container does not exist" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 1; }
+    _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  refute_output --partial "Configuration changed"
+}
+
+@test "_resolve_config_drift: no-op when hashes match" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "abc123"; }
+    compute_config_fingerprint() { echo "abc123"; }
+    _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  refute_output --partial "Configuration changed"
+}
+
+@test "_resolve_config_drift: non-TTY prints warning notice and continues" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "old"; }
+    compute_config_fingerprint() { echo "new"; }
+    _is_tty() { return 1; }
+    _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  assert_output --partial "Configuration changed"
+  assert_output --partial "cleat rm && cleat"
+}
+
+@test "_resolve_config_drift: TTY + accept removes the container" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "old"; }
+    compute_config_fingerprint() { echo "new"; }
+    _is_tty() { return 0; }
+    is_running() { return 1; }
+    export DOCKER_CALLS="'"$DOCKER_CALLS"'" PATH="'"$MOCK_BIN"':$PATH"
+    echo "y" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  assert_output --partial "Removed"
+  run cat "$DOCKER_CALLS"
+  assert_output --partial "rm -f cleat-foo"
+}
+
+@test "_resolve_config_drift: TTY + decline keeps the container" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "old"; }
+    compute_config_fingerprint() { echo "new"; }
+    _is_tty() { return 0; }
+    is_running() { return 1; }
+    export DOCKER_CALLS="'"$DOCKER_CALLS"'" PATH="'"$MOCK_BIN"':$PATH"
+    echo "n" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  assert_output --partial "Skipped"
+  run cat "$DOCKER_CALLS"
+  refute_output --partial "rm -f cleat-foo"
 }
 
 # ── Caps categorization (mount / cloud / sandbox) ──────────────────────────

@@ -26,6 +26,7 @@ setup() {
   _host_clip_cmd() { echo ""; }
   check_for_update() { true; }
   check_drift() { true; }
+  _resolve_config_drift() { true; }
   show_first_run_tip() { true; }
 
   # Use isolated config dir so tests don't touch real host
@@ -55,6 +56,9 @@ teardown() {
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
   mock_docker_ps "$cname"
+  # Container must also "exist" so cmd_claude's drift-recreate fallback
+  # doesn't run cmd_run (which would mask a missing _RESOLVED_PROJECT assignment).
+  mock_docker_ps_a "$cname"
   exec_claude() { return 0; }
 
   _RESOLVED_PROJECT=""
@@ -1568,4 +1572,41 @@ EOF
   assert_output --partial "$REGISTRY_IMAGE"
 
   unset DOCKER_TAG_EXIT_CODE DOCKER_PULL_EXIT_CODE
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.12.1 — `cleat config --enable hooks && cleat` did nothing useful: the
+# existing container kept its old mount set (no /var/log/cleat), so hooks
+# silently never fired. Drift was detected but the response was a static
+# "Run: cleat rm && cleat" notice — invisible to most users.
+#
+# Fix: cmd_start / cmd_resume / cmd_claude now call _resolve_config_drift
+# early, before any docker operation, so a drifted TTY session prompts the
+# user to recreate. Without the wiring, the existing capabilities.bats unit
+# tests for _resolve_config_drift still pass — this regression pins the
+# wiring itself.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.12.1: cmd_start invokes _resolve_config_drift before docker ops" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_images "cleat"
+  mock_docker_ps_a "$cname"
+  is_running() { return 1; }
+  exec_claude() { return 0; }
+
+  # Settings overlay must exist or the unrelated stale-mount path fires
+  mkdir -p "/tmp/cleat-settings-${cname}"
+  echo '{}' > "/tmp/cleat-settings-${cname}/settings.json"
+
+  # Sentinel — set by the spy below if the wiring is intact
+  DRIFT_CALLED=0
+  _resolve_config_drift() { DRIFT_CALLED=1; }
+
+  cmd_start "$TEST_TEMP/project"
+
+  [[ "$DRIFT_CALLED" == "1" ]] || {
+    echo "REGRESSION: cmd_start did not call _resolve_config_drift"
+    return 1
+  }
 }

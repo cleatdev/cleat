@@ -18,6 +18,7 @@ setup() {
   _host_clip_cmd() { echo ""; }
   check_for_update() { true; }
   check_drift() { true; }
+  _resolve_config_drift() { true; }
   show_first_run_tip() { true; }
 }
 

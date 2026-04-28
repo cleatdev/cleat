@@ -417,6 +417,17 @@ s|if docker tag "\$target_image" "\$IMAGE_NAME" > /dev/null 2>&1; then|if true; 
 SED
 try "v0.10.1_pull_cache_tag_failure_fallthrough" "_do_pull falls through to network pull when cache-hit tag fails"
 
+# v0.12.1 — drift detection now prompts to recreate (interactive). Mutate
+# cmd_start to drop the _resolve_config_drift call. Without it, drift
+# silently goes undetected and users keep hitting the stale-cap container.
+# The regression spy in regressions.bats should fail to set DRIFT_CALLED.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /_resolve_config_drift "\$cname" "\$project"/d
+}
+SED
+try "v0.12.1_drift_recreate_wired" "cmd_start invokes _resolve_config_drift"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

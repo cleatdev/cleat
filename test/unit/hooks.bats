@@ -926,18 +926,30 @@ EOF
 }
 
 @test "_hook_bridge_cleanup: kills all tracked children" {
+  # Snapshot PIDs before cleanup zeroes _HOOK_BRIDGE_CHILDREN — the original
+  # loop iterated the post-cleanup empty array and never asserted anything.
+  # Disown the sleeps so bats's DEBUG trap doesn't hit a wait race when
+  # _hook_bridge_cleanup kills them inside the test shell's job table.
   _HOOK_BRIDGE_CHILDREN=()
   sleep 60 &
-  _HOOK_BRIDGE_CHILDREN+=("$!")
+  local pid1=$!
+  _HOOK_BRIDGE_CHILDREN+=("$pid1")
+  disown "$pid1"
   sleep 60 &
-  _HOOK_BRIDGE_CHILDREN+=("$!")
+  local pid2=$!
+  _HOOK_BRIDGE_CHILDREN+=("$pid2")
+  disown "$pid2"
 
   _hook_bridge_cleanup
 
-  for pid in "${_HOOK_BRIDGE_CHILDREN[@]+"${_HOOK_BRIDGE_CHILDREN[@]}"}"; do
-    run kill -0 "$pid"
-    assert_failure
-  done
+  # Give the kernel a beat to reap before kill -0 — the assertion is "process
+  # is gone", not "process exited synchronously with the kill syscall".
+  sleep 0.2
+  run kill -0 "$pid1"
+  assert_failure
+  run kill -0 "$pid2"
+  assert_failure
+  [[ ${#_HOOK_BRIDGE_CHILDREN[@]} -eq 0 ]] || return 1
 }
 
 # ── Resume refreshes overlay ─────────────────────────────────────────────

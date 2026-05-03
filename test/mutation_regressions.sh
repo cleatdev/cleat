@@ -428,6 +428,14 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.12.1_drift_recreate_wired" "cmd_start invokes _resolve_config_drift"
 
+# v0.12.1 — the drift recreate prompt must interpret ANSI escapes. Mutate
+# `echo -en` back to `echo -n` so $BOLD/$RESET print as literal `\033[...]`
+# strings; the regression test asserts no such literal appears in output.
+cat > "$SED_TMP" << 'SED'
+s|echo -en "  Recreate|echo -n "  Recreate|
+SED
+try "v0.12.1_drift_prompt_ansi" "drift recreate prompt interprets ANSI escapes"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

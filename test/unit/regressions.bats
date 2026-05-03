@@ -1610,3 +1610,26 @@ EOF
     return 1
   }
 }
+
+# v0.12.1 shipped the drift recreate prompt with `echo -n` instead of
+# `echo -en`, so ${BOLD}/${RESET} printed as literal `\033[1m`/`\033[0m`
+# instead of being interpreted as ANSI escape sequences. The user saw a
+# garbled prompt: `Recreate \033[1mcleat-foo\033[0m now? [Y/n]`.
+@test "regression v0.12.1: drift recreate prompt interprets ANSI escapes" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "old"; }
+    compute_config_fingerprint() { echo "new"; }
+    _is_tty() { return 0; }
+    is_running() { return 1; }
+    export DOCKER_CALLS="'"$DOCKER_CALLS"'" PATH="'"$MOCK_BIN"':$PATH"
+    echo "y" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  # Bug present → output contains the 7-char literal sequence.
+  # Fix in place → those characters appear only as the actual ESC byte + `[1m`,
+  # so the literal substring isn't found.
+  refute_output --partial '\033[1m'
+  refute_output --partial '\033[0m'
+}

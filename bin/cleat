@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.12.1"
+VERSION="0.12.2"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -836,7 +836,7 @@ _resolve_config_drift() {
       "created. Caps or env keys differ from the running setup." \
       "" \
       "Recreating will apply the new settings."
-    echo -n "  Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
+    echo -en "  Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
     local yn
     read -r yn
     if [[ -z "$yn" || "$yn" == [yY]* ]]; then

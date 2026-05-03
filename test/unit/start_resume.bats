@@ -196,7 +196,8 @@ teardown() { _common_teardown; }
 }
 
 @test "resume: stale mounts show clear error directing to cleat start" {
-  # After reboot, resume can't fix stale mounts — tell user to recreate.
+  # After /tmp paths rotate (reboot, partial /tmp file cleanup, etc.),
+  # resume can't fix stale mounts — tell user to recreate.
   mkdir -p "$TEST_TEMP/project"
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
@@ -207,7 +208,7 @@ teardown() { _common_teardown; }
   run cmd_resume "$TEST_TEMP/project"
   assert_failure
   assert_output --partial "stale"
-  assert_output --partial "rebooted"
+  assert_output --partial "host paths changed"
   assert_output --partial "cleat"
 }
 

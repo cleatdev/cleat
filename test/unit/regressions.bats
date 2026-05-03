@@ -1633,3 +1633,54 @@ EOF
   refute_output --partial '\033[1m'
   refute_output --partial '\033[0m'
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.12.3 — `cleat start` aborted with an opaque OCI runtime error
+# ("not a directory: Are you trying to mount a directory onto a file...")
+# when the settings-overlay dir survived but a specific file inside was
+# missing. The pre-fix stale-mount check only verified `[[ -d $overlay_dir ]]`,
+# so the partial-rotation state slipped past the gate, fell through to
+# `docker start`, and let Docker auto-create the missing bind source as a
+# directory — which then failed to mount onto the file destination inside
+# the container. Reported in the wild after a long session: user declined
+# the drift recreate prompt, container start failed with the OCI error,
+# leaving them stuck.
+#
+# Fix: _settings_overlay_intact also enumerates the container's bind
+# sources via `docker inspect` and verifies each one inside the overlay
+# dir is a regular file before docker start. When any source is missing
+# or the wrong type, cmd_start auto-recreates (the alternative is the
+# same opaque failure they hit in production).
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.12.3: cmd_start auto-recreates when overlay dir survives but a file is missing" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+
+  # Overlay dir survives with settings.json, but the container's mount set
+  # still references project-settings.local.json which was rotated out.
+  # This is the exact partial-rotation state the dir-only check missed.
+  local overlay_dir="/tmp/cleat-settings-${cname}"
+  mkdir -p "$overlay_dir"
+  echo '{}' > "$overlay_dir/settings.json"
+  # docker inspect must report both sources so the helper can spot the
+  # missing one. The mock returns this for ALL inspect calls in this test
+  # — fine because _container_config_hash isn't on the cmd_start path
+  # under the bypassed _resolve_config_drift in setup().
+  mock_docker_inspect "${overlay_dir}/settings.json
+${overlay_dir}/project-settings.local.json"
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  assert_output --partial "host paths changed"
+  run docker_calls
+  assert_output --partial "docker rm -f $cname"
+  assert_output --partial "docker run"
+  refute_output --partial "docker start $cname"
+
+  rm -rf "$overlay_dir" "/tmp/cleat-clip-${cname}"
+}

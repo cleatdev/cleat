@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.12.2"
+VERSION="0.12.3"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -777,6 +777,35 @@ _container_config_hash() {
 # Read Cleat version stored on the Docker image label
 _image_cleat_version() {
   docker inspect "$IMAGE_NAME" --format '{{index .Config.Labels "sh.cleat.version"}}' 2>/dev/null || echo ""
+}
+
+# Return success if the container's settings-overlay bind sources are all
+# present and the right type. Return failure when the overlay dir is missing
+# OR when any bind source within it is missing or has the wrong type.
+#
+# Why this can't just check the dir: Docker auto-creates a missing bind
+# source as a directory, which then fails to mount onto a file destination
+# with an opaque OCI "not a directory" error. macOS rotates individual files
+# in /tmp on a different schedule than the parent dir (and reboot-time
+# cleanup can race partial state), so the dir may survive while specific
+# overlay files do not.
+_settings_overlay_intact() {
+  local cname="$1"
+  local overlay_dir="/tmp/cleat-settings-${cname}"
+  [[ -d "$overlay_dir" ]] || return 1
+
+  local mounts src
+  mounts="$(docker inspect "$cname" --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' 2>/dev/null)" || return 0
+  [[ -n "$mounts" ]] || return 0
+  while IFS= read -r src; do
+    [[ -z "$src" ]] && continue
+    case "$src" in
+      "$overlay_dir"/*)
+        [[ -f "$src" ]] || return 1
+        ;;
+    esac
+  done <<< "$mounts"
+  return 0
 }
 
 # Print a notice box with dynamic width. Each argument is a line of plain text.
@@ -2140,11 +2169,11 @@ cmd_start() {
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      # Detect stale mounts (e.g., after host reboot clears /tmp and
-      # rotates the SSH agent socket path).  The container's bind mounts
-      # are baked in at creation time and cannot be updated — recreate.
-      local settings_overlay_dir="/tmp/cleat-settings-${cname}"
-      if [[ ! -d "$settings_overlay_dir" ]]; then
+      # Detect stale mounts (e.g., after host reboot clears /tmp, after
+      # macOS rotates individual /tmp files, or after the SSH agent socket
+      # path changes). The container's bind mounts are baked in at
+      # creation time and cannot be updated — recreate.
+      if ! _settings_overlay_intact "$cname"; then
         info "Recreating container ${DIM}(host paths changed)"
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
@@ -2273,11 +2302,12 @@ cmd_resume() {
   # Start container if stopped
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      # Detect stale mounts (e.g., after host reboot clears /tmp and
-      # rotates the SSH agent socket path).  Can't docker-start with
-      # broken bind sources — tell user to recreate.
-      if [[ ! -d "$settings_overlay_dir" ]]; then
-        error "Container mounts are stale ${DIM}(host was rebooted)${RESET}."
+      # Detect stale mounts (e.g., after host reboot clears /tmp, after
+      # macOS rotates individual /tmp files, or after the SSH agent socket
+      # path changes).  Can't docker-start with broken bind sources — tell
+      # user to recreate.
+      if ! _settings_overlay_intact "$cname"; then
+        error "Container mounts are stale ${DIM}(host paths changed)${RESET}."
         error "Run ${BOLD}cleat${RESET} to recreate the container."
         exit 1
       fi

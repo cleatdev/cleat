@@ -436,6 +436,19 @@ s|echo -en "  Recreate|echo -n "  Recreate|
 SED
 try "v0.12.1_drift_prompt_ansi" "drift recreate prompt interprets ANSI escapes"
 
+# v0.12.3 — _settings_overlay_intact must also verify that each bind source
+# inside the overlay dir is a regular file, not just that the dir exists.
+# Mutate the per-file check out of the helper so it falls back to the old
+# dir-only behavior. With the per-file guard removed, cmd_start no longer
+# auto-recreates on partial rotation — it would fall through to
+# `docker start` and the regression test's recreate assertions would fail.
+cat > "$SED_TMP" << 'SED'
+/^_settings_overlay_intact()/,/^}$/{
+  /\[\[ -f "\$src" \]\] || return 1/d
+}
+SED
+try "v0.12.3_overlay_intact_per_file_check" "cmd_start auto-recreates when overlay dir survives but a file is missing"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

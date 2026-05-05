@@ -54,13 +54,20 @@ jobs:
         run: ./test/mutation_regressions.sh
 
   # ── Full test suite on macOS via /bin/bash (bash 3.2, catches bash 4+ bugs) ─
-  # GitHub's macos-latest ships both /bin/bash (Apple's 3.2.57, unchanged
-  # since 2009 due to the bash 4 GPLv3 switch) and Homebrew bash 5. We run
-  # the suite through /bin/bash explicitly so we're actually testing the
-  # version that real macOS users have as default.
+  # macOS ships both /bin/bash (Apple's 3.2.57, unchanged since 2009 due to the
+  # bash 4 GPLv3 switch) and Homebrew bash 5. We run the suite through /bin/bash
+  # explicitly so we're actually testing the version real macOS users have as
+  # default — bash 3.2 compatibility is a hard project invariant.
+  #
+  # Pinned to macos-15 (not macos-latest) on purpose. GitHub is migrating the
+  # `macos-latest` label to macOS 26 over Jun 15–Jul 15 2026, gradually, so the
+  # `latest` label would run this canary on a mix of OS images during the
+  # rollout. Pinning keeps the bash-3.2 canary deterministic; macos-15 is
+  # supported for ~a year. Revisit (bump to macos-26 or back to latest) once the
+  # migration settles. The 3.2.x assertion below is the backstop either way.
   test-macos-bash32:
     name: test (macos, bash 3.2)
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 20
     defaults:
       run:

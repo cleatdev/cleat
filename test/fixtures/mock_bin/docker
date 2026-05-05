@@ -33,6 +33,12 @@
 #
 # Exit code is controlled by $DOCKER_EXIT_CODE (default 0).
 # Stderr is emitted if $DOCKER_STDERR is set.
+#
+# Per-subcommand exit overrides (for testing specific failure paths):
+#   $DOCKER_TAG_EXIT_CODE     — `docker tag`    (default 0)
+#   $DOCKER_PULL_EXIT_CODE    — `docker pull`   (default 1, no registry in tests)
+#   $DOCKER_RUN_EXIT_CODE     — `docker run`    (default: falls through to 0)
+#   $DOCKER_COMMIT_EXIT_CODE  — `docker commit` (default 0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Record the call (always, for observability)
@@ -209,6 +215,9 @@ case "$1" in
     # Validate bind mounts in strict / virtiofs modes. This must happen
     # BEFORE we emit DOCKER_STDERR / exit so the strict errors take priority.
     _validate_docker_run "$@"
+    # Tests that need a `docker run` to fail (e.g. installer failure in
+    # upgrade-claude) set DOCKER_RUN_EXIT_CODE.
+    [[ -n "${DOCKER_RUN_EXIT_CODE:-}" ]] && exit "$DOCKER_RUN_EXIT_CODE"
     ;;
   image)
     # `docker image inspect <ref>` is the only image subcommand currently
@@ -216,6 +225,11 @@ case "$1" in
     [[ "${2:-}" == "inspect" ]] && _handle_image_inspect "${@:3}"
     ;;
   build|start|stop|rm|exec|logs|rmi|builder)
+    ;;
+  commit)
+    # Tests that need a commit to fail (e.g. upgrade-claude commit failure)
+    # set DOCKER_COMMIT_EXIT_CODE.
+    exit "${DOCKER_COMMIT_EXIT_CODE:-0}"
     ;;
   tag)
     # Tag normally succeeds. Tests that need to simulate a tag failure

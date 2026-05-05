@@ -306,59 +306,6 @@ cleat_bin_timeout() {
   refute_output --partial "unbound variable"
 }
 
-@test "smoke: cleat --cap az --help parses (lazy-install cap)" {
-  # `az` is a lazy-install cap; --help short-circuits before any docker exec
-  # is attempted. This confirms cap registration + flag parsing is clean and
-  # the LAZY_CAPS init doesn't trigger unbound-variable failures under set -u.
-  run cleat_bin --cap az --help
-  assert_success
-  refute_output --partial "unbound variable"
-}
-
-@test "smoke: cleat config --enable az then --list shows az enabled" {
-  # End-to-end round-trip through the cap registry: az must be a known cap,
-  # writable to the global config file, and round-trippable via --list.
-  run cleat_bin config --enable az
-  assert_success
-  refute_output --partial "Unknown capability"
-
-  run cleat_bin config --list
-  assert_success
-  assert_output --partial "az"
-}
-
-@test "smoke: cleat --cap aws --help parses (lazy-install cap)" {
-  run cleat_bin --cap aws --help
-  assert_success
-  refute_output --partial "unbound variable"
-}
-
-@test "smoke: cleat config --enable aws then --list shows aws enabled" {
-  run cleat_bin config --enable aws
-  assert_success
-  refute_output --partial "Unknown capability"
-
-  run cleat_bin config --list
-  assert_success
-  assert_output --partial "aws"
-}
-
-@test "smoke: cleat --cap gcloud --help parses (lazy-install cap)" {
-  run cleat_bin --cap gcloud --help
-  assert_success
-  refute_output --partial "unbound variable"
-}
-
-@test "smoke: cleat config --enable gcloud then --list shows gcloud enabled" {
-  run cleat_bin config --enable gcloud
-  assert_success
-  refute_output --partial "Unknown capability"
-
-  run cleat_bin config --list
-  assert_success
-  assert_output --partial "gcloud"
-}
-
 @test "smoke: cleat --env KEY=VAL --help parses global flags cleanly" {
   run cleat_bin --env "FOO=bar" --help
   assert_success
@@ -630,4 +577,27 @@ EOF
     cat "$DOCKER_CALLS"
     return 1
   }
+}
+
+@test "smoke: cleat upgrade-claude runs installer + commit under strict mode" {
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  run cleat_bin_timeout 10 upgrade-claude latest
+  [ "$status" -eq 0 ]
+  grep -q 'install.sh' "$DOCKER_CALLS" || {
+    echo "installer not invoked"; cat "$DOCKER_CALLS"; return 1
+  }
+  grep -q '^docker commit' "$DOCKER_CALLS" || {
+    echo "commit not invoked"; cat "$DOCKER_CALLS"; return 1
+  }
+}
+
+@test "smoke: cleat upgrade-claude rejects a bogus version under strict mode" {
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  run cleat_bin upgrade-claude not-a-version
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid version"* ]]
 }

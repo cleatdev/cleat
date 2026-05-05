@@ -17,19 +17,10 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 
 # Known capabilities (order matters for display).
-# Three behavioral categories — see _cap_category for the mapping:
+# Two behavioral categories — see _cap_category for the mapping:
 #   mount   git, ssh, env, hooks, gh   auth/identity bind-mounts (no install)
-#   cloud   az, aws, gcloud            cloud CLIs, lazy-installed on first use
 #   sandbox docker                     mounts host docker socket (breaks isolation)
-KNOWN_CAPS=(git ssh env hooks gh docker az aws gcloud)
-
-# Lazy-install caps: tool not in the base image; cleat installs it inside the
-# container the first time the cap is active. Auth dirs still bind-mount from
-# the host so credentials persist across `cleat rm`. Install scripts live in
-# cli/docker/cap-installs/<cap>.sh and ship at /usr/local/lib/cleat/cap-installs/
-# inside the image. Full pattern: concept/10-capabilities.md → "Lazy install".
-LAZY_CAPS=(az aws gcloud)
-_LAZY_INSTALL_DIR="/usr/local/lib/cleat/cap-installs"
+KNOWN_CAPS=(git ssh env hooks gh docker)
 
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
@@ -40,7 +31,6 @@ _CLI_TRUST_PROJECT=0
 
 # Caps display buckets (populated by _caps_bucket_active for _print_caps).
 _CAPS_MOUNT=()
-_CAPS_CLOUD=()
 _CAPS_SANDBOX=()
 
 # ── Colors & Formatting ────────────────────────────────────────────────────
@@ -779,6 +769,22 @@ _image_cleat_version() {
   docker inspect "$IMAGE_NAME" --format '{{index .Config.Labels "sh.cleat.version"}}' 2>/dev/null || echo ""
 }
 
+# Read the Claude Code version bundled in the image. The `claude` launcher is a
+# symlink into ~/.local/share/claude/versions/<v>, so the target's basename is
+# the version. Prints the version string, or nothing if it can't be determined
+# (e.g. layout changed, or no image). Spawns a throwaway container to resolve
+# the symlink as it exists *inside* the image.
+_image_claude_version() {
+  local target v
+  target="$(docker run --rm "$IMAGE_NAME" \
+    bash -c 'readlink -f /home/coder/.local/bin/claude 2>/dev/null' 2>/dev/null)" || true
+  case "$target" in
+    */versions/*) v="${target##*/versions/}"; v="${v%%/*}" ;;
+    *) v="" ;;
+  esac
+  printf '%s' "$v"
+}
+
 # Return success if the container's settings-overlay bind sources are all
 # present and the right type. Return failure when the overlay dir is missing
 # OR when any bind source within it is missing or has the wrong type.
@@ -922,33 +928,29 @@ show_first_run_tip() {
 #
 # Caps display groups active caps by behavior — same UI on the landing page.
 #   mount   green   git, ssh, env, hooks, gh    auth/identity, no install
-#   cloud   blue    az, aws, gcloud             cloud CLIs, lazy install
 #   sandbox amber   docker                      breaks isolation (host socket)
 #
 # When only one category has active caps the line collapses to the legacy
-# single-line form (`Caps:    git, ssh`). With caps in two or more categories
-# the renderer breaks them into a labeled block — the categorization itself
-# teaches the user that docker/cloud caps behave differently.
+# single-line form (`Caps:    git, ssh`). With caps in two categories the
+# renderer breaks them into a labeled block — the categorization itself
+# teaches the user that the docker cap behaves differently.
 
-# Map a single cap name to its display category. Stdout: mount|cloud|sandbox.
+# Map a single cap name to its display category. Stdout: mount|sandbox.
 _cap_category() {
   case "$1" in
-    docker)         echo "sandbox" ;;
-    az|aws|gcloud)  echo "cloud" ;;
-    *)              echo "mount" ;;
+    docker) echo "sandbox" ;;
+    *)      echo "mount" ;;
   esac
 }
 
-# Bucket ACTIVE_CAPS into _CAPS_MOUNT/_CAPS_CLOUD/_CAPS_SANDBOX globals.
+# Bucket ACTIVE_CAPS into _CAPS_MOUNT/_CAPS_SANDBOX globals.
 _caps_bucket_active() {
   _CAPS_MOUNT=()
-  _CAPS_CLOUD=()
   _CAPS_SANDBOX=()
   local cap
   for cap in "${ACTIVE_CAPS[@]+"${ACTIVE_CAPS[@]}"}"; do
     case "$(_cap_category "$cap")" in
       sandbox) _CAPS_SANDBOX+=("$cap") ;;
-      cloud)   _CAPS_CLOUD+=("$cap") ;;
       mount)   _CAPS_MOUNT+=("$cap") ;;
     esac
   done
@@ -968,14 +970,11 @@ _print_caps() {
 
   local cats=0
   [[ ${#_CAPS_MOUNT[@]}   -gt 0 ]] && cats=$((cats + 1))
-  [[ ${#_CAPS_CLOUD[@]}   -gt 0 ]] && cats=$((cats + 1))
   [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]] && cats=$((cats + 1))
 
   if [[ $cats -le 1 ]]; then
     local color s
-    if [[ ${#_CAPS_CLOUD[@]} -gt 0 ]]; then
-      color="$BLUE"; s="$(printf '%s, ' "${_CAPS_CLOUD[@]}")"
-    elif [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
+    if [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
       color="$YELLOW"; s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"
     else
       color="$GREEN"; s="$(printf '%s, ' "${_CAPS_MOUNT[@]}")"
@@ -990,10 +989,6 @@ _print_caps() {
   if [[ ${#_CAPS_MOUNT[@]} -gt 0 ]]; then
     s="$(printf '%s, ' "${_CAPS_MOUNT[@]}")"; s="${s%, }"
     echo -e "${indent}  ${DIM}mount:${RESET}    ${GREEN}${BOLD}${s}${RESET}"
-  fi
-  if [[ ${#_CAPS_CLOUD[@]} -gt 0 ]]; then
-    s="$(printf '%s, ' "${_CAPS_CLOUD[@]}")"; s="${s%, }"
-    echo -e "${indent}  ${DIM}cloud:${RESET}    ${BLUE}${BOLD}${s}${RESET} ${DIM}(lazy install)${RESET}"
   fi
   if [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
     s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"; s="${s%, }"
@@ -1051,71 +1046,6 @@ _env_summary_inline() {
     fi
     echo -e "  ${DIM}Env:${RESET}        ${msg}"
   fi
-}
-
-# ── Lazy-install caps ──────────────────────────────────────────────────────
-# Some caps require tools too large to bake into the base image (e.g. azure-cli
-# ~250 MB). Cleat installs them on first activation, scoped to the container.
-# After `cleat rm` the install is gone; auth dirs (mounted from host) persist.
-# Pattern documented in concept/10-capabilities.md → "Lazy install".
-
-# Display label per lazy cap — used in the install spinner.
-_lazy_cap_label() {
-  case "$1" in
-    az)     echo "Azure CLI" ;;
-    aws)    echo "AWS CLI" ;;
-    gcloud) echo "Google Cloud CLI" ;;
-    *)      echo "$1" ;;
-  esac
-}
-
-# Tool name to probe with `command -v` to decide whether install is needed.
-_lazy_cap_probe() {
-  case "$1" in
-    az)     echo "az" ;;
-    aws)    echo "aws" ;;
-    gcloud) echo "gcloud" ;;
-    *)      echo "" ;;
-  esac
-}
-
-# Returns 0 if the lazy cap's tool is already installed in $cname.
-# Tests can override this function to force the install path.
-_lazy_cap_is_installed() {
-  local cname="$1" cap="$2"
-  local probe
-  probe="$(_lazy_cap_probe "$cap")"
-  [[ -z "$probe" ]] && return 0
-  docker exec --user root "$cname" sh -c "command -v $probe >/dev/null 2>&1" 2>/dev/null
-}
-
-# For each active lazy cap, install the tool if missing. Idempotent —
-# subsequent invocations no-op via the probe check. Aborts cleat on
-# install failure since the user explicitly opted in to the cap.
-_run_lazy_installs() {
-  local cname="$1"
-  local cap label rc
-  for cap in "${LAZY_CAPS[@]+"${LAZY_CAPS[@]}"}"; do
-    cap_is_active "$cap" || continue
-    if _lazy_cap_is_installed "$cname" "$cap"; then
-      continue
-    fi
-    label="$(_lazy_cap_label "$cap")"
-    spin "Installing ${label} (one-time per container, ~30s)..."
-    local _err="/tmp/cleat-cap-${cap}-$$"
-    rc=0
-    docker exec --user root "$cname" \
-      bash "${_LAZY_INSTALL_DIR}/${cap}.sh" > "$_err" 2>&1 || rc=$?
-    if [[ $rc -eq 0 ]]; then
-      spin_stop 0 "${label} installed"
-    else
-      spin_stop "$rc" "" "Failed to install ${label}"
-      [[ -s "$_err" ]] && error "${DIM}$(tail -20 "$_err")${RESET}"
-      rm -f "$_err"
-      exit 1
-    fi
-    rm -f "$_err"
-  done
 }
 
 # ── Clipboard bridge ──────────────────────────────────────────────────────
@@ -1871,6 +1801,156 @@ cmd_rebuild() {
   rm -f "$build_log"
 }
 
+# Upgrade the Claude Code build bundled inside the shared image.
+#
+# Claude Code lives at ~/.local/share/claude/versions/<v> in the image and is
+# NOT host-mounted, so it's frozen at image build/pull time. This re-runs the
+# official installer in a throwaway container from the current image and
+# `docker commit`s the result back, durably baking the new version into
+# $IMAGE_NAME (fast — only the new binary is downloaded).
+#
+# The upgrade is local-only: `cleat rebuild`, `cleat update`, and `cleat nuke`
+# reset $IMAGE_NAME to a fresh release image (which already bundles a current
+# Claude Code) and discard this commit. That's intentional — a CLI release
+# supersedes a manual bump. Re-run this if a release happens to bundle an older
+# Claude Code than you had.
+#
+# Usage: cleat upgrade-claude [stable|latest|VERSION]   (default: latest)
+cmd_upgrade_claude() {
+  local channel="${1:-latest}"
+
+  # Validate strictly. The channel is interpolated into the container's shell
+  # command, so anything but `stable`, `latest`, or a bare semver would be a
+  # command-injection vector (e.g. `2.1.0; rm -rf ~`). The regex admits an
+  # optional prerelease/build suffix (`-rc.1`, `.20240101`) but no shell
+  # metacharacters, whitespace, or slashes.
+  local _semver='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
+  case "$channel" in
+    stable|latest) ;;
+    *)
+      if [[ ! "$channel" =~ $_semver ]]; then
+        error "Invalid version: ${BOLD}${channel}${RESET}."
+        echo -e "    ${DIM}Use ${BOLD}stable${RESET}${DIM}, ${BOLD}latest${RESET}${DIM}, or a version like ${BOLD}2.1.156${RESET}${DIM}.${RESET}"
+        exit 1
+      fi
+      ;;
+  esac
+
+  # Need an image to upgrade — build or pull one first if missing.
+  if ! image_exists; then
+    info "No image yet — preparing one first..."
+    _do_pull || _do_build
+  fi
+  # Defensive: if pull+build still left us without an image, stop here rather
+  # than spawning a container against a non-existent reference.
+  if ! image_exists; then
+    error "No ${BOLD}${IMAGE_NAME}${RESET} image available to upgrade."
+    exit 1
+  fi
+
+  local before old_id
+  before="$(_image_claude_version)"
+  old_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+
+  local tmp="cleat-claude-upgrade"
+  # Self-heal a leftover container from a previously interrupted run.
+  docker rm -f "$tmp" > /dev/null 2>&1 || true
+
+  local log
+  log="$(mktemp 2>/dev/null)" || log="/tmp/cleat-upgrade.$$"
+  : > "$log" 2>/dev/null || true
+
+  # Build the in-container command. Notes on why each piece matters:
+  #   set -euo pipefail  — without pipefail, a failed `curl` feeds empty input
+  #                        to `bash` which exits 0, so a network failure would
+  #                        silently commit an UNCHANGED image. This makes the
+  #                        installer download failure abort the whole run.
+  #   absolute paths     — HOME is always /home/coder in the image; hardcoding
+  #                        avoids any empty-$HOME `rm -rf /...` surprise.
+  #   test -x readlink   — verifies the installer actually produced a runnable
+  #                        claude binary before we commit it. A broken/partial
+  #                        install fails here instead of being baked in.
+  # `$channel` is safe to interpolate — validated above.
+  local install_cmd
+  install_cmd='set -euo pipefail; curl -fsSL https://claude.ai/install.sh | bash -s -- '"$channel"'; rm -rf /home/coder/.claude/downloads; test -x "$(readlink -f /home/coder/.local/bin/claude)"'
+
+  spin "Upgrading Claude Code (${channel})..."
+  local rc=0
+  # The image ENTRYPOINT remaps UID/GID as root then drops to the coder user,
+  # so the installer writes to coder's home exactly as it did at build time.
+  docker run --name "$tmp" "$IMAGE_NAME" bash -c "$install_cmd" > "$log" 2>&1 || rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    # Commit the updated filesystem over the working image. Restore the default
+    # CMD: the throwaway container overrode it with the install command, and
+    # `docker commit` would otherwise bake that in (breaking `cleat run`, which
+    # relies on the image's `["bash"]` CMD to keep the container alive).
+    docker commit --change 'CMD ["bash"]' "$tmp" "$IMAGE_NAME" >> "$log" 2>&1 || rc=$?
+  fi
+  docker rm -f "$tmp" > /dev/null 2>&1 || true
+  spin_stop "$rc" "Claude Code upgraded" "Upgrade failed"
+
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    echo -e "  ${DIM}Upgrade log:${RESET}"
+    tail -20 "$log" 2>/dev/null | sed 's/^/    /'
+    rm -f "$log"
+    exit 1
+  fi
+  rm -f "$log"
+
+  local after
+  after="$(_image_claude_version)"
+  if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
+    info "Claude Code ${DIM}${before}${RESET} → ${BOLD}${after}${RESET}"
+  elif [[ -n "$after" && "$before" == "$after" ]]; then
+    info "Claude Code already at ${BOLD}${after}${RESET} ${DIM}(no change)${RESET}"
+  elif [[ -n "$after" ]]; then
+    info "Claude Code now at ${BOLD}${after}${RESET}"
+  else
+    warn "Upgrade committed, but could not read the installed Claude Code version."
+  fi
+
+  # Drop the now-orphaned pre-commit layer so repeated upgrades don't stack
+  # dangling images. Best-effort and heavily guarded: only when the old id is
+  # truly untagged (a version tag like cleat:vX.Y.Z would keep it) and not
+  # referenced by any container — `docker rmi` refuses both, harmlessly.
+  if [[ -n "$old_id" ]]; then
+    local new_id old_tags
+    new_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+    if [[ "$old_id" != "$new_id" ]]; then
+      old_tags="$(docker image inspect "$old_id" --format '{{len .RepoTags}}' 2>/dev/null || echo 1)"
+      [[ "$old_tags" == "0" ]] && docker rmi "$old_id" > /dev/null 2>&1 || true
+    fi
+  fi
+
+  # Existing containers were created from the old image and still run the old
+  # Claude Code. Recreate the current project's container so the upgrade takes
+  # effect immediately (sessions live on the host and are preserved).
+  local project cname
+  project="$(resolve_project)"
+  cname="$(container_name_for "$project")"
+  if container_exists "$cname"; then
+    if _is_tty; then
+      echo -en "  Recreate ${BOLD}${cname}${RESET} now to use it? [Y/n] "
+      local yn=""
+      read -r yn || yn=""
+      if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+        if is_running "$cname"; then
+          docker stop "$cname" > /dev/null 2>&1 || true
+        fi
+        docker rm -f "$cname" > /dev/null 2>&1 || true
+        rm -rf "/tmp/cleat-hooks-${cname}" "/tmp/cleat-clip-${cname}" "/tmp/cleat-settings-${cname}" 2>/dev/null || true
+        success "Removed ${BOLD}${cname}${RESET}."
+        cmd_run "$project"
+        return
+      fi
+    fi
+    info "Run ${BOLD}cleat rm && cleat${RESET} to use the new Claude Code in ${BOLD}${cname}${RESET}."
+  fi
+  echo -e "  ${DIM}Other projects pick up the new Claude Code next time their container is recreated.${RESET}"
+}
+
 cmd_run() {
   local project
   project="$(resolve_project "${1:-}")"
@@ -2059,31 +2139,6 @@ cmd_run() {
     mount_args+=(-v "${HOME}/.config/gh:/home/coder/.config/gh")
   fi
 
-  # ── az capability: mount Azure CLI config (read-write) so `az login` tokens
-  # persist on the host across `cleat rm`. The CLI itself is lazy-installed in
-  # the container on first use (see _run_lazy_installs); the mount is the auth
-  # boundary, the install is the tool boundary — same separation as gh.
-  if cap_is_active az; then
-    mkdir -p "${HOME}/.azure"
-    mount_args+=(-v "${HOME}/.azure:/home/coder/.azure")
-  fi
-
-  # ── aws capability: mount AWS CLI config (read-write) so `aws configure`
-  # and SSO sessions persist on the host across `cleat rm`. Same pattern as
-  # az: bind-mount = auth boundary, lazy install = tool boundary.
-  if cap_is_active aws; then
-    mkdir -p "${HOME}/.aws"
-    mount_args+=(-v "${HOME}/.aws:/home/coder/.aws")
-  fi
-
-  # ── gcloud capability: mount Google Cloud SDK config (read-write) so
-  # `gcloud auth login` credentials persist on the host across `cleat rm`.
-  # Same pattern as az/aws.
-  if cap_is_active gcloud; then
-    mkdir -p "${HOME}/.config/gcloud"
-    mount_args+=(-v "${HOME}/.config/gcloud:/home/coder/.config/gcloud")
-  fi
-
   # ── docker capability: mount the host Docker socket so the container can
   # build, run, and manage Docker workloads against the host daemon. Also
   # bind-mount the project at its HOST path (in addition to /workspace) and
@@ -2230,8 +2285,6 @@ cmd_start() {
     check_drift "$cname" "$project"
   fi
 
-  _run_lazy_installs "$cname"
-
   success "Claude launched"
   _print_summary_block "$cname" "$project"
   echo ""
@@ -2341,8 +2394,6 @@ cmd_resume() {
 
   # Drift detection
   check_drift "$cname" "$project"
-
-  _run_lazy_installs "$cname"
 
   success "Session resumed"
   _print_summary_block "$cname" "$project"
@@ -2496,8 +2547,6 @@ cmd_claude() {
   fi
 
   check_for_update
-
-  _run_lazy_installs "$cname"
 
   success "Claude launched"
   _print_summary_block "$cname" "$project"
@@ -2706,9 +2755,6 @@ _cap_description() {
     hooks)  echo "Run your Claude Code hooks on the host (global + project)" ;;
     gh)     echo "GitHub CLI auth (persists across rm/nuke/rebuild)" ;;
     docker) echo "Host Docker socket (breaks sandbox) to test Docker apps" ;;
-    az)     echo "Azure CLI auth (lazy install ~250 MB on first use; auth persists)" ;;
-    aws)    echo "AWS CLI auth (lazy install ~150 MB on first use; auth persists)" ;;
-    gcloud) echo "Google Cloud CLI auth (lazy install ~200 MB on first use; auth persists)" ;;
     *)      echo "(unknown capability)" ;;
   esac
 }
@@ -3236,6 +3282,7 @@ cmd_help() {
   echo -e "  ${BOLD}LIFECYCLE${RESET}"
   echo -e "    ${GREEN}build${RESET}              Build the Docker image (shared across projects)"
   echo -e "    ${GREEN}rebuild${RESET}            Force rebuild the image from scratch"
+  echo -e "    ${GREEN}upgrade-claude${RESET}     Update bundled Claude Code in the image ${DIM}[stable|latest|VERSION]${RESET}"
   echo -e "    ${GREEN}run${RESET}     ${DIM}[path]${RESET}     Start a container for this project"
   echo -e "    ${GREEN}stop${RESET}    ${DIM}[path]${RESET}     Stop container (keeps it for resume)"
   echo -e "    ${GREEN}rm${RESET}      ${DIM}[path]${RESET}     Stop + remove container permanently"
@@ -3356,6 +3403,7 @@ main() {
     resume|r)  cmd_resume "$@" ;;
     build)     cmd_build "$@" ;;
     rebuild)   cmd_rebuild "$@" ;;
+    upgrade-claude) cmd_upgrade_claude "$@" ;;
     run)       cmd_run "$@" ;;
     stop)      cmd_stop "$@" ;;
     rm)        cmd_rm "$@" ;;

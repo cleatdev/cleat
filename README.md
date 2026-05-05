@@ -83,7 +83,7 @@ Cleat gives you the best of both worlds:
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
 - **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq, and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), host Docker daemon for testing dockerized apps (`--cap docker`), and cloud CLI auth via lazy install for Azure (`--cap az`), AWS (`--cap aws`), and Google Cloud (`--cap gcloud`); all disabled by default
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), and host Docker daemon for testing dockerized apps (`--cap docker`); all disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
@@ -138,7 +138,15 @@ Releases are published as git tags (e.g. `v0.1.0`). The updater fetches tags and
 cleat update
 ```
 
-To also update Claude Code inside the container:
+To update just the Claude Code build bundled in the image — without a full rebuild:
+
+```bash
+cleat upgrade-claude            # latest (default)
+cleat upgrade-claude stable     # stable channel
+cleat upgrade-claude 2.1.156    # pin a version
+```
+
+This re-runs the official installer in the image and commits it back, then offers to recreate the current project's container so the new version takes effect immediately. The change is local-only — `cleat rebuild`/`update`/`nuke` reset the image to a fresh release build (which already bundles a current Claude Code). To rebuild the whole image from scratch instead:
 
 ```bash
 cleat rebuild
@@ -245,6 +253,7 @@ cleat ps
 | `cleat stop-all` | Stop all Cleat containers |
 | `cleat build` | Build the Docker image |
 | `cleat rebuild` | Force rebuild the image from scratch |
+| `cleat upgrade-claude [stable\|latest\|VERSION]` | Update the bundled Claude Code in place (default `latest`); offers to recreate the current container |
 | `cleat clean` | Stop everything and remove the image |
 | `cleat nuke` | Remove **all** containers, images, and build cache |
 
@@ -380,27 +389,17 @@ cleat --cap ssh start
 | `hooks` | mount | Runs your Claude Code hooks on the host (global and project-level). |
 | `gh` | mount | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
 | `docker` | sandbox | Mounts `/var/run/docker.sock`. `docker`, `docker compose`, and anything that talks to the daemon run against your host — sibling containers, zero overhead. **Sandbox-escaping — see security note below.** |
-| `az` | cloud | Mounts `~/.azure` (read-write). The `az` CLI itself is **lazy-installed** inside the container on first cap activation (~250 MB, ~30s); subsequent starts are instant. Auth (`az login` tokens) persists on the host. See [Lazy install caps](#lazy-install-caps) below. |
-| `aws` | cloud | Mounts `~/.aws` (read-write). AWS CLI v2 is **lazy-installed** inside the container on first cap activation (~150 MB, ~20s). Auth (`aws configure` and SSO sessions) persists on the host. |
-| `gcloud` | cloud | Mounts `~/.config/gcloud` (read-write). The Google Cloud SDK is **lazy-installed** inside the container on first cap activation (~200 MB, ~25s). Auth (`gcloud auth login` credentials) persists on the host. |
+
+> Cloud CLI caps (`az`, `aws`, `gcloud`) and the lazy-install framework that backed them shipped in v0.11.0 / v0.12.0 and were removed after v0.12.3 — they bloated first-run time without earning their weight. Install the CLI on the host and pass credentials via the `env` cap.
 
 ### Display categories
 
 The post-launch summary and `cleat status` group active caps by behavior:
 
 - **mount** (green): `git`, `ssh`, `env`, `hooks`, `gh` — bind-mount auth/identity, no install.
-- **cloud** (blue): `az`, `aws`, `gcloud` — bind-mount auth dir, lazy-install the binary.
 - **sandbox** (amber): `docker` — mounts the host socket, breaks isolation.
 
-When only one category is active the line collapses to a single coloured row. With caps in two or more categories, the renderer prints a labeled block — same UI on the landing page mockups so the CLI and the marketing copy stay in lockstep.
-
-### Lazy install caps
-
-Most caps are mount-only — the tool already lives in the cleat image. **Lazy install caps** install a tool inside the container the first time the cap is active, used for tools too large to ship by default. `az`, `aws`, and `gcloud` are lazy-install.
-
-How it works: cleat probes the container with `command -v <tool>`. If absent, it runs the install script with a spinner; if present, it skips. Subsequent `cleat resume` calls hit the fast path. The install lives inside the container — `cleat rm` removes it — but the auth dir bind-mounted from the host (`~/.azure`, `~/.aws`, `~/.config/gcloud`, `~/.config/gh`) survives every container lifecycle operation, so credentials are never lost.
-
-Full design and instructions for adding a new lazy cap: [`concept/10-capabilities.md`](../concept/10-capabilities.md#lazy-install-capabilities).
+When only one category is active the line collapses to a single coloured row. With caps in both categories, the renderer prints a labeled block — same UI on the landing page mockups so the CLI and the marketing copy stay in lockstep.
 
 ### Workspace trust — project `.cleat` approval
 

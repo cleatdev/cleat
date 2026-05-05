@@ -341,344 +341,6 @@ EOF
   assert_success
 }
 
-# ── az capability: docker run mounts + lazy install ─────────────────────────
-#
-# `az` is the first lazy-install cap. The mount block (~/.azure → container)
-# behaves like `gh`: read-write so `az login` writes tokens back to the host,
-# auto-creating the dir if missing. The install of the `az` binary itself is
-# triggered by _run_lazy_installs, NOT by cmd_run — see the dedicated tests.
-
-@test "az cap: mounts ~/.azure read-write when enabled" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
-[caps]
-az
-EOF
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  # Read-write so `az login` can write tokens back to host
-  run assert_docker_run_has "$cname" ".azure:/home/coder/.azure"
-  assert_success
-  # Must NOT have :ro flag
-  run assert_docker_run_lacks "$cname" ".azure:/home/coder/.azure:ro"
-  assert_success
-}
-
-@test "az cap: creates ~/.azure if missing" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  rm -rf "$HOME/.azure"
-
-  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
-[caps]
-az
-EOF
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  [[ -d "$HOME/.azure" ]] || {
-    echo "~/.azure was not created"
-    return 1
-  }
-  run assert_docker_run_has "$cname" ".azure:/home/coder/.azure"
-  assert_success
-}
-
-@test "no az cap: does not mount azure config" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  mkdir -p "$HOME/.azure"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  run assert_docker_run_lacks "$cname" ".azure:/home/coder/.azure"
-  assert_success
-}
-
-@test "az cap: registered as a lazy-install cap" {
-  # az is the first lazy-install cap. Future caps are added by listing them
-  # in LAZY_CAPS — that's the framework registry. This test guards the
-  # registration so a refactor that drops az can't pass tests.
-  local found=0 cap
-  for cap in "${LAZY_CAPS[@]}"; do
-    [[ "$cap" == "az" ]] && found=1
-  done
-  [[ "$found" -eq 1 ]] || {
-    echo "expected 'az' in LAZY_CAPS=(${LAZY_CAPS[*]})"
-    return 1
-  }
-}
-
-@test "az cap: description mentions lazy install" {
-  # Picker description must surface the lazy-install behavior so users
-  # know first activation is slow and roughly how big the download is.
-  run _cap_description az
-  assert_success
-  assert_output --partial "lazy install"
-}
-
-@test "_run_lazy_installs: invokes install script when probe reports missing" {
-  # Force the probe to return non-zero (tool absent) — the install script
-  # must then be executed via docker exec --user root inside the container.
-  _lazy_cap_is_installed() { return 1; }
-  ACTIVE_CAPS=(az)
-
-  # spin/spin_stop touch the terminal — silence them in tests.
-  spin() { :; }
-  spin_stop() { :; }
-
-  run _run_lazy_installs "test-cname"
-  assert_success
-  grep -qE 'exec.*test-cname.*cap-installs/az\.sh' "$DOCKER_CALLS" || {
-    echo "expected docker exec for cap-installs/az.sh; got:"
-    cat "$DOCKER_CALLS"
-    return 1
-  }
-}
-
-@test "_run_lazy_installs: skips install when probe reports installed" {
-  _lazy_cap_is_installed() { return 0; }
-  ACTIVE_CAPS=(az)
-
-  spin() { :; }
-  spin_stop() { :; }
-
-  run _run_lazy_installs "test-cname"
-  assert_success
-  if grep -qE 'exec.*test-cname.*cap-installs/az\.sh' "$DOCKER_CALLS"; then
-    echo "install ran when probe reported tool already installed:"
-    cat "$DOCKER_CALLS"
-    return 1
-  fi
-}
-
-@test "_run_lazy_installs: no-op when az cap is not active" {
-  _lazy_cap_is_installed() { return 1; }  # would install if invoked
-  ACTIVE_CAPS=()
-
-  spin() { :; }
-  spin_stop() { :; }
-
-  run _run_lazy_installs "test-cname"
-  assert_success
-  if grep -qE 'cap-installs/az\.sh' "$DOCKER_CALLS"; then
-    echo "lazy install ran without az cap active"
-    cat "$DOCKER_CALLS"
-    return 1
-  fi
-}
-
-@test "_run_lazy_installs: aborts cleat when install script fails" {
-  # The user opted in to the cap; if the install fails we shouldn't silently
-  # launch claude with a half-broken environment. Force the probe to report
-  # missing, then make docker exec fail — _run_lazy_installs must propagate.
-  _lazy_cap_is_installed() { return 1; }
-  ACTIVE_CAPS=(az)
-  spin() { :; }
-  spin_stop() { :; }
-  export DOCKER_EXIT_CODE=1
-
-  run _run_lazy_installs "test-cname"
-  assert_failure
-  unset DOCKER_EXIT_CODE
-}
-
-# ── aws capability: docker run mounts + lazy install ────────────────────────
-#
-# Same lazy-install pattern as `az`: ~/.aws is bind-mounted read-write so
-# `aws configure` / SSO sessions persist on the host across `cleat rm`,
-# while the binary is installed inside the container on first activation.
-
-@test "aws cap: mounts ~/.aws read-write when enabled" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
-[caps]
-aws
-EOF
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  run assert_docker_run_has "$cname" ".aws:/home/coder/.aws"
-  assert_success
-  run assert_docker_run_lacks "$cname" ".aws:/home/coder/.aws:ro"
-  assert_success
-}
-
-@test "aws cap: creates ~/.aws if missing" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  rm -rf "$HOME/.aws"
-
-  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
-[caps]
-aws
-EOF
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  [[ -d "$HOME/.aws" ]] || {
-    echo "~/.aws was not created"
-    return 1
-  }
-  run assert_docker_run_has "$cname" ".aws:/home/coder/.aws"
-  assert_success
-}
-
-@test "no aws cap: does not mount aws config" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  mkdir -p "$HOME/.aws"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  run assert_docker_run_lacks "$cname" ".aws:/home/coder/.aws"
-  assert_success
-}
-
-@test "aws cap: registered as a lazy-install cap" {
-  local found=0 cap
-  for cap in "${LAZY_CAPS[@]}"; do
-    [[ "$cap" == "aws" ]] && found=1
-  done
-  [[ "$found" -eq 1 ]] || {
-    echo "expected 'aws' in LAZY_CAPS=(${LAZY_CAPS[*]})"
-    return 1
-  }
-}
-
-@test "aws cap: description mentions lazy install" {
-  run _cap_description aws
-  assert_success
-  assert_output --partial "lazy install"
-}
-
-@test "_run_lazy_installs: invokes install script for aws when probe reports missing" {
-  _lazy_cap_is_installed() { return 1; }
-  ACTIVE_CAPS=(aws)
-  spin() { :; }
-  spin_stop() { :; }
-
-  run _run_lazy_installs "test-cname"
-  assert_success
-  grep -qE 'exec.*test-cname.*cap-installs/aws\.sh' "$DOCKER_CALLS" || {
-    echo "expected docker exec for cap-installs/aws.sh; got:"
-    cat "$DOCKER_CALLS"
-    return 1
-  }
-}
-
-# ── gcloud capability: docker run mounts + lazy install ─────────────────────
-#
-# Same lazy-install pattern as `az`/`aws`: ~/.config/gcloud is bind-mounted
-# read-write so `gcloud auth login` credentials persist across `cleat rm`,
-# while the SDK is installed inside the container on first activation.
-
-@test "gcloud cap: mounts ~/.config/gcloud read-write when enabled" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
-[caps]
-gcloud
-EOF
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  run assert_docker_run_has "$cname" ".config/gcloud:/home/coder/.config/gcloud"
-  assert_success
-  run assert_docker_run_lacks "$cname" ".config/gcloud:/home/coder/.config/gcloud:ro"
-  assert_success
-}
-
-@test "gcloud cap: creates ~/.config/gcloud if missing" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  rm -rf "$HOME/.config/gcloud"
-
-  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
-[caps]
-gcloud
-EOF
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  [[ -d "$HOME/.config/gcloud" ]] || {
-    echo "~/.config/gcloud was not created"
-    return 1
-  }
-  run assert_docker_run_has "$cname" ".config/gcloud:/home/coder/.config/gcloud"
-  assert_success
-}
-
-@test "no gcloud cap: does not mount gcloud config" {
-  mock_docker_images "cleat"
-  mkdir -p "$TEST_TEMP/project"
-  mkdir -p "$HOME/.config/gcloud"
-  local cname
-  cname="$(container_name_for "$TEST_TEMP/project")"
-
-  run cmd_run "$TEST_TEMP/project"
-  assert_success
-  run assert_docker_run_lacks "$cname" ".config/gcloud:/home/coder/.config/gcloud"
-  assert_success
-}
-
-@test "gcloud cap: registered as a lazy-install cap" {
-  local found=0 cap
-  for cap in "${LAZY_CAPS[@]}"; do
-    [[ "$cap" == "gcloud" ]] && found=1
-  done
-  [[ "$found" -eq 1 ]] || {
-    echo "expected 'gcloud' in LAZY_CAPS=(${LAZY_CAPS[*]})"
-    return 1
-  }
-}
-
-@test "gcloud cap: description mentions lazy install" {
-  run _cap_description gcloud
-  assert_success
-  assert_output --partial "lazy install"
-}
-
-@test "_run_lazy_installs: invokes install script for gcloud when probe reports missing" {
-  _lazy_cap_is_installed() { return 1; }
-  ACTIVE_CAPS=(gcloud)
-  spin() { :; }
-  spin_stop() { :; }
-
-  run _run_lazy_installs "test-cname"
-  assert_success
-  grep -qE 'exec.*test-cname.*cap-installs/gcloud\.sh' "$DOCKER_CALLS" || {
-    echo "expected docker exec for cap-installs/gcloud.sh; got:"
-    cat "$DOCKER_CALLS"
-    return 1
-  }
-}
-
 # ── docker capability: docker run mounts ──────────────────────────────────
 #
 # Design rationale: concept/15-docker-capability.md. Opt-in only. When active,
@@ -1240,13 +902,13 @@ EOF
   refute_output --partial "rm -f cleat-foo"
 }
 
-# ── Caps categorization (mount / cloud / sandbox) ──────────────────────────
+# ── Caps categorization (mount / sandbox) ──────────────────────────────────
 #
 # Active caps display groups by behavior — same UI on the landing page.
 # These tests pin the category mapping and the renderer's behavior so a
 # refactor that drops a cap from its category, or breaks the multi-line
 # layout, fails loudly. The visual is part of the brand: it teaches users
-# that docker is sandbox-breaking and cloud caps lazy-install.
+# that the docker cap is sandbox-breaking.
 
 @test "_cap_category: mount caps are mount" {
   local cap
@@ -1257,15 +919,6 @@ EOF
   done
 }
 
-@test "_cap_category: cloud caps are cloud" {
-  local cap
-  for cap in az aws gcloud; do
-    run _cap_category "$cap"
-    assert_success
-    assert_output "cloud"
-  done
-}
-
 @test "_cap_category: docker is sandbox" {
   run _cap_category docker
   assert_success
@@ -1273,11 +926,10 @@ EOF
 }
 
 @test "_caps_bucket_active: splits ACTIVE_CAPS by category" {
-  ACTIVE_CAPS=(git az docker aws ssh gcloud)
+  ACTIVE_CAPS=(git docker ssh)
   _caps_bucket_active
-  [[ "${_CAPS_MOUNT[*]}"   == "git ssh" ]]            || { echo "mount: ${_CAPS_MOUNT[*]}"; return 1; }
-  [[ "${_CAPS_CLOUD[*]}"   == "az aws gcloud" ]]      || { echo "cloud: ${_CAPS_CLOUD[*]}"; return 1; }
-  [[ "${_CAPS_SANDBOX[*]}" == "docker" ]]             || { echo "sandbox: ${_CAPS_SANDBOX[*]}"; return 1; }
+  [[ "${_CAPS_MOUNT[*]}"   == "git ssh" ]] || { echo "mount: ${_CAPS_MOUNT[*]}"; return 1; }
+  [[ "${_CAPS_SANDBOX[*]}" == "docker" ]]  || { echo "sandbox: ${_CAPS_SANDBOX[*]}"; return 1; }
 }
 
 @test "_print_caps: silent when ACTIVE_CAPS is empty" {
@@ -1293,16 +945,7 @@ EOF
   assert_output --partial "Caps:"
   assert_output --partial "git, ssh, env, hooks"
   refute_output --partial "mount:"
-  refute_output --partial "cloud:"
   refute_output --partial "sandbox:"
-}
-
-@test "_print_caps: single-line form when only cloud caps" {
-  ACTIVE_CAPS=(az aws)
-  run _print_caps
-  assert_output --partial "Caps:"
-  assert_output --partial "az, aws"
-  refute_output --partial "cloud:"
 }
 
 @test "_print_caps: single-line form when only docker (sandbox)" {
@@ -1313,33 +956,13 @@ EOF
   refute_output --partial "sandbox:"
 }
 
-@test "_print_caps: multi-line block when two or more categories active" {
-  ACTIVE_CAPS=(git az docker)
+@test "_print_caps: multi-line block when both categories active" {
+  ACTIVE_CAPS=(git docker)
   run _print_caps
   assert_output --partial "Caps:"
   assert_output --partial "mount:"
-  assert_output --partial "cloud:"
   assert_output --partial "sandbox:"
-  assert_output --partial "(lazy install)"
   assert_output --partial "(breaks isolation)"
-}
-
-@test "_print_caps: multi-line omits categories with no active caps" {
-  # Only mount + cloud here — sandbox row must NOT appear.
-  ACTIVE_CAPS=(git aws)
-  run _print_caps
-  assert_output --partial "mount:"
-  assert_output --partial "cloud:"
-  refute_output --partial "sandbox:"
-  refute_output --partial "(breaks isolation)"
-}
-
-@test "_print_caps: groups all three cloud caps under one cloud line" {
-  ACTIVE_CAPS=(git az aws gcloud)
-  run _print_caps
-  assert_output --partial "az, aws, gcloud"
-  # Cloud caps on a single line under 'cloud:', not interleaved with mount caps.
-  assert_output --partial "cloud:"
 }
 
 @test "_print_summary_block: renders categorized caps when categories span" {

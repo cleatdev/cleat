@@ -25,6 +25,7 @@ CLI="$REPO_ROOT/bin/cleat"
 INSTALLER="$REPO_ROOT/install.sh"
 BATS="$REPO_ROOT/test/bats/bin/bats"
 REGRESSIONS="$REPO_ROOT/test/unit/regressions.bats"
+UPGRADE_BATS="$REPO_ROOT/test/unit/upgrade_claude.bats"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
 INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
 
@@ -50,7 +51,7 @@ filter="${1:-}"
 # Target file defaults to $CLI; pass $INSTALLER (or any other path) to mutate
 # a companion script. Returns 0 if mutation caught, 1 if missed, 2 if skipped.
 run_mutation() {
-  local name="$1" test_filter="$2" sed_file="$3" target="${4:-$CLI}" backup
+  local name="$1" test_filter="$2" sed_file="$3" target="${4:-$CLI}" test_file="${5:-$REGRESSIONS}" backup
   if [[ "$target" == "$INSTALLER" ]]; then
     backup="$INSTALLER_BACKUP"
   else
@@ -82,7 +83,7 @@ run_mutation() {
   fi
 
   # Run only the target test; expect it to FAIL
-  if "$BATS" --filter "$test_filter" "$REGRESSIONS" >/dev/null 2>&1; then
+  if "$BATS" --filter "$test_filter" "$test_file" >/dev/null 2>&1; then
     echo "${RED}✖ $name: MISSED${RESET} ${DIM}(test passed against mutated code)${RESET}"
     return 1
   else
@@ -105,13 +106,13 @@ skipped=0
 declare -a missed_names=()
 
 try() {
-  local name="$1" test_filter="$2" target="${3:-$CLI}"
+  local name="$1" test_filter="$2" target="${3:-$CLI}" test_file="${4:-$REGRESSIONS}"
   if [[ -n "$filter" && "$name" != *"$filter"* ]]; then
     return
   fi
   total=$((total + 1))
   local rc=0
-  run_mutation "$name" "$test_filter" "$SED_TMP" "$target" || rc=$?
+  run_mutation "$name" "$test_filter" "$SED_TMP" "$target" "$test_file" || rc=$?
   case "$rc" in
     0) caught=$((caught + 1)) ;;
     1) missed=$((missed + 1)); missed_names+=("$name → $test_filter") ;;
@@ -306,9 +307,8 @@ SED
 try "v0.9.2_cli_spin_stop_line_clear" "bin/cleat spin_stop clears line before writing"
 
 # v0.10.0 — docker must be in KNOWN_CAPS. Remove it, guard test should fail.
-# Pattern updated when cloud caps (az, aws, gcloud) joined the array.
 cat > "$SED_TMP" << 'SED'
-s|^KNOWN_CAPS=(git ssh env hooks gh docker az aws gcloud)$|KNOWN_CAPS=(git ssh env hooks gh az aws gcloud)|
+s|^KNOWN_CAPS=(git ssh env hooks gh docker)$|KNOWN_CAPS=(git ssh env hooks gh)|
 SED
 try "v0.10.0_docker_in_known_caps" "docker listed in KNOWN_CAPS"
 
@@ -448,6 +448,34 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v0.12.3_overlay_intact_per_file_check" "cmd_start auto-recreates when overlay dir survives but a file is missing"
+
+# ── upgrade-claude hardening (tested against upgrade_claude.bats) ────────────
+
+# Channel validation must reject anything but stable/latest/semver. Neuter the
+# regex guard so a shell-injection channel would slip through — the rejection
+# test must then fail.
+cat > "$SED_TMP" << 'SED'
+s|if \[\[ ! "\$channel" =~ \$_semver \]\]; then|if false; then|
+SED
+try "upgrade_claude_channel_validation" "rejects a shell-injection channel without running anything" "$CLI" "$UPGRADE_BATS"
+
+# The in-container install must run under pipefail, or a failed `curl` feeds
+# empty input to bash (exit 0) and an unchanged image gets committed. Strip
+# the `set -euo pipefail;` prefix and the guard test must fail.
+cat > "$SED_TMP" << 'SED'
+s|set -euo pipefail; ||
+SED
+# Filter is a regex matched against the test name — keep it free of the name's
+# literal parentheses, which would otherwise be interpreted as a regex group
+# and fail to match (selecting zero tests, which bats reports as success).
+try "upgrade_claude_install_pipefail" "install command enables pipefail" "$CLI" "$UPGRADE_BATS"
+
+# The commit must restore CMD ["bash"]; without it the committed image would
+# re-run the installer instead of staying alive. Drop the --change flag.
+cat > "$SED_TMP" << 'SED'
+s|--change 'CMD \["bash"\]' ||
+SED
+try "upgrade_claude_commit_cmd_restore" "commits the result back over the working image" "$CLI" "$UPGRADE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

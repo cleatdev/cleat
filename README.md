@@ -146,7 +146,11 @@ cleat upgrade-claude stable     # stable channel
 cleat upgrade-claude 2.1.156    # pin a version
 ```
 
-This re-runs the official installer in the image and commits it back, then offers to recreate the current project's container so the new version takes effect immediately. The change is local-only — `cleat rebuild`/`update`/`nuke` reset the image to a fresh release build (which already bundles a current Claude Code). To rebuild the whole image from scratch instead:
+This re-runs the official installer in the image and commits it back, then offers to recreate the current project's container so the new version takes effect immediately. The change is local-only — `cleat rebuild`/`update`/`nuke` reset the image to a fresh release build (which already bundles a current Claude Code).
+
+You don't have to remember to run it: when you start `cleat` interactively, it checks (at most once every 10 minutes) whether a newer Claude Code is out and offers to upgrade before starting. The check is skipped for non-interactive runs, never blocks on a slow network, defaults to the `latest` channel (`CLEAT_CLAUDE_CHANNEL=stable` to change it), and can be turned off with `CLEAT_NO_CLAUDE_UPDATE_CHECK=1`.
+
+To rebuild the whole image from scratch instead:
 
 ```bash
 cleat rebuild

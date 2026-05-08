@@ -28,6 +28,18 @@ chown -R "$HOST_UID:$HOST_GID" /home/coder/.claude 2>/dev/null || true
 chown "$HOST_UID:$HOST_GID" /home/coder/.claude.json 2>/dev/null || true
 chown "$HOST_UID:$HOST_GID" /workspace 2>/dev/null || true
 
+# Claude Code's binary store lives in ~/.local (the launcher symlink in
+# ~/.local/bin and the versioned binaries in ~/.local/share/claude). It is
+# baked at build time owned by the build UID and is NOT host-mounted. Without
+# this chown, after the UID remap above the runtime user can't write it, so
+# `claude update` and the on-launch auto-updater fail with EACCES (and
+# `claude doctor` reports a broken install). Chown it so the native update
+# path works. NB: ~/.local is in the container's writable layer, so updates
+# made this way are ephemeral — they revert on `cleat rm`/recreate. The
+# durable path is `cleat upgrade-claude` / the on-start update prompt, which
+# commit the new version into the image.
+chown -R "$HOST_UID:$HOST_GID" /home/coder/.local 2>/dev/null || true
+
 # Docker capability: when /var/run/docker.sock is mounted (docker cap active),
 # the socket is group-owned by the host's docker GID (typically 999 on Linux).
 # The coder user's GID has been remapped to HOST_GID, which generally isn't

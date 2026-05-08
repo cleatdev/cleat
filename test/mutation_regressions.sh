@@ -26,8 +26,12 @@ INSTALLER="$REPO_ROOT/install.sh"
 BATS="$REPO_ROOT/test/bats/bin/bats"
 REGRESSIONS="$REPO_ROOT/test/unit/regressions.bats"
 UPGRADE_BATS="$REPO_ROOT/test/unit/upgrade_claude.bats"
+CLAUDE_BATS="$REPO_ROOT/test/unit/claude_update_check.bats"
+ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
+ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
 INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
+ENTRYPOINT_BACKUP="/tmp/cleat-regression-mutation-entrypoint-backup-$$"
 
 BOLD=$'\033[1m'
 RED=$'\033[0;31m'
@@ -39,12 +43,14 @@ RESET=$'\033[0m'
 cleanup() {
   [[ -f "$BACKUP" ]] && cp "$BACKUP" "$CLI"
   [[ -f "$INSTALLER_BACKUP" ]] && cp "$INSTALLER_BACKUP" "$INSTALLER"
-  rm -f "$BACKUP" "$INSTALLER_BACKUP"
+  [[ -f "$ENTRYPOINT_BACKUP" ]] && cp "$ENTRYPOINT_BACKUP" "$ENTRYPOINT"
+  rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP"
 }
 trap cleanup EXIT INT TERM
 
 cp "$CLI" "$BACKUP"
 cp "$INSTALLER" "$INSTALLER_BACKUP"
+cp "$ENTRYPOINT" "$ENTRYPOINT_BACKUP"
 filter="${1:-}"
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
@@ -54,6 +60,8 @@ run_mutation() {
   local name="$1" test_filter="$2" sed_file="$3" target="${4:-$CLI}" test_file="${5:-$REGRESSIONS}" backup
   if [[ "$target" == "$INSTALLER" ]]; then
     backup="$INSTALLER_BACKUP"
+  elif [[ "$target" == "$ENTRYPOINT" ]]; then
+    backup="$ENTRYPOINT_BACKUP"
   else
     backup="$BACKUP"
   fi
@@ -476,6 +484,46 @@ cat > "$SED_TMP" << 'SED'
 s|--change 'CMD \["bash"\]' ||
 SED
 try "upgrade_claude_commit_cmd_restore" "commits the result back over the working image" "$CLI" "$UPGRADE_BATS"
+
+# ── Claude auto-update permission fix (entrypoint.sh) ────────────────────────
+
+# The entrypoint must chown ~/.local after the UID remap, or the runtime user
+# can't write the Claude Code binary store and `claude update` fails with
+# EACCES. Delete the chown line; the entrypoint regression test must then fail.
+cat > "$SED_TMP" << 'SED'
+/chown -R "\$HOST_UID:\$HOST_GID" \/home\/coder\/\.local/d
+SED
+try "claude_update_local_chown" "chowns ~/.local" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# ── On-start Claude update check (bin/cleat, tested vs claude_update_check) ───
+
+# The prompt must fire only when the remote version is strictly newer. Neuter
+# the "already current" short-circuit so it would nag even when the image
+# already runs the remote version — the equal-version test must then fail.
+# Use `#` as the sed delimiter — the pattern contains `||`, which would
+# otherwise be read as the `s|...|` delimiter and break the expression.
+cat > "$SED_TMP" << 'SED'
+s#\[\[ "\$remote" != "\$local_v" \]\] || return 0#[[ "$remote" != "$local_v" ]] || true#
+SED
+try "claude_check_strictly_newer" "no prompt when the image already runs the remote version" "$CLI" "$CLAUDE_BATS"
+
+# CLEAT_CLAUDE_CHANNEL is user-controlled and is interpolated into a URL and
+# the in-container shell command, so a non-stable/latest/semver value must be
+# replaced with the safe default. Drop the fallback so a malicious channel
+# would pass through — the injection-guard test must then fail.
+# `#` delimiter again — the pattern contains `||`.
+cat > "$SED_TMP" << 'SED'
+s#\[\[ "\$channel" =~ \$_semver \]\] || channel="latest"#:#
+SED
+try "claude_check_channel_injection" "malicious CLEAT_CLAUDE_CHANNEL falls back to latest" "$CLI" "$CLAUDE_BATS"
+
+# The check must never run in a non-interactive context (it would block scripts
+# on a prompt). Remove the TTY guard; the "silent when non-interactive" test
+# must then fail.
+cat > "$SED_TMP" << 'SED'
+/^  _is_tty || return 0$/d
+SED
+try "claude_check_tty_only" "silent when non-interactive" "$CLI" "$CLAUDE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

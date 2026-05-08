@@ -601,3 +601,26 @@ EOF
   [ "$status" -eq 1 ]
   [[ "$output" == *"Invalid version"* ]]
 }
+
+@test "smoke: on-start update check never blocks a non-interactive start" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  # Force the check and pretend a much newer Claude Code exists. A
+  # non-interactive run (smoke output is piped, so not a TTY) must skip the
+  # prompt entirely and start the container — never hang waiting on input.
+  export CLEAT_FORCE_CLAUDE_CHECK=1
+  export CLEAT_FAKE_REMOTE_CLAUDE=2.1.999
+
+  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  refute_output --partial "Update the image before starting?"
+  # The container actually started — proves cmd_run got past the check rather
+  # than blocking on the prompt (which would have tripped the 5s timeout).
+  grep -q 'sh.cleat.version=' "$DOCKER_CALLS" || {
+    echo "container never started — the update check may have blocked"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+}

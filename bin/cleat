@@ -1600,6 +1600,17 @@ exec_claude() {
 UPDATE_CHECK_FILE="$REPO_DIR/.update_check"
 UPDATE_CHECK_INTERVAL=86400
 
+# Claude Code update check — separate cadence/cache from the cleat self-update
+# check above. The channel defaults to `latest` to match `cleat upgrade-claude`
+# (so the on-start prompt and the action it triggers agree); override with
+# CLEAT_CLAUDE_CHANNEL (stable|latest|VERSION). Disable the whole on-start
+# prompt with CLEAT_NO_CLAUDE_UPDATE_CHECK=1.
+CLAUDE_CHECK_FILE="$REPO_DIR/.claude_update_check"
+CLAUDE_CHECK_INTERVAL=600   # 10 minutes — the lookup is a tiny GET; the only
+                            # real per-check cost is one throwaway container to
+                            # read the image's version, bounded to once/interval.
+CLAUDE_RELEASES_URL="https://downloads.claude.ai/claude-code-releases"
+
 latest_remote_tag() {
   git -C "$REPO_DIR" ls-remote --tags --refs origin 2>/dev/null \
     | awk '{print $2}' \
@@ -1641,6 +1652,91 @@ check_for_update() {
         "{BOLD}Update available{/BOLD}  v${VERSION} → v${cached_version}" \
         "Run {BOLD}cleat update{/BOLD} to install the latest version."
     fi
+  fi
+}
+
+# Fetch the newest released Claude Code version for a channel from the public
+# releases endpoint (the same one the official installer reads). Stdout: a bare
+# version like `2.1.149`, or empty on any failure. Tests inject a value via
+# CLEAT_FAKE_REMOTE_CLAUDE so they never hit the network.
+_claude_remote_version() {
+  local channel="${1:-latest}"
+  if [[ -n "${CLEAT_FAKE_REMOTE_CLAUDE:-}" ]]; then
+    printf '%s' "$CLEAT_FAKE_REMOTE_CLAUDE"
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || return 0
+  local v
+  v="$(curl -fsSL "$CLAUDE_RELEASES_URL/$channel" 2>/dev/null)" || return 0
+  # Take only the first line and strip surrounding whitespace, then require a
+  # clean, fully-anchored semver. This rejects HTML/error pages and stops any
+  # trailing or multiline bytes (e.g. ANSI escapes from a compromised/MITM'd
+  # endpoint) from reaching the terminal display or the cache file.
+  v="$(printf '%s' "$v" | head -n1 | tr -d '[:space:]')"
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]] || return 0
+  printf '%s' "$v"
+}
+
+# On an interactive `cleat` start, check at most once every 10 minutes whether a newer
+# Claude Code than the one baked into the image is available, and if so offer
+# to upgrade the image before starting. "Yes" runs the durable image-commit
+# upgrade (NOT an in-container `claude update`, which would be ephemeral), then
+# cmd_run continues and starts a fresh container from the updated image.
+# Designed never to block: non-interactive, opted-out, throttled, offline, or
+# version-read failures all fall through silently.
+_maybe_prompt_claude_update() {
+  _is_tty || return 0
+  [[ "${CLEAT_NO_CLAUDE_UPDATE_CHECK:-}" == "1" ]] && return 0
+  image_exists || return 0
+
+  local now last_check=0
+  now="$(date +%s)"
+  if [[ -f "$CLAUDE_CHECK_FILE" ]]; then
+    last_check="$(awk 'NR==1 {print $1}' "$CLAUDE_CHECK_FILE" 2>/dev/null || echo 0)"
+    [[ "$last_check" =~ ^[0-9]+$ ]] || last_check=0
+  fi
+  # Throttle to once per interval. CLEAT_FORCE_CLAUDE_CHECK bypasses (tests).
+  if [[ -z "${CLEAT_FORCE_CLAUDE_CHECK:-}" ]] && (( now - last_check < CLAUDE_CHECK_INTERVAL )); then
+    return 0
+  fi
+
+  # Resolve and STRICTLY validate the channel before it touches a URL or the
+  # in-container shell command — CLEAT_CLAUDE_CHANNEL is user-controlled, so a
+  # value like `2.1.0; rm -rf ~` must not slip through to _upgrade_claude_image.
+  local channel="${CLEAT_CLAUDE_CHANNEL:-latest}"
+  local _semver='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
+  case "$channel" in
+    stable|latest) ;;
+    *) [[ "$channel" =~ $_semver ]] || channel="latest" ;;
+  esac
+
+  local remote
+  remote="$(_claude_remote_version "$channel")"
+  # Record the attempt regardless of outcome so a flaky network can't nag on
+  # every single start.
+  echo "$now $remote" > "$CLAUDE_CHECK_FILE" 2>/dev/null || true
+  [[ -n "$remote" ]] || return 0
+
+  local local_v
+  local_v="$(_image_claude_version)"
+  [[ -n "$local_v" ]] || return 0
+  [[ "$remote" != "$local_v" ]] || return 0
+  # Only prompt when the remote version is strictly newer — never nag to
+  # downgrade (e.g. when the image already runs a newer build than `stable`).
+  # Compare on the numeric base, stripping any prerelease suffix (`-rc.1`), so a
+  # pinned-prerelease channel doesn't mis-rank against a plain release.
+  local base_local="${local_v%%[-]*}" base_remote="${remote%%[-]*}"
+  local newest
+  newest="$(printf '%s\n%s\n' "$base_local" "$base_remote" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+  [[ "$newest" == "$base_remote" ]] || return 0
+
+  echo ""
+  info "New Claude Code available: ${DIM}${local_v}${RESET} → ${BOLD}${remote}${RESET} ${DIM}(${channel})${RESET}"
+  echo -en "  Update the image before starting? [Y/n] "
+  local yn=""
+  read -r yn || yn=""
+  if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+    _upgrade_claude_image "$channel" || warn "Update failed — starting with the current version."
   fi
 }
 
@@ -1836,6 +1932,44 @@ cmd_upgrade_claude() {
       ;;
   esac
 
+  _upgrade_claude_image "$channel" || exit 1
+
+  # Existing containers were created from the old image and still run the old
+  # Claude Code. Recreate the current project's container so the upgrade takes
+  # effect immediately (sessions live on the host and are preserved).
+  local project cname
+  project="$(resolve_project)"
+  cname="$(container_name_for "$project")"
+  if container_exists "$cname"; then
+    if _is_tty; then
+      echo -en "  Recreate ${BOLD}${cname}${RESET} now to use it? [Y/n] "
+      local yn=""
+      read -r yn || yn=""
+      if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+        if is_running "$cname"; then
+          docker stop "$cname" > /dev/null 2>&1 || true
+        fi
+        docker rm -f "$cname" > /dev/null 2>&1 || true
+        rm -rf "/tmp/cleat-hooks-${cname}" "/tmp/cleat-clip-${cname}" "/tmp/cleat-settings-${cname}" 2>/dev/null || true
+        success "Removed ${BOLD}${cname}${RESET}."
+        cmd_run "$project"
+        return
+      fi
+    fi
+    info "Run ${BOLD}cleat rm && cleat${RESET} to use the new Claude Code in ${BOLD}${cname}${RESET}."
+  fi
+  echo -e "  ${DIM}Other projects pick up the new Claude Code next time their container is recreated.${RESET}"
+}
+
+# Core upgrade: re-install Claude Code into the local image for <channel> and
+# commit the result back over the image. The channel MUST be pre-validated by
+# the caller (it is interpolated into the in-container shell command). Returns
+# 0 on success, 1 on failure — it never exits the process and never recreates
+# a container, so the on-start update prompt can update the image in place and
+# then let cmd_run continue starting a fresh container from it.
+_upgrade_claude_image() {
+  local channel="$1"
+
   # Need an image to upgrade — build or pull one first if missing.
   if ! image_exists; then
     info "No image yet — preparing one first..."
@@ -1845,7 +1979,7 @@ cmd_upgrade_claude() {
   # than spawning a container against a non-existent reference.
   if ! image_exists; then
     error "No ${BOLD}${IMAGE_NAME}${RESET} image available to upgrade."
-    exit 1
+    return 1
   fi
 
   local before old_id
@@ -1895,7 +2029,7 @@ cmd_upgrade_claude() {
     echo -e "  ${DIM}Upgrade log:${RESET}"
     tail -20 "$log" 2>/dev/null | sed 's/^/    /'
     rm -f "$log"
-    exit 1
+    return 1
   fi
   rm -f "$log"
 
@@ -1924,31 +2058,7 @@ cmd_upgrade_claude() {
     fi
   fi
 
-  # Existing containers were created from the old image and still run the old
-  # Claude Code. Recreate the current project's container so the upgrade takes
-  # effect immediately (sessions live on the host and are preserved).
-  local project cname
-  project="$(resolve_project)"
-  cname="$(container_name_for "$project")"
-  if container_exists "$cname"; then
-    if _is_tty; then
-      echo -en "  Recreate ${BOLD}${cname}${RESET} now to use it? [Y/n] "
-      local yn=""
-      read -r yn || yn=""
-      if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-        if is_running "$cname"; then
-          docker stop "$cname" > /dev/null 2>&1 || true
-        fi
-        docker rm -f "$cname" > /dev/null 2>&1 || true
-        rm -rf "/tmp/cleat-hooks-${cname}" "/tmp/cleat-clip-${cname}" "/tmp/cleat-settings-${cname}" 2>/dev/null || true
-        success "Removed ${BOLD}${cname}${RESET}."
-        cmd_run "$project"
-        return
-      fi
-    fi
-    info "Run ${BOLD}cleat rm && cleat${RESET} to use the new Claude Code in ${BOLD}${cname}${RESET}."
-  fi
-  echo -e "  ${DIM}Other projects pick up the new Claude Code next time their container is recreated.${RESET}"
+  return 0
 }
 
 cmd_run() {
@@ -1972,6 +2082,10 @@ cmd_run() {
   else
     success "Image ready ${RESET}${DIM}(cached)"
   fi
+
+  # If a newer Claude Code than the image ships is available, offer to bump it
+  # (durably, by committing into the image) before we start the container.
+  _maybe_prompt_claude_update
 
   if [[ ! -d "$project" ]]; then
     error "Project directory does not exist: ${BOLD}${project}${RESET}"
@@ -3257,6 +3371,9 @@ cmd_update() {
   success "Updated to v${remote_version}."
 
   rm -f "$UPDATE_CHECK_FILE" 2>/dev/null || true
+  # The new release image bundles its own Claude Code, so invalidate the
+  # Claude update-check cache to re-check against the fresh image next start.
+  rm -f "$CLAUDE_CHECK_FILE" 2>/dev/null || true
 
   # Pull the prebuilt image matching the new version. _do_pull prints its own
   # progress/result; on failure the user can rebuild locally.

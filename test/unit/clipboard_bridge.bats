@@ -93,7 +93,7 @@ teardown() { _common_teardown; }
   # Override _host_clip_cmd to simulate no clipboard
   _host_clip_cmd() { echo ""; }
 
-  local clip_dir="/tmp/cleat-clip-test-noclip"
+  local clip_dir="$CLEAT_RUN_DIR/test-noclip/clip"
   rm -rf "$clip_dir"
 
   run exec_claude "test-noclip" --dangerously-skip-permissions

@@ -38,9 +38,9 @@ setup() {
 }
 
 teardown() {
-  rm -rf /tmp/cleat-settings-cleat-project-* 2>/dev/null || true
-  rm -rf /tmp/cleat-hooks-cleat-project-* 2>/dev/null || true
-  rm -rf /tmp/cleat-clip-cleat-project-* 2>/dev/null || true
+  rm -rf $CLEAT_RUN_DIR/cleat-project-*/settings 2>/dev/null || true
+  rm -rf $CLEAT_RUN_DIR/cleat-project-*/hooks 2>/dev/null || true
+  rm -rf $CLEAT_RUN_DIR/cleat-project-*/clip 2>/dev/null || true
   _common_teardown
 }
 
@@ -91,7 +91,7 @@ EOF
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  local overlay="/tmp/cleat-settings-${cname}/settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/settings.json"
   [[ -f "$overlay" ]] || { echo "REGRESSION: overlay not created"; return 1; }
 
   # Must contain forwarder command, not be empty and not contain original
@@ -99,7 +99,7 @@ EOF
   assert_output "cat >> /var/log/cleat/events.jsonl"
 
   : > "${HOME}/.claude/settings.json" 2>/dev/null || true
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ EOF
     return 1
   }
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,7 +220,7 @@ EOF
   unset DOCKER_EXIT_CODE DOCKER_STDERR
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,7 +238,7 @@ EOF
   cname="$(container_name_for "$TEST_TEMP/project")"
 
   # Seed stale state from a previous container
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$overlay_dir"
   echo '{"stale":true}' > "$overlay_dir/settings.json"
   echo '{"stale":true}' > "$overlay_dir/stale-file-from-prior-run.json"
@@ -256,7 +256,7 @@ EOF
   run jq -e '.stale // empty' "$overlay_dir/settings.json"
   assert_failure  # no .stale field in new file
 
-  rm -rf "$overlay_dir" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$overlay_dir" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,16 +503,16 @@ EOF
   assert_success
 
   # And no empty overlay file should have been created (the broken path wrote `{}`)
-  [[ ! -f "/tmp/cleat-settings-${cname}/project-settings.json" ]] || {
+  [[ ! -f "$CLEAT_RUN_DIR/${cname}/settings/project-settings.json" ]] || {
     echo "REGRESSION: empty overlay file created for non-existent host file"
     return 1
   }
-  [[ ! -f "/tmp/cleat-settings-${cname}/project-settings.local.json" ]] || {
+  [[ ! -f "$CLEAT_RUN_DIR/${cname}/settings/project-settings.local.json" ]] || {
     echo "REGRESSION: empty overlay file created for non-existent host file"
     return 1
   }
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,7 +540,7 @@ EOF
   }
 
   unset DOCKER_EXIT_CODE DOCKER_STDERR
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -600,7 +600,7 @@ EOF
   # Simulate: container exists (stopped), overlay dir is missing (stale after reboot)
   mock_docker_ps_a "$cname"
   is_running() { return 1; }
-  rm -rf "/tmp/cleat-settings-${cname}" 2>/dev/null || true
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" 2>/dev/null || true
 
   run cmd_start "$TEST_TEMP/project"
 
@@ -616,7 +616,7 @@ EOF
     return 1
   }
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -863,7 +863,7 @@ _run_cleat() {
   run assert_docker_run_has "$cname" "${project_key}:/home/coder/.claude/projects/-workspace"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -895,7 +895,7 @@ EOF
   assert_success
 
   # The overlay must NOT contain the original hook command
-  local overlay="/tmp/cleat-settings-${cname}/project-settings.local.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/project-settings.local.json"
   [[ -f "$overlay" ]] || { echo "Overlay file missing"; return 1; }
 
   # Hooks must be stripped (not present at all)
@@ -910,7 +910,7 @@ EOF
     assert_output "Read"
   fi
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1056,7 +1056,7 @@ EOF
   run assert_docker_run_has "$cname" "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1151,7 +1151,7 @@ EOF
 
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1180,7 +1180,7 @@ EOF
 
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1260,7 +1260,7 @@ EOF
   run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "regression v0.10.0: docker cap mounts project at host path with workdir" {
@@ -1284,7 +1284,7 @@ EOF
   run assert_docker_run_has "$cname" "--workdir $TEST_TEMP/project"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "regression v0.10.0: docker cap off leaves baseline mounts unchanged" {
@@ -1309,7 +1309,7 @@ EOF
   run assert_docker_run_lacks "$cname" "--workdir"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1423,7 +1423,7 @@ EOF
   assert_success
   assert_output --partial "--name $cname"
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "regression v0.10.0: cmd_rm leaves per-project session dir untouched" {
@@ -1485,7 +1485,7 @@ EOF
   run assert_docker_run_has "$cname" ":/home/coder/.claude/projects/${host_key}"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "regression v0.10.0: cmd_status never prompts for trust" {
@@ -1537,7 +1537,7 @@ EOF
 
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1596,8 +1596,8 @@ EOF
   exec_claude() { return 0; }
 
   # Settings overlay must exist or the unrelated stale-mount path fires
-  mkdir -p "/tmp/cleat-settings-${cname}"
-  echo '{}' > "/tmp/cleat-settings-${cname}/settings.json"
+  mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
 
   # Sentinel — set by the spy below if the wiring is intact
   DRIFT_CALLED=0
@@ -1663,7 +1663,7 @@ EOF
   # Overlay dir survives with settings.json, but the container's mount set
   # still references project-settings.local.json which was rotated out.
   # This is the exact partial-rotation state the dir-only check missed.
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$overlay_dir"
   echo '{}' > "$overlay_dir/settings.json"
   # docker inspect must report both sources so the helper can spot the
@@ -1682,5 +1682,5 @@ ${overlay_dir}/project-settings.local.json"
   assert_output --partial "docker run"
   refute_output --partial "docker start $cname"
 
-  rm -rf "$overlay_dir" "/tmp/cleat-clip-${cname}"
+  rm -rf "$overlay_dir" "$CLEAT_RUN_DIR/${cname}/clip"
 }

@@ -152,7 +152,7 @@ teardown() { _common_teardown; }
   run assert_docker_run_has "$cname" "/home/coder/.claude/projects/-workspace"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: mounts per-project history overlay at history.jsonl" {
@@ -176,7 +176,7 @@ teardown() { _common_teardown; }
   run assert_docker_run_has "$cname" "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: different projects get different session overlay sources" {
@@ -212,8 +212,8 @@ teardown() { _common_teardown; }
   local cname_a cname_b
   cname_a="$(container_name_for "$TEST_TEMP/project-a")"
   cname_b="$(container_name_for "$TEST_TEMP/project-b")"
-  rm -rf "/tmp/cleat-settings-${cname_a}" "/tmp/cleat-settings-${cname_b}"
-  rm -rf "/tmp/cleat-hooks-${cname_a}" "/tmp/cleat-hooks-${cname_b}"
+  rm -rf "$CLEAT_RUN_DIR/${cname_a}/settings" "$CLEAT_RUN_DIR/${cname_b}/settings"
+  rm -rf "$CLEAT_RUN_DIR/${cname_a}/hooks" "$CLEAT_RUN_DIR/${cname_b}/hooks"
 }
 
 @test "run: session overlay creates host project dir if missing" {
@@ -240,7 +240,7 @@ teardown() { _common_teardown; }
 
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: session key avoids collision for paths with similar names" {
@@ -280,8 +280,8 @@ teardown() { _common_teardown; }
   local c1 c2
   c1="$(container_name_for "$TEST_TEMP/a-b/c")"
   c2="$(container_name_for "$TEST_TEMP/a/b-c")"
-  rm -rf "/tmp/cleat-settings-${c1}" "/tmp/cleat-settings-${c2}"
-  rm -rf "/tmp/cleat-hooks-${c1}" "/tmp/cleat-hooks-${c2}"
+  rm -rf "$CLEAT_RUN_DIR/${c1}/settings" "$CLEAT_RUN_DIR/${c2}/settings"
+  rm -rf "$CLEAT_RUN_DIR/${c1}/hooks" "$CLEAT_RUN_DIR/${c2}/hooks"
 }
 
 @test "run: session key handles root path" {
@@ -296,7 +296,7 @@ teardown() { _common_teardown; }
   run assert_docker_run_has "$cname" "projects/-workspace"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: session key basename is case-normalized" {
@@ -321,7 +321,7 @@ teardown() { _common_teardown; }
 
   local cname
   cname="$(container_name_for "$TEST_TEMP/MyProject")"
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: cmd_rm preserves session directory on host" {
@@ -357,7 +357,7 @@ teardown() { _common_teardown; }
     return 1
   }
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: docker run failure is handled (spinner not orphaned)" {

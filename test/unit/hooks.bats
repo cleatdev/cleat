@@ -57,8 +57,8 @@ teardown() {
   cname="$(container_name_for "$TEST_TEMP/project")"
 
   cmd_run "$TEST_TEMP/project"
-  [[ -d "/tmp/cleat-hooks-${cname}" ]] || return 1
-  rmdir "/tmp/cleat-hooks-${cname}" 2>/dev/null || true
+  [[ -d "$CLEAT_RUN_DIR/${cname}/hooks" ]] || return 1
+  rmdir "$CLEAT_RUN_DIR/${cname}/hooks" 2>/dev/null || true
 }
 
 @test "run: no hooks mount when hooks cap is disabled" {
@@ -186,7 +186,7 @@ EOF
   assert_success
 
   # The overlay should have forwarder command, not the original
-  local overlay="/tmp/cleat-settings-${cname}/settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/settings.json"
   [[ -f "$overlay" ]] || return 1
 
   # Should keep permissions
@@ -201,7 +201,7 @@ EOF
   run jq -r '.hooks.Stop[0].hooks[0].async' "$overlay"
   assert_output "true"
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: overlay preserves matchers when replacing commands" {
@@ -218,7 +218,7 @@ EOF
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  local overlay="/tmp/cleat-settings-${cname}/settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/settings.json"
   # Matcher should be preserved
   run jq -r '.hooks.PostToolUse[0].matcher' "$overlay"
   assert_output "Bash|Write"
@@ -227,7 +227,7 @@ EOF
   run jq -r '.hooks.PostToolUse[0].hooks[0].command' "$overlay"
   assert_output "cat >> /var/log/cleat/events.jsonl"
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ── Settings overlay: hooks OFF (strip) ─────────────────────────────────
@@ -250,7 +250,7 @@ EOF
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  local overlay="/tmp/cleat-settings-${cname}/settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/settings.json"
   [[ -f "$overlay" ]] || return 1
 
   run jq -r '.permissions.allow[0]' "$overlay"
@@ -259,7 +259,7 @@ EOF
   run jq -r '.hooks // "none"' "$overlay"
   assert_output "none"
 
-  rm -rf "/tmp/cleat-settings-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings"
 }
 
 @test "run: overlay works when settings.json is empty" {
@@ -271,12 +271,12 @@ EOF
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  local overlay="/tmp/cleat-settings-${cname}/settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/settings.json"
   [[ -f "$overlay" ]] || return 1
   run cat "$overlay"
   assert_output "{}"
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: overlay falls back to empty {} when jq unavailable" {
@@ -302,13 +302,13 @@ EOF
   PATH="$real_path"
   unset -f command
 
-  local overlay="/tmp/cleat-settings-${cname}/settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/settings.json"
   if [[ -f "$overlay" ]]; then
     run cat "$overlay"
     assert_output "{}"
   fi
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ── Project-level hook overlay ──────────────────────────────────────────
@@ -330,7 +330,7 @@ EOF
   assert_success
 
   # Overlay should contain forwarder command, not the original hook command
-  local overlay="/tmp/cleat-settings-${cname}/project-settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/project-settings.json"
   run jq -r '.hooks.PostToolUse[0].hooks[0].command' "$overlay"
   assert_output "cat >> /var/log/cleat/events.jsonl"
 
@@ -338,7 +338,7 @@ EOF
   run jq -r '.permissions.allow[0]' "$overlay"
   assert_output "Read"
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: always mounts project overlay even when no hooks yet" {
@@ -356,11 +356,11 @@ EOF
   assert_success
 
   # Overlay should be a copy of the original (no hooks to replace)
-  local overlay="/tmp/cleat-settings-${cname}/project-settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/project-settings.json"
   run jq -r '.permissions.allow[0]' "$overlay"
   assert_output "Read"
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: skips project overlay for files that don't exist on host" {
@@ -383,12 +383,12 @@ EOF
   assert_success
 
   # Overlay files should not be created for missing host files
-  [[ ! -f "/tmp/cleat-settings-${cname}/project-settings.json" ]] || {
+  [[ ! -f "$CLEAT_RUN_DIR/${cname}/settings/project-settings.json" ]] || {
     echo "project-settings.json overlay should not exist for missing host file"
     return 1
   }
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: mounts only existing overlay files when one of two exists" {
@@ -409,7 +409,7 @@ EOF
   run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: skips project overlay when no .claude/ directory" {
@@ -428,7 +428,7 @@ EOF
   run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.local.json"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "run: strips hooks from project settings overlay when hooks OFF" {
@@ -452,7 +452,7 @@ EOF
   assert_success
 
   # Overlay must have hooks stripped but preserve other fields
-  local overlay="/tmp/cleat-settings-${cname}/project-settings.json"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/project-settings.json"
   if command -v jq &>/dev/null; then
     run jq -e '.hooks // empty | length > 0' "$overlay"
     assert_failure  # hooks should be gone
@@ -460,7 +460,7 @@ EOF
     assert_output "Read"
   fi
 
-  rm -rf "/tmp/cleat-settings-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings"
 }
 
 # ── cmd_claude sets _RESOLVED_PROJECT for hooks ────────────────────────
@@ -501,7 +501,7 @@ EOF
   cname="$(container_name_for "$TEST_TEMP/project")"
 
   # Simulate overlay dir from original cmd_run (no hooks at creation time)
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$overlay_dir"
   echo '{}' > "$overlay_dir/settings.json"
   echo '{}' > "$overlay_dir/project-settings.json"
@@ -521,7 +521,7 @@ EOF
   run jq -r '.hooks.Stop[0].hooks[0].command' "$overlay_dir/project-settings.local.json"
   assert_output "cat >> /var/log/cleat/events.jsonl"
 
-  rm -rf "$overlay_dir" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$overlay_dir" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ── Resume refreshes project-level overlays ────────────────────────────
@@ -532,7 +532,7 @@ EOF
   cname="$(container_name_for "$TEST_TEMP/project")"
 
   # Simulate an existing overlay directory (created by original cmd_run)
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$overlay_dir"
   echo '{}' > "$overlay_dir/settings.json"
 
@@ -558,7 +558,7 @@ EOF
   run jq -r '.hooks.PostToolUse[0].hooks[0].command' "$project_overlay"
   assert_output "cat >> /var/log/cleat/events.jsonl"
 
-  rm -rf "$overlay_dir" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$overlay_dir" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 @test "resume: copies project settings as-is when hooks removed" {
@@ -567,7 +567,7 @@ EOF
   cname="$(container_name_for "$TEST_TEMP/project")"
 
   # Simulate overlay dir with old forwarder
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$overlay_dir"
   echo '{}' > "$overlay_dir/settings.json"
   echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cat >> /var/log/cleat/events.jsonl"}]}]}}' \
@@ -587,7 +587,7 @@ EOF
   run jq -e '.hooks // empty | length > 0' "$overlay_dir/project-settings.local.json"
   assert_failure
 
-  rm -rf "$overlay_dir" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$overlay_dir" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ── Settings overlay mount ordering ─────────────────────────────────────
@@ -608,7 +608,7 @@ EOF
   run assert_docker_run_has "$cname" "settings.json:/home/coder/.claude/settings.json"
   assert_success
 
-  rm -rf "/tmp/cleat-settings-${cname}" "/tmp/cleat-hooks-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
 # ── --cap hooks session-only ────────────────────────────────────────────
@@ -699,7 +699,7 @@ EOF
   mock_docker_ps "$cname"
   mock_docker_ps_a "$cname"
 
-  local hooks_dir="/tmp/cleat-hooks-${cname}"
+  local hooks_dir="$CLEAT_RUN_DIR/${cname}/hooks"
   mkdir -p "$hooks_dir"
   echo "test" > "$hooks_dir/events.jsonl"
 
@@ -715,7 +715,7 @@ EOF
   mock_docker_ps "$cname"
   mock_docker_ps_a "$cname"
 
-  local settings_dir="/tmp/cleat-settings-${cname}"
+  local settings_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$settings_dir"
   echo '{}' > "$settings_dir/settings.json"
 
@@ -925,30 +925,24 @@ EOF
   [[ ${#_HOOK_BRIDGE_CHILDREN[@]} -eq 0 ]] || return 1
 }
 
-@test "_hook_bridge_cleanup: kills all tracked children" {
-  # Snapshot PIDs before cleanup zeroes _HOOK_BRIDGE_CHILDREN — the original
-  # loop iterated the post-cleanup empty array and never asserted anything.
-  # Disown the sleeps so bats's DEBUG trap doesn't hit a wait race when
-  # _hook_bridge_cleanup kills them inside the test shell's job table.
-  _HOOK_BRIDGE_CHILDREN=()
-  sleep 60 &
-  local pid1=$!
-  _HOOK_BRIDGE_CHILDREN+=("$pid1")
-  disown "$pid1"
-  sleep 60 &
-  local pid2=$!
-  _HOOK_BRIDGE_CHILDREN+=("$pid2")
-  disown "$pid2"
+@test "_hook_bridge_cleanup: kills all tracked children and clears the list" {
+  # Test the function's CONTRACT — it signals every tracked PID and empties the
+  # tracking array — not kernel reaping timing. The old version spawned real
+  # `sleep`s, disowned them, then asserted they were gone; but disowned children
+  # become zombies that `kill -0` reports as alive until the kernel reaps them,
+  # and `_hook_bridge_cleanup`'s own `wait` can't reap a disowned (non-job) PID.
+  # Under full-suite load that race flaked. Recording kill targets is
+  # deterministic and load-independent.
+  local _killed="$TEST_TEMP/killed.log"; : > "$_killed"
+  # Override the builtin to record signals instead of sending them. cleanup's
+  # subsequent `wait <fake-pid>` is a fast no-op ("not a child").
+  kill() { printf '%s\n' "$*" >> "$_killed"; }
 
+  _HOOK_BRIDGE_CHILDREN=(4242 4243)
   _hook_bridge_cleanup
 
-  # Give the kernel a beat to reap before kill -0 — the assertion is "process
-  # is gone", not "process exited synchronously with the kill syscall".
-  sleep 0.2
-  run kill -0 "$pid1"
-  assert_failure
-  run kill -0 "$pid2"
-  assert_failure
+  grep -q '4242' "$_killed" || { echo "pid1 was not signalled"; return 1; }
+  grep -q '4243' "$_killed" || { echo "pid2 was not signalled"; return 1; }
   [[ ${#_HOOK_BRIDGE_CHILDREN[@]} -eq 0 ]] || return 1
 }
 
@@ -961,7 +955,7 @@ EOF
   mock_docker_ps "$cname"
   mock_docker_ps_a "$cname"
 
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$overlay_dir"
   echo '{"stale":true}' > "$overlay_dir/settings.json"
 
@@ -992,7 +986,7 @@ EOF
   mock_docker_ps "$cname"
   mock_docker_ps_a "$cname"
 
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   mkdir -p "$overlay_dir"
   echo '{"stale":true}' > "$overlay_dir/settings.json"
 
@@ -1047,14 +1041,14 @@ EOF
   _host_clip_cmd() { echo ""; }
   _host_open_cmd() { echo ""; }
   export DOCKER_EXIT_CODE=0
-  mkdir -p "/tmp/cleat-clip-test-cleanup"
-  touch "/tmp/cleat-clip-test-cleanup/.browser-open"
+  mkdir -p "$CLEAT_RUN_DIR/test-cleanup/clip"
+  touch "$CLEAT_RUN_DIR/test-cleanup/clip/.browser-open"
 
-  _CLIP_DIR="/tmp/cleat-clip-test-cleanup"
+  _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup/clip"
   run exec_claude "test-cleanup" --dangerously-skip-permissions
 
-  [[ ! -f "/tmp/cleat-clip-test-cleanup/.browser-open" ]] || return 1
-  rm -rf "/tmp/cleat-clip-test-cleanup"
+  [[ ! -f "$CLEAT_RUN_DIR/test-cleanup/clip/.browser-open" ]] || return 1
+  rm -rf "$CLEAT_RUN_DIR/test-cleanup/clip"
 }
 
 # ── Browser bridge ───────────────────────────────────────────────────────

@@ -39,9 +39,9 @@ teardown() { _common_teardown; }
 
 @test "creates clipboard bridge directory" {
   run exec_claude "my-ctr" --dangerously-skip-permissions
-  run test -d "/tmp/cleat-clip-my-ctr"
+  run test -d "$CLEAT_RUN_DIR/my-ctr/clip"
   assert_success
-  rm -rf "/tmp/cleat-clip-my-ctr"
+  rm -rf "$CLEAT_RUN_DIR/my-ctr/clip"
 }
 
 @test "passes resolved env args to docker exec" {

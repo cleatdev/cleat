@@ -27,6 +27,7 @@ BATS="$REPO_ROOT/test/bats/bin/bats"
 REGRESSIONS="$REPO_ROOT/test/unit/regressions.bats"
 UPGRADE_BATS="$REPO_ROOT/test/unit/upgrade_claude.bats"
 CLAUDE_BATS="$REPO_ROOT/test/unit/claude_update_check.bats"
+RUN_DIR_BATS="$REPO_ROOT/test/unit/run_dir.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
@@ -387,11 +388,15 @@ SED
 try "v0.10.0_resume_auto_creates" "cleat resume after cleat rm creates container"
 
 # v0.10.0 — cmd_rm must not touch the per-project session dir under
-# ~/.claude/projects/. Append an rm that clobbers the whole projects
-# dir; the "leaves session dir untouched" regression test should fail.
+# ~/.claude/projects/. Append, inside cmd_rm only, an rm that clobbers the
+# whole projects dir; the "leaves session dir untouched" regression test should
+# fail. (Anchored on the per-container runtime-dir cleanup, which replaced the
+# old /tmp cleanup lines when runtime state moved off /tmp.)
 cat > "$SED_TMP" << 'SED'
-/rm -rf "\/tmp\/cleat-hooks-\${cname}"/a\
+/^cmd_rm()/,/^}$/{
+  /rm -rf "\$CLEAT_RUN_DIR\/\${cname}"/a\
     rm -rf "${HOME}/.claude/projects" 2>/dev/null || true
+}
 SED
 try "v0.10.0_cmd_rm_preserves_sessions" "cmd_rm leaves per-project session dir untouched"
 
@@ -524,6 +529,60 @@ cat > "$SED_TMP" << 'SED'
 /^  _is_tty || return 0$/d
 SED
 try "claude_check_tty_only" "silent when non-interactive" "$CLI" "$CLAUDE_BATS"
+
+# ── Persistent per-container run dir (bin/cleat, tested vs run_dir.bats) ──────
+
+# The settings overlay must mount from the persistent $CLEAT_RUN_DIR, not /tmp
+# (where macOS rotation deletes the source and forces a recreate). Revert the
+# overlay dir to the old /tmp scheme; the relocation test must then fail.
+cat > "$SED_TMP" << 'SED'
+s#local settings_overlay_dir="\$CLEAT_RUN_DIR/\${cname}/settings"#local settings_overlay_dir="/tmp/cleat-settings-${cname}"#g
+SED
+try "run_dir_settings_relocated" "settings overlay is mounted from CLEAT_RUN_DIR" "$CLI" "$RUN_DIR_BATS"
+
+# The stale-mount check must look at the new-layout dir so pre-move containers
+# (mounts under /tmp) and broken overlays force a recreate. Point it back at
+# /tmp; the "intact when present" test must then fail (new-layout dir unseen).
+cat > "$SED_TMP" << 'SED'
+s#local overlay_dir="\$CLEAT_RUN_DIR/\${cname}/settings"#local overlay_dir="/tmp/cleat-settings-${cname}"#
+SED
+try "run_dir_intact_uses_new_path" "true when overlay dir" "$CLI" "$RUN_DIR_BATS"
+
+# cmd_clean must prune orphaned run dirs (containers gone). Neuter the
+# orphan test so nothing is pruned; the prune test must then fail.
+cat > "$SED_TMP" << 'SED'
+s#if ! container_exists "\$_cn"; then#if false; then#
+SED
+try "run_dir_clean_prunes_orphans" "prunes orphaned run dirs but keeps live" "$CLI" "$RUN_DIR_BATS"
+
+# cmd_nuke must wipe the whole persistent run dir (it no longer self-cleans via
+# /tmp rotation). Remove the wipe; the nuke test must then fail.
+cat > "$SED_TMP" << 'SED'
+/rm -rf "\$CLEAT_RUN_DIR" 2>\/dev\/null || true/d
+SED
+try "run_dir_nuke_wipes_all" "wipes the entire CLEAT_RUN_DIR" "$CLI" "$RUN_DIR_BATS"
+
+# The clipboard bridge source must move too (parity with settings). Revert it to
+# /tmp; the clip relocation test must then fail.
+cat > "$SED_TMP" << 'SED'
+s#local clip_dir="\$CLEAT_RUN_DIR/\${cname}/clip"#local clip_dir="/tmp/cleat-clip-${cname}"#
+SED
+try "run_dir_clip_relocated" "clipboard bridge source is under CLEAT_RUN_DIR" "$CLI" "$RUN_DIR_BATS"
+
+# The hook spool source must move too. Revert it to /tmp; the hooks relocation
+# test must then fail.
+cat > "$SED_TMP" << 'SED'
+s#local hooks_dir="\$CLEAT_RUN_DIR/\${cname}/hooks"#local hooks_dir="/tmp/cleat-hooks-${cname}"#
+SED
+try "run_dir_hooks_relocated" "hooks spool source is under CLEAT_RUN_DIR" "$CLI" "$RUN_DIR_BATS"
+
+# cmd_clean's prune report must use if/fi, not `[[ ]] &&` — the latter makes the
+# function (last statement in main) exit 1 on a successful run with 0 orphans.
+# Revert to the `&&` form; the "exits 0 with nothing to prune" test must fail.
+cat > "$SED_TMP" << 'SED'
+s#if \[\[ \$_pruned -gt 0 \]\]; then info "Pruned \${_pruned} orphaned runtime dir(s)."; fi#[[ $_pruned -gt 0 ]] \&\& info "Pruned ${_pruned} orphaned runtime dir(s)."#
+SED
+try "run_dir_clean_exit_code" "exits 0 on a successful run with nothing to prune" "$CLI" "$RUN_DIR_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

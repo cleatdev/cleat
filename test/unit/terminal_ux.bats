@@ -76,8 +76,8 @@ teardown() { _common_teardown; }
   local expected_cname="cleat-${dir_name}-${hash}"
 
   # Create settings overlay dir so stale-mount check doesn't trigger
-  mkdir -p "/tmp/cleat-settings-${expected_cname}"
-  echo '{}' > "/tmp/cleat-settings-${expected_cname}/settings.json"
+  mkdir -p "$CLEAT_RUN_DIR/${expected_cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${expected_cname}/settings/settings.json"
 
   # Mock docker: image exists, container exists (stopped), start fails, run fails
   # Both start and run fail so the test verifies failure handling regardless
@@ -117,7 +117,7 @@ MOCK
   # Must fail with proper message (spin_stop was reached, not set -e abort)
   assert_failure
   assert_output --partial "Container failed to start"
-  rm -rf "/tmp/cleat-settings-${expected_cname}"
+  rm -rf "$CLEAT_RUN_DIR/${expected_cname}/settings"
 }
 
 @test "strict mode: cleat --help runs without error" {
@@ -387,7 +387,7 @@ EOF
   assert_success
   assert_output --partial "Docker socket mounted"
 
-  rm -rf "/tmp/cleat-settings-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings"
 }
 
 @test "resume: does NOT print docker warning when cap is off" {
@@ -402,7 +402,7 @@ EOF
   assert_success
   refute_output --partial "Docker socket mounted"
 
-  rm -rf "/tmp/cleat-settings-${cname}"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings"
 }
 
 @test "start: outputs summary block with container name" {

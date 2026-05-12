@@ -14,6 +14,14 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLEAT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cleat"
 CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
 CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
+
+# Per-container runtime state: the settings overlay, clipboard bridge, and hook
+# event spool. Persistent — deliberately NOT under /tmp — so macOS file rotation
+# and reboots can't delete a container's bind-mount sources out from under it and
+# force a recreate (which would discard the container's writable layer, e.g. an
+# ad-hoc `az` install). One dir per container, NOT mounted into the container:
+#   $CLEAT_RUN_DIR/<cname>/{settings,clip,hooks}
+CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 
 # Known capabilities (order matters for display).
@@ -789,15 +797,19 @@ _image_claude_version() {
 # present and the right type. Return failure when the overlay dir is missing
 # OR when any bind source within it is missing or has the wrong type.
 #
-# Why this can't just check the dir: Docker auto-creates a missing bind
-# source as a directory, which then fails to mount onto a file destination
-# with an opaque OCI "not a directory" error. macOS rotates individual files
-# in /tmp on a different schedule than the parent dir (and reboot-time
-# cleanup can race partial state), so the dir may survive while specific
-# overlay files do not.
+# The overlay now lives under $CLEAT_RUN_DIR (persistent), not /tmp, so routine
+# macOS /tmp rotation no longer invalidates it. This check now serves two roles:
+#   1. Migration: a container created before the move has its overlay mounts
+#      under /tmp, so the new-layout dir is absent → recreate to adopt the
+#      persistent layout.
+#   2. Defense: if the overlay dir or a file within it is missing (manual
+#      deletion, partial state), recreate rather than mount a broken source.
+# Why per-file, not just the dir: Docker auto-creates a missing bind source as a
+# directory, which then fails to mount onto a file destination with an opaque
+# OCI "not a directory" error.
 _settings_overlay_intact() {
   local cname="$1"
-  local overlay_dir="/tmp/cleat-settings-${cname}"
+  local overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   [[ -d "$overlay_dir" ]] || return 1
 
   local mounts src
@@ -880,7 +892,7 @@ _resolve_config_drift() {
         docker stop "$cname" > /dev/null 2>&1 || true
       fi
       docker rm -f "$cname" > /dev/null 2>&1 || true
-      rm -rf "/tmp/cleat-hooks-${cname}" "/tmp/cleat-clip-${cname}" "/tmp/cleat-settings-${cname}" 2>/dev/null || true
+      rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
       success "Removed ${BOLD}${cname}${RESET}."
       return 0
     fi
@@ -1103,7 +1115,7 @@ _clipboard_watcher() {
 
 # ── Browser bridge ────────────────────────────────────────────────────────
 # Watches for URLs written by the container's open-bridge shim and opens them
-# on the host. Reuses the clipboard bridge mount (/tmp/cleat-clip-*).
+# on the host. Reuses the clipboard bridge dir ($CLEAT_RUN_DIR/<cname>/clip).
 
 _host_open_cmd() {
   if command -v open &>/dev/null; then echo "open"
@@ -1507,7 +1519,7 @@ exec_claude() {
   local cname="$1"
   shift
 
-  _CLIP_DIR="/tmp/cleat-clip-${cname}"
+  _CLIP_DIR="$CLEAT_RUN_DIR/${cname}/clip"
   _CLIP_WATCHER_PID=""
   _BROWSER_WATCHER_PID=""
   _HOOK_BRIDGE_PID=""
@@ -1560,7 +1572,7 @@ exec_claude() {
   fi
 
   # Start host-side hook bridge if user has hooks and hooks cap is active
-  local hooks_file="/tmp/cleat-hooks-${cname}/events.jsonl"
+  local hooks_file="$CLEAT_RUN_DIR/${cname}/hooks/events.jsonl"
   if cap_is_active hooks 2>/dev/null && _has_host_hooks 2>/dev/null; then
     _hook_bridge_watcher "$hooks_file" &
     _HOOK_BRIDGE_PID=$!
@@ -1950,7 +1962,7 @@ cmd_upgrade_claude() {
           docker stop "$cname" > /dev/null 2>&1 || true
         fi
         docker rm -f "$cname" > /dev/null 2>&1 || true
-        rm -rf "/tmp/cleat-hooks-${cname}" "/tmp/cleat-clip-${cname}" "/tmp/cleat-settings-${cname}" 2>/dev/null || true
+        rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
         success "Removed ${BOLD}${cname}${RESET}."
         cmd_run "$project"
         return
@@ -2099,14 +2111,14 @@ cmd_run() {
   spin "Starting container..."
 
   # Clipboard bridge
-  local clip_dir="/tmp/cleat-clip-${cname}"
+  local clip_dir="$CLEAT_RUN_DIR/${cname}/clip"
   mkdir -p "$clip_dir"
 
   # ── Settings overlay ──────────────────────────────────────────────────────
   # When hooks OFF: strip hooks from settings (they'd fail in the container).
   # When hooks ON:  replace hook commands with an event forwarder — the host-side
   #                 bridge reads forwarded events and executes the real commands.
-  local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+  local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   rm -rf "$settings_overlay_dir"
   mkdir -p "$settings_overlay_dir"
   local _overlay_ok=false
@@ -2175,7 +2187,7 @@ cmd_run() {
 
   # ── hooks capability: shared directory for event forwarding to host bridge
   if cap_is_active hooks; then
-    local hooks_dir="/tmp/cleat-hooks-${cname}"
+    local hooks_dir="$CLEAT_RUN_DIR/${cname}/hooks"
     mkdir -p "$hooks_dir"
     mount_args+=(-v "$hooks_dir":/var/log/cleat)
   fi
@@ -2422,7 +2434,7 @@ cmd_resume() {
   _resolve_config_drift "$cname" "$project"
 
   # Refresh settings overlays (user may have changed hooks between stop/resume)
-  local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+  local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null; then
     # Global settings overlay
     if [[ -f "${HOME}/.claude/settings.json" ]]; then
@@ -2540,11 +2552,10 @@ cmd_rm() {
   fi
   if container_exists "$cname"; then
     docker rm "$cname" > /dev/null
-    # Clean up temp dirs — sessions on the host are intentionally NOT
-    # touched; they live at ~/.claude/projects/<key>/ and survive cleat rm.
-    rm -rf "/tmp/cleat-hooks-${cname}" 2>/dev/null || true
-    rm -rf "/tmp/cleat-clip-${cname}" 2>/dev/null || true
-    rm -rf "/tmp/cleat-settings-${cname}" 2>/dev/null || true
+    # Clean up this container's runtime dir — sessions on the host are
+    # intentionally NOT touched; they live at ~/.claude/projects/<key>/ and
+    # survive cleat rm.
+    rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
     success "Removed ${BOLD}${cname}${RESET}."
     echo -e "    ${DIM}Sessions preserved. Run ${BOLD}cleat resume${RESET}${DIM} to pick up where you left off.${RESET}"
   else
@@ -2579,7 +2590,7 @@ cmd_login() {
   info "Authenticating with your Anthropic team account..."
 
   # Start browser bridge so auth URL opens automatically and callback works
-  local _login_clip_dir="/tmp/cleat-clip-${cname}"
+  local _login_clip_dir="$CLEAT_RUN_DIR/${cname}/clip"
   local _login_browser_pid=""
   local _login_open_cmd
   _login_open_cmd="$(_host_open_cmd)"
@@ -2631,7 +2642,7 @@ cmd_claude() {
   fi
 
   # Refresh project-level settings overlays (hooks may have changed)
-  local settings_overlay_dir="/tmp/cleat-settings-${cname}"
+  local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
   if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null && cap_is_active hooks && [[ -d "$project/.claude" ]]; then
     local pf
     for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
@@ -2784,6 +2795,25 @@ cmd_clean() {
   else
     info "No image to remove."
   fi
+
+  # Prune orphaned per-container runtime dirs: overlays for containers that no
+  # longer exist (project dir moved/deleted, or the container was removed
+  # outside cleat). cmd_stop_all only stops containers, so live ones still
+  # exist and their dirs are kept.
+  if [[ -d "$CLEAT_RUN_DIR" ]]; then
+    local _d _cn _pruned=0
+    for _d in "$CLEAT_RUN_DIR"/*/; do
+      [[ -d "$_d" ]] || continue
+      _cn="$(basename "$_d")"
+      if ! container_exists "$_cn"; then
+        rm -rf "$_d" 2>/dev/null || true
+        _pruned=$((_pruned + 1))
+      fi
+    done
+    # Use if/fi, not `[[ ]] &&` — a trailing false test would make cmd_clean
+    # (the last statement in main) exit 1 on a successful run with 0 orphans.
+    if [[ $_pruned -gt 0 ]]; then info "Pruned ${_pruned} orphaned runtime dir(s)."; fi
+  fi
 }
 
 cmd_nuke() {
@@ -2811,6 +2841,13 @@ cmd_nuke() {
   if image_exists; then
     info "Removing image..."
     docker rmi -f "$IMAGE_NAME" > /dev/null 2>&1
+  fi
+
+  # Per-container runtime dirs (overlays / clipboard / hook spool) are persistent
+  # now, so /tmp rotation won't reclaim them — wipe them explicitly.
+  if [[ -d "$CLEAT_RUN_DIR" ]]; then
+    info "Removing per-container runtime dirs..."
+    rm -rf "$CLEAT_RUN_DIR" 2>/dev/null || true
   fi
 
   local dangling

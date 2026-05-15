@@ -365,6 +365,33 @@ cleat_bin_timeout() {
   refute_output --partial "syntax error"
 }
 
+@test "smoke: cleat run builds isolated .claude.json from a valid host file (strict mode)" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  printf '{"oauthAccount":{"emailAddress":"a@b.com"},"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > "$HOME/.claude.json"
+
+  run cleat_bin_timeout 5 run "$TEST_TEMP/project"
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+}
+
+@test "smoke: cleat run survives a corrupt host .claude.json (strict mode)" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  printf '{"oauthAccount": {' > "$HOME/.claude.json"   # truncated / invalid
+
+  run cleat_bin_timeout 5 run "$TEST_TEMP/project"
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  # The corruption is handled gracefully — host file backed up, not a crash.
+  assert_output --partial "invalid JSON"
+  [[ -f "$HOME/.claude.json.bak" ]]
+}
+
 @test "smoke: cleat start fails cleanly when docker run errors" {
   mkdir -p "$TEST_TEMP/project"
   printf '' > "$DOCKER_MOCK_DIR/ps_output"

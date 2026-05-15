@@ -45,6 +45,40 @@ teardown() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v0.13.0 — Claude greeted users with "Configuration Error / The configuration
+# file at /home/coder/.claude.json contains invalid JSON ... Unexpected EOF" at
+# startup, intermittently. Root cause: Cleat mounted the single host
+# ~/.claude.json WHOLE and READ-WRITE into every container. Since every
+# container runs at CWD /workspace, parallel/interrupted Claude writes to the
+# same shared host file truncated it, and all projects also shared
+# projects["/workspace"] (trust/MCP/allowedTools bled across unrelated repos).
+#
+# Fix: build a per-project, persistent ~/.claude.json (host global keys as base
+# + this project's own /workspace block) and mount THAT. The container never
+# writes the host file, so the corruption race and the bleed are gone by
+# construction. The regression guard: the container's .claude.json bind SOURCE
+# must be the per-project store, never the shared host file.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.13.0: container mounts an isolated .claude.json, not the shared host file" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  echo '{"oauthAccount":{"emailAddress":"a@b.com"}}' > "${HOME}/.claude.json"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+
+  # A .claude.json is mounted onto the canonical container path…
+  run assert_docker_run_has "$cname" ":/home/coder/.claude.json"
+  assert_success
+  # …from the per-project store, NOT the shared host file (the bug).
+  run assert_docker_run_has "$cname" "cleat/projects/"
+  assert_success
+  run assert_docker_run_lacks "$cname" "${HOME}/.claude.json:/home/coder/.claude.json"
+  assert_success
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # v0.5.1 — cmd_claude did not set _RESOLVED_PROJECT, so hook bridge
 # couldn't find project-level hooks. Silent failure in production, invisible
 # to tests because `set -u` was stripped.

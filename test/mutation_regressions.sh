@@ -584,6 +584,15 @@ s#if \[\[ \$_pruned -gt 0 \]\]; then info "Pruned \${_pruned} orphaned runtime d
 SED
 try "run_dir_clean_exit_code" "exits 0 on a successful run with nothing to prune" "$CLI" "$RUN_DIR_BATS"
 
+# v0.13.0 — the container must mount the per-project isolated .claude.json, not
+# the shared host file. Revert to the old host-file mount; the regression test
+# (which asserts the bind source is the per-project store, never ~/.claude.json)
+# must fail.
+cat > "$SED_TMP" << 'SED'
+s#mount_args+=(-v "\$project_claude_json:/home/coder/.claude.json")#mount_args+=(-v "${HOME}/.claude.json:/home/coder/.claude.json")#
+SED
+try "v0.13.0_claude_json_isolation" "container mounts an isolated .claude.json"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

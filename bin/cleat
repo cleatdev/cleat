@@ -24,6 +24,12 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 
+# Persistent per-project Claude global-state (.claude.json) store. Unlike
+# $CLEAT_RUN_DIR (per-container, wiped on `cleat rm`/recreate), this is keyed by
+# PROJECT and deliberately survives recreate so a project's trust/MCP approvals
+# persist. One file per project: $CLEAT_PROJECTS_DIR/<project_session_key>/claude.json
+CLEAT_PROJECTS_DIR="$CLEAT_CONFIG_DIR/projects"
+
 # Known capabilities (order matters for display).
 # Two behavioral categories — see _cap_category for the mapping:
 #   mount   git, ssh, env, hooks, gh   auth/identity bind-mounts (no install)
@@ -818,12 +824,89 @@ _settings_overlay_intact() {
   while IFS= read -r src; do
     [[ -z "$src" ]] && continue
     case "$src" in
-      "$overlay_dir"/*)
+      "$overlay_dir"/* | "$CLEAT_PROJECTS_DIR"/*)
+        # Overlay files and the persistent per-project .claude.json are bind
+        # sources mounted onto file destinations. If one was deleted, Docker
+        # would auto-create it as a directory and the start would fail with an
+        # opaque OCI error — recreate instead.
         [[ -f "$src" ]] || return 1
         ;;
     esac
   done <<< "$mounts"
   return 0
+}
+
+# Build a per-project ~/.claude.json for the container, isolated from the shared
+# host file. Mounting the host ~/.claude.json directly (the old behavior) caused
+# two problems, because every container runs at CWD /workspace and writes back
+# to the same host file:
+#   1. Corruption — concurrent/interrupted writes from parallel containers
+#      truncate the file → Claude greets the user with "Configuration Error /
+#      Unexpected EOF" on startup.
+#   2. Cross-project bleed — all containers share projects["/workspace"], so
+#      trust-dialog / MCP / allowedTools approvals leak between unrelated projects.
+#
+# Strategy (per-project, host-as-base): on each (re)create take the host file
+# WHOLE as the base — preserving Claude's global identity, onboarding, migration
+# flags, and whatever schema the installed host version writes (no drift) — then
+# overlay this project's persisted projects["/workspace"] block on top. Global
+# identity/onboarding keys fall back to the persisted copy when the host lacks
+# them, so onboarding done inside a container on a fresh machine still sticks.
+# The result is written ATOMICALLY (temp + mv) to a persistent, project-keyed
+# file that the container mounts. The container never writes the host file, so
+# the corruption race and the cross-project bleed are gone by construction.
+#
+# Args: $1 = output path (the mount source / persisted per-project file)
+_build_project_claude_json() {
+  local out="$1"
+  mkdir -p "$(dirname "$out")"
+
+  local host="${HOME}/.claude.json"
+  local host_src="$host"
+
+  # Corruption guard: never feed invalid JSON into the build, and never silently
+  # reset the host file to {}. Back the bad file up and warn so the user can
+  # recover it; proceed from the persisted project copy (onboarding preserved).
+  if command -v jq &>/dev/null && [[ -f "$host" && -s "$host" ]] && ! jq empty "$host" >/dev/null 2>&1; then
+    cp "$host" "${host}.bak" 2>/dev/null || true
+    warn "Host ${BOLD}~/.claude.json${RESET} is invalid JSON — backed up to ${BOLD}~/.claude.json.bak${RESET}."
+    echo -e "    ${DIM}Container uses last-known project state; the host file is left untouched.${RESET}"
+    host_src=""
+  fi
+
+  if command -v jq &>/dev/null; then
+    local tmp="${out}.tmp.$$"
+    local hf pf
+    if [[ -n "$host_src" && -f "$host_src" && -s "$host_src" ]]; then hf="$host_src"; else hf=/dev/null; fi
+    if [[ -f "$out" && -s "$out" ]]; then pf="$out"; else pf=/dev/null; fi
+    # slurpfile reads each input fully before output is written, so reading $out
+    # while writing $tmp is safe; mv makes the swap atomic.
+    if jq -n --slurpfile h "$hf" --slurpfile p "$pf" '
+        ($h[0] // {}) as $host |
+        ($p[0] // {}) as $proj |
+        $host
+        + { projects: (($host.projects // {}) + ($proj.projects // {})) }
+        + ( ["oauthAccount","userID","hasCompletedOnboarding","lastOnboardingVersion"]
+            | map({ (.): ($host[.] // $proj[.]) })
+            | add
+            | with_entries(select(.value != null)) )
+      ' > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$out"
+    else
+      rm -f "$tmp" 2>/dev/null || true
+      # jq failed unexpectedly — keep the persisted copy if present, else start clean.
+      [[ -f "$out" && -s "$out" ]] || echo '{}' > "$out"
+    fi
+  else
+    # No jq: best effort. Keep persisted copy, else seed from host, else empty.
+    if [[ -f "$out" && -s "$out" ]]; then
+      :
+    elif [[ -n "$host_src" && -f "$host_src" && -s "$host_src" ]]; then
+      cp "$host_src" "$out"
+    else
+      echo '{}' > "$out"
+    fi
+  fi
 }
 
 # Print a notice box with dynamic width. Each argument is a line of plain text.
@@ -2232,10 +2315,14 @@ cmd_run() {
     done
   fi
 
-  # Mount .claude.json if it exists on host
-  if [[ -f "${HOME}/.claude.json" ]]; then
-    mount_args+=(-v "${HOME}/.claude.json:/home/coder/.claude.json")
-  fi
+  # ── Per-project Claude global-state (.claude.json) isolation ──────────────
+  # Build an isolated, persistent per-project ~/.claude.json instead of mounting
+  # the shared host file directly. The shared mount let concurrent containers
+  # truncate the file (→ "Configuration Error / Unexpected EOF") and leaked
+  # trust/MCP approvals across projects. See _build_project_claude_json.
+  local project_claude_json="$CLEAT_PROJECTS_DIR/${project_session_key}/claude.json"
+  _build_project_claude_json "$project_claude_json"
+  mount_args+=(-v "$project_claude_json:/home/coder/.claude.json")
 
   # ── git capability: mount gitconfig (read-only) for commit identity
   if cap_is_active git; then
@@ -2848,6 +2935,13 @@ cmd_nuke() {
   if [[ -d "$CLEAT_RUN_DIR" ]]; then
     info "Removing per-container runtime dirs..."
     rm -rf "$CLEAT_RUN_DIR" 2>/dev/null || true
+  fi
+
+  # Per-project persistent .claude.json store (trust/MCP approvals) — nuke
+  # removes everything Cleat-related, so clear it too. (cleat rm preserves it.)
+  if [[ -d "$CLEAT_PROJECTS_DIR" ]]; then
+    info "Removing per-project Claude state..."
+    rm -rf "$CLEAT_PROJECTS_DIR" 2>/dev/null || true
   fi
 
   local dangling

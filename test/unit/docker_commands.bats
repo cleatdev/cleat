@@ -428,23 +428,35 @@ teardown() { _common_teardown; }
   assert_output --partial "docker build"
 }
 
-@test "run: mounts .claude.json only when it exists" {
-  # Skip if .claude.json is a bind mount (can't be temporarily removed)
-  if [[ -f "${HOME}/.claude.json" ]] && ! mv "${HOME}/.claude.json" "${HOME}/.claude.json.bak" 2>/dev/null; then
-    skip ".claude.json is a bind mount, can't test conditional mount"
-  fi
-
+@test "run: mounts an isolated per-project .claude.json, never the shared host file" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
+  echo '{"oauthAccount":{"emailAddress":"a@b.com"}}' > "${HOME}/.claude.json"
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
 
   run cmd_run "$TEST_TEMP/project"
-  run assert_docker_run_lacks "$cname" ".claude.json:/home/coder/.claude.json"
-  assert_success
 
-  # Restore if we moved it
-  [[ -f "${HOME}/.claude.json.bak" ]] && mv "${HOME}/.claude.json.bak" "${HOME}/.claude.json" || true
+  # The container always gets a .claude.json mounted onto the canonical path…
+  run assert_docker_run_has "$cname" ":/home/coder/.claude.json"
+  assert_success
+  # …but the SOURCE must be the per-project store, never the shared host file.
+  run assert_docker_run_has "$cname" "$HOME/.config/cleat/projects/"
+  assert_success
+  run assert_docker_run_lacks "$cname" "$HOME/.claude.json:/home/coder/.claude.json"
+  assert_success
+}
+
+@test "run: mounts an isolated .claude.json even with no host file (fresh machine)" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  rm -f "${HOME}/.claude.json"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  run assert_docker_run_has "$cname" ":/home/coder/.claude.json"
+  assert_success
 }
 
 @test "run: handles project path with spaces" {

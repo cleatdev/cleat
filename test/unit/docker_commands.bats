@@ -360,6 +360,38 @@ teardown() { _common_teardown; }
   rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }
 
+@test "run: cmd_rm preserves the per-project .claude.json store (approvals survive recreate)" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  echo '{"oauthAccount":{"emailAddress":"a@b.com"}}' > "${HOME}/.claude.json"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  local _basename _hash key store
+  _basename="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _hash="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
+  key="${_basename}-${_hash}"
+  store="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [[ -f "$store" ]] || { echo "store not created at $store"; return 1; }
+
+  # Simulate Claude having recorded a per-project approval into the store.
+  local with_approval
+  with_approval="$(jq '.projects["/workspace"].hasTrustDialogAccepted = true' "$store")"
+  echo "$with_approval" > "$store"
+
+  mock_docker_ps "$cname"
+  run cmd_rm "$TEST_TEMP/project"
+  assert_success
+
+  # The store — and the approval in it — must survive cleat rm.
+  [[ -f "$store" ]] || { echo "REGRESSION: cmd_rm deleted the per-project store"; return 1; }
+  run jq -r '.projects["/workspace"].hasTrustDialogAccepted' "$store"
+  assert_output "true"
+}
+
 @test "run: docker run failure is handled (spinner not orphaned)" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
@@ -457,6 +489,23 @@ teardown() { _common_teardown; }
   run cmd_run "$TEST_TEMP/project"
   run assert_docker_run_has "$cname" ":/home/coder/.claude.json"
   assert_success
+}
+
+@test "run: .claude.json bind source exists at docker-run time under strict stub (virtiofs safety)" {
+  # macOS Docker Desktop (virtiofs) requires a bind-mount SOURCE to exist as a
+  # real file before docker run, or it silently creates a directory and the
+  # file→file mount fails with an opaque OCI error. The strict stub rejects any
+  # -v whose source is missing — so a clean cmd_run proves every source (incl.
+  # the per-project .claude.json) was materialized first. Test the fresh-machine
+  # case (no host file) since that's where the old code mounted nothing at all.
+  export DOCKER_STUB_STRICT=1
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  rm -f "${HOME}/.claude.json"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "bind source path does not exist"
 }
 
 @test "run: handles project path with spaces" {

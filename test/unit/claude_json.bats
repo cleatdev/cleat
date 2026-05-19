@@ -130,7 +130,7 @@ teardown() { _common_teardown; }
 
   run _build_project_claude_json "$OUT"
   assert_success
-  assert_output --partial "invalid JSON"
+  assert_output --partial "backed up to"
 
   # Backup created, original left exactly as-is (not reset to {}).
   [[ -f "${HOST_JSON}.bak" ]]
@@ -156,4 +156,70 @@ teardown() { _common_teardown; }
   _build_project_claude_json "$OUT"
   run bash -c "ls $(dirname "$OUT")/*.tmp.* 2>/dev/null | wc -l | tr -d ' '"
   assert_output "0"
+}
+
+# ── malformed shapes (valid JSON but not an object) ─────────────────────────
+
+@test "build: a valid-JSON-but-non-object host file is treated as corrupt, not crashed on" {
+  # A JSON array/string passes `jq empty` but would crash the object merge.
+  printf '["not","an","object"]' > "$HOST_JSON"
+  mkdir -p "$(dirname "$OUT")"
+  echo '{"hasCompletedOnboarding":true}' > "$OUT"
+
+  run _build_project_claude_json "$OUT"
+  assert_success
+  assert_output --partial "backed up to"
+
+  [[ -f "${HOST_JSON}.bak" ]]
+  # Output is a valid object that kept the persisted project state.
+  run jq -e 'type=="object"' "$OUT"
+  assert_success
+  run jq -r '.hasCompletedOnboarding' "$OUT"
+  assert_output "true"
+}
+
+# ── defensive: stray directory where the output file should be ──────────────
+
+@test "build: replaces a stray directory at the output path with a regular file" {
+  echo '{"userID":"u1"}' > "$HOST_JSON"
+  # Simulate Docker having auto-created the bind source as a directory.
+  mkdir -p "$OUT/oops"
+
+  _build_project_claude_json "$OUT"
+
+  [[ -f "$OUT" ]]
+  run jq -r '.userID' "$OUT"
+  assert_output "u1"
+}
+
+# ── degraded path: no jq available ──────────────────────────────────────────
+
+@test "build: with no jq, falls back to host seed and still produces a valid file" {
+  echo '{"userID":"u1"}' > "$HOST_JSON"
+  rm -f "$OUT"
+  # Shadow jq with a PATH that has none of it.
+  local nojq="$TEST_TEMP/nojq-bin"
+  mkdir -p "$nojq"
+  for t in bash cat cp mv mkdir rm dirname echo; do
+    ln -sf "$(command -v "$t")" "$nojq/$t" 2>/dev/null || true
+  done
+
+  PATH="$nojq" run _build_project_claude_json "$OUT"
+  assert_success
+  [[ -f "$OUT" ]]
+  run cat "$OUT"
+  assert_output --partial '"userID"'
+}
+
+@test "build: with no jq and no host file, still produces an empty valid file" {
+  rm -f "$HOST_JSON" "$OUT"
+  local nojq="$TEST_TEMP/nojq-bin"
+  mkdir -p "$nojq"
+  for t in bash cat cp mv mkdir rm dirname echo; do
+    ln -sf "$(command -v "$t")" "$nojq/$t" 2>/dev/null || true
+  done
+
+  PATH="$nojq" run _build_project_claude_json "$OUT"
+  assert_success
+  [[ -f "$OUT" ]]
 }

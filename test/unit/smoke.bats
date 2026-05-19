@@ -388,7 +388,7 @@ cleat_bin_timeout() {
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
   # The corruption is handled gracefully — host file backed up, not a crash.
-  assert_output --partial "invalid JSON"
+  assert_output --partial "backed up to"
   [[ -f "$HOME/.claude.json.bak" ]]
 }
 

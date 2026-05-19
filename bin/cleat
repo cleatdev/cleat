@@ -861,15 +861,23 @@ _build_project_claude_json() {
   local out="$1"
   mkdir -p "$(dirname "$out")"
 
+  # Defensive: a stray directory at the output path (e.g. Docker auto-created a
+  # missing bind source as a dir on a prior run) would make the atomic mv fail
+  # and then break the file→file mount. Clear anything that isn't a regular file.
+  [[ -e "$out" && ! -f "$out" ]] && rm -rf "$out"
+
   local host="${HOME}/.claude.json"
   local host_src="$host"
 
-  # Corruption guard: never feed invalid JSON into the build, and never silently
-  # reset the host file to {}. Back the bad file up and warn so the user can
-  # recover it; proceed from the persisted project copy (onboarding preserved).
-  if command -v jq &>/dev/null && [[ -f "$host" && -s "$host" ]] && ! jq empty "$host" >/dev/null 2>&1; then
+  # Corruption guard: never feed a broken host file into the build, and never
+  # silently reset it to {}. "Broken" = not parseable JSON (the common case is a
+  # truncated file → Claude's "Unexpected EOF") OR valid JSON that isn't an
+  # object (a malformed shape that would crash the merge). Back the bad file up
+  # and warn so the user can recover it; proceed from the persisted project copy
+  # (onboarding preserved).
+  if command -v jq &>/dev/null && [[ -f "$host" && -s "$host" ]] && ! jq -e 'type=="object"' "$host" >/dev/null 2>&1; then
     cp "$host" "${host}.bak" 2>/dev/null || true
-    warn "Host ${BOLD}~/.claude.json${RESET} is invalid JSON — backed up to ${BOLD}~/.claude.json.bak${RESET}."
+    warn "Host ${BOLD}~/.claude.json${RESET} is corrupt — backed up to ${BOLD}~/.claude.json.bak${RESET}."
     echo -e "    ${DIM}Container uses last-known project state; the host file is left untouched.${RESET}"
     host_src=""
   fi

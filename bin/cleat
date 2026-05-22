@@ -856,6 +856,17 @@ _settings_overlay_intact() {
 # file that the container mounts. The container never writes the host file, so
 # the corruption race and the cross-project bleed are gone by construction.
 #
+# jq-free sanity check: does a file look like a JSON object? After stripping all
+# whitespace it must be non-empty and start with `{` and end with `}`. This is a
+# heuristic, not a parser — it can't catch interior damage, but it reliably
+# catches the dominant corruption mode (a truncated write → Claude's "Unexpected
+# EOF"), which never ends in `}`. Used only when jq is unavailable on the host.
+_looks_like_json_object() {
+  local content
+  content="$(tr -d '[:space:]' < "$1" 2>/dev/null)" || return 1
+  [[ -n "$content" && "${content:0:1}" == "{" && "${content: -1}" == "}" ]]
+}
+
 # Args: $1 = output path (the mount source / persisted per-project file)
 _build_project_claude_json() {
   local out="$1"
@@ -874,8 +885,18 @@ _build_project_claude_json() {
   # truncated file → Claude's "Unexpected EOF") OR valid JSON that isn't an
   # object (a malformed shape that would crash the merge). Back the bad file up
   # and warn so the user can recover it; proceed from the persisted project copy
-  # (onboarding preserved).
-  if command -v jq &>/dev/null && [[ -f "$host" && -s "$host" ]] && ! jq -e 'type=="object"' "$host" >/dev/null 2>&1; then
+  # (onboarding preserved). The guard runs WITHOUT jq too — jq gives a precise
+  # check, otherwise a pure-bash heuristic (must be {…}) catches truncation, the
+  # dominant corruption mode — so a jq-less host can't propagate a corrupt file.
+  local host_broken=false
+  if [[ -f "$host" && -s "$host" ]]; then
+    if command -v jq &>/dev/null; then
+      jq -e 'type=="object"' "$host" >/dev/null 2>&1 || host_broken=true
+    else
+      _looks_like_json_object "$host" || host_broken=true
+    fi
+  fi
+  if $host_broken; then
     cp "$host" "${host}.bak" 2>/dev/null || true
     warn "Host ${BOLD}~/.claude.json${RESET} is corrupt — backed up to ${BOLD}~/.claude.json.bak${RESET}."
     echo -e "    ${DIM}Container uses last-known project state; the host file is left untouched.${RESET}"

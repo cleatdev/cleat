@@ -200,7 +200,7 @@ teardown() { _common_teardown; }
   # Shadow jq with a PATH that has none of it.
   local nojq="$TEST_TEMP/nojq-bin"
   mkdir -p "$nojq"
-  for t in bash cat cp mv mkdir rm dirname echo; do
+  for t in bash cat cp mv mkdir rm dirname echo tr; do
     ln -sf "$(command -v "$t")" "$nojq/$t" 2>/dev/null || true
   done
 
@@ -215,11 +215,58 @@ teardown() { _common_teardown; }
   rm -f "$HOST_JSON" "$OUT"
   local nojq="$TEST_TEMP/nojq-bin"
   mkdir -p "$nojq"
-  for t in bash cat cp mv mkdir rm dirname echo; do
+  for t in bash cat cp mv mkdir rm dirname echo tr; do
     ln -sf "$(command -v "$t")" "$nojq/$t" 2>/dev/null || true
   done
 
   PATH="$nojq" run _build_project_claude_json "$OUT"
   assert_success
   [[ -f "$OUT" ]]
+}
+
+@test "build: with no jq, a truncated host file is caught and NOT copied into the container" {
+  # The dominant corruption mode (truncated write → "Unexpected EOF"). Without
+  # jq the pure-bash heuristic must still catch it so it can't be propagated.
+  printf '{"oauthAccount": {' > "$HOST_JSON"
+  rm -f "$OUT"
+  local nojq="$TEST_TEMP/nojq-bin"
+  mkdir -p "$nojq"
+  for t in bash cat cp mv mkdir rm dirname echo tr; do
+    ln -sf "$(command -v "$t")" "$nojq/$t" 2>/dev/null || true
+  done
+
+  PATH="$nojq" run _build_project_claude_json "$OUT"
+  assert_success
+  assert_output --partial "backed up to"
+  [[ -f "${HOST_JSON}.bak" ]]
+  # The corrupt content must NOT have been copied into the mounted file.
+  run cat "$OUT"
+  refute_output --partial 'oauthAccount'
+}
+
+@test "build: with no jq, a truncated host file falls back to the persisted copy" {
+  printf '{"truncated' > "$HOST_JSON"
+  mkdir -p "$(dirname "$OUT")"
+  echo '{"hasCompletedOnboarding":true}' > "$OUT"   # prior good per-project copy
+  local nojq="$TEST_TEMP/nojq-bin"
+  mkdir -p "$nojq"
+  for t in bash cat cp mv mkdir rm dirname echo tr; do
+    ln -sf "$(command -v "$t")" "$nojq/$t" 2>/dev/null || true
+  done
+
+  PATH="$nojq" run _build_project_claude_json "$OUT"
+  assert_success
+  # Prior good copy is kept (corruption did not overwrite it).
+  run cat "$OUT"
+  assert_output --partial 'hasCompletedOnboarding'
+}
+
+# ── the pure-bash heuristic itself ──────────────────────────────────────────
+
+@test "looks_like_json_object: accepts objects, rejects truncation and non-objects" {
+  printf '{"a":1}\n'        > "$TEST_TEMP/ok.json"        && _looks_like_json_object "$TEST_TEMP/ok.json"
+  printf '   \n {"a":1}  '  > "$TEST_TEMP/ws.json"        && _looks_like_json_object "$TEST_TEMP/ws.json"
+  printf '{"a": {'          > "$TEST_TEMP/trunc.json"     && ! _looks_like_json_object "$TEST_TEMP/trunc.json"
+  printf '[1,2,3]'          > "$TEST_TEMP/arr.json"       && ! _looks_like_json_object "$TEST_TEMP/arr.json"
+  printf ''                 > "$TEST_TEMP/empty.json"     && ! _looks_like_json_object "$TEST_TEMP/empty.json"
 }

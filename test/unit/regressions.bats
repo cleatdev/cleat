@@ -45,6 +45,21 @@ teardown() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v0.13.0 — the startup summary's "Project:" row always claimed the project was
+# mounted at "→ /workspace". That's a lie under the docker cap: that cap mounts
+# the project at its HOST path and sets the container workdir there (so $(pwd)
+# and `docker run -v $(pwd)` resolve on the host daemon — see the docker-cap
+# mount block). The row now branches: host path "(same path, sandboxed)" under
+# the docker cap, "→ /workspace" otherwise.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v0.13.0: summary Project row is truthful under the docker cap" {
+  ACTIVE_CAPS=(docker)
+  run _print_summary_block "cleat-x-12345678" "$HOME/proj"
+  assert_output --partial "(same path, sandboxed)"
+  refute_output --partial " /workspace"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # v0.13.0 — Claude greeted users with "Configuration Error / The configuration
 # file at /home/coder/.claude.json contains invalid JSON ... Unexpected EOF" at
 # startup, intermittently. Root cause: Cleat mounted the single host
@@ -734,11 +749,7 @@ EOF
 
 # Verify the caller (check_for_update) correctly handles latest_remote_tag
 # returning non-zero with empty output — this is the production contract.
-@test "regression: check_for_update handles empty latest_remote_tag output" {
-  # Restore the real function (setup() neutralizes it)
-  unset -f check_for_update
-  source_cli
-
+@test "regression: _maybe_prompt_cli_update handles empty latest_remote_tag output" {
   REPO_DIR="$TEST_TEMP"
   UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
   mkdir -p "$TEST_TEMP/.git" "$TEST_TEMP/bin"
@@ -750,13 +761,13 @@ echo ""
 EOF
   chmod +x "$TEST_TEMP/bin/git"
   export PATH="$TEST_TEMP/bin:$PATH"
+  # Force TTY so the check actually reaches the cache/version logic (the prompt
+  # is TTY-gated); empty cached_version must then yield no prompt and no crash.
+  _is_tty() { return 0; }
 
-  # check_for_update must not crash under strict mode even when
-  # latest_remote_tag returns non-zero with empty output
-  run check_for_update
+  run _maybe_prompt_cli_update
   assert_success
-  # No update banner should show since cached_version is empty
-  refute_output --partial "Update available"
+  refute_output --partial "update available"
 }
 
 @test "regression: latest_remote_tag accepts both vX.Y.Z and X.Y.Z refs" {
@@ -780,24 +791,23 @@ EOF
   assert_output "0.7.0"
 }
 
-@test "regression: check_for_update survives corrupted cache under strict mode" {
-  # The shared setup() neutralizes check_for_update with a no-op.
-  # Re-source the CLI to get the real function back.
-  unset -f check_for_update
-  source_cli
-
+@test "regression: _maybe_prompt_cli_update survives corrupted cache under strict mode" {
   REPO_DIR="$TEST_TEMP"
   UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
   mkdir -p "$TEST_TEMP/.git"
 
-  # Create a git stub that returns a fake tag
+  # Create a git stub that returns the current version (so the refresh yields a
+  # non-newer version → no prompt → no blocking read while we hammer the guard).
   mkdir -p "$TEST_TEMP/bin"
   printf '#!/bin/sh\necho "abc refs/tags/v%s"' "$VERSION" > "$TEST_TEMP/bin/git"
   chmod +x "$TEST_TEMP/bin/git"
   export PATH="$TEST_TEMP/bin:$PATH"
+  # Force TTY so the non-numeric-last_check arithmetic guard is actually
+  # exercised (it lives past the TTY gate).
+  _is_tty() { return 0; }
 
   # Write several flavors of corrupted cache content. Each one must not
-  # crash check_for_update under set -uo pipefail.
+  # crash the preflight under set -uo pipefail.
   local garbage
   for garbage in \
     "garbage data here" \
@@ -806,7 +816,7 @@ EOF
     "-1 $VERSION"
   do
     echo "$garbage" > "$UPDATE_CHECK_FILE"
-    run check_for_update
+    run _maybe_prompt_cli_update
     assert_success
   done
 }
@@ -1021,12 +1031,10 @@ EOF
 }
 
 @test "regression fallback: update check skips for non-git installs" {
-  unset -f check_for_update
-  source_cli
-
   REPO_DIR="$TEST_TEMP"
   # No .git directory
-  run check_for_update
+  _is_tty() { return 0; }
+  run _maybe_prompt_cli_update
   assert_success
   assert_output ""
 }

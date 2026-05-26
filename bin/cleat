@@ -42,6 +42,9 @@ _RESOLVED_PROJECT=""
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 _CLI_TRUST_PROJECT=0
+# Original argv as `main` received it — used by the CLI self-update preflight to
+# re-exec the freshly-installed version with the same command.
+_CLEAT_ORIG_ARGV=()
 
 # Caps display buckets (populated by _caps_bucket_active for _print_caps).
 _CAPS_MOUNT=()
@@ -53,6 +56,12 @@ DIM='\033[2m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+# Amber/orange for warnings — visually distinct from the neutral-yellow status
+# markers. xterm-256 color 214 (~#ffaf00) approximates the site's warning orange
+# rgb(245,158,11) and renders correctly everywhere 256-color is supported
+# (Terminal.app, iTerm2, Linux terminals, VS Code) — unlike 24-bit truecolor,
+# which degrades to the default foreground on terminals that don't support it.
+AMBER='\033[38;5;214m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
@@ -67,8 +76,27 @@ header() {
 
 info()    { echo -e "  ${BLUE}▸${RESET} $1"; }
 success() { echo -e "  ${GREEN}✔ $1${RESET}"; }
-warn()    { echo -e "  ${YELLOW}!${RESET} $1"; }
+warn()    { echo -e "  ${AMBER}!${RESET} $1"; }
 error()   { echo -e "  ${RED}✖${RESET} $1"; }
+
+# Aligned interactive Y/n prompt that pairs with an info()/warn() headline.
+# The headline owns the icon (▸/!); the question continues underneath it,
+# indented to sit under the headline TEXT (4 spaces) — not back at the margin.
+# Reads one line into the named variable. TTY-gating is the caller's job.
+#
+# A `read` FAILURE (EOF — e.g. `cleat start </dev/null`, a wrapper that redirects
+# stdin, a non-interactive pipe) yields "n", i.e. DECLINE — never an empty string.
+# Callers treat empty as the [Y/n] default of yes, so without this a redirected
+# stdin would silently auto-accept destructive actions (git checkout + re-exec,
+# a rebuild) with no human input. Empty-as-yes only happens on a real Enter press.
+# Usage: _ask_yn answer "Rebuild now? [Y/n] "
+_ask_yn() {
+  local _var="$1" _prompt="$2"
+  echo -en "    ${_prompt}"
+  local _reply=""
+  read -r _reply || { printf -v "$_var" '%s' 'n'; return 0; }
+  printf -v "$_var" '%s' "$_reply"
+}
 
 # ── Spinner ────────────────────────────────────────────────────────────────
 _SPIN_PID=""
@@ -995,9 +1023,8 @@ _resolve_config_drift() {
       "created. Caps or env keys differ from the running setup." \
       "" \
       "Recreating will apply the new settings."
-    echo -en "  Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
-    local yn
-    read -r yn
+    local yn=""
+    _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
     if [[ -z "$yn" || "$yn" == [yY]* ]]; then
       info "Recreating container..."
       if is_running "$cname"; then
@@ -1019,20 +1046,51 @@ _resolve_config_drift() {
     "Run: {BOLD}cleat rm && cleat{/BOLD}"
 }
 
-# Check for image-version drift and show a notice. Config drift is handled
-# earlier and interactively by _resolve_config_drift.
-check_drift() {
+# Image-version drift: the local image was built by an OLDER Cleat than the CLI
+# now running, so it may lack the latest container setup. Offer to rebuild it as
+# an interactive startup action — the same aligned Y/n prompt style (_ask_yn) as
+# the other startup prompts — rather than printing a static "run cleat rebuild"
+# notice.
+#
+# On accept: rebuild the image, then drop this project's container so the normal
+# start flow recreates it from the fresh image (the same mechanism
+# _resolve_config_drift uses). Runs at most once per process, TTY-only, and only
+# when the image is strictly OLDER than the CLI (never nags the reverse).
+# Disable with CLEAT_NO_REBUILD_CHECK=1.
+_REBUILD_PROMPTED=0
+_maybe_prompt_image_rebuild() {
   local cname="$1"
-  local project="${2:-}"
+  _is_tty || return 0
+  [[ "${CLEAT_NO_REBUILD_CHECK:-}" == "1" ]] && return 0
+  [[ "$_REBUILD_PROMPTED" == "1" ]] && return 0
+  image_exists || return 0
 
   local image_version
   image_version="$(_image_cleat_version)"
-  if [[ -n "$image_version" && "$image_version" != "$VERSION" ]]; then
-    _notice_box \
-      "Cleat image was built with {BOLD}v${image_version}{/BOLD} but CLI is" \
-      "{BOLD}v${VERSION}{/BOLD}. Rebuild to get the latest container setup." \
-      "" \
-      "Run: {BOLD}cleat rebuild{/BOLD}"
+  [[ -n "$image_version" && "$image_version" != "$VERSION" ]] || return 0
+  # Only prompt when the image is OLDER than the CLI. Compare on the numeric base
+  # (strip any prerelease/build suffix) so the sort's whole-line tiebreak can't
+  # mis-rank e.g. an image built at `X.Y.Z-rc1` against CLI `X.Y.Z`.
+  local base_img="${image_version%%[-+]*}" base_cli="${VERSION%%[-+]*}"
+  local newest
+  newest="$(printf '%s\n%s\n' "$base_img" "$base_cli" \
+    | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+  [[ "$newest" == "$base_cli" && "$base_img" != "$base_cli" ]] || return 0
+  _REBUILD_PROMPTED=1
+
+  echo ""
+  info "Cleat image is outdated: built with ${DIM}v${image_version}${RESET} → CLI is ${BOLD}v${VERSION}${RESET}"
+  local yn=""
+  _ask_yn yn "Rebuild the image now? ${DIM}(~2 min; recreates this project's container)${RESET} [Y/n] "
+  if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+    cmd_rebuild
+    # Drop the existing container so the start flow recreates it from the fresh
+    # image (its bind mounts and base layer are baked in at creation time).
+    if container_exists "$cname"; then
+      is_running "$cname" && docker stop "$cname" > /dev/null 2>&1 || true
+      docker rm -f "$cname" > /dev/null 2>&1 || true
+      rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -1099,7 +1157,7 @@ _print_caps() {
   if [[ $cats -le 1 ]]; then
     local color s
     if [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
-      color="$YELLOW"; s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"
+      color="$AMBER"; s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"
     else
       color="$GREEN"; s="$(printf '%s, ' "${_CAPS_MOUNT[@]}")"
     fi
@@ -1116,7 +1174,7 @@ _print_caps() {
   fi
   if [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
     s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"; s="${s%, }"
-    echo -e "${indent}  ${DIM}sandbox:${RESET}  ${YELLOW}${BOLD}${s}${RESET} ${DIM}(breaks isolation)${RESET}"
+    echo -e "${indent}  ${DIM}sandbox:${RESET}  ${AMBER}${BOLD}${s}${RESET} ${DIM}(breaks isolation)${RESET}"
   fi
 }
 
@@ -1133,7 +1191,15 @@ _print_summary_block() {
   if [[ -n "$project" ]]; then
     local _tilde='~'
     local display_path="${project/#$HOME/$_tilde}"
-    echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
+    # With the docker cap the container's workdir IS the host path (mounted at
+    # its own path so $(pwd) and `docker run -v $(pwd)` resolve on the host
+    # daemon — see the docker-cap mount block). Without it, the project lives at
+    # /workspace. Show the truth for each case.
+    if cap_is_active docker; then
+      echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}(same path, sandboxed)${RESET}"
+    else
+      echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
+    fi
   fi
   _print_caps "  " "Caps:" "       "
   _env_summary_inline "$project"
@@ -1744,38 +1810,113 @@ latest_remote_tag() {
     | tail -1
 }
 
-check_for_update() {
+# Return success only when $REPO_DIR is a git work tree with NO uncommitted
+# changes — i.e. a pristine release install onto which `git checkout v<tag>` is
+# safe. A dirty tree is a developer/contributor checkout (the maintainer's daily
+# state): there `git checkout` would fail on the very file that differs between
+# tags (bin/cleat), so offering the auto-update would just nag "Update failed" on
+# every launch. Skip it for them — `cleat update` stays available explicitly.
+_repo_is_clean() {
+  git -C "$REPO_DIR" diff --quiet 2>/dev/null \
+    && git -C "$REPO_DIR" diff --cached --quiet 2>/dev/null
+}
+
+# Checkout the given release tag and invalidate the update caches. Does NOT pull
+# the image or exit — the re-exec'd new CLI handles image/build itself. Returns
+# nonzero on any git failure so the caller can continue on the current version.
+# Separated from the prompt so tests can stub it.
+_apply_cli_update() {
+  local target="$1"
+  [[ -d "$REPO_DIR/.git" ]] || return 1
+  git -C "$REPO_DIR" fetch --tags --force --quiet 2>/dev/null || return 1
+  git -C "$REPO_DIR" checkout "v${target}" --quiet 2>/dev/null || return 1
+  # Re-check against the fresh checkout next launch (and re-evaluate the bundled
+  # Claude Code, since the new release image ships its own).
+  rm -f "$UPDATE_CHECK_FILE" "$CLAUDE_CHECK_FILE" 2>/dev/null || true
+  return 0
+}
+
+# Re-exec the (now-updated) CLI with the ORIGINAL argv so the new version drives
+# the rest of this run. CLEAT_SKIP_CLI_UPDATE stops the new process from
+# re-prompting (belt-and-suspenders; the version check already wouldn't fire).
+# Isolated so tests can override it — exec replaces the process and can't be run
+# under bats.
+_reexec_cli() {
+  export CLEAT_SKIP_CLI_UPDATE=1
+  # `exec` only returns if it FAILED (e.g. $0 no longer resolves). `execfail`
+  # lets it return instead of the shell exiting, and `|| true` keeps `set -e`
+  # from aborting — so a user who just opted into an update is never stranded
+  # with no session. The fallback re-enters main in-process (old in-memory code,
+  # but a working session); CLEAT_SKIP_CLI_UPDATE prevents a re-prompt loop.
+  shopt -s execfail 2>/dev/null || true
+  exec "$0" "${_CLEAT_ORIG_ARGV[@]+"${_CLEAT_ORIG_ARGV[@]}"}" || true
+  warn "Could not restart automatically — continuing in this session."
+  main "${_CLEAT_ORIG_ARGV[@]+"${_CLEAT_ORIG_ARGV[@]}"}"
+  exit $?
+}
+
+# Interactive CLI self-update preflight. TTY-only, throttled, opt-out-able. When
+# a newer RELEASED Cleat is available, offer to update and re-exec as that
+# version. Runs before any docker work so the new version drives the whole run.
+# Declined / non-interactive / offline → silently continue on the current
+# version. Disable entirely with CLEAT_NO_UPDATE_CHECK=1.
+_maybe_prompt_cli_update() {
+  _is_tty || return 0
+  [[ "${CLEAT_SKIP_CLI_UPDATE:-}" == "1" ]] && return 0
+  [[ "${CLEAT_NO_UPDATE_CHECK:-}" == "1" ]] && return 0
   [[ -d "$REPO_DIR/.git" ]] || return 0
 
-  local now
+  # Don't offer an auto-`git checkout` onto a developer's dirty tree — it would
+  # fail every launch (see _repo_is_clean). They can still run `cleat update`.
+  _repo_is_clean || return 0
+
+  # Cache layout: "<timestamp> <latest-version> [declined-version]". Field 3 (if
+  # present) is the version the user last declined; we don't re-nag for it.
+  local now last_check=0 cached_version="" declined_version=""
   now=$(date +%s)
-
-  local last_check=0
-  local cached_version=""
-
   if [[ -f "$UPDATE_CHECK_FILE" ]]; then
     last_check=$(awk 'NR==1 {print $1}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)
     cached_version=$(awk 'NR==1 {print $2}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo "")
-    # Defensive: corrupted cache files can yield non-numeric last_check,
-    # which would crash the arithmetic expression below under set -u.
+    declined_version=$(awk 'NR==1 {print $3}' "$UPDATE_CHECK_FILE" 2>/dev/null || echo "")
     [[ "$last_check" =~ ^[0-9]+$ ]] || last_check=0
   fi
-
-  if (( now - last_check >= UPDATE_CHECK_INTERVAL )); then
+  # Throttle the network lookup to once per interval; CLEAT_FORCE_UPDATE_CHECK
+  # bypasses (tests). Within the window we reuse the cached version, so a known
+  # newer release still prompts without hitting the network every start. Preserve
+  # the recorded decline across the refresh.
+  if [[ -n "${CLEAT_FORCE_UPDATE_CHECK:-}" ]] || (( now - last_check >= UPDATE_CHECK_INTERVAL )); then
     cached_version=$(latest_remote_tag || true)
-    echo "$now $cached_version" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
+    echo "$now $cached_version $declined_version" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
   fi
 
-  # Only show banner when remote version is strictly newer
-  if [[ -n "$cached_version" && "$cached_version" != "$VERSION" ]]; then
-    local latest
-    latest=$(printf '%s\n%s\n' "$VERSION" "$cached_version" \
-      | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
-    if [[ "$latest" = "$cached_version" ]]; then
-      _notice_box \
-        "{BOLD}Update available{/BOLD}  v${VERSION} → v${cached_version}" \
-        "Run {BOLD}cleat update{/BOLD} to install the latest version."
+  [[ -n "$cached_version" && "$cached_version" != "$VERSION" ]] || return 0
+  # Already declined THIS exact version → stay quiet until an even newer one ships.
+  [[ -n "$declined_version" && "$cached_version" == "$declined_version" ]] && return 0
+  # Only prompt when the remote release is strictly newer — never nag to
+  # downgrade (e.g. running a local prerelease ahead of the latest tag). Compare
+  # on the numeric base, stripping any prerelease/build suffix, so the sort's
+  # whole-line tiebreak can't mis-rank `X.Y.Z-rc1` against `X.Y.Z`.
+  local base_cur="${VERSION%%[-+]*}" base_new="${cached_version%%[-+]*}"
+  local newest
+  newest=$(printf '%s\n%s\n' "$base_cur" "$base_new" \
+    | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  [[ "$newest" == "$base_new" && "$base_new" != "$base_cur" ]] || return 0
+
+  echo ""
+  info "Cleat update available: ${DIM}v${VERSION}${RESET} → ${BOLD}v${cached_version}${RESET}"
+  local yn=""
+  _ask_yn yn "Upgrade now? ${DIM}(re-runs as the new version)${RESET} [Y/n] "
+  if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+    if _apply_cli_update "$cached_version"; then
+      success "Updated to v${cached_version}"
+      info "Restarting with the new version…"
+      _reexec_cli
+    else
+      warn "Update failed — continuing on v${VERSION}."
     fi
+  else
+    # Record the decline so we don't re-prompt for this version every launch.
+    echo "$now $cached_version $cached_version" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
   fi
 }
 
@@ -1856,9 +1997,8 @@ _maybe_prompt_claude_update() {
 
   echo ""
   info "New Claude Code available: ${DIM}${local_v}${RESET} → ${BOLD}${remote}${RESET} ${DIM}(${channel})${RESET}"
-  echo -en "  Update the image before starting? [Y/n] "
   local yn=""
-  read -r yn || yn=""
+  _ask_yn yn "Update the image before starting? ${DIM}(downloads the new build)${RESET} [Y/n] "
   if [[ -z "$yn" || "$yn" == [yY]* ]]; then
     _upgrade_claude_image "$channel" || warn "Update failed — starting with the current version."
   fi
@@ -1967,7 +2107,7 @@ _do_pull() {
   { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
 
   if [[ $rc -ne 0 ]]; then
-    printf "\r\033[K  ${YELLOW}!${RESET} Prebuilt image unavailable for v%s, building locally\n" \
+    printf "\r\033[K  ${AMBER}!${RESET} Prebuilt image unavailable for v%s, building locally\n" \
       "$target_version"
     rm -f "$log"
     return 1
@@ -2066,9 +2206,8 @@ cmd_upgrade_claude() {
   cname="$(container_name_for "$project")"
   if container_exists "$cname"; then
     if _is_tty; then
-      echo -en "  Recreate ${BOLD}${cname}${RESET} now to use it? [Y/n] "
       local yn=""
-      read -r yn || yn=""
+      _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now to use it? [Y/n] "
       if [[ -z "$yn" || "$yn" == [yY]* ]]; then
         if is_running "$cname"; then
           docker stop "$cname" > /dev/null 2>&1 || true
@@ -2146,7 +2285,24 @@ _upgrade_claude_image() {
     docker commit --change 'CMD ["bash"]' "$tmp" "$IMAGE_NAME" >> "$log" 2>&1 || rc=$?
   fi
   docker rm -f "$tmp" > /dev/null 2>&1 || true
-  spin_stop "$rc" "Claude Code upgraded" "Upgrade failed"
+
+  # Fold the version delta straight into the success line so the result is a
+  # single row — "Claude Code upgraded (2.1.156 → 2.1.161)" — instead of a green
+  # check followed by a separate version line. Read the new version BEFORE
+  # spin_stop, and keep the message plain text: spin_stop's TTY path prints it
+  # with printf %s, which would NOT interpret embedded color escapes.
+  local after="" ok_msg="Claude Code upgraded"
+  if [[ $rc -eq 0 ]]; then
+    after="$(_image_claude_version)"
+    if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
+      ok_msg="Claude Code upgraded (${before} → ${after})"
+    elif [[ -n "$after" && "$before" == "$after" ]]; then
+      ok_msg="Claude Code already at ${after} (no change)"
+    elif [[ -n "$after" ]]; then
+      ok_msg="Claude Code upgraded (now ${after})"
+    fi
+  fi
+  spin_stop "$rc" "$ok_msg" "Upgrade failed"
 
   if [[ $rc -ne 0 ]]; then
     echo ""
@@ -2157,15 +2313,7 @@ _upgrade_claude_image() {
   fi
   rm -f "$log"
 
-  local after
-  after="$(_image_claude_version)"
-  if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
-    info "Claude Code ${DIM}${before}${RESET} → ${BOLD}${after}${RESET}"
-  elif [[ -n "$after" && "$before" == "$after" ]]; then
-    info "Claude Code already at ${BOLD}${after}${RESET} ${DIM}(no change)${RESET}"
-  elif [[ -n "$after" ]]; then
-    info "Claude Code now at ${BOLD}${after}${RESET}"
-  else
+  if [[ -z "$after" ]]; then
     warn "Upgrade committed, but could not read the installed Claude Code version."
   fi
 
@@ -2206,6 +2354,10 @@ cmd_run() {
   else
     success "Image ready ${RESET}${DIM}(cached)"
   fi
+
+  # If the image was built by an older Cleat, offer to rebuild it before we
+  # create the container (so the fresh container picks up the new setup).
+  _maybe_prompt_image_rebuild "$cname"
 
   # If a newer Claude Code than the image ships is available, offer to bump it
   # (durably, by committing into the image) before we start the container.
@@ -2463,6 +2615,11 @@ cmd_start() {
   # container so the branches below fall into cmd_run with the new settings.
   _resolve_config_drift "$cname" "$project"
 
+  # Image-version drift — offer to rebuild before any docker operations. On
+  # accept it removes the container too, so the branches below recreate it
+  # from the freshly-built image.
+  _maybe_prompt_image_rebuild "$cname"
+
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
@@ -2487,9 +2644,8 @@ cmd_start() {
           rm -f "$_docker_err"
           if _is_tty; then
             echo ""
-            echo -n "  Remove container and start fresh? [Y/n] "
-            local yn
-            read -r yn
+            local yn=""
+            _ask_yn yn "Remove container and start fresh? [Y/n] "
             if [[ -z "$yn" || "$yn" == [yY]* ]]; then
               docker rm -f "$cname" > /dev/null 2>&1 || true
               success "Removed ${BOLD}$cname${RESET}."
@@ -2519,13 +2675,7 @@ cmd_start() {
     warn "Docker socket mounted — container can create host-level processes"
   fi
 
-  check_for_update
   show_first_run_tip
-
-  # Drift detection on existing containers
-  if container_exists "$cname"; then
-    check_drift "$cname" "$project"
-  fi
 
   success "Claude launched"
   _print_summary_block "$cname" "$project"
@@ -2548,6 +2698,9 @@ cmd_resume() {
   # accepts, the container and tmp dirs are gone; the missing-container path
   # below will call cmd_run, which rebuilds the overlay from scratch.
   _resolve_config_drift "$cname" "$project"
+
+  # Image-version drift — offer to rebuild (and recreate) before resuming.
+  _maybe_prompt_image_rebuild "$cname"
 
   # Refresh settings overlays (user may have changed hooks between stop/resume)
   local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
@@ -2631,11 +2784,6 @@ cmd_resume() {
   if cap_is_active docker; then
     warn "Docker socket mounted — container can create host-level processes"
   fi
-
-  check_for_update
-
-  # Drift detection
-  check_drift "$cname" "$project"
 
   success "Session resumed"
   _print_summary_block "$cname" "$project"
@@ -2786,8 +2934,6 @@ cmd_claude() {
   if cap_is_active docker; then
     warn "Docker socket mounted — container can create host-level processes"
   fi
-
-  check_for_update
 
   success "Claude launched"
   _print_summary_block "$cname" "$project"
@@ -3152,9 +3298,8 @@ _config_picker_tui() {
           *,env,*)
             if [[ ! -f "$(pwd)/.cleat.env" ]]; then
               echo ""
-              echo -n "  Create .cleat.env in current project? [Y/n] "
-              local yn
-              read -r yn
+              local yn=""
+              _ask_yn yn "Create .cleat.env in current project? [Y/n] "
               if [[ -z "$yn" || "$yn" == [yY]* ]]; then
                 _scaffold_cleat_env "$(pwd)"
               fi
@@ -3229,9 +3374,8 @@ _config_picker_text() {
           *,env,*)
             if [[ ! -f "$(pwd)/.cleat.env" ]]; then
               echo ""
-              echo -n "  Create .cleat.env in current project? [Y/n] "
-              local yn
-              read -r yn
+              local yn=""
+              _ask_yn yn "Create .cleat.env in current project? [Y/n] "
               if [[ -z "$yn" || "$yn" == [yY]* ]]; then
                 _scaffold_cleat_env "$(pwd)"
               fi
@@ -3665,6 +3809,10 @@ parse_global_flags() {
 
 # ── Main ────────────────────────────────────────────────────────────────────
 main() {
+  # Capture the original argv verbatim BEFORE flag parsing consumes it, so the
+  # CLI self-update preflight can re-exec the new version with the same command.
+  _CLEAT_ORIG_ARGV=("$@")
+
   # Defense-in-depth: always kill spinner and restore cursor on exit.
   # exec_claude sets its own trap (which calls _cleanup_spin internally).
   trap '_cleanup_spin' EXIT
@@ -3674,6 +3822,13 @@ main() {
 
   local cmd="${1:-start}"
   shift 2>/dev/null || true
+
+  # Interactive CLI self-update preflight — only for the session-launching
+  # commands, and before any docker work: accepting re-execs the new version,
+  # which then drives the entire run.
+  case "$cmd" in
+    start|resume|r|run|claude|shell|sh) _maybe_prompt_cli_update ;;
+  esac
 
   case "$cmd" in
     start)     cmd_start "$@" ;;

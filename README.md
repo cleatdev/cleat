@@ -477,7 +477,7 @@ Cleat also bind-mounts your project at its **host path** inside the container (i
 
 The `CLEAT_HOST_PROJECT` environment variable is exported with your project's host path for scripts that want it explicitly.
 
-> **Security note.** The Docker socket grants root-equivalent access to your host. Any process inside the container that can reach `/var/run/docker.sock` can create a container that mounts `/` from the host and escape the sandbox (this is a property of Docker, not Cleat). When the capability is active, Cleat prints a yellow warning on startup:
+> **Security note.** The Docker socket grants root-equivalent access to your host. Any process inside the container that can reach `/var/run/docker.sock` can create a container that mounts `/` from the host and escape the sandbox (this is a property of Docker, not Cleat). When the capability is active, Cleat prints an amber warning on startup:
 >
 > ```
 >   ! Docker socket mounted — container can create host-level processes

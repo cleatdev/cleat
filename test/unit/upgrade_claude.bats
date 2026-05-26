@@ -56,6 +56,36 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+# ── Consolidated success line ────────────────────────────────────────────────
+
+@test "upgrade-claude: folds the version delta into a single success line" {
+  mock_docker_images "cleat"
+  mock_docker_ps_a ""
+  # Stateful stub: first call (before) → old version, second (after) → new.
+  local seq="$TEST_TEMP/iclaude.seq"
+  echo 0 > "$seq"
+  _image_claude_version() {
+    local n; n="$(cat "$seq")"; echo $((n + 1)) > "$seq"
+    if [[ "$n" -eq 0 ]]; then echo "2.1.156"; else echo "2.1.161"; fi
+  }
+
+  run cmd_upgrade_claude latest
+  assert_success
+  # One consolidated row — not a green check followed by a separate version line.
+  assert_output --partial "Claude Code upgraded (2.1.156 → 2.1.161)"
+  refute_output --partial "▸ Claude Code 2.1.156"
+}
+
+@test "upgrade-claude: success line reports no-change when version is identical" {
+  mock_docker_images "cleat"
+  mock_docker_ps_a ""
+  _image_claude_version() { echo "2.1.161"; }   # before == after
+
+  run cmd_upgrade_claude latest
+  assert_success
+  assert_output --partial "already at 2.1.161 (no change)"
+}
+
 # ── Input validation / injection hardening ──────────────────────────────────
 
 @test "upgrade-claude: rejects a bogus channel before touching docker" {

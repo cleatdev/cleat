@@ -28,6 +28,8 @@ REGRESSIONS="$REPO_ROOT/test/unit/regressions.bats"
 UPGRADE_BATS="$REPO_ROOT/test/unit/upgrade_claude.bats"
 CLAUDE_BATS="$REPO_ROOT/test/unit/claude_update_check.bats"
 RUN_DIR_BATS="$REPO_ROOT/test/unit/run_dir.bats"
+VERSION_BATS="$REPO_ROOT/test/unit/version.bats"
+TERMINAL_UX_BATS="$REPO_ROOT/test/unit/terminal_ux.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
@@ -441,11 +443,13 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.12.1_drift_recreate_wired" "cmd_start invokes _resolve_config_drift"
 
-# v0.12.1 — the drift recreate prompt must interpret ANSI escapes. Mutate
-# `echo -en` back to `echo -n` so $BOLD/$RESET print as literal `\033[...]`
-# strings; the regression test asserts no such literal appears in output.
+# v0.12.1 — the drift recreate prompt must interpret ANSI escapes. The prompt
+# now routes through the shared _ask_yn helper, so mutate ITS `echo -en` back to
+# `echo -n`: $BOLD/$RESET would then print as literal `\033[...]` strings. The
+# regression test (pipes "y" into _resolve_config_drift) asserts no such literal
+# appears — and this guards every prompt that uses _ask_yn, not just this one.
 cat > "$SED_TMP" << 'SED'
-s|echo -en "  Recreate|echo -n "  Recreate|
+s|echo -en "    ${_prompt}"|echo -n "    ${_prompt}"|
 SED
 try "v0.12.1_drift_prompt_ansi" "drift recreate prompt interprets ANSI escapes"
 
@@ -592,6 +596,37 @@ cat > "$SED_TMP" << 'SED'
 s#mount_args+=(-v "\$project_claude_json:/home/coder/.claude.json")#mount_args+=(-v "${HOME}/.claude.json:/home/coder/.claude.json")#
 SED
 try "v0.13.0_claude_json_isolation" "container mounts an isolated .claude.json"
+
+# v0.13.0 — the summary "Project:" row must tell the truth under the docker cap
+# (host path "(same path, sandboxed)", not "→ /workspace"). Revert the docker
+# branch to the /workspace form; the regression test must fail.
+cat > "$SED_TMP" << 'SED'
+s#${display_path} ${DIM}(same path, sandboxed)${RESET}#${display_path} ${DIM}→${RESET} /workspace#
+SED
+try "v0.13.0_project_row_docker_cap" "summary Project row is truthful under the docker cap"
+
+# v0.13.0 — _ask_yn must treat a read FAILURE (EOF / redirected stdin) as DECLINE,
+# not empty (which callers read as the [Y/n] default of yes). Revert to the old
+# empty-on-EOF behavior; the EOF-decline test must fail.
+cat > "$SED_TMP" << 'SED'
+s#read -r _reply || { printf -v "$_var" '%s' 'n'; return 0; }#read -r _reply || _reply=""#
+SED
+try "v0.13.0_ask_yn_eof_declines" "EOF / redirected stdin yields decline" "$CLI" "$TERMINAL_UX_BATS"
+
+# v0.13.0 — the CLI self-update must skip a dirty/dev tree (else it nags
+# "Update failed" every launch). Drop the guard; the dirty-tree skip test fails.
+cat > "$SED_TMP" << 'SED'
+/_repo_is_clean || return 0/d
+SED
+try "v0.13.0_cli_update_skips_dirty_tree" "skips entirely on a dirty/dev tree" "$CLI" "$VERSION_BATS"
+
+# v0.13.0 — _apply_cli_update must check out the v-prefixed tag (latest_remote_tag
+# returns a bare X.Y.Z; tags are vX.Y.Z). Drop the prefix; the real-git apply
+# test (which asserts `checkout v9.9.9`) must fail.
+cat > "$SED_TMP" << 'SED'
+s#checkout "v${target}"#checkout "${target}"#
+SED
+try "v0.13.0_apply_checkout_v_prefix" "_apply_cli_update checks out v<tag>" "$CLI" "$VERSION_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

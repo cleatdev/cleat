@@ -236,11 +236,88 @@ MOCK
   assert_output --partial "/workspace"
 }
 
+@test "summary block: without docker cap, project maps to /workspace" {
+  ACTIVE_CAPS=(git)
+  run _print_summary_block "cleat-test-12345678" "$HOME/my-project"
+  assert_output --partial "~/my-project"
+  assert_output --partial "/workspace"
+  refute_output --partial "same path"
+}
+
+@test "summary block: with docker cap, project shows host path (not /workspace)" {
+  # The docker cap mounts the project at its host path and sets workdir there,
+  # so the container's cwd IS the host path — /workspace would be a lie.
+  ACTIVE_CAPS=(docker)
+  run _print_summary_block "cleat-test-12345678" "$HOME/my-project"
+  assert_output --partial "~/my-project"
+  assert_output --partial "(same path, sandboxed)"
+  refute_output --partial "→${RESET} /workspace"
+  refute_output --partial " /workspace"
+}
+
 @test "summary block: shows capabilities when active" {
   ACTIVE_CAPS=(git ssh)
   run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
   assert_output --partial "Caps:"
   assert_output --partial "git, ssh"
+}
+
+# ── Warning color: amber (256-color 214), not plain yellow ───────────────────
+
+@test "warn: renders in amber (xterm-256 color 214)" {
+  run warn "Docker socket mounted — container can create host-level processes"
+  assert_output --partial "38;5;214"
+  assert_output --partial "Docker socket mounted"
+}
+
+@test "caps: the sandbox row renders in amber, matching the warning color" {
+  ACTIVE_CAPS=(git docker)   # two categories → labeled block with a sandbox row
+  run _print_caps "  " "Caps:" "       "
+  assert_output --partial "sandbox:"
+  assert_output --partial "38;5;214"
+  assert_output --partial "(breaks isolation)"
+}
+
+@test "caps: the mount row is NOT amber (stays green)" {
+  ACTIVE_CAPS=(git ssh)   # mount-only → single green row
+  run _print_caps "  " "Caps:" "       "
+  refute_output --partial "38;5;214"
+}
+
+@test "caps: a sandbox-only (single-category) row is also amber" {
+  ACTIVE_CAPS=(docker)   # sandbox-only → single-line collapsed form
+  run _print_caps "  " "Caps:" "       "
+  assert_output --partial "38;5;214"
+  assert_output --partial "docker"
+}
+
+# ── Aligned Y/n prompt helper ────────────────────────────────────────────────
+
+@test "ask_yn: question is indented under the headline text, not at the margin" {
+  run _ask_yn _discard "Rebuild the image now? [Y/n] " <<< "y"
+  # Four-space indent aligns the question under an info()/warn() headline's text.
+  assert_output --partial "    Rebuild the image now? [Y/n] "
+}
+
+@test "ask_yn: reads the answer into the named variable" {
+  local answer=""
+  _ask_yn answer "Proceed? [Y/n] " <<< "n" >/dev/null
+  assert_equal "$answer" "n"
+}
+
+@test "ask_yn: a real Enter (empty line) stays empty so callers apply the [Y/n] default" {
+  local answer="sentinel"
+  _ask_yn answer "Proceed? [Y/n] " <<< "" >/dev/null
+  assert_equal "$answer" ""
+}
+
+@test "ask_yn: EOF / redirected stdin yields decline (n), never empty default-yes" {
+  # cleat start </dev/null, wrappers, tmux respawn: stdout may be a TTY while
+  # stdin is EOF. read fails -> must decline, NOT return empty (which callers
+  # treat as the default yes and would silently run a destructive action).
+  local answer="sentinel"
+  _ask_yn answer "Proceed? [Y/n] " </dev/null >/dev/null
+  assert_equal "$answer" "n"
 }
 
 @test "summary block: omits Caps line when no capabilities" {

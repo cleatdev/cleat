@@ -16,8 +16,13 @@ BRIDGE_FILE="$BRIDGE/.browser-open"
 
 url="${1:-}"
 
-# If no argument, read from stdin
-if [ -z "$url" ]; then
+# If no argument, read from stdin — but only when stdin is NOT a terminal.
+# A pipe (e.g. `printf '%s' "$url" | open`) still feeds a URL, while an
+# interactive `open` with no argument falls through to the usage error below
+# instead of blocking forever on `cat` reading the tty. This also keeps the
+# test suite from hanging: the open-bridge empty-input test runs this shim with
+# no arg, and `./test.sh` in a terminal would otherwise inherit the TTY on fd0.
+if [ -z "$url" ] && [ ! -t 0 ]; then
   url="$(cat)"
 fi
 

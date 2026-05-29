@@ -1726,3 +1726,35 @@ ${overlay_dir}/project-settings.local.json"
 
   rm -rf "$overlay_dir" "$CLEAT_RUN_DIR/${cname}/clip"
 }
+
+# ── v0.13.0: `./test.sh` must not hang on an interactive terminal ────────────
+# The open-bridge shim (installed in the container as open/xdg-open) read fd0
+# via `cat` when invoked with no URL. The open-bridge "rejects empty input" test
+# in hooks.bats runs it with an empty arg; when `./test.sh` is run in a terminal
+# (stdin = TTY, inherited through bats), `cat` blocked forever and the whole
+# suite hung at the hooks file. Two complementary guards below.
+
+@test "regression v0.13.0: open-bridge does not read stdin when fd0 is a tty" {
+  # Root-cause fix lives in the shipped shim: it must guard the `cat` read behind
+  # a "not a terminal" check so an interactive `open`/`xdg-open` with no argument
+  # (and the empty-input test) falls through to usage instead of blocking. A pipe
+  # is still consumed because a pipe is not a tty.
+  local script="$PROJECT_ROOT/docker/open-bridge"
+  [[ -f "$script" ]] || { echo "open-bridge shim missing"; return 1; }
+  grep -qE '\[ *! -t 0 *\]' "$script" || {
+    echo "open-bridge reads stdin without a tty guard — interactive use can hang"
+    return 1
+  }
+}
+
+@test "regression v0.13.0: test runner isolates bats stdin from the terminal" {
+  # Defense in depth: the per-file loop must run bats with stdin from /dev/null
+  # so any future test that reads fd0 gets EOF (matching CI) instead of blocking
+  # on the developer's terminal.
+  local runner="$PROJECT_ROOT/test.sh"
+  [[ -f "$runner" ]] || { echo "test.sh missing"; return 1; }
+  grep -qE '"\$BATS" "\$f".*</dev/null' "$runner" || {
+    echo "test.sh runs bats without </dev/null — interactive ./test.sh can hang"
+    return 1
+  }
+}

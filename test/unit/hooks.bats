@@ -1227,8 +1227,27 @@ SCRIPT
   sed "s|/tmp/cleat-clip|${bridge}|g" "$script" > "$wrapper"
   chmod +x "$wrapper"
 
-  run bash "$wrapper" ""
+  # Feed /dev/null on fd0: the shim only reads stdin when fd0 is not a tty, but
+  # be explicit so this test can never block when run directly in a terminal.
+  run bash "$wrapper" "" </dev/null
   assert_failure
+}
+
+@test "open-bridge: forwards a URL piped on stdin (non-tty)" {
+  local bridge="$TEST_TEMP/clip"
+  mkdir -p "$bridge"
+  local script="$PROJECT_ROOT/docker/open-bridge"
+
+  local wrapper="$TEST_TEMP/test-open-bridge.sh"
+  sed "s|/tmp/cleat-clip|${bridge}|g" "$script" > "$wrapper"
+  chmod +x "$wrapper"
+
+  # No URL arg → the shim reads it from stdin because the pipe is not a tty.
+  run bash -c "printf '%s' 'https://example.com/piped' | '$wrapper'"
+  assert_success
+  [[ -f "$bridge/.browser-open" ]] || return 1
+  run cat "$bridge/.browser-open"
+  assert_output "https://example.com/piped"
 }
 
 # ── Auth callback proxy ──────────────────────────────────────────────────
@@ -1440,9 +1459,13 @@ SCRIPT
   local bw_killed="$TEST_TEMP/login-bw-killed2"
   _browser_watcher() {
     touch "$bw_started"
-    trap "touch '$bw_killed'; exit 0" TERM
     sleep 60 &
-    wait $!
+    local pid=$!
+    # Kill the backgrounded sleep inside the trap (like the success-path test
+    # above). Leaving it orphaned keeps the `run` output pipe open for the full
+    # 60s, turning a fast assertion into a 60s stall.
+    trap "touch '$bw_killed'; kill $pid 2>/dev/null; exit 0" TERM
+    wait "$pid"
   }
   _host_open_cmd() { echo "true"; }
   export DOCKER_EXIT_CODE=1

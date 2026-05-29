@@ -32,9 +32,13 @@ VERSION_BATS="$REPO_ROOT/test/unit/version.bats"
 TERMINAL_UX_BATS="$REPO_ROOT/test/unit/terminal_ux.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
+OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
+TEST_SH="$REPO_ROOT/test.sh"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
 INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
 ENTRYPOINT_BACKUP="/tmp/cleat-regression-mutation-entrypoint-backup-$$"
+OPENBRIDGE_BACKUP="/tmp/cleat-regression-mutation-openbridge-backup-$$"
+TEST_SH_BACKUP="/tmp/cleat-regression-mutation-testsh-backup-$$"
 
 BOLD=$'\033[1m'
 RED=$'\033[0;31m'
@@ -47,13 +51,18 @@ cleanup() {
   [[ -f "$BACKUP" ]] && cp "$BACKUP" "$CLI"
   [[ -f "$INSTALLER_BACKUP" ]] && cp "$INSTALLER_BACKUP" "$INSTALLER"
   [[ -f "$ENTRYPOINT_BACKUP" ]] && cp "$ENTRYPOINT_BACKUP" "$ENTRYPOINT"
-  rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP"
+  [[ -f "$OPENBRIDGE_BACKUP" ]] && cp "$OPENBRIDGE_BACKUP" "$OPENBRIDGE"
+  [[ -f "$TEST_SH_BACKUP" ]] && cp "$TEST_SH_BACKUP" "$TEST_SH"
+  rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP" \
+        "$OPENBRIDGE_BACKUP" "$TEST_SH_BACKUP"
 }
 trap cleanup EXIT INT TERM
 
 cp "$CLI" "$BACKUP"
 cp "$INSTALLER" "$INSTALLER_BACKUP"
 cp "$ENTRYPOINT" "$ENTRYPOINT_BACKUP"
+cp "$OPENBRIDGE" "$OPENBRIDGE_BACKUP"
+cp "$TEST_SH" "$TEST_SH_BACKUP"
 filter="${1:-}"
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
@@ -65,6 +74,10 @@ run_mutation() {
     backup="$INSTALLER_BACKUP"
   elif [[ "$target" == "$ENTRYPOINT" ]]; then
     backup="$ENTRYPOINT_BACKUP"
+  elif [[ "$target" == "$OPENBRIDGE" ]]; then
+    backup="$OPENBRIDGE_BACKUP"
+  elif [[ "$target" == "$TEST_SH" ]]; then
+    backup="$TEST_SH_BACKUP"
   else
     backup="$BACKUP"
   fi
@@ -94,7 +107,7 @@ run_mutation() {
   fi
 
   # Run only the target test; expect it to FAIL
-  if "$BATS" --filter "$test_filter" "$test_file" >/dev/null 2>&1; then
+  if "$BATS" --filter "$test_filter" "$test_file" </dev/null >/dev/null 2>&1; then
     echo "${RED}✖ $name: MISSED${RESET} ${DIM}(test passed against mutated code)${RESET}"
     return 1
   else
@@ -627,6 +640,25 @@ cat > "$SED_TMP" << 'SED'
 s#checkout "v${target}"#checkout "${target}"#
 SED
 try "v0.13.0_apply_checkout_v_prefix" "_apply_cli_update checks out v<tag>" "$CLI" "$VERSION_BATS"
+
+# v0.13.0 — the open-bridge shim must guard its stdin `cat` read behind a tty
+# check, else an interactive `open` (and `./test.sh` on a terminal) blocks
+# forever. Remove the guard; the regression test that greps for `[ ! -t 0 ]`
+# in the shim must fail.
+cat > "$SED_TMP" << 'SED'
+s/ && \[ ! -t 0 \]//
+SED
+try "v0.13.0_openbridge_tty_guard" "open-bridge does not read stdin when fd0 is a tty" "$OPENBRIDGE" "$REGRESSIONS"
+
+# v0.13.0 — the test runner must feed bats stdin from /dev/null so an
+# interactive run can't hang on a test that reads fd0. Drop the redirect; the
+# regression test that greps test.sh for `</dev/null` on the bats call must
+# fail. (Delete the token rather than rewriting the tail — a `&` in the sed
+# replacement would expand to the whole match and leave `</dev/null` behind.)
+cat > "$SED_TMP" << 'SED'
+s#"\$f" </dev/null#"\$f"#
+SED
+try "v0.13.0_testsh_stdin_isolation" "test runner isolates bats stdin from the terminal" "$TEST_SH" "$REGRESSIONS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

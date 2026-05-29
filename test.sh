@@ -51,7 +51,10 @@ for f in "${files[@]}"; do
   fname="$(basename "$f" .bats)"
   total_files=$((total_files + 1))
 
-  output=$("$BATS" "$f" 2>&1)
+  # Redirect bats stdin from /dev/null so an interactive `./test.sh` matches CI:
+  # any test that reads fd0 (e.g. a shim that falls through to `cat`) gets EOF
+  # instead of blocking forever on the developer's terminal.
+  output=$("$BATS" "$f" </dev/null 2>&1)
   file_pass=$(echo "$output" | grep -c "^ok " || true)
   file_fail=$(echo "$output" | grep -c "^not ok " || true)
   file_skip=$(echo "$output" | grep -c "# skip" || true)

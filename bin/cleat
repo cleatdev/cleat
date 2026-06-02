@@ -77,6 +77,10 @@ header() {
 info()    { echo -e "  ${BLUE}▸${RESET} $1"; }
 success() { echo -e "  ${GREEN}✔ $1${RESET}"; }
 warn()    { echo -e "  ${AMBER}!${RESET} $1"; }
+# A sandbox-break warning: the whole line renders in the sandbox amber (marker
+# AND message), so it reads as loud as the `docker` cap it warns about — unlike
+# generic warn(), which tints only the `!` marker and leaves the text default.
+warn_sandbox() { echo -e "  ${AMBER}! $1${RESET}"; }
 error()   { echo -e "  ${RED}✖${RESET} $1"; }
 
 # Aligned interactive Y/n prompt that pairs with an info()/warn() headline.
@@ -2672,7 +2676,7 @@ cmd_start() {
 
   # Docker cap is the only capability that breaks the sandbox — loud warning.
   if cap_is_active docker; then
-    warn "Docker socket mounted — container can create host-level processes"
+    warn_sandbox "Docker socket mounted — container can create host-level processes"
   fi
 
   show_first_run_tip
@@ -2782,7 +2786,7 @@ cmd_resume() {
 
   # Docker cap is the only capability that breaks the sandbox — loud warning.
   if cap_is_active docker; then
-    warn "Docker socket mounted — container can create host-level processes"
+    warn_sandbox "Docker socket mounted — container can create host-level processes"
   fi
 
   success "Session resumed"
@@ -2932,7 +2936,7 @@ cmd_claude() {
   fi
 
   if cap_is_active docker; then
-    warn "Docker socket mounted — container can create host-level processes"
+    warn_sandbox "Docker socket mounted — container can create host-level processes"
   fi
 
   success "Claude launched"

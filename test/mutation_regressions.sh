@@ -660,6 +660,15 @@ s#"\$f" </dev/null#"\$f"#
 SED
 try "v0.13.0_testsh_stdin_isolation" "test runner isolates bats stdin from the terminal" "$TEST_SH" "$REGRESSIONS"
 
+# v0.13.0 — the sandbox-break warning (`warn_sandbox`) must render its whole
+# line in amber, not just the `!`, so the docker-socket caution matches the
+# sandbox cap. Revert it to the marker-only form; the terminal_ux test that
+# asserts the amber code runs straight into the message must fail.
+cat > "$SED_TMP" << 'SED'
+s|\${AMBER}! \$1\${RESET}|\${AMBER}!\${RESET} \$1|
+SED
+try "v0.13.0_warn_sandbox_full_amber" "the whole line is amber, matching the sandbox cap" "$CLI" "$TERMINAL_UX_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

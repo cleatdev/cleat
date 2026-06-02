@@ -264,10 +264,19 @@ MOCK
 
 # ── Warning color: amber (256-color 214), not plain yellow ───────────────────
 
-@test "warn: renders in amber (xterm-256 color 214)" {
-  run warn "Docker socket mounted — container can create host-level processes"
+@test "warn: the ! marker renders in amber (xterm-256 color 214)" {
+  run warn "caution: something happened"
   assert_output --partial "38;5;214"
-  assert_output --partial "Docker socket mounted"
+  assert_output --partial "caution: something happened"
+}
+
+@test "warn_sandbox: the whole line is amber, matching the sandbox cap" {
+  # A sandbox-break warning must read as loud as the docker cap: the message
+  # text — not just the `!` — is amber. The substring asserts the amber code is
+  # immediately followed by the marker AND message with no reset between them
+  # (the bug: warn-style output resets the color right after `!`).
+  run warn_sandbox "Docker socket mounted — container can create host-level processes"
+  assert_output --partial "214m! Docker socket mounted"
 }
 
 @test "caps: the sandbox row renders in amber, matching the warning color" {

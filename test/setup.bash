@@ -29,6 +29,14 @@ _common_setup() {
   export HOME
   mkdir -p "$HOME/.claude"
 
+  # The CLI derives its config/run/projects dirs from XDG_CONFIG_HOME, falling
+  # back to $HOME/.config (CLEAT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cleat").
+  # A CI runner (or dev) that exports XDG_CONFIG_HOME would pull those dirs OUT
+  # of the isolated HOME set above — leaking runtime/projects state across tests
+  # and breaking "$HOME/.config/..." path assertions. Clear the XDG path vars so
+  # the CLI always resolves under the sandboxed HOME.
+  unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
+
   # Git commits in some tests need an author identity. Inject via env vars
   # so we don't need a global .gitconfig (which would pollute the real host).
   export GIT_AUTHOR_NAME="Cleat Test"

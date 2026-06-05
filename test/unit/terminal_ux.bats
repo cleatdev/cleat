@@ -109,10 +109,11 @@ MOCK
   # Run actual binary — set -euo pipefail is active.
   # Redirect stdin from /dev/null to ensure non-interactive mode
   # (macOS CI runners may report TTY=true, triggering interactive recovery).
+  cd "$TEST_TEMP/strict-project"
   run env PATH="$TEST_TEMP/strict-bin:$PATH" \
     HOME="$TEST_TEMP" \
     XDG_CONFIG_HOME="$TEST_TEMP/strict-config" \
-    bash "$CLI" start "$TEST_TEMP/strict-project" < /dev/null
+    bash "$CLI" start < /dev/null
 
   # Must fail with proper message (spin_stop was reached, not set -e abort)
   assert_failure

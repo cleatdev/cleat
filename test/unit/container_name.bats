@@ -158,3 +158,40 @@ teardown() { _common_teardown; }
   result="$(container_name_for "/tmp/\$\$\$\$")"
   [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
 }
+
+# ── Boxes — named per-project sandboxes (see concept/20-boxes.md) ────────────
+
+@test "box: a named box appends -<box> to the container name" {
+  local base named
+  base="$(container_name_for "/home/user/api")"
+  named="$(container_name_for "/home/user/api" az)"
+  assert_equal "$named" "${base}-az"
+}
+
+@test "box: the 'main' box is byte-identical to the no-box name" {
+  # Upgrade-safety: cleat start main must resolve to the exact legacy container.
+  assert_equal "$(container_name_for "/home/user/api" main)" "$(container_name_for "/home/user/api")"
+}
+
+@test "box: an empty box arg equals the no-box name" {
+  assert_equal "$(container_name_for "/home/user/api" "")" "$(container_name_for "/home/user/api")"
+}
+
+@test "box: a named-box container name stays within Docker's 63-char limit" {
+  local long_dir result
+  long_dir="$(printf 'a%.0s' {1..80})"
+  result="$(container_name_for "/home/user/${long_dir}" mybox)"
+  [[ ${#result} -le 63 ]] || { echo "len=${#result}: $result"; return 1; }
+  [[ "$result" =~ ^cleat-.*-[0-9a-f]{8}-mybox$ ]] || { echo "got: $result"; return 1; }
+}
+
+@test "box: hash and box suffix survive when a long box forces dir truncation" {
+  # 29-char box → suffix 30 chars → dir budget 18; the name must still be ≤63
+  # and still carry BOTH the 8-char hash AND the full box suffix.
+  local p result box
+  p="/home/user/$(printf 'a%.0s' {1..60})"
+  box="verylongboxname12345678901234"
+  result="$(container_name_for "$p" "$box")"
+  [[ ${#result} -le 63 ]] || { echo "len=${#result}: $result"; return 1; }
+  [[ "$result" =~ -[0-9a-f]{8}-verylongboxname12345678901234$ ]] || { echo "got: $result"; return 1; }
+}

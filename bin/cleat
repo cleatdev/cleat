@@ -39,6 +39,10 @@ KNOWN_CAPS=(git ssh env hooks gh docker)
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
 _RESOLVED_PROJECT=""
+# The active box — a named per-project sandbox (see concept/20-boxes.md).
+# Default "main" = the legacy suffix-less container. Set by the dispatch via
+# _set_box for box-aware verbs; stays "main" for everything else.
+_BOX="main"
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 _CLI_TRUST_PROJECT=0
@@ -204,15 +208,74 @@ _md5() {
 # ── Project-scoped container naming ─────────────────────────────────────────
 container_name_for() {
   local project_path="$1"
-  local dir_name hash
+  local box="${2:-}"
+  local dir_name hash suffix=""
+  # A named (non-default) box folds in as a trailing -<box>. The default box
+  # ("main" or empty) gets the legacy suffix-less name — zero migration for
+  # existing containers (see concept/20-boxes.md). The 8-char hash is ALWAYS
+  # preserved; only the human-readable dir segment is re-truncated to fit.
+  if [[ -n "$box" && "$box" != "main" ]]; then
+    suffix="-${box}"
+  fi
   dir_name="$(basename "$project_path" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  # Truncate dir_name to keep total under Docker's 63-char limit
-  # Format: cleat-<dir_name>-<hash8> → 15 fixed chars, 48 for dir_name
-  dir_name="${dir_name:0:48}"
+  # Keep the full name under Docker's 63-char limit:
+  #   "cleat-" (6) + dir + "-" (1) + hash8 (8) + suffix = 15 + dir + |suffix|.
+  # Budget the remaining room (48 minus the suffix length) for dir_name.
+  local max_dir=$(( 48 - ${#suffix} ))
+  (( max_dir < 1 )) && max_dir=1
+  dir_name="${dir_name:0:$max_dir}"
   # Remove trailing dash from truncation
   dir_name="${dir_name%-}"
   hash="$(echo -n "$project_path" | _md5 | head -c 8)"
-  echo "cleat-${dir_name}-${hash}"
+  echo "cleat-${dir_name}-${hash}${suffix}"
+}
+
+# Validate a box name. Boxes are named, per-project sandboxes (see
+# concept/20-boxes.md): 1–31 chars, must start with a lowercase alnum, and may
+# contain lowercase alnum, dash, or underscore. The pattern is held in a
+# variable and used UNQUOTED — bash 3.2 treats a quoted =~ RHS as a literal
+# string, which would silently break matching.
+_validate_box_name() {
+  local box="$1"
+  local _box_re='^[a-z0-9][a-z0-9_-]{0,30}$'
+  [[ "$box" =~ $_box_re ]]
+}
+
+# Derive the per-project session key used for Claude session/history isolation
+# and the per-project .claude.json store (see concept/19-claude-json-isolation.md
+# and concept/20-boxes.md). The DEFAULT box ("main" or empty) returns the legacy
+# <basename>-<hash8> key BYTE-IDENTICALLY — folding a suffix in for the default
+# would orphan every existing user's session history on upgrade. A named box
+# appends "-<box>" so two boxes over one workspace never share sessions.
+_derive_project_session_key() {
+  local project="$1"
+  local box="${2:-}"
+  local _basename _hash key
+  _basename="$(basename "$project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _hash="$(echo -n "$project" | _md5 | head -c 8)"
+  key="${_basename}-${_hash}"
+  if [[ -n "$box" && "$box" != "main" ]]; then
+    key="${key}-${box}"
+  fi
+  echo "$key"
+}
+
+# Parse and validate the box positional for a box-aware verb (see
+# concept/20-boxes.md). Sets the global _BOX; an empty arg → the default box
+# "main". Prints an error and exits on an invalid name. Call from the dispatch
+# DIRECTLY, not inside $(...), so the exit propagates to the whole process.
+_set_box() {
+  local box="${1:-}"
+  if [[ -z "$box" ]]; then
+    _BOX="main"
+    return 0
+  fi
+  if ! _validate_box_name "$box"; then
+    error "Invalid box name: ${BOLD}${box}${RESET}"
+    echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars (e.g. ${BOLD}az${RESET}${DIM}, ${BOLD}dev${RESET}${DIM}).${RESET}"
+    exit 1
+  fi
+  _BOX="$box"
 }
 
 resolve_project() {
@@ -2377,11 +2440,12 @@ _upgrade_claude_image() {
 }
 
 cmd_run() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   _RESOLVED_PROJECT="$project"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   if is_running "$cname"; then
     warn "Container ${BOLD}${cname}${RESET} already running for this project."
@@ -2469,10 +2533,8 @@ cmd_run() {
   # own sessions. Input history (arrow-up) lives in ~/.claude/history.jsonl
   # — we overlay that too so each project has its own history.
   # The base ~/.claude mount provides auth and global config.
-  local project_session_key _session_basename _session_hash
-  _session_basename="$(basename "$project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-  _session_hash="$(echo -n "$project" | _md5 | head -c 8)"
-  project_session_key="${_session_basename}-${_session_hash}"
+  local project_session_key
+  project_session_key="$(_derive_project_session_key "$project" "$box")"
   local project_session_dir="${HOME}/.claude/projects/${project_session_key}"
   mkdir -p "$project_session_dir"
   # Ensure per-project history file exists (Docker needs the source for bind mounts)
@@ -2606,6 +2668,7 @@ cmd_run() {
   local label_args=(
     --label "sh.cleat.config-hash=$config_hash"
     --label "sh.cleat.version=$VERSION"
+    --label "sh.cleat.box=$box"
   )
 
   # ── Host connectivity: always-on so user-defined hooks and MCP servers work
@@ -2643,11 +2706,12 @@ cmd_run() {
 }
 
 cmd_start() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   _RESOLVED_PROJECT="$project"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   # Resolve caps early for startup output and drift detection
   resolve_caps "$project"
@@ -2727,11 +2791,12 @@ cmd_start() {
 }
 
 cmd_resume() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   _RESOLVED_PROJECT="$project"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   # Resolve caps for startup output and drift detection
   resolve_caps "$project"
@@ -2835,10 +2900,11 @@ cmd_resume() {
 }
 
 cmd_stop() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   if is_running "$cname"; then
     docker stop "$cname" > /dev/null 2>&1
@@ -2849,10 +2915,11 @@ cmd_stop() {
 }
 
 cmd_rm() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   if is_running "$cname"; then
     docker stop "$cname" > /dev/null
@@ -2871,10 +2938,11 @@ cmd_rm() {
 }
 
 cmd_shell() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   require_running "$cname"
   _wait_for_coder_remap "$cname"
@@ -2887,10 +2955,11 @@ cmd_shell() {
 }
 
 cmd_login() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   require_running "$cname"
   _wait_for_coder_remap "$cname"
@@ -2933,10 +3002,11 @@ cmd_login() {
 }
 
 cmd_claude() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   require_running "$cname"
   _RESOLVED_PROJECT="$project"
@@ -2987,10 +3057,11 @@ cmd_claude() {
 }
 
 cmd_logs() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
   require_running "$cname"
   docker logs -f "$cname"
 }
@@ -3048,10 +3119,11 @@ cmd_stop_all() {
 }
 
 cmd_status() {
-  local project
+  local project box
   project="$(resolve_project "${1:-}")"
+  box="${_BOX:-main}"
   local cname
-  cname="$(container_name_for "$project")"
+  cname="$(container_name_for "$project" "$box")"
 
   # Resolve caps for display only — never trigger a trust prompt from
   # a read-only status call.
@@ -3876,19 +3948,19 @@ main() {
   esac
 
   case "$cmd" in
-    start)     cmd_start "$@" ;;
-    resume|r)  cmd_resume "$@" ;;
+    start)     _set_box "${1:-}"; cmd_start ;;
+    resume|r)  _set_box "${1:-}"; cmd_resume ;;
     build)     cmd_build "$@" ;;
     rebuild)   cmd_rebuild "$@" ;;
     upgrade-claude) cmd_upgrade_claude "$@" ;;
-    run)       cmd_run "$@" ;;
-    stop)      cmd_stop "$@" ;;
-    rm)        cmd_rm "$@" ;;
+    run)       _set_box "${1:-}"; cmd_run ;;
+    stop)      _set_box "${1:-}"; cmd_stop ;;
+    rm)        _set_box "${1:-}"; cmd_rm ;;
     stop-all)  cmd_stop_all "$@" ;;
-    shell|sh)  cmd_shell "$@" ;;
-    login)     cmd_login "$@" ;;
-    claude)    cmd_claude "$@" ;;
-    logs)      cmd_logs "$@" ;;
+    shell|sh)  _set_box "${1:-}"; cmd_shell ;;
+    login)     _set_box "${1:-}"; cmd_login ;;
+    claude)    _set_box "${1:-}"; cmd_claude ;;
+    logs)      _set_box "${1:-}"; cmd_logs ;;
     ps)        cmd_ps "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;

@@ -260,7 +260,8 @@ cleat_bin_timeout() {
   # Override the auto-trust env var from setup so we genuinely test the flag.
   unset CLEAT_TRUST_PROJECT
 
-  run cleat_bin_timeout 5 --trust-project start "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  run cleat_bin_timeout 5 --trust-project start
   # env cap should be respected (env vars would flow into docker run when
   # .cleat.env exists; if not, no crash either way)
   refute_output --partial "Project .cleat skipped"
@@ -285,7 +286,8 @@ cleat_bin_timeout() {
   printf '' > "$DOCKER_MOCK_DIR/ps_output"
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   mkdir -p "$TEST_TEMP/project"
-  run cleat_bin rm "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin rm
   assert_success
   refute_output --partial "unbound variable"
 }
@@ -346,7 +348,8 @@ cleat_bin_timeout() {
   # start → reaches exec_claude which would docker exec; our docker stub
   # accepts it. We use a short timeout via a wrapper so interactive bits
   # don't hang.
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   # The test must either succeed or fail with a clear message. It must
   # NOT hang, and must NOT emit strict-mode errors.
   refute_output --partial "unbound variable"
@@ -360,7 +363,8 @@ cleat_bin_timeout() {
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
-  run cleat_bin_timeout 5 run "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 run
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
 }
@@ -372,7 +376,8 @@ cleat_bin_timeout() {
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
   printf '{"oauthAccount":{"emailAddress":"a@b.com"},"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > "$HOME/.claude.json"
 
-  run cleat_bin_timeout 5 run "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 run
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
 }
@@ -384,7 +389,8 @@ cleat_bin_timeout() {
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
   printf '{"oauthAccount": {' > "$HOME/.claude.json"   # truncated / invalid
 
-  run cleat_bin_timeout 5 run "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 run
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
   # The corruption is handled gracefully — host file backed up, not a crash.
@@ -400,11 +406,39 @@ cleat_bin_timeout() {
   export DOCKER_EXIT_CODE=125
   export DOCKER_STDERR="Error: something went wrong"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
   # Either the docker error surfaces, or a retry message — both OK
   [[ "$status" -ne 0 ]] || true
+}
+
+# ── Boxes — named per-project sandboxes (see concept/20-boxes.md) ────────────
+
+@test "smoke: cleat start <box> creates a box-suffixed container" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start az
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  grep -qE 'cleat-project-[0-9a-f]{8}-az' "$DOCKER_CALLS" || {
+    echo "expected an -az suffixed container in docker calls"
+    grep '^docker run' "$DOCKER_CALLS"
+    return 1
+  }
+}
+
+@test "smoke: a path argument is rejected as an invalid box name" {
+  mkdir -p "$TEST_TEMP/project"
+  run cleat_bin start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Invalid box name"
+  refute_output --partial "unbound variable"
 }
 
 # ── Env passthrough end-to-end ─────────────────────────────────────────────
@@ -417,7 +451,8 @@ cleat_bin_timeout() {
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
-  run cleat_bin_timeout 5 --env "SMOKE_TEST_VAR=hello" start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 --env "SMOKE_TEST_VAR=hello" start
   # Check the docker stub recorded our env var
   grep -q 'SMOKE_TEST_VAR=hello' "$DOCKER_CALLS" || {
     echo "SMOKE_TEST_VAR not passed to docker run"
@@ -440,7 +475,8 @@ EOF
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   grep -q 'DATABASE_URL=postgres://smoke-test/db' "$DOCKER_CALLS" || {
     echo "DATABASE_URL from .cleat.env not passed to docker run"
     cat "$DOCKER_CALLS"
@@ -464,7 +500,8 @@ EOF
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
 
-  run cleat_bin_timeout 5 shell "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 shell
   grep -q 'SHELL_TEST_VAR=shell-value' "$DOCKER_CALLS" || {
     echo "SHELL_TEST_VAR not in docker exec args"
     echo "Expected cname: $cname"
@@ -487,7 +524,8 @@ EOF
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   grep -qF ".config/gh:/home/coder/.config/gh" "$DOCKER_CALLS" || {
     echo "gh config mount missing from docker run"
     cat "$DOCKER_CALLS"
@@ -505,7 +543,8 @@ EOF
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   grep -qF "/var/run/docker.sock:/var/run/docker.sock" "$DOCKER_CALLS" || {
     echo "docker socket mount missing from docker run"
     cat "$DOCKER_CALLS"
@@ -538,7 +577,8 @@ EOF
   _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   project_key="${_bn}-${_h}"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   grep -q "projects/-workspace" "$DOCKER_CALLS" || {
     echo "Session overlay mount missing from docker run"
     cat "$DOCKER_CALLS"
@@ -563,7 +603,8 @@ EOF
   _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   project_key="${_bn}-${_h}"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   grep -qF -- "history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
     echo "History overlay mount missing from docker run"
     cat "$DOCKER_CALLS"
@@ -584,7 +625,8 @@ EOF
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   grep -q 'sh.cleat.config-hash=' "$DOCKER_CALLS" || {
     echo "config-hash label missing from docker run"
     cat "$DOCKER_CALLS"
@@ -598,7 +640,8 @@ EOF
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   grep -q 'sh.cleat.version=' "$DOCKER_CALLS" || {
     echo "version label missing from docker run"
     cat "$DOCKER_CALLS"
@@ -641,7 +684,8 @@ EOF
   export CLEAT_FORCE_CLAUDE_CHECK=1
   export CLEAT_FAKE_REMOTE_CLAUDE=2.1.999
 
-  run cleat_bin_timeout 5 start "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 5 start
   refute_output --partial "Update the image before starting?"
   # The container actually started — proves cmd_run got past the check rather
   # than blocking on the prompt (which would have tripped the 5s timeout).

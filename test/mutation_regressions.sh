@@ -30,6 +30,9 @@ CLAUDE_BATS="$REPO_ROOT/test/unit/claude_update_check.bats"
 RUN_DIR_BATS="$REPO_ROOT/test/unit/run_dir.bats"
 VERSION_BATS="$REPO_ROOT/test/unit/version.bats"
 TERMINAL_UX_BATS="$REPO_ROOT/test/unit/terminal_ux.bats"
+BOX_NAME_BATS="$REPO_ROOT/test/unit/box_name.bats"
+CONTAINER_NAME_BATS="$REPO_ROOT/test/unit/container_name.bats"
+BOXES_BATS="$REPO_ROOT/test/unit/boxes.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -718,6 +721,36 @@ cat > "$SED_TMP" << 'SED'
 /rm -rf \/tmp\/cleat-run-/d
 SED
 try "v0.13.1_entrypoint_clip_cleanup" "clears stale clipboard runtime files before dropping to coder" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# boxes — the default/"main" box session key MUST stay byte-identical to the
+# legacy <basename>-<hash8> key. Drop the `main` exemption in the helper so the
+# default box would gain a "-main" suffix; the byte-identity test must fail.
+# (Folding a suffix into the default would orphan every user's session history.)
+cat > "$SED_TMP" << 'SED'
+s| && "\$box" != "main"||
+SED
+try "boxes_default_session_key_byte_identical" "the 'main' box is byte-identical to the default" "$CLI" "$BOX_NAME_BATS"
+
+# boxes — the default/"main" box CONTAINER NAME must stay byte-identical to the
+# legacy cleat-<dir>-<hash8> (no -main suffix on disk). Drop the `main` exemption
+# inside container_name_for so the default would gain a "-main" suffix; the
+# byte-identity test must fail. (Folding a suffix would orphan every existing
+# container.)
+cat > "$SED_TMP" << 'SED'
+/^container_name_for()/,/^}$/{
+  s| && "\$box" != "main"||
+}
+SED
+try "boxes_main_container_name_byte_identical" "the 'main' box is byte-identical to the no-box name" "$CLI" "$CONTAINER_NAME_BATS"
+
+# boxes — cmd_run must thread the active box into the session key so two boxes
+# over one workspace get SEPARATE Claude sessions/.claude.json (the cross-box
+# bleed/corruption guard). Drop the box arg at the call site so every box falls
+# back to the default key; the per-box session-overlay test must fail.
+cat > "$SED_TMP" << 'SED'
+s|_derive_project_session_key "\$project" "\$box"|_derive_project_session_key "\$project"|
+SED
+try "boxes_session_key_threads_box" "a named box gets its own session overlay dir" "$CLI" "$BOXES_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

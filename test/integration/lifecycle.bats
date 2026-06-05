@@ -73,7 +73,8 @@ teardown() {
 hooks
 EOF
 
-  run "$CLI" run "$INT_PROJECT"
+  cd "$INT_PROJECT"
+  run "$CLI" run
   assert_success
   refute_output --partial "outside of rootfs"
   refute_output --partial "Container failed to start"
@@ -94,7 +95,8 @@ env
 EOF
 
   # Start a container for this project. Real docker.
-  run "$CLI" run "$INT_PROJECT"
+  cd "$INT_PROJECT"
+  run "$CLI" run
   assert_success
 
   # Non-interactive shell: feed a command to cleat shell via stdin

@@ -143,6 +143,7 @@ EOF
   # .claude/ exists but neither settings.json nor settings.local.json —
   # the exact v0.6.5 trigger condition.
 
+  cd "$TEST_TEMP/project"
   run _portable_timeout 5 env \
     PATH="$MOCK_BIN:$PATH" \
     HOME="$HOME" \
@@ -150,7 +151,7 @@ EOF
     DOCKER_CALLS="$DOCKER_CALLS" \
     DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
     DOCKER_STUB_SIMULATE_VIRTIOFS=1 \
-    "$CLI" start "$TEST_TEMP/project"
+    "$CLI" start
 
   # With the v0.6.5 fix, the project overlay is never mounted for missing
   # files, so virtiofs simulation has nothing to reject.
@@ -178,6 +179,7 @@ EOF
 hooks
 EOF
 
+  cd "$TEST_TEMP/project"
   run _portable_timeout 5 env \
     PATH="$MOCK_BIN:$PATH" \
     HOME="$HOME" \
@@ -185,7 +187,7 @@ EOF
     DOCKER_CALLS="$DOCKER_CALLS" \
     DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
     DOCKER_STUB_SIMULATE_VIRTIOFS=1 \
-    "$CLI" start "$TEST_TEMP/project"
+    "$CLI" start
 
   # This test documents the finding: when $HOME/.claude/settings.json does
   # not exist, cleat currently mounts an overlay over it anyway, which would

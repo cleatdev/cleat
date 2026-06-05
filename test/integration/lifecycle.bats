@@ -43,6 +43,12 @@ teardown() {
   local default_name
   default_name="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'" 2>/dev/null)"
   [[ -n "$default_name" ]] && docker rm -f "$default_name" >/dev/null 2>&1 || true
+  # Remove any box containers for this project (main cname is the prefix).
+  if [[ -n "$default_name" ]]; then
+    docker ps -aq --filter "name=^${default_name}" 2>/dev/null | while read -r _c; do
+      [[ -n "$_c" ]] && docker rm -f "$_c" >/dev/null 2>&1 || true
+    done
+  fi
   _common_teardown
 }
 
@@ -105,4 +111,44 @@ EOF
   run docker exec "$cname" printenv DATABASE_URL
   assert_success
   assert_output "postgres://integration-test/db"
+}
+
+# ── Boxes (concept/20-boxes.md): two boxes over one live workspace ──────────
+
+@test "integration: two boxes are distinct containers sharing one /workspace; describe never recreates" {
+  cd "$INT_PROJECT"
+  local main_cname az_cname
+  main_cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT' main")"
+  az_cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT' az")"
+
+  run "$CLI" run
+  assert_success
+  run "$CLI" run az
+  assert_success
+
+  # Two distinct, really-existing containers for this one project.
+  [[ "$main_cname" != "$az_cname" ]] || { echo "names collided"; return 1; }
+  docker inspect "$main_cname" >/dev/null 2>&1 || { echo "main container missing"; return 1; }
+  docker inspect "$az_cname"   >/dev/null 2>&1 || { echo "az container missing"; return 1; }
+
+  # Both bind-mount the SAME host path at /workspace — the live shared tree.
+  local m_src a_src
+  m_src="$(docker inspect "$main_cname" --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}')"
+  a_src="$(docker inspect "$az_cname"   --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}')"
+  [[ -n "$m_src" && "$m_src" == "$a_src" ]] || { echo "workspace mounts differ: '$m_src' vs '$a_src'"; return 1; }
+
+  # The az box carries the sh.cleat.box label.
+  run docker inspect "$az_cname" --format '{{index .Config.Labels "sh.cleat.box"}}'
+  assert_output "az"
+
+  # `cleat describe` must NOT recreate the container (host-side metadata) — the
+  # writable layer (e.g. an `az login`) must survive. Verify the container ID
+  # is unchanged across a describe.
+  local before after
+  before="$(docker inspect --format '{{.Id}}' "$az_cname")"
+  "$CLI" describe az "cloud box" >/dev/null
+  after="$(docker inspect --format '{{.Id}}' "$az_cname")"
+  [[ "$before" == "$after" ]] || { echo "describe recreated the container!"; return 1; }
+
+  docker rm -f "$main_cname" "$az_cname" >/dev/null 2>&1 || true
 }

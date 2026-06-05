@@ -441,6 +441,36 @@ cleat_bin_timeout() {
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat describe sets and shows a box description" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  cleat_bin describe az "cloud box" >/dev/null
+  run cleat_bin describe az
+  assert_success
+  assert_output --partial "cloud box"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat status exits 0 even when the docker daemon is unavailable" {
+  # Box discovery must not abort status under set -euo pipefail when docker errs
+  # (regression guard for the bare command-substitution strict-mode crash).
+  mkdir -p "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1
+  cd "$TEST_TEMP/project"
+  run cleat_bin status
+  assert_success
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: a box-aware verb rejects a stray second positional" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin stop az dev
+  assert_failure
+  assert_output --partial "Unexpected argument"
+  refute_output --partial "unbound variable"
+}
+
 # ── Env passthrough end-to-end ─────────────────────────────────────────────
 # The real binary + docker stub: confirm env vars make it into the docker
 # exec args. This is the test that would have caught v0.6.3 at smoke level.

@@ -23,6 +23,10 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 #   $CLEAT_RUN_DIR/<cname>/{settings,clip,hooks}
 CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
+# Host-side per-box descriptions, keyed by container name. NOT Docker labels:
+# labels are immutable, so editing one would force a recreate that wipes the
+# writable layer (e.g. an `az login`). See concept/20-boxes.md.
+CLEAT_BOXES_DIR="$CLEAT_CONFIG_DIR/boxes"
 
 # Persistent per-project Claude global-state (.claude.json) store. Unlike
 # $CLEAT_RUN_DIR (per-container, wiped on `cleat rm`/recreate), this is keyed by
@@ -46,6 +50,8 @@ _BOX="main"
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 _CLI_TRUST_PROJECT=0
+_CLI_DESC=""
+_CLI_DESC_SET=0
 # Original argv as `main` received it — used by the CLI self-update preflight to
 # re-exec the freshly-installed version with the same command.
 _CLEAT_ORIG_ARGV=()
@@ -266,6 +272,13 @@ _derive_project_session_key() {
 # DIRECTLY, not inside $(...), so the exit propagates to the whole process.
 _set_box() {
   local box="${1:-}"
+  # A box-aware verb takes exactly one [box] positional; reject stray args so a
+  # typo like `cleat stop az dev` errors instead of silently acting on only az.
+  if [[ $# -gt 1 ]]; then
+    error "Unexpected argument: ${BOLD}${2}${RESET}"
+    echo -e "    ${DIM}A box-aware command takes a single [box] name.${RESET}"
+    exit 1
+  fi
   if [[ -z "$box" ]]; then
     _BOX="main"
     return 0
@@ -394,6 +407,59 @@ _write_caps_to_file() {
   } > "$file"
 }
 
+# Resolve which project cap file applies to a box (see concept/20-boxes.md):
+# a named box uses .cleat.<box> if present, ELSE falls back to .cleat. The
+# default/"main" box always uses .cleat. REPLACE semantics — a box file fully
+# replaces .cleat (it does NOT inherit), which is what enables least privilege:
+# a box can declare FEWER caps than the project default.
+_project_caps_file() {
+  local project="$1" box="${2:-main}"
+  if [[ "$box" != "main" && -f "$project/.cleat.$box" ]]; then
+    echo "$project/.cleat.$box"
+  else
+    echo "$project/.cleat"
+  fi
+}
+
+# Same fallback shape for the env file: .cleat.<box>.env else .cleat.env — so
+# an az box's cloud credentials are never visible to a dev box.
+_project_env_file() {
+  local project="$1" box="${2:-main}"
+  if [[ "$box" != "main" && -f "$project/.cleat.$box.env" ]]; then
+    echo "$project/.cleat.$box.env"
+  else
+    echo "$project/.cleat.env"
+  fi
+}
+
+# ── Box descriptions (host-side metadata) ────────────────────────────────────
+# An optional one-line human description per box, keyed by container name so it
+# survives stop/resume/recreate and is removed with the box. Text is always
+# written with printf and printed as data — never eval'd. See
+# concept/20-boxes.md for why this is a host-side file, not a Docker label.
+_box_desc_file() {
+  echo "$CLEAT_BOXES_DIR/$1"
+}
+
+_box_desc_read() {
+  local f
+  f="$(_box_desc_file "$1")"
+  [[ -f "$f" ]] && cat "$f" || true
+}
+
+_box_desc_write() {
+  local cname="$1" text="$2"
+  # Collapse CR/LF so a description is always a single line (it renders as a
+  # one-line sub-entry in status/ps; see concept/20-boxes.md).
+  text="$(printf '%s' "$text" | tr '\r\n' '  ')"
+  mkdir -p "$CLEAT_BOXES_DIR"
+  printf '%s\n' "$text" > "$(_box_desc_file "$cname")"
+}
+
+_box_desc_remove() {
+  rm -f "$(_box_desc_file "$1")" 2>/dev/null || true
+}
+
 # ── Workspace trust ─────────────────────────────────────────────────────────
 #
 # A project's .cleat file lives in the repo — it's untrusted input. Before
@@ -426,20 +492,27 @@ _hash_cleat_caps() {
   echo -n "$caps" | _md5 | awk '{print $1}'
 }
 
-# Look up the stored trust hash for a project path. Empty on miss.
+# Look up the stored trust hash for a (project, box). Empty on miss.
+# The trust file is <path><TAB><box><TAB><hash>. Legacy two-column rows
+# (<path><TAB><hash>) are read as the "main" box (see concept/20-boxes.md).
 _trust_lookup() {
-  local project="$1"
+  local project="$1" box="${2:-main}"
   [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
-  awk -F'\t' -v p="$project" '
+  awk -F'\t' -v p="$project" -v b="$box" '
     /^#/ { next }
-    $1 == p { print $2; exit }
+    $1 != p { next }
+    NF >= 3 { if ($2 == b) { print $3; exit } ; next }
+    NF == 2 { if (b == "main") { print $2; exit } }
   ' "$CLEAT_TRUST_FILE" 2>/dev/null
 }
 
-# Append/update a trust entry. Atomic via temp+rename. 0600 permissions.
-# Refuses to write paths containing tab/newline/carriage-return.
+# Append/update a trust entry for a (project, box). Atomic via temp+rename.
+# 0600 permissions. Refuses paths containing tab/newline/carriage-return.
+# Recording the "main" box also supersedes any legacy two-column row.
 _trust_record() {
-  local project="$1" hash="$2"
+  # box is the optional LAST arg so legacy 2-arg callers (project, hash) keep
+  # working with box defaulting to "main".
+  local project="$1" hash="$2" box="${3:-main}"
   case "$project" in
     *$'\t'*|*$'\n'*|*$'\r'*)
       error "Refusing to trust a project path containing control characters"
@@ -450,44 +523,61 @@ _trust_record() {
   local tmp="${CLEAT_TRUST_FILE}.tmp.$$"
   {
     echo "# Cleat project trust file — one entry per line"
-    echo "# <absolute-project-path><TAB><hash-of-canonical-caps>"
+    echo "# <absolute-project-path><TAB><box><TAB><hash-of-canonical-caps>"
+    echo "# Legacy two-column rows (<path><TAB><hash>) are read as the 'main' box."
     if [[ -f "$CLEAT_TRUST_FILE" ]]; then
-      awk -F'\t' -v p="$project" '
+      awk -F'\t' -v p="$project" -v b="$box" '
         /^#/ { next }
         NF < 2 { next }
-        $1 != p { print }
+        {
+          if ($1 == p) {
+            if (NF >= 3 && $2 == b) next
+            if (NF == 2 && b == "main") next
+          }
+          print
+        }
       ' "$CLEAT_TRUST_FILE"
     fi
-    printf '%s\t%s\n' "$project" "$hash"
+    printf '%s\t%s\t%s\n' "$project" "$box" "$hash"
   } > "$tmp"
   chmod 0600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$CLEAT_TRUST_FILE"
 }
 
-# Remove a project's trust entry. Silent no-op if not present.
+# Remove a (project, box) trust entry. Silent no-op if not present. Removing
+# the "main" box also clears any legacy two-column row for the path.
 _trust_remove() {
-  local project="$1"
+  local project="$1" box="${2:-main}"
   [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
   local tmp="${CLEAT_TRUST_FILE}.tmp.$$"
   {
     echo "# Cleat project trust file — one entry per line"
-    echo "# <absolute-project-path><TAB><hash-of-canonical-caps>"
-    awk -F'\t' -v p="$project" '
+    echo "# <absolute-project-path><TAB><box><TAB><hash-of-canonical-caps>"
+    echo "# Legacy two-column rows (<path><TAB><hash>) are read as the 'main' box."
+    awk -F'\t' -v p="$project" -v b="$box" '
       /^#/ { next }
       NF < 2 { next }
-      $1 != p { print }
+      {
+        if ($1 == p) {
+          if (NF >= 3 && $2 == b) next
+          if (NF == 2 && b == "main") next
+        }
+        print
+      }
     ' "$CLEAT_TRUST_FILE"
   } > "$tmp"
   chmod 0600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$CLEAT_TRUST_FILE"
 }
 
-# List all trusted projects (one per line).
+# List all trusted (project, box) pairs as <path><TAB><box>, one per line.
+# Legacy two-column rows surface as <path><TAB>main.
 _trust_list() {
   [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
   awk -F'\t' '
     /^#/ { next }
-    NF >= 2 { print $1 }
+    NF >= 3 { print $1 "\t" $2; next }
+    NF == 2 { print $1 "\t" "main" }
   ' "$CLEAT_TRUST_FILE" 2>/dev/null
 }
 
@@ -495,10 +585,12 @@ _trust_list() {
 # Returns 0 when trusted, 1 when not (missing entry, stale hash, or no .cleat).
 _is_project_trusted() {
   local project="$1"
-  local stored current
-  stored="$(_trust_lookup "$project")"
+  local box="${_BOX:-main}"
+  local caps_file stored current
+  caps_file="$(_project_caps_file "$project" "$box")"
+  stored="$(_trust_lookup "$project" "$box")"
   [[ -z "$stored" ]] && return 1
-  current="$(_hash_cleat_caps "$project/.cleat")"
+  current="$(_hash_cleat_caps "$caps_file")"
   [[ -z "$current" ]] && return 1
   [[ "$stored" == "$current" ]]
 }
@@ -512,7 +604,7 @@ _trust_prompt() {
 
   # Detect if this is a re-prompt (stored hash exists but doesn't match).
   local is_reprompt=0
-  [[ -n "$(_trust_lookup "$project")" ]] && is_reprompt=1
+  [[ -n "$(_trust_lookup "$project" "${_BOX:-main}")" ]] && is_reprompt=1
 
   local -a lines=()
   if [[ $is_reprompt -eq 1 ]]; then
@@ -566,6 +658,7 @@ _trust_prompt() {
 # resolve_caps is called from multiple command paths in the same run.
 _TRUST_SESSION_DECISION=""   # "", "approved", "rejected"
 _TRUST_SESSION_PROJECT=""    # the project path we decided on
+_TRUST_SESSION_BOX=""        # the box we decided on (per-box trust)
 
 # Decide whether to apply a project's .cleat caps. Sets _TRUST_SESSION_* on
 # first call for a given project. Returns 0 = apply, 1 = skip.
@@ -574,26 +667,31 @@ _TRUST_SESSION_PROJECT=""    # the project path we decided on
 _resolve_project_trust() {
   local project="$1"
   local mode="${2:-prompt}"
+  local box="${_BOX:-main}"
+  local caps_file
+  caps_file="$(_project_caps_file "$project" "$box")"
 
-  # Cached decision for this session/project
-  if [[ -n "$_TRUST_SESSION_DECISION" && "$_TRUST_SESSION_PROJECT" == "$project" ]]; then
+  # Cached decision for this session/project/box
+  if [[ -n "$_TRUST_SESSION_DECISION" && "$_TRUST_SESSION_PROJECT" == "$project" && "$_TRUST_SESSION_BOX" == "$box" ]]; then
     [[ "$_TRUST_SESSION_DECISION" == "approved" ]] && return 0 || return 1
   fi
 
-  # Already approved at the current hash
+  # Already approved at the current hash (per box)
   if _is_project_trusted "$project"; then
     _TRUST_SESSION_DECISION="approved"
     _TRUST_SESSION_PROJECT="$project"
+    _TRUST_SESSION_BOX="$box"
     return 0
   fi
 
   # Explicit non-interactive opt-in
   if [[ "${CLEAT_TRUST_PROJECT:-}" == "1" || "${_CLI_TRUST_PROJECT:-0}" == "1" ]]; then
     local hash
-    hash="$(_hash_cleat_caps "$project/.cleat")"
-    _trust_record "$project" "$hash" || true
+    hash="$(_hash_cleat_caps "$caps_file")"
+    _trust_record "$project" "$hash" "$box" || true
     _TRUST_SESSION_DECISION="approved"
     _TRUST_SESSION_PROJECT="$project"
+    _TRUST_SESSION_BOX="$box"
     return 0
   fi
 
@@ -604,18 +702,20 @@ _resolve_project_trust() {
   if _is_tty; then
     local -a req_caps=()
     local c
-    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$project/.cleat")
+    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$caps_file")
     if _trust_prompt "$project" "${req_caps[@]}"; then
       local hash
-      hash="$(_hash_cleat_caps "$project/.cleat")"
-      _trust_record "$project" "$hash" || true
+      hash="$(_hash_cleat_caps "$caps_file")"
+      _trust_record "$project" "$hash" "$box" || true
       _TRUST_SESSION_DECISION="approved"
       _TRUST_SESSION_PROJECT="$project"
+      _TRUST_SESSION_BOX="$box"
       return 0
     else
       warn "Project .cleat ignored — not trusted ${DIM}(global config still applied)${RESET}"
       _TRUST_SESSION_DECISION="rejected"
       _TRUST_SESSION_PROJECT="$project"
+      _TRUST_SESSION_BOX="$box"
       return 1
     fi
   fi
@@ -624,6 +724,7 @@ _resolve_project_trust() {
   warn "Project .cleat skipped in non-interactive mode ${DIM}(pass --trust-project or set CLEAT_TRUST_PROJECT=1 to approve)${RESET}"
   _TRUST_SESSION_DECISION="rejected"
   _TRUST_SESSION_PROJECT="$project"
+  _TRUST_SESSION_BOX="$box"
   return 1
 }
 
@@ -632,6 +733,7 @@ _resolve_project_trust() {
 resolve_caps() {
   local project="${1:-}"
   local trust_mode="${2:-prompt}"
+  local box="${_BOX:-main}"
   ACTIVE_CAPS=()
 
   # 1. Global config
@@ -642,13 +744,19 @@ resolve_caps() {
   # the repo is untrusted input. Apply its caps only if the user has
   # approved this project (either a persistent trust record, a one-off
   # --trust-project flag, or an interactive "y" to the prompt).
+  # The box's cap file REPLACES .cleat (no merge): .cleat.<box> if present,
+  # else .cleat; main always uses .cleat. See concept/20-boxes.md.
   local project_caps=""
-  if [[ -n "$project" && -f "$project/.cleat" ]]; then
-    local _raw_project_caps
-    _raw_project_caps="$(_read_caps_from_file "$project/.cleat")"
-    if [[ -n "$_raw_project_caps" ]]; then
-      if _resolve_project_trust "$project" "$trust_mode"; then
-        project_caps="$_raw_project_caps"
+  if [[ -n "$project" ]]; then
+    local caps_file
+    caps_file="$(_project_caps_file "$project" "$box")"
+    if [[ -f "$caps_file" ]]; then
+      local _raw_project_caps
+      _raw_project_caps="$(_read_caps_from_file "$caps_file")"
+      if [[ -n "$_raw_project_caps" ]]; then
+        if _resolve_project_trust "$project" "$trust_mode"; then
+          project_caps="$_raw_project_caps"
+        fi
       fi
     fi
   fi
@@ -749,13 +857,15 @@ resolve_env_args() {
       done < <(_parse_env_file "$CLEAT_GLOBAL_ENV")
     fi
 
-    # Project env file
-    if [[ -n "$project" && -f "$project/.cleat.env" ]]; then
+    # Project env file — box-aware: .cleat.<box>.env else .cleat.env
+    local _env_file
+    _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
+    if [[ -n "$project" && -f "$_env_file" ]]; then
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         key="${line%%=*}"; val="${line#*=}"
         _env_set "$key" "$val"
-      done < <(_parse_env_file "$project/.cleat.env")
+      done < <(_parse_env_file "$_env_file")
     fi
   fi
 
@@ -812,8 +922,10 @@ _env_summary() {
       global_count=$(_parse_env_file "$CLEAT_GLOBAL_ENV" | wc -l)
       global_count=$((global_count + 0))  # force integer
     fi
-    if [[ -n "$project" && -f "$project/.cleat.env" ]]; then
-      project_count=$(_parse_env_file "$project/.cleat.env" | wc -l)
+    local _env_file
+    _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
+    if [[ -n "$project" && -f "$_env_file" ]]; then
+      project_count=$(_parse_env_file "$_env_file" | wc -l)
       project_count=$((project_count + 0))
     fi
   fi
@@ -825,7 +937,7 @@ _env_summary() {
     fi
     if (( project_count > 0 )); then
       [[ "$msg" != "Env:" ]] && msg+=","
-      msg+=" ${project_count} from .cleat.env"
+      msg+=" ${project_count} from $(basename "$_env_file")"
     fi
     info "$msg"
   fi
@@ -1285,9 +1397,11 @@ _env_summary_inline() {
       global_count=$(_parse_env_file "$CLEAT_GLOBAL_ENV" | wc -l)
       global_count=$((global_count + 0))
     fi
-    if [[ -n "$project" && -f "$project/.cleat.env" ]]; then
+    local _env_file
+    _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
+    if [[ -n "$project" && -f "$_env_file" ]]; then
       project_exists=true
-      project_count=$(_parse_env_file "$project/.cleat.env" | wc -l)
+      project_count=$(_parse_env_file "$_env_file" | wc -l)
       project_count=$((project_count + 0))
     fi
   fi
@@ -1299,7 +1413,7 @@ _env_summary_inline() {
     fi
     if $project_exists; then
       [[ -n "$msg" ]] && msg+=", "
-      msg+="${project_count} from .cleat.env"
+      msg+="${project_count} from $(basename "$_env_file")"
     fi
     echo -e "  ${DIM}Env:${RESET}        ${msg}"
   fi
@@ -2703,6 +2817,11 @@ cmd_run() {
     exit 1
   fi
   rm -f "$_docker_err"
+
+  # A --desc set at creation time (host-side, keyed by cname; never recreates).
+  if [[ "${_CLI_DESC_SET:-0}" == "1" ]]; then
+    _box_desc_write "$cname" "$_CLI_DESC"
+  fi
 }
 
 cmd_start() {
@@ -2935,6 +3054,9 @@ cmd_rm() {
   else
     info "No container to remove."
   fi
+  # Remove the box's host-side description unconditionally — `cleat rm <box>` is
+  # the documented removal path even for a box that was only ever describe'd.
+  _box_desc_remove "$cname"
 }
 
 cmd_shell() {
@@ -3086,8 +3208,22 @@ cmd_ps() {
         color="$YELLOW"
       fi
 
-      echo -e "    ${color}●${RESET} ${BOLD}${name}${RESET}"
+      # Box column — read from the sh.cleat.box label (concept/20-boxes.md).
+      # Containers created before boxes (or the default box) have no label or
+      # "main"; either way show nothing extra to keep the default view clean.
+      local box_label
+      box_label="$(docker inspect "$name" --format '{{index .Config.Labels "sh.cleat.box"}}' 2>/dev/null)"
+      [[ -z "$box_label" || "$box_label" == "<no value>" ]] && box_label="main"
+
+      if [[ "$box_label" != "main" ]]; then
+        echo -e "    ${color}●${RESET} ${BOLD}${name}${RESET}  ${DIM}[box: ${box_label}]${RESET}"
+      else
+        echo -e "    ${color}●${RESET} ${BOLD}${name}${RESET}"
+      fi
       echo -e "      ${DIM}${status}${RESET}"
+      local box_desc
+      box_desc="$(_box_desc_read "$name" | head -n 1)"
+      if [[ -n "$box_desc" ]]; then printf '      %b%s%b\n' "$DIM" "$box_desc" "$RESET"; fi
       if [[ -n "$project_path" ]]; then
         echo -e "      ${DIM}${project_path}${RESET}"
       fi
@@ -3115,6 +3251,16 @@ cmd_stop_all() {
     docker rm "$c" > /dev/null 2>&1 || true
     echo -e "    ${DIM}removed ${c}${RESET}"
   done
+  # Box descriptions are keyed by container name; drop any whose container is now
+  # gone (mirrors cmd_clean) so a stale label can't resurrect on box recreate.
+  if [[ -d "$CLEAT_BOXES_DIR" ]]; then
+    local _bf _bcn
+    for _bf in "$CLEAT_BOXES_DIR"/*; do
+      [[ -f "$_bf" ]] || continue
+      _bcn="$(basename "$_bf")"
+      if ! container_exists "$_bcn"; then rm -f "$_bf" 2>/dev/null || true; fi
+    done
+  fi
   success "All stopped."
 }
 
@@ -3162,6 +3308,49 @@ cmd_status() {
   else
     echo -e "  ${BOLD}Caps:${RESET}      ${DIM}none${RESET} ${DIM}(cleat config)${RESET}"
   fi
+
+  # ── Boxes: every sandbox for this project (see concept/20-boxes.md). The
+  # detail above is the main box; this lists all boxes (main + named) so you
+  # can see what exists here. Boxes are discovered by the INVARIANT project hash
+  # plus the sh.cleat.box label and the /workspace mount source — NOT the main
+  # container-name prefix (container_name_for re-truncates the dir segment per
+  # box, so a long project dir would otherwise HIDE named boxes here, and a
+  # sibling project could collide on the prefix and show a phantom box). The
+  # `< <(... || true)` form also keeps `set -euo pipefail` from aborting status
+  # when the docker daemon is down. See concept/20-boxes.md.
+  echo ""
+  echo -e "  ${BOLD}Boxes:${RESET}"
+  local _main_cname _hash _n _meta _b _src
+  _main_cname="$(container_name_for "$project" main)"
+  _hash="$(echo -n "$project" | _md5 | head -c 8)"
+  _status_box_row() {
+    local _bx="$1" _cn="$2"
+    if is_running "$_cn"; then
+      echo -e "    ${GREEN}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}running${RESET}"
+    elif container_exists "$_cn"; then
+      echo -e "    ${YELLOW}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}stopped${RESET}"
+    else
+      echo -e "    ${DIM}○ ${_bx}${RESET} ${DIM}not created${RESET}"
+    fi
+    # First line only — a multi-line description must not break the list layout.
+    local _desc
+    _desc="$(_box_desc_read "$_cn" | head -n 1)"
+    if [[ -n "$_desc" ]]; then printf '        %b%s%b\n' "$DIM" "$_desc" "$RESET"; fi
+  }
+  _status_box_row "main" "$_main_cname"
+  while IFS= read -r _n; do
+    [[ -z "$_n" ]] && continue
+    # Cheap pre-filter on the invariant hash; the mount-source check below is
+    # authoritative (a sibling project could embed this hash in its dir name).
+    case "$_n" in *"-${_hash}"*) ;; *) continue ;; esac
+    _meta="$(docker inspect "$_n" --format '{{index .Config.Labels "sh.cleat.box"}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+    _b="${_meta%%|*}"
+    _src="${_meta#*|}"
+    if [[ -z "$_b" || "$_b" == "<no value>" ]]; then _b="main"; fi
+    [[ "$_src" == "$project" ]] || continue
+    [[ "$_b" == "main" ]] && continue
+    _status_box_row "$_b" "$_n"
+  done < <(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null || true)
   echo ""
 }
 
@@ -3175,10 +3364,21 @@ cmd_clean() {
     info "No image to remove."
   fi
 
+  # Prune orphaned box descriptions (boxes whose container no longer exists).
+  if [[ -d "$CLEAT_BOXES_DIR" ]]; then
+    local _bf _bcn
+    for _bf in "$CLEAT_BOXES_DIR"/*; do
+      [[ -f "$_bf" ]] || continue
+      _bcn="$(basename "$_bf")"
+      if ! container_exists "$_bcn"; then rm -f "$_bf" 2>/dev/null || true; fi
+    done
+  fi
+
   # Prune orphaned per-container runtime dirs: overlays for containers that no
   # longer exist (project dir moved/deleted, or the container was removed
   # outside cleat). cmd_stop_all only stops containers, so live ones still
-  # exist and their dirs are kept.
+  # exist and their dirs are kept. Kept LAST so its if/fi guard remains
+  # cmd_clean's final statement (a trailing false `[[ ]] &&` would exit 1).
   if [[ -d "$CLEAT_RUN_DIR" ]]; then
     local _d _cn _pruned=0
     for _d in "$CLEAT_RUN_DIR"/*/; do
@@ -3234,6 +3434,10 @@ cmd_nuke() {
   if [[ -d "$CLEAT_PROJECTS_DIR" ]]; then
     info "Removing per-project Claude state..."
     rm -rf "$CLEAT_PROJECTS_DIR" 2>/dev/null || true
+  fi
+
+  if [[ -d "$CLEAT_BOXES_DIR" ]]; then
+    rm -rf "$CLEAT_BOXES_DIR" 2>/dev/null || true
   fi
 
   local dangling
@@ -3541,6 +3745,7 @@ cmd_config() {
   local scope="global"
   local action=""
   local cap_name=""
+  local box=""
 
   # Parse config subcommand flags
   while [[ $# -gt 0 ]]; do
@@ -3555,15 +3760,31 @@ cmd_config() {
         if [[ $# -lt 2 ]]; then cap_name=""; shift; else cap_name="$2"; shift 2; fi
         ;;
       --list)     action="list"; shift ;;
-      *)
+      --*)
         error "Unknown config option: $1"
         exit 1
+        ;;
+      *)
+        # A bareword positional is a box name → operate on that box's project
+        # cap file (.cleat.<box>). "main" maps to the base .cleat.
+        if [[ -n "$box" ]]; then
+          error "Unexpected argument: ${BOLD}$1${RESET}"
+          exit 1
+        fi
+        if ! _validate_box_name "$1"; then
+          error "Invalid box name: ${BOLD}$1${RESET}"
+          echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars.${RESET}"
+          exit 1
+        fi
+        box="$1"; scope="project"; shift
         ;;
     esac
   done
 
   local config_file
-  if [[ "$scope" == "project" ]]; then
+  if [[ -n "$box" && "$box" != "main" ]]; then
+    config_file="$(pwd)/.cleat.$box"
+  elif [[ "$scope" == "project" ]]; then
     config_file="$(pwd)/.cleat"
   else
     config_file="$CLEAT_GLOBAL_CONFIG"
@@ -3580,11 +3801,13 @@ cmd_config() {
     while IFS= read -r cap; do
       [[ -n "$cap" ]] && _active_list="${_active_list:+${_active_list},}${cap}"
     done < <(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")
-    # Also read project caps if available
-    if [[ -f "$(pwd)/.cleat" ]]; then
+    # Also read project caps if available (box-aware: .cleat.<box> else .cleat)
+    local _proj_caps_file
+    _proj_caps_file="$(_project_caps_file "$(pwd)" "${box:-main}")"
+    if [[ -f "$_proj_caps_file" ]]; then
       while IFS= read -r cap; do
         [[ -n "$cap" ]] && case ",${_active_list}," in *,"$cap",*) ;; *) _active_list="${_active_list:+${_active_list},}${cap}" ;; esac
-      done < <(_read_caps_from_file "$(pwd)/.cleat")
+      done < <(_read_caps_from_file "$_proj_caps_file")
     fi
 
     for cap in "${KNOWN_CAPS[@]}"; do
@@ -3696,14 +3919,23 @@ cmd_trust() {
     fi
     echo -e "  ${BOLD}Trusted projects${RESET} ${DIM}(${count})${RESET}"
     echo ""
-    _trust_list | while IFS= read -r p; do
+    _trust_list | while IFS=$'\t' read -r p b; do
       [[ -z "$p" ]] && continue
+      [[ -z "$b" ]] && b="main"
       local marker="${GREEN}●${RESET}"
-      # Indicate if the project .cleat has changed since approval
-      if [[ -f "$p/.cleat" ]] && ! _is_project_trusted "$p"; then
+      # Indicate if the box's cap file has changed since approval
+      local _cf _stored _cur
+      _cf="$(_project_caps_file "$p" "$b")"
+      _stored="$(_trust_lookup "$p" "$b")"
+      _cur="$(_hash_cleat_caps "$_cf")"
+      if [[ -f "$_cf" && -n "$_cur" && "$_stored" != "$_cur" ]]; then
         marker="${YELLOW}●${RESET}"
       fi
-      echo -e "    ${marker} ${p}"
+      if [[ "$b" == "main" ]]; then
+        echo -e "    ${marker} ${p}"
+      else
+        echo -e "    ${marker} ${p}  ${DIM}[${b}]${RESET}"
+      fi
     done
     echo ""
     echo -e "  ${DIM}${GREEN}●${DIM} trusted at current caps   ${YELLOW}●${DIM} .cleat changed since approval${RESET}"
@@ -3749,6 +3981,57 @@ cmd_untrust() {
     success "Removed trust for ${BOLD}${project}${RESET}"
   else
     info "${project} was not trusted"
+  fi
+}
+
+# ── Box descriptions ────────────────────────────────────────────────────────
+#
+# `cleat describe`             — show the main box's description
+# `cleat describe <box>`       — show that box's description
+# `cleat describe <box> text`  — set/update it (no docker calls; never recreates)
+#
+# The description is host-side metadata (see concept/20-boxes.md), so updating
+# it never restarts or recreates the container — the writable layer (e.g. an
+# `az login`) is untouched.
+cmd_describe() {
+  case "${1:-}" in
+    --help|-h)
+      echo "Usage: cleat describe [box] [text]"
+      echo "       cleat describe <box>          Show a box's description"
+      echo "       cleat describe <box> \"text\"   Set/update it (no container restart)"
+      return 0 ;;
+  esac
+
+  local box="main"
+  if [[ $# -gt 0 ]]; then
+    if ! _validate_box_name "$1"; then
+      error "Invalid box name: ${BOLD}$1${RESET}"
+      echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars.${RESET}"
+      exit 1
+    fi
+    box="$1"; shift
+  fi
+
+  local project cname
+  project="$(resolve_project)"
+  cname="$(container_name_for "$project" "$box")"
+
+  if [[ $# -gt 0 ]]; then
+    # Set/update — remaining args are the description, joined and stored as data.
+    _box_desc_write "$cname" "$*"
+    success "Description set for box ${BOLD}${box}${RESET}"
+    # Print the description as DATA (%s) — never through echo -e, which would
+    # interpret backslash escapes / ANSI in user text. Colors use %b.
+    printf '    %b%s%b\n' "$DIM" "$*" "$RESET"
+  else
+    local cur
+    cur="$(_box_desc_read "$cname")"
+    if [[ -n "$cur" ]]; then
+      printf '  %b%s%b  %s\n' "$BOLD" "$box" "$RESET" "$cur"
+    else
+      info "No description set for box ${BOLD}${box}${RESET}."
+      echo -e "    ${DIM}Set one with: cleat describe ${box} \"...\"${RESET}"
+    fi
   fi
 }
 
@@ -3810,39 +4093,41 @@ cmd_update() {
 cmd_help() {
   header
   echo -e "  ${BOLD}USAGE${RESET}"
-  echo -e "    cleat ${DIM}<command>${RESET} ${DIM}[options] [project-path]${RESET}"
-  echo -e "    ${DIM}Defaults to current directory if no path given.${RESET}"
+  echo -e "    cleat ${DIM}<command> [box] [options]${RESET}"
+  echo -e "    ${DIM}Always operates on the current directory. [box] is a named sandbox${RESET}"
+  echo -e "    ${DIM}for this project (default: main), e.g. ${RESET}${BOLD}cleat start az${RESET}"
   echo ""
   echo -e "  ${BOLD}QUICK START${RESET}"
-  echo -e "    ${GREEN}start${RESET}   ${DIM}[path]${RESET}     Build + run + launch Claude (all-in-one)"
-  echo -e "    ${GREEN}resume${RESET}  ${DIM}[path]${RESET}     Resume the last Claude Code session"
+  echo -e "    ${GREEN}start${RESET}   ${DIM}[box]${RESET}      Build + run + launch Claude (all-in-one)"
+  echo -e "    ${GREEN}resume${RESET}  ${DIM}[box]${RESET}      Resume the last Claude Code session"
   echo ""
   echo -e "  ${BOLD}LIFECYCLE${RESET}"
   echo -e "    ${GREEN}build${RESET}              Build the Docker image (shared across projects)"
   echo -e "    ${GREEN}rebuild${RESET}            Force rebuild the image from scratch"
   echo -e "    ${GREEN}upgrade-claude${RESET}     Update bundled Claude Code in the image ${DIM}[stable|latest|VERSION]${RESET}"
-  echo -e "    ${GREEN}run${RESET}     ${DIM}[path]${RESET}     Start a container for this project"
-  echo -e "    ${GREEN}stop${RESET}    ${DIM}[path]${RESET}     Stop container (keeps it for resume)"
-  echo -e "    ${GREEN}rm${RESET}      ${DIM}[path]${RESET}     Stop + remove container permanently"
+  echo -e "    ${GREEN}run${RESET}     ${DIM}[box]${RESET}      Start a container for this project"
+  echo -e "    ${GREEN}stop${RESET}    ${DIM}[box]${RESET}      Stop container (keeps it for resume)"
+  echo -e "    ${GREEN}rm${RESET}      ${DIM}[box]${RESET}      Stop + remove container permanently"
   echo -e "    ${GREEN}stop-all${RESET}           Stop all Cleat containers"
   echo -e "    ${GREEN}clean${RESET}              Stop everything + remove image"
   echo -e "    ${RED}nuke${RESET}               Remove ALL containers, images, and build cache"
   echo ""
   echo -e "  ${BOLD}CAPABILITIES${RESET}"
-  echo -e "    ${GREEN}config${RESET}             Interactive capability wizard"
-  echo -e "    ${GREEN}config${RESET} --list       List capabilities and their status"
-  echo -e "    ${GREEN}config${RESET} --enable ${DIM}<cap>${RESET}   Enable a capability"
-  echo -e "    ${GREEN}config${RESET} --disable ${DIM}<cap>${RESET}  Disable a capability"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET}        Interactive wizard ${DIM}(no box = global; box = .cleat.<box>)${RESET}"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --list       List effective capabilities"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --enable ${DIM}<cap>${RESET}   Enable a capability"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --disable ${DIM}<cap>${RESET}  Disable a capability"
   echo ""
   echo -e "  ${BOLD}INTERACT${RESET}"
-  echo -e "    ${GREEN}claude${RESET}  ${DIM}[path]${RESET}     Attach Claude Code (--dangerously-skip-permissions)"
-  echo -e "    ${GREEN}shell${RESET}   ${DIM}[path]${RESET}     Open bash in the container"
-  echo -e "    ${GREEN}login${RESET}   ${DIM}[path]${RESET}     Authenticate with Anthropic team account"
-  echo -e "    ${GREEN}logs${RESET}    ${DIM}[path]${RESET}     Tail container logs"
+  echo -e "    ${GREEN}claude${RESET}  ${DIM}[box]${RESET}      Attach Claude Code (--dangerously-skip-permissions)"
+  echo -e "    ${GREEN}shell${RESET}   ${DIM}[box]${RESET}      Open bash in the container"
+  echo -e "    ${GREEN}login${RESET}   ${DIM}[box]${RESET}      Authenticate with Anthropic team account"
+  echo -e "    ${GREEN}logs${RESET}    ${DIM}[box]${RESET}      Tail container logs"
   echo ""
   echo -e "  ${BOLD}INFO${RESET}"
-  echo -e "    ${GREEN}status${RESET}  ${DIM}[path]${RESET}     Show project container & auth status"
+  echo -e "    ${GREEN}status${RESET}             Show this project's boxes, auth & caps"
   echo -e "    ${GREEN}ps${RESET}                 List all Cleat containers (running & stopped)"
+  echo -e "    ${GREEN}describe${RESET} ${DIM}[box] [text]${RESET}  Show or set a box's description"
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
   echo -e "    ${GREEN}update${RESET}             Check for updates and install the latest version"
@@ -3855,14 +4140,15 @@ cmd_help() {
   echo -e "    ${GREEN}--env${RESET} ${DIM}KEY=VALUE${RESET}    Pass environment variable to container"
   echo -e "    ${GREEN}--env${RESET} ${DIM}KEY${RESET}          Inherit from host environment"
   echo -e "    ${GREEN}--env-file${RESET} ${DIM}PATH${RESET}    Load env vars from file"
+  echo -e "    ${GREEN}--desc${RESET} ${DIM}<text>${RESET}      Set a box description at start"
   echo ""
   echo -e "  ${BOLD}EXAMPLES${RESET}"
-  echo -e "    ${DIM}cd ~/code/my-app && cleat start${RESET}           ${DIM}# first time${RESET}"
-  echo -e "    ${DIM}cleat resume${RESET}                              ${DIM}# pick up where you left off${RESET}"
-  echo -e "    ${DIM}cleat config --enable git${RESET}                 ${DIM}# enable git identity${RESET}"
+  echo -e "    ${DIM}cd ~/code/my-app && cleat start${RESET}           ${DIM}# first time (main box)${RESET}"
+  echo -e "    ${DIM}cleat start az --desc \"cloud box\"${RESET}         ${DIM}# a separate az sandbox${RESET}"
+  echo -e "    ${DIM}cleat config az --enable docker${RESET}           ${DIM}# per-box capabilities${RESET}"
+  echo -e "    ${DIM}cleat resume dev${RESET}                          ${DIM}# resume the dev box${RESET}"
+  echo -e "    ${DIM}cleat status${RESET}                              ${DIM}# list this project's boxes${RESET}"
   echo -e "    ${DIM}cleat --cap ssh --env GH_TOKEN start${RESET}      ${DIM}# one-off session${RESET}"
-  echo -e "    ${DIM}cleat ps${RESET}                                  ${DIM}# see all containers${RESET}"
-  echo -e "    ${DIM}cleat stop${RESET}                                ${DIM}# pause (keeps container)${RESET}"
   echo ""
 }
 
@@ -3874,6 +4160,7 @@ parse_global_flags() {
   _CLI_ENVS=()
   _CLI_ENV_FILES=()
   _CLI_TRUST_PROJECT=0
+  _CLI_DESC_SET=0
   _REMAINING_ARGS=()
 
   while [[ $# -gt 0 ]]; do
@@ -3916,6 +4203,15 @@ parse_global_flags() {
         _CLI_ENV_FILES+=("$2")
         shift 2
         ;;
+      --desc)
+        if [[ -z "${2:-}" ]]; then
+          error "Missing text after --desc"
+          exit 1
+        fi
+        _CLI_DESC="$2"
+        _CLI_DESC_SET=1
+        shift 2
+        ;;
       *)
         _REMAINING_ARGS+=("$1")
         shift
@@ -3948,22 +4244,23 @@ main() {
   esac
 
   case "$cmd" in
-    start)     _set_box "${1:-}"; cmd_start ;;
-    resume|r)  _set_box "${1:-}"; cmd_resume ;;
+    start)     _set_box "$@"; cmd_start ;;
+    resume|r)  _set_box "$@"; cmd_resume ;;
     build)     cmd_build "$@" ;;
     rebuild)   cmd_rebuild "$@" ;;
     upgrade-claude) cmd_upgrade_claude "$@" ;;
-    run)       _set_box "${1:-}"; cmd_run ;;
-    stop)      _set_box "${1:-}"; cmd_stop ;;
-    rm)        _set_box "${1:-}"; cmd_rm ;;
+    run)       _set_box "$@"; cmd_run ;;
+    stop)      _set_box "$@"; cmd_stop ;;
+    rm)        _set_box "$@"; cmd_rm ;;
     stop-all)  cmd_stop_all "$@" ;;
-    shell|sh)  _set_box "${1:-}"; cmd_shell ;;
-    login)     _set_box "${1:-}"; cmd_login ;;
-    claude)    _set_box "${1:-}"; cmd_claude ;;
-    logs)      _set_box "${1:-}"; cmd_logs ;;
+    shell|sh)  _set_box "$@"; cmd_shell ;;
+    login)     _set_box "$@"; cmd_login ;;
+    claude)    _set_box "$@"; cmd_claude ;;
+    logs)      _set_box "$@"; cmd_logs ;;
     ps)        cmd_ps "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
+    describe)  cmd_describe "$@" ;;
     trust)     cmd_trust "$@" ;;
     untrust)   cmd_untrust "$@" ;;
     clean)     cmd_clean "$@" ;;

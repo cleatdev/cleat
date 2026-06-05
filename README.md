@@ -241,6 +241,30 @@ cleat ps
       /Users/you/frontend
 ```
 
+### Boxes — multiple sandboxes per project
+
+A **box** is a named, isolated container scoped to the current directory. Every
+box mounts the **same** live files, but each has its own capabilities, writable
+layer, and Claude session — so a locked-down `dev` box can run beside a
+cloud-capable `az` box over the same repo, and the agent in `dev` can't reach the
+Docker socket or cloud token that `az` holds.
+
+```bash
+cleat start                       # the default box (main)
+cleat start az --desc "cloud box" # a separate az sandbox
+cleat config az --enable docker   # give just the az box the docker cap
+cleat resume dev                  # resume the dev box's last session
+cleat status                      # list this project's boxes
+```
+
+The token after a verb is a box name (lowercase letters, digits, `-`, `_`),
+never a path — `cleat` always operates on the current directory. The default box
+is byte-identical to the pre-boxes container, so existing projects keep working
+unchanged. Per-box caps come from `.cleat.<box>` (replace, not merge — a box can
+have *fewer* caps than `.cleat`). One caveat: `~/.claude` (your Anthropic auth)
+is shared across boxes — a box isolates host capabilities and the writable layer,
+not your Claude login.
+
 ### Command reference
 
 #### Quick start
@@ -252,8 +276,8 @@ cleat ps
 #### Lifecycle
 | Command | Description |
 |---|---|
-| `cleat stop [path]` | Stop this project's container (keeps it for resume) |
-| `cleat rm [path]` | Stop and remove container permanently (session history on the host is preserved) |
+| `cleat stop [box]` | Stop this project's container (keeps it for resume) |
+| `cleat rm [box]` | Stop and remove container permanently (session history on the host is preserved) |
 | `cleat stop-all` | Stop all Cleat containers |
 | `cleat build` | Build the Docker image |
 | `cleat rebuild` | Force rebuild the image from scratch |
@@ -269,6 +293,7 @@ cleat ps
 | `cleat config --enable <cap>` | Enable a capability (e.g. `git`, `ssh`, `env`) |
 | `cleat config --disable <cap>` | Disable a capability |
 | `cleat config --project --enable <cap>` | Project-level config (saved to `.cleat`) |
+| `cleat config <box> --enable <cap>` | Per-box config (saved to `.cleat.<box>`; replaces `.cleat` for that box) |
 
 #### Workspace trust
 | Command | Description |
@@ -285,24 +310,27 @@ cleat ps
 | `--env KEY` | Inherit from host environment |
 | `--env-file PATH` | Load env vars from file |
 | `--trust-project` | Auto-approve the current project's `.cleat` without prompting |
+| `--desc <text>` | Set the box's description at start (host-side; never recreates) |
 
 #### Interact
 | Command | Description |
 |---|---|
-| `cleat claude [path]` | Attach Claude Code to a running container |
-| `cleat shell [path]` | Open bash inside the container |
-| `cleat login [path]` | Authenticate with Anthropic (OAuth) |
-| `cleat logs [path]` | Tail container logs |
+| `cleat claude [box]` | Attach Claude Code to a running container |
+| `cleat shell [box]` | Open bash inside the container |
+| `cleat login [box]` | Authenticate with Anthropic (OAuth) |
+| `cleat logs [box]` | Tail container logs |
 
 #### Info
 | Command | Description |
 |---|---|
-| `cleat status [path]` | Show container, image, and auth status |
-| `cleat ps` | List all Cleat containers (running and stopped) |
+| `cleat status` | Show this project's boxes, image, and auth status |
+| `cleat describe [box] [text]` | Show or set a box's description (host-side; never recreates) |
+| `cleat ps` | List all Cleat containers (running and stopped, with a box column) |
 | `cleat update` | Check for updates and install the latest version |
 | `cleat version` | Show current version |
 
-All commands default to the current working directory if `[path]` is omitted.
+All commands operate on the current working directory. The optional `[box]` is a
+named sandbox for the project (default: `main`) — see **Boxes** above.
 
 ---
 

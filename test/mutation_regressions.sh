@@ -33,6 +33,7 @@ TERMINAL_UX_BATS="$REPO_ROOT/test/unit/terminal_ux.bats"
 BOX_NAME_BATS="$REPO_ROOT/test/unit/box_name.bats"
 CONTAINER_NAME_BATS="$REPO_ROOT/test/unit/container_name.bats"
 BOXES_BATS="$REPO_ROOT/test/unit/boxes.bats"
+BOX_HARDENING_BATS="$REPO_ROOT/test/unit/box_hardening.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -751,6 +752,53 @@ cat > "$SED_TMP" << 'SED'
 s|_derive_project_session_key "\$project" "\$box"|_derive_project_session_key "\$project"|
 SED
 try "boxes_session_key_threads_box" "a named box gets its own session overlay dir" "$CLI" "$BOXES_BATS"
+
+# boxes — a named box's caps come from .cleat.<box> (REPLACE, not merge), which
+# is what enables least privilege (a box with FEWER caps than the project
+# default). Make _project_caps_file return .cleat for a named box instead of
+# .cleat.<box>; the dev box would then inherit .cleat's docker cap and the
+# replace-not-merge test must fail.
+cat > "$SED_TMP" << 'SED'
+/^_project_caps_file()/,/^}$/{
+  s|echo "\$project/.cleat.\$box"|echo "\$project/.cleat"|
+}
+SED
+try "boxes_caps_file_replace_not_merge" "REPLACES .cleat — a box can have FEWER caps" "$CLI" "$BOXES_BATS"
+
+# boxes — a box description must actually persist to its host-side file (so it
+# survives stop/resume/recreate). Make _box_desc_write drop the text to
+# /dev/null; the set/show round-trip test must fail.
+cat > "$SED_TMP" << 'SED'
+/^_box_desc_write()/,/^}$/{
+  s|> "\$(_box_desc_file "\$cname")"|> /dev/null|
+}
+SED
+try "boxes_desc_persists" "set then show round-trips the description" "$CLI" "$BOXES_BATS"
+
+# boxes — a box description is user-controlled text and must be printed as DATA
+# (printf %s), never through echo -e, which would interpret backslash escapes /
+# ANSI in the text. Turn the %s back into %b so the text is interpreted; the
+# "shown LITERALLY in cleat status" hardening test must fail.
+cat > "$SED_TMP" << 'SED'
+s|%b%s%b|%b%b%b|
+SED
+try "boxes_desc_printed_as_data" "shown LITERALLY in cleat status" "$CLI" "$BOX_HARDENING_BATS"
+
+# boxes — `cleat rm <box>` must remove the box's host-side description
+# unconditionally (even for a box that was only ever describe'd, never started).
+# Delete the unconditional removal; the rm-without-container test must fail.
+cat > "$SED_TMP" << 'SED'
+/_box_desc_remove "\$cname"/d
+SED
+try "boxes_rm_removes_desc_unconditional" "removes the description even when no container existed" "$CLI" "$BOX_HARDENING_BATS"
+
+# boxes — cmd_status must confirm a candidate's /workspace mount source IS this
+# project (guards the cross-project hash-substring collision). Drop the check;
+# a sibling project's container would then surface as a phantom box.
+cat > "$SED_TMP" << 'SED'
+/\[\[ "\$_src" == "\$project" \]\] || continue/d
+SED
+try "boxes_status_mount_source_guard" "ignores a container whose /workspace mount is a different project" "$CLI" "$BOXES_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

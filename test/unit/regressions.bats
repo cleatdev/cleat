@@ -1758,3 +1758,68 @@ ${overlay_dir}/project-settings.local.json"
     return 1
   }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.13.1 — two bugs surfaced when the v0.13.0 upgrade forced a container
+# recreate on a macOS host (host uid 501, image-baked coder uid 1000):
+#
+#   (A) FREEZE: v0.13.0 made ~/.local writable, re-enabling Claude Code's
+#       launch-time self-updater, which hangs the TUI under `docker exec -it` on
+#       a fresh container. Fix: disable it via DISABLE_AUTOUPDATER=1 in the
+#       session env — cleat owns Claude's version (image + `cleat upgrade-claude`).
+#
+#   (B) CLIP EPERM STORM: `docker exec ... runuser -u coder` could fire before
+#       the entrypoint finished remapping coder 1000→501, so clip-daemon stamped
+#       /tmp/clip.* as uid 1000; later 501 sessions couldn't unlink them from the
+#       sticky /tmp. Fixes: wait for the remap before exec, AND give clip-daemon a
+#       per-uid runtime dir so two uids can never collide on one socket.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@test "regression v0.13.1: session env disables Claude's launch-time auto-updater" {
+  # The freeze cause was Claude's in-container self-updater running at launch.
+  # Cleat manages Claude's version itself, so the session must pass
+  # DISABLE_AUTOUPDATER=1 to claude.
+  _host_open_cmd() { echo ""; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  run assert_docker_exec_has "DISABLE_AUTOUPDATER=1"
+  assert_success
+}
+
+@test "regression v0.13.1: session waits for the UID remap before launching" {
+  # The wrong-uid / clip-EPERM cause was the session exec racing the entrypoint's
+  # /etc/passwd remap. exec_claude must probe `id -u coder` in the container
+  # before launching, so clip-daemon and claude never run as the stale image uid.
+  _host_open_cmd() { echo ""; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  run assert_docker_exec_has "id -u coder"
+  assert_success
+}
+
+@test "regression v0.13.1: clip-daemon uses a per-uid runtime dir, not shared /tmp/clip.sock" {
+  # Stale, foreign-owned /tmp/clip.sock in the sticky /tmp was the wedge. The
+  # daemon must honor CLEAT_CLIP_DIR (a per-uid dir) for its socket so two uids
+  # can never collide. Stub socat so we observe the bind path without listening.
+  local rundir="$TEST_TEMP/clip-run"
+  local stubs="$TEST_TEMP/clipd-stubs"; mkdir -p "$stubs" "$rundir"
+  local socat_log="$TEST_TEMP/socat-args.log"; : > "$socat_log"
+  printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$socat_log" > "$stubs/socat"
+  chmod +x "$stubs/socat"
+  run env PATH="$stubs:$PATH" CLEAT_CLIP_DIR="$rundir" bash "$PROJECT_ROOT/docker/clip-daemon"
+  run cat "$socat_log"
+  assert_output --partial "$rundir/clip.sock"
+}
+
+@test "regression v0.13.1: clip shim and clip-daemon resolve the SAME socket path" {
+  # The OSC52 fallback only works if `clip` connects to the exact socket
+  # clip-daemon binds. Both derive it from CLEAT_CLIP_DIR / the per-uid dir; a
+  # divergence (e.g. one left at /tmp/clip.sock) silently breaks paste. Evaluate
+  # the real assignment lines from each shipped script and compare.
+  local daemon_sock clip_sock
+  daemon_sock="$(CLEAT_CLIP_DIR=/probe bash -c 'eval "$(grep -E "^(RUNDIR|SOCK)=" "'"$PROJECT_ROOT/docker/clip-daemon"'")"; printf %s "$SOCK"')"
+  clip_sock="$(CLEAT_CLIP_DIR=/probe bash -c 'eval "$(grep -E "^SOCK=" "'"$PROJECT_ROOT/docker/clip"'")"; printf %s "$SOCK"')"
+  assert_equal "$daemon_sock" "/probe/clip.sock"
+  assert_equal "$clip_sock" "/probe/clip.sock"
+  assert_equal "$clip_sock" "$daemon_sock"
+}

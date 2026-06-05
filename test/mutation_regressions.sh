@@ -33,11 +33,15 @@ TERMINAL_UX_BATS="$REPO_ROOT/test/unit/terminal_ux.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
+CLIP_DAEMON="$REPO_ROOT/docker/clip-daemon"
+CLIP_SHIM="$REPO_ROOT/docker/clip"
 TEST_SH="$REPO_ROOT/test.sh"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
 INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
 ENTRYPOINT_BACKUP="/tmp/cleat-regression-mutation-entrypoint-backup-$$"
 OPENBRIDGE_BACKUP="/tmp/cleat-regression-mutation-openbridge-backup-$$"
+CLIP_DAEMON_BACKUP="/tmp/cleat-regression-mutation-clipdaemon-backup-$$"
+CLIP_SHIM_BACKUP="/tmp/cleat-regression-mutation-clipshim-backup-$$"
 TEST_SH_BACKUP="/tmp/cleat-regression-mutation-testsh-backup-$$"
 
 BOLD=$'\033[1m'
@@ -52,9 +56,11 @@ cleanup() {
   [[ -f "$INSTALLER_BACKUP" ]] && cp "$INSTALLER_BACKUP" "$INSTALLER"
   [[ -f "$ENTRYPOINT_BACKUP" ]] && cp "$ENTRYPOINT_BACKUP" "$ENTRYPOINT"
   [[ -f "$OPENBRIDGE_BACKUP" ]] && cp "$OPENBRIDGE_BACKUP" "$OPENBRIDGE"
+  [[ -f "$CLIP_DAEMON_BACKUP" ]] && cp "$CLIP_DAEMON_BACKUP" "$CLIP_DAEMON"
+  [[ -f "$CLIP_SHIM_BACKUP" ]] && cp "$CLIP_SHIM_BACKUP" "$CLIP_SHIM"
   [[ -f "$TEST_SH_BACKUP" ]] && cp "$TEST_SH_BACKUP" "$TEST_SH"
   rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP" \
-        "$OPENBRIDGE_BACKUP" "$TEST_SH_BACKUP"
+        "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$TEST_SH_BACKUP"
 }
 trap cleanup EXIT INT TERM
 
@@ -62,6 +68,8 @@ cp "$CLI" "$BACKUP"
 cp "$INSTALLER" "$INSTALLER_BACKUP"
 cp "$ENTRYPOINT" "$ENTRYPOINT_BACKUP"
 cp "$OPENBRIDGE" "$OPENBRIDGE_BACKUP"
+cp "$CLIP_DAEMON" "$CLIP_DAEMON_BACKUP"
+cp "$CLIP_SHIM" "$CLIP_SHIM_BACKUP"
 cp "$TEST_SH" "$TEST_SH_BACKUP"
 filter="${1:-}"
 
@@ -76,6 +84,10 @@ run_mutation() {
     backup="$ENTRYPOINT_BACKUP"
   elif [[ "$target" == "$OPENBRIDGE" ]]; then
     backup="$OPENBRIDGE_BACKUP"
+  elif [[ "$target" == "$CLIP_DAEMON" ]]; then
+    backup="$CLIP_DAEMON_BACKUP"
+  elif [[ "$target" == "$CLIP_SHIM" ]]; then
+    backup="$CLIP_SHIM_BACKUP"
   elif [[ "$target" == "$TEST_SH" ]]; then
     backup="$TEST_SH_BACKUP"
   else
@@ -668,6 +680,44 @@ cat > "$SED_TMP" << 'SED'
 s|\${AMBER}! \$1\${RESET}|\${AMBER}!\${RESET} \$1|
 SED
 try "v0.13.0_warn_sandbox_full_amber" "the whole line is amber, matching the sandbox cap" "$CLI" "$TERMINAL_UX_BATS"
+
+# v0.13.1 — the session env must disable Claude's launch-time auto-updater
+# (the freeze). Drop the flag from CLAUDE_ENV; the regression test that asserts
+# the session exec carries DISABLE_AUTOUPDATER=1 must fail.
+cat > "$SED_TMP" << 'SED'
+s| -e DISABLE_AUTOUPDATER=1||
+SED
+try "v0.13.1_disable_autoupdater" "session env disables Claude's launch-time auto-updater"
+
+# v0.13.1 — exec_claude must wait for the entrypoint UID remap before launching.
+# Delete the call; the test that asserts a `id -u coder` probe was issued fails.
+cat > "$SED_TMP" << 'SED'
+/_wait_for_coder_remap "\$cname"/d
+SED
+try "v0.13.1_remap_wait" "session waits for the UID remap before launching"
+
+# v0.13.1 — clip-daemon must use a per-uid runtime dir (CLEAT_CLIP_DIR), not the
+# shared /tmp/clip.sock. Revert it to a fixed path; the test that points it at a
+# per-uid dir and checks the socat bind path must fail.
+cat > "$SED_TMP" << 'SED'
+s|"\${CLEAT_CLIP_DIR:-/tmp/cleat-run-\$(id -u)}"|"/tmp/cleat-run-mutant"|
+SED
+try "v0.13.1_clip_per_uid_dir" "clip-daemon uses a per-uid runtime dir" "$CLIP_DAEMON" "$REGRESSIONS"
+
+# v0.13.1 — the clip shim must resolve the SAME per-uid socket as clip-daemon.
+# Revert it to the legacy /tmp/clip.sock; the path-consistency test must fail.
+cat > "$SED_TMP" << 'SED'
+s|SOCK="\${CLEAT_CLIP_DIR:-/tmp/cleat-run-\$(id -u)}/clip.sock"|SOCK="/tmp/clip.sock"|
+SED
+try "v0.13.1_clip_shim_sock_path" "clip shim and clip-daemon resolve the SAME socket path" "$CLIP_SHIM" "$REGRESSIONS"
+
+# v0.13.1 — the entrypoint must clear stale clip runtime files (as root) before
+# dropping to coder. Delete the cleanup line; the entrypoint test that asserts
+# the removal must fail.
+cat > "$SED_TMP" << 'SED'
+/rm -rf \/tmp\/cleat-run-/d
+SED
+try "v0.13.1_entrypoint_clip_cleanup" "clears stale clipboard runtime files before dropping to coder" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

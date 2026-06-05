@@ -50,6 +50,12 @@ RUN userdel -r node 2>/dev/null || true && \
 # Install Claude Code CLI as coder user (native installer)
 USER coder
 ENV HOME=/home/coder
+# Disable Claude Code's launch-time/background self-updater image-wide. Cleat
+# owns Claude's version (baked here, updated via `cleat upgrade-claude`); an
+# in-container self-update is ephemeral and has hung the TUI at launch. The CLI
+# also sets this on `docker exec`, but baking it covers manual exec too. Manual
+# `claude update` still works. docs.claude.com/en/setup#disable-auto-updates
+ENV DISABLE_AUTOUPDATER=1
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/coder/.bashrc
 USER root

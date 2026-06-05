@@ -15,7 +15,7 @@
 set -euo pipefail
 
 BRIDGE="/tmp/cleat-clip"
-SOCK="/tmp/clip.sock"
+SOCK="${CLEAT_CLIP_DIR:-/tmp/cleat-run-$(id -u)}/clip.sock"
 MAX_PAYLOAD=102400  # 100KB
 
 # Detect which name we were called as

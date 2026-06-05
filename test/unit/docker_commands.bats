@@ -576,6 +576,10 @@ teardown() { _common_teardown; }
 
   run cmd_shell "$TEST_TEMP/project"
   assert_success
+  # v0.13.1: must wait for the entrypoint UID remap before exec, so the shell
+  # never opens as the stale image uid (same race as the session launch).
+  run assert_docker_exec_has "id -u coder"
+  assert_success
   run assert_docker_exec_has "runuser -u coder"
   assert_success
   run assert_docker_exec_has "HOME=/home/coder"
@@ -625,6 +629,10 @@ EOF
   mock_docker_ps "$cname"
 
   run cmd_login "$TEST_TEMP/project"
+  assert_success
+  # v0.13.1: must wait for the UID remap before exec, so `claude login` never
+  # runs as the stale image uid and writes auth that the real uid can't own.
+  run assert_docker_exec_has "id -u coder"
   assert_success
   run assert_docker_exec_has "claude login"
   assert_success

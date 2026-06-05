@@ -17,6 +17,7 @@ _run_entrypoint() {
   local stubs="$TEST_TEMP/stubs"
   mkdir -p "$stubs"
   CHOWN_LOG="$TEST_TEMP/chown.log"; : > "$CHOWN_LOG"; export CHOWN_LOG
+  RM_LOG="$TEST_TEMP/rm.log"; : > "$RM_LOG"; export RM_LOG
 
   printf '#!/bin/sh\necho "$@" >> "$CHOWN_LOG"\nexit 0\n' > "$stubs/chown"
   printf '#!/bin/sh\necho 1000\nexit 0\n'                 > "$stubs/id"
@@ -26,10 +27,13 @@ _run_entrypoint() {
   printf '#!/bin/sh\nexit 0\n'                            > "$stubs/getent"
   printf '#!/bin/sh\nexit 0\n'                            > "$stubs/stat"
   printf '#!/bin/sh\nexit 0\n'                            > "$stubs/su"
+  # Stub `rm` so the entrypoint's stale-runtime cleanup is observable AND can't
+  # touch the real /tmp during tests (the dev box may have a live clip socket).
+  printf '#!/bin/sh\necho "$@" >> "$RM_LOG"\nexit 0\n'    > "$stubs/rm"
   chmod +x "$stubs"/*
 
   local entrypoint="$BATS_TEST_DIRNAME/../../docker/entrypoint.sh"
-  run env PATH="$stubs:$PATH" HOST_UID=501 HOST_GID=501 CHOWN_LOG="$CHOWN_LOG" \
+  run env PATH="$stubs:$PATH" HOST_UID=501 HOST_GID=501 CHOWN_LOG="$CHOWN_LOG" RM_LOG="$RM_LOG" \
     bash "$entrypoint"
 }
 
@@ -46,6 +50,17 @@ _run_entrypoint() {
   _run_entrypoint
   run cat "$CHOWN_LOG"
   assert_output --partial "/home/coder/.claude"
+}
+
+@test "entrypoint: clears stale clipboard runtime files before dropping to coder" {
+  # v0.13.1: a hard-killed prior session can leave a foreign-owned clip socket in
+  # the sticky /tmp (it survives docker stop/start). As root, the entrypoint must
+  # remove it so the next clip-daemon starts clean — otherwise the runtime user
+  # can't unlink it and clip-daemon spews EPERM every launch.
+  _run_entrypoint
+  assert_success
+  run cat "$RM_LOG"
+  assert_output --partial "/tmp/clip.sock"
 }
 
 @test "entrypoint: rejects a non-numeric HOST_UID" {

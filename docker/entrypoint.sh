@@ -60,6 +60,14 @@ if [ -S /var/run/docker.sock ]; then
   fi
 fi
 
+# Clear stale clipboard-daemon runtime files left in this container's writable
+# layer by a previous session. /tmp survives `docker stop`/`docker start`, so a
+# file created under a different (pre-remap) uid could otherwise persist and
+# wedge the next clip-daemon. As root we can remove them regardless of owner,
+# guaranteeing a clean slate. Covers both the current per-uid dirs and the
+# legacy bare paths used before v0.13.1.
+rm -rf /tmp/cleat-run-* /tmp/clip.sock /tmp/clip-daemon.pid /tmp/clip-handler 2>/dev/null || true
+
 if [ $# -eq 0 ]; then
   exec su -s /bin/bash coder
 else

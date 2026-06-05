@@ -11,15 +11,28 @@
 # Usage (started automatically by cleat before launching Claude Code):
 #   clip-daemon &
 
-SOCK="/tmp/clip.sock"
-PIDFILE="/tmp/clip-daemon.pid"
-HANDLER="/tmp/clip-handler"
+# Runtime files live in a PER-UID directory, never directly in the shared,
+# sticky (1777) /tmp. If two sessions ever resolve `coder` to different uids
+# (e.g. transiently, during the entrypoint UID remap) they would otherwise
+# collide on the same /tmp/clip.sock, and the later one could neither unlink
+# nor rebind a socket it doesn't own (EPERM in a sticky dir) — the historical
+# clip-error storm. A per-uid dir (mode 700) is owned by its creator, so each
+# uid manages its own files and a stale foreign-owned file can't wedge a new
+# daemon. The socket MUST stay in the container layer (not the /tmp/cleat-clip
+# bind mount), since AF_UNIX sockets don't work on macOS virtiofs mounts.
+# CLEAT_CLIP_DIR overrides the path (used by the test harness).
+RUNDIR="${CLEAT_CLIP_DIR:-/tmp/cleat-run-$(id -u)}"
+mkdir -p "$RUNDIR" 2>/dev/null || true
+chmod 700 "$RUNDIR" 2>/dev/null || true
+SOCK="$RUNDIR/clip.sock"
+PIDFILE="$RUNDIR/clip-daemon.pid"
+HANDLER="$RUNDIR/clip-handler"
 MAX_CHILDREN=5         # cap concurrent socat forks (prevents PID exhaustion)
 MAX_PAYLOAD=102400     # 100KB -- matches typical terminal OSC 52 limits
 
 cleanup() {
   [ -n "${SOCAT_PID:-}" ] && kill "$SOCAT_PID" 2>/dev/null && wait "$SOCAT_PID" 2>/dev/null
-  rm -f "$SOCK" "$PIDFILE" "$HANDLER"
+  rm -f "$SOCK" "$PIDFILE" "$HANDLER" 2>/dev/null || true
   exit 0
 }
 trap cleanup EXIT INT TERM HUP
@@ -34,7 +47,7 @@ if [ -f "$PIDFILE" ]; then
       sleep 0.1
     fi
   fi
-  rm -f "$SOCK" "$PIDFILE" "$HANDLER"
+  rm -f "$SOCK" "$PIDFILE" "$HANDLER" 2>/dev/null || true
 fi
 
 echo $$ > "$PIDFILE"
@@ -55,7 +68,10 @@ chmod +x "$HANDLER"
 # socat fork mode: keeps the socket alive permanently, forks a handler for
 # each connection.  max-children caps concurrent forks to prevent PID
 # exhaustion under rapid-fire usage.
-socat -u "UNIX-LISTEN:$SOCK,mode=666,fork,max-children=$MAX_CHILDREN" "EXEC:$HANDLER" &
+# unlink-early: socat removes any stale socket file before binding, so a
+# leftover socket (e.g. from a hard-killed prior session) can't make the bind
+# fail with "address already in use".
+socat -u "UNIX-LISTEN:$SOCK,mode=666,fork,max-children=$MAX_CHILDREN,unlink-early" "EXEC:$HANDLER" &
 SOCAT_PID=$!
 
 # Wait for socat -- if it exits unexpectedly, cleanup runs via the trap

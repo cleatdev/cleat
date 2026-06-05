@@ -1243,7 +1243,13 @@ _env_summary_inline() {
 }
 
 # ── Clipboard bridge ──────────────────────────────────────────────────────
-CLAUDE_ENV=(-e HOME=/home/coder -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+# DISABLE_AUTOUPDATER=1 turns off Claude Code's launch-time/background self-
+# updater inside the container. Cleat owns Claude's version (it's baked into the
+# image and updated via `cleat upgrade-claude`); an in-container self-update is
+# ephemeral (reverts on recreate) AND has been observed to hang the TUI at launch
+# on a freshly-(re)created container. Manual `claude update` / `claude doctor`
+# still work. See docs.claude.com/en/setup#disable-auto-updates.
+CLAUDE_ENV=(-e HOME=/home/coder -e DISABLE_AUTOUPDATER=1 -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 
 _host_clip_cmd() {
   if command -v pbcopy &>/dev/null; then echo pbcopy
@@ -1697,6 +1703,33 @@ _execute_host_hooks() {
   done
 }
 
+# Block until the container's entrypoint has finished remapping the `coder`
+# user from the image-baked UID to the host UID, before we exec a session into
+# it. `docker exec` works the instant PID 1 exists — which can be BEFORE the
+# entrypoint rewrites /etc/passwd. If we exec into that window, `runuser -u
+# coder` resolves the STALE uid, so clip-daemon and claude run as the wrong
+# user: claude can't write its host-owned config/auth (it hangs), and clip-daemon
+# stamps its runtime files with the wrong owner — which later, correctly-mapped
+# sessions can't clean from the sticky /tmp (the historical clip-EPERM storm).
+# Best-effort gate: a running container's `id -u coder` is always numeric, so an
+# empty/non-numeric reply means "can't determine" (broken exec) and we proceed
+# rather than stall; a valid-but-mismatched uid means the remap is still in
+# flight, so we keep polling (≤5s).
+_wait_for_coder_remap() {
+  local cname="$1" want got i=0
+  want="$(id -u)"
+  while [ "$i" -lt 50 ]; do
+    got="$(docker exec "$cname" id -u coder 2>/dev/null)"
+    case "$got" in
+      ''|*[!0-9]*) return 0 ;;
+    esac
+    [ "$got" = "$want" ] && return 0
+    i=$((i + 1))
+    sleep 0.1
+  done
+  return 0
+}
+
 exec_claude() {
   local cname="$1"
   shift
@@ -1763,6 +1796,9 @@ exec_claude() {
 
   trap _cleanup_session EXIT INT TERM HUP
 
+  # Don't launch the session until the UID remap has landed (see helper above).
+  _wait_for_coder_remap "$cname"
+
   local rc=0
   # Use `runuser -u coder` rather than `docker exec --user coder` because the
   # latter sets UID/GID but skips initgroups(3), so supplementary groups from
@@ -1773,7 +1809,7 @@ exec_claude() {
     runuser -u coder -- bash -c '
       clip-daemon &
       _MY_CLIP_DAEMON=$!
-      for i in 1 2 3 4 5; do [ -S /tmp/clip.sock ] && break; sleep 0.1; done
+      for i in 1 2 3 4 5; do [ -S "${CLEAT_CLIP_DIR:-/tmp/cleat-run-$(id -u)}/clip.sock" ] && break; sleep 0.1; done
       claude "$@"
       kill "$_MY_CLIP_DAEMON" 2>/dev/null
       wait "$_MY_CLIP_DAEMON" 2>/dev/null
@@ -2277,9 +2313,12 @@ _upgrade_claude_image() {
 
   spin "Upgrading Claude Code (${channel})..."
   local rc=0
-  # The image ENTRYPOINT remaps UID/GID as root then drops to the coder user,
-  # so the installer writes to coder's home exactly as it did at build time.
-  docker run --name "$tmp" "$IMAGE_NAME" bash -c "$install_cmd" > "$log" 2>&1 || rc=$?
+  # The image ENTRYPOINT remaps UID/GID as root then drops to the coder user.
+  # Pass the host UID/GID so the installer writes ~/.local owned by the SAME uid
+  # the runtime container will remap coder to. Without this the throwaway defaults
+  # to the image-baked uid (1000), baking a 1000-owned ~/.local that a host-uid
+  # (e.g. macOS 501) runtime can't write — breaking manual `claude update`.
+  docker run --name "$tmp" -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" "$IMAGE_NAME" bash -c "$install_cmd" > "$log" 2>&1 || rc=$?
 
   if [[ $rc -eq 0 ]]; then
     # Commit the updated filesystem over the working image. Restore the default
@@ -2838,6 +2877,7 @@ cmd_shell() {
   cname="$(container_name_for "$project")"
 
   require_running "$cname"
+  _wait_for_coder_remap "$cname"
   resolve_caps "$project"
   resolve_env_args "$project"
   info "Container ${BOLD}${cname}${RESET}"
@@ -2853,6 +2893,7 @@ cmd_login() {
   cname="$(container_name_for "$project")"
 
   require_running "$cname"
+  _wait_for_coder_remap "$cname"
   resolve_caps "$project"
   resolve_env_args "$project"
   info "Authenticating with your Anthropic team account..."

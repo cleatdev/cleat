@@ -3247,23 +3247,26 @@ cmd_ps() {
   while IFS= read -r line; do
     if [[ -n "$line" ]]; then
       found=true
-      local name status project_path color
+      local name status project_path color meta box_label running rest
       name="$(echo "$line" | awk -F'\t' '{print $1}' | xargs)"
       status="$(echo "$line" | awk -F'\t' '{print $2}' | xargs)"
 
-      project_path=$(docker inspect "$name" --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+      # One inspect per container yields everything this row renders: the box
+      # label, the running state (dot colour) and the /workspace mount source.
+      # Field order is box|running|path so a literal '|' in the project path
+      # (legal on disk) falls into the trailing field and can't corrupt the
+      # parse of the two fixed-charset fields ahead of it.
+      meta="$(docker inspect "$name" --format '{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)"
+      box_label="${meta%%|*}"
+      rest="${meta#*|}"
+      running="${rest%%|*}"
+      project_path="${rest#*|}"
 
-      if docker ps --filter "name=^${name}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-        color="$GREEN"
-      else
-        color="$YELLOW"
-      fi
+      if [[ "$running" == "true" ]]; then color="$GREEN"; else color="$YELLOW"; fi
 
       # Box column — read from the sh.cleat.box label (concept/20-boxes.md).
       # Containers created before boxes (or the default box) have no label or
       # "main"; either way show nothing extra to keep the default view clean.
-      local box_label
-      box_label="$(docker inspect "$name" --format '{{index .Config.Labels "sh.cleat.box"}}' 2>/dev/null)"
       [[ -z "$box_label" || "$box_label" == "<no value>" ]] && box_label="main"
 
       if [[ "$box_label" != "main" ]]; then
@@ -3371,12 +3374,20 @@ cmd_status() {
   # when the docker daemon is down. See concept/20-boxes.md.
   echo ""
   echo -e "  ${BOLD}Boxes:${RESET}"
-  local _main_cname _hash _n _meta _b _src
+  local _main_cname _hash _n _meta _b _rest _running _src
   _main_cname="$(container_name_for "$project" main)"
   _hash="$(echo -n "$project" | _md5 | head -c 8)"
+  # Third arg is an OPTIONAL pre-resolved running state ("true"/"false"). The
+  # named-box loop already learns this from its one discovery inspect, so it
+  # passes it here to skip the is_running + container_exists docker calls. The
+  # main row passes nothing and falls back to probing (it may not exist yet).
   _status_box_row() {
-    local _bx="$1" _cn="$2"
-    if is_running "$_cn"; then
+    local _bx="$1" _cn="$2" _known="${3:-}"
+    if [[ "$_known" == "true" ]]; then
+      echo -e "    ${GREEN}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}running${RESET}"
+    elif [[ "$_known" == "false" ]]; then
+      echo -e "    ${YELLOW}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}stopped${RESET}"
+    elif is_running "$_cn"; then
       echo -e "    ${GREEN}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}running${RESET}"
     elif container_exists "$_cn"; then
       echo -e "    ${YELLOW}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}stopped${RESET}"
@@ -3394,13 +3405,20 @@ cmd_status() {
     # Cheap pre-filter on the invariant hash; the mount-source check below is
     # authoritative (a sibling project could embed this hash in its dir name).
     case "$_n" in *"-${_hash}"*) ;; *) continue ;; esac
-    _meta="$(docker inspect "$_n" --format '{{index .Config.Labels "sh.cleat.box"}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+    # One inspect per candidate yields label|running|workspace-source. Field
+    # order keeps the (possibly '|'-bearing) path trailing so it can't corrupt
+    # the parse of the two fixed-charset fields ahead of it.
+    _meta="$(docker inspect "$_n" --format '{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
     _b="${_meta%%|*}"
-    _src="${_meta#*|}"
+    _rest="${_meta#*|}"
+    _running="${_rest%%|*}"
+    _src="${_rest#*|}"
     if [[ -z "$_b" || "$_b" == "<no value>" ]]; then _b="main"; fi
     [[ "$_src" == "$project" ]] || continue
     [[ "$_b" == "main" ]] && continue
-    _status_box_row "$_b" "$_n"
+    # A candidate from `docker ps -a` always exists, so running/stopped is the
+    # only distinction — pass the inspect's State.Running and skip re-probing.
+    _status_box_row "$_b" "$_n" "$_running"
   done < <(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null || true)
   echo ""
 }

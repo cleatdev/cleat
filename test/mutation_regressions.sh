@@ -817,6 +817,26 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "docker_cap_session_self_heal" "cleat shell self-heals the socket group" "$CLI" "$DOCKER_CAP_BATS"
 
+# boxes/efficiency — cmd_ps reads the workspace path as the TRAILING field of one
+# combined inspect (box|running|path) and extracts it with `${rest#*|}`
+# (remove-up-to-FIRST '|') precisely so a literal '|' in the path survives. Flip
+# it to `##*|` (greedy, remove-up-to-LAST) and a piped path is truncated to its
+# tail; the "literal '|' survives" test must fail.
+cat > "$SED_TMP" << 'SED'
+s~rest#\*|}~rest##*|}~
+SED
+try "boxes_ps_path_pipe_robust" "literal '|' in the project path survives" "$CLI" "$BOXES_BATS"
+
+# boxes/efficiency — cmd_status must reuse State.Running from its single
+# discovery inspect rather than re-probing each named box with
+# is_running/container_exists. Drop the pre-resolved running arg at the call
+# site; the named box then re-probes (and, in the test setup, mis-reports as
+# stopped), so the "running state comes from the discovery inspect" test fails.
+cat > "$SED_TMP" << 'SED'
+s|_status_box_row "\$_b" "\$_n" "\$_running"|_status_box_row "$_b" "$_n"|
+SED
+try "boxes_status_running_from_inspect" "running state comes from the discovery inspect" "$CLI" "$BOXES_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

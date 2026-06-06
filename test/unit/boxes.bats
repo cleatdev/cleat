@@ -240,7 +240,7 @@ teardown() { _common_teardown; }
   local az_cname
   az_cname="$(container_name_for "$TEST_TEMP/project" az)"
   printf '%s\n' "$az_cname" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'az|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$TEST_TEMP/project"
   assert_success
   assert_output --partial "az"
@@ -259,7 +259,7 @@ teardown() { _common_teardown; }
   # Only meaningful if truncation actually diverges (az not under main's prefix).
   [[ "$az_cname" == "${main_cname}-"* ]] && skip "dir too short to exercise truncation divergence"
   printf '%s\n' "$az_cname" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'az|%s\n' "$proj" > "$DOCKER_MOCK_DIR/inspect_output"
+  printf 'az|true|%s\n' "$proj" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$proj"
   assert_success
   assert_output --partial "az"
@@ -272,7 +272,7 @@ teardown() { _common_teardown; }
   local hash
   hash="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   printf '%s\n' "cleat-sibling-${hash}-zzz-99999999" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'zzz|/some/other/project\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  printf 'zzz|true|/some/other/project\n' > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$TEST_TEMP/project"
   assert_success
   refute_output --partial "zzz"
@@ -286,13 +286,61 @@ teardown() { _common_teardown; }
   refute_output --partial "zzz"
 }
 
+@test "box status: a named box's running state comes from the discovery inspect, not a re-probe" {
+  # Efficiency: the named-box loop must reuse State.Running from its one
+  # discovery inspect instead of calling is_running/container_exists again.
+  # Proof: `docker ps` (non -a) lists ONLY main, so a fresh is_running(az) probe
+  # would report az as NOT running → "stopped". The az row must still read
+  # "running" (from the inspect), which is only possible if the re-probe is
+  # skipped. If the optimization regresses, az shows "stopped" and this fails.
+  mkdir -p "$TEST_TEMP/project"
+  local main_cname az_cname
+  main_cname="$(container_name_for "$TEST_TEMP/project" main)"
+  az_cname="$(container_name_for "$TEST_TEMP/project" az)"
+  printf '%s\n' "$main_cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$az_cname"   > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  run cmd_status "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "az"
+  refute_output --partial "stopped"
+}
+
 @test "box ps: shows the box column from the sh.cleat.box label" {
   local cname="cleat-proj-abcdef12-az"
   printf '%s\t%s\n' "$cname" "Up 1 minute" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'az\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  # cmd_ps does ONE combined inspect per row: box|running|workspace-source.
+  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_ps
   assert_success
   assert_output --partial "box: az"
+}
+
+@test "box ps: one combined inspect per row (no per-field re-inspect / extra ps)" {
+  # Efficiency contract: cmd_ps must read box label, running state AND the
+  # workspace path from a SINGLE inspect per container — not 2 inspects + a ps.
+  local cname="cleat-proj-abcdef12-az"
+  printf '%s\t%s\n' "$cname" "Up 1 minute" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  : > "$DOCKER_CALLS"
+  cmd_ps >/dev/null
+  local n_inspect n_ps
+  n_inspect="$(grep -c '^docker inspect ' "$DOCKER_CALLS" || true)"
+  # The only allowed `docker ps` is the single outer list; no per-row ps for colour.
+  n_ps="$(grep -c '^docker ps ' "$DOCKER_CALLS" || true)"
+  [[ "$n_inspect" -eq 1 ]] || { echo "expected exactly 1 inspect, got $n_inspect"; cat "$DOCKER_CALLS"; return 1; }
+  [[ "$n_ps" -eq 1 ]]      || { echo "expected exactly 1 ps, got $n_ps"; cat "$DOCKER_CALLS"; return 1; }
+}
+
+@test "box ps: a literal '|' in the project path survives the combined-inspect parse" {
+  # Field order is box|running|path precisely so a '|' in the path (legal on
+  # disk) lands in the trailing field and is shown verbatim, not truncated.
+  local cname="cleat-proj-abcdef12"
+  printf '%s\t%s\n' "$cname" "Up 1 minute" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'main|true|/home/me/weird|dir\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  run cmd_ps
+  assert_success
+  assert_output --partial "/home/me/weird|dir"
 }
 
 # ── Phase 6: box descriptions (host-side, never recreates) ──────────────────

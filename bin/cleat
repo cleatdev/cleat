@@ -1907,6 +1907,54 @@ _wait_for_coder_remap() {
   return 0
 }
 
+# Docker-capability session-start hardening (see concept/15-docker-capability.md).
+# _heal_docker_sock: re-resolve the docker.sock owning GID and re-add coder to
+# that group, AS ROOT, before each session exec. The entrypoint does this once
+# at container start, but a Docker Desktop restart / daemon update can change the
+# socket GID under a long-running (days-of-uptime) container — and a bare
+# `docker exec` never re-runs the entrypoint, so `cleat`/`cleat shell` then fail
+# with "permission denied /var/run/docker.sock". Inlined (not a baked image
+# script) so it heals already-running containers without a rebuild; the following
+# `runuser -u coder` re-runs initgroups and picks up the new group. Idempotent:
+# groupmod re-points docker-host across GID changes instead of accreting groups.
+_heal_docker_sock() {
+  local cname="$1" _to=""
+  command -v timeout >/dev/null 2>&1 && _to="timeout 10"
+  $_to docker exec -u 0 "$cname" sh -c '
+    [ -S /var/run/docker.sock ] || exit 0
+    g=$(stat -c %g /var/run/docker.sock 2>/dev/null) || exit 0
+    case "$g" in ""|*[!0-9]*) exit 0 ;; esac
+    [ "$g" = "$(id -g coder)" ] && exit 0
+    owner=$(getent group "$g" | cut -d: -f1)
+    if [ -z "$owner" ]; then
+      if getent group docker-host >/dev/null 2>&1; then groupmod -g "$g" docker-host 2>/dev/null || true
+      else groupadd -g "$g" docker-host 2>/dev/null || true; fi
+      owner=$(getent group "$g" | cut -d: -f1)
+    fi
+    [ -n "$owner" ] && usermod -aG "$owner" coder 2>/dev/null || true
+  ' >/dev/null 2>&1 || true
+}
+
+# Ensure the docker cap can reach the daemon before a session. No-op unless the
+# docker cap is active. Runs the per-exec GID self-heal, then probes as root: if
+# even root can't reach the daemon, the socket bind is a stale inode (Docker
+# replaced /var/run/docker.sock under the running container) — no group fix can
+# repair that in place, so guide the user to the re-bind recovery rather than
+# silently failing. We do NOT auto-restart: a restart would kill any live
+# session sharing this container.
+_ensure_docker_access() {
+  local cname="$1"
+  cap_is_active docker 2>/dev/null || return 0
+  _heal_docker_sock "$cname"
+  local _to=""
+  command -v timeout >/dev/null 2>&1 && _to="timeout 8"
+  if ! $_to docker exec -u 0 "$cname" docker version >/dev/null 2>&1; then
+    warn "Docker socket unreachable in this container ${DIM}(the daemon likely restarted)${RESET}"
+    echo -e "    ${DIM}A stale socket bind can't be repaired in place. Recover with:${RESET}"
+    echo -e "    ${BOLD}cleat stop && cleat resume${RESET}${DIM}  — re-binds the socket; your session is preserved.${RESET}"
+  fi
+}
+
 exec_claude() {
   local cname="$1"
   shift
@@ -1977,6 +2025,7 @@ exec_claude() {
   _wait_for_coder_remap "$cname"
 
   local rc=0
+  _ensure_docker_access "$cname"
   # Use `runuser -u coder` rather than `docker exec --user coder` because the
   # latter sets UID/GID but skips initgroups(3), so supplementary groups from
   # /etc/group aren't loaded. This matters for the docker capability, where
@@ -2804,7 +2853,7 @@ cmd_run() {
     -e "HOST_UID=$(id -u)" \
     -e "HOST_GID=$(id -g)" \
     -e "HOME=/home/coder" \
-    --pids-limit 1024 \
+    --pids-limit 4096 \
     --memory 8g \
     -it \
     "$IMAGE_NAME" > /dev/null 2>"$_docker_err" || run_rc=$?
@@ -3070,6 +3119,7 @@ cmd_shell() {
   _wait_for_coder_remap "$cname"
   resolve_caps "$project"
   resolve_env_args "$project"
+  _ensure_docker_access "$cname"
   info "Container ${BOLD}${cname}${RESET}"
   docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
@@ -3106,6 +3156,7 @@ cmd_login() {
   fi
   echo ""
 
+  _ensure_docker_access "$cname"
   local login_rc=0
   docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \

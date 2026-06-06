@@ -47,16 +47,21 @@ chown -R "$HOST_UID:$HOST_GID" /home/coder/.local 2>/dev/null || true
 # a group exists with the socket's GID and making coder a member.
 if [ -S /var/run/docker.sock ]; then
   SOCK_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo "")
-  if [ -n "$SOCK_GID" ] && [[ "$SOCK_GID" =~ ^[0-9]+$ ]]; then
-    # Skip when the socket GID already matches coder's primary group (no-op).
-    if [ "$SOCK_GID" != "$HOST_GID" ]; then
-      SOCK_GROUP=$(getent group "$SOCK_GID" | cut -d: -f1)
-      if [ -z "$SOCK_GROUP" ]; then
-        SOCK_GROUP="docker-host"
-        groupadd -g "$SOCK_GID" "$SOCK_GROUP" 2>/dev/null || true
+  # Skip when the socket GID already matches coder's primary group (no-op).
+  if [ -n "$SOCK_GID" ] && [[ "$SOCK_GID" =~ ^[0-9]+$ ]] && [ "$SOCK_GID" != "$(id -g coder)" ]; then
+    SOCK_GROUP=$(getent group "$SOCK_GID" | cut -d: -f1)
+    if [ -z "$SOCK_GROUP" ]; then
+      # Re-point an existing docker-host group to the CURRENT socket GID rather
+      # than leaving a stale group and adding a second — idempotent across the
+      # Docker Desktop restarts that renumber the socket GID. See concept/15.
+      if getent group docker-host >/dev/null 2>&1; then
+        groupmod -g "$SOCK_GID" docker-host 2>/dev/null || true
+      else
+        groupadd -g "$SOCK_GID" docker-host 2>/dev/null || true
       fi
-      usermod -aG "$SOCK_GROUP" coder 2>/dev/null || true
+      SOCK_GROUP=$(getent group "$SOCK_GID" | cut -d: -f1)
     fi
+    [ -n "$SOCK_GROUP" ] && usermod -aG "$SOCK_GROUP" coder 2>/dev/null || true
   fi
 fi
 

@@ -131,7 +131,7 @@ teardown() { _common_teardown; }
   assert_success
   run assert_docker_run_has "$cname" "--memory 8g"
   assert_success
-  run assert_docker_run_has "$cname" "--pids-limit 1024"
+  run assert_docker_run_has "$cname" "--pids-limit 4096"
   assert_success
   run assert_docker_run_has "$cname" "-it"
   assert_success

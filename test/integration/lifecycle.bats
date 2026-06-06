@@ -152,3 +152,26 @@ EOF
 
   docker rm -f "$main_cname" "$az_cname" >/dev/null 2>&1 || true
 }
+
+# ── Docker capability (concept/15): coder reaches the host daemon; heal is safe ──
+
+@test "integration: docker cap — coder reaches the daemon, and the self-heal is idempotent" {
+  cd "$INT_PROJECT"
+  run "$CLI" --cap docker run
+  assert_success
+  local cname
+  cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+
+  # The entrypoint added coder to the socket's owning group → coder can talk to
+  # the host daemon through the mounted /var/run/docker.sock.
+  run docker exec "$cname" runuser -u coder -- docker version
+  assert_success
+
+  # The per-exec self-heal must be idempotent — re-running it on an already-OK
+  # container keeps coder's access working (doesn't strip the group / break it).
+  bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); _heal_docker_sock '$cname'"
+  run docker exec "$cname" runuser -u coder -- docker version
+  assert_success
+
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+}

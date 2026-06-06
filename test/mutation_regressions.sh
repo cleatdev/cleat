@@ -34,6 +34,7 @@ BOX_NAME_BATS="$REPO_ROOT/test/unit/box_name.bats"
 CONTAINER_NAME_BATS="$REPO_ROOT/test/unit/container_name.bats"
 BOXES_BATS="$REPO_ROOT/test/unit/boxes.bats"
 BOX_HARDENING_BATS="$REPO_ROOT/test/unit/box_hardening.bats"
+DOCKER_CAP_BATS="$REPO_ROOT/test/unit/docker_cap.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -799,6 +800,22 @@ cat > "$SED_TMP" << 'SED'
 /\[\[ "\$_src" == "\$project" \]\] || continue/d
 SED
 try "boxes_status_mount_source_guard" "ignores a container whose /workspace mount is a different project" "$CLI" "$BOXES_BATS"
+
+# fork-storm — clip-daemon must give socat an inactivity timeout (-T) so a hung
+# clipboard handler can't accumulate and exhaust the container's PIDs. Strip the
+# -T; the regression test that asserts socat receives `-T 5` must fail.
+cat > "$SED_TMP" << 'SED'
+s| -T "\$IDLE_TIMEOUT"||
+SED
+try "clip_daemon_socat_idle_timeout" "socat an inactivity timeout" "$CLIP_DAEMON" "$REGRESSIONS"
+
+# docker-cap — each session exec must re-resolve the socket group (self-heal) so
+# a long-running container survives a Docker Desktop socket-GID change. Delete
+# the _ensure_docker_access calls; the cleat-shell self-heal test must fail.
+cat > "$SED_TMP" << 'SED'
+/_ensure_docker_access "\$cname"/d
+SED
+try "docker_cap_session_self_heal" "cleat shell self-heals the socket group" "$CLI" "$DOCKER_CAP_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

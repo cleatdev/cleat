@@ -1811,6 +1811,20 @@ ${overlay_dir}/project-settings.local.json"
   assert_output --partial "$rundir/clip.sock"
 }
 
+@test "regression: clip-daemon passes socat an inactivity timeout (-T) so hung handlers can't exhaust PIDs" {
+  # A client that connects but never sends/closes left a handler hung on
+  # `head -c` forever; accumulated hung handlers were the fork-storm. The
+  # listener must carry socat's -T inactivity timeout.
+  local rundir="$TEST_TEMP/clip-run"
+  local stubs="$TEST_TEMP/clipd-stubs"; mkdir -p "$stubs" "$rundir"
+  local socat_log="$TEST_TEMP/socat-args.log"; : > "$socat_log"
+  printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$socat_log" > "$stubs/socat"
+  chmod +x "$stubs/socat"
+  run env PATH="$stubs:$PATH" CLEAT_CLIP_DIR="$rundir" bash "$PROJECT_ROOT/docker/clip-daemon"
+  run cat "$socat_log"
+  assert_output --partial "-T 5"
+}
+
 @test "regression v0.13.1: clip shim and clip-daemon resolve the SAME socket path" {
   # The OSC52 fallback only works if `clip` connects to the exact socket
   # clip-daemon binds. Both derive it from CLEAT_CLIP_DIR / the per-uid dir; a

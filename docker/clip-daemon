@@ -29,6 +29,11 @@ PIDFILE="$RUNDIR/clip-daemon.pid"
 HANDLER="$RUNDIR/clip-handler"
 MAX_CHILDREN=5         # cap concurrent socat forks (prevents PID exhaustion)
 MAX_PAYLOAD=102400     # 100KB -- matches typical terminal OSC 52 limits
+IDLE_TIMEOUT=5         # socat -T: drop a connection idle this many seconds. A
+                       # client that connects but never sends data (or never
+                       # closes) would otherwise leave a handler hung on
+                       # `head -c` forever; accumulated hung handlers were the
+                       # clip-daemon PID-exhaustion fork-storm.
 
 cleanup() {
   [ -n "${SOCAT_PID:-}" ] && kill "$SOCAT_PID" 2>/dev/null && wait "$SOCAT_PID" 2>/dev/null
@@ -71,7 +76,7 @@ chmod +x "$HANDLER"
 # unlink-early: socat removes any stale socket file before binding, so a
 # leftover socket (e.g. from a hard-killed prior session) can't make the bind
 # fail with "address already in use".
-socat -u "UNIX-LISTEN:$SOCK,mode=666,fork,max-children=$MAX_CHILDREN,unlink-early" "EXEC:$HANDLER" &
+socat -u -T "$IDLE_TIMEOUT" "UNIX-LISTEN:$SOCK,mode=666,fork,max-children=$MAX_CHILDREN,unlink-early" "EXEC:$HANDLER" &
 SOCAT_PID=$!
 
 # Wait for socat -- if it exits unexpectedly, cleanup runs via the trap

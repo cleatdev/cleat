@@ -7,5 +7,6 @@ concept
 *~
 .DS_Store
 .update_check
+.claude_update_check
 .cleat.env
 coverage/

@@ -162,18 +162,27 @@ EOF
   local cname
   cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
 
-  # ── Diagnostics (bats prints echo output only on failure) ──
-  echo "DIAG host-sock: $(stat -c '%g %U:%G %a' /var/run/docker.sock 2>&1)"
-  echo "DIAG in-sock:   $(docker exec "$cname" stat -c '%g %U:%G %a' /var/run/docker.sock 2>&1)"
-  echo "DIAG coder-id:  $(docker exec "$cname" id coder 2>&1)"
-  echo "DIAG sock-grp:  $(docker exec "$cname" sh -c 'g=$(stat -c %g /var/run/docker.sock 2>/dev/null); echo "gid=$g group=[$(getent group "$g")]"' 2>&1)"
-  echo "DIAG dh-group:  $(docker exec "$cname" sh -c 'getent group docker-host || echo NONE' 2>&1)"
-  echo "DIAG as-root:   $(docker exec "$cname" docker version --format '{{.Server.Version}}' 2>&1 | tail -1)"
-  echo "DIAG as-coder:  $(docker exec "$cname" runuser -u coder -- docker version --format '{{.Server.Version}}' 2>&1 | tail -1)"
-  echo "DIAG coder-sg:  $(docker exec "$cname" runuser -u coder -- id 2>&1)"
+  # The entrypoint adds coder to the socket's owning group at container start so
+  # coder can reach the mounted /var/run/docker.sock. Against a freshly started
+  # real container the daemon side can take a moment to become reachable, so poll
+  # a few seconds before asserting — a single 0ms probe raced container startup
+  # and flaked in CI. This still fails hard (with diagnostics) if coder genuinely
+  # cannot connect; it only tolerates the sub-second startup settle.
+  local ok=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if docker exec "$cname" runuser -u coder -- docker version >/dev/null 2>&1; then ok=1; break; fi
+    sleep 0.5
+  done
+  if [ -z "$ok" ]; then
+    echo "DIAG host-sock:  $(stat -c '%g %U:%G %a' /var/run/docker.sock 2>&1)"
+    echo "DIAG in-sock:    $(docker exec "$cname" stat -c '%g %U:%G %a' /var/run/docker.sock 2>&1)"
+    echo "DIAG coder-id:   $(docker exec "$cname" id coder 2>&1)"
+    echo "DIAG runuser-id: $(docker exec "$cname" runuser -u coder -- id 2>&1)"
+    echo "DIAG as-root:    $(docker exec "$cname" docker version 2>&1 | tail -2)"
+    echo "DIAG as-coder:   $(docker exec "$cname" runuser -u coder -- docker version 2>&1 | tail -2)"
+  fi
 
-  # The entrypoint added coder to the socket's owning group → coder can talk to
-  # the host daemon through the mounted /var/run/docker.sock.
+  # coder can talk to the host daemon through the mounted /var/run/docker.sock.
   run docker exec "$cname" runuser -u coder -- docker version
   assert_success
 

@@ -175,3 +175,16 @@ EOF
 
   docker rm -f "$cname" >/dev/null 2>&1 || true
 }
+
+# ── Base image (concept/14): ships the expected Node major ───────────────────
+
+@test "integration: base image ships Node 24" {
+  cd "$INT_PROJECT"
+  run "$CLI" run
+  assert_success
+  local cname
+  cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+  run docker exec "$cname" node --version
+  assert_success
+  [[ "$output" == v24* ]] || { echo "expected Node 24, got: $output"; return 1; }
+}

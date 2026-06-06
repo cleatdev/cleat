@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:24-bookworm-slim
 
 # Install packages (node/npm pre-installed in base image)
 # gh:     GitHub CLI from official apt repo
@@ -36,7 +36,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user (UID/GID will be remapped at runtime via entrypoint)
-# node:20-bookworm-slim ships with node:node at 1000:1000 — remove it first
+# node:24-bookworm-slim ships with node:node at 1000:1000 — remove it first
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN userdel -r node 2>/dev/null || true && \

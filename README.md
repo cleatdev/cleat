@@ -498,7 +498,7 @@ cleat --cap docker                  # one-off session
 docker compose up -d
 docker compose exec app npm run test:ci
 docker build -t myapp .
-docker run -v $(pwd):/app node:20 npm install
+docker run -v $(pwd):/app node:24 npm install
 ```
 
 Cleat also bind-mounts your project at its **host path** inside the container (in addition to `/workspace`) and sets `workdir` there, so `$(pwd)` returns a host-valid path. This makes `docker run -v $(pwd):/app …` and relative paths like `-v ./data:/data` in `docker-compose.yml` resolve correctly on the host daemon.

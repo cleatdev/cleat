@@ -385,7 +385,7 @@ named sandbox for the project (default: `main`) — see **Boxes** above.
 
 Containers run with these protections by default:
 
-- `--pids-limit 1024` -- prevents fork bombs from affecting the host
+- `--pids-limit 4096` -- prevents fork bombs from affecting the host
 - `--memory 8g` -- prevents runaway processes from exhausting host memory
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
 - Node.js bookworm-slim base image with minimal attack surface

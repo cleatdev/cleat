@@ -3,6 +3,10 @@ set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
 VERSION="0.14.0"
+# Gates the one-time on-start release highlight (_maybe_show_release_highlight):
+# must equal VERSION to fire, so a release that forgets to refresh the highlight
+# copy shows nothing rather than stale text. Bump with VERSION at tag time.
+RELEASE_HIGHLIGHT_VERSION="0.14.0"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -1235,12 +1239,10 @@ _resolve_config_drift() {
 # start flow recreates it from the fresh image (the same mechanism
 # _resolve_config_drift uses). Runs at most once per process, TTY-only, and only
 # when the image is strictly OLDER than the CLI (never nags the reverse).
-# Disable with CLEAT_NO_REBUILD_CHECK=1.
 _REBUILD_PROMPTED=0
 _maybe_prompt_image_rebuild() {
   local cname="$1"
   _is_tty || return 0
-  [[ "${CLEAT_NO_REBUILD_CHECK:-}" == "1" ]] && return 0
   [[ "$_REBUILD_PROMPTED" == "1" ]] && return 0
   image_exists || return 0
 
@@ -2052,9 +2054,16 @@ exec_claude() {
   fi
 }
 
-# ── Update check (once per day) ─────────────────────────────────────────────
+# ── Update check (every 10 minutes) ─────────────────────────────────────────
 UPDATE_CHECK_FILE="$REPO_DIR/.update_check"
-UPDATE_CHECK_INTERVAL=86400
+# Records the last VERSION whose on-start release highlight was shown (one line).
+# Absent or different from VERSION => the highlight shows once on the next launch.
+LAST_SEEN_VERSION_FILE="$REPO_DIR/.last_seen_version"
+UPDATE_CHECK_INTERVAL=600   # 10 minutes — a release cut minutes after a launch
+                            # should surface on the next run, not up to a day
+                            # later. The lookup is one `git ls-remote --tags`
+                            # (refs only, no objects), so this cadence is cheap;
+                            # the declined-version field still prevents re-nagging.
 
 # Claude Code update check — separate cadence/cache from the cleat self-update
 # check above. The channel defaults to `latest` to match `cleat upgrade-claude`
@@ -2184,6 +2193,42 @@ _maybe_prompt_cli_update() {
     # Record the decline so we don't re-prompt for this version every launch.
     echo "$now $cached_version $cached_version" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
   fi
+}
+
+# One-time, non-blocking release highlight. On the first interactive,
+# session-launching run after VERSION changes, print a short note about the
+# release's flagship feature, record the version, and never show it again. It is
+# purely local (no network → CI/offline-safe) and NEVER prompts — the update
+# check is the only thing allowed to ask at startup. Shown exactly once per
+# version, so it has no opt-out knob (a one-time, non-blocking notice doesn't
+# warrant one). The copy below is the per-release content: update it AND
+# RELEASE_HIGHLIGHT_VERSION together at tag time. A version mismatch shows
+# nothing, so a forgotten update fails to silence — never to stale marketing.
+_maybe_show_release_highlight() {
+  _is_tty || return 0
+  # Only fire for the exact version this copy was written for.
+  [[ "$RELEASE_HIGHLIGHT_VERSION" == "$VERSION" ]] || return 0
+
+  local last_seen=""
+  if [[ -f "$LAST_SEEN_VERSION_FILE" ]]; then
+    last_seen=$(awk 'NR==1 {print $1}' "$LAST_SEEN_VERSION_FILE" 2>/dev/null || echo "")
+  fi
+  # Already shown for this version → stay quiet.
+  [[ "$last_seen" == "$VERSION" ]] && return 0
+
+  # Record BEFORE printing so a Ctrl-C or write race can never re-show next run.
+  # Brace-wrap so a redirect-open failure's own stderr is suppressed too (plain
+  # `echo ... 2>/dev/null` doesn't catch the shell's "Permission denied"). If the
+  # record can't be persisted (read-only install dir, unwritable stale file), the
+  # read-back below fails and we stay SILENT rather than nag on every launch —
+  # "fail to silence, never to a permanent nag."
+  { echo "$VERSION" > "$LAST_SEEN_VERSION_FILE"; } 2>/dev/null || true
+  [[ -f "$LAST_SEEN_VERSION_FILE" && "$(cat "$LAST_SEEN_VERSION_FILE" 2>/dev/null)" == "$VERSION" ]] || return 0
+
+  echo ""
+  info "${BOLD}New in v${VERSION}${RESET} — ${CYAN}Boxes${RESET}: many sandboxes per project, each with its own caps"
+  echo -e "    ${DIM}A locked-down dev box beside a cloud box over the same files; neither${RESET}"
+  echo -e "    ${DIM}reaches the other's caps.${RESET}    Try:  ${BOLD}cleat start dev${RESET}   ${DIM}·   cleat.sh/changelog${RESET}"
 }
 
 # Fetch the newest released Claude Code version for a channel from the public
@@ -4307,9 +4352,13 @@ main() {
 
   # Interactive CLI self-update preflight — only for the session-launching
   # commands, and before any docker work: accepting re-execs the new version,
-  # which then drives the entire run.
+  # which then drives the entire run. The release highlight runs right after, so
+  # a user who just updated sees the new version's note on the re-exec'd run.
   case "$cmd" in
-    start|resume|r|run|claude|shell|sh) _maybe_prompt_cli_update ;;
+    start|resume|r|run|claude|shell|sh)
+      _maybe_prompt_cli_update
+      _maybe_show_release_highlight
+      ;;
   esac
 
   case "$cmd" in

@@ -43,15 +43,6 @@ teardown() { _common_teardown; }
   refute_output --partial "outdated"
 }
 
-@test "rebuild prompt: opt-out env disables it" {
-  _is_tty() { return 0; }
-  _image_cleat_version() { echo "0.0.1"; }
-  export CLEAT_NO_REBUILD_CHECK=1
-  run _maybe_prompt_image_rebuild "cleat-x-12345678" <<< "y"
-  assert_success
-  refute_output --partial "REBUILD_CALLED"
-}
-
 @test "rebuild prompt: silent when image version matches the CLI" {
   _is_tty() { return 0; }
   _image_cleat_version() { echo "$VERSION"; }

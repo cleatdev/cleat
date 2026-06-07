@@ -90,7 +90,8 @@ Cleat gives you the best of both worlds:
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
 - **Configuration drift detection** -- notifies when config has changed since container creation
 - **Clean terminal output** -- braille spinners for slow operations, suppressed Docker noise, canonical startup/exit sequences
-- **Auto-upgrade notifications** -- checks for updates once per day and notifies you before launching Claude
+- **Auto-upgrade notifications** -- checks for updates every 10 minutes and notifies you before launching Claude
+- **Release highlights** -- a one-time, non-blocking note on the first run after an update tells you the new version's headline feature
 
 ---
 
@@ -635,7 +636,7 @@ On Linux (Docker Engine), Cleat adds `--add-host host.docker.internal:host-gatew
 
 ## Auto-upgrade notifications
 
-Cleat checks for new release tags once every 24 hours via `git ls-remote --tags` (a lightweight network call that fetches no objects). When a newer version is available, you'll see a notice before Claude Code launches:
+Cleat checks for new release tags at most once every 10 minutes via `git ls-remote --tags` (a lightweight network call that fetches no objects). When a newer version is available, you'll see a notice before Claude Code launches:
 
 ```
   ┌──────────────────────────────────────────────────────┐
@@ -644,7 +645,7 @@ Cleat checks for new release tags once every 24 hours via `git ls-remote --tags`
   └──────────────────────────────────────────────────────┘
 ```
 
-- The check runs at most **once per day** — it will not slow down subsequent launches.
+- The check runs at most **once every 10 minutes** — it will not slow down subsequent launches.
 - The result is cached in `.update_check` inside the installation directory (`~/.cleat`).
 - The notification is informational only — it will never interrupt or block your workflow.
 - To upgrade, run `cleat update`. To also update Claude Code inside containers, follow up with `cleat rebuild`.

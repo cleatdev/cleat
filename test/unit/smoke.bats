@@ -123,6 +123,27 @@ cleat_bin_timeout() {
   assert_output --partial "cleat"
 }
 
+# ── Release highlight (strict-mode body coverage) ────────────────────────────
+# The sourced unit tests run with strict mode stripped, and the highlight is
+# TTY-gated so a normal smoke subprocess returns before its body. Source the real
+# binary in a subprocess under full `set -euo pipefail`, force the TTY path, and
+# run the body — proving it's free of set -u / pipefail crashes on the real code.
+@test "smoke: release highlight body is strict-mode (set -euo pipefail) safe" {
+  local seen="$TEST_TEMP/.last_seen_version"
+  run env HOME="$HOME" CLI="$CLI" RDIR="$TEST_TEMP" SEEN="$seen" PATH="$MOCK_BIN:$PATH" \
+    bash -uo pipefail -c '
+      source "$CLI"
+      REPO_DIR="$RDIR"
+      LAST_SEEN_VERSION_FILE="$SEEN"
+      RELEASE_HIGHLIGHT_VERSION="$VERSION"
+      _is_tty() { return 0; }
+      _maybe_show_release_highlight
+    '
+  assert_success
+  assert_output --partial "New in v"
+  [[ -f "$seen" ]]  || return 1
+}
+
 # ── Unknown command handling ────────────────────────────────────────────────
 
 @test "smoke: cleat unknown-command exits 1 without unbound variable" {

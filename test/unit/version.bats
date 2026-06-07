@@ -175,7 +175,12 @@ teardown() { _common_teardown; }
   assert_success
 }
 
-@test "cli update: refreshes stale cache (>24h old)" {
+# These two tests bracket UPDATE_CHECK_INTERVAL (600s / 10 min). A cache just
+# PAST the window must refresh; one just INSIDE it must not. The 60s margins on
+# each side keep them non-flaky while still pinning the constant: bumping it back
+# to 86400 breaks the "stale → refresh" test (660 < 86400), and dropping it to
+# 300 or 60 breaks the "fresh → no refresh" test (540 ≥ 300).
+@test "cli update: refreshes stale cache (>10min old)" {
   mkdir -p "$TEST_TEMP/.git"
   REPO_DIR="$TEST_TEMP"
   UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
@@ -186,7 +191,7 @@ teardown() { _common_teardown; }
   export PATH="$TEST_TEMP/bin:$PATH"
   _is_tty() { return 0; }
 
-  local old_ts=$(( $(date +%s) - 200000 ))
+  local old_ts=$(( $(date +%s) - 660 ))   # just past the 10-min window
   echo "$old_ts ${VERSION}" > "$UPDATE_CHECK_FILE"
 
   run _maybe_prompt_cli_update
@@ -196,13 +201,13 @@ teardown() { _common_teardown; }
   [[ "$new_ts" -gt "$old_ts" ]]  || return 1
 }
 
-@test "cli update: does NOT refresh fresh cache (<24h old)" {
+@test "cli update: does NOT refresh fresh cache (<10min old)" {
   mkdir -p "$TEST_TEMP/.git"
   REPO_DIR="$TEST_TEMP"
   UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
   _is_tty() { return 0; }
 
-  local fresh_ts=$(( $(date +%s) - 1 ))
+  local fresh_ts=$(( $(date +%s) - 540 ))   # just inside the 10-min window
   echo "$fresh_ts ${VERSION}" > "$UPDATE_CHECK_FILE"
 
   run _maybe_prompt_cli_update

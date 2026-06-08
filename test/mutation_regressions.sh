@@ -35,6 +35,7 @@ CONTAINER_NAME_BATS="$REPO_ROOT/test/unit/container_name.bats"
 BOXES_BATS="$REPO_ROOT/test/unit/boxes.bats"
 BOX_HARDENING_BATS="$REPO_ROOT/test/unit/box_hardening.bats"
 DOCKER_CAP_BATS="$REPO_ROOT/test/unit/docker_cap.bats"
+BROWSER_BRIDGE_BATS="$REPO_ROOT/test/unit/browser_bridge.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -836,6 +837,24 @@ cat > "$SED_TMP" << 'SED'
 s|_status_box_row "\$_b" "\$_n" "\$_running"|_status_box_row "$_b" "$_n"|
 SED
 try "boxes_status_running_from_inspect" "running state comes from the discovery inspect" "$CLI" "$BOXES_BATS"
+
+# v0.15.0 — _browser_claim_url must CONSUME the bridge file (atomic rename), so
+# only one of several racing watchers opens a given URL. Swap the consuming `mv`
+# for a non-consuming `cp`: the file persists, a second watcher claims the same
+# URL too, and the "consumes each URL once" regression then fails.
+cat > "$SED_TMP" << 'SED'
+s|mv "\$bridge_file" "\$claim"|cp "\$bridge_file" "\$claim"|
+SED
+try "v0.15.0_browser_consume_once" "browser bridge consumes each URL once"
+
+# v0.15.0 — _browser_watcher must self-exit when its run dir is removed, so an
+# orphan from a crashed session stops re-opening URLs instead of spinning
+# forever. Delete the clip_dir-gone guard: the orphan-cleanup test then sees the
+# watcher keep running after rm and fails.
+cat > "$SED_TMP" << 'SED'
+/\[ -d "\$clip_dir" \] || { _bw_cleanup; exit 0; }/d
+SED
+try "v0.15.0_watcher_orphan_exit" "self-exits when its run dir is removed" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

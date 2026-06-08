@@ -1681,6 +1681,24 @@ PYEOF
   _proxy_log "FAILED: neither socat nor python3 available on host"
 }
 
+# Atomically claim the URL pending in the bridge file. Prints the URL and returns
+# 0 if THIS caller won the claim; returns 1 if there was nothing to claim. The
+# rename is atomic, so when several watchers race on the same bridge file — e.g.
+# an orphan left by a crashed/SIGKILL'd session plus the current one — exactly
+# ONE wins per written URL. That makes a single in-container `open` open exactly
+# one host tab instead of one-per-watcher (the duplicate-tab bug). Consuming the
+# file also retires the old mtime-second dedup, which silently dropped a second
+# URL written in the same wall-clock second.
+_browser_claim_url() {
+  local bridge_file="$1"
+  [ -f "$bridge_file" ] || return 1
+  local claim="${bridge_file}.opening.$$.${RANDOM}"
+  mv "$bridge_file" "$claim" 2>/dev/null || return 1
+  cat "$claim" 2>/dev/null || true
+  rm -f "$claim" 2>/dev/null || true
+  return 0
+}
+
 _browser_watcher() {
   local clip_dir="$1"
   local open_cmd="$2"
@@ -1699,32 +1717,27 @@ _browser_watcher() {
 
   # Remove any URL left over from a previous session
   rm -f "$bridge_file"
-  local last_ts=""
   while true; do
-    if [ -f "$bridge_file" ]; then
-      local cur_ts
-      cur_ts=$(stat -c '%Y%N' "$bridge_file" 2>/dev/null \
-            || stat -f '%m' "$bridge_file" 2>/dev/null || echo "")
-      if [ -n "$cur_ts" ] && [ "$cur_ts" != "$last_ts" ]; then
-        last_ts="$cur_ts"
-        local url
-        url="$(cat "$bridge_file" 2>/dev/null)" || true
-        if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
-          # Start auth callback proxy if URL has a localhost redirect_uri
-          if [ -n "$cname" ]; then
-            local cb_port proxy_log="$clip_dir/.proxy-log"
-            cb_port=$(_extract_callback_port "$url" 2>/dev/null) && {
-              _bw_cleanup  # kill any previous proxy
-              echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
-              _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" &
-              _proxy_pid=$!
-              sleep 0.5  # let proxy bind before opening browser
-            } || {
-              echo "[browser-watcher $(date +%H:%M:%S)] no redirect_uri port found in URL" >> "$clip_dir/.proxy-log"
-            }
-          fi
-          $open_cmd "$url" >/dev/null 2>&1 || true
+    # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
+    # an orphan from a now-gone session — stop polling instead of spinning forever.
+    [ -d "$clip_dir" ] || { _bw_cleanup; exit 0; }
+    local url
+    if url="$(_browser_claim_url "$bridge_file")"; then
+      if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
+        # Start auth callback proxy if URL has a localhost redirect_uri
+        if [ -n "$cname" ]; then
+          local cb_port proxy_log="$clip_dir/.proxy-log"
+          cb_port=$(_extract_callback_port "$url" 2>/dev/null) && {
+            _bw_cleanup  # kill any previous proxy
+            echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
+            _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" &
+            _proxy_pid=$!
+            sleep 0.5  # let proxy bind before opening browser
+          } || {
+            echo "[browser-watcher $(date +%H:%M:%S)] no redirect_uri port found in URL" >> "$clip_dir/.proxy-log"
+          }
         fi
+        $open_cmd "$url" >/dev/null 2>&1 || true
       fi
     fi
     sleep 0.5

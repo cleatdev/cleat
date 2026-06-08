@@ -1837,3 +1837,20 @@ ${overlay_dir}/project-settings.local.json"
   assert_equal "$clip_sock" "/probe/clip.sock"
   assert_equal "$clip_sock" "$daemon_sock"
 }
+
+@test "regression v0.15.0: browser bridge consumes each URL once (no per-watcher duplicate opens)" {
+  # A session that dies without its cleanup trap (crash / SIGKILL / closed
+  # terminal) orphans its disowned _browser_watcher. The next session on the same
+  # cname reuses the clip dir and starts ANOTHER watcher, so N watchers each open
+  # every URL → one in-container `open` produced N host tabs. The fix consumes
+  # the bridge file with an atomic rename: exactly one watcher claims each URL.
+  local bridge="$TEST_TEMP/.browser-open"
+  printf '%s\n' "https://example.com/oauth" > "$bridge"
+  # Two watchers racing the same bridge file (orphan + current).
+  run _browser_claim_url "$bridge"
+  assert_success
+  assert_output --partial "https://example.com/oauth"
+  # The second watcher must find nothing — one tab, not two.
+  run _browser_claim_url "$bridge"
+  assert_failure
+}

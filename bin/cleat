@@ -2,11 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.14.0"
+VERSION="0.15.0"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
-# equal VERSION to fire, so a release that forgets to refresh the highlight copy
-# shows nothing rather than stale text. Bump with VERSION at tag time.
-RELEASE_HIGHLIGHT_VERSION="0.14.0"
+# equal VERSION to fire. Bump it to the new VERSION at each tag so the
+# maintainer-curated highlight re-surfaces for that release; a mismatch shows
+# nothing (fail-safe). The highlight COPY and its version label are editorial,
+# set by hand below — not derived from VERSION (a big feature stays highlighted
+# across several releases, labelled with the version it shipped in).
+RELEASE_HIGHLIGHT_VERSION="0.15.0"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -2222,9 +2225,11 @@ _maybe_prompt_cli_update() {
 # actionable drift/update/security notices live. Purely local (no network →
 # CI/offline-safe) and NEVER prompts — the update check is the only thing allowed
 # to ask at startup. State is "<version> <shown_count>" in $LAST_SEEN_VERSION_FILE.
-# The copy below is the per-release content: update it AND RELEASE_HIGHLIGHT_VERSION
-# together at tag time. A version mismatch shows nothing, so a forgotten update
-# fails to silence — never to stale marketing.
+# The copy below is the maintainer's editorial "what's new" news: written by
+# hand, NOT auto-generated, and its version label is the feature's introduction
+# version (a big feature may stay highlighted across several releases). Leave it
+# as-is unless you have new news to announce; bump RELEASE_HIGHLIGHT_VERSION at
+# tag time to re-surface it. A version mismatch shows nothing — fail-safe.
 _maybe_show_release_highlight() {
   _is_tty || return 0
   # Only fire for the exact version this copy was written for.
@@ -2254,7 +2259,7 @@ _maybe_show_release_highlight() {
   [[ "$confirm" == "$VERSION $next" ]] || return 0
 
   echo ""
-  info "${BOLD}New in v${VERSION}${RESET} — ${CYAN}Boxes${RESET}: many sandboxes per project, each with its own caps"
+  info "${BOLD}New in v0.14.0${RESET} — ${CYAN}Boxes${RESET}: many sandboxes per project, each with its own caps"
   echo -e "    ${DIM}A locked-down dev box beside a cloud box over the same files; neither${RESET}"
   echo -e "    ${DIM}reaches the other's caps.${RESET}    Try:  ${BOLD}cleat start dev${RESET}   ${DIM}·   cleat.sh/changelog${RESET}"
 }

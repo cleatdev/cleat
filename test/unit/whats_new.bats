@@ -28,7 +28,7 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v${VERSION}"
+  assert_output --partial "New in v0.14.0"
   assert_output --partial "Boxes"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
@@ -48,7 +48,7 @@ teardown() { _common_teardown; }
   for i in 1 2 3; do
     run _maybe_show_release_highlight
     assert_success
-    assert_output --partial "New in v${VERSION}"
+    assert_output --partial "New in v"
   done
   # 4th launch: cap reached → silent, count pinned at the cap.
   run _maybe_show_release_highlight
@@ -79,7 +79,7 @@ teardown() { _common_teardown; }
   echo "0.0.1 9" > "$LAST_SEEN_VERSION_FILE"   # different version, well past the cap
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v${VERSION}"
+  assert_output --partial "New in v"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
 }
@@ -107,7 +107,7 @@ teardown() { _common_teardown; }
   printf 'garbage\nlines\n' > "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v${VERSION}"
+  assert_output --partial "New in v"
   # Rewrites it cleanly as a fresh count.
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
@@ -153,7 +153,7 @@ teardown() { _common_teardown; }
   printf '%s 1 extra trailing tokens\n' "$VERSION" > "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v${VERSION}"
+  assert_output --partial "New in v"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 2"
 }
@@ -163,7 +163,7 @@ teardown() { _common_teardown; }
   printf '%s xyz\n' "$VERSION" > "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v${VERSION}"
+  assert_output --partial "New in v"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
 }

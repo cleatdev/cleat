@@ -868,6 +868,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.15.0_highlight_bounded_cap" "first 3 launches" "$CLI" "$WHATS_NEW_BATS"
 
+# v0.15.0 — the release-highlight version label is editorial: hardcoded to the
+# feature's introduction version (v0.14.0 for Boxes), NOT the dynamic ${VERSION}.
+# Revert it to ${VERSION}: with VERSION past 0.14.0 the label renders wrong and
+# the "fresh install" test (which pins "New in v0.14.0") fails.
+cat > "$SED_TMP" << 'SED'
+s/New in v0.14.0/New in v${VERSION}/
+SED
+try "v0.15.0_highlight_label_frozen" "fresh install" "$CLI" "$WHATS_NEW_BATS"
+
 # v0.15.0 — the config-drift notice must be plain text, not a bordered
 # _notice_box. Mutate the non-TTY drift line's `info` back to `_notice_box`:
 # the box border returns and the "plain text, not a box" regression test trips

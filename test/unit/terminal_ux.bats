@@ -612,6 +612,29 @@ EOF
   assert_output --partial "Image ready"
 }
 
+@test "run: a blank line precedes Image ready (cached) — separates bring-up from notices" {
+  # The cached image-ready line must be preceded by a blank line so the bring-up
+  # block reads as its own group, separate from the preceding startup notices
+  # (update prompt, release highlight, drift / 'Removed …'). Guarding the blank
+  # itself (not just the text) means deleting the separator fails this test.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Image ready"
+  # Classify the line immediately before "Image ready (cached)". NR>1 guards the
+  # mutation case where the blank is gone and Image-ready becomes the first line
+  # (an uninitialised prev would otherwise look blank and hide the regression).
+  local prev
+  prev="$(printf '%s\n' "$output" | awk '
+    /Image ready/ && /\(cached\)/ { print ((NR>1 && p ~ /^[[:space:]]*$/) ? "BLANK" : "NOTBLANK"); f=1; exit }
+    { p=$0 }
+    END { if (!f) print "NOTFOUND" }
+  ')"
+  run echo "$prev"
+  assert_output "BLANK"
+}
+
 # ── rebuild output ───────────────────────────────────────────────────────
 
 @test "rebuild: outputs Image rebuilt on success" {

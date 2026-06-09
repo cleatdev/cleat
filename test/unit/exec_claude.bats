@@ -37,6 +37,22 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+@test "session env: CLAUDE_ENV injects exactly HOME, DISABLE_AUTOUPDATER, PATH" {
+  # CLAUDE_ENV is forced into every session (docker exec -it "${CLAUDE_ENV[@]}").
+  # Pin the EXACT key set so a future addition — especially one templated from
+  # host state (PATH=$PATH, TERM, LANG, USER) — can't silently leak the host's
+  # shell environment into the sandbox. Presence-only checks wouldn't catch that.
+  local keys="" e
+  for e in "${CLAUDE_ENV[@]}"; do
+    [[ "$e" == "-e" ]] && continue
+    keys+="${e%%=*}"$'\n'
+  done
+  local sorted
+  sorted="$(printf '%s' "$keys" | sort | tr '\n' ' ' | sed 's/ *$//')"
+  run echo "$sorted"
+  assert_output "DISABLE_AUTOUPDATER HOME PATH"
+}
+
 @test "creates clipboard bridge directory" {
   run exec_claude "my-ctr" --dangerously-skip-permissions
   run test -d "$CLEAT_RUN_DIR/my-ctr/clip"

@@ -1,10 +1,14 @@
 #!/usr/bin/env bats
-# ── _maybe_show_release_highlight (one-time on-start release highlight) ────────
+# ── _maybe_show_release_highlight (bounded on-start release highlight) ─────────
 #
-# A TTY-only, non-blocking note shown ONCE after VERSION changes, then never
-# again for that version. It never prompts and never touches the network. The
-# state lives in $LAST_SEEN_VERSION_FILE; _is_tty is false under bats (output is
-# captured), so tests that exercise the visible path force it true.
+# A TTY-only, non-blocking note shown for the first RELEASE_HIGHLIGHT_MAX_SHOWS
+# launches after VERSION changes, then quiet for that version. Bounded
+# repetition, not once and not forever: people miss a one-time note, but a
+# forever-repeating one trains the eye to skip the startup block (where the
+# actionable drift/update/security notices also live). It never prompts and
+# never touches the network. State is "<version> <count>" in
+# $LAST_SEEN_VERSION_FILE; _is_tty is false under bats (output is captured), so
+# tests that exercise the visible path force it true.
 load "../setup"
 setup() {
   _common_setup
@@ -13,20 +17,21 @@ setup() {
   REPO_DIR="$TEST_TEMP"
   LAST_SEEN_VERSION_FILE="$TEST_TEMP/.last_seen_version"
   # The shipped copy is written for the current VERSION; keep them in sync so the
-  # visible-path tests fire. The stale-guard test overrides this back to a mismatch.
+  # visible-path tests fire. The stale-guard test overrides this to a mismatch.
   RELEASE_HIGHLIGHT_VERSION="$VERSION"
+  # Pin the cap so these tests don't drift if the shipped default changes.
+  RELEASE_HIGHLIGHT_MAX_SHOWS=3
 }
 teardown() { _common_teardown; }
 
-@test "whats-new: shows once on a fresh install (no state file)" {
+@test "whats-new: shows on a fresh install (no state file), recording count 1" {
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
   assert_output --partial "New in v${VERSION}"
   assert_output --partial "Boxes"
-  # Records the version so it never shows again.
   run cat "$LAST_SEEN_VERSION_FILE"
-  assert_output "$VERSION"
+  assert_output "$VERSION 1"
 }
 
 @test "whats-new: copy carries the try-command and the changelog link" {
@@ -37,22 +42,46 @@ teardown() { _common_teardown; }
   assert_output --partial "cleat.sh/changelog"
 }
 
-@test "whats-new: silent when already shown for this version" {
+@test "whats-new: shows the first 3 launches, then goes silent" {
   _is_tty() { return 0; }
-  echo "$VERSION" > "$LAST_SEEN_VERSION_FILE"
+  local i
+  for i in 1 2 3; do
+    run _maybe_show_release_highlight
+    assert_success
+    assert_output --partial "New in v${VERSION}"
+  done
+  # 4th launch: cap reached → silent, count pinned at the cap.
+  run _maybe_show_release_highlight
+  assert_success
+  assert_output ""
+  run cat "$LAST_SEEN_VERSION_FILE"
+  assert_output "$VERSION 3"
+}
+
+@test "whats-new: increments the shown count on each visible launch" {
+  _is_tty() { return 0; }
+  _maybe_show_release_highlight >/dev/null
+  run cat "$LAST_SEEN_VERSION_FILE"; assert_output "$VERSION 1"
+  _maybe_show_release_highlight >/dev/null
+  run cat "$LAST_SEEN_VERSION_FILE"; assert_output "$VERSION 2"
+}
+
+@test "whats-new: silent once the cap is already recorded" {
+  _is_tty() { return 0; }
+  echo "$VERSION $RELEASE_HIGHLIGHT_MAX_SHOWS" > "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight
   assert_success
   assert_output ""
 }
 
-@test "whats-new: shows once after an upgrade (older version recorded)" {
+@test "whats-new: an upgrade resets the counter (old version past the cap → shows)" {
   _is_tty() { return 0; }
-  echo "0.0.1" > "$LAST_SEEN_VERSION_FILE"
+  echo "0.0.1 9" > "$LAST_SEEN_VERSION_FILE"   # different version, well past the cap
   run _maybe_show_release_highlight
   assert_success
   assert_output --partial "New in v${VERSION}"
   run cat "$LAST_SEEN_VERSION_FILE"
-  assert_output "$VERSION"
+  assert_output "$VERSION 1"
 }
 
 @test "whats-new: STALE GUARD — silent when highlight copy is for another version" {
@@ -61,7 +90,7 @@ teardown() { _common_teardown; }
   run _maybe_show_release_highlight
   assert_success
   assert_output ""
-  # Must NOT record anything — a future matching release still shows once.
+  # Must NOT record anything — a future matching release still shows.
   [[ ! -f "$LAST_SEEN_VERSION_FILE" ]]  || return 1
 }
 
@@ -73,25 +102,15 @@ teardown() { _common_teardown; }
   [[ ! -f "$LAST_SEEN_VERSION_FILE" ]]  || return 1
 }
 
-@test "whats-new: shows only once across two consecutive launches" {
-  _is_tty() { return 0; }
-  run _maybe_show_release_highlight
-  assert_output --partial "New in v${VERSION}"
-  # Second launch (same version) is silent.
-  run _maybe_show_release_highlight
-  assert_success
-  assert_output ""
-}
-
 @test "whats-new: self-heals a corrupted state file" {
   _is_tty() { return 0; }
   printf 'garbage\nlines\n' > "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight
   assert_success
   assert_output --partial "New in v${VERSION}"
-  # Rewrites it cleanly so it won't show again.
+  # Rewrites it cleanly as a fresh count.
   run cat "$LAST_SEEN_VERSION_FILE"
-  assert_output "$VERSION"
+  assert_output "$VERSION 1"
 }
 
 @test "whats-new: never reads stdin (would block on a real TTY)" {
@@ -104,12 +123,12 @@ teardown() { _common_teardown; }
   assert_equal "$rest" "SENTINEL"
 }
 
-@test "whats-new: records the version BEFORE printing (Ctrl-C safe)" {
+@test "whats-new: records the bumped count BEFORE printing (Ctrl-C / under-count safe)" {
   _is_tty() { return 0; }
-  # Stub the first visible line to assert the state file is ALREADY written when
-  # output begins. Moving the write after the print (a plausible refactor) makes
-  # this fail — pinning the "record before print" invariant.
-  info() { [[ "$(cat "$LAST_SEEN_VERSION_FILE" 2>/dev/null)" == "$VERSION" ]] || echo "ORDER_VIOLATION"; }
+  # Stub the first visible line to assert the state file ALREADY holds the bumped
+  # count when output begins. Moving the write after the print (a plausible
+  # refactor) makes this fail — pinning the "record before print" invariant.
+  info() { [[ "$(cat "$LAST_SEEN_VERSION_FILE" 2>/dev/null)" == "$VERSION 1" ]] || echo "ORDER_VIOLATION"; }
   run _maybe_show_release_highlight
   assert_success
   refute_output --partial "ORDER_VIOLATION"
@@ -117,9 +136,9 @@ teardown() { _common_teardown; }
 
 @test "whats-new: silent (no permanent nag) when the state can't be persisted" {
   _is_tty() { return 0; }
-  # Read-only install dir: the record can't be written, so it must NOT print —
-  # otherwise the note would re-show on every single launch.
-  echo "0.0.1" > "$LAST_SEEN_VERSION_FILE"   # stale, older version
+  # Read-only install dir: the bumped count can't be written, so it must NOT
+  # print — otherwise the note would re-show on every single launch.
+  echo "0.0.1 0" > "$LAST_SEEN_VERSION_FILE"   # stale, older version
   chmod 0444 "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight
   chmod 0644 "$LAST_SEEN_VERSION_FILE" 2>/dev/null || true
@@ -127,12 +146,24 @@ teardown() { _common_teardown; }
   assert_output ""
 }
 
-@test "whats-new: treats the first whitespace field as the seen version" {
+@test "whats-new: parses \$1 as version and \$2 as count (trailing tokens ignored)" {
   _is_tty() { return 0; }
-  # A state file with trailing tokens must still count as "seen" (awk picks $1).
-  # Mutating `print $1` → `print $0` makes last_seen != VERSION → it would show.
-  printf '%s extra trailing tokens\n' "$VERSION" > "$LAST_SEEN_VERSION_FILE"
+  # A count below the cap with trailing junk must still show and bump correctly.
+  # Mutating `print \$2+0` → `print \$0` would mis-read the count and break this.
+  printf '%s 1 extra trailing tokens\n' "$VERSION" > "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight
   assert_success
-  assert_output ""
+  assert_output --partial "New in v${VERSION}"
+  run cat "$LAST_SEEN_VERSION_FILE"
+  assert_output "$VERSION 2"
+}
+
+@test "whats-new: a non-numeric count is treated as zero (shows, records 1)" {
+  _is_tty() { return 0; }
+  printf '%s xyz\n' "$VERSION" > "$LAST_SEEN_VERSION_FILE"
+  run _maybe_show_release_highlight
+  assert_success
+  assert_output --partial "New in v${VERSION}"
+  run cat "$LAST_SEEN_VERSION_FILE"
+  assert_output "$VERSION 1"
 }

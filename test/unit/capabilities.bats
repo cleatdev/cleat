@@ -825,6 +825,34 @@ EOF
   [[ "$hash1" == "$hash2" ]]
 }
 
+@test "fingerprint: stable regardless of cap order" {
+  # Caps are sorted before hashing, so (git ssh) and (ssh git) must match.
+  # Without the sort, a reordered cap list would fire a false drift notice.
+  _RESOLVED_ENV_ARGS=()
+  ACTIVE_CAPS=(git ssh); local h1; h1="$(compute_config_fingerprint)"
+  ACTIVE_CAPS=(ssh git); local h2; h2="$(compute_config_fingerprint)"
+  [[ "$h1" == "$h2" ]]
+}
+
+@test "fingerprint: stable regardless of env-arg order" {
+  # Env keys are sorted INSIDE compute_config_fingerprint, so a different arg
+  # order (refactor, new env source) can't drift the hash. Guards against the
+  # false "caps or env keys differ" notice on an otherwise-unchanged setup.
+  ACTIVE_CAPS=(env)
+  _RESOLVED_ENV_ARGS=(-e "FOO=1" -e "BAR=2"); local h1; h1="$(compute_config_fingerprint)"
+  _RESOLVED_ENV_ARGS=(-e "BAR=2" -e "FOO=1"); local h2; h2="$(compute_config_fingerprint)"
+  [[ "$h1" == "$h2" ]]
+}
+
+@test "fingerprint: ignores env values (only keys matter)" {
+  # Env VALUES are deliberately excluded — they're passed at exec time, not baked
+  # into the container, so a value change must NOT force a recreate.
+  ACTIVE_CAPS=(env)
+  _RESOLVED_ENV_ARGS=(-e "FOO=old"); local h1; h1="$(compute_config_fingerprint)"
+  _RESOLVED_ENV_ARGS=(-e "FOO=new"); local h2; h2="$(compute_config_fingerprint)"
+  [[ "$h1" == "$h2" ]]
+}
+
 # ── Config drift resolution ────────────────────────────────────────────────
 #
 # _resolve_config_drift is the interactive fix path users hit after
@@ -839,7 +867,7 @@ EOF
     _resolve_config_drift "cleat-foo" ""
   '
   assert_success
-  refute_output --partial "Configuration changed"
+  refute_output --partial "Config changed"
 }
 
 @test "_resolve_config_drift: no-op when hashes match" {
@@ -851,7 +879,7 @@ EOF
     _resolve_config_drift "cleat-foo" ""
   '
   assert_success
-  refute_output --partial "Configuration changed"
+  refute_output --partial "Config changed"
 }
 
 @test "_resolve_config_drift: non-TTY prints warning notice and continues" {
@@ -864,8 +892,10 @@ EOF
     _resolve_config_drift "cleat-foo" ""
   '
   assert_success
-  assert_output --partial "Configuration changed"
+  assert_output --partial "Config changed"
   assert_output --partial "cleat rm && cleat"
+  # Plain text now, not a bordered _notice_box.
+  refute_output --partial "┌"
 }
 
 @test "_resolve_config_drift: TTY + accept removes the container" {

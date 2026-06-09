@@ -1854,3 +1854,67 @@ ${overlay_dir}/project-settings.local.json"
   run _browser_claim_url "$bridge"
   assert_failure
 }
+
+# v0.15.0 — the config-drift notice shipped as a cyan-bordered _notice_box with
+# blank-line padding. It now renders as plain text in the "New in v…" style (no
+# box, no empty lines), per the maintainer's startup-output taste. The bug we
+# guard against is the bordered box returning. Exercises the non-TTY branch
+# (no prompt) so the whole notice is in captured output; mutating that branch's
+# `info` back to `_notice_box` reintroduces the border and trips the refutes.
+@test "regression v0.15.0: config-drift notice is plain text, not a box" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "old"; }
+    compute_config_fingerprint() { echo "new"; }
+    _is_tty() { return 1; }
+    _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  assert_output --partial "Config changed"
+  assert_output --partial "cleat-foo"
+  refute_output --partial "┌"
+  refute_output --partial "└"
+  refute_output --partial "│"
+}
+
+# v0.15.0 — the image-rebuild prompt opened with a stray `echo ""`, leaving a
+# blank line between the preceding "✔ Removed …" (drift recreate) and the
+# notice — visible in the wild on a drift→rebuild startup. The leading blank is
+# gone; the notice is now the first byte of output. Command substitution strips
+# trailing newlines but PRESERVES a leading one, so re-adding `echo ""` makes
+# $out start with a newline and trips the guard.
+@test "regression v0.15.0: image-rebuild notice has no leading blank line" {
+  _is_tty() { return 0; }
+  image_exists() { return 0; }
+  _image_cleat_version() { echo "0.0.1"; }   # older than VERSION → prompt fires
+  cmd_rebuild() { :; }
+  container_exists() { return 1; }
+  is_running() { return 1; }
+  _REBUILD_PROMPTED=0
+  local out
+  out="$(_maybe_prompt_image_rebuild "cleat-x-12345678" <<< "n" 2>&1)"
+  [[ "$out" == *"Cleat image is outdated"* ]] \
+    || { echo "notice missing: $out"; return 1; }
+  [[ "$out" != $'\n'* ]] \
+    || { echo "REGRESSION: leading blank line before rebuild notice"; return 1; }
+}
+
+@test "regression v0.15.0: version bump alone does not trigger config drift" {
+  # The config fingerprint must depend ONLY on caps + env keys — never the CLI
+  # version. Folding version in made every release fire a false "caps or env
+  # keys differ" drift notice on existing containers whose setup was untouched,
+  # with a remedy (recreate from the same image) that fixes nothing for a
+  # version change. Version drift is _maybe_prompt_image_rebuild's job.
+  run bash -c '
+    source "'"$CLI"'"
+    ACTIVE_CAPS=(git env)
+    _RESOLVED_ENV_ARGS=(-e "FOO=bar")
+    VERSION="0.14.0"; h1="$(compute_config_fingerprint)"
+    VERSION="0.15.0"; h2="$(compute_config_fingerprint)"
+    [[ "$h1" == "$h2" ]] || { echo "DRIFTED: $h1 vs $h2" >&2; exit 1; }
+    echo "STABLE"
+  '
+  assert_success
+  assert_output --partial "STABLE"
+}

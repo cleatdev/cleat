@@ -3,10 +3,15 @@ set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
 VERSION="0.14.0"
-# Gates the one-time on-start release highlight (_maybe_show_release_highlight):
-# must equal VERSION to fire, so a release that forgets to refresh the highlight
-# copy shows nothing rather than stale text. Bump with VERSION at tag time.
+# Gates the on-start release highlight (_maybe_show_release_highlight): must
+# equal VERSION to fire, so a release that forgets to refresh the highlight copy
+# shows nothing rather than stale text. Bump with VERSION at tag time.
 RELEASE_HIGHLIGHT_VERSION="0.14.0"
+# How many launches after an upgrade the highlight is shown before going quiet.
+# Bounded repetition aids feature discovery (people miss it the first time)
+# without training the eye to skip the startup block, where drift/update/security
+# notices also live. See concept/21-on-start-notices.md.
+RELEASE_HIGHLIGHT_MAX_SHOWS=3
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -948,10 +953,17 @@ _env_summary() {
 }
 
 # ── Configuration drift detection ──────────────────────────────────────────
-# Compute a fingerprint from: sorted caps, sorted env keys, version.
+# Compute a fingerprint from sorted caps + sorted env keys ONLY.
 # Env VALUES are intentionally excluded — only structural changes (adding/removing
 # keys or capabilities) trigger drift. Value changes don't require container
 # recreation since env vars are passed at exec time, not baked into the container.
+#
+# The CLI VERSION is deliberately NOT part of the fingerprint. Folding it in made
+# every release fire a false "caps or env keys differ" notice on existing
+# containers whose only change was the version bump — a misleading message whose
+# offered remedy (recreate the container from the *same* image) does nothing for a
+# version change. Version drift is handled separately by _maybe_prompt_image_rebuild,
+# which offers a real rebuild and only when the image is genuinely older.
 compute_config_fingerprint() {
   local project="${1:-}"
   local fingerprint_input=""
@@ -963,18 +975,21 @@ compute_config_fingerprint() {
   fi
   fingerprint_input+=$'\n'
 
-  # Env keys (sorted, values excluded)
+  # Env keys (sorted HERE, values excluded). We sort inside this function rather
+  # than trust the caller's arg order: resolve_env_args happens to emit keys
+  # sorted today, but folding that assumption in means a different ordering (a
+  # refactor, a new env source) would silently change the hash and fire a false
+  # "caps or env keys differ" drift notice on an otherwise-unchanged setup.
   fingerprint_input+="env-keys:"
   if [[ ${#_RESOLVED_ENV_ARGS[@]} -gt 0 ]]; then
+    local _ekeys=""
     for arg in "${_RESOLVED_ENV_ARGS[@]}"; do
       [[ "$arg" == -e ]] && continue
-      fingerprint_input+="${arg%%=*},"
+      _ekeys+="${arg%%=*}"$'\n'
     done
+    fingerprint_input+="$(printf '%s' "$_ekeys" | sort | tr '\n' ',')"
   fi
   fingerprint_input+=$'\n'
-
-  # Version
-  fingerprint_input+="version:${VERSION}"
 
   if command -v sha256sum &>/dev/null; then
     echo -n "$fingerprint_input" | sha256sum | head -c 16
@@ -1201,11 +1216,7 @@ _resolve_config_drift() {
   [[ -z "$stored_hash" || "$stored_hash" == "$current_hash" ]] && return 0
 
   if _is_tty; then
-    _notice_box \
-      "Configuration changed since this container was" \
-      "created. Caps or env keys differ from the running setup." \
-      "" \
-      "Recreating will apply the new settings."
+    info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created — caps or env keys differ from the running setup"
     local yn=""
     _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
     if [[ -z "$yn" || "$yn" == [yY]* ]]; then
@@ -1222,11 +1233,7 @@ _resolve_config_drift() {
     return 0
   fi
 
-  _notice_box \
-    "Configuration changed since this container was" \
-    "created. Recreate to apply the new settings." \
-    "" \
-    "Run: {BOLD}cleat rm && cleat{/BOLD}"
+  info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created — recreate to apply: ${BOLD}cleat rm && cleat${RESET}"
 }
 
 # Image-version drift: the local image was built by an OLDER Cleat than the CLI
@@ -1259,7 +1266,6 @@ _maybe_prompt_image_rebuild() {
   [[ "$newest" == "$base_cli" && "$base_img" != "$base_cli" ]] || return 0
   _REBUILD_PROMPTED=1
 
-  echo ""
   info "Cleat image is outdated: built with ${DIM}v${image_version}${RESET} → CLI is ${BOLD}v${VERSION}${RESET}"
   local yn=""
   _ask_yn yn "Rebuild the image now? ${DIM}(~2 min; recreates this project's container)${RESET} [Y/n] "
@@ -2208,35 +2214,44 @@ _maybe_prompt_cli_update() {
   fi
 }
 
-# One-time, non-blocking release highlight. On the first interactive,
-# session-launching run after VERSION changes, print a short note about the
-# release's flagship feature, record the version, and never show it again. It is
-# purely local (no network → CI/offline-safe) and NEVER prompts — the update
-# check is the only thing allowed to ask at startup. Shown exactly once per
-# version, so it has no opt-out knob (a one-time, non-blocking notice doesn't
-# warrant one). The copy below is the per-release content: update it AND
-# RELEASE_HIGHLIGHT_VERSION together at tag time. A version mismatch shows
-# nothing, so a forgotten update fails to silence — never to stale marketing.
+# Non-blocking release highlight. On the first RELEASE_HIGHLIGHT_MAX_SHOWS
+# interactive, session-launching runs after VERSION changes, print a short note
+# about the release's flagship feature, then go quiet for that version. Bounded
+# repetition (not once, not forever): people miss a one-time note, and a
+# forever-repeating one trains the eye to skip the startup block where the
+# actionable drift/update/security notices live. Purely local (no network →
+# CI/offline-safe) and NEVER prompts — the update check is the only thing allowed
+# to ask at startup. State is "<version> <shown_count>" in $LAST_SEEN_VERSION_FILE.
+# The copy below is the per-release content: update it AND RELEASE_HIGHLIGHT_VERSION
+# together at tag time. A version mismatch shows nothing, so a forgotten update
+# fails to silence — never to stale marketing.
 _maybe_show_release_highlight() {
   _is_tty || return 0
   # Only fire for the exact version this copy was written for.
   [[ "$RELEASE_HIGHLIGHT_VERSION" == "$VERSION" ]] || return 0
 
-  local last_seen=""
+  local last_seen="" shown=0
   if [[ -f "$LAST_SEEN_VERSION_FILE" ]]; then
     last_seen=$(awk 'NR==1 {print $1}' "$LAST_SEEN_VERSION_FILE" 2>/dev/null || echo "")
+    shown=$(awk 'NR==1 {print $2+0}' "$LAST_SEEN_VERSION_FILE" 2>/dev/null || echo 0)
   fi
-  # Already shown for this version → stay quiet.
-  [[ "$last_seen" == "$VERSION" ]] && return 0
+  # Already shown the cap for this version → stay quiet.
+  [[ "$last_seen" == "$VERSION" && "$shown" -ge "$RELEASE_HIGHLIGHT_MAX_SHOWS" ]] && return 0
 
-  # Record BEFORE printing so a Ctrl-C or write race can never re-show next run.
-  # Brace-wrap so a redirect-open failure's own stderr is suppressed too (plain
-  # `echo ... 2>/dev/null` doesn't catch the shell's "Permission denied"). If the
-  # record can't be persisted (read-only install dir, unwritable stale file), the
-  # read-back below fails and we stay SILENT rather than nag on every launch —
-  # "fail to silence, never to a permanent nag."
-  { echo "$VERSION" > "$LAST_SEEN_VERSION_FILE"; } 2>/dev/null || true
-  [[ -f "$LAST_SEEN_VERSION_FILE" && "$(cat "$LAST_SEEN_VERSION_FILE" 2>/dev/null)" == "$VERSION" ]] || return 0
+  # A fresh version resets the counter; the same version increments it.
+  local next=1
+  [[ "$last_seen" == "$VERSION" ]] && next=$(( shown + 1 ))
+
+  # Record the bumped count BEFORE printing so a Ctrl-C or write race can never
+  # under-count (which would over-show). Brace-wrap so a redirect-open failure's
+  # own stderr is suppressed too (plain `echo ... 2>/dev/null` doesn't catch the
+  # shell's "Permission denied"). If the bump can't be persisted (read-only
+  # install dir, unwritable stale file), the read-back fails and we stay SILENT
+  # rather than show forever — "fail to silence, never to a permanent nag."
+  { echo "$VERSION $next" > "$LAST_SEEN_VERSION_FILE"; } 2>/dev/null || true
+  local confirm=""
+  [[ -f "$LAST_SEEN_VERSION_FILE" ]] && confirm=$(awk 'NR==1 {print $1" "($2+0)}' "$LAST_SEEN_VERSION_FILE" 2>/dev/null || echo "")
+  [[ "$confirm" == "$VERSION $next" ]] || return 0
 
   echo ""
   info "${BOLD}New in v${VERSION}${RESET} — ${CYAN}Boxes${RESET}: many sandboxes per project, each with its own caps"
@@ -2680,6 +2695,7 @@ cmd_run() {
   if ! image_exists; then
     _do_pull || _do_build
   else
+    echo ""   # blank separates the bring-up block from preceding notices
     success "Image ready ${RESET}${DIM}(cached)"
   fi
 
@@ -2966,6 +2982,7 @@ cmd_start() {
         cmd_run "$project"
       else
         # Restarting a stopped container — image already exists
+        echo ""
         success "Image ready ${RESET}${DIM}(cached)"
         spin "Starting container..."
         local _docker_err="/tmp/cleat-err.$$"
@@ -2997,6 +3014,7 @@ cmd_start() {
       cmd_run "$project"
     fi
   else
+    echo ""
     success "Image ready ${RESET}${DIM}(cached)"
     success "Container started"
   fi

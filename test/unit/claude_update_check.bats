@@ -100,6 +100,22 @@ teardown() { _common_teardown; }
   refute_output --partial "UPGRADE_CALLED"
 }
 
+@test "startup check: a stale check (past the interval) is not throttled" {
+  _is_tty() { return 0; }
+  CLEAT_FAKE_REMOTE_CLAUDE="2.1.149"
+  _image_claude_version() { echo "2.1.40"; }
+  # Paired with "recent check skips" above, this brackets CLAUDE_CHECK_INTERVAL
+  # (600s / 10 min): a check older than the window must proceed (not throttled),
+  # so bumping the interval to a large value — which would silently stop periodic
+  # re-checks — breaks this test. No CLEAT_FORCE_CLAUDE_CHECK here: the throttle
+  # path itself is under test, not bypassed.
+  local old_ts=$(( $(date +%s) - 660 ))   # just past the 10-min window
+  echo "$old_ts 2.1.149" > "$CLAUDE_CHECK_FILE"
+  run _maybe_prompt_claude_update <<< "n"
+  assert_success
+  assert_output --partial "New Claude Code available"
+}
+
 # ── _maybe_prompt_claude_update: version comparison ──────────────────────────
 
 @test "startup check: prompts and upgrades on 'yes' when remote is newer" {

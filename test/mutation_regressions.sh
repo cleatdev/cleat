@@ -36,6 +36,9 @@ BOXES_BATS="$REPO_ROOT/test/unit/boxes.bats"
 BOX_HARDENING_BATS="$REPO_ROOT/test/unit/box_hardening.bats"
 DOCKER_CAP_BATS="$REPO_ROOT/test/unit/docker_cap.bats"
 BROWSER_BRIDGE_BATS="$REPO_ROOT/test/unit/browser_bridge.bats"
+WHATS_NEW_BATS="$REPO_ROOT/test/unit/whats_new.bats"
+CAPABILITIES_BATS="$REPO_ROOT/test/unit/capabilities.bats"
+EXEC_CLAUDE_BATS="$REPO_ROOT/test/unit/exec_claude.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -855,6 +858,92 @@ cat > "$SED_TMP" << 'SED'
 /\[ -d "\$clip_dir" \] || { _bw_cleanup; exit 0; }/d
 SED
 try "v0.15.0_watcher_orphan_exit" "self-exits when its run dir is removed" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# v0.15.0 — the release highlight shows for a BOUNDED number of launches
+# (RELEASE_HIGHLIGHT_MAX_SHOWS) then goes quiet, not forever. Delete the cap
+# check so it shows on every launch: the "first 3 launches, then goes silent"
+# test then sees output on the 4th launch and fails.
+cat > "$SED_TMP" << 'SED'
+/"\$shown" -ge "\$RELEASE_HIGHLIGHT_MAX_SHOWS"/d
+SED
+try "v0.15.0_highlight_bounded_cap" "first 3 launches" "$CLI" "$WHATS_NEW_BATS"
+
+# v0.15.0 — the config-drift notice must be plain text, not a bordered
+# _notice_box. Mutate the non-TTY drift line's `info` back to `_notice_box`:
+# the box border returns and the "plain text, not a box" regression test trips
+# on the "┌" it refutes.
+cat > "$SED_TMP" << 'SED'
+s|info "\(.*recreate to apply.*\)|_notice_box "\1|
+SED
+try "v0.15.0_drift_notice_plain_text" "config-drift notice is plain text"
+
+# v0.15.0 — the image-rebuild notice must not open with a stray blank line.
+# Re-add the `echo ""` (inline, before the info) so the notice is preceded by a
+# newline again: the "no leading blank line" regression test then trips.
+cat > "$SED_TMP" << 'SED'
+s|info "Cleat image is outdated|echo ""; info "Cleat image is outdated|
+SED
+try "v0.15.0_rebuild_notice_no_leading_blank" "image-rebuild notice has no leading blank line"
+
+# v0.15.0 — the config fingerprint must NOT depend on the CLI version, or every
+# release fires a false "caps or env keys differ" drift notice on unchanged
+# containers. Re-fold version into the hash (inline, before the sha256sum line):
+# the "version bump alone does not trigger config drift" regression then sees the
+# two hashes diverge across a version change and fails.
+cat > "$SED_TMP" << 'SED'
+s|if command -v sha256sum|fingerprint_input+="version:\${VERSION}"; if command -v sha256sum|
+SED
+try "v0.15.0_fingerprint_excludes_version" "version bump alone does not trigger config drift"
+
+# v0.15.0 — caps are sorted before hashing so cap order can't drift the print.
+# Drop the cap `| sort`: (git ssh) and (ssh git) then hash differently and the
+# "stable regardless of cap order" test fails.
+cat > "$SED_TMP" << 'SED'
+s#ACTIVE_CAPS\[@\]}" | sort#ACTIVE_CAPS[@]}"#
+SED
+try "v0.15.0_fingerprint_cap_sort" "stable regardless of cap order" "$CLI" "$CAPABILITIES_BATS"
+
+# v0.15.0 — env keys are sorted INSIDE compute_config_fingerprint (not trusting
+# the caller's arg order). Drop the env `| sort`: a reordered arg list then
+# drifts the hash and the "stable regardless of env-arg order" test fails.
+cat > "$SED_TMP" << 'SED'
+s#"\$_ekeys" | sort#"\$_ekeys"#
+SED
+try "v0.15.0_fingerprint_env_sort" "stable regardless of env-arg order" "$CLI" "$CAPABILITIES_BATS"
+
+# v0.15.0 — env VALUES are excluded from the fingerprint (only keys matter), so a
+# value change never forces a recreate. Hash the full KEY=VALUE instead of the
+# key: a value change then drifts the hash and the "ignores env values" test fails.
+cat > "$SED_TMP" << 'SED'
+s|_ekeys+="${arg%%=\*}"|_ekeys+="${arg}"|
+SED
+try "v0.15.0_fingerprint_ignores_values" "ignores env values" "$CLI" "$CAPABILITIES_BATS"
+
+# v0.15.0 — CLAUDE_CHECK_INTERVAL (10-min cadence) must be pinned on the STALE
+# side: a check past the window proceeds. Bump it to a huge value (which would
+# silently stop periodic re-checks): the "stale check ... is not throttled" test
+# then sees the prompt suppressed and fails.
+cat > "$SED_TMP" << 'SED'
+s/CLAUDE_CHECK_INTERVAL=600/CLAUDE_CHECK_INTERVAL=6000/
+SED
+try "v0.15.0_claude_check_interval_pinned" "a stale check" "$CLI" "$CLAUDE_BATS"
+
+# v0.15.0 — CLAUDE_ENV is the fixed env forced into every session; its key set
+# must stay exactly {HOME, DISABLE_AUTOUPDATER, PATH} so no host state leaks in.
+# Inject an extra var: the "injects exactly" test sees a 4th key and fails.
+cat > "$SED_TMP" << 'SED'
+s|CLAUDE_ENV=(-e HOME=/home/coder|CLAUDE_ENV=(-e TERM=xterm -e HOME=/home/coder|
+SED
+try "v0.15.0_session_env_exact_set" "injects exactly" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# v0.15.0 — a blank line must precede the "Image ready (cached)" bring-up line so
+# it reads as its own group, separate from the preceding startup notices. Delete
+# the separating echo "": the "blank line precedes Image ready" terminal_ux test
+# then sees Image-ready with no blank before it and fails.
+cat > "$SED_TMP" << 'SED'
+/echo "".*blank separates the bring-up/d
+SED
+try "v0.15.0_blank_before_image_ready" "blank line precedes Image ready" "$CLI" "$TERMINAL_UX_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -612,27 +612,25 @@ EOF
   assert_output --partial "Image ready"
 }
 
-@test "run: a blank line precedes Image ready (cached) — separates bring-up from notices" {
-  # The cached image-ready line must be preceded by a blank line so the bring-up
-  # block reads as its own group, separate from the preceding startup notices
-  # (update prompt, release highlight, drift / 'Removed …'). Guarding the blank
-  # itself (not just the text) means deleting the separator fails this test.
+@test "run: the cached Image-ready line opens the bring-up with no leading blank" {
+  # The bring-up block must be one contiguous coloured group so a rebuild's
+  # "Image rebuilt" flows straight into "Image ready (cached)". A stray leading
+  # blank here would split that group (and double up with the release
+  # highlight's own trailing blank). So Image-ready must be the FIRST line
+  # cmd_run prints — not preceded by a blank. Re-adding `echo ""` pushes it to
+  # line 2 and trips this test.
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
   run cmd_run "$TEST_TEMP/project"
   assert_success
   assert_output --partial "Image ready"
-  # Classify the line immediately before "Image ready (cached)". NR>1 guards the
-  # mutation case where the blank is gone and Image-ready becomes the first line
-  # (an uninitialised prev would otherwise look blank and hide the regression).
-  local prev
-  prev="$(printf '%s\n' "$output" | awk '
-    /Image ready/ && /\(cached\)/ { print ((NR>1 && p ~ /^[[:space:]]*$/) ? "BLANK" : "NOTBLANK"); f=1; exit }
-    { p=$0 }
+  local cls
+  cls="$(printf '%s\n' "$output" | awk '
+    /Image ready/ && /\(cached\)/ { print (NR==1 ? "FIRST" : "NOTFIRST"); f=1; exit }
     END { if (!f) print "NOTFOUND" }
   ')"
-  run echo "$prev"
-  assert_output "BLANK"
+  run echo "$cls"
+  assert_output "FIRST"
 }
 
 # ── rebuild output ───────────────────────────────────────────────────────

@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.15.0"
+VERSION="0.15.1"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below — not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="0.15.0"
+RELEASE_HIGHLIGHT_VERSION="0.15.1"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -1061,6 +1061,39 @@ _settings_overlay_intact() {
         [[ -f "$src" ]] || return 1
         ;;
     esac
+  done <<< "$mounts"
+  return 0
+}
+
+# Return failure when any of the container's bind-mount sources no longer exist
+# on the host. Bind sources are baked in at `docker run` (creation) and cannot
+# be changed; `docker start` re-mounts the SAME recorded sources, and if one has
+# vanished it aborts with an opaque OCI error:
+#   error mounting "<src>" to rootfs at "<dst>" ... not a directory:
+#   Are you trying to mount a directory onto a file (or vice-versa)?
+#
+# The classic trigger is the macOS SSH agent socket (the `ssh` cap). launchd
+# regenerates its socket directory (…/com.apple.launchd.XXXX/Listeners) on every
+# boot, so SSH_AUTH_SOCK rotates and the path baked into the container points at
+# a directory that no longer exists — every `ssh`-cap box fails to restart after
+# a reboot. Detect it here so the caller can recreate transparently (cheap: the
+# container is disposable; auth, sessions, and the project all live in other
+# mounts). Only `bind` mounts are checked — volumes/tmpfs have no host source to
+# stat. Unreadable inspect (no daemon, gone container) → treat as present (0):
+# the start path that follows surfaces the real error.
+_container_bind_sources_present() {
+  local cname="$1"
+  local mounts line typ src
+  mounts="$(docker inspect "$cname" \
+    --format '{{range .Mounts}}{{.Type}}|{{.Source}}{{"\n"}}{{end}}' 2>/dev/null)" || return 0
+  [[ -n "$mounts" ]] || return 0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    typ="${line%%|*}"
+    src="${line#*|}"
+    [[ "$typ" == "bind" ]] || continue
+    [[ -n "$src" ]] || continue
+    [[ -e "$src" ]] || return 1
   done <<< "$mounts"
   return 0
 }
@@ -2262,6 +2295,9 @@ _maybe_show_release_highlight() {
   info "${BOLD}New in v0.14.0${RESET} — ${CYAN}Boxes${RESET}: many sandboxes per project, each with its own caps"
   echo -e "    ${DIM}A locked-down dev box beside a cloud box over the same files; neither${RESET}"
   echo -e "    ${DIM}reaches the other's caps.${RESET}    Try:  ${BOLD}cleat start dev${RESET}   ${DIM}·   cleat.sh/changelog${RESET}"
+  # Trailing blank: the highlight owns its own separation from the bring-up
+  # block that follows, so the bring-up needs no leading blank of its own.
+  echo ""
 }
 
 # Fetch the newest released Claude Code version for a channel from the public
@@ -2700,7 +2736,11 @@ cmd_run() {
   if ! image_exists; then
     _do_pull || _do_build
   else
-    echo ""   # blank separates the bring-up block from preceding notices
+    # No leading blank: the bring-up block (Image ready/rebuilt → Container
+    # started → …) stays one contiguous coloured group. Separation from the
+    # preceding notices is owned by those notices (the release highlight emits
+    # a trailing blank), so a rebuild's "Image rebuilt" flows straight into
+    # this line instead of being split by a stray blank. See concept/21.
     success "Image ready ${RESET}${DIM}(cached)"
   fi
 
@@ -2977,17 +3017,19 @@ cmd_start() {
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      # Detect stale mounts (e.g., after host reboot clears /tmp, after
-      # macOS rotates individual /tmp files, or after the SSH agent socket
-      # path changes). The container's bind mounts are baked in at
-      # creation time and cannot be updated — recreate.
-      if ! _settings_overlay_intact "$cname"; then
+      # Detect stale mounts. The container's bind sources are baked in at
+      # creation and `docker start` re-mounts them as-is, so if any has moved
+      # or vanished the start aborts with an opaque OCI error — recreate
+      # instead. Two independent classes: a missing/wrong-type settings overlay
+      # (_settings_overlay_intact), and any vanished bind source — most often
+      # the macOS SSH agent socket, whose launchd path rotates every reboot
+      # (_container_bind_sources_present).
+      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname"; then
         info "Recreating container ${DIM}(host paths changed)"
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
       else
         # Restarting a stopped container — image already exists
-        echo ""
         success "Image ready ${RESET}${DIM}(cached)"
         spin "Starting container..."
         local _docker_err="/tmp/cleat-err.$$"
@@ -3019,7 +3061,6 @@ cmd_start() {
       cmd_run "$project"
     fi
   else
-    echo ""
     success "Image ready ${RESET}${DIM}(cached)"
     success "Container started"
   fi
@@ -3107,26 +3148,29 @@ cmd_resume() {
   # Start container if stopped
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
-      # Detect stale mounts (e.g., after host reboot clears /tmp, after
-      # macOS rotates individual /tmp files, or after the SSH agent socket
-      # path changes).  Can't docker-start with broken bind sources — tell
-      # user to recreate.
-      if ! _settings_overlay_intact "$cname"; then
-        error "Container mounts are stale ${DIM}(host paths changed)${RESET}."
-        error "Run ${BOLD}cleat${RESET} to recreate the container."
-        exit 1
+      # Detect stale mounts and recreate transparently (sessions live on the
+      # host, so --continue below still resumes the conversation). A missing
+      # settings overlay (_settings_overlay_intact) or any vanished bind source
+      # — most often the macOS SSH agent socket, whose launchd path rotates
+      # every reboot (_container_bind_sources_present) — would otherwise make
+      # `docker start` abort with an opaque OCI error.
+      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname"; then
+        info "Recreating container ${DIM}(host paths changed)${RESET}"
+        docker rm -f "$cname" > /dev/null 2>&1 || true
+        cmd_run "$project"
+      else
+        local _docker_err="/tmp/cleat-err.$$"
+        local resume_rc=0
+        docker start "$cname" > /dev/null 2>"$_docker_err" || resume_rc=$?
+        if [[ $resume_rc -ne 0 ]]; then
+          error "Container failed to start."
+          [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
+          rm -f "$_docker_err"
+          error "Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET} to recreate."
+          exit 1
+        fi
+        rm -f "$_docker_err" 2>/dev/null
       fi
-      local _docker_err="/tmp/cleat-err.$$"
-      local resume_rc=0
-      docker start "$cname" > /dev/null 2>"$_docker_err" || resume_rc=$?
-      if [[ $resume_rc -ne 0 ]]; then
-        error "Container failed to start."
-        [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
-        rm -f "$_docker_err"
-        error "Try ${BOLD}cleat rm${RESET} then ${BOLD}cleat${RESET} to recreate."
-        exit 1
-      fi
-      rm -f "$_docker_err" 2>/dev/null
     else
       # No container exists (e.g., after `cleat rm`). Session files live on
       # the host at ~/.claude/projects/<key>/, so `--continue` below will

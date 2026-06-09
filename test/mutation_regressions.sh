@@ -945,14 +945,41 @@ s|CLAUDE_ENV=(-e HOME=/home/coder|CLAUDE_ENV=(-e TERM=xterm -e HOME=/home/coder|
 SED
 try "v0.15.0_session_env_exact_set" "injects exactly" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# v0.15.0 — a blank line must precede the "Image ready (cached)" bring-up line so
-# it reads as its own group, separate from the preceding startup notices. Delete
-# the separating echo "": the "blank line precedes Image ready" terminal_ux test
-# then sees Image-ready with no blank before it and fails.
+# v0.15.1 — the bring-up block is one contiguous coloured group: the cached
+# "Image ready" line must NOT carry a leading blank (a rebuild's "Image rebuilt"
+# flows straight into it). Re-add the `echo ""` in front: the "no leading blank"
+# terminal_ux test then sees Image-ready pushed to line 2 and fails.
 cat > "$SED_TMP" << 'SED'
-/echo "".*blank separates the bring-up/d
+s|success "Image ready \${RESET}\${DIM}(cached)"|echo ""; &|
 SED
-try "v0.15.0_blank_before_image_ready" "blank line precedes Image ready" "$CLI" "$TERMINAL_UX_BATS"
+try "v0.15.1_image_ready_no_leading_blank" "opens the bring-up with no leading blank" "$CLI" "$TERMINAL_UX_BATS"
+
+# v0.15.1 — the release highlight ends with a trailing blank so it owns its own
+# separation from the bring-up that follows. Delete that trailing echo "" (the
+# one after the changelog line): the "trailing blank separates the highlight"
+# test then sees the changelog line abut the sentinel and fails.
+cat > "$SED_TMP" << 'SED'
+/# block that follows, so the bring-up needs no leading blank/{n;d;}
+SED
+try "v0.15.1_highlight_trailing_blank" "trailing blank separates the highlight" "$CLI" "$WHATS_NEW_BATS"
+
+# v0.15.1 — a stopped container whose baked-in bind source has vanished (the
+# macOS SSH agent socket rotates every reboot) must be recreated, not handed to
+# `docker start` (which aborts with an opaque OCI error). Neuter the missing-
+# source check so it always reports present: the rotated-SSH-socket regression
+# then sees `docker start` instead of a recreate and fails.
+cat > "$SED_TMP" << 'SED'
+s#\[\[ -e "\$src" \]\] || return 1#true#
+SED
+try "v0.15.1_bind_sources_vanished_recreates" "rotated SSH-agent socket after reboot recreates"
+
+# v0.15.1 — the entrypoint must chown ~/.cache after the UID remap so the Claude
+# installer can mkdir its staging dir. Drop the chown: the "chowns ~/.cache"
+# entrypoint test then no longer sees it logged and fails.
+cat > "$SED_TMP" << 'SED'
+/chown -R "\$HOST_UID:\$HOST_GID" \/home\/coder\/.cache/d
+SED
+try "v0.15.1_entrypoint_cache_chown" "chowns ~/.cache" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

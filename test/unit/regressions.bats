@@ -1918,3 +1918,34 @@ ${overlay_dir}/project-settings.local.json"
   assert_success
   assert_output --partial "STABLE"
 }
+
+@test "regression v0.15.1: rotated SSH-agent socket after reboot recreates instead of failing to start" {
+  # macOS launchd regenerates the SSH agent socket directory
+  # (…/com.apple.launchd.XXXX/Listeners) on every reboot, so SSH_AUTH_SOCK
+  # rotates. A stopped ssh-cap container has the OLD path baked into its mount
+  # spec; `docker start` re-mounts it and aborts with an opaque OCI error:
+  #   error mounting "…/Listeners" to rootfs at "/tmp/ssh-agent.sock" …
+  #   not a directory. cmd_start must detect the vanished bind source up front
+  # and recreate (the settings overlay alone never caught it).
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  # Settings overlay intact, so the OTHER stale-check passes …
+  mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
+  # … but the rotated SSH-agent socket source is gone.
+  mock_docker_inspect "$(printf 'bind|%s\nbind|%s\n' \
+    "$TEST_TEMP/project" "$TEST_TEMP/run/com.apple.launchd.GONE/Listeners")"
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  run docker_calls
+  assert_output --partial "docker rm -f $cname"
+  assert_output --partial "docker run"
+  refute_output --partial "docker start $cname"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/clip"
+}

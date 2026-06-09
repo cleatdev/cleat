@@ -195,9 +195,12 @@ teardown() { _common_teardown; }
   rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/clip"
 }
 
-@test "resume: stale mounts show clear error directing to cleat start" {
-  # After /tmp paths rotate (reboot, partial /tmp file cleanup, etc.),
-  # resume can't fix stale mounts — tell user to recreate.
+@test "resume: stale mounts auto-recreate and continue (sessions live on host)" {
+  # After paths rotate (reboot, partial /tmp cleanup, SSH-socket rotation),
+  # resume can't docker-start the stale container — but sessions live on the
+  # host, so it recreates transparently and continues with --continue instead
+  # of erroring out and dead-ending the user.
+  mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
@@ -206,10 +209,46 @@ teardown() { _common_teardown; }
   # Do NOT create settings overlay dir — simulates post-reboot state
 
   run cmd_resume "$TEST_TEMP/project"
-  assert_failure
-  assert_output --partial "stale"
+  assert_success
+  assert_output --partial "Recreating container"
   assert_output --partial "host paths changed"
-  assert_output --partial "cleat"
+  run docker_calls
+  assert_output --partial "docker rm -f $cname"
+  assert_output --partial "docker run"
+  refute_output --partial "docker start $cname"
+  run assert_docker_exec_has "--continue"
+  assert_success
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/clip"
+}
+
+# ── _container_bind_sources_present (vanished bind-source detection) ──────────
+# Detects when a baked-in bind-mount source no longer exists on the host, so the
+# caller can recreate instead of letting `docker start` abort with an opaque OCI
+# "not a directory" error. The headline trigger is the macOS SSH agent socket,
+# whose launchd path rotates on every reboot.
+
+@test "bind-sources: present when every bind source exists on the host" {
+  touch "$TEST_TEMP/sock"
+  mock_docker_inspect "$(printf 'bind|%s\nbind|%s\n' "$TEST_TEMP" "$TEST_TEMP/sock")"
+  run _container_bind_sources_present "cleat-x"
+  assert_success
+}
+
+@test "bind-sources: stale when a bind source has vanished (rotated SSH socket)" {
+  # The launchd SSH-agent socket dir is regenerated each reboot, so the recorded
+  # source path no longer resolves on the host.
+  mock_docker_inspect "$(printf 'bind|%s\nbind|%s\n' \
+    "$TEST_TEMP" "$TEST_TEMP/run/com.apple.launchd.GONE/Listeners")"
+  run _container_bind_sources_present "cleat-x"
+  assert_failure
+}
+
+@test "bind-sources: ignores non-bind mounts (volumes/tmpfs have no host source)" {
+  # A volume Source under docker's internal dir won't exist on the host, but a
+  # non-bind mount must NEVER be treated as a vanished source.
+  mock_docker_inspect "$(printf 'volume|%s\ntmpfs|\n' "/var/lib/docker/volumes/x/_data")"
+  run _container_bind_sources_present "cleat-x"
+  assert_success
 }
 
 @test "no arguments to main defaults to start" {

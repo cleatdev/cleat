@@ -42,6 +42,25 @@ teardown() { _common_teardown; }
   assert_output --partial "cleat.sh/changelog"
 }
 
+@test "whats-new: a trailing blank separates the highlight from the bring-up block" {
+  _is_tty() { return 0; }
+  # The highlight owns its own separation from the bring-up that follows, so the
+  # bring-up needs no leading blank of its own. Append a sentinel: $(...) strips
+  # only the FINAL newline, so the trailing `echo ""` survives as an empty line
+  # immediately before SENTINEL. Dropping it makes the 'changelog' line sit right
+  # against SENTINEL — falsifiable.
+  local out
+  out="$( { _maybe_show_release_highlight; printf 'SENTINEL\n'; } )"
+  local cls
+  cls="$(printf '%s\n' "$out" | awk '
+    /^SENTINEL$/ { print (p ~ /^[[:space:]]*$/ ? "BLANK" : "NOTBLANK"); f=1; exit }
+    { p=$0 }
+    END { if (!f) print "NOTFOUND" }
+  ')"
+  run echo "$cls"
+  assert_output "BLANK"
+}
+
 @test "whats-new: shows the first 3 launches, then goes silent" {
   _is_tty() { return 0; }
   local i

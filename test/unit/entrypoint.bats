@@ -52,6 +52,18 @@ _run_entrypoint() {
   assert_output --partial "/home/coder/.claude"
 }
 
+@test "entrypoint: chowns ~/.cache so the Claude installer can stage downloads" {
+  _run_entrypoint
+  assert_success
+  run cat "$CHOWN_LOG"
+  # The native installer stages each build under ~/.cache/claude/staging before
+  # moving it into ~/.local. Baked owned by the build UID and not host-mounted,
+  # so without this chown the remapped runtime user hits
+  #   EACCES: permission denied, mkdir '/home/coder/.cache/claude/staging/...'
+  # and `cleat upgrade-claude` / the on-start update prompt fail.
+  assert_output --partial "/home/coder/.cache"
+}
+
 @test "entrypoint: clears stale clipboard runtime files before dropping to coder" {
   # v0.13.1: a hard-killed prior session can leave a foreign-owned clip socket in
   # the sticky /tmp (it survives docker stop/start). As root, the entrypoint must

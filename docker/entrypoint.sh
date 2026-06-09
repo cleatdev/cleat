@@ -40,6 +40,16 @@ chown "$HOST_UID:$HOST_GID" /workspace 2>/dev/null || true
 # commit the new version into the image.
 chown -R "$HOST_UID:$HOST_GID" /home/coder/.local 2>/dev/null || true
 
+# Claude Code's native installer stages each downloaded build under
+# ~/.cache/claude/staging before atomically moving it into ~/.local. Like
+# ~/.local it is baked at build time owned by the build UID and is NOT
+# host-mounted, so after the remap above the runtime user can't mkdir there.
+# Without this chown the installer dies with
+#   EACCES: permission denied, mkdir '/home/coder/.cache/claude/staging/...'
+# breaking `cleat upgrade-claude`, the on-start update prompt, and a manual
+# in-container `claude update`. Chown it so staging can write.
+chown -R "$HOST_UID:$HOST_GID" /home/coder/.cache 2>/dev/null || true
+
 # Docker capability: when /var/run/docker.sock is mounted (docker cap active),
 # the socket is group-owned by the host's docker GID (typically 999 on Linux).
 # The coder user's GID has been remapped to HOST_GID, which generally isn't

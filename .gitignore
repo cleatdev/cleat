@@ -8,6 +8,7 @@ concept
 .DS_Store
 .update_check
 .claude_update_check
+.pressure_check
 .last_seen_version
 .cleat.env
 coverage/

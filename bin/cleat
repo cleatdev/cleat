@@ -140,6 +140,9 @@ spin() {
     info "$msg"
     return
   fi
+  # A second spin() before spin_stop would orphan the first frame loop and
+  # interleave two \r-animations into garbage — stop the old one first.
+  [[ -n "${_SPIN_PID:-}" ]] && _cleanup_spin
   local frames
   if _has_unicode; then
     frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
@@ -147,16 +150,25 @@ spin() {
     frames=('-' '\' '|' '/')
   fi
   command -v tput &>/dev/null && tput civis 2>/dev/null
+  local _spin_parent=$$
   (
+    trap 'exit 0' TERM INT
     local i=0
-    while true; do
+    while kill -0 "$_spin_parent" 2>/dev/null; do
       printf "\r  ${BLUE}%s${RESET} %s" "${frames[$i]}" "$msg"
       i=$(( (i + 1) % ${#frames[@]} ))
       sleep 0.08
     done
+    # Parent died without spin_stop (SIGKILL, hard crash): erase the frame and
+    # restore the cursor instead of overwriting the shell prompt every 80 ms
+    # with the cursor left hidden — the old spinner was un-disownable spam.
+    printf "\r\033[K"
+    { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
   ) &
   _SPIN_PID=$!
-  disown "$_SPIN_PID" 2>/dev/null
+  # NOT disowned: spin_stop's `wait` must synchronize with the loop's exit so
+  # no final frame can print after the ✔/✖ line (wait on a disowned pid is a
+  # no-op race).
 }
 
 spin_stop() {
@@ -185,6 +197,21 @@ _cleanup_spin() {
     _SPIN_PID=""
   fi
   { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+}
+
+# Restore the host terminal after an interactive `docker exec`. The docker CLI
+# only undoes the termios state it set itself; private modes enabled by the
+# in-box TUI — alternate screen, mouse tracking, bracketed paste, hidden
+# cursor — survive a hard crash (a SIGSEGV'd claude, fork lockup at the pids
+# cap) and leave the terminal spraying escape garbage on every keystroke and
+# mouse move until a manual `reset`. Every sequence here is a no-op on a
+# terminal already in a clean state, so this is safe after normal exits too.
+_restore_terminal() {
+  _is_tty || return 0
+  {
+    stty sane
+    printf '\033[?1049l\033[?2004l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?25h\033[0m'
+  } </dev/tty >/dev/tty 2>/dev/null || true
 }
 
 # ── Keypress reader for TUI ────────────────────────────────────────────────
@@ -325,6 +352,42 @@ image_exists() {
   docker images --format '{{.Repository}}' 2>/dev/null | grep -q "^${IMAGE_NAME}$"
 }
 
+# GOARCH of the docker daemon (arm64/amd64) — the architecture containers
+# actually run as. Read from the SERVER, not uname: with a remote DOCKER_HOST
+# the local machine's arch is irrelevant. Empty when unreachable (callers
+# must fail open).
+_daemon_arch() {
+  docker version --format '{{.Server.Arch}}' 2>/dev/null || true
+}
+
+# GOARCH of a local image, empty if unknown/absent.
+_image_arch() {
+  docker image inspect "$1" --format '{{.Architecture}}' 2>/dev/null || true
+}
+
+# True when the image's architecture matches the daemon's — i.e. its
+# containers run natively. Unknown daemon or image arch fails OPEN (ok): an
+# unreachable daemon or exotic setup must never force a rebuild loop. FALSE
+# means the image would run under emulation — slow, and the documented
+# trigger for node segfaults and garbled TTYs on Apple Silicon (Docker calls
+# amd64-on-arm "best effort"). Callers treat such an image as missing and
+# re-acquire a native one.
+_image_arch_ok() {
+  local image="${1:-$IMAGE_NAME}"
+  local want have
+  want="$(_daemon_arch)"
+  [[ -n "$want" ]] || return 0
+  have="$(_image_arch "$image")"
+  [[ -n "$have" ]] || return 0
+  [[ "$have" == "$want" ]]
+}
+
+# One-line explanation used by the acquisition gates when replacing an
+# emulated image with a native one.
+_warn_image_emulated() {
+  warn "Local image is ${BOLD}$(_image_arch "$IMAGE_NAME")${RESET} but Docker runs ${BOLD}$(_daemon_arch)${RESET} — emulated boxes are slow and crash-prone; fetching a native image"
+}
+
 require_running() {
   local cname="$1"
   if ! is_running "$cname"; then
@@ -441,6 +504,187 @@ _project_env_file() {
     echo "$project/.cleat.$box.env"
   else
     echo "$project/.cleat.env"
+  fi
+}
+
+# ── Resources: per-box memory limit ──────────────────────────────────────────
+# Read one key from a config file's [resources] section. Lines are
+# `key = value` (spaces optional). Same parsing hygiene as [caps]: CRLF-safe,
+# comment- and whitespace-tolerant. Prints the value, or nothing when absent.
+_read_resource_from_file() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  local in_section=false line k v
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == "["*"]" ]]; then
+      [[ "$line" == "[resources]" ]] && in_section=true || in_section=false
+      continue
+    fi
+    $in_section || continue
+    [[ "$line" == *"="* ]] || continue
+    k="${line%%=*}"
+    v="${line#*=}"
+    k="${k%"${k##*[![:space:]]}"}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    if [[ "$k" == "$key" ]]; then
+      echo "$v"
+      return 0
+    fi
+  done < "$file"
+}
+
+# A docker memory value: positive integer with optional b/k/m/g suffix.
+_valid_memory_value() {
+  [[ "$1" =~ ^[0-9]+[bkmgBKMG]?$ ]] || return 1
+  local n="${1%[bkmgBKMG]}"
+  [[ -n "$n" ]] || return 1
+  # Per-suffix digit caps keep the byte conversion inside 64-bit arithmetic.
+  # An overflowed product WRAPS (possibly negative), slips past the 8g project
+  # clamp comparison, and then aborts `docker run` with an opaque daemon error
+  # — so e.g. "99999999999g" must be rejected here, not discovered by dockerd.
+  case "$1" in
+    *[gG]) [[ ${#n} -le 9 ]] || return 1 ;;
+    *[mM]) [[ ${#n} -le 12 ]] || return 1 ;;
+    *[kK]) [[ ${#n} -le 15 ]] || return 1 ;;
+    *)     [[ ${#n} -le 18 ]] || return 1 ;;
+  esac
+  # Force base-10: a leading zero ("08g") is otherwise an octal parse error in
+  # bash arithmetic, and all-zero spellings ("0", "00g") mean --memory 0 —
+  # which docker treats as UNLIMITED, a clamp bypass rather than a limit.
+  (( 10#$n > 0 ))
+}
+
+# Convert a validated memory value to bytes (for clamping comparisons).
+_mem_to_bytes() {
+  local v="$1" n unit
+  n="${v%[bkmgBKMG]}"
+  unit="${v#"$n"}"
+  n=$(( 10#$n ))   # strip leading zeros — bare $((08*…)) is an octal error
+  case "$unit" in
+    [gG]) echo $(( n * 1073741824 )) ;;
+    [mM]) echo $(( n * 1048576 )) ;;
+    [kK]) echo $(( n * 1024 )) ;;
+    *)    echo "$n" ;;
+  esac
+}
+
+# The Docker VM's total memory in bytes (empty when unknown). Split out so
+# tests and the overload check can override/reuse it.
+_docker_vm_memory() {
+  docker info --format '{{.MemTotal}}' 2>/dev/null || true
+}
+
+# Default per-box memory: a quarter of the Docker VM's memory, clamped to
+# [2g, 8g]. A cgroup limit is a ceiling, not a reservation — typical agent
+# sessions use a few hundred MB — but the old fixed 8g EXCEEDED entire Docker
+# Desktop VMs (7.75 GiB default), so the per-box limit never bound and a
+# runaway process swap-thrashed every session at once instead of OOM-ing
+# inside its own box. Unknown VM size falls back to 2g (smallest safe ceiling).
+_default_box_memory() {
+  local vm_bytes
+  vm_bytes="$(_docker_vm_memory)"
+  if ! [[ "$vm_bytes" =~ ^[0-9]+$ ]] || (( vm_bytes == 0 )); then
+    echo "2g"
+    return
+  fi
+  local quarter_gb=$(( vm_bytes / 4 / 1073741824 ))
+  if (( quarter_gb < 2 )); then
+    echo "2g"
+  elif (( quarter_gb > 8 )); then
+    echo "8g"
+  else
+    echo "${quarter_gb}g"
+  fi
+}
+
+# Resolve the per-box memory limit: project box config ([resources] memory in
+# .cleat.<box>, else .cleat) > global config > VM-derived default. Invalid
+# values fall through to the next source (a typo must not abort `docker run`
+# with an opaque daemon error). PROJECT-supplied values are clamped to 8g —
+# .cleat ships with the repo, and an untrusted project must not be able to
+# re-introduce VM-wide overcommit; the user's own global config is not capped.
+resolve_box_memory() {
+  local project="$1" box="${2:-main}"
+  local v
+
+  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" memory)"
+  if [[ -n "$v" ]]; then
+    if _valid_memory_value "$v"; then
+      if (( $(_mem_to_bytes "$v") > 8589934592 )); then
+        echo "8g"
+      else
+        echo "$v"
+      fi
+      return 0
+    fi
+    warn "Ignoring invalid memory '$v' in project config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
+  fi
+
+  v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory)"
+  if [[ -n "$v" ]]; then
+    if _valid_memory_value "$v"; then
+      echo "$v"
+      return 0
+    fi
+    warn "Ignoring invalid memory '$v' in global config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
+  fi
+
+  _default_box_memory
+}
+
+# A docker --cpus value: positive decimal (2, 1.5, 0.5). Length-capped so the
+# clamp arithmetic below can't overflow; zero is rejected (docker reads 0 as
+# "no limit", not a limit).
+_valid_cpus_value() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  [[ ${#1} -le 7 ]] || return 1
+  local digits="${1//./}"
+  (( 10#$digits > 0 ))
+}
+
+# The daemon's core count (empty when unknown). Seam for tests + the clamp.
+_daemon_ncpu() {
+  docker info --format '{{.NCPU}}' 2>/dev/null || true
+}
+
+# Resolve the per-box CPU limit: project box config > global config > NO
+# default. Memory gets a default ceiling because memory is held, not shared;
+# CPU is work-conserving — an idle core costs nothing and the scheduler
+# already balances competing boxes, so an unconfigured box keeps all cores.
+# PROJECT-supplied values are clamped to the daemon's core count: --cpus
+# above NCPU is a dockerd error, so an untrusted .cleat could otherwise abort
+# `docker run` outright. The user's own global config is passed through
+# (dockerd validates it against the actual machine).
+resolve_box_cpus() {
+  local project="$1" box="${2:-main}"
+  local v ncpu
+
+  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" cpus)"
+  if [[ -n "$v" ]]; then
+    if _valid_cpus_value "$v"; then
+      ncpu="$(_daemon_ncpu)"
+      if [[ "$ncpu" =~ ^[0-9]+$ ]] && (( ncpu > 0 )) && \
+         awk -v v="$v" -v n="$ncpu" 'BEGIN { exit !(v > n) }'; then
+        echo "$ncpu"
+      else
+        echo "$v"
+      fi
+      return 0
+    fi
+    warn "Ignoring invalid cpus '$v' in project config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
+  fi
+
+  v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" cpus)"
+  if [[ -n "$v" ]]; then
+    if _valid_cpus_value "$v"; then
+      echo "$v"
+      return 0
+    fi
+    warn "Ignoring invalid cpus '$v' in global config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
   fi
 }
 
@@ -994,6 +1238,15 @@ compute_config_fingerprint() {
   fi
   fingerprint_input+=$'\n'
 
+  # Resources: the limits a NEW container would be created with. Baked into
+  # the fingerprint so changing [resources] memory (or resizing the VM, which
+  # moves the derived default) surfaces the existing config-drift notice —
+  # limits are set at `docker run` and can't be applied to a live container.
+  fingerprint_input+="resources:memory=$(resolve_box_memory "$project" "${_BOX:-main}")"
+  fingerprint_input+=$'\n'
+  fingerprint_input+="resources:cpus=$(resolve_box_cpus "$project" "${_BOX:-main}")"
+  fingerprint_input+=$'\n'
+
   if command -v sha256sum &>/dev/null; then
     echo -n "$fingerprint_input" | sha256sum | head -c 16
   else
@@ -1317,6 +1570,38 @@ _maybe_prompt_image_rebuild() {
   fi
 }
 
+# Reaper drift: containers created before Cleat passed --init have `su` as
+# PID 1, which never reaps re-parented children. Orphans from agent subshells
+# accumulate as zombies until the box hits its pids cap, fork() fails, and the
+# session wedges mid-keystroke (`docker stop` also burns its full timeout —
+# `su` doesn't forward SIGTERM either). Detect such boxes on start and offer a
+# recreate, which picks up --init from the current creation flags. Same prompt
+# family as _maybe_prompt_image_rebuild: TTY-only, once per process, fail-open.
+_INIT_RECREATE_PROMPTED=0
+_maybe_prompt_init_recreate() {
+  local cname="$1"
+  _is_tty || return 0
+  [[ "$_INIT_RECREATE_PROMPTED" == "1" ]] && return 0
+  container_exists "$cname" || return 0
+  # {{json .HostConfig}} is version-portable: Init serializes as true / false /
+  # null (very old daemons omit the key). Only an explicit true means a reaper
+  # is present; an inspect failure stays silent — never block a start on it.
+  local hostconfig
+  hostconfig="$(docker inspect --format '{{json .HostConfig}}' "$cname" 2>/dev/null)" || return 0
+  [[ -n "$hostconfig" ]] || return 0
+  [[ "$hostconfig" == *'"Init":true'* ]] && return 0
+  _INIT_RECREATE_PROMPTED=1
+
+  info "Box ${BOLD}${cname}${RESET} predates the zombie reaper ${DIM}(long sessions can freeze at the pids cap)${RESET}"
+  local yn=""
+  _ask_yn yn "Recreate it now? ${DIM}(project files and Claude state survive; /tmp and apt installs don't)${RESET} [Y/n] "
+  if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+    is_running "$cname" && { docker stop "$cname" > /dev/null 2>&1 || true; }
+    docker rm -f "$cname" > /dev/null 2>&1 || true
+    rm -rf "${CLEAT_RUN_DIR:?}/${cname}" 2>/dev/null || true
+  fi
+}
+
 # ── First-run tip ──────────────────────────────────────────────────────────
 _first_run_tip_file="$CLEAT_CONFIG_DIR/.tip-shown"
 
@@ -1472,6 +1757,16 @@ _env_summary_inline() {
 # still work. See docs.claude.com/en/setup#disable-auto-updates.
 CLAUDE_ENV=(-e HOME=/home/coder -e DISABLE_AUTOUPDATER=1 -e PATH="/home/coder/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 
+# TERM/COLORTERM are the two DELIBERATE host-templated entries: docker exec -t
+# does not propagate the attached terminal's type, so without these the box's
+# terminfo can mismatch the real terminal (wrong key sequences, degraded
+# colors in iTerm2/Ghostty/tmux). Everything else from the host stays out —
+# the exec_claude tests pin the exact key set.
+CLAUDE_ENV+=(-e "TERM=${TERM:-xterm-256color}")
+if [[ -n "${COLORTERM:-}" ]]; then
+  CLAUDE_ENV+=(-e "COLORTERM=${COLORTERM}")
+fi
+
 _host_clip_cmd() {
   if command -v pbcopy &>/dev/null; then echo pbcopy
   elif command -v xclip &>/dev/null; then echo "xclip -selection clipboard"
@@ -1485,10 +1780,16 @@ _clipboard_watcher() {
   local clip_dir="$1"
   local clip_cmd="$2"
   trap 'exit 0' TERM INT HUP
+  # Same orphan story as _browser_watcher: a watcher whose cleat process died
+  # without the cleanup trap (terminal closed, SIGKILL) must not keep writing
+  # a dead session's box clipboard over the host clipboard. Checked at the
+  # single copy choke point so all three watch modes are covered.
+  local _cw_parent=$$
 
   touch "$clip_dir/.host-ready"
 
   _do_copy() {
+    kill -0 "$_cw_parent" 2>/dev/null || exit 0
     [ -f "$clip_dir/clipboard" ] && eval "$clip_cmd" < "$clip_dir/clipboard" 2>/dev/null || true
   }
 
@@ -1509,6 +1810,7 @@ _clipboard_watcher() {
 
   local last_ts=""
   while true; do
+    kill -0 "$_cw_parent" 2>/dev/null || exit 0
     if [ -f "$clip_dir/clipboard" ]; then
       local cur_ts
       cur_ts=$(stat -c '%Y%N' "$clip_dir/clipboard" 2>/dev/null \
@@ -1741,12 +2043,42 @@ _browser_claim_url() {
   return 0
 }
 
+# Same-URL debounce, shared across watchers via a stamp file in the clip dir.
+# The atomic claim above makes each WRITE open exactly once — but one user
+# action can produce SEVERAL writes: a TUI link click can fire the open shim
+# on both press and release, and tools retry. With a single watcher the 0.5s
+# poll collapses rapid rewrites (the second write lands before the first is
+# claimed); with overlapping watchers (a login alongside a session, or an
+# orphan from a crashed session) each watcher claims one write and every tab
+# opens N times. Skipping a repeat of the SAME url within the window restores
+# one-action-one-tab regardless of watcher count. Different URLs are never
+# deduped, and the same URL opens again normally after the window.
+_BROWSER_DEBOUNCE_SECS=2
+_browser_recently_opened() {
+  local clip_dir="$1" url="$2"
+  local stamp_file="$clip_dir/.last-open" now last_epoch last_url
+  now="$(date +%s)"
+  if [ -f "$stamp_file" ]; then
+    last_epoch="$(sed -n 1p "$stamp_file" 2>/dev/null)"
+    last_url="$(sed -n 2p "$stamp_file" 2>/dev/null)"
+    case "$last_epoch" in ''|*[!0-9]*) last_epoch=0 ;; esac
+    if [ "$last_url" = "$url" ] && [ $(( now - last_epoch )) -le "$_BROWSER_DEBOUNCE_SECS" ]; then
+      return 0
+    fi
+  fi
+  printf '%s\n%s\n' "$now" "$url" > "$stamp_file" 2>/dev/null || true
+  return 1
+}
+
 _browser_watcher() {
   local clip_dir="$1"
   local open_cmd="$2"
   local cname="${3:-}"
   local bridge_file="$clip_dir/.browser-open"
   local _proxy_pid=""
+  # $$ is the spawning cleat process even inside this backgrounded function —
+  # used below to reap orphans (see the liveness check in the loop).
+  local _bw_parent=$$
 
   _bw_cleanup() {
     if [ -n "$_proxy_pid" ]; then
@@ -1763,8 +2095,16 @@ _browser_watcher() {
     # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
     # an orphan from a now-gone session — stop polling instead of spinning forever.
     [ -d "$clip_dir" ] || { _bw_cleanup; exit 0; }
+    # If the cleat process that spawned this watcher is gone (terminal closed,
+    # SIGKILL — anything that skips the cleanup trap), exit instead of polling
+    # the box's clip dir forever. Leaked watchers are how one click became one
+    # tab PER crashed session.
+    kill -0 "$_bw_parent" 2>/dev/null || { _bw_cleanup; exit 0; }
     local url
     if url="$(_browser_claim_url "$bridge_file")"; then
+      if _browser_recently_opened "$clip_dir" "$url"; then
+        url=""   # duplicate of a just-opened URL — drop it
+      fi
       if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
         # Start auth callback proxy if URL has a localhost redirect_uri
         if [ -n "$cname" ]; then
@@ -1805,6 +2145,10 @@ _has_host_hooks() {
 
 _hook_bridge_watcher() {
   local hooks_file="$1"
+  # Orphan guard, as in _browser_watcher: a bridge whose cleat process died
+  # without the cleanup trap must not keep executing host hooks for a dead
+  # session. $$ is the spawning cleat process even in this backgrounded call.
+  local _hb_parent=$$
   # Collect all settings files that define hooks (global + project)
   local settings_files=()
   local f
@@ -1818,6 +2162,7 @@ _hook_bridge_watcher() {
   # Wait for hooks file to appear
   local waited=0
   while [[ ! -f "$hooks_file" ]] && [[ $waited -lt 30 ]]; do
+    kill -0 "$_hb_parent" 2>/dev/null || return 0
     sleep 1
     waited=$((waited + 1))
   done
@@ -1830,6 +2175,9 @@ _hook_bridge_watcher() {
   byte_offset=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
   byte_offset=$((byte_offset + 0))
   while true; do
+    # Liveness BEFORE processing: an orphaned bridge must not run one last
+    # batch of host hooks for a session whose cleat process is already gone.
+    kill -0 "$_hb_parent" 2>/dev/null || { _hook_bridge_cleanup; exit 0; }
     local file_size
     file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
     file_size=$((file_size + 0))
@@ -2087,26 +2435,53 @@ exec_claude() {
   # latter sets UID/GID but skips initgroups(3), so supplementary groups from
   # /etc/group aren't loaded. This matters for the docker capability, where
   # the entrypoint adds coder to the host docker socket's owning group.
+  # Pin node's heap to the box's real memory budget. Node sizes its default
+  # heap ceiling from the cgroup limit, so before the limits were right-sized
+  # it believed ~8g was available inside a 7.75g VM. 60% of the box limit
+  # leaves headroom for non-heap memory (buffers, workers, the shell). A
+  # user-supplied NODE_OPTIONS via env passthrough appears LATER on the exec
+  # command line and wins — this is a default, not a straitjacket.
+  local _heap_env=()
+  local _mem_bytes _heap_mb
+  _mem_bytes="$(docker inspect "$cname" --format '{{.HostConfig.Memory}}' 2>/dev/null)" || _mem_bytes=""
+  if [[ "$_mem_bytes" =~ ^[0-9]+$ ]] && (( _mem_bytes > 0 )); then
+    _heap_mb=$(( _mem_bytes * 60 / 100 / 1048576 ))
+    (( _heap_mb > 0 )) && _heap_env=(-e "NODE_OPTIONS=--max-old-space-size=${_heap_mb}")
+  fi
+
+  # The inner script must exit with CLAUDE's status, not the clip-daemon
+  # cleanup's: `wait` on the TERM-trapped daemon reports 0, which used to mask
+  # a crashed claude (SIGSEGV=139, SIGABRT=134) as a clean session end — and
+  # the rc==0 branch below then ERASED the crash message bash had just printed.
+  # Host-side docker errors ('exec failed' during fork lockup, daemon resets)
+  # go to a temp file and surface on failure instead of vanishing.
+  local _exec_err="/tmp/cleat-exec-err.$$"
   docker exec -it "${CLAUDE_ENV[@]}" \
+    "${_heap_env[@]+"${_heap_env[@]}"}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
     runuser -u coder -- bash -c '
       clip-daemon &
       _MY_CLIP_DAEMON=$!
       for i in 1 2 3 4 5; do [ -S "${CLEAT_CLIP_DIR:-/tmp/cleat-run-$(id -u)}/clip.sock" ] && break; sleep 0.1; done
       claude "$@"
+      _CLAUDE_RC=$?
       kill "$_MY_CLIP_DAEMON" 2>/dev/null
       wait "$_MY_CLIP_DAEMON" 2>/dev/null
-    ' _ "$@" 2>/dev/null || rc=$?
+      exit "$_CLAUDE_RC"
+    ' _ "$@" 2>"$_exec_err" || rc=$?
 
   _cleanup_session
   trap - EXIT INT TERM HUP
+  _restore_terminal
 
   if [[ $rc -eq 0 ]]; then
-    printf '\033[A\033[2K\r\n'
+    _is_tty && printf '\033[A\033[2K\r\n'
     success "Session ended — resume with: ${BOLD}cleat resume${RESET}"
   elif [[ $rc -ne 130 ]]; then
     warn "Claude exited with code $rc"
+    [[ -s "$_exec_err" ]] && error "${DIM}$(cat "$_exec_err")${RESET}"
   fi
+  rm -f "$_exec_err"
 }
 
 # ── Update check (every 10 minutes) ─────────────────────────────────────────
@@ -2125,6 +2500,12 @@ UPDATE_CHECK_INTERVAL=600   # 10 minutes — a release cut minutes after a launc
 # (so the on-start prompt and the action it triggers agree); override with
 # CLEAT_CLAUDE_CHANNEL (stable|latest|VERSION). Disable the whole on-start
 # prompt with CLEAT_NO_CLAUDE_UPDATE_CHECK=1.
+# Docker pressure check (bloat → prune offer; overload → notice) — throttled
+# like the update checks, but daily: image bloat grows by the day, not the
+# minute, and the check costs a handful of docker calls.
+PRESSURE_CHECK_FILE="$REPO_DIR/.pressure_check"
+PRESSURE_CHECK_INTERVAL=86400
+
 CLAUDE_CHECK_FILE="$REPO_DIR/.claude_update_check"
 CLAUDE_CHECK_INTERVAL=600   # 10 minutes — the lookup is a tiny GET; the only
                             # real per-check cost is one throwaway container to
@@ -2387,8 +2768,14 @@ _maybe_prompt_claude_update() {
 # ── Commands ────────────────────────────────────────────────────────────────
 cmd_build() {
   if image_exists; then
-    success "Image ready ${RESET}${DIM}(cached)"
-    return
+    # An image of the wrong architecture (e.g. an amd64 pull cached on an
+    # Apple Silicon machine) counts as missing: every box created from it
+    # would run emulated. Re-acquire a native one instead.
+    if _image_arch_ok; then
+      success "Image ready ${RESET}${DIM}(cached)"
+      return
+    fi
+    _warn_image_emulated
   fi
   _do_pull || _do_build
 }
@@ -2417,16 +2804,30 @@ _do_pull() {
   local target_image="${REGISTRY_BASE}:v${target_version}"
   local log rc=0
 
+  # Pin the pull to the daemon's architecture. A single-arch manifest of the
+  # WRONG arch then fails loudly ('no matching manifest') and the caller's
+  # `_do_pull || _do_build` falls back to a native local build — instead of
+  # the pre-multi-arch behavior where docker pulled it anyway with a warning
+  # the CLI discarded, and every box silently ran emulated. Empty daemon arch
+  # (unreachable, exotic) omits the flag — today's behavior, fail-open.
+  local arch platform_args=()
+  arch="$(_daemon_arch)"
+  [[ -n "$arch" ]] && platform_args=(--platform "linux/${arch}")
+  local arch_note="${arch:+, ${arch}}"
+
   # Cache short-circuit: if the version-tagged prebuilt image is already on
-  # disk, retag it as $IMAGE_NAME and skip the network entirely. A failure
-  # to retag (rare — disk full, denied, etc.) must fall through to the
-  # normal pull path so we never lie about success.
-  if docker image inspect "$target_image" > /dev/null 2>&1; then
+  # disk AND matches the daemon arch, retag it as $IMAGE_NAME and skip the
+  # network entirely. An arch-mismatched cache entry (an amd64 image pulled
+  # before multi-arch publishing) must NOT short-circuit — fall through to
+  # the platform-pinned pull so the native half of the manifest replaces it.
+  # A failure to retag (rare — disk full, denied, etc.) must also fall
+  # through so we never lie about success.
+  if docker image inspect "$target_image" > /dev/null 2>&1 && _image_arch_ok "$target_image"; then
     if docker tag "$target_image" "$IMAGE_NAME" > /dev/null 2>&1; then
       local size_bytes size_human
       size_bytes=$(docker image inspect "$IMAGE_NAME" --format '{{.Size}}' 2>/dev/null || echo 0)
       size_human=$(_human_bytes "$size_bytes")
-      success "Image ready ${RESET}${DIM}(cached v${target_version}, ${size_human})"
+      success "Image ready ${RESET}${DIM}(cached v${target_version}${arch_note}, ${size_human})"
       return 0
     fi
     warn "Cached prebuilt image found but could not be tagged as ${IMAGE_NAME}; falling through to pull"
@@ -2435,15 +2836,19 @@ _do_pull() {
   log="$(mktemp)"
 
   if ! _is_tty; then
-    info "Pulling image from ghcr.io ${DIM}(v${target_version})${RESET}"
-    docker pull "$target_image" > /dev/null 2>&1 || rc=$?
+    info "Pulling image from ghcr.io ${DIM}(v${target_version}${arch_note})${RESET}"
+    docker pull "${platform_args[@]+"${platform_args[@]}"}" "$target_image" > /dev/null 2>&1 || rc=$?
     if [[ $rc -ne 0 ]]; then
       warn "Prebuilt image unavailable for v${target_version}, building locally"
       rm -f "$log"
       return 1
     fi
     docker tag "$target_image" "$IMAGE_NAME" > /dev/null 2>&1 || true
-    success "Image ready ${RESET}${DIM}(pulled v${target_version})"
+    success "Image ready ${RESET}${DIM}(pulled v${target_version}${arch_note})"
+    # Routine GC: drop superseded prebuilt tags and orphaned builds so each
+    # update doesn't accrete another ~1-2 GB. Silent and fail-soft — images
+    # still referenced by a container are kept.
+    cmd_prune > /dev/null 2>&1 || true
     rm -f "$log"
     return 0
   fi
@@ -2451,7 +2856,7 @@ _do_pull() {
   # TTY: run docker pull in the background and animate progress by tailing
   # its line-per-event output (non-TTY docker pull writes one line per layer
   # event: "Pulling fs layer", "Downloading", "Extracting", "Pull complete").
-  ( docker pull "$target_image" > "$log" 2>&1 ) &
+  ( docker pull "${platform_args[@]+"${platform_args[@]}"}" "$target_image" > "$log" 2>&1 ) &
   local pull_pid=$!
 
   local frames
@@ -2499,8 +2904,10 @@ _do_pull() {
   size_bytes=$(docker image inspect "$IMAGE_NAME" --format '{{.Size}}' 2>/dev/null || echo 0)
   size_human=$(_human_bytes "$size_bytes")
 
-  printf "\r\033[K  ${GREEN}✔${RESET} Image ready ${DIM}(pulled v%s, %s)${RESET}\n" \
-    "$target_version" "$size_human"
+  printf "\r\033[K  ${GREEN}✔${RESET} Image ready ${DIM}(pulled v%s%s, %s)${RESET}\n" \
+    "$target_version" "$arch_note" "$size_human"
+  # Routine GC — see the non-TTY path above.
+  cmd_prune > /dev/null 2>&1 || true
   rm -f "$log"
   return 0
 }
@@ -2521,6 +2928,10 @@ _do_build() {
     exit 1
   fi
   rm -f "$build_log"
+  # Routine GC: the build that was just replaced is now a dangling
+  # sh.cleat.version image (1.5-2.5 GB). Silent, fail-soft, keeps anything a
+  # container still references.
+  cmd_prune > /dev/null 2>&1 || true
 }
 
 cmd_rebuild() {
@@ -2539,6 +2950,9 @@ cmd_rebuild() {
     exit 1
   fi
   rm -f "$build_log"
+  # Routine GC — see _do_build. Drift rebuilds are the main bloat source: a
+  # maintainer's image churns daily and every rebuild orphaned the previous.
+  cmd_prune > /dev/null 2>&1 || true
 }
 
 # Upgrade the Claude Code build bundled inside the shared image.
@@ -2734,6 +3148,11 @@ cmd_run() {
   fi
 
   if ! image_exists; then
+    _do_pull || _do_build
+  elif ! _image_arch_ok; then
+    # Wrong-arch image (e.g. an amd64 pull cached on Apple Silicon) counts as
+    # missing — a box created from it would run emulated. Re-acquire native.
+    _warn_image_emulated
     _do_pull || _do_build
   else
     # No leading blank: the bring-up block (Image ready/rebuilt → Container
@@ -2943,6 +3362,18 @@ cmd_run() {
     mount_args+=(-v "${project_session_dir}:/home/coder/.claude/projects/${_host_project_key}")
   fi
 
+  # ── Per-box memory ceiling. --memory-swap equal to --memory disables swap
+  # for the box: a runaway process OOMs inside its own cgroup instead of
+  # dragging the whole VM (and every other session) into swap-thrash.
+  local box_memory
+  box_memory="$(resolve_box_memory "$project" "$box")"
+
+  # ── Per-box CPU ceiling — only when configured ([resources] cpus). No
+  # default: CPU is work-conserving, so an unconfigured box keeps all cores.
+  local box_cpus cpu_args=()
+  box_cpus="$(resolve_box_cpus "$project" "$box")"
+  [[ -n "$box_cpus" ]] && cpu_args=(--cpus "$box_cpus")
+
   # ── Compute config fingerprint and store as label
   local config_hash
   config_hash="$(compute_config_fingerprint "$project")"
@@ -2973,7 +3404,10 @@ cmd_run() {
     -e "HOST_GID=$(id -g)" \
     -e "HOME=/home/coder" \
     --pids-limit 4096 \
-    --memory 8g \
+    --memory "$box_memory" \
+    --memory-swap "$box_memory" \
+    "${cpu_args[@]+"${cpu_args[@]}"}" \
+    --init \
     -it \
     "$IMAGE_NAME" > /dev/null 2>"$_docker_err" || run_rc=$?
   spin_stop "$run_rc" "Container started" "Container failed to start"
@@ -3013,6 +3447,10 @@ cmd_start() {
   # accept it removes the container too, so the branches below recreate it
   # from the freshly-built image.
   _maybe_prompt_image_rebuild "$cname"
+
+  # Reaper drift — a box created without --init wedges on long sessions; offer
+  # a recreate (the branches below then recreate it with the current flags).
+  _maybe_prompt_init_recreate "$cname"
 
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
@@ -3099,6 +3537,10 @@ cmd_resume() {
 
   # Image-version drift — offer to rebuild (and recreate) before resuming.
   _maybe_prompt_image_rebuild "$cname"
+
+  # Reaper drift — a box created without --init wedges on long sessions; offer
+  # a recreate (the missing-container path below then recreates it).
+  _maybe_prompt_init_recreate "$cname"
 
   # Refresh settings overlays (user may have changed hooks between stop/resume)
   local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
@@ -3246,9 +3688,12 @@ cmd_shell() {
   resolve_env_args "$project"
   _ensure_docker_access "$cname"
   info "Container ${BOLD}${cname}${RESET}"
+  local shell_rc=0
   docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
-    runuser -u coder -- bash
+    runuser -u coder -- bash || shell_rc=$?
+  _restore_terminal
+  return "$shell_rc"
 }
 
 cmd_login() {
@@ -3286,6 +3731,7 @@ cmd_login() {
   docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
     runuser -u coder -- claude login || login_rc=$?
+  _restore_terminal
 
   # Cleanup browser bridge
   if [ -n "$_login_browser_pid" ]; then
@@ -3376,6 +3822,11 @@ cmd_ps() {
       name="$(echo "$line" | awk -F'\t' '{print $1}' | xargs)"
       status="$(echo "$line" | awk -F'\t' '{print $2}' | xargs)"
 
+      # Exit 255 is the Docker-restart signature (the VM went away under the
+      # box) — without the hint it reads as a crash. RestartPolicy is 'no' by
+      # design, so a restarted Docker leaves every box stopped.
+      [[ "$status" == *"Exited (255)"* ]] && status="${status} — Docker restarted; resume with: cleat resume"
+
       # One inspect per container yields everything this row renders: the box
       # label, the running state (dot colour) and the /workspace mount source.
       # Field order is box|running|path so a literal '|' in the project path
@@ -3460,6 +3911,14 @@ cmd_status() {
 
   if is_running "$cname"; then
     echo -e "  ${BOLD}Status:${RESET}    ${GREEN}● running${RESET}"
+    # Zombie pressure: a pre---init box accumulates unreapable zombies until
+    # fork() fails at the pids cap and the session freezes. Surface the count
+    # while it's still a warning, not a wedge.
+    local _zombies
+    _zombies="$(_box_zombie_count "$cname")"
+    if [[ "$_zombies" =~ ^[0-9]+$ ]] && (( _zombies > 0 )); then
+      echo -e "  ${BOLD}Zombies:${RESET}   ${AMBER}● ${_zombies} unreaped${RESET} ${DIM}(recreate the box to get the --init reaper: cleat rm && cleat)${RESET}"
+    fi
   elif container_exists "$cname"; then
     echo -e "  ${BOLD}Status:${RESET}    ${YELLOW}● stopped${RESET}"
   else
@@ -3467,9 +3926,19 @@ cmd_status() {
   fi
 
   if image_exists; then
-    local size
+    local size iarch darch
     size=$(docker images "$IMAGE_NAME" --format '{{.Size}}' | head -1)
-    echo -e "  ${BOLD}Image:${RESET}     ${GREEN}● ${IMAGE_NAME}${RESET} ${DIM}(${size})${RESET}"
+    iarch="$(_image_arch "$IMAGE_NAME")"
+    darch="$(_daemon_arch)"
+    if [[ -n "$iarch" && -n "$darch" && "$iarch" != "$darch" ]]; then
+      # Loud: an emulated image is the documented trigger for node crashes
+      # and garbled TTYs — and the next `cleat start` will replace it anyway.
+      echo -e "  ${BOLD}Image:${RESET}     ${AMBER}● ${IMAGE_NAME} (${iarch} — EMULATED on ${darch}; next start fetches native)${RESET} ${DIM}(${size})${RESET}"
+    elif [[ -n "$iarch" ]]; then
+      echo -e "  ${BOLD}Image:${RESET}     ${GREEN}● ${IMAGE_NAME}${RESET} ${DIM}(${iarch}, ${size})${RESET}"
+    else
+      echo -e "  ${BOLD}Image:${RESET}     ${GREEN}● ${IMAGE_NAME}${RESET} ${DIM}(${size})${RESET}"
+    fi
   else
     echo -e "  ${BOLD}Image:${RESET}     ${DIM}○ not built${RESET}"
   fi
@@ -3545,7 +4014,185 @@ cmd_status() {
     # only distinction — pass the inspect's State.Running and skip re-probing.
     _status_box_row "$_b" "$_n" "$_running"
   done < <(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null || true)
+
+  # ── VM memory budget: running containers' limits vs what the VM actually
+  # has. Overcommit means the limits can't bind and a runaway process swap-
+  # thrashes EVERY session at once (counts all containers — the VM is shared).
+  local _vm_bytes _limit_sum
+  _vm_bytes="$(_docker_vm_memory)"
+  if [[ "$_vm_bytes" =~ ^[0-9]+$ ]] && (( _vm_bytes > 0 )); then
+    _limit_sum="$(_running_memory_limits_sum)"
+    if [[ "$_limit_sum" =~ ^[0-9]+$ ]] && (( _limit_sum > _vm_bytes )); then
+      echo ""
+      echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET} ${DIM}— running containers are promised $(( _limit_sum / 1073741824 )) GB of a $(( _vm_bytes / 1073741824 )) GB VM${RESET}"
+    fi
+  fi
   echo ""
+}
+
+# ── Prune: cleat-owned image bloat ──────────────────────────────────────────
+# Two artifact classes accrete in daily use (see concept/22):
+#   1. Dangling images labeled sh.cleat.version — every drift rebuild orphans
+#      the previous build (1.5-2.5 GB each, several per day for a maintainer).
+#   2. Superseded ghcr.io prebuilt version tags — `cleat update` pulls the new
+#      tag but never removed old ones (~1 GB per release; amd64-era tags can
+#      never be used natively again on Apple Silicon).
+# Boxes — even exited ones — are NEVER touched: a stopped box is a resumable
+# session holding /tmp state. Other projects' images and caches are never
+# touched. This is the safe middle ground between `clean` and `nuke`.
+
+# Seams for cmd_prune/_cleat_prunable_stats (overridable in tests — the docker
+# stub serves one canned `images` response for every query shape).
+_dangling_cleat_images() {
+  docker images -f dangling=true -f label=sh.cleat.version -q 2>/dev/null || true
+}
+
+# Prints "tag<TAB>size" per prebuilt image (size used by the stats helper).
+_prebuilt_image_tags() {
+  docker images "$REGISTRY_BASE" --format '{{.Repository}}:{{.Tag}}	{{.Size}}' 2>/dev/null || true
+}
+
+# Count and approximate size (MB) of prunable cleat artifacts: "count<TAB>mb".
+# Sizes are docker's human strings (1.72GB / 971MB) — close enough to decide
+# whether a prune is worth offering.
+_cleat_prunable_stats() {
+  {
+    local id
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      # Unsizeable still counts: the artifact exists even if inspect hiccups.
+      docker image inspect "$id" --format '{{.Size}}B' 2>/dev/null || echo "0B"
+    done < <(_dangling_cleat_images)
+    _prebuilt_image_tags | awk -F'\t' -v cur="${REGISTRY_BASE}:v${VERSION}" \
+      '$1 != cur && $1 != "" {print $2}'
+  } | awk '
+    /GB$/ { sub(/GB$/,"");  mb += $0 * 1024;           n++; next }
+    /MB$/ { sub(/MB$/,"");  mb += $0;                  n++; next }
+    /B$/  { sub(/B$/,"");   mb += $0 / 1048576;        n++; next }
+    { n++ }
+    END { printf "%d\t%d", n, mb }
+  '
+}
+
+cmd_prune() {
+  local removed=0 failed=0
+
+  # Superseded prebuilt version tags (everything but the current version's).
+  local line tag
+  while IFS= read -r line; do
+    tag="${line%%	*}"
+    [[ -z "$tag" ]] && continue
+    [[ "$tag" == "${REGISTRY_BASE}:v${VERSION}" ]] && continue
+    if docker rmi "$tag" > /dev/null 2>&1; then
+      removed=$((removed + 1))
+    else
+      failed=$((failed + 1))   # in use by a container — leave it
+    fi
+  done < <(_prebuilt_image_tags)
+
+  # Dangling cleat builds (label-filtered: other projects' dangling images
+  # are not ours to delete).
+  local id
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    if docker rmi "$id" > /dev/null 2>&1; then
+      removed=$((removed + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done < <(_dangling_cleat_images)
+
+  if (( removed > 0 )); then
+    success "Pruned ${removed} stale cleat image$( (( removed != 1 )) && echo s )."
+  else
+    info "Nothing to prune."
+  fi
+  if (( failed > 0 )); then
+    echo -e "    ${DIM}${failed} kept (still referenced by a container).${RESET}"
+  fi
+}
+
+# ── On-start Docker pressure check ──────────────────────────────────────────
+# TTY-only, throttled to once per day, entirely local, fail-soft (a down
+# daemon yields empty reads and silence). Two independent signals:
+#   1. BLOAT — prunable cleat artifacts above ~5 GB → offer `cleat prune`
+#      ([Y/n]; the fix is safe and one keypress away — users should never be
+#      told to run manual docker cleanup).
+#   2. OVERLOAD — running containers' memory limits overcommit the Docker VM
+#      → a one-line notice. No auto-fix: resizing the VM or stopping boxes is
+#      the user's call. Counts ALL running containers, not just cleat's: the
+#      VM is shared, and a neighboring compose stack squeezes cleat boxes
+#      just the same.
+_PRESSURE_BLOAT_MB_THRESHOLD=5120
+
+# Count zombie processes inside a running box by reading /proc directly (the
+# image ships no `ps`). The comm field in /proc/N/stat may contain spaces, so
+# strip through the closing paren before taking the state field. Empty output
+# on any failure — callers treat that as "unknown", never as an error.
+_box_zombie_count() {
+  docker exec "$1" sh -c '
+    z=0
+    for f in /proc/[0-9]*/stat; do
+      s=$(sed "s/^[^)]*) //" "$f" 2>/dev/null | cut -d" " -f1)
+      [ "$s" = "Z" ] && z=$((z+1))
+    done
+    echo "$z"
+  ' 2>/dev/null || true
+}
+
+# Sum of HostConfig.Memory over all RUNNING containers, in bytes.
+_running_memory_limits_sum() {
+  local ids=() id sum=0 mem
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && ids+=("$id")
+  done < <(docker ps -q 2>/dev/null || true)
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    echo 0
+    return
+  fi
+  while IFS= read -r mem; do
+    [[ "$mem" =~ ^[0-9]+$ ]] || continue
+    sum=$(( sum + mem ))
+  done < <(docker inspect --format '{{.HostConfig.Memory}}' "${ids[@]}" 2>/dev/null || true)
+  echo "$sum"
+}
+
+_maybe_check_docker_pressure() {
+  _is_tty || return 0
+
+  local now last=0
+  now="$(date +%s)"
+  if [[ -f "$PRESSURE_CHECK_FILE" ]]; then
+    last="$(head -1 "$PRESSURE_CHECK_FILE" 2>/dev/null || echo 0)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  fi
+  (( now - last < PRESSURE_CHECK_INTERVAL )) && return 0
+  echo "$now" > "$PRESSURE_CHECK_FILE" 2>/dev/null || true
+
+  # 1. Bloat → prune prompt.
+  local stats count mb
+  stats="$(_cleat_prunable_stats)"
+  count="${stats%%	*}"
+  mb="${stats##*	}"
+  if [[ "$count" =~ ^[0-9]+$ && "$mb" =~ ^[0-9]+$ ]] && (( mb >= _PRESSURE_BLOAT_MB_THRESHOLD )); then
+    info "Docker is carrying ${BOLD}${count} stale cleat images${RESET} ${DIM}(~$(( (mb + 512) / 1024 )) GB of old builds and superseded pulls)${RESET}"
+    local yn=""
+    _ask_yn yn "Prune them now? ${DIM}(boxes and other projects are not touched)${RESET} [Y/n] "
+    if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+      cmd_prune
+    fi
+  fi
+
+  # 2. Overload → notice.
+  local vm_bytes sum
+  vm_bytes="$(_docker_vm_memory)"
+  [[ "$vm_bytes" =~ ^[0-9]+$ ]] || return 0
+  (( vm_bytes > 0 )) || return 0
+  sum="$(_running_memory_limits_sum)"
+  [[ "$sum" =~ ^[0-9]+$ ]] || return 0
+  if (( sum > vm_bytes )); then
+    warn "Running containers are promised $(( sum / 1073741824 )) GB but the Docker VM has $(( vm_bytes / 1073741824 )) GB — under load everything swaps and every session freezes. Stop unused boxes, or raise VM memory ${DIM}(Docker Desktop → Settings → Resources)${RESET}."
+  fi
 }
 
 cmd_clean() {
@@ -4303,6 +4950,7 @@ cmd_help() {
   echo -e "    ${GREEN}stop${RESET}    ${DIM}[box]${RESET}      Stop container (keeps it for resume)"
   echo -e "    ${GREEN}rm${RESET}      ${DIM}[box]${RESET}      Stop + remove container permanently"
   echo -e "    ${GREEN}stop-all${RESET}           Stop all Cleat containers"
+  echo -e "    ${GREEN}prune${RESET}              Remove stale cleat images ${DIM}(old builds, superseded pulls — boxes untouched)${RESET}"
   echo -e "    ${GREEN}clean${RESET}              Stop everything + remove image"
   echo -e "    ${RED}nuke${RESET}               Remove ALL containers, images, and build cache"
   echo ""
@@ -4438,6 +5086,7 @@ main() {
     start|resume|r|run|claude|shell|sh)
       _maybe_prompt_cli_update
       _maybe_show_release_highlight
+      _maybe_check_docker_pressure
       ;;
   esac
 
@@ -4462,6 +5111,7 @@ main() {
     trust)     cmd_trust "$@" ;;
     untrust)   cmd_untrust "$@" ;;
     clean)     cmd_clean "$@" ;;
+    prune)     cmd_prune "$@" ;;
     nuke)      cmd_nuke "$@" ;;
     update)    cmd_update "$@" ;;
     version|-v|--version) cmd_version ;;

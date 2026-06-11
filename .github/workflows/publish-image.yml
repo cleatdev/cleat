@@ -1,7 +1,20 @@
 name: publish-image
 
-# Build and push Docker image to ghcr.io on every semver tag.
+# Build and push a MULTI-ARCH Docker image to ghcr.io on every semver tag.
 # The CLI's `cleat start` pulls this image instead of building locally.
+#
+# Each platform builds NATIVELY (ubuntu-latest = amd64, ubuntu-24.04-arm =
+# arm64 — free for public repos) and pushes by digest; a merge job then
+# assembles the two digests into one multi-arch manifest per tag. We don't
+# cross-build under QEMU: the Dockerfile runs the Claude Code installer,
+# whose Bun-compiled binary is unreliable under qemu-user emulation, and apt
+# under QEMU is 5-15x slower. Without the arm64 half, every Apple Silicon
+# user who pulls runs the box under emulation — the documented trigger for
+# node crashes and garbled TTYs (see concept/22-performance-and-resources.md).
+#
+# INVARIANT: the sh.cleat.version label must be present on the final image.
+# The CLI's image-version drift detection (_image_cleat_version) reads it and
+# silently disables when it's missing.
 on:
   push:
     tags: ['v*']
@@ -20,10 +33,18 @@ env:
   IMAGE_NAME: cleatdev/cleat
 
 jobs:
-  publish:
-    name: build & push
-    runs-on: ubuntu-latest
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -39,20 +60,78 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build image
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            sh.cleat.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.source=https://github.com/cleatdev/cleat
+          # provenance attestations would turn each per-arch manifest into a
+          # nested index and confuse `docker manifest inspect` consumers —
+          # keep the final tag a clean two-entry index.
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,push=true
+
+      - name: Export digest
         run: |
-          docker build \
-            -f docker/Dockerfile \
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge manifests & tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: meta
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
             -t "$REGISTRY/$IMAGE_NAME:latest" \
             -t "$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}" \
-            --label "sh.cleat.version=${{ steps.meta.outputs.version }}" \
-            --label "org.opencontainers.image.source=https://github.com/cleatdev/cleat" \
-            docker/
+            $(printf "$REGISTRY/$IMAGE_NAME@sha256:%s " *)
 
-      - name: Push image
+      - name: Verify manifest covers both architectures
         run: |
-          docker push "$REGISTRY/$IMAGE_NAME:latest"
-          docker push "$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}"
+          docker buildx imagetools inspect "$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}" | tee /tmp/manifest
+          grep -q 'linux/amd64' /tmp/manifest
+          grep -q 'linux/arm64' /tmp/manifest

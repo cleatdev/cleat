@@ -387,9 +387,12 @@ named sandbox for the project (default: `main`) — see **Boxes** above.
 Containers run with these protections by default:
 
 - `--pids-limit 4096` -- prevents fork bombs from affecting the host
-- `--memory 8g` -- prevents runaway processes from exhausting host memory
+- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 2-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Override with a `[resources]` section (`memory = 4g`, optionally `cpus = 2`) in `~/.config/cleat/config` or `<project>/.cleat`; repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing
+- `--init` -- a real PID 1 reaps orphaned processes, so long sessions can't wedge on zombie buildup and `cleat stop` is instant
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
 - Node.js bookworm-slim base image with minimal attack surface
+
+Images are published multi-arch (amd64 + arm64): Apple Silicon runs natively, never under emulation. `cleat prune` clears cleat's own stale images (cleat also offers this automatically when they pile up); boxes and other projects' images are never touched.
 
 ---
 

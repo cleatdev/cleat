@@ -37,20 +37,48 @@ teardown() { _common_teardown; }
   assert_success
 }
 
-@test "session env: CLAUDE_ENV injects exactly HOME, DISABLE_AUTOUPDATER, PATH" {
+@test "session env: CLAUDE_ENV injects exactly HOME, DISABLE_AUTOUPDATER, PATH, TERM (+ COLORTERM when set)" {
   # CLAUDE_ENV is forced into every session (docker exec -it "${CLAUDE_ENV[@]}").
   # Pin the EXACT key set so a future addition — especially one templated from
-  # host state (PATH=$PATH, TERM, LANG, USER) — can't silently leak the host's
-  # shell environment into the sandbox. Presence-only checks wouldn't catch that.
+  # host state (PATH=$PATH, LANG, USER) — can't silently leak the host's shell
+  # environment into the sandbox. Presence-only checks wouldn't catch that.
+  # TERM and COLORTERM are the two DELIBERATE host-templated entries: docker
+  # exec -t doesn't propagate the terminal type, and a terminfo mismatch
+  # corrupts key sequences and colors. COLORTERM is filtered here because it's
+  # only present when the invoking environment has it.
   local keys="" e
   for e in "${CLAUDE_ENV[@]}"; do
     [[ "$e" == "-e" ]] && continue
+    [[ "${e%%=*}" == "COLORTERM" ]] && continue
     keys+="${e%%=*}"$'\n'
   done
   local sorted
   sorted="$(printf '%s' "$keys" | sort | tr '\n' ' ' | sed 's/ *$//')"
   run echo "$sorted"
-  assert_output "DISABLE_AUTOUPDATER HOME PATH"
+  assert_output "DISABLE_AUTOUPDATER HOME PATH TERM"
+}
+
+@test "session env: COLORTERM is forwarded only when the host sets it" {
+  # CLAUDE_ENV is built at SOURCE time, so the conditional must be exercised
+  # in a fresh subprocess — an in-process override can't reach it. Forwarding
+  # COLORTERM keeps truecolor in iTerm2/Ghostty; omitting it when absent keeps
+  # the pinned key set tight.
+  local stripped="$TEST_TEMP/cli_stripped"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$stripped"
+  run bash -c "export COLORTERM=truecolor; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
+  assert_success
+  assert_output --partial "COLORTERM=truecolor"
+  run bash -c "unset COLORTERM; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
+  assert_success
+  refute_output --partial "COLORTERM"
+}
+
+@test "session env: TERM falls back to xterm-256color when the host has none" {
+  local stripped="$TEST_TEMP/cli_stripped"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$stripped"
+  run bash -c "unset TERM; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
+  assert_success
+  assert_output --partial "TERM=xterm-256color"
 }
 
 @test "creates clipboard bridge directory" {

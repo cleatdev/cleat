@@ -1949,3 +1949,99 @@ ${overlay_dir}/project-settings.local.json"
   refute_output --partial "docker start $cname"
   rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/clip"
 }
+
+@test "regression: containers are created with --init so PID 1 reaps zombies" {
+  # Without --init, PID 1 inside the box is `su`, which never wait()s on
+  # re-parented children. Orphans from agent subshells accumulate as zombies
+  # until the box hits --pids-limit: fork() fails, node aborts mid-frame, and
+  # the attached terminal freezes (observed live: a 2-day box wedged at the
+  # pids cap with ~900 zombie bash procs). --init makes docker's bundled tini
+  # PID 1, which reaps everything and forwards SIGTERM (so `cleat stop` no
+  # longer burns its full timeout and SIGKILLs — the historical fleet all
+  # shows Exited(137) for this reason).
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "--init"
+  assert_success
+}
+
+@test "regression: claude's exit code survives clip-daemon cleanup in the session script" {
+  # The session script used to end with `kill/wait $_MY_CLIP_DAEMON`, so the
+  # `bash -c` exit status was the daemon wait's 0 — masking a crashed claude
+  # (SIGSEGV=139, SIGABRT=134) as a clean session end, whose rc==0 branch then
+  # ERASED the crash message bash had just printed. The script must capture
+  # claude's status and exit with it.
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  run assert_docker_exec_has 'claude "$@"'
+  assert_success
+  run assert_docker_exec_has 'exit "$_CLAUDE_RC"'
+  assert_success
+}
+
+@test "regression: the session script propagates a crashed claude's exit code when executed" {
+  # The text-pin above can't catch a capture-ORDER regression: moving
+  # _CLAUDE_RC=$? after the daemon kill re-masks crashes with the kill's 0.
+  # So capture the ACTUAL script sent to docker exec and run it with a
+  # SIGSEGV-ing claude stub — the wrapper must exit 139, not 0.
+  local script_file="$TEST_TEMP/inner_script"
+  docker() {
+    if [[ "$1" == "exec" ]]; then
+      local arg prev=""
+      for arg in "$@"; do
+        if [[ "$prev" == "-c" && "$arg" == *"clip-daemon &"* ]]; then
+          printf '%s' "$arg" > "$script_file"
+        fi
+        prev="$arg"
+      done
+      return 0
+    fi
+    command docker "$@"
+  }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  [ -s "$script_file" ] || { echo "session script not captured"; return 1; }
+  mkdir -p "$TEST_TEMP/fakebin"
+  printf '#!/usr/bin/env bash\nexit 139\n' > "$TEST_TEMP/fakebin/claude"
+  printf '#!/usr/bin/env bash\nsleep 30\n' > "$TEST_TEMP/fakebin/clip-daemon"
+  chmod +x "$TEST_TEMP/fakebin/claude" "$TEST_TEMP/fakebin/clip-daemon"
+  run env PATH="$TEST_TEMP/fakebin:$PATH" CLEAT_CLIP_DIR="$TEST_TEMP" \
+    bash "$script_file" --dangerously-skip-permissions
+  assert_failure 139
+}
+
+@test "regression: docker exec stderr surfaces when the session fails" {
+  # Host-side docker errors ('exec failed: resource temporarily unavailable'
+  # during fork lockup, daemon connection resets) were thrown away by
+  # 2>/dev/null, leaving the user with a corrupted terminal and zero
+  # diagnostics. On a non-zero exit they must be shown.
+  _wait_for_coder_remap() { true; }
+  _ensure_docker_access() { true; }
+  export DOCKER_STDERR="exec failed: resource temporarily unavailable"
+  export DOCKER_EXIT_CODE=1
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_output --partial "exited with code 1"
+  assert_output --partial "resource temporarily unavailable"
+}
+
+@test "regression: interactive session restores terminal state after docker exec" {
+  # A hard-dying claude (SIGSEGV under amd64 emulation, fork lockup) leaves
+  # the host terminal in raw mode with alt-screen/mouse-tracking on — every
+  # keystroke and scroll sprays escape garbage until a manual `reset`.
+  # exec_claude must always run the terminal-restore path after the exec.
+  _restore_terminal() { echo "RESTORE_TERMINAL_CALLED"; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_output --partial "RESTORE_TERMINAL_CALLED"
+}
+
+@test "regression: clean session end emits no cursor-up erase into a pipe" {
+  # The rc==0 branch unconditionally printed '\033[A\033[2K' (cursor-up +
+  # erase-line) even when stdout was not a terminal, corrupting piped/captured
+  # output — and after a masked crash it deleted the crash evidence itself.
+  # The erase is cosmetic TTY furniture: it must be TTY-gated.
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_output --partial "Session ended"
+  refute_output --partial $'\033[A'
+}

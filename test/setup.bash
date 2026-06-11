@@ -80,6 +80,33 @@ _md5() {
   fi
 }
 
+# A process counts as exited if its PID is gone OR it is a zombie — an
+# orphaned child gets reparented, and if the new parent doesn't reap promptly
+# (containerized test runs), the EXITED process lingers as a zombie that
+# kill -0 still sees. Reads /proc first (Linux; works in minimal containers
+# with no `ps`), falls back to `ps` (macOS). Waits up to ~4s for the state
+# to land. NOTE: callers must still `kill` the PID afterwards regardless of
+# the result — a process left alive holds bats' internal fd and hangs the
+# whole file.
+_proc_state() {
+  local pid="$1"
+  if [ -r "/proc/$pid/stat" ]; then
+    sed 's/^[^)]*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1
+  else
+    ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]' | cut -c1
+  fi
+}
+process_exited() {
+  local pid="$1" i st
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    st="$(_proc_state "$pid")"
+    case "$st" in Z*) return 0 ;; esac
+    sleep 0.2
+  done
+  return 1
+}
+
 # Portable timeout — GNU timeout on Linux, perl alarm on macOS.
 # Available to all test files via setup.bash.
 _portable_timeout() {

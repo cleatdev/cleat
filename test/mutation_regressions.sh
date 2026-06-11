@@ -39,6 +39,13 @@ BROWSER_BRIDGE_BATS="$REPO_ROOT/test/unit/browser_bridge.bats"
 WHATS_NEW_BATS="$REPO_ROOT/test/unit/whats_new.bats"
 CAPABILITIES_BATS="$REPO_ROOT/test/unit/capabilities.bats"
 EXEC_CLAUDE_BATS="$REPO_ROOT/test/unit/exec_claude.bats"
+INIT_RECREATE_BATS="$REPO_ROOT/test/unit/init_recreate_check.bats"
+ARCH_BATS="$REPO_ROOT/test/unit/arch.bats"
+RESOURCES_BATS="$REPO_ROOT/test/unit/resources.bats"
+PRUNE_BATS="$REPO_ROOT/test/unit/prune.bats"
+DOCKER_COMMANDS_BATS="$REPO_ROOT/test/unit/docker_commands.bats"
+CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
+HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -450,8 +457,9 @@ try "v0.10.0_docker_cap_session_overlay" "docker cap overlays session dir at hos
 # every call hits the network, then fails (DOCKER_PULL_EXIT_CODE=1 in
 # tests), then falls back to a local build — exactly what the regression
 # test forbids.
+# (pattern updated when the cache condition grew the arch check — see vnext_pull_cache_arch)
 cat > "$SED_TMP" << 'SED'
-s|if docker image inspect "\$target_image" > /dev/null 2>&1; then|if false; then|
+s|if docker image inspect "\$target_image" > /dev/null 2>&1 \&\& _image_arch_ok "\$target_image"; then|if false; then|
 SED
 try "v0.10.1_pull_local_cache_short_circuit" "_do_pull reuses locally cached prebuilt without network call"
 
@@ -938,10 +946,12 @@ SED
 try "v0.15.0_claude_check_interval_pinned" "a stale check" "$CLI" "$CLAUDE_BATS"
 
 # v0.15.0 — CLAUDE_ENV is the fixed env forced into every session; its key set
-# must stay exactly {HOME, DISABLE_AUTOUPDATER, PATH} so no host state leaks in.
-# Inject an extra var: the "injects exactly" test sees a 4th key and fails.
+# must stay exactly {HOME, DISABLE_AUTOUPDATER, PATH, TERM} (+ COLORTERM when
+# the host has one) so no other host state leaks in. Inject an extra var: the
+# "injects exactly" test sees a stray key and fails. (TERM itself became a
+# deliberate entry when terminfo forwarding shipped — the canary is LANG now.)
 cat > "$SED_TMP" << 'SED'
-s|CLAUDE_ENV=(-e HOME=/home/coder|CLAUDE_ENV=(-e TERM=xterm -e HOME=/home/coder|
+s|CLAUDE_ENV=(-e HOME=/home/coder|CLAUDE_ENV=(-e LANG=C -e HOME=/home/coder|
 SED
 try "v0.15.0_session_env_exact_set" "injects exactly" "$CLI" "$EXEC_CLAUDE_BATS"
 
@@ -980,6 +990,377 @@ cat > "$SED_TMP" << 'SED'
 /chown -R "\$HOST_UID:\$HOST_GID" \/home\/coder\/.cache/d
 SED
 try "v0.15.1_entrypoint_cache_chown" "chowns ~/.cache" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# vnext — boxes must be created with --init (tini as PID 1) or `su` leaves
+# zombies unreaped until the pids cap wedges the box. Drop the flag: the
+# regression test asserting the recorded docker run contains --init fails.
+cat > "$SED_TMP" << 'SED'
+/^    --init \\$/d
+SED
+try "vnext_init_reaper" "containers are created with --init"
+
+# vnext — the session script must exit with CLAUDE's status, not the
+# clip-daemon wait's 0. Strip the rc capture/propagation: the test asserting
+# the script exits with claude's rc fails.
+cat > "$SED_TMP" << 'SED'
+/_CLAUDE_RC/d
+SED
+try "vnext_claude_exit_code" "exit code survives clip-daemon cleanup"
+
+# vnext — docker exec stderr must surface on failure, not vanish. Revert to
+# the pre-fix 2>/dev/null: the stderr-surfacing test fails.
+cat > "$SED_TMP" << 'SED'
+s|2>"\$_exec_err"|2>/dev/null|
+SED
+try "vnext_exec_stderr" "stderr surfaces when the session fails"
+
+# vnext — the terminal must be restored after every interactive session exec
+# (raw mode / alt screen / mouse tracking survive a crashed claude). Drop the
+# restore calls: the restore regression test fails.
+cat > "$SED_TMP" << 'SED'
+/^  _restore_terminal$/d
+SED
+try "vnext_restore_terminal" "restores terminal state after docker exec"
+
+# vnext — the clean-exit cursor-up erase must be TTY-gated so pipes stay
+# clean (and a masked crash can't have its evidence deleted). Make it
+# unconditional again: the piped-output test fails.
+cat > "$SED_TMP" << 'SED'
+s|_is_tty && printf|printf|
+SED
+try "vnext_clean_end_erase_tty_gated" "no cursor-up erase into a pipe"
+
+# vnext — the reaper-drift prompt must recognize an existing init reaper via
+# HostConfig "Init":true. Break the detection so every box looks pre-init:
+# the "silent when the box already has an init reaper" test fails.
+cat > "$SED_TMP" << 'SED'
+s|"Init":true|"Init":NEVERTRUE|
+SED
+try "vnext_init_detect_true" "already has an init reaper" "$CLI" "$INIT_RECREATE_BATS"
+
+# vnext — cmd_start/cmd_resume must actually consult the reaper-drift check.
+# Delete the call sites: the call-site test fails.
+cat > "$SED_TMP" << 'SED'
+/_maybe_prompt_init_recreate "\$cname"/d
+SED
+try "vnext_init_recreate_callsite" "cmd_start consults the reaper-drift check" "$CLI" "$INIT_RECREATE_BATS"
+
+# vnext — pulls must be pinned to the daemon arch so a wrong single-arch
+# manifest fails loudly into the local-build fallback. Drop the pin: the
+# --platform test fails.
+cat > "$SED_TMP" << 'SED'
+/platform_args=(--platform/d
+SED
+try "vnext_pull_platform_pin" "pull pins --platform to the daemon arch" "$CLI" "$ARCH_BATS"
+
+# vnext — an arch-mismatched cached ghcr image must not short-circuit the
+# pull (it would put the emulated image back into service). Drop the arch
+# check from the cache condition: the mismatch test fails.
+cat > "$SED_TMP" << 'SED'
+s|&& _image_arch_ok "\$target_image"||
+SED
+try "vnext_pull_cache_arch" "cached prebuilt does not short-circuit" "$CLI" "$ARCH_BATS"
+
+# vnext — _image_arch_ok must compare image arch to daemon arch, not merely
+# check non-emptiness. Gut the comparison: the emulation test fails.
+cat > "$SED_TMP" << 'SED'
+s|\[\[ "\$have" == "\$want" \]\]|[[ -n "$have" ]]|
+SED
+try "vnext_arch_compare" "fails when the image would run emulated" "$CLI" "$ARCH_BATS"
+
+# vnext — cmd_run must treat a wrong-arch image as missing. Neutralize the
+# gate: the cmd_run re-acquire test fails.
+cat > "$SED_TMP" << 'SED'
+s|elif ! _image_arch_ok; then|elif false; then|
+SED
+try "vnext_run_arch_gate" "cmd_run re-acquires a wrong-arch image" "$CLI" "$ARCH_BATS"
+
+# vnext — cmd_build must treat a wrong-arch image as missing. Neutralize the
+# gate: the cmd_build re-acquire test fails.
+cat > "$SED_TMP" << 'SED'
+s|if _image_arch_ok; then|if true; then|
+SED
+try "vnext_build_arch_gate" "cmd_build re-acquires a wrong-arch image" "$CLI" "$ARCH_BATS"
+
+# vnext — the per-box memory limit must come from resolve_box_memory, not a
+# hardcoded 8g that exceeds whole Docker Desktop VMs. Re-hardcode it: the
+# wiring test (configured 3g must reach docker run) fails.
+cat > "$SED_TMP" << 'SED'
+s|--memory "\$box_memory"|--memory 8g|
+SED
+try "vnext_memory_resolved" "configured memory limit reaches docker run" "$CLI" "$RESOURCES_BATS"
+
+# vnext — swap must be pinned to the memory limit (a runaway box OOMs in its
+# own cgroup instead of thrashing VM swap). Drop the pin: the wiring test
+# asserting --memory-swap fails.
+cat > "$SED_TMP" << 'SED'
+/--memory-swap "\$box_memory"/d
+SED
+try "vnext_memory_swap_pinned" "swap pinned equal" "$CLI" "$RESOURCES_BATS"
+
+# vnext — project-supplied memory must be clamped to 8g (untrusted repo
+# config can't re-introduce overcommit). Raise the clamp out of reach: the
+# clamp test fails.
+cat > "$SED_TMP" << 'SED'
+s|> 8589934592|> 999999999999999|
+SED
+try "vnext_memory_project_clamp" "above 8g is clamped" "$CLI" "$RESOURCES_BATS"
+
+# vnext — resources must be part of the config fingerprint so a changed limit
+# surfaces the drift notice. Drop them: the fingerprint test fails.
+cat > "$SED_TMP" << 'SED'
+/resources:memory=/d
+SED
+try "vnext_memory_fingerprint" "changes the config fingerprint" "$CLI" "$RESOURCES_BATS"
+
+# vnext — sessions must pin node's heap to the box's real budget. Drop the
+# pin: the heap test fails.
+cat > "$SED_TMP" << 'SED'
+/NODE_OPTIONS=--max-old-space-size/d
+SED
+try "vnext_node_heap_pin" "pins node's heap" "$CLI" "$RESOURCES_BATS"
+
+# vnext — the VM-derived default must be a quarter of the VM (clamped), not
+# the whole of it. Break the divisor: the scaling test (16 GiB VM → 4g) fails.
+cat > "$SED_TMP" << 'SED'
+s|vm_bytes / 4 / 1073741824|vm_bytes / 1073741824|
+SED
+try "vnext_memory_default_quarter" "default scales with a bigger VM" "$CLI" "$RESOURCES_BATS"
+
+# vnext — prune must never remove the CURRENT version's prebuilt tag. Drop
+# the guard: the "never the current version" test fails.
+cat > "$SED_TMP" << 'SED'
+/\[\[ "\$tag" == "\${REGISTRY_BASE}:v\${VERSION}" \]\] \&\& continue/d
+SED
+try "vnext_prune_keeps_current" "never the current version" "$CLI" "$PRUNE_BATS"
+
+# vnext — the pressure check must offer the prune when bloat passes the
+# threshold. Push the threshold out of reach: the offer test fails.
+cat > "$SED_TMP" << 'SED'
+s|_PRESSURE_BLOAT_MB_THRESHOLD=5120|_PRESSURE_BLOAT_MB_THRESHOLD=99999999|
+SED
+try "vnext_pressure_bloat_threshold" "offers prune when bloat passes" "$CLI" "$PRUNE_BATS"
+
+# vnext — the overload notice must compare promised limits to the VM size.
+# Invert the comparison out of existence: the overcommit warning test fails.
+cat > "$SED_TMP" << 'SED'
+s|if (( sum > vm_bytes )); then|if (( sum > vm_bytes * 1000 )); then|
+SED
+try "vnext_pressure_overcommit" "warns when running limits overcommit" "$CLI" "$PRUNE_BATS"
+
+# vnext — TERM must be forwarded into sessions (docker exec -t doesn't
+# propagate the terminal type; a terminfo mismatch corrupts keys/colors).
+# Drop the forward: the pinned key-set test fails.
+cat > "$SED_TMP" << 'SED'
+/CLAUDE_ENV+=(-e "TERM=/d
+SED
+try "vnext_term_forwarded" "injects exactly" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# vnext — the routine auto-GC after pull/build/rebuild is what keeps daily
+# drift rebuilds from accreting ~120 GB of orphans. Delete all four silent
+# call sites: the marker-file auto-GC tests fail.
+cat > "$SED_TMP" << 'SED'
+/cmd_prune > \/dev\/null 2>&1 || true/d
+SED
+try "vnext_autogc_callsites" "auto-GC" "$CLI" "$PRUNE_BATS"
+
+# vnext — prune's dangling query must stay label-scoped to cleat-owned
+# images; unscoped it deletes EVERY project's dangling images. Strip the
+# label filter: the ownership-filters test fails.
+cat > "$SED_TMP" << 'SED'
+s| -f label=sh.cleat.version||
+SED
+try "vnext_prune_label_filter" "queries docker with the cleat ownership filters" "$CLI" "$PRUNE_BATS"
+
+# vnext — prune's tag query must stay scoped to the cleat registry repo.
+# Unscope it: the ownership-filters test fails.
+cat > "$SED_TMP" << 'SED'
+s|docker images "\$REGISTRY_BASE" --format|docker images --format|
+SED
+try "vnext_prune_repo_scope" "queries docker with the cleat ownership filters" "$CLI" "$PRUNE_BATS"
+
+# vnext — main()'s session-launching verbs must reach the pressure check.
+# Delete the call site: the marker test fails.
+cat > "$SED_TMP" << 'SED'
+/^      _maybe_check_docker_pressure$/d
+SED
+try "vnext_pressure_main_callsite" "session-launching commands consult the pressure check" "$CLI" "$PRUNE_BATS"
+
+# vnext — status must flag an EMULATED image (arch mismatch), not a native
+# one. Flip the comparison: both status-arch tests fail.
+cat > "$SED_TMP" << 'SED'
+s|"\$iarch" != "\$darch"|"$iarch" == "$darch"|
+SED
+try "vnext_status_emulated" "status flags an emulated image" "$CLI" "$ARCH_BATS"
+
+# vnext — the user-facing reason for a wrong-arch re-fetch must be printed at
+# the acquisition gates. Delete the call sites: the gate tests fail.
+cat > "$SED_TMP" << 'SED'
+/^    _warn_image_emulated$/d
+SED
+try "vnext_warn_emulated_callsites" "re-acquires a wrong-arch image and says why" "$CLI" "$ARCH_BATS"
+
+# vnext — status must surface a positive zombie count. Invert the gate: the
+# zombie-status test fails.
+cat > "$SED_TMP" << 'SED'
+s|(( _zombies > 0 ))|(( _zombies < 0 ))|
+SED
+try "vnext_status_zombie_gate" "status surfaces the unreaped-zombie count" "$CLI" "$INIT_RECREATE_BATS"
+
+# vnext — cmd_resume must consult the reaper-drift check independently of
+# cmd_start (resume is the verb that revives pre---init boxes). Delete only
+# the resume call site: the resume call-site test fails.
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume() {$/,/^}$/{
+  /_maybe_prompt_init_recreate "\$cname"/d
+}
+SED
+try "vnext_resume_init_recreate_callsite" "cmd_resume consults the reaper-drift check" "$CLI" "$INIT_RECREATE_BATS"
+
+# vnext — status's own VM-overcommit line (distinct from the on-start warn).
+# Push the comparison out of reach: the status overcommit test fails.
+cat > "$SED_TMP" << 'SED'
+s|(( _limit_sum > _vm_bytes ))|(( _limit_sum > _vm_bytes * 1000 ))|
+SED
+try "vnext_status_overcommit_line" "flags an overcommitted VM" "$CLI" "$PRUNE_BATS"
+
+# vnext — an Exited (255) box is a Docker restart, not a crash; ps must say
+# so. Delete the hint: the ps hint test fails.
+cat > "$SED_TMP" << 'SED'
+/Docker restarted; resume with: cleat resume/d
+SED
+try "vnext_ps_restart_hint" "box gets the Docker-restarted resume hint" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# vnext — zero-spelling memory values must be rejected ("00g" → --memory 0 is
+# UNLIMITED in docker — a project-clamp bypass). Accept zero: the 00g test fails.
+cat > "$SED_TMP" << 'SED'
+s|(( 10#\$n > 0 ))|(( 10#$n >= 0 ))|
+SED
+try "vnext_memory_zero_guard" "zero-spellings like 00g are rejected" "$CLI" "$RESOURCES_BATS"
+
+# vnext — the per-suffix digit caps keep the byte conversion inside int64; an
+# overflowed product wraps past the 8g clamp. Loosen the g-cap: the
+# overflowing-value test fails.
+cat > "$SED_TMP" << 'SED'
+s|\[\[ \${#n} -le 9 \]\]|[[ \${#n} -le 99 ]]|
+SED
+try "vnext_memory_overflow_guard" "64-bit-overflowing suffixed value is rejected" "$CLI" "$RESOURCES_BATS"
+
+# vnext — a configured cpus limit must reach docker run. Drop the wiring:
+# the cpus docker-run test fails.
+cat > "$SED_TMP" << 'SED'
+s|cpu_args=(--cpus "\$box_cpus")|cpu_args=()|
+SED
+try "vnext_cpus_run_wiring" "cpus limit reaches docker run" "$CLI" "$RESOURCES_BATS"
+
+# vnext — a project cpus above the daemon's cores must clamp (dockerd ERRORS
+# on --cpus > NCPU, so an untrusted .cleat could abort the start). Echo the
+# raw value instead: the clamp test fails.
+cat > "$SED_TMP" << 'SED'
+s|echo "\$ncpu"|echo "$v"|
+SED
+try "vnext_cpus_project_clamp" "above the daemon.s cores is clamped" "$CLI" "$RESOURCES_BATS"
+
+# vnext — zero cpus must be rejected (docker reads 0 as no limit). Accept
+# zero: the zero-cpus test fails.
+cat > "$SED_TMP" << 'SED'
+s|(( 10#\$digits > 0 ))|(( 10#$digits >= 0 ))|
+SED
+try "vnext_cpus_zero_guard" "zero cpus is rejected" "$CLI" "$RESOURCES_BATS"
+
+# vnext — cpus must be part of the config fingerprint (limits are set at
+# docker run; drift must surface). Drop it: the cpus fingerprint test fails.
+cat > "$SED_TMP" << 'SED'
+/resources:cpus=/d
+SED
+try "vnext_cpus_fingerprint" "cpus limit changes the config fingerprint" "$CLI" "$RESOURCES_BATS"
+
+# vnext — COLORTERM must be forwarded when (and only when) the host sets it.
+# Make the condition never true: the COLORTERM subprocess test fails.
+cat > "$SED_TMP" << 'SED'
+s|-n "\${COLORTERM:-}"|-n ""|
+SED
+try "vnext_colorterm_forward" "COLORTERM is forwarded only when the host sets it" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# vnext — the TERM fallback value is part of the contract (a box with no
+# terminfo match garbles keys). Change it: the fallback test fails.
+cat > "$SED_TMP" << 'SED'
+s|xterm-256color|dumb|
+SED
+try "vnext_term_fallback_value" "TERM falls back to xterm-256color" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# vnext — capture ORDER in the session script: moving _CLAUDE_RC=$? after the
+# daemon kill re-masks crashes with the kill's rc. Re-capture after the kill:
+# the executed-script propagation test fails.
+cat > "$SED_TMP" << 'SED'
+s|kill "\$_MY_CLIP_DAEMON" 2>/dev/null$|kill "$_MY_CLIP_DAEMON" 2>/dev/null; _CLAUDE_RC=$?|
+SED
+try "vnext_claude_rc_order" "propagates a crashed claude.s exit code when executed" "$CLI" "$REGRESSIONS"
+
+# vnext — a second spin() must reap the first frame loop (two \r loops
+# interleave into garbage). Drop the nested guard: the double-spin test fails.
+cat > "$SED_TMP" << 'SED'
+/\[\[ -n "\${_SPIN_PID:-}" \]\] && _cleanup_spin/d
+SED
+try "vnext_spin_nested_guard" "second spin stops the first frame loop" "$CLI" "$TERMINAL_UX_BATS"
+
+# vnext — the frame loop must exit on its own when its parent dies without
+# spin_stop. Make it loop forever: the orphan-spinner test fails.
+cat > "$SED_TMP" << 'SED'
+s|while kill -0 "\$_spin_parent" 2>/dev/null; do|while true; do|
+SED
+try "vnext_spin_parent_liveness" "frame loop exits on its own" "$CLI" "$TERMINAL_UX_BATS"
+
+# vnext — cmd_shell and cmd_login run their own interactive exec and must
+# restore the terminal independently. Delete both call sites: the shell and
+# login restore tests fail.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell() {$/,/^}$/{
+  /_restore_terminal/d
+}
+/^cmd_login() {$/,/^}$/{
+  /_restore_terminal/d
+}
+SED
+try "vnext_shell_login_restore" "restores the terminal after the interactive exec" "$CLI" "$TERMINAL_UX_BATS"
+
+# vnext — the same-URL debounce window is what folds a TUI click's double
+# open-shim fire into one tab. Disable the window: the dedup test fails.
+cat > "$SED_TMP" << 'SED'
+s|_BROWSER_DEBOUNCE_SECS=2|_BROWSER_DEBOUNCE_SECS=-1|
+SED
+try "vnext_browser_debounce_window" "repeat of the same URL inside the window is deduped" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# vnext — the watcher must actually consult the debounce before opening.
+# Bypass the consult: the watcher-consults test fails.
+cat > "$SED_TMP" << 'SED'
+s|if _browser_recently_opened "\$clip_dir" "\$url"; then|if false; then|
+SED
+try "vnext_browser_debounce_callsite" "watcher consults the debounce before opening" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# vnext — a watcher whose cleat process died without the cleanup trap must
+# stop polling (leaked watchers are one tab PER crashed session). Drop the
+# liveness check: the orphan-watcher test fails.
+cat > "$SED_TMP" << 'SED'
+s|kill -0 "\$_bw_parent" 2>/dev/null \|\| { _bw_cleanup; exit 0; }|true|
+SED
+try "vnext_browser_watcher_liveness" "watcher self-exits when its spawning cleat process dies" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# vnext — an orphaned clipboard watcher must never write a dead session's box
+# clipboard over the host clipboard. Drop the choke-point check: the
+# orphan-copy test fails.
+cat > "$SED_TMP" << 'SED'
+s|kill -0 "\$_cw_parent" 2>/dev/null \|\| exit 0|true|
+SED
+try "vnext_clipboard_watcher_liveness" "never copies" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# vnext — an orphaned hook bridge must exit BEFORE processing late events
+# (host hooks for a dead session). Drop the loop-top check: the orphan-bridge
+# test fails.
+cat > "$SED_TMP" << 'SED'
+s|kill -0 "\$_hb_parent" 2>/dev/null \|\| { _hook_bridge_cleanup; exit 0; }|true|
+SED
+try "vnext_hook_bridge_liveness" "orphaned bridge exits without executing late events" "$CLI" "$HOOKS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -129,10 +129,17 @@ teardown() { _common_teardown; }
   assert_success
   run assert_docker_run_has "$cname" "HOME=/home/coder"
   assert_success
-  run assert_docker_run_has "$cname" "--memory 8g"
+  # Default memory in the test env: VM size unknown via the stub → the 2g
+  # floor. Swap is pinned to the same value so a runaway box OOMs inside its
+  # own cgroup instead of thrashing the VM's swap (see resources.bats).
+  run assert_docker_run_has "$cname" "--memory 2g"
+  assert_success
+  run assert_docker_run_has "$cname" "--memory-swap 2g"
   assert_success
   run assert_docker_run_has "$cname" "--pids-limit 4096"
   assert_success
+  # --init is asserted by its regression test in regressions.bats (one test
+  # per behavior — rule 3).
   run assert_docker_run_has "$cname" "-it"
   assert_success
 }
@@ -749,6 +756,22 @@ EOF
 @test "ps: shows empty message" {
   run cmd_ps
   assert_output --partial "No containers found"
+}
+
+@test "ps: an Exited (255) box gets the Docker-restarted resume hint" {
+  # Exit 255 is the Docker-restart signature (the VM died under the box) —
+  # without the hint a healthy, resumable box reads as a crash.
+  printf 'cleat-proj-12345678\tExited (255) 2 hours ago\n' > "$DOCKER_MOCK_DIR/ps_a_output"
+  run cmd_ps
+  assert_success
+  assert_output --partial "Docker restarted; resume with: cleat resume"
+}
+
+@test "ps: a normally-exited box gets no restart hint" {
+  printf 'cleat-proj-12345678\tExited (0) 2 hours ago\n' > "$DOCKER_MOCK_DIR/ps_a_output"
+  run cmd_ps
+  assert_success
+  refute_output --partial "Docker restarted"
 }
 
 @test "help: shows all sections" {

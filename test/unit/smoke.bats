@@ -746,3 +746,20 @@ EOF
     return 1
   }
 }
+
+@test "smoke: cleat prune exits 0 under strict mode" {
+  # No prunable artifacts in the stub world — must report cleanly, not crash
+  # on set -u / pipefail in the stats plumbing.
+  run cleat_bin prune
+  assert_success
+  assert_output --partial "Nothing to prune"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+}
+
+@test "smoke: cleat status survives the new arch/zombie/VM probes under strict mode" {
+  run cleat_bin status
+  assert_success
+  assert_output --partial "Status:"
+  refute_output --partial "unbound variable"
+}

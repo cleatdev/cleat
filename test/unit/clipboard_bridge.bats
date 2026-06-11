@@ -26,6 +26,32 @@ teardown() { _common_teardown; }
   [[ -f "$clip_dir/.host-ready" ]]  || return 1
 }
 
+@test "_clipboard_watcher from a dead cleat process never copies (orphan guard)" {
+  # A watcher whose cleat process was SIGKILL'd must not keep writing a dead
+  # session's box clipboard over the host clipboard. The liveness check sits
+  # at the copy choke point, so this holds in all three watch modes.
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  cat > "$TEST_TEMP/clip_spawner.sh" <<EOF
+source "$TEST_TEMP/cli_stripped"
+_clipboard_watcher "$clip_dir" "touch '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+echo "\$!" > "$TEST_TEMP/clip_watcher_pid"
+kill -9 \$\$
+EOF
+  bash "$TEST_TEMP/clip_spawner.sh" 2>/dev/null || true
+  sleep 0.3
+  # Deliver a clipboard write the way the box does (mv → fires moved_to too)
+  echo "stolen" > "$TEST_TEMP/payload"
+  mv "$TEST_TEMP/payload" "$clip_dir/clipboard"
+  local wpid
+  wpid="$(cat "$TEST_TEMP/clip_watcher_pid")"
+  process_exited "$wpid" || true
+  # Unconditional reap: a live straggler holds bats' fd and hangs the file.
+  kill "$wpid" 2>/dev/null || true
+  [ ! -f "$TEST_TEMP/copied" ] || { echo "orphan watcher copied a dead session's clipboard"; return 1; }
+}
+
 # ── _cleanup_clipboard ──────────────────────────────────────────────────────
 
 @test "cleanup removes session marker" {

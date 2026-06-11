@@ -740,3 +740,80 @@ EOF
   assert_success
   refute_output --partial "docker stop"
 }
+
+# ── terminal restore call sites ───────────────────────────────────────────
+# exec_claude's restore is pinned by a regression test; shell and login run
+# their own interactive `docker exec` and must restore independently — a
+# crashed TUI in either leaves the same raw-mode/mouse-tracking garbage.
+
+@test "shell: restores the terminal after the interactive exec" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _wait_for_coder_remap() { true; }
+  _ensure_docker_access() { true; }
+  _restore_terminal() { echo "RESTORE_TERMINAL_CALLED"; }
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "RESTORE_TERMINAL_CALLED"
+}
+
+@test "login: restores the terminal after the interactive exec" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _wait_for_coder_remap() { true; }
+  _ensure_docker_access() { true; }
+  _host_open_cmd() { echo ""; }
+  _restore_terminal() { echo "RESTORE_TERMINAL_CALLED"; }
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "RESTORE_TERMINAL_CALLED"
+}
+
+# ── spinner hardening (TTY mode) ──────────────────────────────────────────
+# Bats is never a TTY, so these run a harness script that forces _is_tty.
+# Two guards: a second spin() must reap the first frame loop (two \r loops
+# interleave into garbage), and a loop whose parent died without spin_stop
+# (SIGKILL, hard crash) must exit on its own instead of spamming the prompt.
+
+@test "spin: a second spin stops the first frame loop before starting its own" {
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  cat > "$TEST_TEMP/spin_twice.sh" <<EOF
+source "$TEST_TEMP/cli_stripped"
+_is_tty() { return 0; }
+spin "one" > /dev/null
+first=\$_SPIN_PID
+spin "two" > /dev/null
+if kill -0 "\$first" 2>/dev/null; then
+  echo "FIRST_LOOP_STILL_RUNNING"
+  spin_stop 0 "x" > /dev/null
+  exit 1
+fi
+spin_stop 0 "x" > /dev/null
+echo "FIRST_LOOP_REAPED"
+EOF
+  run bash "$TEST_TEMP/spin_twice.sh"
+  assert_success
+  assert_output --partial "FIRST_LOOP_REAPED"
+}
+
+@test "spin: the frame loop exits on its own when its parent dies without spin_stop" {
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  cat > "$TEST_TEMP/spin_orphan.sh" <<EOF
+source "$TEST_TEMP/cli_stripped"
+_is_tty() { return 0; }
+spin "x" > /dev/null
+echo "\$_SPIN_PID" > "$TEST_TEMP/spin_pid"
+kill -9 \$\$
+EOF
+  bash "$TEST_TEMP/spin_orphan.sh" > /dev/null 2>&1 || true
+  local spid dead=0
+  spid="$(cat "$TEST_TEMP/spin_pid")"
+  process_exited "$spid" && dead=1
+  # Unconditional reap: a live straggler holds bats' fd and hangs the file.
+  kill "$spid" 2>/dev/null || true
+  [ "$dead" = 1 ] || { echo "spinner loop outlived its dead parent"; return 1; }
+}

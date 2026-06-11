@@ -1475,3 +1475,32 @@ SCRIPT
   sleep 0.3
   [[ -f "$bw_killed" ]] || { echo "Browser watcher not killed after login failure"; return 1; }
 }
+
+@test "hook bridge: an orphaned bridge exits without executing late events" {
+  # A bridge whose cleat process was SIGKILL'd must not keep running HOST
+  # hooks for a dead session. Liveness is checked BEFORE event processing, so
+  # an event arriving after the parent died is never executed.
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<EOF
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch $TEST_TEMP/hook_ran"}]}]}}
+EOF
+  local hooks_file="$TEST_TEMP/events.jsonl"
+  : > "$hooks_file"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  cat > "$TEST_TEMP/hb_spawner.sh" <<EOF
+source "$TEST_TEMP/cli_stripped"
+_hook_bridge_watcher "$hooks_file" >/dev/null 2>&1 &
+echo "\$!" > "$TEST_TEMP/hb_pid"
+kill -9 \$\$
+EOF
+  bash "$TEST_TEMP/hb_spawner.sh" 2>/dev/null || true
+  sleep 0.2
+  echo '{"hook_event_name":"Stop"}' >> "$hooks_file"
+  local bpid dead=0
+  bpid="$(cat "$TEST_TEMP/hb_pid")"
+  process_exited "$bpid" && dead=1
+  # Unconditional reap: a live straggler holds bats' fd and hangs the file.
+  kill "$bpid" 2>/dev/null || true
+  [ "$dead" = 1 ] || { echo "bridge outlived its dead parent"; return 1; }
+  [ ! -f "$TEST_TEMP/hook_ran" ] || { echo "orphan bridge executed a hook"; return 1; }
+}

@@ -817,3 +817,64 @@ EOF
   kill "$spid" 2>/dev/null || true
   [ "$dead" = 1 ] || { echo "spinner loop outlived its dead parent"; return 1; }
 }
+
+# ── Terminal hyperlinks (OSC 8) ───────────────────────────────────────────────
+# Clickable links where the terminal supports OSC 8 (iTerm2, VS Code, WezTerm,
+# Ghostty, kitty, GNOME/VTE), a bare clickable URL everywhere else. Conservative
+# allow-list so an unknown terminal / multiplexer never gets escape garbage.
+
+@test "osc8: detected for known terminals via TERM_PROGRAM" {
+  _is_tty() { return 0; }
+  for prog in iTerm.app vscode WezTerm ghostty Hyper Tabby rio; do
+    TERM_PROGRAM="$prog" run _supports_osc8
+    assert_success
+  done
+}
+
+@test "osc8: detected via kitty / wezterm / vte env when TERM_PROGRAM is unset" {
+  _is_tty() { return 0; }
+  unset TERM_PROGRAM
+  ( KITTY_WINDOW_ID=1 run _supports_osc8; assert_success )
+  ( WEZTERM_PANE=0 run _supports_osc8; assert_success )
+  ( VTE_VERSION=6003 run _supports_osc8; assert_success )
+}
+
+@test "osc8: NOT detected for Apple Terminal or an unknown terminal" {
+  _is_tty() { return 0; }
+  unset KITTY_WINDOW_ID WEZTERM_PANE VTE_VERSION
+  TERM_PROGRAM="Apple_Terminal" run _supports_osc8
+  assert_failure
+  TERM_PROGRAM="" run _supports_osc8
+  assert_failure
+}
+
+@test "osc8: an old VTE (<5000) is not treated as capable" {
+  _is_tty() { return 0; }
+  unset TERM_PROGRAM KITTY_WINDOW_ID WEZTERM_PANE
+  VTE_VERSION=4002 run _supports_osc8
+  assert_failure
+}
+
+@test "osc8: never emitted to a non-TTY (no escapes into pipes)" {
+  _is_tty() { return 1; }   # piped / redirected
+  TERM_PROGRAM="iTerm.app" run _supports_osc8
+  assert_failure
+}
+
+@test "hyperlink: wraps text in an OSC 8 sequence when supported" {
+  _supports_osc8() { return 0; }
+  run _hyperlink "https://cleat.sh/x" "click me"
+  assert_success
+  # OSC 8 opener with the URL, the visible text, and the closer — real ESC bytes.
+  assert_output --partial "$(printf '\033]8;;https://cleat.sh/x\033\\')"
+  assert_output --partial "click me"
+  assert_output --partial "$(printf '\033]8;;\033\\')"
+}
+
+@test "hyperlink: falls back to the bare URL (clickable via autodetect) when unsupported" {
+  _supports_osc8() { return 1; }
+  run _hyperlink "https://cleat.sh/x" "click me"
+  assert_success
+  assert_output "https://cleat.sh/x"          # the full URL, not the short text
+  refute_output --partial "$(printf '\033]8;;')"   # no OSC 8 escapes
+}

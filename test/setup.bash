@@ -139,7 +139,13 @@ _common_teardown() {
 # bugs that `-e` would surface at runtime but sourced tests can't.
 source_cli() {
   local _cli_tmp
-  _cli_tmp=$(mktemp)
+  # Write into the per-test TEST_TEMP dir (a fresh `mktemp -d`), NOT a
+  # top-level `mktemp` file. On overlayfs-backed /tmp (Linux CI containers),
+  # a recycled `mktemp` name can return a stale page-cache view of a just-
+  # deleted file, so `source` reads OLD CLI content. That non-determinism
+  # made the mutation harness flap (a mutated bin/cleat sourced as pristine →
+  # spurious MISSED). A brand-new path under TEST_TEMP avoids inode recycling.
+  _cli_tmp="${TEST_TEMP:-$(mktemp -d)}/cleat-source.sh"
   # Strip `set -euo pipefail` entirely for sourced tests. Keeping any of
   # -e/-u/-o pipefail introduces subtle test-order pollution in bats because
   # function overrides and global state interact with bash's strict checks

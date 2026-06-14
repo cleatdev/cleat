@@ -216,6 +216,186 @@ teardown() { _common_teardown; }
   refute_output --partial "promised"
 }
 
+# ── Docker Desktop memory advisory (sized for ~4 parallel sessions) ───────────
+# A box and a worktree are the same thing here — one session, one ~4g ceiling —
+# so the advisory sizes the VM for the realistic max of ~4 in parallel: 4 × ~4g
+# = 16 GiB, capped at half the host's RAM. It fires while the VM is below that,
+# names the concrete memory to set + the click-path + the machine's safe max,
+# and recurs daily (no once-ever stamp) until fixed. Host RAM unknown → an
+# absolute 8 GiB floor. Docker-Desktop-only (a native engine's VM is the host).
+
+@test "pressure: advises a concrete VM size + click-path + safe max when the VM is too small" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }            # no bloat
+  _docker_vm_memory() { echo "8589934592"; }            # 8 GiB VM
+  _host_total_memory() { echo "34359738368"; }          # 32 GiB Mac → rec 16, max ~24
+  _running_memory_limits_sum() { echo "0"; }            # no overload
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "Docker VM memory is"
+  assert_output --partial "16 GB"          # recommended (4 sessions × ~4g)
+  assert_output --partial "24 GB"          # safe max (~3/4 of the 32 GB host)
+  assert_output --partial "Resources"      # the click-path
+  assert_output --partial "Swap"
+  assert_output --partial "VirtioFS"
+}
+
+@test "pressure: the VM advisory is an amber warning, not a neutral blue note (it's crucial)" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }
+  _host_total_memory() { echo "34359738368"; }
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  # Render the amber `!` marker from the sourced AMBER var (real ESC bytes, not
+  # the literal "\033…" string) and assert the rendered output carries it.
+  local amber_bang; amber_bang="$(printf '%b!' "$AMBER")"
+  assert_output --partial "$amber_bang"    # warn marker (amber !), not the blue info ▸
+}
+
+@test "pressure: a blank line follows the VM advisory (separates it from the news/bring-up)" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }
+  _host_total_memory() { echo "34359738368"; }
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  # $(...) strips only the FINAL newline, so the trailing `echo ""` survives as a
+  # blank line immediately before SENTINEL. Dropping it makes VirtioFS abut SENTINEL.
+  local out cls
+  out="$( { _maybe_check_docker_pressure; printf 'SENTINEL\n'; } )"
+  cls="$(printf '%s\n' "$out" | awk '
+    /^SENTINEL$/ { print (p ~ /^[[:space:]]*$/ ? "BLANK" : "NOTBLANK"); f=1; exit }
+    { p=$0 }
+    END { if (!f) print "NOTFOUND" }')"
+  run echo "$cls"
+  assert_output "BLANK"
+}
+
+@test "pressure: recommendation is capped at half the host RAM on a smaller machine" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "4294967296"; }            # 4 GiB VM
+  _host_total_memory() { echo "17179869184"; }          # 16 GiB Mac → rec = half = 8, max ~12
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "8 GB"           # recommended = half of a 16 GB host (not the 16 GB target)
+  assert_output --partial "12 GB"          # safe max (~3/4 of 16 GB)
+}
+
+@test "pressure: no advisory when the VM already meets the recommendation" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }            # 8 GiB VM
+  _host_total_memory() { echo "17179869184"; }          # 16 GiB Mac → rec = half = 8 GiB (met)
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  refute_output --partial "Docker VM memory is"
+}
+
+@test "pressure: no advisory for a VM at/above the 16 GiB target even on a huge host" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "17179869184"; }           # 16 GiB VM (meets the 4-session target)
+  _host_total_memory() { echo "137438953472"; }         # 128 GiB host (half is huge, but target is met)
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  refute_output --partial "Docker VM memory is"
+}
+
+@test "pressure: recurs while bad (no once-ever stamp) — shows again after the daily re-arm" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }
+  _host_total_memory() { echo "34359738368"; }
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure                       # first daily check
+  assert_output --partial "Docker VM memory is"
+  rm -f "$PRESSURE_CHECK_FILE"                            # next day re-arms the check
+  run _maybe_check_docker_pressure
+  assert_output --partial "Docker VM memory is"           # still advises — not once-ever
+}
+
+@test "pressure: falls back to an 8 GiB floor (no host-specific max) when host RAM is unknown" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "7800000000"; }            # ~7.3 GiB, under the 8 GiB fallback
+  _host_total_memory() { echo ""; }                      # host RAM unreadable
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "Docker VM memory is"
+  assert_output --partial "16 GB"                         # falls back to the target
+  refute_output --partial "max ≈"                         # no host-specific max when host unknown
+  refute_output --partial "of your"                       # no "of your N GB" when host unknown
+}
+
+@test "pressure: no advisory off Docker Desktop (native engine has no resizable VM)" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }
+  _host_total_memory() { echo "34359738368"; }
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 1; }                    # native Linux engine
+  run _maybe_check_docker_pressure
+  assert_success
+  refute_output --partial "Docker VM memory is"
+}
+
+@test "pressure: overload takes precedence but STILL prints the grow-the-VM fix" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }            # small AND overcommitted
+  _host_total_memory() { echo "34359738368"; }
+  _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB promised
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "promised 40 GB"
+  assert_output --partial "Resources"           # the how-to is appended to the overload notice
+  refute_output --partial "roomier VM"           # but NOT the 2b undersized-VM line (overload returns first)
+}
+
+@test "pressure: overload off Docker Desktop warns without the (inapplicable) Docker Desktop steps" {
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }
+  _host_total_memory() { echo "34359738368"; }
+  _running_memory_limits_sum() { echo "42949672960"; }
+  _is_docker_desktop() { return 1; }                    # native engine — no slider
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "promised 40 GB"
+  refute_output --partial "Resources"        # no Docker Desktop click-path on a native engine
+}
+
+@test "pressure: a non-numeric running-limits sum does not abort the VM advisory" {
+  # v0.16.1 folded v0.16.0's standalone `[[ $sum =~ ^[0-9]+$ ]] || return 0` into
+  # the overload `if`. A non-numeric/empty sum must therefore NOT overload AND
+  # must NOT abort the whole check — the undersized-VM advisory still fires.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }            # 8 GiB VM (undersized)
+  _host_total_memory() { echo "34359738368"; }          # 32 GiB host
+  _running_memory_limits_sum() { echo ""; }             # non-numeric / unknown
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "Docker VM memory is"   # 2b advisory still reached
+  refute_output --partial "promised"              # overload must NOT fire on a non-numeric sum
+}
+
 @test "pressure: throttled to once per interval" {
   _is_tty() { return 0; }
   _cleat_prunable_stats() { printf '7\t8192'; }

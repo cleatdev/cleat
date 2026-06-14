@@ -125,3 +125,38 @@ teardown() { _common_teardown; }
   run exec_claude "test-ctr" --dangerously-skip-permissions
   assert_output --partial "exited with code 42"
 }
+
+# ── OOM detection + guidance (_maybe_explain_oom) ─────────────────────────────
+# A box that hits its memory ceiling OOM-kills (no swap, by design). The kill
+# is otherwise an unexplained crash; name it and say how to fix it. Two signals:
+# the cgroup OOM flag (State.OOMKilled) or exit 137 (SIGKILL).
+
+@test "oom: explains an OOM flagged by the container (State.OOMKilled=true)" {
+  docker() { [[ "$1" == "inspect" ]] && { echo "true"; return 0; }; return 0; }
+  run _maybe_explain_oom "test-ctr" 1 2147483648   # 2 GiB box
+  assert_success
+  assert_output --partial "Out of memory"
+  assert_output --partial "2 GB"          # the box-limit note
+  assert_output --partial "memory = 8g"   # raise-memory guidance
+  assert_output --partial "maxWorkers"    # fewer-workers guidance
+}
+
+@test "oom: infers OOM from exit 137 (SIGKILL) even when inspect reports false" {
+  docker() { [[ "$1" == "inspect" ]] && { echo "false"; return 0; }; return 0; }
+  run _maybe_explain_oom "test-ctr" 137 ""
+  assert_success
+  assert_output --partial "Out of memory"
+}
+
+@test "oom: stays silent on a non-OOM failure (other non-zero exit, not OOM-killed)" {
+  docker() { [[ "$1" == "inspect" ]] && { echo "false"; return 0; }; return 0; }
+  run _maybe_explain_oom "test-ctr" 1 2147483648
+  assert_success
+  assert_output ""
+}
+
+@test "oom: a session SIGKILLed (exit 137) surfaces the guidance through exec_claude" {
+  export DOCKER_EXIT_CODE=137
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_output --partial "Out of memory"
+}

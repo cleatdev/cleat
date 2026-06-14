@@ -34,12 +34,41 @@ teardown() { _common_teardown; }
   assert_output "$VERSION 1"
 }
 
-@test "whats-new: copy carries the try-command and the changelog link" {
+@test "whats-new: copy carries the try-command and the version-anchored changelog link" {
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
   assert_output --partial "cleat start dev"
-  assert_output --partial "cleat.sh/changelog"
+  # Anchored to the feature's release section (#v0.14.0), not the bare changelog
+  # page — the /changelog page IDs each release by its version.
+  assert_output --partial "cleat.sh/changelog#v0.14.0"
+}
+
+@test "whats-new: the changelog link is a clickable OSC 8 hyperlink in supporting terminals" {
+  _is_tty() { return 0; }
+  _supports_osc8() { return 0; }   # e.g. iTerm2 / VS Code / WezTerm
+  run _maybe_show_release_highlight
+  assert_success
+  # OSC 8 link target is the full https URL (the visible label can be the short form).
+  assert_output --partial "$(printf '\033]8;;https://cleat.sh/changelog#v0.14.0\033\\')"
+}
+
+@test "whats-new: the try-command and changelog sit on their own lines, not crammed onto the prose" {
+  # The cramped layout tacked "Try: cleat start dev · cleat.sh/changelog" onto
+  # the end of the description line. They now each get a labelled line. Falsify
+  # the run-on layout: the line that holds the try-command must not also hold the
+  # prose tail, and the changelog must not share the try-command's line.
+  _is_tty() { return 0; }
+  local out; out="$(_maybe_show_release_highlight)"
+  local try_line cl_line
+  try_line="$(printf '%s\n' "$out" | grep -F 'cleat start dev')"
+  cl_line="$(printf '%s\n' "$out" | grep -F 'cleat.sh/changelog')"
+  # The try-command is not buried in the prose sentence.
+  printf '%s' "$try_line" | grep -qF "reaches the other" \
+    && { echo "try-command crammed onto the prose line"; return 1; } || true
+  # The changelog link is on its own line, not appended after the try-command.
+  printf '%s' "$cl_line" | grep -qF 'cleat start dev' \
+    && { echo "changelog crammed onto the try-command line"; return 1; } || true
 }
 
 @test "whats-new: a trailing blank separates the highlight from the bring-up block" {

@@ -4,7 +4,7 @@
 # process swap-thrashed the whole VM and froze every concurrent session at
 # once (observed live: 1 GiB VM swap 78% consumed, 7 kernel OOM kills). The
 # limit is now resolved per box — project [resources] > global [resources] >
-# a VM-derived default clamped to [2g, 8g] — and swap is pinned to the same
+# a VM-derived default clamped to [4g, 8g] — and swap is pinned to the same
 # value so a runaway box OOMs inside its own cgroup.
 
 load "../setup"
@@ -152,16 +152,16 @@ teardown() { _common_teardown; }
 
 # ── VM-derived default ───────────────────────────────────────────────────────
 
-@test "resources: default is a quarter of the VM, floored at 2g" {
-  _docker_vm_memory() { echo "8589934592"; }   # 8 GiB VM → quarter = 2g
-  run _default_box_memory
-  assert_output "2g"
-}
-
-@test "resources: default scales with a bigger VM" {
-  _docker_vm_memory() { echo "17179869184"; }  # 16 GiB VM → 4g
+@test "resources: default is a quarter of the VM, floored at 4g" {
+  _docker_vm_memory() { echo "8589934592"; }   # 8 GiB VM → quarter 2g → floor 4g
   run _default_box_memory
   assert_output "4g"
+}
+
+@test "resources: default scales with a bigger VM (between floor and cap)" {
+  _docker_vm_memory() { echo "25769803776"; }  # 24 GiB VM → quarter 6g (strictly 4<6<8)
+  run _default_box_memory
+  assert_output "6g"
 }
 
 @test "resources: default is capped at 8g on huge VMs" {
@@ -174,6 +174,31 @@ teardown() { _common_teardown; }
   _docker_vm_memory() { echo "garbage"; }
   run _default_box_memory
   assert_output "2g"
+}
+
+# ── host RAM detection (_host_total_memory) ──────────────────────────────────
+# Exercises the REAL Linux /proc/meminfo path (not a function override): reading
+# MemTotal must yield a plain integer of bytes. `awk '{print $2 * 1024}'` would
+# emit scientific notation (e.g. 3.36e+10) for real RAM sizes, which fails the
+# ^[0-9]+$ check every consumer uses → host RAM silently treated as unknown.
+
+@test "resources: _host_total_memory reads /proc/meminfo as a plain integer of bytes" {
+  uname() { echo "Linux"; }   # force the /proc/meminfo branch regardless of CI host OS
+  local mi="$TEST_TEMP/meminfo"
+  printf 'MemTotal:       32910736 kB\nMemFree:         1048576 kB\n' > "$mi"
+  _MEMINFO_FILE="$mi" run _host_total_memory
+  assert_success
+  # Plain integer (no sci-notation), and exactly kB * 1024.
+  [[ "$output" =~ ^[0-9]+$ ]] || { echo "not a plain integer: '$output'"; return 1; }
+  assert_output "33700593664"
+}
+
+@test "resources: _host_total_memory is empty when meminfo is unreadable" {
+  uname() { echo "Linux"; }
+  _MEMINFO_FILE="$TEST_TEMP/does-not-exist"
+  run _host_total_memory
+  assert_success
+  assert_output ""
 }
 
 # ── cpus ─────────────────────────────────────────────────────────────────────

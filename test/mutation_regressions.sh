@@ -43,6 +43,9 @@ INIT_RECREATE_BATS="$REPO_ROOT/test/unit/init_recreate_check.bats"
 ARCH_BATS="$REPO_ROOT/test/unit/arch.bats"
 RESOURCES_BATS="$REPO_ROOT/test/unit/resources.bats"
 PRUNE_BATS="$REPO_ROOT/test/unit/prune.bats"
+CLAUDE_JSON_BATS="$REPO_ROOT/test/unit/claude_json.bats"
+CREDENTIALS_BATS="$REPO_ROOT/test/unit/credentials.bats"
+IMAGE_REBUILD_BATS="$REPO_ROOT/test/unit/image_rebuild_check.bats"
 DOCKER_COMMANDS_BATS="$REPO_ROOT/test/unit/docker_commands.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
@@ -1121,11 +1124,20 @@ SED
 try "vnext_node_heap_pin" "pins node's heap" "$CLI" "$RESOURCES_BATS"
 
 # vnext — the VM-derived default must be a quarter of the VM (clamped), not
-# the whole of it. Break the divisor: the scaling test (16 GiB VM → 4g) fails.
+# the whole of it. Break the divisor: the scaling test (24 GiB VM → 6g, which
+# is strictly between the 4g floor and 8g cap) sees 8g (24 → capped) and fails.
 cat > "$SED_TMP" << 'SED'
 s|vm_bytes / 4 / 1073741824|vm_bytes / 1073741824|
 SED
 try "vnext_memory_default_quarter" "default scales with a bigger VM" "$CLI" "$RESOURCES_BATS"
+
+# 2026-06-14 — the default ceiling is floored at 4g (a 1M-context session is too
+# tight at 2g). Defeat the floor (small VMs fall through to the raw quarter, 2g):
+# the "floored at 4g" test sees 2g and fails.
+cat > "$SED_TMP" << 'SED'
+s|quarter_gb < 4|quarter_gb < 0|
+SED
+try "bugfix_memory_floor_4g" "floored at 4g" "$CLI" "$RESOURCES_BATS"
 
 # vnext — prune must never remove the CURRENT version's prebuilt tag. Drop
 # the guard: the "never the current version" test fails.
@@ -1144,7 +1156,7 @@ try "vnext_pressure_bloat_threshold" "offers prune when bloat passes" "$CLI" "$P
 # vnext — the overload notice must compare promised limits to the VM size.
 # Invert the comparison out of existence: the overcommit warning test fails.
 cat > "$SED_TMP" << 'SED'
-s|if (( sum > vm_bytes )); then|if (( sum > vm_bytes * 1000 )); then|
+s|(( sum > vm_bytes ))|(( sum > vm_bytes * 1000 ))|
 SED
 try "vnext_pressure_overcommit" "warns when running limits overcommit" "$CLI" "$PRUNE_BATS"
 
@@ -1361,6 +1373,187 @@ cat > "$SED_TMP" << 'SED'
 s|kill -0 "\$_hb_parent" 2>/dev/null \|\| { _hook_bridge_cleanup; exit 0; }|true|
 SED
 try "vnext_hook_bridge_liveness" "orphaned bridge exits without executing late events" "$CLI" "$HOOKS_BATS"
+
+# ── 2026-06 bugfix round (s1/s2 screenshots) ─────────────────────────────────
+
+# The container is always a native install, so the per-project .claude.json must
+# force installMethod=native (the host value/absence would otherwise leak in and
+# `claude doctor` warns "install method is unknown"). Flip it to "unknown": the
+# claude_json test sees the wrong value and fails.
+cat > "$SED_TMP" << 'SED'
+s|installMethod: "native"|installMethod: "unknown"|
+SED
+try "bugfix_installmethod_native" "forces installMethod=native even when" "$CLI" "$CLAUDE_JSON_BATS"
+
+# macOS keychain → box credential seed must actually write the file. Neuter the
+# move: the "writes the keychain blob" test sees no creds file and fails.
+cat > "$SED_TMP" << 'SED'
+s|mv -f "\$tmp" "\$cred" 2>/dev/null|false|
+SED
+try "bugfix_keychain_seed_write" "writes the keychain blob" "$CLI" "$CREDENTIALS_BATS"
+
+# Seeding must NEVER clobber an existing (possibly fresher) in-box token. Drop
+# the early-return guard: the "never clobbers" test sees its token overwritten.
+cat > "$SED_TMP" << 'SED'
+/\[\[ -s "\$cred" \]\] && return 0/d
+SED
+try "bugfix_keychain_no_clobber" "never clobbers an existing" "$CLI" "$CREDENTIALS_BATS"
+
+# Seeding must validate the blob is a JSON object (never write an error string
+# into the creds file). Force the validation true: the "refuses a non-JSON"
+# test sees a poisoned creds file written and fails.
+cat > "$SED_TMP" << 'SED'
+s|if \$ok; then|if true; then|
+SED
+try "bugfix_keychain_validate_json" "refuses to write a non-JSON-object blob" "$CLI" "$CREDENTIALS_BATS"
+
+# Seeding is macOS-only (Linux already has the file via the dir mount). Make the
+# call site ignore the OS gate: the "no-op off macOS" test sees a file written.
+cat > "$SED_TMP" << 'SED'
+s#_is_macos || return 0#true || return 0#
+SED
+try "bugfix_keychain_macos_guard" "no-op off macOS" "$CLI" "$CREDENTIALS_BATS"
+
+# An outdated image is refreshed by PULLING the released image for this version
+# (download), not the old unconditional local rebuild. Revert to cmd_rebuild:
+# the accept-path test sees no PULL_CALLED and fails.
+cat > "$SED_TMP" << 'SED'
+s#_do_pull "\$VERSION" || _do_build#cmd_rebuild#
+SED
+try "bugfix_image_outdated_pulls" "PULLS this version on accept" "$CLI" "$IMAGE_REBUILD_BATS"
+
+# OOM guidance fires on exit 137 (SIGKILL — the kernel OOM-killer's signature).
+# Break the 137 arm: the "infers OOM from exit 137" test sees no guidance.
+cat > "$SED_TMP" << 'SED'
+s|"\$rc" == "137"|"\$rc" == "138"|
+SED
+try "bugfix_oom_exit137_signal" "infers OOM from exit 137" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# OOM guidance also fires on the cgroup OOM flag (State.OOMKilled). Break that
+# arm: the "explains an OOM flagged by the container" test sees no guidance.
+cat > "$SED_TMP" << 'SED'
+s|"\$oomkilled" == "true"|"\$oomkilled" == "nope"|
+SED
+try "bugfix_oom_oomkilled_signal" "explains an OOM flagged by the container" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The advisory sizes the VM for ~4 parallel sessions (4 × ~4g = 16g target).
+# Shrink the target so a too-small VM looks fine: the "advises a concrete VM
+# size" test sees no advisory and fails.
+cat > "$SED_TMP" << 'SED'
+s|_PRESSURE_TARGET_VM_GB=16|_PRESSURE_TARGET_VM_GB=2|
+SED
+try "bugfix_advisory_target_sessions" "advises a concrete VM size" "$CLI" "$PRUNE_BATS"
+
+# The recommendation is capped at HALF the host's RAM (don't recommend a VM the
+# machine can't back). Drop the cap so it ignores the host: the "capped at half
+# the host RAM" test sees the 16g target instead of the 8g half and fails.
+cat > "$SED_TMP" << 'SED'
+/(( half < rec )) && rec=\$half/d
+SED
+try "bugfix_advisory_half_host_cap" "capped at half the host RAM" "$CLI" "$PRUNE_BATS"
+
+# When host RAM is unknown, the advisory falls back to an absolute 8 GiB floor.
+# Force that floor to 0: the host-unknown fallback test sees no advisory.
+cat > "$SED_TMP" << 'SED'
+s|vm_bytes < _PRESSURE_VM_ADVISORY_BYTES|vm_bytes < 0|
+SED
+try "bugfix_advisory_fallback_floor" "falls back to an 8 GiB floor" "$CLI" "$PRUNE_BATS"
+
+# The advisory + its grow-the-VM fix are Docker-Desktop-only (a native engine
+# has no resizable VM). Neuter the gate: the "off Docker Desktop" test sees the
+# advisory fire.
+cat > "$SED_TMP" << 'SED'
+s#_is_docker_desktop 2>/dev/null || return 0#true || return 0#
+SED
+try "bugfix_advisory_desktop_gate" "no advisory off Docker Desktop" "$CLI" "$PRUNE_BATS"
+
+# The overload notice must ALSO print the concrete grow-the-VM fix, not just the
+# terse warning. Delete the fix call: the overload test loses the click-path.
+cat > "$SED_TMP" << 'SED'
+/_print_docker_vm_fix "\$host_bytes" "\$rec_gb"/d
+SED
+try "bugfix_advisory_overload_howto" "STILL prints the grow-the-VM fix" "$CLI" "$PRUNE_BATS"
+
+# The fix names the machine's safe max (~3/4 of host RAM). Zero it out: the
+# "concrete VM size + safe max" test no longer sees the 24 GB max and fails.
+cat > "$SED_TMP" << 'SED'
+s|host_bytes \* 3 / 4|host_bytes * 0|
+SED
+try "bugfix_advisory_safe_max" "advises a concrete VM size" "$CLI" "$PRUNE_BATS"
+
+# The VM advisory must be an amber WARNING (crucial), not a neutral blue info
+# note. Revert it to info: the amber-marker test loses the amber `!` and fails.
+cat > "$SED_TMP" << 'SED'
+s|warn "Docker VM memory is|info "Docker VM memory is|
+SED
+try "bugfix_advisory_amber" "amber warning" "$CLI" "$PRUNE_BATS"
+
+# The multi-line advisory owns a trailing blank so it doesn't abut the news /
+# bring-up. Delete the echo "" after the VirtioFS line: the "blank line follows"
+# test sees the content abut the sentinel and fails.
+cat > "$SED_TMP" << 'SED'
+/VirtioFS/{n;d;}
+SED
+try "bugfix_advisory_trailing_blank" "blank line follows the VM advisory" "$CLI" "$PRUNE_BATS"
+
+# The release highlight's changelog link is on its own labelled line. Delete it:
+# the "version-anchored changelog link" test loses the link entirely.
+cat > "$SED_TMP" << 'SED'
+/Changelog:/d
+SED
+try "bugfix_highlight_changelog_line" "version-anchored changelog link" "$CLI" "$WHATS_NEW_BATS"
+
+# That changelog link must deep-link to the feature's release section (#v0.14.0),
+# not the bare page. Strip the anchor: the "version-anchored" test fails.
+cat > "$SED_TMP" << 'SED'
+s|cleat.sh/changelog#v0.14.0|cleat.sh/changelog|
+SED
+try "bugfix_highlight_changelog_anchor" "version-anchored changelog link" "$CLI" "$WHATS_NEW_BATS"
+
+# _hyperlink must emit a real OSC 8 sequence in supporting terminals. Force the
+# fallback branch: the "wraps text in an OSC 8 sequence" test loses the escapes.
+cat > "$SED_TMP" << 'SED'
+s|if _supports_osc8; then|if false; then|
+SED
+try "bugfix_hyperlink_osc8" "wraps text in an OSC 8 sequence" "$CLI" "$TERMINAL_UX_BATS"
+
+# The fallback must print the full URL (autodetect-clickable), not the short
+# label. Swap it to the label: the "falls back to the bare URL" test fails.
+cat > "$SED_TMP" << 'SED'
+s|printf '%s' "$url"|printf '%s' "$text"|
+SED
+try "bugfix_hyperlink_fallback" "falls back to the bare URL" "$CLI" "$TERMINAL_UX_BATS"
+
+# OSC 8 must never be emitted to a non-TTY (no escapes into pipes). Drop the TTY
+# guard in _supports_osc8: the "never emitted to a non-TTY" test then succeeds.
+cat > "$SED_TMP" << 'SED'
+s#_is_tty || return 1#true#
+SED
+try "bugfix_osc8_tty_guard" "never emitted to a non-TTY" "$CLI" "$TERMINAL_UX_BATS"
+
+# The OSC 8 capability allow-list must actually match known terminals. Break the
+# iTerm.app entry: the "detected for known terminals" test fails.
+cat > "$SED_TMP" << 'SED'
+s#iTerm.app#nope.app#
+SED
+try "bugfix_osc8_allowlist" "detected for known terminals" "$CLI" "$TERMINAL_UX_BATS"
+
+# _host_total_memory must scale kB in bash, not `awk '{print $2 * 1024}'` (which
+# emits scientific notation for real RAM sizes → fails ^[0-9]+$ → host treated as
+# unknown). Revert to the awk multiply: the plain-integer test fails.
+cat > "$SED_TMP" << 'SED'
+s|print $2; exit|print $2 * 1024; exit|
+SED
+try "bugfix_host_mem_awk_integer" "reads /proc/meminfo as a plain integer" "$CLI" "$RESOURCES_BATS"
+
+# A non-numeric running-limits sum must NOT abort the pressure check before the
+# undersized-VM advisory (v0.16.1 folded the old standalone guard into the
+# overload if). Re-add a hard `|| return 0` after the sum read: the advisory is
+# skipped on a non-numeric sum and the regression test fails.
+cat > "$SED_TMP" << 'SED'
+s#sum="$(_running_memory_limits_sum)"#&; [[ "$sum" =~ ^[0-9]+$ ]] || return 0#
+SED
+try "bugfix_pressure_sum_guard_folded" "non-numeric running-limits sum" "$CLI" "$PRUNE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

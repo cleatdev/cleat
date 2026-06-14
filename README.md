@@ -176,7 +176,7 @@ cleat start          # start the container
 cleat login          # opens a browser URL to sign in
 ```
 
-Credentials are saved to `~/.claude` on your host and shared across all containers automatically. Log in once, every container picks it up.
+Credentials are saved to `~/.claude` on your host and shared across all containers automatically. Log in once, every container picks it up. On macOS, where Claude keeps its login in the **Keychain** rather than a file, Cleat bridges that token into the box for you on launch — so a login you did on the host (not just inside a box) carries in too.
 
 ### 2. Use it
 
@@ -387,7 +387,7 @@ named sandbox for the project (default: `main`) — see **Boxes** above.
 Containers run with these protections by default:
 
 - `--pids-limit 4096` -- prevents fork bombs from affecting the host
-- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 2-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Override with a `[resources]` section (`memory = 4g`, optionally `cpus = 2`) in `~/.config/cleat/config` or `<project>/.cleat`; repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing
+- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 4-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Override with a `[resources]` section (`memory = 4g`, optionally `cpus = 2`) in `~/.config/cleat/config` or `<project>/.cleat`; repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing. If a session is ever OOM-killed (often a test runner spawning one worker per host core), Cleat says so and how to fix it — raise `memory`, cap workers (`jest --maxWorkers=2`), or set `cpus`
 - `--init` -- a real PID 1 reaps orphaned processes, so long sessions can't wedge on zombie buildup and `cleat stop` is instant
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
 - Node.js bookworm-slim base image with minimal attack surface

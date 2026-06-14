@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.16.0"
+VERSION="0.16.1"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below — not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="0.16.0"
+RELEASE_HIGHLIGHT_VERSION="0.16.1"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -86,6 +86,7 @@ YELLOW='\033[0;33m'
 AMBER='\033[38;5;214m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+UNDERLINE='\033[4m'
 RESET='\033[0m'
 
 header() {
@@ -132,6 +133,38 @@ _is_tty() { [[ -t 1 ]]; }
 _has_unicode() {
   local lang="${LANG:-}${LC_ALL:-}${LC_CTYPE:-}"
   [[ "$lang" == *UTF-8* ]] || [[ "$lang" == *utf8* ]]
+}
+
+# True when the terminal is known to render OSC 8 hyperlinks (and we're on a
+# TTY). Deliberately a conservative allow-list: a miss just falls back to a bare
+# clickable URL (see _hyperlink), so we never risk escape garbage on an unknown
+# or old terminal, a multiplexer, or piped output. Covers the terminals the
+# maintainer's audience actually uses; Apple Terminal is intentionally absent
+# (it has no OSC 8 but autodetects bare URLs itself).
+_supports_osc8() {
+  _is_tty || return 1
+  case "${TERM_PROGRAM:-}" in
+    iTerm.app|vscode|WezTerm|ghostty|Hyper|Tabby|rio) return 0 ;;
+  esac
+  [[ -n "${KITTY_WINDOW_ID:-}" || -n "${WEZTERM_PANE:-}" || -n "${GHOSTTY_BIN_DIR:-}" ]] && return 0
+  # GNOME VTE 0.50+ (VTE_VERSION ≥ 5000) added OSC 8 support.
+  [[ "${VTE_VERSION:-}" =~ ^[0-9]+$ ]] && (( ${VTE_VERSION:-0} >= 5000 )) && return 0
+  return 1
+}
+
+# Render a terminal hyperlink. In OSC-8-capable terminals (iTerm2, VS Code,
+# WezTerm, Ghostty, kitty, GNOME/VTE…) the short TEXT becomes a clickable link to
+# URL; elsewhere it degrades to the bare URL, which terminals like Apple Terminal
+# autodetect and make clickable on their own (so it's always at least copyable).
+# OSC 8 format:  ESC ] 8 ; ; URL  ST   TEXT   ESC ] 8 ; ; ST     (ST = ESC \).
+# Prints with no trailing newline; callers add color/underline around it.
+_hyperlink() {
+  local url="$1" text="${2:-$1}"
+  if _supports_osc8; then
+    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$text"
+  else
+    printf '%s' "$url"
+  fi
 }
 
 spin() {
@@ -404,6 +437,67 @@ _is_docker_desktop() {
   docker info 2>/dev/null | grep -q "Operating System:.*Docker Desktop"
 }
 
+# True on macOS. macOS keeps Claude Code's OAuth login in the login Keychain,
+# not in ~/.claude/.credentials.json, so the shared ~/.claude mount carries no
+# token and a freshly-auth'd host still re-prompts inside the box. The seed
+# helpers below bridge that gap. Overridable in tests.
+_is_macos() {
+  [[ "${OSTYPE:-}" == darwin* ]] || [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]
+}
+
+# Read Claude Code's OAuth credential blob from the macOS login Keychain. Claude
+# stores it as a generic-password under the service "Claude Code-credentials"
+# (older builds: "Claude Code"); `-w` prints just the secret (the JSON blob).
+# Prints the blob on stdout, nothing on failure. `security` may pop a one-time
+# Keychain access dialog the first time — once the user clicks "Always Allow"
+# it's silent; a denied/headless read (errSecInteractionNotAllowed over SSH)
+# simply fails and we fall through. Overridable in tests.
+_macos_keychain_credentials() {
+  command -v security &>/dev/null || return 1
+  local svc blob
+  for svc in "Claude Code-credentials" "Claude Code"; do
+    blob="$(security find-generic-password -s "$svc" -w 2>/dev/null)" || continue
+    [[ -n "$blob" ]] && { printf '%s' "$blob"; return 0; }
+  done
+  return 1
+}
+
+# On macOS, materialize the Keychain-stored OAuth credential into
+# ~/.claude/.credentials.json (the path Claude reads on Linux), so the box —
+# which only sees the mounted ~/.claude dir, never the Keychain — starts
+# authenticated instead of re-prompting. Only when that file is absent/empty:
+# once a box has a token it refreshes its own (the refresh token is long-lived),
+# so we never clobber a fresher in-box token with a staler Keychain copy. The
+# blob is validated as a JSON object and written 0600. No-op off macOS, when the
+# Keychain has nothing, or when the file already exists (Linux hosts keep it
+# there already — this never runs for them). Sets _SEEDED_CREDS=1 on a write.
+_SEEDED_CREDS=0
+_seed_macos_credentials() {
+  _is_macos || return 0
+  local cred="${HOME}/.claude/.credentials.json"
+  [[ -s "$cred" ]] && return 0
+  local blob
+  blob="$(_macos_keychain_credentials)" || return 0
+  [[ -n "$blob" ]] || return 0
+  mkdir -p "${HOME}/.claude" 2>/dev/null || return 0
+  local tmp="${cred}.tmp.$$"
+  ( umask 077; printf '%s' "$blob" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  # Never write a non-JSON-object (e.g. an error string) into the creds file.
+  local ok=false
+  if command -v jq &>/dev/null; then
+    jq -e 'type=="object"' "$tmp" >/dev/null 2>&1 && ok=true
+  else
+    _looks_like_json_object "$tmp" && ok=true
+  fi
+  if $ok; then
+    chmod 600 "$tmp" 2>/dev/null || true
+    if mv -f "$tmp" "$cred" 2>/dev/null; then _SEEDED_CREDS=1; else rm -f "$tmp" 2>/dev/null; fi
+  else
+    rm -f "$tmp" 2>/dev/null
+  fi
+  return 0
+}
+
 _host_connectivity_args() {
   local args=()
   if ! _is_docker_desktop 2>/dev/null; then
@@ -578,12 +672,35 @@ _docker_vm_memory() {
   docker info --format '{{.MemTotal}}' 2>/dev/null || true
 }
 
+# Total physical RAM of the HOST machine in BYTES, empty when unknown. Used to
+# judge whether the Docker Desktop VM is sized sensibly *relative to the host*
+# (concept/22: a VM of ~half the host RAM). macOS: `sysctl hw.memsize` (already
+# bytes). Linux: read MemTotal (kB) from /proc/meminfo and scale in bash — NOT
+# `awk '{print $2 * 1024}'`, which makes awk do float math and print scientific
+# notation (e.g. `3.36e+10`) for real RAM sizes, failing the `^[0-9]+$` check
+# every consumer uses (→ host RAM silently treated as unknown on Linux). The
+# meminfo path is overridable for tests. Empty on any failure → callers fall
+# back to the absolute floor.
+_host_total_memory() {
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    sysctl -n hw.memsize 2>/dev/null || true
+  elif [[ -r "${_MEMINFO_FILE:-/proc/meminfo}" ]]; then
+    local kb
+    kb="$(awk '/^MemTotal:/ { print $2; exit }' "${_MEMINFO_FILE:-/proc/meminfo}" 2>/dev/null)"
+    [[ "$kb" =~ ^[0-9]+$ ]] && echo $(( kb * 1024 ))
+  fi
+}
+
 # Default per-box memory: a quarter of the Docker VM's memory, clamped to
-# [2g, 8g]. A cgroup limit is a ceiling, not a reservation — typical agent
-# sessions use a few hundred MB — but the old fixed 8g EXCEEDED entire Docker
-# Desktop VMs (7.75 GiB default), so the per-box limit never bound and a
-# runaway process swap-thrashed every session at once instead of OOM-ing
-# inside its own box. Unknown VM size falls back to 2g (smallest safe ceiling).
+# [4g, 8g]. A cgroup limit is a ceiling, not a reservation — a box only uses
+# what it touches — so a bigger floor only bites when several boxes spike at
+# once, which the on-start overload notice and undersized-VM advisory already
+# warn about. The 2g floor that shipped in v0.16.0 was too tight for a single
+# 1M-context Opus session: at 60% (the NODE_OPTIONS heap pin) that's a ~1.2g
+# heap, which GC-thrashes and OOM-kills under a build/test. 4g lifts that to
+# ~2.4g. Still far under the old fixed 8g that exceeded entire default VMs.
+# Unknown VM size falls back to 2g — we can't gauge overcommit risk on a VM we
+# can't size, so we stay conservative there rather than commit to the 4g floor.
 _default_box_memory() {
   local vm_bytes
   vm_bytes="$(_docker_vm_memory)"
@@ -592,8 +709,8 @@ _default_box_memory() {
     return
   fi
   local quarter_gb=$(( vm_bytes / 4 / 1073741824 ))
-  if (( quarter_gb < 2 )); then
-    echo "2g"
+  if (( quarter_gb < 4 )); then
+    echo "4g"
   elif (( quarter_gb > 8 )); then
     echo "8g"
   else
@@ -1434,6 +1551,13 @@ _build_project_claude_json() {
             | map({ (.): ($host[.] // $proj[.]) })
             | add
             | with_entries(select(.value != null)) )
+        # The container always runs the native installer build (~/.local/bin/
+        # claude → versions/), but this file is rebuilt from the host every run,
+        # shadowing the installMethod the installer wrote at image-build time.
+        # Without it, `claude doctor` warns "native installation but config
+        # install method is unknown" and the updater logs install_failed. Force
+        # it to match the real install so config agrees with the filesystem.
+        + { installMethod: "native" }
       ' > "$tmp" 2>/dev/null; then
       mv -f "$tmp" "$out"
     else
@@ -1557,9 +1681,15 @@ _maybe_prompt_image_rebuild() {
 
   info "Cleat image is outdated: built with ${DIM}v${image_version}${RESET} → CLI is ${BOLD}v${VERSION}${RESET}"
   local yn=""
-  _ask_yn yn "Rebuild the image now? ${DIM}(~2 min; recreates this project's container)${RESET} [Y/n] "
+  _ask_yn yn "Update the image now? ${DIM}(downloads the prebuilt v${VERSION}, or builds it locally; recreates this project's container)${RESET} [Y/n] "
   if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-    cmd_rebuild
+    # Prefer pulling the released multi-arch image for THIS version — it ships
+    # the exact tested setup and Claude build, and a download beats a ~2 min
+    # local rebuild. Fall back to a local build only when the prebuilt image
+    # isn't published (e.g. an unreleased dev VERSION). Same chain as cmd_run's
+    # acquisition path, so an outdated image is refreshed the same way a missing
+    # one is acquired. See concept/22 (multi-arch publish).
+    _do_pull "$VERSION" || _do_build
     # Drop the existing container so the start flow recreates it from the fresh
     # image (its bind mounts and base layer are baked in at creation time).
     if container_exists "$cname"; then
@@ -2370,6 +2500,11 @@ exec_claude() {
   _HOOK_BRIDGE_PID=""
   mkdir -p "$_CLIP_DIR"
 
+  # On macOS, bridge the host Keychain's OAuth token into the box before Claude
+  # launches (the ~/.claude mount is live, so a write here is visible inside the
+  # running container). No-op off macOS or once the box already has a token.
+  _seed_macos_credentials
+
   _cleanup_session() {
     # Kill clipboard watcher
     if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
@@ -2480,8 +2615,38 @@ exec_claude() {
   elif [[ $rc -ne 130 ]]; then
     warn "Claude exited with code $rc"
     [[ -s "$_exec_err" ]] && error "${DIM}$(cat "$_exec_err")${RESET}"
+    _maybe_explain_oom "$cname" "$rc" "${_mem_bytes:-}"
   fi
   rm -f "$_exec_err"
+}
+
+# When a session dies from memory pressure, name it and say what to do — an
+# unexplained exit-137/crash sends users hunting in the wrong place. Two
+# signals: the box's cgroup OOM flag (State.OOMKilled, set when its own process
+# tree is OOM-killed) or exit 137 (SIGKILL — the kernel OOM-killer's signature
+# when it picks Claude itself). The classic trigger is a test runner: jest and
+# vitest size their worker pool to the CPU count, and a box sees ALL host cores
+# (CPU is unconfigured by default — concept/22), so a 2 GB box can spawn ~one
+# node worker per core and blow its ceiling. There is no swap to absorb the
+# spike (by design), so the spike is killed, not paged. This is guidance, not a
+# fix — the user picks more memory, fewer workers, or a CPU cap. Fail-soft: an
+# unreadable inspect just falls back to the exit-code signal.
+_maybe_explain_oom() {
+  local cname="$1" rc="$2" mem_bytes="${3:-}"
+  local oomkilled=""
+  oomkilled="$(docker inspect --format '{{.State.OOMKilled}}' "$cname" 2>/dev/null || true)"
+  [[ "$oomkilled" == "true" || "$rc" == "137" ]] || return 0
+  local mem_note=""
+  if [[ "$mem_bytes" =~ ^[0-9]+$ ]] && (( mem_bytes > 0 )); then
+    mem_note=" ${DIM}(box limit: $(( mem_bytes / 1073741824 )) GB)${RESET}"
+  fi
+  echo ""
+  warn "${BOLD}Out of memory${RESET} — the box hit its memory ceiling${mem_note} and the kernel killed the process."
+  echo -e "    ${DIM}Test runners are the usual cause: jest/vitest start one worker per CPU, and a box${RESET}"
+  echo -e "    ${DIM}sees every host core. Pick one:${RESET}"
+  echo -e "    ${DIM}•${RESET} More memory — add ${BOLD}[resources]${RESET} then ${BOLD}memory = 8g${RESET} to ${BOLD}.cleat${RESET} ${DIM}(or your global config)${RESET}"
+  echo -e "    ${DIM}•${RESET} Fewer workers — ${BOLD}jest --maxWorkers=2${RESET}, ${BOLD}vitest --poolOptions.threads.maxThreads=2${RESET}"
+  echo -e "    ${DIM}•${RESET} Cap CPU so runners self-limit — add ${BOLD}cpus = 2${RESET} under ${BOLD}[resources]${RESET}"
 }
 
 # ── Update check (every 10 minutes) ─────────────────────────────────────────
@@ -2505,6 +2670,18 @@ UPDATE_CHECK_INTERVAL=600   # 10 minutes — a release cut minutes after a launc
 # minute, and the check costs a handful of docker calls.
 PRESSURE_CHECK_FILE="$REPO_DIR/.pressure_check"
 PRESSURE_CHECK_INTERVAL=86400
+# Docker Desktop resources advisory (the VM memory/swap/file-sharing tuning the
+# `docker` CLI cannot change). A box and a worktree are the same thing here —
+# each is one session with its own ~4g ceiling — so the model is "how many
+# sessions in parallel fit the VM". The realistic ceiling is ~4 concurrent
+# sessions (more is hard to drive at once), so the recommended VM is 4 × ~4g =
+# 16 GiB, capped at half the host's RAM (leave the rest for macOS + apps). The
+# advisory fires when the VM is below that recommendation; a generous VM never
+# nags, and it recurs on the daily check while the VM stays small, then stops
+# once fixed. Host RAM unknown → conservative 8 GiB floor (don't over-recommend
+# a VM the machine may not be able to back). See _recommended_vm_gb.
+_PRESSURE_TARGET_VM_GB=16                     # 4 parallel sessions × ~4g each
+_PRESSURE_VM_ADVISORY_BYTES=8589934592        # 8 GiB — fallback floor (host RAM unknown)
 
 CLAUDE_CHECK_FILE="$REPO_DIR/.claude_update_check"
 CLAUDE_CHECK_INTERVAL=600   # 10 minutes — the lookup is a tiny GET; the only
@@ -2672,10 +2849,29 @@ _maybe_show_release_highlight() {
   [[ -f "$LAST_SEEN_VERSION_FILE" ]] && confirm=$(awk 'NR==1 {print $1" "($2+0)}' "$LAST_SEEN_VERSION_FILE" 2>/dev/null || echo "")
   [[ "$confirm" == "$VERSION $next" ]] || return 0
 
-  echo ""
+  # No leading blank: whatever precedes the highlight owns the separation — the
+  # Docker pressure advisory above it ends with a trailing blank, and when that's
+  # silent the highlight sits flush like the other on-start notices. (It still
+  # owns its OWN trailing blank below, so the bring-up that follows needs none.)
   info "${BOLD}New in v0.14.0${RESET} — ${CYAN}Boxes${RESET}: many sandboxes per project, each with its own caps"
-  echo -e "    ${DIM}A locked-down dev box beside a cloud box over the same files; neither${RESET}"
-  echo -e "    ${DIM}reaches the other's caps.${RESET}    Try:  ${BOLD}cleat start dev${RESET}   ${DIM}·   cleat.sh/changelog${RESET}"
+  echo -e "    ${DIM}A locked-down dev box beside a cloud box over the same files;${RESET}"
+  echo -e "    ${DIM}neither reaches the other's caps.${RESET}"
+  # Try-command and changelog each get their own labelled line: tacking them onto
+  # the end of the prose line read as cramped run-on text. Two aligned labels are
+  # scannable and leave the command/link unmistakable.
+  echo -e "    ${DIM}Try:${RESET}       ${BOLD}cleat start dev${RESET}"
+  # A clickable, version-anchored changelog link. The /changelog page IDs each
+  # release `id="vX.Y.Z"` (changelog.astro), so #v0.14.0 deep-links to the Boxes
+  # release; _hyperlink makes it a real OSC 8 link where supported (clean short
+  # text), else a bare clickable URL. Blue + underline reads as a link either
+  # way. Keep the anchor version in lockstep with the "New in vX.Y.Z" label above.
+  # printf, not `echo -e`: _hyperlink emits real escape bytes, and piping those
+  # back through `echo -e` would re-interpret the OSC 8 string-terminator's
+  # trailing `\` against ${RESET}'s leading `\033`. %b expands the colour vars;
+  # %s passes the already-rendered link through untouched.
+  printf '    %bChangelog:%b %b%b%s%b\n' \
+    "$DIM" "$RESET" "$BLUE" "$UNDERLINE" \
+    "$(_hyperlink "https://cleat.sh/changelog#v0.14.0" "cleat.sh/changelog#v0.14.0")" "$RESET"
   # Trailing blank: the highlight owns its own separation from the bring-up
   # block that follows, so the bring-up needs no leading blank of its own.
   echo ""
@@ -4157,6 +4353,38 @@ _running_memory_limits_sum() {
   echo "$sum"
 }
 
+# Recommended Docker VM size in whole GB. Sized for the realistic max of ~4
+# parallel sessions (boxes and/or worktrees — same thing) at the ~4g per-session
+# ceiling = _PRESSURE_TARGET_VM_GB, but never more than half the host's RAM
+# (leave the rest for macOS + apps). Host RAM unknown → just the target. Always
+# ≥ 1. Arg: $1 = host RAM bytes (may be empty).
+_recommended_vm_gb() {
+  local host_bytes="${1:-}" rec="$_PRESSURE_TARGET_VM_GB" half
+  if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
+    half=$(( host_bytes / 2 / 1073741824 ))
+    (( half < rec )) && rec=$half
+  fi
+  (( rec < 1 )) && rec=1
+  echo "$rec"
+}
+
+# Print the concrete "give Docker more memory" instructions — the one knob set
+# the `docker` CLI cannot touch. Docker-Desktop-only (a native engine's VM is
+# the host; there's no slider). Shows the recommended memory, the click-path,
+# the machine's safe max (≈¾ host RAM, when known), swap, and VirtioFS.
+# Args: $1 = host RAM bytes (may be empty), $2 = recommended GB.
+_print_docker_vm_fix() {
+  local host_bytes="${1:-}" rec_gb="${2:-$_PRESSURE_TARGET_VM_GB}" max_note=""
+  _is_docker_desktop 2>/dev/null || return 0
+  if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
+    max_note="${DIM}   (max ≈ $(( host_bytes * 3 / 4 / 1073741824 )) GB)${RESET}"
+  fi
+  echo -e "    ${DIM}Give Docker more — only Docker Desktop can, not the CLI:${RESET}"
+  echo -e "    ${BOLD}Settings → Resources → Memory${RESET}${DIM} → ${RESET}${AMBER}${BOLD}${rec_gb} GB${RESET}${DIM} → Apply & restart${RESET}${max_note}"
+  echo -e "    ${DIM}then ${RESET}${BOLD}Swap ≥ 2 GB${RESET}${DIM}, and File sharing → ${RESET}${BOLD}VirtioFS${RESET}${DIM} for faster I/O.${RESET}"
+  echo ""   # trailing blank: this multi-line notice owns its own separation (see dispatch)
+}
+
 _maybe_check_docker_pressure() {
   _is_tty || return 0
 
@@ -4183,15 +4411,48 @@ _maybe_check_docker_pressure() {
     fi
   fi
 
-  # 2. Overload → notice.
-  local vm_bytes sum
+  # 2. VM memory vs the host + the running sessions. A box and a worktree are
+  #    the same thing here — one session, one ~4g ceiling — so both signals are
+  #    about how many sessions fit the VM, and both point at the one knob the
+  #    `docker` CLI can't change: the Docker Desktop memory slider.
+  local vm_bytes sum host_bytes vm_gb rec_gb
   vm_bytes="$(_docker_vm_memory)"
   [[ "$vm_bytes" =~ ^[0-9]+$ ]] || return 0
   (( vm_bytes > 0 )) || return 0
+  vm_gb=$(( vm_bytes / 1073741824 ))
   sum="$(_running_memory_limits_sum)"
-  [[ "$sum" =~ ^[0-9]+$ ]] || return 0
-  if (( sum > vm_bytes )); then
-    warn "Running containers are promised $(( sum / 1073741824 )) GB but the Docker VM has $(( vm_bytes / 1073741824 )) GB — under load everything swaps and every session freezes. Stop unused boxes, or raise VM memory ${DIM}(Docker Desktop → Settings → Resources)${RESET}."
+  host_bytes="$(_host_total_memory)"
+  rec_gb="$(_recommended_vm_gb "$host_bytes")"
+
+  # 2a. OVERLOAD (urgent, recurs): the sessions running RIGHT NOW are promised
+  #     more memory than the VM has. Real on any engine, so the warn is
+  #     ungated; the Docker-Desktop fix is appended only where it applies.
+  if [[ "$sum" =~ ^[0-9]+$ ]] && (( sum > vm_bytes )); then
+    warn "Running sessions are promised $(( sum / 1073741824 )) GB but the Docker VM has ${vm_gb} GB — under load everything swaps and every session freezes. Stop a session, or give Docker more memory."
+    _print_docker_vm_fix "$host_bytes" "$rec_gb"
+    return 0
+  fi
+
+  # 2b. UNDERSIZED VM for parallel work — Docker-Desktop-only (a native-Linux
+  #     engine's "VM" is the host: nothing to resize). The recommendation is
+  #     host-aware (4 sessions × ~4g, capped at half the host RAM); fires while
+  #     the VM is below it and recurs on the daily check until fixed (no
+  #     once-ever stamp — "always suggest while the config is bad"). Host RAM
+  #     unknown → conservative 8 GiB floor so we never over-recommend blind.
+  _is_docker_desktop 2>/dev/null || return 0
+  local bad=false
+  if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
+    (( vm_bytes < rec_gb * 1073741824 )) && bad=true
+  else
+    (( vm_bytes < _PRESSURE_VM_ADVISORY_BYTES )) && bad=true
+  fi
+  if $bad; then
+    local host_note=""
+    [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )) \
+      && host_note=" of your ${BOLD}$(( host_bytes / 1073741824 )) GB${RESET}"
+    warn "Docker VM memory is ${BOLD}${vm_gb} GB${RESET}${host_note} — tight for parallel sessions."
+    echo -e "    ${DIM}Each box/worktree gets a ~4 GB ceiling; a few at once need a roomier VM.${RESET}"
+    _print_docker_vm_fix "$host_bytes" "$rec_gb"
   fi
 }
 
@@ -5080,13 +5341,15 @@ main() {
 
   # Interactive CLI self-update preflight — only for the session-launching
   # commands, and before any docker work: accepting re-execs the new version,
-  # which then drives the entire run. The release highlight runs right after, so
-  # a user who just updated sees the new version's note on the re-exec'd run.
+  # which then drives the entire run. The Docker pressure check (an amber, often
+  # crucial resource warning) runs BEFORE the release highlight so it sits at the
+  # top of the startup, above the editorial "New in …" note — act on the warning
+  # first, read the news second.
   case "$cmd" in
     start|resume|r|run|claude|shell|sh)
       _maybe_prompt_cli_update
-      _maybe_show_release_highlight
       _maybe_check_docker_pressure
+      _maybe_show_release_highlight
       ;;
   esac
 

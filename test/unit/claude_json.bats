@@ -121,6 +121,35 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+# ── installMethod (container is always a native install) ────────────────────
+# The container's Claude is the native installer build, but this file is rebuilt
+# from the host every run and shadows the installMethod the installer wrote at
+# image-build time. Without forcing it, `claude doctor` warns "native
+# installation but config install method is unknown". See bin/cleat comment.
+
+@test "build: forces installMethod=native even when the host file has none" {
+  echo '{"oauthAccount":{"emailAddress":"x@y.z"}}' > "$HOST_JSON"
+  _build_project_claude_json "$OUT"
+  run jq -r '.installMethod' "$OUT"
+  assert_output "native"
+}
+
+@test "build: forces installMethod=native over a different host value (e.g. homebrew)" {
+  # The host might be a Homebrew/npm install; the CONTAINER is always native, so
+  # the host's value must not leak in. Mutating the forced value breaks this.
+  echo '{"installMethod":"homebrew","oauthAccount":{"emailAddress":"x@y.z"}}' > "$HOST_JSON"
+  _build_project_claude_json "$OUT"
+  run jq -r '.installMethod' "$OUT"
+  assert_output "native"
+}
+
+@test "build: installMethod=native with no host file at all" {
+  rm -f "$HOST_JSON" "$OUT"
+  _build_project_claude_json "$OUT"
+  run jq -r '.installMethod' "$OUT"
+  assert_output "native"
+}
+
 # ── corruption guard (Decision 3) ───────────────────────────────────────────
 
 @test "build: a corrupt host file is backed up, left untouched, and never feeds the build" {

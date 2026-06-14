@@ -1414,6 +1414,13 @@ s#_is_macos || return 0#true || return 0#
 SED
 try "bugfix_keychain_macos_guard" "no-op off macOS" "$CLI" "$CREDENTIALS_BATS"
 
+# _is_macos's OSTYPE signal must actually match darwin. Break the glob: with the
+# uname fallback forced to Linux in the test, the OSTYPE-only detection fails.
+cat > "$SED_TMP" << 'SED'
+s|darwin\*|nope*|
+SED
+try "bugfix_is_macos_ostype" "true under a darwin OSTYPE" "$CLI" "$CREDENTIALS_BATS"
+
 # An outdated image is refreshed by PULLING the released image for this version
 # (download), not the old unconditional local rebuild. Revert to cmd_rebuild:
 # the accept-path test sees no PULL_CALLED and fails.

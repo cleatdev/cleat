@@ -22,16 +22,27 @@ setup() {
 teardown() { _common_teardown; }
 
 # ── _is_macos ─────────────────────────────────────────────────────────────────
+# Two signals: OSTYPE or `uname -s`. These tests override `uname` so they assert
+# the same result on a Linux OR a macOS CI host (the real macOS runner's uname is
+# Darwin, which would otherwise leak into the "false" case).
 
-@test "is_macos: true under a darwin OSTYPE" {
+@test "is_macos: true under a darwin OSTYPE (OSTYPE signal alone, regardless of host)" {
+  uname() { echo "Linux"; }   # prove OSTYPE alone is enough; don't rely on the host
   OSTYPE="darwin24"
   run _is_macos
   assert_success
 }
 
-@test "is_macos: false under a linux OSTYPE" {
+@test "is_macos: true via the uname fallback when OSTYPE is not darwin" {
+  uname() { echo "Darwin"; }
   OSTYPE="linux-gnu"
-  # uname here is the test host (Linux); both signals must be non-darwin.
+  run _is_macos
+  assert_success
+}
+
+@test "is_macos: false when neither OSTYPE nor uname is darwin" {
+  uname() { echo "Linux"; }   # host-independent — a macOS runner's uname must not leak in
+  OSTYPE="linux-gnu"
   run _is_macos
   assert_failure
 }

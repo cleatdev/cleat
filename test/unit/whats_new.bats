@@ -90,6 +90,62 @@ teardown() { _common_teardown; }
   assert_output "BLANK"
 }
 
+@test "whats-new: opens its own blank line above the news when nothing preceded it" {
+  # The bug (v0.16.1): the news leaned on the Docker pressure advisory's trailing
+  # blank for separation. When that advisory was silent OR its fix block was gated
+  # out, the "New in …" line sat flush against whatever was above it (the shell
+  # prompt, or a warning). With no preceding on-start notice (_ONSTART_GAP_OPEN
+  # unset/0) the highlight must open the gap itself.
+  _is_tty() { return 0; }
+  _ONSTART_GAP_OPEN=0
+  local out; out="$( { printf 'TOP\n'; _maybe_show_release_highlight; } )"
+  printf '%s\n' "$out" | awk '
+    /New in v/ { print (prev ~ /^[[:space:]]*$/ ? "BLANK" : "FLUSH"); f=1; exit }
+    { prev=$0 } END { if (!f) print "NOTFOUND" }' > "$TEST_TEMP/lead.txt"
+  run cat "$TEST_TEMP/lead.txt"
+  assert_output "BLANK"
+}
+
+@test "whats-new: does NOT add a second blank when an on-start notice already opened the gap" {
+  # The flip side: when a preceding notice (the Docker pressure block) already
+  # printed its own trailing blank it sets _ONSTART_GAP_OPEN=1, and the highlight
+  # must NOT add a second — exactly one blank above the news, never two.
+  _is_tty() { return 0; }
+  _ONSTART_GAP_OPEN=1
+  # PREV, one blank (the notice's), then the highlight.
+  local out; out="$( { printf 'PREV\n'; printf '\n'; _maybe_show_release_highlight; } )"
+  printf '%s\n' "$out" | awk '
+    /New in v/ { print (prev2 ~ /^[[:space:]]*$/ ? "DOUBLE" : "SINGLE"); f=1; exit }
+    { prev2=prev; prev=$0 } END { if (!f) print "NOTFOUND" }' > "$TEST_TEMP/dbl.txt"
+  run cat "$TEST_TEMP/dbl.txt"
+  assert_output "SINGLE"
+}
+
+@test "whats-new: exactly one blank separates a real preceding pressure advisory from the news" {
+  # End-to-end of the on-start sequence: an undersized-VM advisory, then the
+  # highlight — the two functions wired as main() calls them. The advisory's
+  # trailing blank + the gap flag must yield ONE blank above "New in", not zero
+  # (flush) and not two (double). This is the user-visible bug from img.png.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }            # 8 GiB VM (undersized)
+  _host_total_memory() { echo "34359738368"; }          # 32 GiB host
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  PRESSURE_CHECK_FILE="$TEST_TEMP/pressure_check"
+  local out; out="$( { _maybe_check_docker_pressure; _maybe_show_release_highlight; } )"
+  printf '%s\n' "$out" | awk '
+    /New in v/ {
+      print (prev  ~ /^[[:space:]]*$/ ? "ONE_BLANK" : "FLUSH")
+      print (prev2 ~ /^[[:space:]]*$/ ? "DOUBLE" : "SINGLE")
+      f=1; exit
+    }
+    { prev2=prev; prev=$0 } END { if (!f) print "NOTFOUND" }' > "$TEST_TEMP/sep.txt"
+  run cat "$TEST_TEMP/sep.txt"
+  assert_line "ONE_BLANK"
+  assert_line "SINGLE"
+}
+
 @test "whats-new: shows the first 3 launches, then goes silent" {
   _is_tty() { return 0; }
   local i

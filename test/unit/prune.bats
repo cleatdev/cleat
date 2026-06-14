@@ -380,6 +380,30 @@ teardown() { _common_teardown; }
   refute_output --partial "Resources"        # no Docker Desktop click-path on a native engine
 }
 
+@test "pressure: overload on a host that can't grow the VM steers to fewer sessions, not a smaller VM target" {
+  # The real-Mac case (v0.16.1): 8 GB Mac, 4 sessions × 4g promised = 16 GB, a
+  # 7 GB Docker VM. The VM is already ~7/8 of host RAM — past the safe max — so
+  # "give Docker more memory → set it to <rec>" is wrong (rec = half of 8 = 4 GB,
+  # SMALLER than the current 7 GB). When the recommended size isn't bigger than
+  # the current VM, the honest fix is to reduce demand, not resize the VM.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "7516192768"; }            # 7 GiB VM
+  _host_total_memory() { echo "8589934592"; }           # 8 GiB Mac → rec = half = 4 GiB (< the VM)
+  _running_memory_limits_sum() { echo "17179869184"; }  # 16 GiB promised (4 × 4g)
+  _is_docker_desktop() { return 0; }                    # Docker Desktop, but can't grow
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "promised 16 GB"
+  assert_output --partial "of your"                      # names the real host RAM …
+  assert_output --partial "8 GB"                         # … the 8 GB Mac
+  assert_output --partial "Run fewer sessions"           # reduce demand …
+  assert_output --partial "[resources] memory"           # … or lower a box's own ceiling
+  # Must NOT tell the user to set the VM to a number it already exceeds.
+  refute_output --partial "Settings"
+  refute_output --partial "Apply & restart"
+}
+
 @test "pressure: a non-numeric running-limits sum does not abort the VM advisory" {
   # v0.16.1 folded v0.16.0's standalone `[[ $sum =~ ^[0-9]+$ ]] || return 0` into
   # the overload `if`. A non-numeric/empty sum must therefore NOT overload AND

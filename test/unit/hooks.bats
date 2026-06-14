@@ -168,6 +168,51 @@ SCRIPT
   assert_failure
 }
 
+@test "_is_docker_desktop: matches under set -o pipefail (no SIGPIPE false-negative) — regression v0.16.2" {
+  # The old `docker info | grep -q` form was SIGPIPE-fragile under `set -o
+  # pipefail` (which the real binary runs): when grep -q matches it exits and
+  # closes the pipe, the still-writing `docker info` dies of SIGPIPE (141), and
+  # pipefail then reports the WHOLE pipeline as failed — even though it matched.
+  # Under memory pressure `docker info` is slow with lots left to write when grep
+  # bails, so the race tips to "failed" exactly when the Docker-Desktop-only VM
+  # advisory needs to fire — the on-start "give Docker more memory" steps silently
+  # vanished (observed on a real Mac, v0.16.1). The fix reads just the
+  # OperatingSystem field via --format (no pipe).
+  #
+  # We encode the failure mode deterministically (real SIGPIPE delivery is a
+  # timing race): the mock answers --format cleanly, but a PLAIN `docker info`
+  # emits the matching OS line and then exits 141 — exactly what a SIGPIPE'd
+  # `docker info` does once a downstream grep -q closes the pipe. Under pipefail
+  # the fixed (--format) code returns 0; the reverted (grep) code returns 141.
+  local mock_dir="$TEST_TEMP/mock-docker-sigpipe"
+  mkdir -p "$mock_dir"
+  cat > "$mock_dir/docker" << 'SCRIPT'
+#!/usr/bin/env bash
+case "$*" in
+  *--format*)
+    # The field query the fixed code uses — clean success.
+    echo "Docker Desktop"
+    exit 0
+    ;;
+  info)
+    # Plain `docker info` (the old grep path): emit the matching line, then exit
+    # 141 — what a SIGPIPE'd `docker info` does. pipefail surfaces this 141 even
+    # though grep -q matched (exit 0).
+    echo " Operating System: Docker Desktop"
+    exit 141
+    ;;
+esac
+exit 0
+SCRIPT
+  chmod +x "$mock_dir/docker"
+  # Reproduce the real binary's strict mode for this call — source_cli strips it.
+  set -o pipefail
+  PATH="$mock_dir:$PATH" _is_docker_desktop
+  local rc=$?
+  set +o pipefail
+  [[ "$rc" -eq 0 ]] || { echo "is_docker_desktop returned $rc under pipefail (SIGPIPE false-negative)"; return 1; }
+}
+
 # ── Settings overlay: hooks ON (forwarder) ──────────────────────────────
 
 @test "run: overlay replaces hook commands with event forwarder when hooks ON" {

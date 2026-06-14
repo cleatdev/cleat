@@ -1466,11 +1466,11 @@ s|vm_bytes < _PRESSURE_VM_ADVISORY_BYTES|vm_bytes < 0|
 SED
 try "bugfix_advisory_fallback_floor" "falls back to an 8 GiB floor" "$CLI" "$PRUNE_BATS"
 
-# The advisory + its grow-the-VM fix are Docker-Desktop-only (a native engine
-# has no resizable VM). Neuter the gate: the "off Docker Desktop" test sees the
-# advisory fire.
+# The undersized-VM advisory is Docker-Desktop-only (a native engine has no
+# resizable VM). Neuter the `elif $is_dd` gate: the "off Docker Desktop" test
+# sees the advisory fire.
 cat > "$SED_TMP" << 'SED'
-s#_is_docker_desktop 2>/dev/null || return 0#true || return 0#
+s|elif \$is_dd; then|elif true; then|
 SED
 try "bugfix_advisory_desktop_gate" "no advisory off Docker Desktop" "$CLI" "$PRUNE_BATS"
 
@@ -1495,11 +1495,14 @@ s|warn "Docker VM memory is|info "Docker VM memory is|
 SED
 try "bugfix_advisory_amber" "amber warning" "$CLI" "$PRUNE_BATS"
 
-# The multi-line advisory owns a trailing blank so it doesn't abut the news /
-# bring-up. Delete the echo "" after the VirtioFS line: the "blank line follows"
-# test sees the content abut the sentinel and fails.
+# The pressure block owns ONE trailing blank (when it printed any notice) so it
+# doesn't abut the news / bring-up. Neuter the `echo ""` in the `if $printed`
+# block: the "blank line follows" test sees the content abut the sentinel.
 cat > "$SED_TMP" << 'SED'
-/VirtioFS/{n;d;}
+/if \$printed; then/{
+n
+s/echo ""/:/
+}
 SED
 try "bugfix_advisory_trailing_blank" "blank line follows the VM advisory" "$CLI" "$PRUNE_BATS"
 
@@ -1561,6 +1564,53 @@ cat > "$SED_TMP" << 'SED'
 s#sum="$(_running_memory_limits_sum)"#&; [[ "$sum" =~ ^[0-9]+$ ]] || return 0#
 SED
 try "bugfix_pressure_sum_guard_folded" "non-numeric running-limits sum" "$CLI" "$PRUNE_BATS"
+
+# v0.16.2 — _is_docker_desktop must read the OperatingSystem field via --format,
+# NOT `docker info | grep -q`. The piped form is SIGPIPE-fragile under pipefail
+# (grep -q closes the pipe, docker info dies 141, pipefail surfaces the 141 even
+# on a match) — which silently killed the Docker-Desktop-only VM advisory under
+# load. Revert it to the grep pipeline: the pipefail regression test returns 141.
+cat > "$SED_TMP" << 'SED'
+/^_is_docker_desktop()/,/^}$/{
+  s#os="\$(docker info --format.*#docker info 2>/dev/null | grep -q "Operating System:.*Docker Desktop"#
+  /== \*"Docker Desktop"\*/d
+  /local os$/d
+}
+SED
+try "bugfix_is_docker_desktop_pipefail" "pipefail" "$CLI" "$HOOKS_BATS"
+
+# v0.16.2 — on a host that can't grow the VM (recommended ≤ current, e.g. a 7 GB
+# VM on an 8 GB Mac), the overload notice must steer to fewer sessions, NOT print
+# a Docker Desktop target smaller than the current VM. Force the grow branch
+# always: the starved-host test then sees the (wrong) Settings click-path.
+cat > "$SED_TMP" << 'SED'
+s|if \$is_dd && (( rec_gb > vm_gb )); then|if true; then|
+SED
+try "bugfix_overload_starved_steer" "steers to fewer sessions" "$CLI" "$PRUNE_BATS"
+
+# v0.16.2 — the release highlight must guarantee one blank line above the news
+# even when no on-start notice preceded it. Drop the leading-blank: the "opens
+# its own blank line" test sees the news sit flush against what's above it.
+cat > "$SED_TMP" << 'SED'
+s#\[\[ "\${_ONSTART_GAP_OPEN:-0}" == "1" \]\] || echo ""#true#
+SED
+try "bugfix_highlight_leading_blank" "opens its own blank line above" "$CLI" "$WHATS_NEW_BATS"
+
+# v0.16.2 — but it must NOT double the blank when a notice already opened the gap.
+# Make the leading blank unconditional: the "does NOT add a second blank" test
+# sees two blanks above the news.
+cat > "$SED_TMP" << 'SED'
+s#\[\[ "\${_ONSTART_GAP_OPEN:-0}" == "1" \]\] || echo ""#echo ""#
+SED
+try "bugfix_highlight_no_double_blank" "does NOT add a second blank" "$CLI" "$WHATS_NEW_BATS"
+
+# v0.16.2 — the pressure block must flag _ONSTART_GAP_OPEN after printing its
+# trailing blank, so the highlight knows the gap is open. Drop the flag: the
+# highlight adds its own blank and the end-to-end test sees a double gap.
+cat > "$SED_TMP" << 'SED'
+s#_ONSTART_GAP_OPEN=1#:#
+SED
+try "bugfix_pressure_gap_flag" "exactly one blank separates a real preceding" "$CLI" "$WHATS_NEW_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

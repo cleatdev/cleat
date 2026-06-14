@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.16.1"
+VERSION="0.16.2"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below — not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="0.16.1"
+RELEASE_HIGHLIGHT_VERSION="0.16.2"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -434,7 +434,19 @@ require_running() {
 # Docker Desktop (macOS/Windows) provides host.docker.internal automatically.
 # On Linux with Docker Engine, we need --add-host for it.
 _is_docker_desktop() {
-  docker info 2>/dev/null | grep -q "Operating System:.*Docker Desktop"
+  # Read JUST the OperatingSystem field via --format — NOT `docker info | grep`.
+  # The piped form is SIGPIPE-fragile under `set -o pipefail` (which the real
+  # binary runs): when `grep -q` matches it exits immediately and closes the
+  # pipe, `docker info` then dies of SIGPIPE (141) on its next write, and
+  # pipefail reports the whole pipeline as FAILED even though it matched. Under
+  # memory pressure `docker info` is slow and has lots still to write when grep
+  # bails, so the race tips to "failed" exactly when the Docker-Desktop-only VM
+  # advisory needs to fire — the on-start "give Docker more memory" steps then
+  # silently vanished (observed v0.16.1). The format query has no pipe, no race,
+  # and is cheaper (one field, not the whole info dump).
+  local os
+  os="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)" || return 1
+  [[ "$os" == *"Docker Desktop"* ]]
 }
 
 # True on macOS. macOS keeps Claude Code's OAuth login in the login Keychain,
@@ -2683,6 +2695,14 @@ PRESSURE_CHECK_INTERVAL=86400
 _PRESSURE_TARGET_VM_GB=16                     # 4 parallel sessions × ~4g each
 _PRESSURE_VM_ADVISORY_BYTES=8589934592        # 8 GiB — fallback floor (host RAM unknown)
 
+# Set to 1 by an on-start notice (the Docker pressure block) once it has emitted
+# its own trailing blank line, so the release highlight below it knows the gap
+# is already open and won't double the blank. When it stays 0 (no notice
+# printed, or a non-Docker-Desktop engine where the fix block is skipped), the
+# highlight opens the gap itself — guaranteeing exactly one blank line above the
+# "New in …" news no matter what preceded it. See _maybe_show_release_highlight.
+_ONSTART_GAP_OPEN=0
+
 CLAUDE_CHECK_FILE="$REPO_DIR/.claude_update_check"
 CLAUDE_CHECK_INTERVAL=600   # 10 minutes — the lookup is a tiny GET; the only
                             # real per-check cost is one throwaway container to
@@ -2849,10 +2869,17 @@ _maybe_show_release_highlight() {
   [[ -f "$LAST_SEEN_VERSION_FILE" ]] && confirm=$(awk 'NR==1 {print $1" "($2+0)}' "$LAST_SEEN_VERSION_FILE" 2>/dev/null || echo "")
   [[ "$confirm" == "$VERSION $next" ]] || return 0
 
-  # No leading blank: whatever precedes the highlight owns the separation — the
-  # Docker pressure advisory above it ends with a trailing blank, and when that's
-  # silent the highlight sits flush like the other on-start notices. (It still
-  # owns its OWN trailing blank below, so the bring-up that follows needs none.)
+  # Exactly one blank line above the news, no matter what preceded it. An
+  # on-start notice (the Docker pressure block) sets _ONSTART_GAP_OPEN once it
+  # has printed its own trailing blank — then we don't double it. Otherwise
+  # (nothing printed, or a non-Docker-Desktop engine where the fix block is
+  # skipped) we open the gap ourselves, so "New in …" never sits flush against a
+  # warning or the shell prompt. The earlier design leaned on the advisory's
+  # trailing blank for this, which vanished whenever the advisory's fix block was
+  # gated out — leaving the news crammed against the warn line (observed
+  # v0.16.1). We still own our OWN trailing blank below, so the bring-up that
+  # follows needs none.
+  [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
   info "${BOLD}New in v0.14.0${RESET} — ${CYAN}Boxes${RESET}: many sandboxes per project, each with its own caps"
   echo -e "    ${DIM}A locked-down dev box beside a cloud box over the same files;${RESET}"
   echo -e "    ${DIM}neither reaches the other's caps.${RESET}"
@@ -4368,21 +4395,24 @@ _recommended_vm_gb() {
   echo "$rec"
 }
 
-# Print the concrete "give Docker more memory" instructions — the one knob set
-# the `docker` CLI cannot touch. Docker-Desktop-only (a native engine's VM is
-# the host; there's no slider). Shows the recommended memory, the click-path,
-# the machine's safe max (≈¾ host RAM, when known), swap, and VirtioFS.
-# Args: $1 = host RAM bytes (may be empty), $2 = recommended GB.
+# Print the concrete "give Docker more memory" instructions — the one knob the
+# `docker` CLI cannot touch (only the Docker Desktop UI). Shows the recommended
+# memory, the click-path, the machine's safe max (≈¾ host RAM, when known), swap,
+# and VirtioFS. The CALLER guarantees this is Docker Desktop AND that growing the
+# VM actually helps (recommended > current) — on a host already near its safe max
+# we steer to "fewer sessions" instead, so this never tells the user to set a
+# target SMALLER than the VM they already have. No engine re-detection here (the
+# caller detects once) and no trailing blank (the pressure block owns that, so
+# the gap survives even when this block is skipped). Args: $1 = host RAM bytes
+# (may be empty), $2 = recommended GB.
 _print_docker_vm_fix() {
   local host_bytes="${1:-}" rec_gb="${2:-$_PRESSURE_TARGET_VM_GB}" max_note=""
-  _is_docker_desktop 2>/dev/null || return 0
   if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
     max_note="${DIM}   (max ≈ $(( host_bytes * 3 / 4 / 1073741824 )) GB)${RESET}"
   fi
   echo -e "    ${DIM}Give Docker more — only Docker Desktop can, not the CLI:${RESET}"
   echo -e "    ${BOLD}Settings → Resources → Memory${RESET}${DIM} → ${RESET}${AMBER}${BOLD}${rec_gb} GB${RESET}${DIM} → Apply & restart${RESET}${max_note}"
   echo -e "    ${DIM}then ${RESET}${BOLD}Swap ≥ 2 GB${RESET}${DIM}, and File sharing → ${RESET}${BOLD}VirtioFS${RESET}${DIM} for faster I/O.${RESET}"
-  echo ""   # trailing blank: this multi-line notice owns its own separation (see dispatch)
 }
 
 _maybe_check_docker_pressure() {
@@ -4397,6 +4427,13 @@ _maybe_check_docker_pressure() {
   (( now - last < PRESSURE_CHECK_INTERVAL )) && return 0
   echo "$now" > "$PRESSURE_CHECK_FILE" 2>/dev/null || true
 
+  # Tracks whether we emitted ANY notice. If so we close with one trailing blank
+  # (and flag _ONSTART_GAP_OPEN) so the release highlight / bring-up below is
+  # separated — owned HERE, not inside the Docker-Desktop fix block, so the gap
+  # survives when that block is skipped (non-Docker-Desktop, or a host already at
+  # its safe max where growing the VM can't help).
+  local printed=false
+
   # 1. Bloat → prune prompt.
   local stats count mb
   stats="$(_cleat_prunable_stats)"
@@ -4404,6 +4441,7 @@ _maybe_check_docker_pressure() {
   mb="${stats##*	}"
   if [[ "$count" =~ ^[0-9]+$ && "$mb" =~ ^[0-9]+$ ]] && (( mb >= _PRESSURE_BLOAT_MB_THRESHOLD )); then
     info "Docker is carrying ${BOLD}${count} stale cleat images${RESET} ${DIM}(~$(( (mb + 512) / 1024 )) GB of old builds and superseded pulls)${RESET}"
+    printed=true
     local yn=""
     _ask_yn yn "Prune them now? ${DIM}(boxes and other projects are not touched)${RESET} [Y/n] "
     if [[ -z "$yn" || "$yn" == [yY]* ]]; then
@@ -4415,44 +4453,66 @@ _maybe_check_docker_pressure() {
   #    the same thing here — one session, one ~4g ceiling — so both signals are
   #    about how many sessions fit the VM, and both point at the one knob the
   #    `docker` CLI can't change: the Docker Desktop memory slider.
-  local vm_bytes sum host_bytes vm_gb rec_gb
+  local vm_bytes sum host_bytes vm_gb rec_gb is_dd=false host_note=""
   vm_bytes="$(_docker_vm_memory)"
-  [[ "$vm_bytes" =~ ^[0-9]+$ ]] || return 0
-  (( vm_bytes > 0 )) || return 0
-  vm_gb=$(( vm_bytes / 1073741824 ))
-  sum="$(_running_memory_limits_sum)"
-  host_bytes="$(_host_total_memory)"
-  rec_gb="$(_recommended_vm_gb "$host_bytes")"
-
-  # 2a. OVERLOAD (urgent, recurs): the sessions running RIGHT NOW are promised
-  #     more memory than the VM has. Real on any engine, so the warn is
-  #     ungated; the Docker-Desktop fix is appended only where it applies.
-  if [[ "$sum" =~ ^[0-9]+$ ]] && (( sum > vm_bytes )); then
-    warn "Running sessions are promised $(( sum / 1073741824 )) GB but the Docker VM has ${vm_gb} GB — under load everything swaps and every session freezes. Stop a session, or give Docker more memory."
-    _print_docker_vm_fix "$host_bytes" "$rec_gb"
-    return 0
-  fi
-
-  # 2b. UNDERSIZED VM for parallel work — Docker-Desktop-only (a native-Linux
-  #     engine's "VM" is the host: nothing to resize). The recommendation is
-  #     host-aware (4 sessions × ~4g, capped at half the host RAM); fires while
-  #     the VM is below it and recurs on the daily check until fixed (no
-  #     once-ever stamp — "always suggest while the config is bad"). Host RAM
-  #     unknown → conservative 8 GiB floor so we never over-recommend blind.
-  _is_docker_desktop 2>/dev/null || return 0
-  local bad=false
-  if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
-    (( vm_bytes < rec_gb * 1073741824 )) && bad=true
-  else
-    (( vm_bytes < _PRESSURE_VM_ADVISORY_BYTES )) && bad=true
-  fi
-  if $bad; then
-    local host_note=""
+  if [[ "$vm_bytes" =~ ^[0-9]+$ ]] && (( vm_bytes > 0 )); then
+    vm_gb=$(( vm_bytes / 1073741824 ))
+    sum="$(_running_memory_limits_sum)"
+    host_bytes="$(_host_total_memory)"
+    rec_gb="$(_recommended_vm_gb "$host_bytes")"
+    # Detect the engine ONCE — every `docker info` is a round-trip to a daemon
+    # that's slow precisely when this fires (under swap), so we never call it
+    # again per-branch.
+    _is_docker_desktop 2>/dev/null && is_dd=true
     [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )) \
       && host_note=" of your ${BOLD}$(( host_bytes / 1073741824 )) GB${RESET}"
-    warn "Docker VM memory is ${BOLD}${vm_gb} GB${RESET}${host_note} — tight for parallel sessions."
-    echo -e "    ${DIM}Each box/worktree gets a ~4 GB ceiling; a few at once need a roomier VM.${RESET}"
-    _print_docker_vm_fix "$host_bytes" "$rec_gb"
+
+    # 2a. OVERLOAD (urgent, recurs): the sessions running RIGHT NOW are promised
+    #     more memory than the VM has. Real on any engine, so the warn always
+    #     fires and names the real RAM. The follow-up is honest about the host:
+    #     where the VM can safely grow (recommended > current) we point at the
+    #     Docker Desktop memory slider; where it can't (the VM is already near
+    #     ~¾ of host RAM — e.g. a 7 GB VM on an 8 GB Mac) growing it is
+    #     impossible/harmful, so we steer to running fewer sessions or lowering a
+    #     box's own ceiling instead. Never suggests a VM target below the current.
+    if [[ "$sum" =~ ^[0-9]+$ ]] && (( sum > vm_bytes )); then
+      warn "Running sessions are promised $(( sum / 1073741824 )) GB but the Docker VM has only ${vm_gb} GB${host_note} — under load everything swaps and sessions freeze."
+      if $is_dd && (( rec_gb > vm_gb )); then
+        echo -e "    ${DIM}Stop a session, or give Docker more memory:${RESET}"
+        _print_docker_vm_fix "$host_bytes" "$rec_gb"
+      else
+        echo -e "    ${DIM}Run fewer sessions at once, or lower a box's ceiling — ${RESET}${BOLD}[resources] memory${RESET}${DIM} in .cleat.${RESET}"
+      fi
+      printed=true
+
+    # 2b. UNDERSIZED VM for parallel work — Docker-Desktop-only (a native-Linux
+    #     engine's "VM" is the host: nothing to resize). The recommendation is
+    #     host-aware (4 sessions × ~4g, capped at half the host RAM); fires while
+    #     the VM is below it and recurs on the daily check until fixed (no
+    #     once-ever stamp — "always suggest while the config is bad"). Host RAM
+    #     unknown → conservative 8 GiB floor so we never over-recommend blind.
+    elif $is_dd; then
+      local bad=false
+      if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
+        (( vm_bytes < rec_gb * 1073741824 )) && bad=true
+      else
+        (( vm_bytes < _PRESSURE_VM_ADVISORY_BYTES )) && bad=true
+      fi
+      if $bad; then
+        warn "Docker VM memory is ${BOLD}${vm_gb} GB${RESET}${host_note} — tight for parallel sessions."
+        echo -e "    ${DIM}Each box/worktree gets a ~4 GB ceiling; a few at once need a roomier VM.${RESET}"
+        _print_docker_vm_fix "$host_bytes" "$rec_gb"
+        printed=true
+      fi
+    fi
+  fi
+
+  # One blank line separates whatever we printed from the release highlight (or
+  # the bring-up) that follows. Flag the open gap so the highlight doesn't add a
+  # second blank of its own.
+  if $printed; then
+    echo ""
+    _ONSTART_GAP_OPEN=1
   fi
 }
 

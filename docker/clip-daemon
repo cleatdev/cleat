@@ -15,7 +15,7 @@
 # sticky (1777) /tmp. If two sessions ever resolve `coder` to different uids
 # (e.g. transiently, during the entrypoint UID remap) they would otherwise
 # collide on the same /tmp/clip.sock, and the later one could neither unlink
-# nor rebind a socket it doesn't own (EPERM in a sticky dir) — the historical
+# nor rebind a socket it doesn't own (EPERM in a sticky dir): the historical
 # clip-error storm. A per-uid dir (mode 700) is owned by its creator, so each
 # uid manages its own files and a stale foreign-owned file can't wedge a new
 # daemon. The socket MUST stay in the container layer (not the /tmp/cleat-clip

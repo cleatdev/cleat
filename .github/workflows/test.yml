@@ -11,14 +11,14 @@ on:
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same ref — avoid wasting minutes on
+# Cancel in-progress runs for the same ref, avoid wasting minutes on
 # superseded pushes. For main branch, this rarely fires.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ── Static analysis: shellcheck (advisory — does not block merge) ─────────
+  # ── Static analysis: shellcheck (advisory, does not block merge) ─────────
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -57,7 +57,7 @@ jobs:
   # macOS ships both /bin/bash (Apple's 3.2.57, unchanged since 2009 due to the
   # bash 4 GPLv3 switch) and Homebrew bash 5. We run the suite through /bin/bash
   # explicitly so we're actually testing the version real macOS users have as
-  # default — bash 3.2 compatibility is a hard project invariant.
+  # default. Bash 3.2 compatibility is a hard project invariant.
   #
   # Pinned to macos-15 (not macos-latest) on purpose. GitHub is migrating the
   # `macos-latest` label to macOS 26 over Jun 15–Jul 15 2026, gradually, so the
@@ -82,7 +82,7 @@ jobs:
           /bin/bash --version
           /bin/bash -c 'echo "BASH_VERSION=$BASH_VERSION"' | grep -E '^BASH_VERSION=3\.2\.' \
             || { echo "Expected /bin/bash to be 3.2.x"; exit 1; }
-      - name: Diagnostic — verify cleat binary runs on bash 3.2
+      - name: Diagnostic, verify cleat binary runs on bash 3.2
         run: |
           export HOME=/tmp/cleat-diag
           export XDG_CONFIG_HOME=/tmp/cleat-diag-xdg
@@ -105,7 +105,7 @@ jobs:
       - name: Mutation test the regression registry via /bin/bash
         run: /bin/bash ./test/mutation_regressions.sh
 
-  # ── Integration tests against real Docker (Linux only — runners have it) ──
+  # ── Integration tests against real Docker (Linux only, runners have it) ──
   test-integration:
     name: integration (real docker)
     runs-on: ubuntu-latest

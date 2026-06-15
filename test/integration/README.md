@@ -29,9 +29,9 @@ Every test starts with a `skip_if_no_docker` check. On machines without Docker
 
 ```
 test/integration/
-  run.sh           — runner script (invokes bats on *.bats files)
-  lifecycle.bats   — full container lifecycle: build → start → shell → stop → rm
-  env.bats         — env passthrough: .cleat.env vars visible in cleat shell
+  run.sh           is the runner script (invokes bats on *.bats files)
+  lifecycle.bats   covers the full container lifecycle: build → start → shell → stop → rm
+  env.bats         covers env passthrough: .cleat.env vars visible in cleat shell
 ```
 
 ## Running locally

@@ -49,7 +49,7 @@ mutate() {
     pass=$((pass + 1))
   else
     echo -e "  ${RED}✗${RESET} MISSED: $description"
-    echo "    Test passed despite mutation — test is ineffective!"
+    echo "    Test passed despite mutation, test is ineffective!"
     echo "    Mutation: $sed_expr"
     fail=$((fail + 1))
   fi
@@ -58,7 +58,7 @@ mutate() {
 }
 
 echo ""
-echo -e "${BOLD}Mutation Testing — v0.3.0 Capabilities${RESET}"
+echo -e "${BOLD}Mutation Testing: v0.3.0 Capabilities${RESET}"
 echo ""
 
 # ── Mutation 1: Remove :ro from SSH mount (security-critical)
@@ -96,7 +96,7 @@ mutate \
   "$PROJECT_ROOT/test/unit/capabilities.bats" \
   "env cap: passes env vars from global env file to docker run"
 
-# ── Mutation 5: Break env cap gate — always read env files
+# ── Mutation 5: Break env cap gate: always read env files
 mutate \
   "env cap: remove capability gate (always load env files)" \
   's/cap_is_active env 2>\/dev\/null/true/' \
@@ -173,28 +173,28 @@ mutate \
   "$PROJECT_ROOT/test/unit/config.bats" \
   "read_caps: reads caps from \\[caps\\] section"
 
-# ── Mutation 11: Break --cap validation — accept anything
+# ── Mutation 11: Break --cap validation: accept anything
 mutate \
   "--cap flag: remove validation" \
   '/_cap_valid=false/,/exit 1/{s/exit 1/: # noop/}' \
   "$PROJECT_ROOT/test/unit/argument_parsing.bats" \
   "parse_global_flags: --cap rejects unknown capability"
 
-# ── Mutation 12: Break _write_caps_to_file — don't write [caps] header
+# ── Mutation 12: Break _write_caps_to_file: don't write [caps] header
 mutate \
   "write_caps: omit [caps] section header" \
   's/echo "\[caps\]"/# omitted/' \
   "$PROJECT_ROOT/test/unit/config.bats" \
   "write_caps: creates file with \\[caps\\] section"
 
-# ── Mutation 13: Break --enable — don't actually add to array
+# ── Mutation 13: Break --enable: don't actually add to array
 mutate \
   "config --enable: don't add cap to list" \
   's/current_caps+=("$cap_name")/# skip adding/' \
   "$PROJECT_ROOT/test/unit/config.bats" \
   "config --enable: enables a capability"
 
-# ── Mutation 14: Break --disable — don't filter out cap
+# ── Mutation 14: Break --disable: don't filter out cap
 mutate \
   "config --disable: don't remove cap from list" \
   's/\[\[ "\$cap" != "\$cap_name" \]\] && new_caps+=("\$cap")/new_caps+=("\$cap")/' \

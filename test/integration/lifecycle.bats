@@ -131,7 +131,7 @@ EOF
   docker inspect "$main_cname" >/dev/null 2>&1 || { echo "main container missing"; return 1; }
   docker inspect "$az_cname"   >/dev/null 2>&1 || { echo "az container missing"; return 1; }
 
-  # Both bind-mount the SAME host path at /workspace — the live shared tree.
+  # Both bind-mount the SAME host path at /workspace: the live shared tree.
   local m_src a_src
   m_src="$(docker inspect "$main_cname" --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}')"
   a_src="$(docker inspect "$az_cname"   --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}')"
@@ -141,7 +141,7 @@ EOF
   run docker inspect "$az_cname" --format '{{index .Config.Labels "sh.cleat.box"}}'
   assert_output "az"
 
-  # `cleat describe` must NOT recreate the container (host-side metadata) — the
+  # `cleat describe` must NOT recreate the container (host-side metadata): the
   # writable layer (e.g. an `az login`) must survive. Verify the container ID
   # is unchanged across a describe.
   local before after
@@ -155,7 +155,7 @@ EOF
 
 # ── Docker capability (concept/15): coder reaches the host daemon; heal is safe ──
 
-@test "integration: docker cap — coder reaches the daemon, and the self-heal is idempotent" {
+@test "integration: docker cap, coder reaches the daemon, and the self-heal is idempotent" {
   cd "$INT_PROJECT"
   run "$CLI" --cap docker run
   assert_success
@@ -165,7 +165,7 @@ EOF
   # The entrypoint adds coder to the socket's owning group at container start so
   # coder can reach the mounted /var/run/docker.sock. Against a freshly started
   # real container the daemon side can take a moment to become reachable, so poll
-  # a few seconds before asserting — a single 0ms probe raced container startup
+  # a few seconds before asserting: a single 0ms probe raced container startup
   # and flaked in CI. This still fails hard (with diagnostics) if coder genuinely
   # cannot connect; it only tolerates the sub-second startup settle.
   local ok=""
@@ -186,7 +186,7 @@ EOF
   run docker exec "$cname" runuser -u coder -- docker version
   assert_success
 
-  # The per-exec self-heal must be idempotent — re-running it on an already-OK
+  # The per-exec self-heal must be idempotent: re-running it on an already-OK
   # container keeps coder's access working (doesn't strip the group / break it).
   bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); _heal_docker_sock '$cname'"
   run docker exec "$cname" runuser -u coder -- docker version

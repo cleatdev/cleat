@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared test setup — sourced by every .bats file
+# Shared test setup, sourced by every .bats file
 
 # Paths
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +32,7 @@ _common_setup() {
   # The CLI derives its config/run/projects dirs from XDG_CONFIG_HOME, falling
   # back to $HOME/.config (CLEAT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cleat").
   # A CI runner (or dev) that exports XDG_CONFIG_HOME would pull those dirs OUT
-  # of the isolated HOME set above — leaking runtime/projects state across tests
+  # of the isolated HOME set above, leaking runtime/projects state across tests
   # and breaking "$HOME/.config/..." path assertions. Clear the XDG path vars so
   # the CLI always resolves under the sandboxed HOME.
   unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
@@ -68,7 +68,7 @@ _common_setup() {
   export CLEAT_TRUST_PROJECT=1
 }
 
-# Portable MD5 — available to all tests regardless of whether CLI is sourced.
+# Portable MD5: available to all tests regardless of whether CLI is sourced.
 # macOS has `md5 -q`, Linux has `md5sum`.
 _md5() {
   if command -v md5sum &>/dev/null; then
@@ -80,13 +80,13 @@ _md5() {
   fi
 }
 
-# A process counts as exited if its PID is gone OR it is a zombie — an
+# A process counts as exited if its PID is gone OR it is a zombie: an
 # orphaned child gets reparented, and if the new parent doesn't reap promptly
 # (containerized test runs), the EXITED process lingers as a zombie that
 # kill -0 still sees. Reads /proc first (Linux; works in minimal containers
 # with no `ps`), falls back to `ps` (macOS). Waits up to ~4s for the state
 # to land. NOTE: callers must still `kill` the PID afterwards regardless of
-# the result — a process left alive holds bats' internal fd and hangs the
+# the result: a process left alive holds bats' internal fd and hangs the
 # whole file.
 _proc_state() {
   local pid="$1"
@@ -107,7 +107,7 @@ process_exited() {
   return 1
 }
 
-# Portable timeout — GNU timeout on Linux, perl alarm on macOS.
+# Portable timeout: GNU timeout on Linux, perl alarm on macOS.
 # Available to all test files via setup.bash.
 _portable_timeout() {
   local secs="$1"; shift
@@ -131,7 +131,7 @@ _common_teardown() {
 #
 # The CLI runs under `set -euo pipefail` in production. In tests:
 #   - `-e` conflicts with bats' ERR trap, so we can't keep it while sourced
-#   - `-u` and `pipefail` are safe and catch real bugs — we preserve them
+#   - `-u` and `pipefail` are safe and catch real bugs, so we preserve them
 #
 # This means sourced tests now catch unbound variables and pipe failures.
 # The strict-mode smoke tests in test/unit/smoke.bats are the second line
@@ -151,10 +151,10 @@ source_cli() {
   # function overrides and global state interact with bash's strict checks
   # differently across test files.
   #
-  # Strict mode IS tested — but via the smoke layer (test/unit/smoke.bats)
+  # Strict mode IS tested, but via the smoke layer (test/unit/smoke.bats)
   # which runs the real binary as a subprocess under full `set -euo pipefail`.
   # That layer caught the corrupted-cache bug that sourced tests missed.
-  sed 's/^set -euo pipefail$/# [stripped for testing — strict mode via smoke.bats]/' "$CLI" > "$_cli_tmp"
+  sed 's/^set -euo pipefail$/# [stripped for testing; strict mode via smoke.bats]/' "$CLI" > "$_cli_tmp"
   source "$_cli_tmp"
   rm -f "$_cli_tmp"
 }

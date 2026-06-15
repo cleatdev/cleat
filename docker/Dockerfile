@@ -3,7 +3,7 @@ FROM node:24-bookworm-slim
 # Install packages (node/npm pre-installed in base image)
 # gh:     GitHub CLI from official apt repo
 # docker: Docker CE CLI + Compose plugin from Docker's official repo. The daemon
-#         is NOT installed — the CLI talks to the host daemon over a socket
+#         is NOT installed. The CLI talks to the host daemon over a socket
 #         mount when the `docker` capability is enabled. See
 #         concept/15-docker-capability.md for the full rationale.
 RUN apt-get update && \
@@ -36,7 +36,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user (UID/GID will be remapped at runtime via entrypoint)
-# node:24-bookworm-slim ships with node:node at 1000:1000 — remove it first
+# node:24-bookworm-slim ships with node:node at 1000:1000, remove it first
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN userdel -r node 2>/dev/null || true && \

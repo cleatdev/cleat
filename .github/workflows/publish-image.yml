@@ -4,12 +4,12 @@ name: publish-image
 # The CLI's `cleat start` pulls this image instead of building locally.
 #
 # Each platform builds NATIVELY (ubuntu-latest = amd64, ubuntu-24.04-arm =
-# arm64 — free for public repos) and pushes by digest; a merge job then
+# arm64, free for public repos) and pushes by digest; a merge job then
 # assembles the two digests into one multi-arch manifest per tag. We don't
 # cross-build under QEMU: the Dockerfile runs the Claude Code installer,
 # whose Bun-compiled binary is unreliable under qemu-user emulation, and apt
 # under QEMU is 5-15x slower. Without the arm64 half, every Apple Silicon
-# user who pulls runs the box under emulation — the documented trigger for
+# user who pulls runs the box under emulation, the documented trigger for
 # node crashes and garbled TTYs (see concept/22-performance-and-resources.md).
 #
 # INVARIANT: the sh.cleat.version label must be present on the final image.
@@ -75,7 +75,7 @@ jobs:
             sh.cleat.version=${{ steps.meta.outputs.version }}
             org.opencontainers.image.source=https://github.com/cleatdev/cleat
           # provenance attestations would turn each per-arch manifest into a
-          # nested index and confuse `docker manifest inspect` consumers —
+          # nested index and confuse `docker manifest inspect` consumers,
           # keep the final tag a clean two-entry index.
           provenance: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,push=true

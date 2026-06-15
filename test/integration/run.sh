@@ -3,7 +3,7 @@
 # Integration test runner.
 #
 # Runs test/integration/*.bats against a real Docker daemon. Skips cleanly
-# if Docker is unavailable. Not invoked by test.sh — run manually or via CI.
+# if Docker is unavailable. Not invoked by test.sh: run manually or via CI.
 #
 # Usage:
 #   test/integration/run.sh              # run all *.bats in this dir
@@ -16,12 +16,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BATS="$REPO_ROOT/test/bats/bin/bats"
 
 if ! command -v docker &>/dev/null; then
-  echo "docker not found — skipping integration tests" >&2
+  echo "docker not found, skipping integration tests" >&2
   exit 0
 fi
 
 if ! docker info &>/dev/null; then
-  echo "docker daemon not responding — skipping integration tests" >&2
+  echo "docker daemon not responding, skipping integration tests" >&2
   exit 0
 fi
 

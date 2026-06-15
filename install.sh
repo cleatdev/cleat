@@ -106,7 +106,7 @@ trap _cleanup_spin EXIT
 # ── Header ─────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────┐${RESET}"
-echo -e "${BOLD}${CYAN}  │   Cleat — Run anything. Break nothing.  │${RESET}"
+echo -e "${BOLD}${CYAN}  │   Cleat. Run anything. Break nothing.   │${RESET}"
 echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────┘${RESET}"
 echo ""
 
@@ -166,7 +166,7 @@ if $LOCAL_MODE; then
   fi
 
   echo ""
-  echo -e "  ${DIM}Local dev install — changes to ${SCRIPT_DIR}/bin/cleat take effect immediately.${RESET}"
+  echo -e "  ${DIM}Local dev install: changes to ${SCRIPT_DIR}/bin/cleat take effect immediately.${RESET}"
   echo -e "  ${DIM}Switch to official release: ${BOLD}./install.sh${RESET}${DIM} (without --local)${RESET}"
   exit 0
 fi

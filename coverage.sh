@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# coverage.sh — Generate code coverage report for bin/cleat via Docker
+# coverage.sh: Generate code coverage report for bin/cleat via Docker
 # Builds a lightweight container with kcov + bats, runs all tests,
 # and outputs coverage to ./coverage/ on the host.
 #

@@ -22,10 +22,10 @@
 #     bind-mount targets). This catches v0.6.5-class regressions.
 #
 # Responses (read from $DOCKER_MOCK_DIR):
-#   ps_output      — for `docker ps --filter ...`
-#   ps_a_output    — for `docker ps -a --filter ...`
-#   images_output  — for `docker images ...`
-#   inspect_output — for `docker inspect ...`
+#   ps_output     : for `docker ps --filter ...`
+#   ps_a_output   : for `docker ps -a --filter ...`
+#   images_output : for `docker images ...`
+#   inspect_output: for `docker inspect ...`
 #
 # Every call is appended to $DOCKER_CALLS (one call per line; multi-arg
 # commands like `docker exec container bash -c 'foo'` are written on a
@@ -35,10 +35,10 @@
 # Stderr is emitted if $DOCKER_STDERR is set.
 #
 # Per-subcommand exit overrides (for testing specific failure paths):
-#   $DOCKER_TAG_EXIT_CODE     — `docker tag`    (default 0)
-#   $DOCKER_PULL_EXIT_CODE    — `docker pull`   (default 1, no registry in tests)
-#   $DOCKER_RUN_EXIT_CODE     — `docker run`    (default: falls through to 0)
-#   $DOCKER_COMMIT_EXIT_CODE  — `docker commit` (default 0)
+#   $DOCKER_TAG_EXIT_CODE    : `docker tag`    (default 0)
+#   $DOCKER_PULL_EXIT_CODE   : `docker pull`   (default 1, no registry in tests)
+#   $DOCKER_RUN_EXIT_CODE    : `docker run`    (default: falls through to 0)
+#   $DOCKER_COMMIT_EXIT_CODE : `docker commit` (default 0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Record the call (always, for observability)
@@ -197,7 +197,7 @@ case "$1" in
   ps)
     # Token-bounded match for `-a` / `--all`. A naive `*"-a"*` substring
     # match falsely fires when the container name contains '-a' (e.g.
-    # `cleat-project-a1b2c3d4` — ~1/16 of random hashes start with 'a'),
+    # `cleat-project-a1b2c3d4`: ~1/16 of random hashes start with 'a'),
     # routing plain `docker ps` calls to ps_a_output and breaking the
     # is_running / container_exists distinction.
     case " $* " in

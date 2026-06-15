@@ -1,5 +1,5 @@
 #!/bin/bash
-# open-bridge — forward URLs from inside the container to the host browser.
+# open-bridge: forward URLs from inside the container to the host browser.
 #
 # Installed as `open`, `xdg-open`, and `sensible-browser` shims so that
 # tools expecting standard browser commands work transparently.
@@ -16,7 +16,7 @@ BRIDGE_FILE="$BRIDGE/.browser-open"
 
 url="${1:-}"
 
-# If no argument, read from stdin — but only when stdin is NOT a terminal.
+# If no argument, read from stdin, but only when stdin is NOT a terminal.
 # A pipe (e.g. `printf '%s' "$url" | open`) still feeds a URL, while an
 # interactive `open` with no argument falls through to the usage error below
 # instead of blocking forever on `cat` reading the tty. This also keeps the

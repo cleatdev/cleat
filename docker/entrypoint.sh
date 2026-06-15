@@ -35,7 +35,7 @@ chown "$HOST_UID:$HOST_GID" /workspace 2>/dev/null || true
 # `claude update` and the on-launch auto-updater fail with EACCES (and
 # `claude doctor` reports a broken install). Chown it so the native update
 # path works. NB: ~/.local is in the container's writable layer, so updates
-# made this way are ephemeral — they revert on `cleat rm`/recreate. The
+# made this way are ephemeral. They revert on `cleat rm`/recreate. The
 # durable path is `cleat upgrade-claude` / the on-start update prompt, which
 # commit the new version into the image.
 chown -R "$HOST_UID:$HOST_GID" /home/coder/.local 2>/dev/null || true
@@ -62,7 +62,7 @@ if [ -S /var/run/docker.sock ]; then
     SOCK_GROUP=$(getent group "$SOCK_GID" | cut -d: -f1)
     if [ -z "$SOCK_GROUP" ]; then
       # Re-point an existing docker-host group to the CURRENT socket GID rather
-      # than leaving a stale group and adding a second — idempotent across the
+      # than leaving a stale group and adding a second: idempotent across the
       # Docker Desktop restarts that renumber the socket GID. See concept/15.
       if getent group docker-host >/dev/null 2>&1; then
         groupmod -g "$SOCK_GID" docker-host 2>/dev/null || true

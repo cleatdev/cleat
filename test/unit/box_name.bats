@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Boxes — named per-project sandboxes (see concept/20-boxes.md).
+# Boxes: named per-project sandboxes (see concept/20-boxes.md).
 # Phase 1: box-name validation + per-project/box session-key derivation.
 load "../setup"
 setup()    { _common_setup; source_cli; }

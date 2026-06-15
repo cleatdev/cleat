@@ -40,7 +40,7 @@ teardown() { _common_teardown; }
   assert_success
   assert_output --partial "cleat start dev"
   # Anchored to the feature's release section (#v0.14.0), not the bare changelog
-  # page — the /changelog page IDs each release by its version.
+  # page, the /changelog page IDs each release by its version.
   assert_output --partial "cleat.sh/changelog#v0.14.0"
 }
 
@@ -77,7 +77,7 @@ teardown() { _common_teardown; }
   # bring-up needs no leading blank of its own. Append a sentinel: $(...) strips
   # only the FINAL newline, so the trailing `echo ""` survives as an empty line
   # immediately before SENTINEL. Dropping it makes the 'changelog' line sit right
-  # against SENTINEL — falsifiable.
+  # against SENTINEL (falsifiable).
   local out
   out="$( { _maybe_show_release_highlight; printf 'SENTINEL\n'; } )"
   local cls
@@ -109,7 +109,7 @@ teardown() { _common_teardown; }
 @test "whats-new: does NOT add a second blank when an on-start notice already opened the gap" {
   # The flip side: when a preceding notice (the Docker pressure block) already
   # printed its own trailing blank it sets _ONSTART_GAP_OPEN=1, and the highlight
-  # must NOT add a second — exactly one blank above the news, never two.
+  # must NOT add a second: exactly one blank above the news, never two.
   _is_tty() { return 0; }
   _ONSTART_GAP_OPEN=1
   # PREV, one blank (the notice's), then the highlight.
@@ -123,7 +123,7 @@ teardown() { _common_teardown; }
 
 @test "whats-new: exactly one blank separates a real preceding pressure advisory from the news" {
   # End-to-end of the on-start sequence: an undersized-VM advisory, then the
-  # highlight — the two functions wired as main() calls them. The advisory's
+  # highlight: the two functions wired as main() calls them. The advisory's
   # trailing blank + the gap flag must yield ONE blank above "New in", not zero
   # (flush) and not two (double). This is the user-visible bug from img.png.
   _is_tty() { return 0; }
@@ -188,18 +188,18 @@ teardown() { _common_teardown; }
   assert_output "$VERSION 1"
 }
 
-@test "whats-new: STALE GUARD — silent when highlight copy is for another version" {
+@test "whats-new: STALE GUARD, silent when highlight copy is for another version" {
   _is_tty() { return 0; }
   RELEASE_HIGHLIGHT_VERSION="0.0.0"   # copy not refreshed for this VERSION
   run _maybe_show_release_highlight
   assert_success
   assert_output ""
-  # Must NOT record anything — a future matching release still shows.
+  # Must NOT record anything: a future matching release still shows.
   [[ ! -f "$LAST_SEEN_VERSION_FILE" ]]  || return 1
 }
 
 @test "whats-new: silent on a non-interactive (non-TTY) run" {
-  # Do NOT override _is_tty — under bats it is false. Scripts/pipes see nothing.
+  # Do NOT override _is_tty, under bats it is false. Scripts/pipes see nothing.
   run _maybe_show_release_highlight
   assert_success
   assert_output ""
@@ -220,7 +220,7 @@ teardown() { _common_teardown; }
 @test "whats-new: never reads stdin (would block on a real TTY)" {
   _is_tty() { return 0; }
   # Feed a sentinel on stdin; a non-blocking function must leave it unconsumed.
-  # An accidental `read` would swallow SENTINEL and this would fail — falsifiable,
+  # An accidental `read` would swallow SENTINEL and this would fail, falsifiable,
   # unlike asserting on a "[Y/n]" string the function can never emit.
   local rest=""
   { _maybe_show_release_highlight >/dev/null; rest=$(cat); } <<< "SENTINEL"
@@ -231,7 +231,7 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   # Stub the first visible line to assert the state file ALREADY holds the bumped
   # count when output begins. Moving the write after the print (a plausible
-  # refactor) makes this fail — pinning the "record before print" invariant.
+  # refactor) makes this fail, pinning the "record before print" invariant.
   info() { [[ "$(cat "$LAST_SEEN_VERSION_FILE" 2>/dev/null)" == "$VERSION 1" ]] || echo "ORDER_VIOLATION"; }
   run _maybe_show_release_highlight
   assert_success
@@ -241,7 +241,7 @@ teardown() { _common_teardown; }
 @test "whats-new: silent (no permanent nag) when the state can't be persisted" {
   _is_tty() { return 0; }
   # Read-only install dir: the bumped count can't be written, so it must NOT
-  # print — otherwise the note would re-show on every single launch.
+  # print: otherwise the note would re-show on every single launch.
   echo "0.0.1 0" > "$LAST_SEEN_VERSION_FILE"   # stale, older version
   chmod 0444 "$LAST_SEEN_VERSION_FILE"
   run _maybe_show_release_highlight

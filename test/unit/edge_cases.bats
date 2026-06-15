@@ -10,7 +10,7 @@
 #   - Very long values
 #
 # These are NOT regression tests (they don't guard against a specific shipped
-# bug). They're preventive — the goal is to catch classes of bugs before they
+# bug). They're preventive: the goal is to catch classes of bugs before they
 # ship.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -173,7 +173,7 @@ EOF
   assert_output ""
 }
 
-@test "parse_env_file: duplicate keys — last wins" {
+@test "parse_env_file: duplicate keys, last wins" {
   # _parse_env_file itself emits both, but resolve_env_args dedupes.
   # This test verifies parsing doesn't fail.
   cat > "$TEST_TEMP/env" << 'EOF'

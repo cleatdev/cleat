@@ -5,9 +5,9 @@
 # Cleat builds an isolated, persistent per-project .claude.json instead of
 # mounting the shared host file into every container. This file guards the two
 # bugs that drove the change:
-#   1. Corruption — concurrent containers truncating the shared host file
+#   1. Corruption: concurrent containers truncating the shared host file
 #      (Claude's "Configuration Error / Unexpected EOF").
-#   2. Cross-project bleed — every container runs at /workspace, so they all
+#   2. Cross-project bleed: every container runs at /workspace, so they all
 #      shared projects["/workspace"] (trust / MCP / allowedTools approvals).
 
 load "../setup"
@@ -153,7 +153,7 @@ teardown() { _common_teardown; }
 # ── corruption guard (Decision 3) ───────────────────────────────────────────
 
 @test "build: a corrupt host file is backed up, left untouched, and never feeds the build" {
-  printf '{"oauthAccount": {' > "$HOST_JSON"   # truncated — invalid JSON
+  printf '{"oauthAccount": {' > "$HOST_JSON"   # truncated, invalid JSON
   mkdir -p "$(dirname "$OUT")"
   echo '{"hasCompletedOnboarding":true}' > "$OUT"
 

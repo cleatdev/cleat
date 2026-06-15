@@ -1,9 +1,9 @@
 #!/usr/bin/env bats
-# Docker capability — per-session socket-access self-heal + dead-socket recovery
+# Docker capability: per-session socket-access self-heal + dead-socket recovery
 # guidance (see concept/15-docker-capability.md). The entrypoint resolves the
 # socket group once at start; a Docker Desktop restart can change the socket GID
 # under a long-running container, and a bare `docker exec` never re-runs the
-# entrypoint — so each session exec re-resolves it as root before dropping to
+# entrypoint: so each session exec re-resolves it as root before dropping to
 # coder. These tests exercise that runtime path (the entrypoint's own copy of
 # the logic is covered by the real-Docker integration test).
 load "../setup"

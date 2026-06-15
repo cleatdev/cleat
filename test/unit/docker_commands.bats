@@ -76,7 +76,7 @@ teardown() { _common_teardown; }
 }
 
 @test "build: skips network pull when registry image is already cached locally" {
-  # Registry-tagged image present on disk, but no `cleat` alias yet — mimics
+  # Registry-tagged image present on disk, but no `cleat` alias yet, mimics
   # a host where the prebuilt image exists (manual pull, leftover from prior
   # nuke, etc.) but cleat hasn't aliased it. The pull stub fails by default
   # (DOCKER_PULL_EXIT_CODE=1), so if _do_pull tried the network it would
@@ -92,7 +92,7 @@ teardown() { _common_teardown; }
   run grep '^docker pull ' "$DOCKER_CALLS"
   assert_failure
 
-  # No local build either — the cached image was reused.
+  # No local build either: the cached image was reused.
   run docker_build_calls
   assert_output ""
 
@@ -139,7 +139,7 @@ teardown() { _common_teardown; }
   run assert_docker_run_has "$cname" "--pids-limit 4096"
   assert_success
   # --init is asserted by its regression test in regressions.bats (one test
-  # per behavior — rule 3).
+  # per behavior, rule 3).
   run assert_docker_run_has "$cname" "-it"
   assert_success
 }
@@ -315,7 +315,7 @@ teardown() { _common_teardown; }
 
   # The session key basename must be lowercased (macOS HFS+ safety).
   # On case-sensitive FS, /MyProject and /myproject are different dirs
-  # and get different hashes — but the basename portion is always lowercase.
+  # and get different hashes, but the basename portion is always lowercase.
   local all_calls
   all_calls="$(cat "$DOCKER_CALLS")"
 
@@ -393,7 +393,7 @@ teardown() { _common_teardown; }
   run cmd_rm "$TEST_TEMP/project"
   assert_success
 
-  # The store — and the approval in it — must survive cleat rm.
+  # The store (and the approval in it) must survive cleat rm.
   [[ -f "$store" ]] || { echo "REGRESSION: cmd_rm deleted the per-project store"; return 1; }
   run jq -r '.projects["/workspace"].hasTrustDialogAccepted' "$store"
   assert_output "true"
@@ -502,7 +502,7 @@ teardown() { _common_teardown; }
   # macOS Docker Desktop (virtiofs) requires a bind-mount SOURCE to exist as a
   # real file before docker run, or it silently creates a directory and the
   # file→file mount fails with an opaque OCI error. The strict stub rejects any
-  # -v whose source is missing — so a clean cmd_run proves every source (incl.
+  # -v whose source is missing, so a clean cmd_run proves every source (incl.
   # the per-project .claude.json) was materialized first. Test the fresh-machine
   # case (no host file) since that's where the old code mounted nothing at all.
   export DOCKER_STUB_STRICT=1
@@ -759,7 +759,7 @@ EOF
 }
 
 @test "ps: an Exited (255) box gets the Docker-restarted resume hint" {
-  # Exit 255 is the Docker-restart signature (the VM died under the box) —
+  # Exit 255 is the Docker-restart signature (the VM died under the box):
   # without the hint a healthy, resumable box reads as a crash.
   printf 'cleat-proj-12345678\tExited (255) 2 hours ago\n' > "$DOCKER_MOCK_DIR/ps_a_output"
   run cmd_ps

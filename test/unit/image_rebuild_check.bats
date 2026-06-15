@@ -1,11 +1,11 @@
 #!/usr/bin/env bats
 # Tests for the on-start image-version drift prompt (_maybe_prompt_image_rebuild):
 # when the local image was built by an OLDER Cleat than the running CLI, offer to
-# update it (and recreate this project's container) before starting — mirroring
+# update it (and recreate this project's container) before starting, mirroring
 # the Claude-update and config-drift prompts. Replaces the old static notice box.
 # On accept it PULLS the released multi-arch image for this version (a fast
 # download of the exact tested setup), falling back to a local build only when
-# the prebuilt image isn't published — not the old unconditional local rebuild.
+# the prebuilt image isn't published, not the old unconditional local rebuild.
 
 load "../setup"
 
@@ -14,7 +14,7 @@ setup() {
   use_docker_stub
   source_cli
 
-  # Decision logic is what we test — not image_exists / acquisition / docker.
+  # Decision logic is what we test, not image_exists / acquisition / docker.
   image_exists() { return 0; }
   # The acquisition chain on accept is `_do_pull "$VERSION" || _do_build`. Mock
   # both halves so we can assert pull-is-tried-first and the build fallback.
@@ -33,7 +33,7 @@ teardown() { _common_teardown; }
 
 @test "rebuild prompt: silent on a non-interactive (non-TTY) run" {
   _image_cleat_version() { echo "0.0.1"; }   # older than VERSION
-  # Do NOT override _is_tty — false under bats.
+  # Do NOT override _is_tty: false under bats.
   run _maybe_prompt_image_rebuild "cleat-x-12345678"
   assert_success
   refute_output --partial "PULL_CALLED"
@@ -78,7 +78,7 @@ teardown() { _common_teardown; }
   assert_output --partial "Cleat image is outdated"
   assert_output --partial "v0.0.1"
   assert_output --partial "v${VERSION}"
-  # Pulls the prebuilt image for THIS version — a download, not a local rebuild.
+  # Pulls the prebuilt image for THIS version: a download, not a local rebuild.
   assert_output --partial "PULL_CALLED ${VERSION}"
   refute_output --partial "BUILD_CALLED"
 }

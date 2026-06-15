@@ -153,7 +153,7 @@ teardown() { _common_teardown; }
   git -C "$install_dir" init --quiet
   git -C "$install_dir" add -A
   git -C "$install_dir" commit -m "init" --quiet
-  # No tags — latest_tag_local returns empty
+  # No tags, latest_tag_local returns empty
   _patch_installer "$install_dir"
 
   run bash "$FAKE_REPO/install.sh"

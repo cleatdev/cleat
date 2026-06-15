@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for docker/entrypoint.sh — the runtime UID/GID remap and the ownership
+# Tests for docker/entrypoint.sh: the runtime UID/GID remap and the ownership
 # fixups that follow it. Per the project rule for scripts that run outside the
 # CLI, we execute entrypoint.sh directly with the privileged commands stubbed
 # (chown/sed/usermod/id/su), so we can assert behavior without root or a real
@@ -67,7 +67,7 @@ _run_entrypoint() {
 @test "entrypoint: clears stale clipboard runtime files before dropping to coder" {
   # v0.13.1: a hard-killed prior session can leave a foreign-owned clip socket in
   # the sticky /tmp (it survives docker stop/start). As root, the entrypoint must
-  # remove it so the next clip-daemon starts clean — otherwise the runtime user
+  # remove it so the next clip-daemon starts clean: otherwise the runtime user
   # can't unlink it and clip-daemon spews EPERM every launch.
   _run_entrypoint
   assert_success

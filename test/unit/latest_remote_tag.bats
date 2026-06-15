@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for latest_remote_tag() — git tag parsing and version sorting
+# Tests for latest_remote_tag(): git tag parsing and version sorting
 
 load "../setup"
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # Tests for the on-start reaper-drift prompt (_maybe_prompt_init_recreate):
 # boxes created before Cleat passed --init have `su` as PID 1, which never
-# reaps re-parented children — zombies accumulate until the pids cap wedges
+# reaps re-parented children: zombies accumulate until the pids cap wedges
 # the box (fork() fails; the attached session freezes mid-keystroke). On
 # start, offer to recreate such boxes so they pick up --init. Mirrors the
 # image-version drift prompt (image_rebuild_check.bats): TTY-only, once per
@@ -27,7 +27,7 @@ teardown() { _common_teardown; }
 
 @test "init recreate: silent on a non-interactive (non-TTY) run" {
   mock_docker_inspect '{"PidsLimit":4096}'
-  # Do NOT override _is_tty — false under bats.
+  # Do NOT override _is_tty: false under bats.
   run _maybe_prompt_init_recreate "cleat-x-12345678"
   assert_success
   refute_output --partial "zombie reaper"
@@ -52,7 +52,7 @@ teardown() { _common_teardown; }
 
 @test "init recreate: silent when docker inspect returns nothing (fail-open)" {
   _is_tty() { return 0; }
-  # No inspect_output mocked — the stub prints nothing. A start must never be
+  # No inspect_output mocked: the stub prints nothing. A start must never be
   # blocked by an inspect hiccup.
   run _maybe_prompt_init_recreate "cleat-x-12345678"
   assert_success
@@ -146,7 +146,7 @@ teardown() { _common_teardown; }
 }
 
 @test "init recreate: cmd_resume consults the reaper-drift check" {
-  # `cleat resume` is the verb that revives an old box after days idle —
+  # `cleat resume` is the verb that revives an old box after days idle:
   # exactly the box most likely to predate --init. The check must run on this
   # path independently of cmd_start.
   mock_docker_images "cleat"
@@ -165,7 +165,7 @@ teardown() { _common_teardown; }
 
 # ── status surfacing ──────────────────────────────────────────────────────────
 # The zombie count is the early warning for the pre---init wedge: surface it
-# while it's a number, not a frozen session — and stay quiet when it's zero
+# while it's a number, not a frozen session, and stay quiet when it's zero
 # or the probe came back empty (daemon hiccup).
 
 @test "init recreate: status surfaces the unreaped-zombie count for a running box" {

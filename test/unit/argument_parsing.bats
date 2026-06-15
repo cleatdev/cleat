@@ -30,7 +30,7 @@ teardown() { _common_teardown; }
   mock_docker_images "cleat"
   run main r
   assert_success
-  assert_output --partial "creating fresh"
+  assert_output --partial "Creating fresh"
 
   run main sh
   assert_failure

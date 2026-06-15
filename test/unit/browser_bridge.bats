@@ -87,16 +87,18 @@ teardown() { _common_teardown; }
   assert_output "https://example.com/b"
 }
 
-# ── Same-URL debounce ─────────────────────────────────────────────────────────
+# ── Same-URL debounce (atomic per-URL marker) ─────────────────────────────────
 # One user action can write the bridge file SEVERAL times (a TUI link click
 # fires the open shim on press and release). The claim makes each write open
 # once; the debounce makes each URL open once per window even across multiple
-# writes claimed by different watchers — the one-click-N-tabs bug.
+# writes claimed by DIFFERENT watchers: the one-click-N-tabs bug. The debounce is
+# an atomic `mkdir` of a per-URL marker dir (not a read-then-write stamp), so two
+# racing watchers can't both pass it. Markers self-expire by their own mtime.
 
 @test "browser bridge: a repeat of the same URL inside the window is deduped" {
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
   run _browser_recently_opened "$dir" "https://example.com/x"
-  assert_failure   # first sighting → open it (and stamp it)
+  assert_failure   # first sighting → open it (and claim the marker)
   run _browser_recently_opened "$dir" "https://example.com/x"
   assert_success   # immediate repeat → suppressed
 }
@@ -109,18 +111,50 @@ teardown() { _common_teardown; }
   assert_failure   # distinct URL right after → still opens
 }
 
-@test "browser bridge: the same URL opens again once the window has passed" {
+@test "browser bridge: concurrent watchers open one URL exactly once (atomic debounce)" {
+  # The one-click-TWO-tabs bug that survived the atomic claim. Two writes of the
+  # SAME url (press + release) claimed by two live watchers (a login alongside a
+  # session, two shells on one box, or a leaked orphan) both used to pass the old
+  # read-then-write stamp before either wrote it. The atomic mkdir claim must
+  # elect exactly ONE opener no matter how many fire at once. Mutation-verified
+  # (mkdir → mkdir -p makes the claim non-exclusive and this fails).
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
-  printf '%s\nhttps://example.com/x\n' "$(( $(date +%s) - 60 ))" > "$dir/.last-open"
-  run _browser_recently_opened "$dir" "https://example.com/x"
-  assert_failure   # stamp is stale → open normally
+  local n=24 i wins
+  local results="$TEST_TEMP/race_wins"; : > "$results"
+  local go="$TEST_TEMP/race_go"
+  for i in $(seq 1 "$n"); do
+    ( while [ ! -f "$go" ]; do :; done            # barrier: maximise overlap
+      if _browser_recently_opened "$dir" "https://example.com/race"; then :; else
+        echo win >> "$results"                    # rc 1 = "open it" = a winner
+      fi
+    ) &
+  done
+  sleep 0.2                                        # let every racer reach the barrier
+  touch "$go"
+  wait
+  wins="$(grep -c win "$results" 2>/dev/null)"; wins="${wins:-0}"
+  [ "$wins" -eq 1 ] || { echo "expected exactly 1 opener across $n racers, got $wins"; return 1; }
 }
 
-@test "browser bridge: a corrupt debounce stamp fails open" {
+@test "browser bridge: the same URL opens again once the window has passed" {
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
-  printf 'garbage\nhttps://example.com/x\n' > "$dir/.last-open"
   run _browser_recently_opened "$dir" "https://example.com/x"
-  assert_failure   # unreadable stamp must never block an open
+  assert_failure                                   # first sighting opens, claims a marker
+  local m
+  for m in "$dir"/.open.*; do touch -t 200001010000 "$m" 2>/dev/null || true; done
+  run _browser_recently_opened "$dir" "https://example.com/x"
+  assert_failure   # marker predates the window → swept → opens again normally
+}
+
+@test "browser bridge: a leftover marker with no readable time fails open (never wedges)" {
+  # A marker left in a broken state (mtime unreadable → treated as epoch 0, far
+  # past the window) must be swept, never permanently suppress a URL.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  local hash; hash="$(printf '%s' "https://example.com/x" | cksum)"; hash="${hash// /_}"
+  mkdir -p "$dir/.open.$hash"
+  touch -t 200001010000 "$dir/.open.$hash" 2>/dev/null || true
+  run _browser_recently_opened "$dir" "https://example.com/x"
+  assert_failure   # ancient/broken marker must never block an open
 }
 
 @test "browser bridge: the watcher consults the debounce before opening" {
@@ -149,7 +183,7 @@ EOF
 @test "browser bridge: watcher self-exits when its spawning cleat process dies" {
   # The accumulation half of the one-click-N-tabs bug: a watcher whose cleat
   # process was SIGKILL'd (closed terminal) skips the cleanup trap and used to
-  # poll forever — every crashed session added one more tab per click. The
+  # poll forever: every crashed session added one more tab per click. The
   # liveness check reaps it within a poll tick.
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
   cat > "$TEST_TEMP/spawner.sh" <<EOF

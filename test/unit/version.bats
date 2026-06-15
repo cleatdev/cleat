@@ -44,7 +44,7 @@ teardown() { _common_teardown; }
   REPO_DIR="$TEST_TEMP"
   UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
   echo "$(date +%s) 99.0.0" > "$UPDATE_CHECK_FILE"
-  # Do NOT override _is_tty — under bats it is false.
+  # Do NOT override _is_tty. Under bats it is false.
   _apply_cli_update() { echo "APPLY_CALLED"; return 0; }
   _reexec_cli() { echo "REEXEC_CALLED"; }
 

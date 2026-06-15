@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Boxes — adversarial hardening (see concept/20-boxes.md).
+# Boxes: adversarial hardening (see concept/20-boxes.md).
 # Hostile inputs, format-boundary edges, and the seams between the new box code
 # and the existing trust/caps system. These are the release-blocker hunters.
 load "../setup"
@@ -22,7 +22,7 @@ teardown() { _common_teardown; }
 }
 
 @test "harden: box name rejects a trailing newline" {
-  # Use $'...' — command substitution would strip the trailing newline.
+  # Use $'...' (command substitution would strip the trailing newline).
   local b=$'az\n'
   run _validate_box_name "$b"
   assert_failure
@@ -58,7 +58,7 @@ teardown() { _common_teardown; }
   mkdir -p "$TEST_TEMP/project"; cd "$TEST_TEMP/project"
   cmd_describe az 'col\t1 \033[31mRED end' >/dev/null
   run cmd_describe az
-  # The literal backslash sequences must survive display — not become a tab or
+  # The literal backslash sequences must survive display, not become a tab or
   # a real ANSI escape.
   assert_output --partial '\t'
   assert_output --partial '\033'

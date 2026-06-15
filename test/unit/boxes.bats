@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Boxes — per-box runtime behavior in cmd_run (see concept/20-boxes.md).
+# Boxes: per-box runtime behavior in cmd_run (see concept/20-boxes.md).
 # Phase 3: per-box session state + the sh.cleat.box container label.
 #
 # These drive cmd_run with the box set via the session-scoped _BOX global
@@ -117,7 +117,7 @@ teardown() { _common_teardown; }
 
 # ── Phase 4: per-box capabilities (.cleat.<box> REPLACES .cleat) ─────────────
 
-@test "box caps: .cleat.<box> REPLACES .cleat — a box can have FEWER caps" {
+@test "box caps: .cleat.<box> REPLACES .cleat, a box can have FEWER caps" {
   # This is the least-privilege guarantee: a dev box denied docker even though
   # the project default (.cleat) grants it.
   mkdir -p "$TEST_TEMP/project"
@@ -166,7 +166,7 @@ teardown() { _common_teardown; }
   _BOX="dev"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active git; assert_success   # from .cleat.dev
-  run cap_is_active gh;  assert_success   # from global — unions in
+  run cap_is_active gh;  assert_success   # from global, unions in
 }
 
 # ── Phase 4: per-box env files (.cleat.<box>.env REPLACES .cleat.env) ────────
@@ -267,7 +267,7 @@ teardown() { _common_teardown; }
 
 @test "box status: ignores a container whose /workspace mount is a different project" {
   # Even if a sibling project's container name embeds this project's hash, the
-  # mount-source check rejects it — no cross-project phantom box.
+  # mount-source check rejects it: no cross-project phantom box.
   mkdir -p "$TEST_TEMP/project"
   local hash
   hash="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
@@ -318,7 +318,7 @@ teardown() { _common_teardown; }
 
 @test "box ps: one combined inspect per row (no per-field re-inspect / extra ps)" {
   # Efficiency contract: cmd_ps must read box label, running state AND the
-  # workspace path from a SINGLE inspect per container — not 2 inspects + a ps.
+  # workspace path from a SINGLE inspect per container, not 2 inspects + a ps.
   local cname="cleat-proj-abcdef12-az"
   printf '%s\t%s\n' "$cname" "Up 1 minute" > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"

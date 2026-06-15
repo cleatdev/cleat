@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
-# Boxes — property/fuzz tests (see feedback_deep_testing_bar). These assert the
+# Boxes: property/fuzz tests (see feedback_deep_testing_bar). These assert the
 # load-bearing invariants over a CROSS-PRODUCT of adversarial inputs, not just a
-# handful of examples — so a future tweak to the truncation math, the charset,
+# handful of examples: so a future tweak to the truncation math, the charset,
 # or the session-key derivation can't quietly break a corner. Pure functions,
 # no docker.
 load "../setup"
@@ -16,7 +16,7 @@ _FUZZ_PATHS=(
   "/very/deeply/nested/path/to/some/project/directory/here"
 )
 
-@test "fuzz: container_name_for — <=63 chars, 8-hex hash, valid Docker name, default byte-identical, named suffix, for ANY path x box" {
+@test "fuzz: container_name_for: <=63 chars, 8-hex hash, valid Docker name, default byte-identical, named suffix, for ANY path x box" {
   local longdir; longdir="/x/$(printf 'a%.0s' {1..120})"
   local paths=( "${_FUZZ_PATHS[@]}" "$longdir" )
   local boxes=( "" "main" "a" "az" "dev-2_x" "scratch" "untrusted" "$(printf 'b%.0s' {1..31})" )
@@ -41,7 +41,7 @@ _FUZZ_PATHS=(
   done
 }
 
-@test "fuzz: container_name_for — distinct (path,box) pairs never collide (modulo md5)" {
+@test "fuzz: container_name_for: distinct (path,box) pairs never collide (modulo md5)" {
   # Same path, different boxes -> different names; same box, different paths ->
   # different names (the hash disambiguates).
   local a b
@@ -53,7 +53,7 @@ _FUZZ_PATHS=(
   [[ "$a" != "$b" ]] || { echo "named vs main collided: $a"; return 1; }
 }
 
-@test "fuzz: _derive_project_session_key — default byte-identical to legacy; named appends -<box>; for ANY path" {
+@test "fuzz: _derive_project_session_key: default byte-identical to legacy; named appends -<box>; for ANY path" {
   local p b legacy
   for p in "${_FUZZ_PATHS[@]}"; do
     legacy="$(basename "$p" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')-$(echo -n "$p" | _md5 | head -c 8)"
@@ -65,7 +65,7 @@ _FUZZ_PATHS=(
   done
 }
 
-@test "fuzz: _validate_box_name — never crashes and agrees with its charset, for hostile inputs" {
+@test "fuzz: _validate_box_name: never crashes and agrees with its charset, for hostile inputs" {
   local inputs=(
     "" "a" "az" "main" "1" "a-b" "a_b" "main-2" "x--y" "0box" "z9"
     "A" "Az" "-a" "_a" ".a" "a." "a/b" "a b" 'a$b' 'a;b' 'a&b' 'a|b' 'a`b' 'a*b' "a:b"

@@ -5,7 +5,7 @@
 # For each historical bug recorded in test/unit/regressions.bats, this script
 # applies a sed mutation to bin/cleat that reintroduces the bug, then runs
 # the guarding test and verifies the test FAILS. A test that passes against
-# the mutated source is worthless — it doesn't catch the bug it claims to.
+# the mutated source is worthless: it doesn't catch the bug it claims to.
 #
 # This is the "verify 3 times" layer for the regression registry:
 #   1. The test passes on the current (fixed) code
@@ -13,7 +13,7 @@
 #   3. The test does not cause false positives in the full suite
 #
 # Usage: test/mutation_regressions.sh [filter]
-#   filter — optional substring to select a subset of mutations by name
+#   filter: optional substring to select a subset of mutations by name
 #
 # Exit: 0 if every tested mutation is caught; 1 otherwise.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,7 +178,7 @@ try() {
 echo "${BOLD}Running regression mutations${RESET}"
 echo ""
 
-# v0.5.1 — cmd_claude must set _RESOLVED_PROJECT
+# v0.5.1: cmd_claude must set _RESOLVED_PROJECT
 cat > "$SED_TMP" << 'SED'
 /^cmd_claude()/,/^}$/{
   /_RESOLVED_PROJECT="\$project"/d
@@ -186,14 +186,14 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.5.1_resolved_project" "cmd_claude sets _RESOLVED_PROJECT"
 
-# v0.5.1 — hook overlay must replace command, not strip. Break it by replacing
+# v0.5.1: hook overlay must replace command, not strip. Break it by replacing
 # the forwarder path with something no test checks for.
 cat > "$SED_TMP" << 'SED'
 s|cat >> /var/log/cleat/events.jsonl|/bin/true|g
 SED
 try "v0.5.1_hook_replace" "hook overlay replaces command with forwarder"
 
-# v0.6.0 + v0.6.5 — both guards must hold. Break BOTH the -d dir check and
+# v0.6.0 + v0.6.5: both guards must hold. Break BOTH the -d dir check and
 # the -f file skip so the overlay is mounted even when neither exists.
 cat > "$SED_TMP" << 'SED'
 s|if \[\[ -d "\$project/.claude" \]\]; then|if true; then|
@@ -201,31 +201,31 @@ s|if \[\[ -d "\$project/.claude" \]\]; then|if true; then|
 SED
 try "v0.6.0_claude_guard" "skip project overlay when .claude/ missing"
 
-# v0.6.1 — _browser_watcher must remove stale bridge file at startup
+# v0.6.1: _browser_watcher must remove stale bridge file at startup
 cat > "$SED_TMP" << 'SED'
 /^  # Remove any URL left over from a previous session$/,/^  rm -f "\$bridge_file"$/d
 SED
 try "v0.6.1_browser_stale" "browser bridge removes stale file"
 
-# v0.6.2 — docker run failure must surface docker stderr
+# v0.6.2: docker run failure must surface docker stderr
 cat > "$SED_TMP" << 'SED'
 s|\[\[ -s "\$_docker_err" \]\] && error "\${DIM}\$(cat "\$_docker_err")\${RESET}"|true|
 SED
 try "v0.6.2_stderr_error" "docker run failure surfaces docker stderr"
 
-# v0.6.2 — cmd_run must wipe stale overlay dir
+# v0.6.2: cmd_run must wipe stale overlay dir
 cat > "$SED_TMP" << 'SED'
 s|rm -rf "\$settings_overlay_dir"|true|
 SED
 try "v0.6.2_stale_overlay" "cmd_run wipes stale settings overlay"
 
-# v0.6.2 — summary block must collapse $HOME to ~ (not show '~' literally)
+# v0.6.2: summary block must collapse $HOME to ~ (not show '~' literally)
 cat > "$SED_TMP" << 'SED'
 s|display_path="\${project/#\$HOME/\$_tilde}"|display_path="'~'\${project#\$HOME}"|
 SED
 try "v0.6.2_tilde" "summary block shows ~ without quotes"
 
-# v0.6.3 — exec_claude must pass _RESOLVED_ENV_ARGS to docker exec
+# v0.6.3: exec_claude must pass _RESOLVED_ENV_ARGS to docker exec
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
   /"\${_RESOLVED_ENV_ARGS\[@\]+/d
@@ -233,7 +233,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.6.3_exec_claude_env" "exec_claude passes resolved env args"
 
-# v0.6.3 — cmd_shell must call resolve_env_args. Replace the call with a
+# v0.6.3: cmd_shell must call resolve_env_args. Replace the call with a
 # no-op so the function signature is preserved but env resolution is skipped.
 cat > "$SED_TMP" << 'SED'
 /^cmd_shell()/,/^}$/{
@@ -242,7 +242,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.6.3_shell_resolve" "cmd_shell resolves env args"
 
-# v0.6.3 — cmd_shell must set full PATH (use CLAUDE_ENV, not hardcoded HOME only)
+# v0.6.3: cmd_shell must set full PATH (use CLAUDE_ENV, not hardcoded HOME only)
 cat > "$SED_TMP" << 'SED'
 /^cmd_shell()/,/^}$/{
   s|"\${CLAUDE_ENV\[@\]}"|-e HOME=/home/coder|
@@ -250,7 +250,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.6.3_shell_path" "cmd_shell sets PATH with /home/coder/.local/bin"
 
-# v0.6.3 — cmd_login must call resolve_env_args. Replace with no-op.
+# v0.6.3: cmd_login must call resolve_env_args. Replace with no-op.
 cat > "$SED_TMP" << 'SED'
 /^cmd_login()/,/^}$/{
   s|resolve_env_args "\$project"|true|
@@ -258,39 +258,39 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.6.3_login_resolve" "cmd_login resolves env args"
 
-# v0.6.3 — _parse_env_file must read last line without trailing newline
+# v0.6.3: _parse_env_file must read last line without trailing newline
 # (use # as delimiter to avoid shell pipe in pattern)
 cat > "$SED_TMP" << 'SED'
 s#while IFS= read -r line || \[\[ -n "\$line" \]\]; do#while IFS= read -r line; do#
 SED
 try "v0.6.3_parse_env_last" "_parse_env_file reads last line"
 
-# v0.6.4 — _auth_callback_proxy must try TCP6 first. Remove the 6 so the
+# v0.6.4: _auth_callback_proxy must try TCP6 first. Remove the 6 so the
 # call becomes pure TCP (the pre-fix behavior).
 cat > "$SED_TMP" << 'SED'
 s|TCP6\\\\:localhost|TCP\\\\:localhost|
 SED
 try "v0.6.4_tcp6_first" "tries TCP6 before TCP"
 
-# v0.6.4 — socat must use -,ignoreeof to prevent stdin EOF propagation
+# v0.6.4: socat must use -,ignoreeof to prevent stdin EOF propagation
 cat > "$SED_TMP" << 'SED'
 s|-,ignoreeof|-|g
 SED
 try "v0.6.4_ignoreeof" "uses ignoreeof on stdin"
 
-# v0.6.5 — cmd_run must skip overlay mount when host file doesn't exist
+# v0.6.5: cmd_run must skip overlay mount when host file doesn't exist
 cat > "$SED_TMP" << 'SED'
 /\[\[ -f "\$pf" \]\] || continue/d
 SED
 try "v0.6.5_skip_missing" "cmd_run skips overlay mount for missing"
 
-# v0.6.5 — cmd_run must force-remove partial container on failure
+# v0.6.5: cmd_run must force-remove partial container on failure
 cat > "$SED_TMP" << 'SED'
 /docker rm -f "\$cname" > \/dev\/null 2>&1 || true/d
 SED
 try "v0.6.5_cleanup_fail" "cmd_run cleans up partial container"
 
-# v0.8.0 — per-project session overlay must be present in docker run
+# v0.8.0: per-project session overlay must be present in docker run
 cat > "$SED_TMP" << 'SED'
 /project_session_key=/d
 /project_session_dir=/d
@@ -300,27 +300,27 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.8.0_session_isolation" "session overlay mount isolates projects"
 
-# v0.8.0 — history.jsonl must be overlaid per-project. Remove the history mount.
+# v0.8.0: history.jsonl must be overlaid per-project. Remove the history mount.
 cat > "$SED_TMP" << 'SED'
 /history\.jsonl:\/home\/coder\/\.claude\/history\.jsonl/d
 SED
 try "v0.8.0_history_isolation" "history.jsonl overlay isolates per-project history"
 
-# bash-3.2 — grep guard must catch associative arrays
+# bash-3.2: grep guard must catch associative arrays
 cat > "$SED_TMP" << 'SED'
 1a\
 local -A _illegal_bash4=()
 SED
 try "bash32_assoc_array" "no associative arrays"
 
-# bash-3.2 — grep guard must catch readarray (syntactically valid form)
+# bash-3.2: grep guard must catch readarray (syntactically valid form)
 cat > "$SED_TMP" << 'SED'
 1a\
 _never_run() { readarray -t arr < /dev/null; }
 SED
 try "bash32_readarray" "no readarray or mapfile"
 
-# v0.9.2 — installer spin_stop must use %b (not %s) so escape sequences
+# v0.9.2: installer spin_stop must use %b (not %s) so escape sequences
 # embedded in ok_msg/fail_msg render instead of printing literal \033.
 cat > "$SED_TMP" << 'SED'
 /^spin_stop()/,/^}$/{
@@ -329,7 +329,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.9.2_spin_stop_pct_b" "installer spin_stop renders escapes and clears line" "$INSTALLER"
 
-# v0.9.2 — installer spin_stop must emit \r\033[K (not just \r) to clear the
+# v0.9.2: installer spin_stop must emit \r\033[K (not just \r) to clear the
 # rest of a longer spinner line before writing a shorter success message.
 cat > "$SED_TMP" << 'SED'
 /^spin_stop()/,/^}$/{
@@ -338,21 +338,21 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.9.2_spin_stop_line_clear" "installer spin_stop renders escapes and clears line" "$INSTALLER"
 
-# v0.9.2 — cmd_run must call _do_pull before falling back to _do_build so
+# v0.9.2: cmd_run must call _do_pull before falling back to _do_build so
 # first-run users get the GHCR prebuilt image instead of a 2-5 min local build.
 cat > "$SED_TMP" << 'SED'
 s#_do_pull || _do_build#_do_build#
 SED
 try "v0.9.2_cmd_run_pull_first" "cmd_run attempts pull before building on first run"
 
-# v0.9.2 — REGISTRY_IMAGE must be derived from $VERSION, not hardcoded to
+# v0.9.2: REGISTRY_IMAGE must be derived from $VERSION, not hardcoded to
 # :latest. Revert to :latest and confirm the version-match guard fails.
 cat > "$SED_TMP" << 'SED'
 s|^REGISTRY_IMAGE=.*|REGISTRY_IMAGE="${REGISTRY_BASE}:latest"|
 SED
 try "v0.9.2_registry_tag_latest" "registry image tag matches CLI version"
 
-# v0.9.2 — bin/cleat's spin_stop must emit \r\033[K (not just \r) to clear
+# v0.9.2: bin/cleat's spin_stop must emit \r\033[K (not just \r) to clear
 # the rest of a longer spinner line before writing a shorter success message.
 cat > "$SED_TMP" << 'SED'
 /^spin_stop()/,/^}$/{
@@ -361,20 +361,20 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.9.2_cli_spin_stop_line_clear" "bin/cleat spin_stop clears line before writing"
 
-# v0.10.0 — docker must be in KNOWN_CAPS. Remove it, guard test should fail.
+# v0.10.0: docker must be in KNOWN_CAPS. Remove it, guard test should fail.
 cat > "$SED_TMP" << 'SED'
 s|^KNOWN_CAPS=(git ssh env hooks gh docker)$|KNOWN_CAPS=(git ssh env hooks gh)|
 SED
 try "v0.10.0_docker_in_known_caps" "docker listed in KNOWN_CAPS"
 
-# v0.10.0 — docker cap must mount the host docker socket when active. Remove
+# v0.10.0: docker cap must mount the host docker socket when active. Remove
 # the socket mount; the regression guard for socket mount should fail.
 cat > "$SED_TMP" << 'SED'
 /mount_args+=(-v \/var\/run\/docker.sock/d
 SED
 try "v0.10.0_docker_cap_socket_mount" "docker cap mounts host socket"
 
-# v0.10.0 — docker cap must add a host-path identity mount + workdir so
+# v0.10.0: docker cap must add a host-path identity mount + workdir so
 # $(pwd) inside Cleat resolves to a host-valid path. Remove the identity
 # mount; the path-remapping guard should fail.
 cat > "$SED_TMP" << 'SED'
@@ -382,16 +382,16 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_docker_cap_identity_mount" "docker cap mounts project at host path with workdir"
 
-# v0.10.0 — workspace trust must default-deny project .cleat caps in non-TTY
+# v0.10.0: workspace trust must default-deny project .cleat caps in non-TTY
 # contexts when no opt-in is provided. Remove the trust gate so project
-# caps are applied unconditionally — the supply-chain regression guard
-# should fail.
+# caps are applied unconditionally (the supply-chain regression guard
+# should fail).
 cat > "$SED_TMP" << 'SED'
 s|if _resolve_project_trust "\$project" "\$trust_mode"; then|if true; then|
 SED
 try "v0.10.0_trust_default_deny" "skips project .cleat caps"
 
-# v0.10.0 — cmd_status must call resolve_caps with readonly mode so it
+# v0.10.0: cmd_status must call resolve_caps with readonly mode so it
 # never prompts. Remove the readonly argument and the "status never
 # prompts" guard should fail.
 cat > "$SED_TMP" << 'SED'
@@ -401,7 +401,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_status_readonly_trust" "cmd_status never prompts for trust"
 
-# v0.10.0 — the trust hash must be over the *canonical* cap list, not the
+# v0.10.0: the trust hash must be over the *canonical* cap list, not the
 # raw .cleat file. If the hash includes comments/whitespace, comment
 # edits trigger re-approval churn. Replace canonical hashing with raw
 # file hashing and the hash-stability guard should fail.
@@ -412,7 +412,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_trust_hash_canonical" "trust hash is over canonical caps"
 
-# v0.10.0 — _md5 on Linux uses md5sum which appends "  -" (stdin filename)
+# v0.10.0: _md5 on Linux uses md5sum which appends "  -" (stdin filename)
 # after the hash. The `awk '{print $1}'` strip in _hash_cleat_caps must
 # remain so the trust file stores pure hex. Removing it reintroduces the
 # junk suffix and the hex-only guard should fail. Use `#` as sed
@@ -424,7 +424,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_trust_hash_hex_strip" "trust hash is pure hex"
 
-# v0.10.0 — cleat resume after cleat rm must auto-create the container
+# v0.10.0: cleat resume after cleat rm must auto-create the container
 # (not error out) so --continue can resume from the host-side session
 # dir. Replace the cmd_run call with a plain `exit 1` and the regression
 # test should fail (assert_success on cmd_resume).
@@ -433,7 +433,7 @@ s#cmd_run "\$project"#exit 1#
 SED
 try "v0.10.0_resume_auto_creates" "cleat resume after cleat rm creates container"
 
-# v0.10.0 — cmd_rm must not touch the per-project session dir under
+# v0.10.0: cmd_rm must not touch the per-project session dir under
 # ~/.claude/projects/. Append, inside cmd_rm only, an rm that clobbers the
 # whole projects dir; the "leaves session dir untouched" regression test should
 # fail. (Anchored on the per-container runtime-dir cleanup, which replaced the
@@ -446,7 +446,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_cmd_rm_preserves_sessions" "cmd_rm leaves per-project session dir untouched"
 
-# v0.10.0 — docker cap must overlay the session dir at the host-path-
+# v0.10.0: docker cap must overlay the session dir at the host-path-
 # encoded key (so Claude's host-path-derived session dir maps to the
 # per-project overlay). Remove the second session-dir overlay under
 # the docker cap and the guard should fail.
@@ -455,21 +455,21 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.10.0_docker_cap_session_overlay" "docker cap overlays session dir at host-path key"
 
-# v0.10.1 — _do_pull must short-circuit when the version-tagged prebuilt
+# v0.10.1: _do_pull must short-circuit when the version-tagged prebuilt
 # image is already on disk. Force the cache check to always-false so
 # every call hits the network, then fails (DOCKER_PULL_EXIT_CODE=1 in
-# tests), then falls back to a local build — exactly what the regression
+# tests), then falls back to a local build: exactly what the regression
 # test forbids.
-# (pattern updated when the cache condition grew the arch check — see vnext_pull_cache_arch)
+# (pattern updated when the cache condition grew the arch check: see vnext_pull_cache_arch)
 cat > "$SED_TMP" << 'SED'
 s|if docker image inspect "\$target_image" > /dev/null 2>&1 \&\& _image_arch_ok "\$target_image"; then|if false; then|
 SED
 try "v0.10.1_pull_local_cache_short_circuit" "_do_pull reuses locally cached prebuilt without network call"
 
-# v0.10.1 — when the cache hit fires but `docker tag` silently fails,
+# v0.10.1: when the cache hit fires but `docker tag` silently fails,
 # _do_pull must fall through to the network pull instead of returning
 # success. Mutate the inner tag-success guard to unconditional truth so
-# the success branch always fires regardless of the tag's exit code —
+# the success branch always fires regardless of the tag's exit code:
 # the hardening regression test should fail (no fall-through warning,
 # no network pull attempt).
 cat > "$SED_TMP" << 'SED'
@@ -477,7 +477,7 @@ s|if docker tag "\$target_image" "\$IMAGE_NAME" > /dev/null 2>&1; then|if true; 
 SED
 try "v0.10.1_pull_cache_tag_failure_fallthrough" "_do_pull falls through to network pull when cache-hit tag fails"
 
-# v0.12.1 — drift detection now prompts to recreate (interactive). Mutate
+# v0.12.1: drift detection now prompts to recreate (interactive). Mutate
 # cmd_start to drop the _resolve_config_drift call. Without it, drift
 # silently goes undetected and users keep hitting the stale-cap container.
 # The regression spy in regressions.bats should fail to set DRIFT_CALLED.
@@ -488,21 +488,21 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.12.1_drift_recreate_wired" "cmd_start invokes _resolve_config_drift"
 
-# v0.12.1 — the drift recreate prompt must interpret ANSI escapes. The prompt
+# v0.12.1: the drift recreate prompt must interpret ANSI escapes. The prompt
 # now routes through the shared _ask_yn helper, so mutate ITS `echo -en` back to
 # `echo -n`: $BOLD/$RESET would then print as literal `\033[...]` strings. The
 # regression test (pipes "y" into _resolve_config_drift) asserts no such literal
-# appears — and this guards every prompt that uses _ask_yn, not just this one.
+# appears, and this guards every prompt that uses _ask_yn, not just this one.
 cat > "$SED_TMP" << 'SED'
 s|echo -en "    ${_prompt}"|echo -n "    ${_prompt}"|
 SED
 try "v0.12.1_drift_prompt_ansi" "drift recreate prompt interprets ANSI escapes"
 
-# v0.12.3 — _settings_overlay_intact must also verify that each bind source
+# v0.12.3: _settings_overlay_intact must also verify that each bind source
 # inside the overlay dir is a regular file, not just that the dir exists.
 # Mutate the per-file check out of the helper so it falls back to the old
 # dir-only behavior. With the per-file guard removed, cmd_start no longer
-# auto-recreates on partial rotation — it would fall through to
+# auto-recreates on partial rotation: it would fall through to
 # `docker start` and the regression test's recreate assertions would fail.
 cat > "$SED_TMP" << 'SED'
 /^_settings_overlay_intact()/,/^}$/{
@@ -514,7 +514,7 @@ try "v0.12.3_overlay_intact_per_file_check" "cmd_start auto-recreates when overl
 # ── upgrade-claude hardening (tested against upgrade_claude.bats) ────────────
 
 # Channel validation must reject anything but stable/latest/semver. Neuter the
-# regex guard so a shell-injection channel would slip through — the rejection
+# regex guard so a shell-injection channel would slip through; the rejection
 # test must then fail.
 cat > "$SED_TMP" << 'SED'
 s|if \[\[ ! "\$channel" =~ \$_semver \]\]; then|if false; then|
@@ -527,7 +527,7 @@ try "upgrade_claude_channel_validation" "rejects a shell-injection channel witho
 cat > "$SED_TMP" << 'SED'
 s|set -euo pipefail; ||
 SED
-# Filter is a regex matched against the test name — keep it free of the name's
+# Filter is a regex matched against the test name: keep it free of the name's
 # literal parentheses, which would otherwise be interpreted as a regex group
 # and fail to match (selecting zero tests, which bats reports as success).
 try "upgrade_claude_install_pipefail" "install command enables pipefail" "$CLI" "$UPGRADE_BATS"
@@ -553,8 +553,8 @@ try "claude_update_local_chown" "chowns ~/.local" "$ENTRYPOINT" "$ENTRYPOINT_BAT
 
 # The prompt must fire only when the remote version is strictly newer. Neuter
 # the "already current" short-circuit so it would nag even when the image
-# already runs the remote version — the equal-version test must then fail.
-# Use `#` as the sed delimiter — the pattern contains `||`, which would
+# already runs the remote version; the equal-version test must then fail.
+# Use `#` as the sed delimiter: the pattern contains `||`, which would
 # otherwise be read as the `s|...|` delimiter and break the expression.
 cat > "$SED_TMP" << 'SED'
 s#\[\[ "\$remote" != "\$local_v" \]\] || return 0#[[ "$remote" != "$local_v" ]] || true#
@@ -564,8 +564,8 @@ try "claude_check_strictly_newer" "no prompt when the image already runs the rem
 # CLEAT_CLAUDE_CHANNEL is user-controlled and is interpolated into a URL and
 # the in-container shell command, so a non-stable/latest/semver value must be
 # replaced with the safe default. Drop the fallback so a malicious channel
-# would pass through — the injection-guard test must then fail.
-# `#` delimiter again — the pattern contains `||`.
+# would pass through; the injection-guard test must then fail.
+# `#` delimiter again: the pattern contains `||`.
 cat > "$SED_TMP" << 'SED'
 s#\[\[ "\$channel" =~ \$_semver \]\] || channel="latest"#:#
 SED
@@ -625,7 +625,7 @@ s#local hooks_dir="\$CLEAT_RUN_DIR/\${cname}/hooks"#local hooks_dir="/tmp/cleat-
 SED
 try "run_dir_hooks_relocated" "hooks spool source is under CLEAT_RUN_DIR" "$CLI" "$RUN_DIR_BATS"
 
-# cmd_clean's prune report must use if/fi, not `[[ ]] &&` — the latter makes the
+# cmd_clean's prune report must use if/fi, not `[[ ]] &&`: the latter makes the
 # function (last statement in main) exit 1 on a successful run with 0 orphans.
 # Revert to the `&&` form; the "exits 0 with nothing to prune" test must fail.
 cat > "$SED_TMP" << 'SED'
@@ -633,7 +633,7 @@ s#if \[\[ \$_pruned -gt 0 \]\]; then info "Pruned \${_pruned} orphaned runtime d
 SED
 try "run_dir_clean_exit_code" "exits 0 on a successful run with nothing to prune" "$CLI" "$RUN_DIR_BATS"
 
-# v0.13.0 — the container must mount the per-project isolated .claude.json, not
+# v0.13.0: the container must mount the per-project isolated .claude.json, not
 # the shared host file. Revert to the old host-file mount; the regression test
 # (which asserts the bind source is the per-project store, never ~/.claude.json)
 # must fail.
@@ -642,7 +642,7 @@ s#mount_args+=(-v "\$project_claude_json:/home/coder/.claude.json")#mount_args+=
 SED
 try "v0.13.0_claude_json_isolation" "container mounts an isolated .claude.json"
 
-# v0.13.0 — the summary "Project:" row must tell the truth under the docker cap
+# v0.13.0: the summary "Project:" row must tell the truth under the docker cap
 # (host path "(same path, sandboxed)", not "→ /workspace"). Revert the docker
 # branch to the /workspace form; the regression test must fail.
 cat > "$SED_TMP" << 'SED'
@@ -650,7 +650,7 @@ s#${display_path} ${DIM}(same path, sandboxed)${RESET}#${display_path} ${DIM}→
 SED
 try "v0.13.0_project_row_docker_cap" "summary Project row is truthful under the docker cap"
 
-# v0.13.0 — _ask_yn must treat a read FAILURE (EOF / redirected stdin) as DECLINE,
+# v0.13.0: _ask_yn must treat a read FAILURE (EOF / redirected stdin) as DECLINE,
 # not empty (which callers read as the [Y/n] default of yes). Revert to the old
 # empty-on-EOF behavior; the EOF-decline test must fail.
 cat > "$SED_TMP" << 'SED'
@@ -658,14 +658,14 @@ s#read -r _reply || { printf -v "$_var" '%s' 'n'; return 0; }#read -r _reply || 
 SED
 try "v0.13.0_ask_yn_eof_declines" "EOF / redirected stdin yields decline" "$CLI" "$TERMINAL_UX_BATS"
 
-# v0.13.0 — the CLI self-update must skip a dirty/dev tree (else it nags
+# v0.13.0: the CLI self-update must skip a dirty/dev tree (else it nags
 # "Update failed" every launch). Drop the guard; the dirty-tree skip test fails.
 cat > "$SED_TMP" << 'SED'
 /_repo_is_clean || return 0/d
 SED
 try "v0.13.0_cli_update_skips_dirty_tree" "skips entirely on a dirty/dev tree" "$CLI" "$VERSION_BATS"
 
-# v0.13.0 — _apply_cli_update must check out the v-prefixed tag (latest_remote_tag
+# v0.13.0: _apply_cli_update must check out the v-prefixed tag (latest_remote_tag
 # returns a bare X.Y.Z; tags are vX.Y.Z). Drop the prefix; the real-git apply
 # test (which asserts `checkout v9.9.9`) must fail.
 cat > "$SED_TMP" << 'SED'
@@ -673,7 +673,7 @@ s#checkout "v${target}"#checkout "${target}"#
 SED
 try "v0.13.0_apply_checkout_v_prefix" "_apply_cli_update checks out v<tag>" "$CLI" "$VERSION_BATS"
 
-# v0.13.0 — the open-bridge shim must guard its stdin `cat` read behind a tty
+# v0.13.0: the open-bridge shim must guard its stdin `cat` read behind a tty
 # check, else an interactive `open` (and `./test.sh` on a terminal) blocks
 # forever. Remove the guard; the regression test that greps for `[ ! -t 0 ]`
 # in the shim must fail.
@@ -682,17 +682,17 @@ s/ && \[ ! -t 0 \]//
 SED
 try "v0.13.0_openbridge_tty_guard" "open-bridge does not read stdin when fd0 is a tty" "$OPENBRIDGE" "$REGRESSIONS"
 
-# v0.13.0 — the test runner must feed bats stdin from /dev/null so an
+# v0.13.0: the test runner must feed bats stdin from /dev/null so an
 # interactive run can't hang on a test that reads fd0. Drop the redirect; the
 # regression test that greps test.sh for `</dev/null` on the bats call must
-# fail. (Delete the token rather than rewriting the tail — a `&` in the sed
+# fail. (Delete the token rather than rewriting the tail; a `&` in the sed
 # replacement would expand to the whole match and leave `</dev/null` behind.)
 cat > "$SED_TMP" << 'SED'
 s#"\$f" </dev/null#"\$f"#
 SED
 try "v0.13.0_testsh_stdin_isolation" "test runner isolates bats stdin from the terminal" "$TEST_SH" "$REGRESSIONS"
 
-# v0.13.0 — the sandbox-break warning (`warn_sandbox`) must render its whole
+# v0.13.0: the sandbox-break warning (`warn_sandbox`) must render its whole
 # line in amber, not just the `!`, so the docker-socket caution matches the
 # sandbox cap. Revert it to the marker-only form; the terminal_ux test that
 # asserts the amber code runs straight into the message must fail.
@@ -701,7 +701,7 @@ s|\${AMBER}! \$1\${RESET}|\${AMBER}!\${RESET} \$1|
 SED
 try "v0.13.0_warn_sandbox_full_amber" "the whole line is amber, matching the sandbox cap" "$CLI" "$TERMINAL_UX_BATS"
 
-# v0.13.1 — the session env must disable Claude's launch-time auto-updater
+# v0.13.1: the session env must disable Claude's launch-time auto-updater
 # (the freeze). Drop the flag from CLAUDE_ENV; the regression test that asserts
 # the session exec carries DISABLE_AUTOUPDATER=1 must fail.
 cat > "$SED_TMP" << 'SED'
@@ -709,14 +709,14 @@ s| -e DISABLE_AUTOUPDATER=1||
 SED
 try "v0.13.1_disable_autoupdater" "session env disables Claude's launch-time auto-updater"
 
-# v0.13.1 — exec_claude must wait for the entrypoint UID remap before launching.
+# v0.13.1: exec_claude must wait for the entrypoint UID remap before launching.
 # Delete the call; the test that asserts a `id -u coder` probe was issued fails.
 cat > "$SED_TMP" << 'SED'
 /_wait_for_coder_remap "\$cname"/d
 SED
 try "v0.13.1_remap_wait" "session waits for the UID remap before launching"
 
-# v0.13.1 — clip-daemon must use a per-uid runtime dir (CLEAT_CLIP_DIR), not the
+# v0.13.1: clip-daemon must use a per-uid runtime dir (CLEAT_CLIP_DIR), not the
 # shared /tmp/clip.sock. Revert it to a fixed path; the test that points it at a
 # per-uid dir and checks the socat bind path must fail.
 cat > "$SED_TMP" << 'SED'
@@ -724,14 +724,14 @@ s|"\${CLEAT_CLIP_DIR:-/tmp/cleat-run-\$(id -u)}"|"/tmp/cleat-run-mutant"|
 SED
 try "v0.13.1_clip_per_uid_dir" "clip-daemon uses a per-uid runtime dir" "$CLIP_DAEMON" "$REGRESSIONS"
 
-# v0.13.1 — the clip shim must resolve the SAME per-uid socket as clip-daemon.
+# v0.13.1: the clip shim must resolve the SAME per-uid socket as clip-daemon.
 # Revert it to the legacy /tmp/clip.sock; the path-consistency test must fail.
 cat > "$SED_TMP" << 'SED'
 s|SOCK="\${CLEAT_CLIP_DIR:-/tmp/cleat-run-\$(id -u)}/clip.sock"|SOCK="/tmp/clip.sock"|
 SED
 try "v0.13.1_clip_shim_sock_path" "clip shim and clip-daemon resolve the SAME socket path" "$CLIP_SHIM" "$REGRESSIONS"
 
-# v0.13.1 — the entrypoint must clear stale clip runtime files (as root) before
+# v0.13.1: the entrypoint must clear stale clip runtime files (as root) before
 # dropping to coder. Delete the cleanup line; the entrypoint test that asserts
 # the removal must fail.
 cat > "$SED_TMP" << 'SED'
@@ -739,7 +739,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.13.1_entrypoint_clip_cleanup" "clears stale clipboard runtime files before dropping to coder" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
 
-# boxes — the default/"main" box session key MUST stay byte-identical to the
+# boxes: the default/"main" box session key MUST stay byte-identical to the
 # legacy <basename>-<hash8> key. Drop the `main` exemption in the helper so the
 # default box would gain a "-main" suffix; the byte-identity test must fail.
 # (Folding a suffix into the default would orphan every user's session history.)
@@ -748,7 +748,7 @@ s| && "\$box" != "main"||
 SED
 try "boxes_default_session_key_byte_identical" "the 'main' box is byte-identical to the default" "$CLI" "$BOX_NAME_BATS"
 
-# boxes — the default/"main" box CONTAINER NAME must stay byte-identical to the
+# boxes: the default/"main" box CONTAINER NAME must stay byte-identical to the
 # legacy cleat-<dir>-<hash8> (no -main suffix on disk). Drop the `main` exemption
 # inside container_name_for so the default would gain a "-main" suffix; the
 # byte-identity test must fail. (Folding a suffix would orphan every existing
@@ -760,7 +760,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "boxes_main_container_name_byte_identical" "the 'main' box is byte-identical to the no-box name" "$CLI" "$CONTAINER_NAME_BATS"
 
-# boxes — cmd_run must thread the active box into the session key so two boxes
+# boxes: cmd_run must thread the active box into the session key so two boxes
 # over one workspace get SEPARATE Claude sessions/.claude.json (the cross-box
 # bleed/corruption guard). Drop the box arg at the call site so every box falls
 # back to the default key; the per-box session-overlay test must fail.
@@ -769,7 +769,7 @@ s|_derive_project_session_key "\$project" "\$box"|_derive_project_session_key "\
 SED
 try "boxes_session_key_threads_box" "a named box gets its own session overlay dir" "$CLI" "$BOXES_BATS"
 
-# boxes — a named box's caps come from .cleat.<box> (REPLACE, not merge), which
+# boxes: a named box's caps come from .cleat.<box> (REPLACE, not merge), which
 # is what enables least privilege (a box with FEWER caps than the project
 # default). Make _project_caps_file return .cleat for a named box instead of
 # .cleat.<box>; the dev box would then inherit .cleat's docker cap and the
@@ -779,9 +779,9 @@ cat > "$SED_TMP" << 'SED'
   s|echo "\$project/.cleat.\$box"|echo "\$project/.cleat"|
 }
 SED
-try "boxes_caps_file_replace_not_merge" "REPLACES .cleat — a box can have FEWER caps" "$CLI" "$BOXES_BATS"
+try "boxes_caps_file_replace_not_merge" "a box can have FEWER caps" "$CLI" "$BOXES_BATS"
 
-# boxes — a box description must actually persist to its host-side file (so it
+# boxes: a box description must actually persist to its host-side file (so it
 # survives stop/resume/recreate). Make _box_desc_write drop the text to
 # /dev/null; the set/show round-trip test must fail.
 cat > "$SED_TMP" << 'SED'
@@ -791,7 +791,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "boxes_desc_persists" "set then show round-trips the description" "$CLI" "$BOXES_BATS"
 
-# boxes — a box description is user-controlled text and must be printed as DATA
+# boxes: a box description is user-controlled text and must be printed as DATA
 # (printf %s), never through echo -e, which would interpret backslash escapes /
 # ANSI in the text. Turn the %s back into %b so the text is interpreted; the
 # "shown LITERALLY in cleat status" hardening test must fail.
@@ -800,7 +800,7 @@ s|%b%s%b|%b%b%b|
 SED
 try "boxes_desc_printed_as_data" "shown LITERALLY in cleat status" "$CLI" "$BOX_HARDENING_BATS"
 
-# boxes — `cleat rm <box>` must remove the box's host-side description
+# boxes: `cleat rm <box>` must remove the box's host-side description
 # unconditionally (even for a box that was only ever describe'd, never started).
 # Delete the unconditional removal; the rm-without-container test must fail.
 cat > "$SED_TMP" << 'SED'
@@ -808,7 +808,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "boxes_rm_removes_desc_unconditional" "removes the description even when no container existed" "$CLI" "$BOX_HARDENING_BATS"
 
-# boxes — cmd_status must confirm a candidate's /workspace mount source IS this
+# boxes: cmd_status must confirm a candidate's /workspace mount source IS this
 # project (guards the cross-project hash-substring collision). Drop the check;
 # a sibling project's container would then surface as a phantom box.
 cat > "$SED_TMP" << 'SED'
@@ -816,7 +816,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "boxes_status_mount_source_guard" "ignores a container whose /workspace mount is a different project" "$CLI" "$BOXES_BATS"
 
-# fork-storm — clip-daemon must give socat an inactivity timeout (-T) so a hung
+# fork-storm: clip-daemon must give socat an inactivity timeout (-T) so a hung
 # clipboard handler can't accumulate and exhaust the container's PIDs. Strip the
 # -T; the regression test that asserts socat receives `-T 5` must fail.
 cat > "$SED_TMP" << 'SED'
@@ -824,7 +824,7 @@ s| -T "\$IDLE_TIMEOUT"||
 SED
 try "clip_daemon_socat_idle_timeout" "socat an inactivity timeout" "$CLIP_DAEMON" "$REGRESSIONS"
 
-# docker-cap — each session exec must re-resolve the socket group (self-heal) so
+# docker-cap: each session exec must re-resolve the socket group (self-heal) so
 # a long-running container survives a Docker Desktop socket-GID change. Delete
 # the _ensure_docker_access calls; the cleat-shell self-heal test must fail.
 cat > "$SED_TMP" << 'SED'
@@ -832,7 +832,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "docker_cap_session_self_heal" "cleat shell self-heals the socket group" "$CLI" "$DOCKER_CAP_BATS"
 
-# boxes/efficiency — cmd_ps reads the workspace path as the TRAILING field of one
+# boxes/efficiency: cmd_ps reads the workspace path as the TRAILING field of one
 # combined inspect (box|running|path) and extracts it with `${rest#*|}`
 # (remove-up-to-FIRST '|') precisely so a literal '|' in the path survives. Flip
 # it to `##*|` (greedy, remove-up-to-LAST) and a piped path is truncated to its
@@ -842,7 +842,7 @@ s~rest#\*|}~rest##*|}~
 SED
 try "boxes_ps_path_pipe_robust" "literal '|' in the project path survives" "$CLI" "$BOXES_BATS"
 
-# boxes/efficiency — cmd_status must reuse State.Running from its single
+# boxes/efficiency: cmd_status must reuse State.Running from its single
 # discovery inspect rather than re-probing each named box with
 # is_running/container_exists. Drop the pre-resolved running arg at the call
 # site; the named box then re-probes (and, in the test setup, mis-reports as
@@ -852,7 +852,7 @@ s|_status_box_row "\$_b" "\$_n" "\$_running"|_status_box_row "$_b" "$_n"|
 SED
 try "boxes_status_running_from_inspect" "running state comes from the discovery inspect" "$CLI" "$BOXES_BATS"
 
-# v0.15.0 — _browser_claim_url must CONSUME the bridge file (atomic rename), so
+# v0.15.0: _browser_claim_url must CONSUME the bridge file (atomic rename), so
 # only one of several racing watchers opens a given URL. Swap the consuming `mv`
 # for a non-consuming `cp`: the file persists, a second watcher claims the same
 # URL too, and the "consumes each URL once" regression then fails.
@@ -861,7 +861,7 @@ s|mv "\$bridge_file" "\$claim"|cp "\$bridge_file" "\$claim"|
 SED
 try "v0.15.0_browser_consume_once" "browser bridge consumes each URL once"
 
-# v0.15.0 — _browser_watcher must self-exit when its run dir is removed, so an
+# v0.15.0: _browser_watcher must self-exit when its run dir is removed, so an
 # orphan from a crashed session stops re-opening URLs instead of spinning
 # forever. Delete the clip_dir-gone guard: the orphan-cleanup test then sees the
 # watcher keep running after rm and fails.
@@ -870,7 +870,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.15.0_watcher_orphan_exit" "self-exits when its run dir is removed" "$CLI" "$BROWSER_BRIDGE_BATS"
 
-# v0.15.0 — the release highlight shows for a BOUNDED number of launches
+# v0.15.0: the release highlight shows for a BOUNDED number of launches
 # (RELEASE_HIGHLIGHT_MAX_SHOWS) then goes quiet, not forever. Delete the cap
 # check so it shows on every launch: the "first 3 launches, then goes silent"
 # test then sees output on the 4th launch and fails.
@@ -879,7 +879,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.15.0_highlight_bounded_cap" "first 3 launches" "$CLI" "$WHATS_NEW_BATS"
 
-# v0.15.0 — the release-highlight version label is editorial: hardcoded to the
+# v0.15.0: the release-highlight version label is editorial: hardcoded to the
 # feature's introduction version (v0.14.0 for Boxes), NOT the dynamic ${VERSION}.
 # Revert it to ${VERSION}: with VERSION past 0.14.0 the label renders wrong and
 # the "fresh install" test (which pins "New in v0.14.0") fails.
@@ -888,16 +888,16 @@ s/New in v0.14.0/New in v${VERSION}/
 SED
 try "v0.15.0_highlight_label_frozen" "fresh install" "$CLI" "$WHATS_NEW_BATS"
 
-# v0.15.0 — the config-drift notice must be plain text, not a bordered
+# v0.15.0: the config-drift notice must be plain text, not a bordered
 # _notice_box. Mutate the non-TTY drift line's `info` back to `_notice_box`:
 # the box border returns and the "plain text, not a box" regression test trips
 # on the "┌" it refutes.
 cat > "$SED_TMP" << 'SED'
-s|info "\(.*recreate to apply.*\)|_notice_box "\1|
+s|info "\(.*Recreate to apply.*\)|_notice_box "\1|
 SED
 try "v0.15.0_drift_notice_plain_text" "config-drift notice is plain text"
 
-# v0.15.0 — the image-rebuild notice must not open with a stray blank line.
+# v0.15.0: the image-rebuild notice must not open with a stray blank line.
 # Re-add the `echo ""` (inline, before the info) so the notice is preceded by a
 # newline again: the "no leading blank line" regression test then trips.
 cat > "$SED_TMP" << 'SED'
@@ -905,7 +905,7 @@ s|info "Cleat image is outdated|echo ""; info "Cleat image is outdated|
 SED
 try "v0.15.0_rebuild_notice_no_leading_blank" "image-rebuild notice has no leading blank line"
 
-# v0.15.0 — the config fingerprint must NOT depend on the CLI version, or every
+# v0.15.0: the config fingerprint must NOT depend on the CLI version, or every
 # release fires a false "caps or env keys differ" drift notice on unchanged
 # containers. Re-fold version into the hash (inline, before the sha256sum line):
 # the "version bump alone does not trigger config drift" regression then sees the
@@ -915,7 +915,7 @@ s|if command -v sha256sum|fingerprint_input+="version:\${VERSION}"; if command -
 SED
 try "v0.15.0_fingerprint_excludes_version" "version bump alone does not trigger config drift"
 
-# v0.15.0 — caps are sorted before hashing so cap order can't drift the print.
+# v0.15.0: caps are sorted before hashing so cap order can't drift the print.
 # Drop the cap `| sort`: (git ssh) and (ssh git) then hash differently and the
 # "stable regardless of cap order" test fails.
 cat > "$SED_TMP" << 'SED'
@@ -923,7 +923,7 @@ s#ACTIVE_CAPS\[@\]}" | sort#ACTIVE_CAPS[@]}"#
 SED
 try "v0.15.0_fingerprint_cap_sort" "stable regardless of cap order" "$CLI" "$CAPABILITIES_BATS"
 
-# v0.15.0 — env keys are sorted INSIDE compute_config_fingerprint (not trusting
+# v0.15.0: env keys are sorted INSIDE compute_config_fingerprint (not trusting
 # the caller's arg order). Drop the env `| sort`: a reordered arg list then
 # drifts the hash and the "stable regardless of env-arg order" test fails.
 cat > "$SED_TMP" << 'SED'
@@ -931,7 +931,7 @@ s#"\$_ekeys" | sort#"\$_ekeys"#
 SED
 try "v0.15.0_fingerprint_env_sort" "stable regardless of env-arg order" "$CLI" "$CAPABILITIES_BATS"
 
-# v0.15.0 — env VALUES are excluded from the fingerprint (only keys matter), so a
+# v0.15.0: env VALUES are excluded from the fingerprint (only keys matter), so a
 # value change never forces a recreate. Hash the full KEY=VALUE instead of the
 # key: a value change then drifts the hash and the "ignores env values" test fails.
 cat > "$SED_TMP" << 'SED'
@@ -939,7 +939,7 @@ s|_ekeys+="${arg%%=\*}"|_ekeys+="${arg}"|
 SED
 try "v0.15.0_fingerprint_ignores_values" "ignores env values" "$CLI" "$CAPABILITIES_BATS"
 
-# v0.15.0 — CLAUDE_CHECK_INTERVAL (10-min cadence) must be pinned on the STALE
+# v0.15.0: CLAUDE_CHECK_INTERVAL (10-min cadence) must be pinned on the STALE
 # side: a check past the window proceeds. Bump it to a huge value (which would
 # silently stop periodic re-checks): the "stale check ... is not throttled" test
 # then sees the prompt suppressed and fails.
@@ -948,17 +948,17 @@ s/CLAUDE_CHECK_INTERVAL=600/CLAUDE_CHECK_INTERVAL=6000/
 SED
 try "v0.15.0_claude_check_interval_pinned" "a stale check" "$CLI" "$CLAUDE_BATS"
 
-# v0.15.0 — CLAUDE_ENV is the fixed env forced into every session; its key set
+# v0.15.0: CLAUDE_ENV is the fixed env forced into every session; its key set
 # must stay exactly {HOME, DISABLE_AUTOUPDATER, PATH, TERM} (+ COLORTERM when
 # the host has one) so no other host state leaks in. Inject an extra var: the
 # "injects exactly" test sees a stray key and fails. (TERM itself became a
-# deliberate entry when terminfo forwarding shipped — the canary is LANG now.)
+# deliberate entry when terminfo forwarding shipped; the canary is LANG now.)
 cat > "$SED_TMP" << 'SED'
 s|CLAUDE_ENV=(-e HOME=/home/coder|CLAUDE_ENV=(-e LANG=C -e HOME=/home/coder|
 SED
 try "v0.15.0_session_env_exact_set" "injects exactly" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# v0.15.1 — the bring-up block is one contiguous coloured group: the cached
+# v0.15.1: the bring-up block is one contiguous coloured group: the cached
 # "Image ready" line must NOT carry a leading blank (a rebuild's "Image rebuilt"
 # flows straight into it). Re-add the `echo ""` in front: the "no leading blank"
 # terminal_ux test then sees Image-ready pushed to line 2 and fails.
@@ -967,7 +967,7 @@ s|success "Image ready \${RESET}\${DIM}(cached)"|echo ""; &|
 SED
 try "v0.15.1_image_ready_no_leading_blank" "opens the bring-up with no leading blank" "$CLI" "$TERMINAL_UX_BATS"
 
-# v0.15.1 — the release highlight ends with a trailing blank so it owns its own
+# v0.15.1: the release highlight ends with a trailing blank so it owns its own
 # separation from the bring-up that follows. Delete that trailing echo "" (the
 # one after the changelog line): the "trailing blank separates the highlight"
 # test then sees the changelog line abut the sentinel and fails.
@@ -976,7 +976,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.15.1_highlight_trailing_blank" "trailing blank separates the highlight" "$CLI" "$WHATS_NEW_BATS"
 
-# v0.15.1 — a stopped container whose baked-in bind source has vanished (the
+# v0.15.1: a stopped container whose baked-in bind source has vanished (the
 # macOS SSH agent socket rotates every reboot) must be recreated, not handed to
 # `docker start` (which aborts with an opaque OCI error). Neuter the missing-
 # source check so it always reports present: the rotated-SSH-socket regression
@@ -986,7 +986,7 @@ s#\[\[ -e "\$src" \]\] || return 1#true#
 SED
 try "v0.15.1_bind_sources_vanished_recreates" "rotated SSH-agent socket after reboot recreates"
 
-# v0.15.1 — the entrypoint must chown ~/.cache after the UID remap so the Claude
+# v0.15.1: the entrypoint must chown ~/.cache after the UID remap so the Claude
 # installer can mkdir its staging dir. Drop the chown: the "chowns ~/.cache"
 # entrypoint test then no longer sees it logged and fails.
 cat > "$SED_TMP" << 'SED'
@@ -994,7 +994,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.15.1_entrypoint_cache_chown" "chowns ~/.cache" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
 
-# vnext — boxes must be created with --init (tini as PID 1) or `su` leaves
+# vnext: boxes must be created with --init (tini as PID 1) or `su` leaves
 # zombies unreaped until the pids cap wedges the box. Drop the flag: the
 # regression test asserting the recorded docker run contains --init fails.
 cat > "$SED_TMP" << 'SED'
@@ -1002,7 +1002,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_init_reaper" "containers are created with --init"
 
-# vnext — the session script must exit with CLAUDE's status, not the
+# vnext: the session script must exit with CLAUDE's status, not the
 # clip-daemon wait's 0. Strip the rc capture/propagation: the test asserting
 # the script exits with claude's rc fails.
 cat > "$SED_TMP" << 'SED'
@@ -1010,14 +1010,14 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_claude_exit_code" "exit code survives clip-daemon cleanup"
 
-# vnext — docker exec stderr must surface on failure, not vanish. Revert to
+# vnext: docker exec stderr must surface on failure, not vanish. Revert to
 # the pre-fix 2>/dev/null: the stderr-surfacing test fails.
 cat > "$SED_TMP" << 'SED'
 s|2>"\$_exec_err"|2>/dev/null|
 SED
 try "vnext_exec_stderr" "stderr surfaces when the session fails"
 
-# vnext — the terminal must be restored after every interactive session exec
+# vnext: the terminal must be restored after every interactive session exec
 # (raw mode / alt screen / mouse tracking survive a crashed claude). Drop the
 # restore calls: the restore regression test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1025,7 +1025,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_restore_terminal" "restores terminal state after docker exec"
 
-# vnext — the clean-exit cursor-up erase must be TTY-gated so pipes stay
+# vnext: the clean-exit cursor-up erase must be TTY-gated so pipes stay
 # clean (and a masked crash can't have its evidence deleted). Make it
 # unconditional again: the piped-output test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1033,7 +1033,7 @@ s|_is_tty && printf|printf|
 SED
 try "vnext_clean_end_erase_tty_gated" "no cursor-up erase into a pipe"
 
-# vnext — the reaper-drift prompt must recognize an existing init reaper via
+# vnext: the reaper-drift prompt must recognize an existing init reaper via
 # HostConfig "Init":true. Break the detection so every box looks pre-init:
 # the "silent when the box already has an init reaper" test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1041,14 +1041,14 @@ s|"Init":true|"Init":NEVERTRUE|
 SED
 try "vnext_init_detect_true" "already has an init reaper" "$CLI" "$INIT_RECREATE_BATS"
 
-# vnext — cmd_start/cmd_resume must actually consult the reaper-drift check.
+# vnext: cmd_start/cmd_resume must actually consult the reaper-drift check.
 # Delete the call sites: the call-site test fails.
 cat > "$SED_TMP" << 'SED'
 /_maybe_prompt_init_recreate "\$cname"/d
 SED
 try "vnext_init_recreate_callsite" "cmd_start consults the reaper-drift check" "$CLI" "$INIT_RECREATE_BATS"
 
-# vnext — pulls must be pinned to the daemon arch so a wrong single-arch
+# vnext: pulls must be pinned to the daemon arch so a wrong single-arch
 # manifest fails loudly into the local-build fallback. Drop the pin: the
 # --platform test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1056,7 +1056,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_pull_platform_pin" "pull pins --platform to the daemon arch" "$CLI" "$ARCH_BATS"
 
-# vnext — an arch-mismatched cached ghcr image must not short-circuit the
+# vnext: an arch-mismatched cached ghcr image must not short-circuit the
 # pull (it would put the emulated image back into service). Drop the arch
 # check from the cache condition: the mismatch test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1064,28 +1064,28 @@ s|&& _image_arch_ok "\$target_image"||
 SED
 try "vnext_pull_cache_arch" "cached prebuilt does not short-circuit" "$CLI" "$ARCH_BATS"
 
-# vnext — _image_arch_ok must compare image arch to daemon arch, not merely
+# vnext: _image_arch_ok must compare image arch to daemon arch, not merely
 # check non-emptiness. Gut the comparison: the emulation test fails.
 cat > "$SED_TMP" << 'SED'
 s|\[\[ "\$have" == "\$want" \]\]|[[ -n "$have" ]]|
 SED
 try "vnext_arch_compare" "fails when the image would run emulated" "$CLI" "$ARCH_BATS"
 
-# vnext — cmd_run must treat a wrong-arch image as missing. Neutralize the
+# vnext: cmd_run must treat a wrong-arch image as missing. Neutralize the
 # gate: the cmd_run re-acquire test fails.
 cat > "$SED_TMP" << 'SED'
 s|elif ! _image_arch_ok; then|elif false; then|
 SED
 try "vnext_run_arch_gate" "cmd_run re-acquires a wrong-arch image" "$CLI" "$ARCH_BATS"
 
-# vnext — cmd_build must treat a wrong-arch image as missing. Neutralize the
+# vnext: cmd_build must treat a wrong-arch image as missing. Neutralize the
 # gate: the cmd_build re-acquire test fails.
 cat > "$SED_TMP" << 'SED'
 s|if _image_arch_ok; then|if true; then|
 SED
 try "vnext_build_arch_gate" "cmd_build re-acquires a wrong-arch image" "$CLI" "$ARCH_BATS"
 
-# vnext — the per-box memory limit must come from resolve_box_memory, not a
+# vnext: the per-box memory limit must come from resolve_box_memory, not a
 # hardcoded 8g that exceeds whole Docker Desktop VMs. Re-hardcode it: the
 # wiring test (configured 3g must reach docker run) fails.
 cat > "$SED_TMP" << 'SED'
@@ -1093,7 +1093,7 @@ s|--memory "\$box_memory"|--memory 8g|
 SED
 try "vnext_memory_resolved" "configured memory limit reaches docker run" "$CLI" "$RESOURCES_BATS"
 
-# vnext — swap must be pinned to the memory limit (a runaway box OOMs in its
+# vnext: swap must be pinned to the memory limit (a runaway box OOMs in its
 # own cgroup instead of thrashing VM swap). Drop the pin: the wiring test
 # asserting --memory-swap fails.
 cat > "$SED_TMP" << 'SED'
@@ -1101,7 +1101,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_memory_swap_pinned" "swap pinned equal" "$CLI" "$RESOURCES_BATS"
 
-# vnext — project-supplied memory must be clamped to 8g (untrusted repo
+# vnext: project-supplied memory must be clamped to 8g (untrusted repo
 # config can't re-introduce overcommit). Raise the clamp out of reach: the
 # clamp test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1109,21 +1109,21 @@ s|> 8589934592|> 999999999999999|
 SED
 try "vnext_memory_project_clamp" "above 8g is clamped" "$CLI" "$RESOURCES_BATS"
 
-# vnext — resources must be part of the config fingerprint so a changed limit
+# vnext: resources must be part of the config fingerprint so a changed limit
 # surfaces the drift notice. Drop them: the fingerprint test fails.
 cat > "$SED_TMP" << 'SED'
 /resources:memory=/d
 SED
 try "vnext_memory_fingerprint" "changes the config fingerprint" "$CLI" "$RESOURCES_BATS"
 
-# vnext — sessions must pin node's heap to the box's real budget. Drop the
+# vnext: sessions must pin node's heap to the box's real budget. Drop the
 # pin: the heap test fails.
 cat > "$SED_TMP" << 'SED'
 /NODE_OPTIONS=--max-old-space-size/d
 SED
 try "vnext_node_heap_pin" "pins node's heap" "$CLI" "$RESOURCES_BATS"
 
-# vnext — the VM-derived default must be a quarter of the VM (clamped), not
+# vnext: the VM-derived default must be a quarter of the VM (clamped), not
 # the whole of it. Break the divisor: the scaling test (24 GiB VM → 6g, which
 # is strictly between the 4g floor and 8g cap) sees 8g (24 → capped) and fails.
 cat > "$SED_TMP" << 'SED'
@@ -1131,7 +1131,7 @@ s|vm_bytes / 4 / 1073741824|vm_bytes / 1073741824|
 SED
 try "vnext_memory_default_quarter" "default scales with a bigger VM" "$CLI" "$RESOURCES_BATS"
 
-# 2026-06-14 — the default ceiling is floored at 4g (a 1M-context session is too
+# 2026-06-14: the default ceiling is floored at 4g (a 1M-context session is too
 # tight at 2g). Defeat the floor (small VMs fall through to the raw quarter, 2g):
 # the "floored at 4g" test sees 2g and fails.
 cat > "$SED_TMP" << 'SED'
@@ -1139,28 +1139,28 @@ s|quarter_gb < 4|quarter_gb < 0|
 SED
 try "bugfix_memory_floor_4g" "floored at 4g" "$CLI" "$RESOURCES_BATS"
 
-# vnext — prune must never remove the CURRENT version's prebuilt tag. Drop
+# vnext: prune must never remove the CURRENT version's prebuilt tag. Drop
 # the guard: the "never the current version" test fails.
 cat > "$SED_TMP" << 'SED'
 /\[\[ "\$tag" == "\${REGISTRY_BASE}:v\${VERSION}" \]\] \&\& continue/d
 SED
 try "vnext_prune_keeps_current" "never the current version" "$CLI" "$PRUNE_BATS"
 
-# vnext — the pressure check must offer the prune when bloat passes the
+# vnext: the pressure check must offer the prune when bloat passes the
 # threshold. Push the threshold out of reach: the offer test fails.
 cat > "$SED_TMP" << 'SED'
 s|_PRESSURE_BLOAT_MB_THRESHOLD=5120|_PRESSURE_BLOAT_MB_THRESHOLD=99999999|
 SED
 try "vnext_pressure_bloat_threshold" "offers prune when bloat passes" "$CLI" "$PRUNE_BATS"
 
-# vnext — the overload notice must compare promised limits to the VM size.
+# vnext: the overload notice must compare promised limits to the VM size.
 # Invert the comparison out of existence: the overcommit warning test fails.
 cat > "$SED_TMP" << 'SED'
 s|(( sum > vm_bytes ))|(( sum > vm_bytes * 1000 ))|
 SED
 try "vnext_pressure_overcommit" "warns when running limits overcommit" "$CLI" "$PRUNE_BATS"
 
-# vnext — TERM must be forwarded into sessions (docker exec -t doesn't
+# vnext: TERM must be forwarded into sessions (docker exec -t doesn't
 # propagate the terminal type; a terminfo mismatch corrupts keys/colors).
 # Drop the forward: the pinned key-set test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1168,7 +1168,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_term_forwarded" "injects exactly" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# vnext — the routine auto-GC after pull/build/rebuild is what keeps daily
+# vnext: the routine auto-GC after pull/build/rebuild is what keeps daily
 # drift rebuilds from accreting ~120 GB of orphans. Delete all four silent
 # call sites: the marker-file auto-GC tests fail.
 cat > "$SED_TMP" << 'SED'
@@ -1176,7 +1176,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_autogc_callsites" "auto-GC" "$CLI" "$PRUNE_BATS"
 
-# vnext — prune's dangling query must stay label-scoped to cleat-owned
+# vnext: prune's dangling query must stay label-scoped to cleat-owned
 # images; unscoped it deletes EVERY project's dangling images. Strip the
 # label filter: the ownership-filters test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1184,42 +1184,42 @@ s| -f label=sh.cleat.version||
 SED
 try "vnext_prune_label_filter" "queries docker with the cleat ownership filters" "$CLI" "$PRUNE_BATS"
 
-# vnext — prune's tag query must stay scoped to the cleat registry repo.
+# vnext: prune's tag query must stay scoped to the cleat registry repo.
 # Unscope it: the ownership-filters test fails.
 cat > "$SED_TMP" << 'SED'
 s|docker images "\$REGISTRY_BASE" --format|docker images --format|
 SED
 try "vnext_prune_repo_scope" "queries docker with the cleat ownership filters" "$CLI" "$PRUNE_BATS"
 
-# vnext — main()'s session-launching verbs must reach the pressure check.
+# vnext: main()'s session-launching verbs must reach the pressure check.
 # Delete the call site: the marker test fails.
 cat > "$SED_TMP" << 'SED'
 /^      _maybe_check_docker_pressure$/d
 SED
 try "vnext_pressure_main_callsite" "session-launching commands consult the pressure check" "$CLI" "$PRUNE_BATS"
 
-# vnext — status must flag an EMULATED image (arch mismatch), not a native
+# vnext: status must flag an EMULATED image (arch mismatch), not a native
 # one. Flip the comparison: both status-arch tests fail.
 cat > "$SED_TMP" << 'SED'
 s|"\$iarch" != "\$darch"|"$iarch" == "$darch"|
 SED
 try "vnext_status_emulated" "status flags an emulated image" "$CLI" "$ARCH_BATS"
 
-# vnext — the user-facing reason for a wrong-arch re-fetch must be printed at
+# vnext: the user-facing reason for a wrong-arch re-fetch must be printed at
 # the acquisition gates. Delete the call sites: the gate tests fail.
 cat > "$SED_TMP" << 'SED'
 /^    _warn_image_emulated$/d
 SED
 try "vnext_warn_emulated_callsites" "re-acquires a wrong-arch image and says why" "$CLI" "$ARCH_BATS"
 
-# vnext — status must surface a positive zombie count. Invert the gate: the
+# vnext: status must surface a positive zombie count. Invert the gate: the
 # zombie-status test fails.
 cat > "$SED_TMP" << 'SED'
 s|(( _zombies > 0 ))|(( _zombies < 0 ))|
 SED
 try "vnext_status_zombie_gate" "status surfaces the unreaped-zombie count" "$CLI" "$INIT_RECREATE_BATS"
 
-# vnext — cmd_resume must consult the reaper-drift check independently of
+# vnext: cmd_resume must consult the reaper-drift check independently of
 # cmd_start (resume is the verb that revives pre---init boxes). Delete only
 # the resume call site: the resume call-site test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1229,28 +1229,28 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_resume_init_recreate_callsite" "cmd_resume consults the reaper-drift check" "$CLI" "$INIT_RECREATE_BATS"
 
-# vnext — status's own VM-overcommit line (distinct from the on-start warn).
+# vnext: status's own VM-overcommit line (distinct from the on-start warn).
 # Push the comparison out of reach: the status overcommit test fails.
 cat > "$SED_TMP" << 'SED'
 s|(( _limit_sum > _vm_bytes ))|(( _limit_sum > _vm_bytes * 1000 ))|
 SED
 try "vnext_status_overcommit_line" "flags an overcommitted VM" "$CLI" "$PRUNE_BATS"
 
-# vnext — an Exited (255) box is a Docker restart, not a crash; ps must say
+# vnext: an Exited (255) box is a Docker restart, not a crash; ps must say
 # so. Delete the hint: the ps hint test fails.
 cat > "$SED_TMP" << 'SED'
 /Docker restarted; resume with: cleat resume/d
 SED
 try "vnext_ps_restart_hint" "box gets the Docker-restarted resume hint" "$CLI" "$DOCKER_COMMANDS_BATS"
 
-# vnext — zero-spelling memory values must be rejected ("00g" → --memory 0 is
-# UNLIMITED in docker — a project-clamp bypass). Accept zero: the 00g test fails.
+# vnext: zero-spelling memory values must be rejected ("00g" → --memory 0 is
+# UNLIMITED in docker, a project-clamp bypass). Accept zero: the 00g test fails.
 cat > "$SED_TMP" << 'SED'
 s|(( 10#\$n > 0 ))|(( 10#$n >= 0 ))|
 SED
 try "vnext_memory_zero_guard" "zero-spellings like 00g are rejected" "$CLI" "$RESOURCES_BATS"
 
-# vnext — the per-suffix digit caps keep the byte conversion inside int64; an
+# vnext: the per-suffix digit caps keep the byte conversion inside int64; an
 # overflowed product wraps past the 8g clamp. Loosen the g-cap: the
 # overflowing-value test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1258,14 +1258,14 @@ s|\[\[ \${#n} -le 9 \]\]|[[ \${#n} -le 99 ]]|
 SED
 try "vnext_memory_overflow_guard" "64-bit-overflowing suffixed value is rejected" "$CLI" "$RESOURCES_BATS"
 
-# vnext — a configured cpus limit must reach docker run. Drop the wiring:
+# vnext: a configured cpus limit must reach docker run. Drop the wiring:
 # the cpus docker-run test fails.
 cat > "$SED_TMP" << 'SED'
 s|cpu_args=(--cpus "\$box_cpus")|cpu_args=()|
 SED
 try "vnext_cpus_run_wiring" "cpus limit reaches docker run" "$CLI" "$RESOURCES_BATS"
 
-# vnext — a project cpus above the daemon's cores must clamp (dockerd ERRORS
+# vnext: a project cpus above the daemon's cores must clamp (dockerd ERRORS
 # on --cpus > NCPU, so an untrusted .cleat could abort the start). Echo the
 # raw value instead: the clamp test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1273,35 +1273,35 @@ s|echo "\$ncpu"|echo "$v"|
 SED
 try "vnext_cpus_project_clamp" "above the daemon.s cores is clamped" "$CLI" "$RESOURCES_BATS"
 
-# vnext — zero cpus must be rejected (docker reads 0 as no limit). Accept
+# vnext: zero cpus must be rejected (docker reads 0 as no limit). Accept
 # zero: the zero-cpus test fails.
 cat > "$SED_TMP" << 'SED'
 s|(( 10#\$digits > 0 ))|(( 10#$digits >= 0 ))|
 SED
 try "vnext_cpus_zero_guard" "zero cpus is rejected" "$CLI" "$RESOURCES_BATS"
 
-# vnext — cpus must be part of the config fingerprint (limits are set at
+# vnext: cpus must be part of the config fingerprint (limits are set at
 # docker run; drift must surface). Drop it: the cpus fingerprint test fails.
 cat > "$SED_TMP" << 'SED'
 /resources:cpus=/d
 SED
 try "vnext_cpus_fingerprint" "cpus limit changes the config fingerprint" "$CLI" "$RESOURCES_BATS"
 
-# vnext — COLORTERM must be forwarded when (and only when) the host sets it.
+# vnext: COLORTERM must be forwarded when (and only when) the host sets it.
 # Make the condition never true: the COLORTERM subprocess test fails.
 cat > "$SED_TMP" << 'SED'
 s|-n "\${COLORTERM:-}"|-n ""|
 SED
 try "vnext_colorterm_forward" "COLORTERM is forwarded only when the host sets it" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# vnext — the TERM fallback value is part of the contract (a box with no
+# vnext: the TERM fallback value is part of the contract (a box with no
 # terminfo match garbles keys). Change it: the fallback test fails.
 cat > "$SED_TMP" << 'SED'
 s|xterm-256color|dumb|
 SED
 try "vnext_term_fallback_value" "TERM falls back to xterm-256color" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# vnext — capture ORDER in the session script: moving _CLAUDE_RC=$? after the
+# vnext: capture ORDER in the session script: moving _CLAUDE_RC=$? after the
 # daemon kill re-masks crashes with the kill's rc. Re-capture after the kill:
 # the executed-script propagation test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1309,21 +1309,21 @@ s|kill "\$_MY_CLIP_DAEMON" 2>/dev/null$|kill "$_MY_CLIP_DAEMON" 2>/dev/null; _CL
 SED
 try "vnext_claude_rc_order" "propagates a crashed claude.s exit code when executed" "$CLI" "$REGRESSIONS"
 
-# vnext — a second spin() must reap the first frame loop (two \r loops
+# vnext: a second spin() must reap the first frame loop (two \r loops
 # interleave into garbage). Drop the nested guard: the double-spin test fails.
 cat > "$SED_TMP" << 'SED'
 /\[\[ -n "\${_SPIN_PID:-}" \]\] && _cleanup_spin/d
 SED
 try "vnext_spin_nested_guard" "second spin stops the first frame loop" "$CLI" "$TERMINAL_UX_BATS"
 
-# vnext — the frame loop must exit on its own when its parent dies without
+# vnext: the frame loop must exit on its own when its parent dies without
 # spin_stop. Make it loop forever: the orphan-spinner test fails.
 cat > "$SED_TMP" << 'SED'
 s|while kill -0 "\$_spin_parent" 2>/dev/null; do|while true; do|
 SED
 try "vnext_spin_parent_liveness" "frame loop exits on its own" "$CLI" "$TERMINAL_UX_BATS"
 
-# vnext — cmd_shell and cmd_login run their own interactive exec and must
+# vnext: cmd_shell and cmd_login run their own interactive exec and must
 # restore the terminal independently. Delete both call sites: the shell and
 # login restore tests fail.
 cat > "$SED_TMP" << 'SED'
@@ -1336,21 +1336,30 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_shell_login_restore" "restores the terminal after the interactive exec" "$CLI" "$TERMINAL_UX_BATS"
 
-# vnext — the same-URL debounce window is what folds a TUI click's double
+# vnext: the same-URL debounce window is what folds a TUI click's double
 # open-shim fire into one tab. Disable the window: the dedup test fails.
 cat > "$SED_TMP" << 'SED'
 s|_BROWSER_DEBOUNCE_SECS=2|_BROWSER_DEBOUNCE_SECS=-1|
 SED
 try "vnext_browser_debounce_window" "repeat of the same URL inside the window is deduped" "$CLI" "$BROWSER_BRIDGE_BATS"
 
-# vnext — the watcher must actually consult the debounce before opening.
+# vnext: the watcher must actually consult the debounce before opening.
 # Bypass the consult: the watcher-consults test fails.
 cat > "$SED_TMP" << 'SED'
 s|if _browser_recently_opened "\$clip_dir" "\$url"; then|if false; then|
 SED
 try "vnext_browser_debounce_callsite" "watcher consults the debounce before opening" "$CLI" "$BROWSER_BRIDGE_BATS"
 
-# vnext — a watcher whose cleat process died without the cleanup trap must
+# vnext: the debounce claim must be ATOMIC. mkdir fails (EEXIST) for all but one
+# racer; mkdir -p succeeds for every racer, so concurrent watchers would each
+# "win" and open the same URL N times (the one-click-two-tabs bug). Swap in -p:
+# the concurrent-open test fails.
+cat > "$SED_TMP" << 'SED'
+s|mkdir "\$lock" 2>/dev/null|mkdir -p "\$lock" 2>/dev/null|
+SED
+try "vnext_browser_debounce_atomic" "open one URL exactly once" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# vnext: a watcher whose cleat process died without the cleanup trap must
 # stop polling (leaked watchers are one tab PER crashed session). Drop the
 # liveness check: the orphan-watcher test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1358,7 +1367,7 @@ s|kill -0 "\$_bw_parent" 2>/dev/null \|\| { _bw_cleanup; exit 0; }|true|
 SED
 try "vnext_browser_watcher_liveness" "watcher self-exits when its spawning cleat process dies" "$CLI" "$BROWSER_BRIDGE_BATS"
 
-# vnext — an orphaned clipboard watcher must never write a dead session's box
+# vnext: an orphaned clipboard watcher must never write a dead session's box
 # clipboard over the host clipboard. Drop the choke-point check: the
 # orphan-copy test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1366,7 +1375,7 @@ s|kill -0 "\$_cw_parent" 2>/dev/null \|\| exit 0|true|
 SED
 try "vnext_clipboard_watcher_liveness" "never copies" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
 
-# vnext — an orphaned hook bridge must exit BEFORE processing late events
+# vnext: an orphaned hook bridge must exit BEFORE processing late events
 # (host hooks for a dead session). Drop the loop-top check: the orphan-bridge
 # test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1429,7 +1438,7 @@ s#_do_pull "\$VERSION" || _do_build#cmd_rebuild#
 SED
 try "bugfix_image_outdated_pulls" "PULLS this version on accept" "$CLI" "$IMAGE_REBUILD_BATS"
 
-# OOM guidance fires on exit 137 (SIGKILL — the kernel OOM-killer's signature).
+# OOM guidance fires on exit 137 (SIGKILL, the kernel OOM-killer's signature).
 # Break the 137 arm: the "infers OOM from exit 137" test sees no guidance.
 cat > "$SED_TMP" << 'SED'
 s|"\$rc" == "137"|"\$rc" == "138"|
@@ -1443,9 +1452,9 @@ s|"\$oomkilled" == "true"|"\$oomkilled" == "nope"|
 SED
 try "bugfix_oom_oomkilled_signal" "explains an OOM flagged by the container" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# The advisory sizes the VM for ~4 parallel sessions (4 × ~4g = 16g target).
-# Shrink the target so a too-small VM looks fine: the "advises a concrete VM
-# size" test sees no advisory and fails.
+# The advisory sizes the VM to a comfortable 16 GiB default target. Shrink the
+# target so a too-small VM looks fine: the "advises a concrete VM size" test sees
+# no advisory and fails.
 cat > "$SED_TMP" << 'SED'
 s|_PRESSURE_TARGET_VM_GB=16|_PRESSURE_TARGET_VM_GB=2|
 SED
@@ -1565,10 +1574,10 @@ s#sum="$(_running_memory_limits_sum)"#&; [[ "$sum" =~ ^[0-9]+$ ]] || return 0#
 SED
 try "bugfix_pressure_sum_guard_folded" "non-numeric running-limits sum" "$CLI" "$PRUNE_BATS"
 
-# v0.16.2 — _is_docker_desktop must read the OperatingSystem field via --format,
+# v0.16.2: _is_docker_desktop must read the OperatingSystem field via --format,
 # NOT `docker info | grep -q`. The piped form is SIGPIPE-fragile under pipefail
 # (grep -q closes the pipe, docker info dies 141, pipefail surfaces the 141 even
-# on a match) — which silently killed the Docker-Desktop-only VM advisory under
+# on a match), which silently killed the Docker-Desktop-only VM advisory under
 # load. Revert it to the grep pipeline: the pipefail regression test returns 141.
 cat > "$SED_TMP" << 'SED'
 /^_is_docker_desktop()/,/^}$/{
@@ -1579,7 +1588,7 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "bugfix_is_docker_desktop_pipefail" "pipefail" "$CLI" "$HOOKS_BATS"
 
-# v0.16.2 — on a host that can't grow the VM (recommended ≤ current, e.g. a 7 GB
+# v0.16.2: on a host that can't grow the VM (recommended ≤ current, e.g. a 7 GB
 # VM on an 8 GB Mac), the overload notice must steer to fewer sessions, NOT print
 # a Docker Desktop target smaller than the current VM. Force the grow branch
 # always: the starved-host test then sees the (wrong) Settings click-path.
@@ -1588,7 +1597,7 @@ s|if \$is_dd && (( rec_gb > vm_gb )); then|if true; then|
 SED
 try "bugfix_overload_starved_steer" "steers to fewer sessions" "$CLI" "$PRUNE_BATS"
 
-# v0.16.2 — the release highlight must guarantee one blank line above the news
+# v0.16.2: the release highlight must guarantee one blank line above the news
 # even when no on-start notice preceded it. Drop the leading-blank: the "opens
 # its own blank line" test sees the news sit flush against what's above it.
 cat > "$SED_TMP" << 'SED'
@@ -1596,7 +1605,7 @@ s#\[\[ "\${_ONSTART_GAP_OPEN:-0}" == "1" \]\] || echo ""#true#
 SED
 try "bugfix_highlight_leading_blank" "opens its own blank line above" "$CLI" "$WHATS_NEW_BATS"
 
-# v0.16.2 — but it must NOT double the blank when a notice already opened the gap.
+# v0.16.2: but it must NOT double the blank when a notice already opened the gap.
 # Make the leading blank unconditional: the "does NOT add a second blank" test
 # sees two blanks above the news.
 cat > "$SED_TMP" << 'SED'
@@ -1604,13 +1613,81 @@ s#\[\[ "\${_ONSTART_GAP_OPEN:-0}" == "1" \]\] || echo ""#echo ""#
 SED
 try "bugfix_highlight_no_double_blank" "does NOT add a second blank" "$CLI" "$WHATS_NEW_BATS"
 
-# v0.16.2 — the pressure block must flag _ONSTART_GAP_OPEN after printing its
+# v0.16.2: the pressure block must flag _ONSTART_GAP_OPEN after printing its
 # trailing blank, so the highlight knows the gap is open. Drop the flag: the
 # highlight adds its own blank and the end-to-end test sees a double gap.
 cat > "$SED_TMP" << 'SED'
 s#_ONSTART_GAP_OPEN=1#:#
 SED
 try "bugfix_pressure_gap_flag" "exactly one blank separates a real preceding" "$CLI" "$WHATS_NEW_BATS"
+
+# v0.16.x: the pressure section must open with its own LEADING blank (before the
+# first notice) so the advisory lands in its own block, not flush against the
+# auto-update "Restarting..." line above it (image.png). Neuter the
+# `$printed || echo ""` lead-ins: the "blank line PRECEDES" test sees the warn on
+# line 1.
+cat > "$SED_TMP" << 'SED'
+s#\$printed || echo ""#:#g
+SED
+try "bugfix_pressure_leading_blank" "blank line PRECEDES the advisory section" "$CLI" "$PRUNE_BATS"
+
+# v0.16.x: the VM fix must name the REAL Docker Desktop panels. Memory + Swap are
+# under Resources → Advanced (docker-2.png). Revert to the old bare "Resources →
+# Memory": the "REAL Docker Desktop panels" test loses the "Resources → Advanced"
+# path.
+cat > "$SED_TMP" << 'SED'
+s|Resources → Advanced|Resources → Memory|
+SED
+try "bugfix_vm_fix_memory_panel" "REAL Docker Desktop panels" "$CLI" "$PRUNE_BATS"
+
+# v0.16.x: VirtioFS file sharing is a SEPARATE panel under General → Virtual
+# Machine Options (docker-1.png), not Resources. Strip that path: the same test
+# loses the "Virtual Machine Options" assertion.
+cat > "$SED_TMP" << 'SED'
+s|General → Virtual Machine Options|Resources|
+SED
+try "bugfix_vm_fix_sharing_panel" "REAL Docker Desktop panels" "$CLI" "$PRUNE_BATS"
+
+# vnext: the undersized-VM advisory must show on EVERY start (an invalid config
+# surfaces until fixed), NOT once a day. Re-gate the 2b branch on the daily stamp:
+# with a fresh stamp the "shows on EVERY start" test sees no advisory and fails.
+cat > "$SED_TMP" << 'SED'
+s|elif \$is_dd; then|elif \$is_dd \&\& \$bloat_due; then|
+SED
+try "vnext_undersized_every_start" "shows on EVERY start" "$CLI" "$PRUNE_BATS"
+
+# vnext: the "Docker tuned" line must defer to a warning the pressure check already
+# showed this run (no warning+confirmation contradiction). Drop the guard: the
+# defers-to-a-warning test sees the confirmation leak through.
+cat > "$SED_TMP" << 'SED'
+/\[\[ "\${_VM_ADVISORY_SHOWN:-0}" == "1" \]\] && return 0/d
+SED
+try "vnext_ready_defers_to_warning" "defers to a warning" "$CLI" "$PRUNE_BATS"
+
+# vnext: the positive "Docker tuned" confirmation must fire ONLY when the VM is
+# adequately sized (the exact inverse of the 2b undersized test), never for an
+# undersized VM. Neuter the host-known adequacy gate so an undersized VM would
+# also print: the "silent when the VM is undersized" test sees the confirmation.
+cat > "$SED_TMP" << 'SED'
+s@(( vm_bytes < rec_gb \* 1073741824 )) && return 0@:@
+SED
+try "vnext_ready_adequacy_gate" "silent when the VM is undersized" "$CLI" "$PRUNE_BATS"
+
+# vnext: main()'s session-launching verbs must reach the readiness confirmation.
+# Delete the call: the announce-on-start test fails.
+cat > "$SED_TMP" << 'SED'
+/^      _maybe_announce_docker_ready$/d
+SED
+try "vnext_ready_main_callsite" "session-launching commands announce docker readiness" "$CLI" "$PRUNE_BATS"
+
+# v0.16.x: the clean-session-end reclaim sequence must clear the line success()
+# writes on (a trailing \033[2K), so stale bytes a heavily-used terminal left on
+# that row can't survive past "cleat resume". Drop the trailing clear: the
+# "clears the success line" regression test loses the second \033[2K.
+cat > "$SED_TMP" << 'SED'
+s|\\r\\n\\033\[2K'|\\r\\n'|
+SED
+try "bugfix_session_end_line_clear" "clears the success line so stale terminal bytes" "$CLI" "$REGRESSIONS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

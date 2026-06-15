@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for `cleat upgrade-claude` — re-runs the official installer in a
+# Tests for `cleat upgrade-claude`: re-runs the official installer in a
 # throwaway container from the current image and commits the result back,
 # durably upgrading the bundled Claude Code without a full rebuild.
 load "../setup"
@@ -71,7 +71,7 @@ teardown() { _common_teardown; }
 
   run cmd_upgrade_claude latest
   assert_success
-  # One consolidated row — not a green check followed by a separate version line.
+  # One consolidated row, not a green check followed by a separate version line.
   assert_output --partial "Claude Code upgraded (2.1.156 → 2.1.161)"
   refute_output --partial "▸ Claude Code 2.1.156"
 }

@@ -45,10 +45,10 @@ teardown() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.13.0 — the startup summary's "Project:" row always claimed the project was
+# v0.13.0: the startup summary's "Project:" row always claimed the project was
 # mounted at "→ /workspace". That's a lie under the docker cap: that cap mounts
 # the project at its HOST path and sets the container workdir there (so $(pwd)
-# and `docker run -v $(pwd)` resolve on the host daemon — see the docker-cap
+# and `docker run -v $(pwd)` resolve on the host daemon, see the docker-cap
 # mount block). The row now branches: host path "(same path, sandboxed)" under
 # the docker cap, "→ /workspace" otherwise.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ teardown() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.13.0 — Claude greeted users with "Configuration Error / The configuration
+# v0.13.0: Claude greeted users with "Configuration Error / The configuration
 # file at /home/coder/.claude.json contains invalid JSON ... Unexpected EOF" at
 # startup, intermittently. Root cause: Cleat mounted the single host
 # ~/.claude.json WHOLE and READ-WRITE into every container. Since every
@@ -94,7 +94,7 @@ teardown() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.5.1 — cmd_claude did not set _RESOLVED_PROJECT, so hook bridge
+# v0.5.1: cmd_claude did not set _RESOLVED_PROJECT, so hook bridge
 # couldn't find project-level hooks. Silent failure in production, invisible
 # to tests because `set -u` was stripped.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ teardown() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.5.1 — Hook settings overlay stripped all hooks instead of replacing
+# v0.5.1: Hook settings overlay stripped all hooks instead of replacing
 # command with forwarder. Project hooks never fired.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.5.1: hook overlay replaces command with forwarder (not strip)" {
@@ -152,7 +152,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.0 — Hook bridge replayed old events on every start. Any events left
+# v0.6.0: Hook bridge replayed old events on every start. Any events left
 # in /var/log/cleat/events.jsonl from a prior session re-executed on restart.
 # Fix: _hook_bridge_watcher reads the file's current byte size at startup and
 # only tails bytes that appear AFTER that offset.
@@ -185,7 +185,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.0 — Project overlay created .claude/ as root on host when directory
+# v0.6.0: Project overlay created .claude/ as root on host when directory
 # didn't exist, because docker created the bind mount source.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.0: skip project overlay when .claude/ missing on host" {
@@ -217,7 +217,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.1 — Browser bridge pre-initialized last_ts with the current file's
+# v0.6.1: Browser bridge pre-initialized last_ts with the current file's
 # mtime to skip stale URLs. Same-second writes had identical mtime and were
 # silently dropped. Fix: delete stale file entirely at watcher startup, then
 # track the empty-state as last_ts="". A new write has cur_ts != "" which
@@ -250,7 +250,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.2 — docker run/start failures were shown as "Container failed to
+# v0.6.2: docker run/start failures were shown as "Container failed to
 # start" with no reason. Docker's stderr was swallowed by 2>&1 redirection.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.2: docker run failure surfaces docker stderr" {
@@ -273,7 +273,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.2 — Settings overlay directory was not cleaned on cmd_run after rm,
+# v0.6.2: Settings overlay directory was not cleaned on cmd_run after rm,
 # causing stale overlays from a previous container to contaminate the new one.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.2: cmd_run wipes stale settings overlay dir" {
@@ -309,7 +309,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.2 — Quoted tilde in summary block showed '~' literally instead of
+# v0.6.2: Quoted tilde in summary block showed '~' literally instead of
 # collapsing $HOME to ~. Fix used intermediate variable to avoid word splitting.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.2: summary block shows ~ without quotes for home-relative path" {
@@ -329,7 +329,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — exec_claude called docker exec with only HOME and PATH. Env vars
+# v0.6.3: exec_claude called docker exec with only HOME and PATH. Env vars
 # resolved from .cleat.env were passed at docker run but not at exec time.
 # Containers restarted via start/resume did not see updated env values.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,7 +343,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — cmd_shell didn't call resolve_env_args and didn't pass env to
+# v0.6.3: cmd_shell didn't call resolve_env_args and didn't pass env to
 # docker exec, so `cleat shell && echo $DATABASE_URL` showed empty.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.3: cmd_shell passes .cleat.env vars to docker exec" {
@@ -370,7 +370,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — cmd_shell used only `-e HOME=/home/coder` and did not pass PATH.
+# v0.6.3: cmd_shell used only `-e HOME=/home/coder` and did not pass PATH.
 # ~/.local/bin was not on the container shell's PATH.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.3: cmd_shell sets PATH with /home/coder/.local/bin" {
@@ -388,7 +388,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — cmd_login didn't call resolve_env_args. Custom API endpoints or
+# v0.6.3: cmd_login didn't call resolve_env_args. Custom API endpoints or
 # credentials in .cleat.env weren't available during authentication.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.3: cmd_login passes .cleat.env vars to docker exec" {
@@ -412,7 +412,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — _parse_env_file used `while read -r line` without `|| [[ -n $line ]]`,
+# v0.6.3: _parse_env_file used `while read -r line` without `|| [[ -n $line ]]`,
 # skipping the last line of a file with no trailing newline.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.3: _parse_env_file reads last line without trailing newline" {
@@ -428,7 +428,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — Env summary line was omitted when a .cleat.env existed but had
+# v0.6.3: Env summary line was omitted when a .cleat.env existed but had
 # only comments (count=0). Users couldn't tell if the file was being read.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.3: env summary shows 0 count when file has only comments" {
@@ -444,7 +444,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.4 — OAuth callback proxy used socat default TCP (127.0.0.1) but
+# v0.6.4: OAuth callback proxy used socat default TCP (127.0.0.1) but
 # Node.js binds localhost to ::1. Every callback was Connection Refused.
 # Fix: try TCP6 first, fall back to TCP.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,7 +482,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.4 — socat stdin EOF propagated to TCP side, killing the read before
+# v0.6.4: socat stdin EOF propagated to TCP side, killing the read before
 # the 302 response came back. Fix: use `-,ignoreeof`.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.4: _auth_callback_proxy uses ignoreeof on stdin" {
@@ -497,14 +497,14 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.4 — Proxy gave up silently on EADDRINUSE. Fix: retry the bind in a loop.
+# v0.6.4: Proxy gave up silently on EADDRINUSE. Fix: retry the bind in a loop.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.4: _auth_callback_proxy retries bind on EADDRINUSE" {
   local body
   body="$(declare -f _auth_callback_proxy)"
   [[ -n "$body" ]] || { echo "REGRESSION: _auth_callback_proxy function missing"; return 1; }
 
-  # Must have a retry loop — look for a bind attempt counter or loop construct
+  # Must have a retry loop, look for a bind attempt counter or loop construct
   # referencing the port. Accept any of: for i in ..., while [[ $attempt ...
   echo "$body" | grep -qE '(attempt|retry|for .* in .* 30|while .* attempt)' || {
     echo "REGRESSION: bind retry loop missing from _auth_callback_proxy"
@@ -513,7 +513,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.4 — `Connection: keep-alive` header made upstream server keep the
+# v0.6.4: `Connection: keep-alive` header made upstream server keep the
 # socket open. Fix: rewrite to `Connection: close` so server actually closes.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.4: _auth_callback_proxy rewrites keep-alive to close" {
@@ -528,7 +528,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.5 — cmd_run wrote empty {} overlay and bind-mounted to
+# v0.6.5: cmd_run wrote empty {} overlay and bind-mounted to
 # /workspace/.claude/settings.json for files that didn't exist on host.
 # Fails on macOS Docker Desktop virtiofs ("outside of rootfs" error).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -565,7 +565,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.5 — docker run failure could leave a partial container that collided
+# v0.6.5: docker run failure could leave a partial container that collided
 # with the next attempt's name. Fix: docker rm -f on failure.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.5: cmd_run cleans up partial container on docker run failure" {
@@ -593,7 +593,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — --env, --env-file, --cap global flags only applied to start/run/
+# v0.6.3: --env, --env-file, --cap global flags only applied to start/run/
 # resume/claude. Users passing `cleat --env X shell` got no env.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.3: cmd_shell resolves env args (not just hardcoded HOME/PATH)" {
@@ -616,7 +616,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.6.3 — cmd_login had the same bug as cmd_shell.
+# v0.6.3: cmd_login had the same bug as cmd_shell.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.3: cmd_login resolves env args" {
   local body
@@ -632,7 +632,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stale-mount detection — after macOS reboot /tmp is cleared and SSH agent
+# Stale-mount detection: after macOS reboot /tmp is cleared and SSH agent
 # socket path rotates. Stopped containers have old bind mounts baked in and
 # cannot start. cmd_start must detect this and recreate silently.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -669,7 +669,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Update cache corruption — check_for_update read a non-numeric last_check
+# Update cache corruption: check_for_update read a non-numeric last_check
 # from a corrupted cache file and passed it directly to an arithmetic
 # expression. Under set -u, bash treats `(( garbage ... ))` as an unbound
 # variable reference and aborts the CLI. Discovered during strict-mode
@@ -677,7 +677,7 @@ EOF
 # a non-negative integer before the arithmetic.
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# latest_remote_tag — must numerically sort semver versions.
+# latest_remote_tag: must numerically sort semver versions.
 # Lexical sort would break v0.10.0 < v0.9.0 → "0.10.0" < "0.9.0" as strings.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression: latest_remote_tag sorts 0.10.0 > 0.9.0 numerically" {
@@ -725,7 +725,7 @@ EOF
 
   run latest_remote_tag
   assert_success
-  # Only v0.6.5 and v0.7.0 are strict X.Y.Z — v0.7.0 wins
+  # Only v0.6.5 and v0.7.0 are strict X.Y.Z, v0.7.0 wins
   assert_output "0.7.0"
 }
 
@@ -741,14 +741,14 @@ EOF
   export PATH="$TEST_TEMP/bin:$PATH"
 
   # Contract: output must be empty when no semver tags exist. Exit code is
-  # non-zero under pipefail (grep non-match) — callers handle this via `|| true`.
+  # non-zero under pipefail (grep non-match), callers handle this via `|| true`.
   # The important part is the OUTPUT contract, not the exit code.
   run latest_remote_tag
   assert_output ""
 }
 
 # Verify the caller (check_for_update) correctly handles latest_remote_tag
-# returning non-zero with empty output — this is the production contract.
+# returning non-zero with empty output. This is the production contract.
 @test "regression: _maybe_prompt_cli_update handles empty latest_remote_tag output" {
   REPO_DIR="$TEST_TEMP"
   UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
@@ -822,7 +822,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Startup-fatal regressions — these check the real binary runs cleanly under
+# Startup-fatal regressions: these check the real binary runs cleanly under
 # strict mode (set -euo pipefail). Tests that only source the CLI can't see
 # unbound-variable or pipefail errors that kill the process in production.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -831,7 +831,7 @@ EOF
 # strict-mode (set -euo pipefail) bugs that sourced tests cannot see.
 #
 # NOTE: cleat derives CLEAT_CONFIG_DIR from $XDG_CONFIG_HOME:-$HOME/.config/cleat
-# at startup — there's no CLEAT_CONFIG_DIR env override. We must set
+# at startup. There's no CLEAT_CONFIG_DIR env override. We must set
 # XDG_CONFIG_HOME to redirect the config lookup.
 _run_cleat() {
   local run_home="$TEST_TEMP/home"
@@ -881,7 +881,7 @@ _run_cleat() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.8.0 — Per-project session isolation. Without the overlay mount, all
+# v0.8.0: Per-project session isolation. Without the overlay mount, all
 # containers write sessions to ~/.claude/projects/-workspace/ on the host,
 # mixing histories across projects. The fix mounts a per-project directory
 # at /home/coder/.claude/projects/-workspace inside each container.
@@ -911,10 +911,10 @@ _run_cleat() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.8.0 — When hooks cap is OFF, project-level settings with hooks were
+# v0.8.0: When hooks cap is OFF, project-level settings with hooks were
 # NOT overlaid. Claude Code saw the raw host hook commands (like osascript)
 # via the workspace bind mount and tried to run them inside the container.
-# Fix: always overlay project settings — strip hooks when OFF, replace with
+# Fix: always overlay project settings, strip hooks when OFF, replace with
 # forwarder when ON.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.8.0: project hooks stripped when hooks cap OFF" {
@@ -958,7 +958,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hook bridge safety — hooks execute untrusted commands from user config
+# Hook bridge safety: hooks execute untrusted commands from user config
 # files. They must be wrapped in timeout, their output suppressed, and their
 # exit code ignored (so a failing hook can't block the bridge).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1001,7 +1001,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Missing-tool fallbacks — every optional dependency (jq, socat, python3,
+# Missing-tool fallbacks: every optional dependency (jq, socat, python3,
 # git) must be guarded by `command -v` so the CLI degrades gracefully
 # instead of crashing. These tests enforce that the guards exist.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1045,7 +1045,7 @@ EOF
   # callsite.
   local empty_path="$TEST_TEMP/nojq-bin"
   mkdir -p "$empty_path"
-  # Only seed the essentials — no jq
+  # Only seed the essentials, no jq
   ln -s "$(command -v bash)" "$empty_path/bash"
   ln -s "$(command -v sed)" "$empty_path/sed"
   ln -s "$(command -v mkdir)" "$empty_path/mkdir"
@@ -1072,7 +1072,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.8.0 — Per-project history isolation. The base ~/.claude mount shares
+# v0.8.0: Per-project history isolation. The base ~/.claude mount shares
 # history.jsonl across all containers, so arrow-up in Claude shows commands
 # from other projects. Fix: overlay history.jsonl with a per-project copy
 # from the same session directory used for projects/-workspace.
@@ -1102,7 +1102,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bash 3.2 compatibility — macOS ships bash 3.2. The CLI must not use bash
+# Bash 3.2 compatibility: macOS ships bash 3.2. The CLI must not use bash
 # 4+ features. Source-level guard against common offenders.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression bash-3.2: no associative arrays" {
@@ -1127,7 +1127,30 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.9.2 — installer spin_stop printed literal \033 escape sequences and
+# Writing style: no em dashes anywhere. They read as AI-authored, so the project
+# bans them repo-wide (see root CLAUDE.md). Source-level guard on the shipped CLI
+# and its runtime scripts: an em dash in any of them fails the suite. Replace one
+# with a period, comma, colon, or parentheses; never a bare hyphen. The pattern
+# below is the literal em-dash character (no \u escape, which bash 3.2 lacks).
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression style: bin/cleat contains no em dashes" {
+  run grep -n "—" "$CLI"
+  assert_failure
+}
+
+@test "regression style: shipped scripts contain no em dashes" {
+  run grep -rn "—" \
+    "$PROJECT_ROOT/install.sh" \
+    "$PROJECT_ROOT/coverage.sh" \
+    "$PROJECT_ROOT/docker/entrypoint.sh" \
+    "$PROJECT_ROOT/docker/open-bridge" \
+    "$PROJECT_ROOT/docker/clip" \
+    "$PROJECT_ROOT/docker/clip-daemon"
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.2: installer spin_stop printed literal \033 escape sequences and
 # left trailing chars from longer spinner lines (e.g. "Pinned to v0.9.1est
 # release..."). Root causes:
 #   1. printf "%s" passes backslash escapes through unchanged; ok_msg/fail_msg
@@ -1172,14 +1195,14 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.9.2 — first-run path in cmd_run called _do_build directly, skipping the
+# v0.9.2: first-run path in cmd_run called _do_build directly, skipping the
 # remote pull entirely. Users got a 2-5 min local build on every clean install
 # even though ghcr.io/cleatdev/cleat was already publishing matching images.
 # The pull path only fired from `cleat build`, which no one types on first run.
 # Fix: cmd_run's missing-image branch now calls `_do_pull || _do_build`.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.9.2: cmd_run attempts pull before building on first run" {
-  # No image exists yet — mimic a clean install.
+  # No image exists yet, mimic a clean install.
   mock_docker_images ""
   mkdir -p "$TEST_TEMP/project"
 
@@ -1197,7 +1220,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.9.2 — REGISTRY_IMAGE was hardcoded to ":latest", ignoring the installed
+# v0.9.2: REGISTRY_IMAGE was hardcoded to ":latest", ignoring the installed
 # CLI's VERSION. The moment GHCR holds a newer tag than the installed CLI,
 # :latest pulls an image the CLI wasn't tested against. Concept doc
 # (14-v090-execution-plan.md) explicitly requires version tag matching.
@@ -1226,7 +1249,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.9.2 — bin/cleat's spin_stop also used \r without \033[K, so a shorter
+# v0.9.2: bin/cleat's spin_stop also used \r without \033[K, so a shorter
 # success message left the tail of the longer spinner line visible. Example:
 # "Starting container..." (21 chars) overwritten by "Container started"
 # (17 chars) produced "Container startedr..." with the leftover "r..." in
@@ -1261,7 +1284,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.10.0 — docker capability. The headline feature: opt-in access to the
+# v0.10.0: docker capability. The headline feature: opt-in access to the
 # host Docker daemon so users can test docker-based apps (compose, exec,
 # build) without leaving the sandbox. Full design in
 # concept/15-docker-capability.md.
@@ -1270,7 +1293,7 @@ EOF
 #   1. `docker` is in KNOWN_CAPS (so config --list/--enable work)
 #   2. When the cap is active, /var/run/docker.sock is mounted
 #   3. When active, project is also mounted at its host path with workdir
-#      set there (so $(pwd) in Cleat == $(pwd) on host — the path-remapping
+#      set there (so $(pwd) in Cleat == $(pwd) on host, the path-remapping
 #      ergonomic fix)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1355,7 +1378,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.10.0 — workspace trust. A project's .cleat file lives in the repo and is
+# v0.10.0: workspace trust. A project's .cleat file lives in the repo and is
 # untrusted input. Applying its caps without user approval was the original
 # supply-chain footgun (any repo could silently enable ssh/gh/docker on
 # clone+run). Workspace trust closes that: project caps require approval
@@ -1364,7 +1387,7 @@ EOF
 #
 # Core invariants:
 #   1. Non-interactive + no opt-in → project caps are DROPPED (default-deny)
-#   2. Hash is over canonical caps, not raw file — comment edits don't
+#   2. Hash is over canonical caps, not raw file: comment edits don't
 #      require re-approval
 #   3. Global config + --cap CLI flags are never gated (user's own input)
 #   4. cleat status never prompts (readonly mode)
@@ -1445,7 +1468,7 @@ EOF
 }
 
 @test "regression v0.10.0: cleat resume after cleat rm creates container and continues" {
-  # cleat rm preserves sessions on the host — they live at
+  # cleat rm preserves sessions on the host: they live at
   # ~/.claude/projects/<key>/ and aren't touched by cmd_rm. But before
   # this fix, cleat resume errored out with "No container found" when
   # the container was gone, so the user couldn't actually pick up their
@@ -1460,7 +1483,7 @@ EOF
   run cmd_resume "$TEST_TEMP/project"
   assert_success
 
-  # docker run happened — container was created fresh, not errored.
+  # docker run happened: container was created fresh, not errored.
   run grep "^docker run " "$DOCKER_CALLS"
   assert_success
   assert_output --partial "--name $cname"
@@ -1545,11 +1568,11 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.10.1 — _do_pull always issued a `docker pull` against GHCR, even when
+# v0.10.1: _do_pull always issued a `docker pull` against GHCR, even when
 # the version-tagged image was already on disk. A transient registry/network
 # error there (offline, GHCR hiccup, auth blip) returned non-zero from
 # `docker pull`, which the caller treated as "image unavailable" and fell
-# back to a 2-5 min local build — even though the prebuilt image was
+# back to a 2-5 min local build, even though the prebuilt image was
 # sitting in the local image store waiting to be reused.
 # Fix: short-circuit at the top of _do_pull. If `docker image inspect
 # ${REGISTRY_BASE}:v${target_version}` succeeds, retag locally and return
@@ -1558,7 +1581,7 @@ EOF
 @test "regression v0.10.1: _do_pull reuses locally cached prebuilt without network call" {
   # Registry-tagged image is on disk but no `cleat` alias. Pull would fail
   # by default (DOCKER_PULL_EXIT_CODE=1), so if _do_pull touched the
-  # network it would fall back to a local build — both forbidden here.
+  # network it would fall back to a local build, both forbidden here.
   mock_docker_image_cached "$REGISTRY_IMAGE"
   mkdir -p "$TEST_TEMP/project"
 
@@ -1583,19 +1606,19 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.10.1 hardening — the cache short-circuit must not declare success when
+# v0.10.1 hardening: the cache short-circuit must not declare success when
 # `docker tag` silently fails. Without the fall-through guard, a tag failure
 # would leave no `cleat` alias on disk while _do_pull returned 0; the next
 # image_exists() check would say "missing" and the user would be back to a
 # local build the next time they ran `cleat start`. The guard re-checks
 # image_exists() after the tag and falls through to the pull path on
-# failure — preserving the GHCR-first contract even when the local image
+# failure, preserving the GHCR-first contract even when the local image
 # store is in a degraded state.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.10.1: _do_pull falls through to network pull when cache-hit tag fails" {
   # Registry-tagged image is on disk, but `docker tag` fails (simulating
   # disk full / permission / etc.). _do_pull must not falsely claim
-  # success — it must fall through to the existing pull path. Pull is
+  # success. It must fall through to the existing pull path. Pull is
   # made to succeed so we can prove the fall-through fired (otherwise
   # we'd land in _do_build and the assertion below would be ambiguous).
   mock_docker_image_cached "$REGISTRY_IMAGE"
@@ -1617,15 +1640,15 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.12.1 — `cleat config --enable hooks && cleat` did nothing useful: the
+# v0.12.1: `cleat config --enable hooks && cleat` did nothing useful: the
 # existing container kept its old mount set (no /var/log/cleat), so hooks
 # silently never fired. Drift was detected but the response was a static
-# "Run: cleat rm && cleat" notice — invisible to most users.
+# "Run: cleat rm && cleat" notice, invisible to most users.
 #
 # Fix: cmd_start / cmd_resume / cmd_claude now call _resolve_config_drift
 # early, before any docker operation, so a drifted TTY session prompts the
 # user to recreate. Without the wiring, the existing capabilities.bats unit
-# tests for _resolve_config_drift still pass — this regression pins the
+# tests for _resolve_config_drift still pass. This regression pins the
 # wiring itself.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.12.1: cmd_start invokes _resolve_config_drift before docker ops" {
@@ -1641,7 +1664,7 @@ EOF
   mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
   echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
 
-  # Sentinel — set by the spy below if the wiring is intact
+  # Sentinel: set by the spy below if the wiring is intact
   DRIFT_CALLED=0
   _resolve_config_drift() { DRIFT_CALLED=1; }
 
@@ -1677,13 +1700,13 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.12.3 — `cleat start` aborted with an opaque OCI runtime error
+# v0.12.3: `cleat start` aborted with an opaque OCI runtime error
 # ("not a directory: Are you trying to mount a directory onto a file...")
 # when the settings-overlay dir survived but a specific file inside was
 # missing. The pre-fix stale-mount check only verified `[[ -d $overlay_dir ]]`,
 # so the partial-rotation state slipped past the gate, fell through to
 # `docker start`, and let Docker auto-create the missing bind source as a
-# directory — which then failed to mount onto the file destination inside
+# directory, which then failed to mount onto the file destination inside
 # the container. Reported in the wild after a long session: user declined
 # the drift recreate prompt, container start failed with the OCI error,
 # leaving them stuck.
@@ -1709,8 +1732,8 @@ EOF
   mkdir -p "$overlay_dir"
   echo '{}' > "$overlay_dir/settings.json"
   # docker inspect must report both sources so the helper can spot the
-  # missing one. The mock returns this for ALL inspect calls in this test
-  # — fine because _container_config_hash isn't on the cmd_start path
+  # missing one. The mock returns this for ALL inspect calls in this test,
+  # fine because _container_config_hash isn't on the cmd_start path
   # under the bypassed _resolve_config_drift in setup().
   mock_docker_inspect "${overlay_dir}/settings.json
 ${overlay_dir}/project-settings.local.json"
@@ -1742,7 +1765,7 @@ ${overlay_dir}/project-settings.local.json"
   local script="$PROJECT_ROOT/docker/open-bridge"
   [[ -f "$script" ]] || { echo "open-bridge shim missing"; return 1; }
   grep -qE '\[ *! -t 0 *\]' "$script" || {
-    echo "open-bridge reads stdin without a tty guard — interactive use can hang"
+    echo "open-bridge reads stdin without a tty guard; interactive use can hang"
     return 1
   }
 }
@@ -1754,19 +1777,19 @@ ${overlay_dir}/project-settings.local.json"
   local runner="$PROJECT_ROOT/test.sh"
   [[ -f "$runner" ]] || { echo "test.sh missing"; return 1; }
   grep -qE '"\$BATS" "\$f".*</dev/null' "$runner" || {
-    echo "test.sh runs bats without </dev/null — interactive ./test.sh can hang"
+    echo "test.sh runs bats without </dev/null; interactive ./test.sh can hang"
     return 1
   }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v0.13.1 — two bugs surfaced when the v0.13.0 upgrade forced a container
+# v0.13.1: two bugs surfaced when the v0.13.0 upgrade forced a container
 # recreate on a macOS host (host uid 501, image-baked coder uid 1000):
 #
 #   (A) FREEZE: v0.13.0 made ~/.local writable, re-enabling Claude Code's
 #       launch-time self-updater, which hangs the TUI under `docker exec -it` on
 #       a fresh container. Fix: disable it via DISABLE_AUTOUPDATER=1 in the
-#       session env — cleat owns Claude's version (image + `cleat upgrade-claude`).
+#       session env: cleat owns Claude's version (image + `cleat upgrade-claude`).
 #
 #   (B) CLIP EPERM STORM: `docker exec ... runuser -u coder` could fire before
 #       the entrypoint finished remapping coder 1000→501, so clip-daemon stamped
@@ -1850,12 +1873,12 @@ ${overlay_dir}/project-settings.local.json"
   run _browser_claim_url "$bridge"
   assert_success
   assert_output --partial "https://example.com/oauth"
-  # The second watcher must find nothing — one tab, not two.
+  # The second watcher must find nothing: one tab, not two.
   run _browser_claim_url "$bridge"
   assert_failure
 }
 
-# v0.15.0 — the config-drift notice shipped as a cyan-bordered _notice_box with
+# v0.15.0: the config-drift notice shipped as a cyan-bordered _notice_box with
 # blank-line padding. It now renders as plain text in the "New in v…" style (no
 # box, no empty lines), per the maintainer's startup-output taste. The bug we
 # guard against is the bordered box returning. Exercises the non-TTY branch
@@ -1878,9 +1901,9 @@ ${overlay_dir}/project-settings.local.json"
   refute_output --partial "│"
 }
 
-# v0.15.0 — the image-rebuild prompt opened with a stray `echo ""`, leaving a
+# v0.15.0: the image-rebuild prompt opened with a stray `echo ""`, leaving a
 # blank line between the preceding "✔ Removed …" (drift recreate) and the
-# notice — visible in the wild on a drift→rebuild startup. The leading blank is
+# notice, visible in the wild on a drift→rebuild startup. The leading blank is
 # gone; the notice is now the first byte of output. Command substitution strips
 # trailing newlines but PRESERVES a leading one, so re-adding `echo ""` makes
 # $out start with a newline and trips the guard.
@@ -1901,7 +1924,7 @@ ${overlay_dir}/project-settings.local.json"
 }
 
 @test "regression v0.15.0: version bump alone does not trigger config drift" {
-  # The config fingerprint must depend ONLY on caps + env keys — never the CLI
+  # The config fingerprint must depend ONLY on caps + env keys, never the CLI
   # version. Folding version in made every release fire a false "caps or env
   # keys differ" drift notice on existing containers whose setup was untouched,
   # with a remedy (recreate from the same image) that fixes nothing for a
@@ -1957,7 +1980,7 @@ ${overlay_dir}/project-settings.local.json"
   # the attached terminal freezes (observed live: a 2-day box wedged at the
   # pids cap with ~900 zombie bash procs). --init makes docker's bundled tini
   # PID 1, which reaps everything and forwards SIGTERM (so `cleat stop` no
-  # longer burns its full timeout and SIGKILLs — the historical fleet all
+  # longer burns its full timeout and SIGKILLs, the historical fleet all
   # shows Exited(137) for this reason).
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
@@ -1971,7 +1994,7 @@ ${overlay_dir}/project-settings.local.json"
 
 @test "regression: claude's exit code survives clip-daemon cleanup in the session script" {
   # The session script used to end with `kill/wait $_MY_CLIP_DAEMON`, so the
-  # `bash -c` exit status was the daemon wait's 0 — masking a crashed claude
+  # `bash -c` exit status was the daemon wait's 0, masking a crashed claude
   # (SIGSEGV=139, SIGABRT=134) as a clean session end, whose rc==0 branch then
   # ERASED the crash message bash had just printed. The script must capture
   # claude's status and exit with it.
@@ -1986,7 +2009,7 @@ ${overlay_dir}/project-settings.local.json"
   # The text-pin above can't catch a capture-ORDER regression: moving
   # _CLAUDE_RC=$? after the daemon kill re-masks crashes with the kill's 0.
   # So capture the ACTUAL script sent to docker exec and run it with a
-  # SIGSEGV-ing claude stub — the wrapper must exit 139, not 0.
+  # SIGSEGV-ing claude stub: the wrapper must exit 139, not 0.
   local script_file="$TEST_TEMP/inner_script"
   docker() {
     if [[ "$1" == "exec" ]]; then
@@ -2028,7 +2051,7 @@ ${overlay_dir}/project-settings.local.json"
 
 @test "regression: interactive session restores terminal state after docker exec" {
   # A hard-dying claude (SIGSEGV under amd64 emulation, fork lockup) leaves
-  # the host terminal in raw mode with alt-screen/mouse-tracking on — every
+  # the host terminal in raw mode with alt-screen/mouse-tracking on, every
   # keystroke and scroll sprays escape garbage until a manual `reset`.
   # exec_claude must always run the terminal-restore path after the exec.
   _restore_terminal() { echo "RESTORE_TERMINAL_CALLED"; }
@@ -2039,9 +2062,24 @@ ${overlay_dir}/project-settings.local.json"
 @test "regression: clean session end emits no cursor-up erase into a pipe" {
   # The rc==0 branch unconditionally printed '\033[A\033[2K' (cursor-up +
   # erase-line) even when stdout was not a terminal, corrupting piped/captured
-  # output — and after a masked crash it deleted the crash evidence itself.
+  # output, and after a masked crash it deleted the crash evidence itself.
   # The erase is cosmetic TTY furniture: it must be TTY-gated.
   run exec_claude "test-ctr" --dangerously-skip-permissions
   assert_output --partial "Session ended"
   refute_output --partial $'\033[A'
+}
+
+@test "regression: clean session end clears the success line so stale terminal bytes can't survive" {
+  # Observed on a heavily-used terminal: a stray hash tail ("e001861") trailed
+  # the "cleat resume" message. Cause: the reclaim sequence moved up, erased the
+  # line ABOVE, dropped back down, then success() wrote from column 0 WITHOUT
+  # clearing to end-of-line, so stale bytes already on that row survived past
+  # the message. Fix: clear the destination line too (a trailing \033[2K after
+  # the \r\n). Force TTY so the (TTY-gated) sequence is actually emitted.
+  _is_tty() { return 0; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "Session ended"
+  # Erase the reclaimed line above, drop down, AND clear the success line.
+  assert_output --partial $'\033[A\033[2K\r\n\033[2K'
 }

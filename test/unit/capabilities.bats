@@ -379,7 +379,7 @@ EOF
 
   run cmd_run "$TEST_TEMP/project"
   assert_success
-  # Project path mounted at its host path inside the container — so
+  # Project path mounted at its host path inside the container, so
   # $(pwd), `.`, and absolute host paths all resolve on the host daemon.
   run assert_docker_run_has "$cname" "$TEST_TEMP/project:$TEST_TEMP/project"
   assert_success
@@ -398,7 +398,7 @@ EOF
 
   run cmd_run "$TEST_TEMP/project"
   assert_success
-  # /workspace still valid — preserves existing muscle memory
+  # /workspace still valid, preserves existing muscle memory
   run assert_docker_run_has "$cname" "$TEST_TEMP/project:/workspace"
   assert_success
 }
@@ -567,7 +567,7 @@ EOF
   export _VALID_KEY="yes"
   run _parse_env_file "$TEST_TEMP/envfile"
   assert_success
-  # Only _VALID_KEY should resolve — the others have invalid variable names
+  # Only _VALID_KEY should resolve. The others have invalid variable names
   assert_output "_VALID_KEY=yes"
   unset _VALID_KEY
 }
@@ -845,7 +845,7 @@ EOF
 }
 
 @test "fingerprint: ignores env values (only keys matter)" {
-  # Env VALUES are deliberately excluded — they're passed at exec time, not baked
+  # Env VALUES are deliberately excluded: they're passed at exec time, not baked
   # into the container, so a value change must NOT force a recreate.
   ACTIVE_CAPS=(env)
   _RESOLVED_ENV_ARGS=(-e "FOO=old"); local h1; h1="$(compute_config_fingerprint)"
@@ -934,7 +934,7 @@ EOF
 
 # ── Caps categorization (mount / sandbox) ──────────────────────────────────
 #
-# Active caps display groups by behavior — same UI on the landing page.
+# Active caps display groups by behavior, same UI on the landing page.
 # These tests pin the category mapping and the renderer's behavior so a
 # refactor that drops a cap from its category, or breaks the multi-line
 # layout, fails loudly. The visual is part of the brand: it teaches users

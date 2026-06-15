@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # Tests for the on-start Claude Code update check:
-#   _claude_remote_version       — fetch the newest released version for a channel
-#   _maybe_prompt_claude_update  — on interactive start, offer a durable upgrade
+#   _claude_remote_version       : fetch the newest released version for a channel
+#   _maybe_prompt_claude_update  : on interactive start, offer a durable upgrade
 #                                  when the image's bundled Claude Code is stale
 load "../setup"
 
@@ -56,7 +56,7 @@ teardown() { _common_teardown; }
 @test "remote version: rejects a semver with trailing junk on the same line" {
   unset CLEAT_FAKE_REMOTE_CLAUDE
   # A leading semver followed by garbage (e.g. injected ANSI/script) must NOT
-  # pass through to the terminal display or the cache — the guard is anchored.
+  # pass through to the terminal display or the cache: the guard is anchored.
   curl() { printf '2.1.149; rm -rf ~'; }
   run _claude_remote_version latest
   assert_success
@@ -106,8 +106,8 @@ teardown() { _common_teardown; }
   _image_claude_version() { echo "2.1.40"; }
   # Paired with "recent check skips" above, this brackets CLAUDE_CHECK_INTERVAL
   # (600s / 10 min): a check older than the window must proceed (not throttled),
-  # so bumping the interval to a large value — which would silently stop periodic
-  # re-checks — breaks this test. No CLEAT_FORCE_CLAUDE_CHECK here: the throttle
+  # so bumping the interval to a large value (which would silently stop periodic
+  # re-checks) breaks this test. No CLEAT_FORCE_CLAUDE_CHECK here: the throttle
   # path itself is under test, not bypassed.
   local old_ts=$(( $(date +%s) - 660 ))   # just past the 10-min window
   echo "$old_ts 2.1.149" > "$CLAUDE_CHECK_FILE"

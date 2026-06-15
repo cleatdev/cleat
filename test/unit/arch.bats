@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # Architecture awareness. The prebuilt GHCR image was amd64-only for every
 # release through v0.15.1, so Apple Silicon users who pulled it ran every box
-# under emulation — slow, and the documented trigger for node segfaults and
+# under emulation, slow, and the documented trigger for node segfaults and
 # garbled TTYs (Docker calls amd64-on-arm "best effort"). The CLI must:
 #   - pin pulls to the daemon's architecture (a wrong single-arch manifest
 #     then fails loudly into the native local-build fallback),
@@ -82,7 +82,7 @@ teardown() { _common_teardown; }
 
 @test "arch: an arch-mismatched cached prebuilt does not short-circuit the pull" {
   # An amd64 ghcr image cached before multi-arch publishing must not be
-  # retagged into service on an arm64 daemon — the platform-pinned pull
+  # retagged into service on an arm64 daemon: the platform-pinned pull
   # replaces it with the native half of the (re-published) manifest.
   mock_docker_image_cached "${REGISTRY_BASE}:v${VERSION}"
   _daemon_arch() { echo "arm64"; }
@@ -108,7 +108,7 @@ teardown() { _common_teardown; }
 
 # ── acquisition gates ────────────────────────────────────────────────────────
 # These drive the REAL gate (_image_arch_ok composed from the two probes) so
-# they also pin the user-facing explanation of why the image is re-fetched —
+# they also pin the user-facing explanation of why the image is re-fetched:
 # _warn_image_emulated builds its message from the same probes.
 
 @test "arch: cmd_run re-acquires a wrong-arch image and says why" {
@@ -148,7 +148,7 @@ teardown() { _common_teardown; }
 
 # ── status surfacing ─────────────────────────────────────────────────────────
 # An emulated image is the documented trigger for node crashes and garbled
-# TTYs — `cleat status` must say so loudly, and must NOT cry wolf on a
+# TTYs: `cleat status` must say so loudly, and must NOT cry wolf on a
 # native image.
 
 @test "arch: status flags an emulated image and promises a native re-fetch" {

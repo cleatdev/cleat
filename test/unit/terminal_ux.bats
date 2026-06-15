@@ -106,7 +106,7 @@ esac
 MOCK
   chmod +x "$TEST_TEMP/strict-bin/docker"
 
-  # Run actual binary — set -euo pipefail is active.
+  # Run actual binary: set -euo pipefail is active.
   # Redirect stdin from /dev/null to ensure non-interactive mode
   # (macOS CI runners may report TTY=true, triggering interactive recovery).
   cd "$TEST_TEMP/strict-project"
@@ -132,7 +132,7 @@ MOCK
 }
 
 @test "strict mode: cleat with no args shows help or starts (exits cleanly)" {
-  # Without docker, this will fail at the docker check — but it should
+  # Without docker, this will fail at the docker check, but it should
   # get past argument parsing and global flag handling without set -u errors.
   # We check that it does NOT die with "unbound variable".
   run bash "$CLI" 2>&1
@@ -247,7 +247,7 @@ MOCK
 
 @test "summary block: with docker cap, project shows host path (not /workspace)" {
   # The docker cap mounts the project at its host path and sets workdir there,
-  # so the container's cwd IS the host path — /workspace would be a lie.
+  # so the container's cwd IS the host path: /workspace would be a lie.
   ACTIVE_CAPS=(docker)
   run _print_summary_block "cleat-test-12345678" "$HOME/my-project"
   assert_output --partial "~/my-project"
@@ -273,10 +273,10 @@ MOCK
 
 @test "warn_sandbox: the whole line is amber, matching the sandbox cap" {
   # A sandbox-break warning must read as loud as the docker cap: the message
-  # text — not just the `!` — is amber. The substring asserts the amber code is
+  # text (not just the `!`) is amber. The substring asserts the amber code is
   # immediately followed by the marker AND message with no reset between them
   # (the bug: warn-style output resets the color right after `!`).
-  run warn_sandbox "Docker socket mounted — container can create host-level processes"
+  run warn_sandbox "Docker socket mounted. Container can create host-level processes"
   assert_output --partial "214m! Docker socket mounted"
 }
 
@@ -444,7 +444,7 @@ EOF
 }
 
 @test "start: does NOT print docker warning when cap is off" {
-  # The baseline launch must stay quiet — no sandbox-break warning unless
+  # The baseline launch must stay quiet: no sandbox-break warning unless
   # the user has explicitly opted in to the docker cap.
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
@@ -456,7 +456,7 @@ EOF
 
 @test "resume: prints docker-cap security warning when cap is active" {
   # cleat resume launches Claude attached to an existing container. If the
-  # cap is active, the warning must print here too — users should never
+  # cap is active, the warning must print here too. Users should never
   # hit Claude with a host-socket-mounted container silently.
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
@@ -617,7 +617,7 @@ EOF
   # "Image rebuilt" flows straight into "Image ready (cached)". A stray leading
   # blank here would split that group (and double up with the release
   # highlight's own trailing blank). So Image-ready must be the FIRST line
-  # cmd_run prints — not preceded by a blank. Re-adding `echo ""` pushes it to
+  # cmd_run prints, not preceded by a blank. Re-adding `echo ""` pushes it to
   # line 2 and trips this test.
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
@@ -743,7 +743,7 @@ EOF
 
 # ── terminal restore call sites ───────────────────────────────────────────
 # exec_claude's restore is pinned by a regression test; shell and login run
-# their own interactive `docker exec` and must restore independently — a
+# their own interactive `docker exec` and must restore independently: a
 # crashed TUI in either leaves the same raw-mode/mouse-tracking garbage.
 
 @test "shell: restores the terminal after the interactive exec" {
@@ -865,7 +865,7 @@ EOF
   _supports_osc8() { return 0; }
   run _hyperlink "https://cleat.sh/x" "click me"
   assert_success
-  # OSC 8 opener with the URL, the visible text, and the closer — real ESC bytes.
+  # OSC 8 opener with the URL, the visible text, and the closer: real ESC bytes.
   assert_output --partial "$(printf '\033]8;;https://cleat.sh/x\033\\')"
   assert_output --partial "click me"
   assert_output --partial "$(printf '\033]8;;\033\\')"

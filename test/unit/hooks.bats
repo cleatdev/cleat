@@ -168,20 +168,20 @@ SCRIPT
   assert_failure
 }
 
-@test "_is_docker_desktop: matches under set -o pipefail (no SIGPIPE false-negative) — regression v0.16.2" {
+@test "_is_docker_desktop: matches under set -o pipefail (no SIGPIPE false-negative), regression v0.16.2" {
   # The old `docker info | grep -q` form was SIGPIPE-fragile under `set -o
   # pipefail` (which the real binary runs): when grep -q matches it exits and
   # closes the pipe, the still-writing `docker info` dies of SIGPIPE (141), and
-  # pipefail then reports the WHOLE pipeline as failed — even though it matched.
+  # pipefail then reports the WHOLE pipeline as failed, even though it matched.
   # Under memory pressure `docker info` is slow with lots left to write when grep
   # bails, so the race tips to "failed" exactly when the Docker-Desktop-only VM
-  # advisory needs to fire — the on-start "give Docker more memory" steps silently
+  # advisory needs to fire, the on-start "give Docker more memory" steps silently
   # vanished (observed on a real Mac, v0.16.1). The fix reads just the
   # OperatingSystem field via --format (no pipe).
   #
   # We encode the failure mode deterministically (real SIGPIPE delivery is a
   # timing race): the mock answers --format cleanly, but a PLAIN `docker info`
-  # emits the matching OS line and then exits 141 — exactly what a SIGPIPE'd
+  # emits the matching OS line and then exits 141, exactly what a SIGPIPE'd
   # `docker info` does once a downstream grep -q closes the pipe. Under pipefail
   # the fixed (--format) code returns 0; the reverted (grep) code returns 141.
   local mock_dir="$TEST_TEMP/mock-docker-sigpipe"
@@ -190,13 +190,13 @@ SCRIPT
 #!/usr/bin/env bash
 case "$*" in
   *--format*)
-    # The field query the fixed code uses — clean success.
+    # The field query the fixed code uses: clean success.
     echo "Docker Desktop"
     exit 0
     ;;
   info)
     # Plain `docker info` (the old grep path): emit the matching line, then exit
-    # 141 — what a SIGPIPE'd `docker info` does. pipefail surfaces this 141 even
+    # 141: what a SIGPIPE'd `docker info` does. pipefail surfaces this 141 even
     # though grep -q matched (exit 0).
     echo " Operating System: Docker Desktop"
     exit 141
@@ -205,7 +205,7 @@ esac
 exit 0
 SCRIPT
   chmod +x "$mock_dir/docker"
-  # Reproduce the real binary's strict mode for this call — source_cli strips it.
+  # Reproduce the real binary's strict mode for this call: source_cli strips it.
   set -o pipefail
   PATH="$mock_dir:$PATH" _is_docker_desktop
   local rc=$?
@@ -971,8 +971,8 @@ EOF
 }
 
 @test "_hook_bridge_cleanup: kills all tracked children and clears the list" {
-  # Test the function's CONTRACT — it signals every tracked PID and empties the
-  # tracking array — not kernel reaping timing. The old version spawned real
+  # Test the function's CONTRACT: it signals every tracked PID and empties the
+  # tracking array, not kernel reaping timing. The old version spawned real
   # `sleep`s, disowned them, then asserted they were gone; but disowned children
   # become zombies that `kill -0` reports as alive until the kernel reaps them,
   # and `_hook_bridge_cleanup`'s own `wait` can't reap a disowned (non-job) PID.
@@ -1186,7 +1186,7 @@ SCRIPT
   sed -i.bak "s|MARKER_PATH|$marker|" "$mock_open" && rm -f "$mock_open.bak"
   chmod +x "$mock_open"
 
-  # Start watcher — the stale file exists at startup
+  # Start watcher: the stale file exists at startup
   _browser_watcher "$clip_dir" "$mock_open" &
   local watcher_pid=$!
   sleep 0.3
@@ -1199,7 +1199,7 @@ SCRIPT
   wait "$watcher_pid" 2>/dev/null || true
 
   # New URL must have been opened (regression: same-second write was missed)
-  [[ -f "$marker" ]] || { echo "URL not opened — same-second regression"; return 1; }
+  [[ -f "$marker" ]] || { echo "URL not opened, same-second regression"; return 1; }
   run cat "$marker"
   assert_output --partial "new.example.com/auth"
 
@@ -1371,7 +1371,7 @@ SCRIPT
 
 @test "_auth_callback_proxy: writes diagnostic start line to log file" {
   local log_file="$TEST_TEMP/proxy-diag.log"
-  # Stub tools lookup so neither socat nor python3 branch executes — we only
+  # Stub tools lookup so neither socat nor python3 branch executes, we only
   # want to verify the start-of-run diagnostic is emitted.
   command() {
     if [[ "$1" == "-v" ]]; then return 1; fi
@@ -1395,7 +1395,7 @@ SCRIPT
   printf '#!/bin/bash\necho "$1" > %s\n' "$marker" > "$mock_open"
   chmod +x "$mock_open"
 
-  # Stub proxy — succeed silently
+  # Stub proxy: succeed silently
   _auth_callback_proxy() { :; }
 
   _browser_watcher "$clip_dir" "$mock_open" "test-container" &

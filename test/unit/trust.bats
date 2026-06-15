@@ -1,11 +1,11 @@
 #!/usr/bin/env bats
 # ─────────────────────────────────────────────────────────────────────────────
-# Workspace trust — unit tests
+# Workspace trust: unit tests
 #
 # Coverage:
 #   1. Canonicalization (_canonical_caps): sort, dedupe, whitespace tolerance
 #   2. Hash (_hash_cleat_caps): hash is over canonical caps, not raw file
-#      — comment changes in .cleat must not change the hash
+#      (comment changes in .cleat must not change the hash)
 #   3. Trust file I/O: record, lookup, remove, list, atomic write
 #   4. _is_project_trusted: hash-match predicate
 #   5. _resolve_project_trust:
@@ -126,7 +126,7 @@ _source_cli_silent() {
 }
 
 @test "hash: output is hex-only (no md5sum filename suffix)" {
-  # md5sum on Linux appends "  -" (the stdin "filename") — without stripping
+  # md5sum on Linux appends "  -" (the stdin "filename"), without stripping
   # it we'd corrupt the tab-separated trust file format. The hash must be
   # purely [0-9a-f] characters.
   local f="$TEST_TEMP/proj/.cleat"
@@ -163,7 +163,7 @@ _source_cli_silent() {
   assert_output "abc123"
 }
 
-@test "trust record: is idempotent — recording again replaces the hash" {
+@test "trust record: is idempotent: recording again replaces the hash" {
   _trust_record "/fake/proj" "first"
   _trust_record "/fake/proj" "second"
   run _trust_lookup "/fake/proj"
@@ -233,7 +233,7 @@ _source_cli_silent() {
 @test "trust remove: is a no-op for unknown project" {
   _trust_remove "/not/there"
   [[ ! -f "$CLEAT_TRUST_FILE" ]] || {
-    # file may get created with header only — that's fine
+    # file may get created with header only, that's fine
     :
   }
 }
@@ -345,7 +345,7 @@ EOF
 @test "resolve_caps: non-TTY + no opt-in skips project caps (default-deny)" {
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ndocker\nssh\n' > "$TEST_TEMP/proj/.cleat"
-  # Global config still applies — user's own file is trusted.
+  # Global config still applies: user's own file is trusted.
   printf '[caps]\ngit\n' > "$CLEAT_GLOBAL_CONFIG"
   touch "$HOME/.gitconfig"
   # Force non-TTY by overriding _is_tty; also no opt-in env var.
@@ -362,7 +362,7 @@ EOF
 }
 
 @test "resolve_caps: readonly mode never prompts or denies visibly" {
-  # readonly trust_mode is for cleat status — it should silently skip
+  # readonly trust_mode is for cleat status: it should silently skip
   # untrusted project caps without warn output.
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat"

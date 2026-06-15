@@ -127,7 +127,7 @@ cleat_bin_timeout() {
 # The sourced unit tests run with strict mode stripped, and the highlight is
 # TTY-gated so a normal smoke subprocess returns before its body. Source the real
 # binary in a subprocess under full `set -euo pipefail`, force the TTY path, and
-# run the body — proving it's free of set -u / pipefail crashes on the real code.
+# run the body, proving it's free of set -u / pipefail crashes on the real code.
 @test "smoke: release highlight body is strict-mode (set -euo pipefail) safe" {
   local seen="$TEST_TEMP/.last_seen_version"
   run env HOME="$HOME" CLI="$CLI" RDIR="$TEST_TEMP" SEEN="$seen" PATH="$MOCK_BIN:$PATH" \
@@ -414,7 +414,7 @@ cleat_bin_timeout() {
   run cleat_bin_timeout 5 run
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
-  # The corruption is handled gracefully — host file backed up, not a crash.
+  # The corruption is handled gracefully: host file backed up, not a crash.
   assert_output --partial "backed up to"
   [[ -f "$HOME/.claude.json.bak" ]]
 }
@@ -431,11 +431,11 @@ cleat_bin_timeout() {
   run cleat_bin_timeout 5 start
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
-  # Either the docker error surfaces, or a retry message — both OK
+  # Either the docker error surfaces, or a retry message: both OK
   [[ "$status" -ne 0 ]] || true
 }
 
-# ── Boxes — named per-project sandboxes (see concept/20-boxes.md) ────────────
+# ── Boxes: named per-project sandboxes (see concept/20-boxes.md) ────────────
 
 @test "smoke: cleat start <box> creates a box-suffixed container" {
   mkdir -p "$TEST_TEMP/project"
@@ -731,24 +731,24 @@ EOF
 
   # Force the check and pretend a much newer Claude Code exists. A
   # non-interactive run (smoke output is piped, so not a TTY) must skip the
-  # prompt entirely and start the container — never hang waiting on input.
+  # prompt entirely and start the container: never hang waiting on input.
   export CLEAT_FORCE_CLAUDE_CHECK=1
   export CLEAT_FAKE_REMOTE_CLAUDE=2.1.999
 
   cd "$TEST_TEMP/project"
   run cleat_bin_timeout 5 start
   refute_output --partial "Update the image before starting?"
-  # The container actually started — proves cmd_run got past the check rather
+  # The container actually started: proves cmd_run got past the check rather
   # than blocking on the prompt (which would have tripped the 5s timeout).
   grep -q 'sh.cleat.version=' "$DOCKER_CALLS" || {
-    echo "container never started — the update check may have blocked"
+    echo "container never started; the update check may have blocked"
     cat "$DOCKER_CALLS"
     return 1
   }
 }
 
 @test "smoke: cleat prune exits 0 under strict mode" {
-  # No prunable artifacts in the stub world — must report cleanly, not crash
+  # No prunable artifacts in the stub world, must report cleanly, not crash
   # on set -u / pipefail in the stats plumbing.
   run cleat_bin prune
   assert_success
@@ -762,4 +762,32 @@ EOF
   assert_success
   assert_output --partial "Status:"
   refute_output --partial "unbound variable"
+}
+
+@test "smoke: the on-start Docker-tuned confirmation survives strict mode" {
+  # The on-start sequence isn't reachable through a stubbed `cleat start`, so
+  # drive _maybe_announce_docker_ready (and its per-URL marker sweep) directly in
+  # a subprocess with the binary's REAL `set -euo pipefail` intact, the condition
+  # macOS users run under. Catches set -e trips (e.g. _path_mtime's stat probe on
+  # a vanished marker) and set -u unbound vars that the sourced unit tests, which
+  # strip strict mode, can't see.
+  cat > "$TEST_TEMP/ready_strict.sh" <<EOF
+set -euo pipefail
+source "$CLI"
+_is_tty() { return 0; }
+_docker_vm_memory() { echo 17179869184; }     # 16 GiB VM
+_host_total_memory() { echo 34359738368; }    # 32 GiB host → rec 16 (met)
+_ONSTART_GAP_OPEN=0
+_maybe_announce_docker_ready
+# Exercise the debounce sweep over a stale marker via the real if-condition call.
+clip="\$(mktemp -d)"
+mkdir -p "\$clip/.open.stale"; touch -t 200001010000 "\$clip/.open.stale"
+if _browser_recently_opened "\$clip" "https://example.com/z"; then :; fi
+rm -rf "\$clip"
+EOF
+  run bash "$TEST_TEMP/ready_strict.sh"
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
 }

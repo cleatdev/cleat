@@ -21,7 +21,7 @@ teardown() { _common_teardown; }
   [[ "$result" == cleat-my-project-v2-* ]]  || return 1
 }
 
-@test "is deterministic — same input always same output" {
+@test "is deterministic: same input always same output" {
   local a b
   a="$(container_name_for "/home/user/project")"
   b="$(container_name_for "/home/user/project")"
@@ -70,7 +70,7 @@ teardown() { _common_teardown; }
 
 @test "truncated name doesn't end with trailing dash" {
   # Create a name that after truncation would end with a dash
-  # 48 chars of 'a' followed by a dash — truncation at 48 should strip the trailing dash
+  # 48 chars of 'a' followed by a dash: truncation at 48 should strip the trailing dash
   local dir_name
   dir_name="$(printf 'a%.0s' {1..47})-b"
   local result
@@ -159,7 +159,7 @@ teardown() { _common_teardown; }
   [[ "$result" =~ ^cleat-[a-z0-9-]+-[0-9a-f]{8}$ ]]  || return 1
 }
 
-# ── Boxes — named per-project sandboxes (see concept/20-boxes.md) ────────────
+# ── Boxes: named per-project sandboxes (see concept/20-boxes.md) ────────────
 
 @test "box: a named box appends -<box> to the container name" {
   local base named

@@ -11,7 +11,7 @@ setup() {
 }
 teardown() { _common_teardown; }
 
-@test "start: full flow — builds, runs, execs with --dangerously-skip-permissions" {
+@test "start: full flow: builds, runs, execs with --dangerously-skip-permissions" {
   mkdir -p "$TEST_TEMP/project"
   run cmd_start "$TEST_TEMP/project"
   assert_success
@@ -73,7 +73,7 @@ teardown() { _common_teardown; }
 
   run cmd_resume "$TEST_TEMP/project"
   assert_success
-  assert_output --partial "No container for this project — creating fresh"
+  assert_output --partial "No container for this project. Creating fresh"
   # docker run was invoked (container creation happened).
   run grep "^docker run" "$DOCKER_CALLS"
   assert_success
@@ -173,7 +173,7 @@ teardown() { _common_teardown; }
 }
 
 @test "start: stale mounts auto-recreate container after reboot" {
-  # After host reboot, /tmp is cleared — settings overlay dir is gone.
+  # After host reboot, /tmp is cleared: settings overlay dir is gone.
   # cmd_start should detect this and silently recreate instead of failing.
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
@@ -181,7 +181,7 @@ teardown() { _common_teardown; }
   cname="$(container_name_for "$TEST_TEMP/project")"
   is_running() { return 1; }
   mock_docker_ps_a "$cname"
-  # Do NOT create settings overlay dir — simulates post-reboot state
+  # Do NOT create settings overlay dir, simulates post-reboot state
 
   run cmd_start "$TEST_TEMP/project"
   assert_success
@@ -197,7 +197,7 @@ teardown() { _common_teardown; }
 
 @test "resume: stale mounts auto-recreate and continue (sessions live on host)" {
   # After paths rotate (reboot, partial /tmp cleanup, SSH-socket rotation),
-  # resume can't docker-start the stale container — but sessions live on the
+  # resume can't docker-start the stale container, but sessions live on the
   # host, so it recreates transparently and continues with --continue instead
   # of erroring out and dead-ending the user.
   mock_docker_images "cleat"
@@ -206,7 +206,7 @@ teardown() { _common_teardown; }
   cname="$(container_name_for "$TEST_TEMP/project")"
   is_running() { return 1; }
   mock_docker_ps_a "$cname"
-  # Do NOT create settings overlay dir — simulates post-reboot state
+  # Do NOT create settings overlay dir, simulates post-reboot state
 
   run cmd_resume "$TEST_TEMP/project"
   assert_success

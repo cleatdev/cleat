@@ -92,7 +92,7 @@ run_docker_stub() {
   echo '{}' > "$TEST_TEMP/overlay.json"
   # /workspace bind-mounted from $TEST_TEMP/project, overlay mounted to
   # /workspace/.claude/settings.json, but .claude/settings.json doesn't exist
-  # on the host — this is the v0.6.5 bug.
+  # on the host: this is the v0.6.5 bug.
   run run_docker_stub run \
     -v "$TEST_TEMP/project:/workspace" \
     -v "$TEST_TEMP/overlay.json:/workspace/.claude/settings.json" \
@@ -134,13 +134,13 @@ run_docker_stub() {
 [caps]
 hooks
 EOF
-  # Satisfy the global settings overlay (unrelated to v0.6.5) — the host file
+  # Satisfy the global settings overlay (unrelated to v0.6.5): the host file
   # must exist for virtiofs to accept the nested mount. See stub_validation
   # note at end of file for the separate global-overlay issue.
   echo '{}' > "$HOME/.claude/settings.json"
 
   mkdir -p "$TEST_TEMP/project/.claude"
-  # .claude/ exists but neither settings.json nor settings.local.json —
+  # .claude/ exists but neither settings.json nor settings.local.json:
   # the exact v0.6.5 trigger condition.
 
   cd "$TEST_TEMP/project"
@@ -170,7 +170,7 @@ EOF
 # see the test below which intentionally omits the host file.
 # ─────────────────────────────────────────────────────────────────────────────
 
-@test "stub virtiofs: finding — global overlay fails when ~/.claude/settings.json missing" {
+@test "stub virtiofs: finding, global overlay fails when ~/.claude/settings.json missing" {
   export DOCKER_STUB_SIMULATE_VIRTIOFS=1
   # Deliberately do NOT create $HOME/.claude/settings.json
   mkdir -p "$TEST_TEMP/project"
@@ -207,7 +207,7 @@ EOF
 # ── ps / ps -a routing: token-bounded match for `-a` flag ───────────────────
 #
 # A naive `[[ "$*" == *"-a"* ]]` substring match falsely fires when the
-# container name contains '-a' (e.g. `cleat-project-a1b2c3d4` — ~1/16 of
+# container name contains '-a' (e.g. `cleat-project-a1b2c3d4`, ~1/16 of
 # random hashes start with 'a'), routing plain `docker ps` calls to
 # ps_a_output and breaking the is_running / container_exists distinction.
 # This pinned pair of tests guards the token-bounded match in the stub.
@@ -215,7 +215,7 @@ EOF
 @test "stub ps routing: docker ps without -a returns ps_output even when filter contains '-a' substring" {
   printf 'this-is-ps-output\n'    > "$DOCKER_MOCK_DIR/ps_output"
   printf 'this-is-ps-a-output\n'  > "$DOCKER_MOCK_DIR/ps_a_output"
-  # Container name with embedded '-a' — used to flake when the hash started with 'a'.
+  # Container name with embedded '-a': used to flake when the hash started with 'a'.
   run run_docker_stub ps --filter 'name=^cleat-project-a1b2c3d4$' --format '{{.Names}}'
   assert_success
   assert_output "this-is-ps-output"

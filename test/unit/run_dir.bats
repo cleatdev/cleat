@@ -91,11 +91,11 @@ _cname_for() { container_name_for "$1"; }
   assert_failure
 }
 
-@test "intact check: settings-only scope — a missing clip/hooks sibling does not force recreate" {
+@test "intact check: settings-only scope, a missing clip/hooks sibling does not force recreate" {
   # The check guards only the settings overlay (file mounts, which fail hard if
   # the source vanishes). clip/ and hooks/ are dir mounts that Docker
   # auto-recreates, so a vanished sibling must NOT trigger a recreate. This
-  # asymmetry is intentional — see concept/18-runtime-state.md.
+  # asymmetry is intentional: see concept/18-runtime-state.md.
   local cname="cleat-siblings-12345678"
   mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
   echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"

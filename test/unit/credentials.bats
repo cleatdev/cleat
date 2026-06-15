@@ -16,7 +16,7 @@ setup() {
   use_docker_stub
   source_cli
   CRED="${HOME}/.claude/.credentials.json"
-  # A realistic credential blob (we treat it opaquely — written verbatim).
+  # A realistic credential blob (we treat it opaquely, written verbatim).
   BLOB='{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"rt-xyz","expiresAt":1234567890,"scopes":["user:inference"],"subscriptionType":"max"}}'
 }
 teardown() { _common_teardown; }
@@ -41,7 +41,7 @@ teardown() { _common_teardown; }
 }
 
 @test "is_macos: false when neither OSTYPE nor uname is darwin" {
-  uname() { echo "Linux"; }   # host-independent — a macOS runner's uname must not leak in
+  uname() { echo "Linux"; }   # host-independent; a macOS runner's uname must not leak in
   OSTYPE="linux-gnu"
   run _is_macos
   assert_failure

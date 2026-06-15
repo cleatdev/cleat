@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for docker/clip — the clipboard shim used inside containers
+# Tests for docker/clip: the clipboard shim used inside containers
 
 load "../setup"
 
@@ -52,7 +52,7 @@ teardown() { _common_teardown; }
   assert_output --partial "nothing to copy"
 }
 
-@test "atomic write — no leftover temp files" {
+@test "atomic write: no leftover temp files" {
   touch "$CLIP_TEST/tmp/cleat-clip/.host-ready"
   echo "atomic" | "$CLIP_TEST/test-clip"
   local leftovers

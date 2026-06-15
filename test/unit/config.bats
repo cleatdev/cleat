@@ -256,7 +256,7 @@ EOF
   assert_line --index 1 "env"
 }
 
-@test "config --enable: idempotent — enabling twice doesn't duplicate" {
+@test "config --enable: idempotent, enabling twice doesn't duplicate" {
   cmd_config --enable git
   cmd_config --enable git
   local count
@@ -368,7 +368,7 @@ EOF
 
 @test "config draw: shows pointer on cursor row" {
   run _config_picker_draw 2 ""
-  # Row 2 is env — should have the pointer
+  # Row 2 is env, should have the pointer
   assert_output --partial "▸"
 }
 

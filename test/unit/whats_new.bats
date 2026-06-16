@@ -121,6 +121,27 @@ teardown() { _common_teardown; }
   assert_output "SINGLE"
 }
 
+@test "whats-new: firing the highlight opens the gap so the next on-start line doesn't double the blank" {
+  # The highlight owns a trailing blank, so it must flag _ONSTART_GAP_OPEN like the
+  # pressure block does. Without it, a post-upgrade start with a well-sized VM
+  # (pressure check silent) doubled the blank before the "Docker tuned"/swap line.
+  # Call directly (not `run`) so the global mutation is observable in this shell.
+  _is_tty() { return 0; }
+  _ONSTART_GAP_OPEN=0
+  _maybe_show_release_highlight >/dev/null
+  [ "$_ONSTART_GAP_OPEN" = "1" ]
+}
+
+@test "whats-new: a silent highlight does NOT open the gap" {
+  # If the highlight printed nothing (cap reached), it must not claim a gap it
+  # never opened, or the next line would skip a leading blank it actually needs.
+  _is_tty() { return 0; }
+  echo "$VERSION $RELEASE_HIGHLIGHT_MAX_SHOWS" > "$LAST_SEEN_VERSION_FILE"
+  _ONSTART_GAP_OPEN=0
+  _maybe_show_release_highlight >/dev/null
+  [ "$_ONSTART_GAP_OPEN" = "0" ]
+}
+
 @test "whats-new: exactly one blank separates a real preceding pressure advisory from the news" {
   # End-to-end of the on-start sequence: an undersized-VM advisory, then the
   # highlight: the two functions wired as main() calls them. The advisory's

@@ -969,10 +969,11 @@ try "v0.15.1_image_ready_no_leading_blank" "opens the bring-up with no leading b
 
 # v0.15.1: the release highlight ends with a trailing blank so it owns its own
 # separation from the bring-up that follows. Delete that trailing echo "" (the
-# one after the changelog line): the "trailing blank separates the highlight"
-# test then sees the changelog line abut the sentinel and fails.
+# one after the changelog line, before the _ONSTART_GAP_OPEN flag): the "trailing
+# blank separates the highlight" test then sees the changelog line abut the
+# sentinel and fails. (Anchor updated v0.16.4 when the comment changed.)
 cat > "$SED_TMP" << 'SED'
-/# block that follows, so the bring-up needs no leading blank/{n;d;}
+/# pressure block follows\./{n;d;}
 SED
 try "v0.15.1_highlight_trailing_blank" "trailing blank separates the highlight" "$CLI" "$WHATS_NEW_BATS"
 
@@ -1114,7 +1115,7 @@ try "vnext_memory_project_clamp" "above 8g is clamped" "$CLI" "$RESOURCES_BATS"
 cat > "$SED_TMP" << 'SED'
 /resources:memory=/d
 SED
-try "vnext_memory_fingerprint" "changes the config fingerprint" "$CLI" "$RESOURCES_BATS"
+try "vnext_memory_fingerprint" "memory changes the fingerprint" "$CLI" "$RESOURCES_BATS"
 
 # vnext: sessions must pin node's heap to the box's real budget. Drop the
 # pin: the heap test fails.
@@ -1236,6 +1237,14 @@ s|(( _limit_sum > _vm_bytes ))|(( _limit_sum > _vm_bytes * 1000 ))|
 SED
 try "vnext_status_overcommit_line" "flags an overcommitted VM" "$CLI" "$PRUNE_BATS"
 
+# v0.16.4: status's VM size must ROUND like the advisory (a 16 GB slider reads
+# ~15.6 GiB), never floor to a misleading 15. Revert the rounded display to a floor:
+# the "rounded to the slider, not floored" status test sees "15 GB VM".
+cat > "$SED_TMP" << 'SED'
+s@$(_vm_gb_rounded "$_vm_bytes") GB VM@$(( _vm_bytes / 1073741824 )) GB VM@
+SED
+try "vnext_status_vm_size_rounds" "rounded to the slider, not floored" "$CLI" "$PRUNE_BATS"
+
 # vnext: an Exited (255) box is a Docker restart, not a crash; ps must say
 # so. Delete the hint: the ps hint test fails.
 cat > "$SED_TMP" << 'SED'
@@ -1285,7 +1294,7 @@ try "vnext_cpus_zero_guard" "zero cpus is rejected" "$CLI" "$RESOURCES_BATS"
 cat > "$SED_TMP" << 'SED'
 /resources:cpus=/d
 SED
-try "vnext_cpus_fingerprint" "cpus limit changes the config fingerprint" "$CLI" "$RESOURCES_BATS"
+try "vnext_cpus_fingerprint" "cpus changes the fingerprint" "$CLI" "$RESOURCES_BATS"
 
 # vnext: COLORTERM must be forwarded when (and only when) the host sets it.
 # Make the condition never true: the COLORTERM subprocess test fails.
@@ -1468,10 +1477,11 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "bugfix_advisory_half_host_cap" "capped at half the host RAM" "$CLI" "$PRUNE_BATS"
 
-# When host RAM is unknown, the advisory falls back to an absolute 8 GiB floor.
-# Force that floor to 0: the host-unknown fallback test sees no advisory.
+# When host RAM is unknown, the advisory falls back to an absolute 8 GiB floor
+# (compared in whole rounded GB since v0.16.4). Force that floor to 0: the
+# host-unknown fallback test sees no advisory.
 cat > "$SED_TMP" << 'SED'
-s|vm_bytes < _PRESSURE_VM_ADVISORY_BYTES|vm_bytes < 0|
+s|vm_gb < _PRESSURE_VM_ADVISORY_BYTES / 1073741824|vm_gb < 0|
 SED
 try "bugfix_advisory_fallback_floor" "falls back to an 8 GiB floor" "$CLI" "$PRUNE_BATS"
 
@@ -1623,11 +1633,15 @@ try "bugfix_pressure_gap_flag" "exactly one blank separates a real preceding" "$
 
 # v0.16.x: the pressure section must open with its own LEADING blank (before the
 # first notice) so the advisory lands in its own block, not flush against the
-# auto-update "Restarting..." line above it (image.png). Neuter the
-# `$printed || echo ""` lead-ins: the "blank line PRECEDES" test sees the warn on
-# line 1.
+# auto-update "Restarting..." line above it (image.png). Since v0.16.4 the
+# advisory owns that blank unconditionally (a bare `echo ""` above the undersized
+# warn), so neuter THAT: the "blank line PRECEDES" test (VM-only, no prune) sees
+# the warn on line 1.
 cat > "$SED_TMP" << 'SED'
-s#\$printed || echo ""#:#g
+/if $bad; then/{
+n
+s@echo ""@:@
+}
 SED
 try "bugfix_pressure_leading_blank" "blank line PRECEDES the advisory section" "$CLI" "$PRUNE_BATS"
 
@@ -1669,7 +1683,7 @@ try "vnext_ready_defers_to_warning" "defers to a warning" "$CLI" "$PRUNE_BATS"
 # undersized VM. Neuter the host-known adequacy gate so an undersized VM would
 # also print: the "silent when the VM is undersized" test sees the confirmation.
 cat > "$SED_TMP" << 'SED'
-s@(( vm_bytes < rec_gb \* 1073741824 )) && return 0@:@
+s@(( vm_gb < rec_gb )) && return 0@:@
 SED
 try "vnext_ready_adequacy_gate" "silent when the VM is undersized" "$CLI" "$PRUNE_BATS"
 
@@ -1688,6 +1702,156 @@ cat > "$SED_TMP" << 'SED'
 s|\\r\\n\\033\[2K'|\\r\\n'|
 SED
 try "bugfix_session_end_line_clear" "clears the success line so stale terminal bytes" "$CLI" "$REGRESSIONS"
+
+# v0.16.4: the config fingerprint must read CONFIGURED memory, never the
+# VM-derived default. Revert to resolve_box_memory: the unconfigured box's hash
+# moves with the (mocked) VM size again and the "resizing the VM does not trigger
+# config drift" regression fails.
+cat > "$SED_TMP" << 'SED'
+s|resources:memory=$(_configured_box_memory|resources:memory=$(resolve_box_memory|
+SED
+try "vnext_fingerprint_configured_memory" "resizing the Docker VM does not trigger" "$CLI" "$REGRESSIONS"
+
+# v0.16.4: the fingerprint must read CONFIGURED cpus, never the daemon-clamped
+# value. Revert to resolve_box_cpus: a configured cpus above the core count gets
+# clamped to the (mocked) NCPU, so changing the core count drifts the hash and the
+# "configured cpus above the cores does NOT drift" test fails.
+cat > "$SED_TMP" << 'SED'
+s|resources:cpus=$(_configured_box_cpus|resources:cpus=$(resolve_box_cpus|
+SED
+try "vnext_fingerprint_configured_cpus" "above the cores does NOT drift the fingerprint" "$CLI" "$RESOURCES_BATS"
+
+# v0.16.4: the stored config-hash must carry the storage-format prefix (v2:) so a
+# formula change is detectable. Drop the prefix at stamping: the "stores
+# config-hash label" test (which pins sh.cleat.config-hash=v2:) fails.
+cat > "$SED_TMP" << 'SED'
+s|config_hash="v${_CONFIG_FP_VERSION}:|config_hash="|
+SED
+try "vnext_config_hash_v2_prefix" "stores config-hash label on container" "$CLI" "$CAPABILITIES_BATS"
+
+# v0.16.4: a legacy (pre-v2) or unprefixed hash can't be reconstructed, so it must
+# NOT be treated as drift (the false-recreate-on-upgrade bug). Delete the
+# format-version gate: a legacy hash now mismatches the current and prompts, so the
+# "legacy (pre-v2) config-hash is never nagged" regression fails.
+cat > "$SED_TMP" << 'SED'
+/\[\[ "\$stored_hash" == "v\${_CONFIG_FP_VERSION}:"\* \]\] || return 0/d
+SED
+try "vnext_drift_legacy_grandfather" "legacy" "$CLI" "$REGRESSIONS"
+
+# v0.16.4: the drift message must name resources too (configured [resources] can
+# drift), not just "caps or env keys". Revert to the old wording: the "message
+# names caps/env/resources" test loses "resource limits" and fails.
+cat > "$SED_TMP" << 'SED'
+s|its capabilities, environment, or resource limits differ from your current setup|caps or env keys differ from the running setup|
+SED
+try "vnext_drift_message_resources" "message names caps" "$CLI" "$CAPABILITIES_BATS"
+
+# v0.16.4: the swap advisory must fire when configured swap is below the target.
+# Defeat the threshold (compare against 0, never true): the "low swap shows the
+# swap advisory" test sees the all-clear instead and fails.
+cat > "$SED_TMP" << 'SED'
+s|swap_bytes < _SWAP_ADVISORY_BYTES|swap_bytes < 0|
+SED
+try "vnext_swap_advisory_branch" "low swap shows the swap advisory" "$CLI" "$PRUNE_BATS"
+
+# v0.16.4: _docker_vm_swap_bytes must convert the settings file's MiB value to
+# bytes. Break the conversion (× 1): the "reads SwapMiB from settings-store" test
+# expects 1073741824 but sees 1024 and fails.
+cat > "$SED_TMP" << 'SED'
+s|mib \* 1048576|mib \* 1|
+SED
+try "vnext_swap_detect_mib" "reads SwapMiB from settings-store" "$CLI" "$PRUNE_BATS"
+
+# v0.16.4: the Claude-update prompt block must close with a trailing blank so the
+# bring-up doesn't sit flush against "Claude Code upgraded". Delete the blank that
+# follows the "# neither blank." anchor: the "fired Claude-update prompt closes
+# with a trailing blank" regression fails.
+cat > "$SED_TMP" << 'SED'
+/# neither blank\./{
+n
+d
+}
+SED
+try "vnext_blank_after_claude_upgrade" "Claude-update prompt closes with a trailing blank" "$CLI" "$REGRESSIONS"
+
+# v0.16.4 hardening: swap MiB→bytes must force base-10 (10#). A leading-zero value
+# (08/09) is invalid octal and aborts the arithmetic under set -e. Revert 10#$mib
+# to $mib: the "leading-zero value is read as base-10" test loses 8388608 (empty).
+cat > "$SED_TMP" << 'SED'
+s|10#$mib|$mib|
+SED
+try "vnext_swap_base10" "leading-zero value is read as base-10" "$CLI" "$PRUNE_BATS"
+
+# v0.16.4 hardening: the swap shortfall is reported in floored GB, never _human_bytes
+# (which rounds 1.5 GB up to "2 GB" and contradicts the "set Swap ≥ 2 GB" step).
+# Make the GB display round UP: the "sub-2GB swap is not rounded UP" test sees "2 GB".
+cat > "$SED_TMP" << 'SED'
+s|swap_bytes / 1073741824 )) GB|(swap_bytes + 1073741823) / 1073741824 )) GB|
+SED
+try "vnext_swap_floor_display" "sub-2GB swap is not rounded UP" "$CLI" "$PRUNE_BATS"
+
+# v0.16.4 hardening: the release highlight owns a trailing blank, so it must flag
+# _ONSTART_GAP_OPEN (else the next on-start line doubles the blank). Delete the flag
+# set after the highlight's trailing blank: the "firing the highlight opens the gap"
+# test sees the flag stay 0.
+cat > "$SED_TMP" << 'SED'
+/# pressure block follows\./{
+n
+n
+d
+}
+SED
+try "vnext_highlight_opens_gap" "firing the highlight opens the gap" "$CLI" "$WHATS_NEW_BATS"
+
+# v0.16.4 hardening: the fingerprint's configured-memory resolver must read the
+# GLOBAL config when the project declares nothing. Neuter the global read (point it
+# at /dev/null): the "configured memory: falls back to the global config" test
+# loses its 12g result. (Also touches resolve_box_memory, but the harness runs only
+# the filtered test.)
+cat > "$SED_TMP" << 'SED'
+s|_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory|_read_resource_from_file /dev/null memory|
+SED
+try "vnext_configured_global_memory" "configured memory: falls back to the global" "$CLI" "$RESOURCES_BATS"
+
+# v0.16.4: the Docker VM size must ROUND to the nearest GB, not floor. `docker info`
+# reports the kernel's MemTotal (~15.6 GiB for a 16 GB slider), which flooring turned
+# into a misleading "15 GB" and a false undersized warning. Revert the +0.5 GiB
+# round-up to +0: _vm_gb_rounded floors again and the "rounds to the slider" regression
+# reads 15 for a 16 GB slider and fails.
+cat > "$SED_TMP" << 'SED'
+s|b + 536870912|b + 0|
+SED
+try "vnext_vm_gb_rounds_slider" "rounds to the slider" "$CLI" "$REGRESSIONS"
+
+# v0.16.4 hardening: _vm_gb_rounded must force base-10 (10#$b) so a digit-only value
+# with a leading zero is not aborted as invalid octal under set -e. Revert 10#$b to
+# $b: the zero-padded assertion in the "rounds to the slider" regression reads empty.
+cat > "$SED_TMP" << 'SED'
+s|10#$b|$b|
+SED
+try "vnext_vm_gb_base10" "rounds to the slider" "$CLI" "$REGRESSIONS"
+
+# v0.16.4: the undersized test must compare WHOLE rounded GB, never raw bytes, else
+# a 16 GB slider's ~15.6 GiB trips the exact-16-GiB byte threshold even though its
+# rounded display reads 16 (the self-contradiction). Revert the GB compare to bytes:
+# the "not flagged undersized" test sees the warning fire and fails.
+cat > "$SED_TMP" << 'SED'
+s|vm_gb < rec_gb|vm_bytes < rec_gb * 1073741824|
+SED
+try "vnext_pressure_compares_gb" "not flagged undersized" "$CLI" "$PRUNE_BATS"
+
+# v0.16.4: the VM advisory must own a blank line above it even when the prune notice
+# already printed (each on-start notice is separated). Revert the unconditional
+# separator before the undersized warn to `$printed || echo ""`: with prune fired,
+# printed=true suppresses it and the "separated by a blank line" regression sees the
+# advisory flush under PRUNE_DONE.
+cat > "$SED_TMP" << 'SED'
+/if $bad; then/{
+n
+s@echo ""@$printed || echo ""@
+}
+SED
+try "vnext_prune_advisory_blank" "separated by a blank line" "$CLI" "$REGRESSIONS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

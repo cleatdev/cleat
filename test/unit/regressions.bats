@@ -1684,7 +1684,7 @@ EOF
   run bash -c '
     source "'"$CLI"'"
     container_exists() { return 0; }
-    _container_config_hash() { echo "old"; }
+    _container_config_hash() { echo "v2:old"; }   # current format, so drift is compared (v0.16.4)
     compute_config_fingerprint() { echo "new"; }
     _is_tty() { return 0; }
     is_running() { return 1; }
@@ -1888,7 +1888,7 @@ ${overlay_dir}/project-settings.local.json"
   run bash -c '
     source "'"$CLI"'"
     container_exists() { return 0; }
-    _container_config_hash() { echo "old"; }
+    _container_config_hash() { echo "v2:old"; }   # current format, so drift is compared (v0.16.4)
     compute_config_fingerprint() { echo "new"; }
     _is_tty() { return 1; }
     _resolve_config_drift "cleat-foo" ""
@@ -2082,4 +2082,111 @@ ${overlay_dir}/project-settings.local.json"
   assert_output --partial "Session ended"
   # Erase the reclaimed line above, drop down, AND clear the success line.
   assert_output --partial $'\033[A\033[2K\r\n\033[2K'
+}
+
+@test "regression v0.16.4: resizing the Docker VM does not trigger config drift" {
+  # The fingerprint folded in resolve_box_memory, whose default is a quarter of
+  # the Docker VM clamped to [4g,8g]. So nudging the Docker memory slider, or a
+  # CLI release that retunes that formula (the 2g→4g floor change in v0.16.1),
+  # moved the hash and fired a false "config changed, recreate?" on a box the
+  # user never touched. The fingerprint now reads CONFIGURED resources only, so
+  # an unconfigured box hashes the same no matter the VM size or CLI version.
+  run bash -c '
+    source "'"$CLI"'"
+    ACTIVE_CAPS=(git env); _RESOLVED_ENV_ARGS=(-e "FOO=bar")
+    proj="'"$TEST_TEMP"'/vmproj"; mkdir -p "$proj"
+    CLEAT_GLOBAL_CONFIG="'"$TEST_TEMP"'/no-such-config"
+    _docker_vm_memory() { echo "$(( 7 * 1073741824 ))"; }
+    h1="$(compute_config_fingerprint "$proj")"
+    _docker_vm_memory() { echo "$(( 48 * 1073741824 ))"; }
+    h2="$(compute_config_fingerprint "$proj")"
+    [[ "$h1" == "$h2" ]] || { echo "DRIFTED: $h1 vs $h2" >&2; exit 1; }
+    echo "STABLE"
+  '
+  assert_success
+  assert_output --partial "STABLE"
+}
+
+@test "regression v0.16.4: a legacy (pre-v2) config-hash is never nagged to recreate" {
+  # Containers created before the v0.16.4 fingerprint format carry a bare hash
+  # whose inputs we can't reconstruct (old formula, unknown VM size at creation).
+  # The upgrade to v0.16.4 must NOT prompt them to recreate (the exact false
+  # positive being fixed): only current-format (v2:) hashes are compared, anything
+  # else is left untouched until its next genuine recreate.
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "0123456789abcdef"; }   # bare legacy hash, no v2: prefix
+    compute_config_fingerprint() { echo "anything-different"; }
+    _is_tty() { return 0; }
+    echo "y" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  refute_output --partial "Config changed"
+}
+
+@test "regression v0.16.4: a fired Claude-update prompt closes with a trailing blank" {
+  # After "Claude Code upgraded", the bring-up (Container started …) printed flush
+  # against the confirmation. The prompt opens with a blank line, so it must also
+  # close with one, but only when it actually fired (a throttled/no-op start prints
+  # neither). SENTINEL stands in for the bring-up; the blank must survive before it.
+  run bash -c '
+    source "'"$CLI"'"
+    _is_tty() { return 0; }
+    image_exists() { return 0; }
+    _upgrade_claude_image() { echo "UPGRADE_CALLED"; return 0; }
+    CLAUDE_CHECK_FILE="'"$TEST_TEMP"'/.cuc"
+    CLEAT_FORCE_CLAUDE_CHECK=1
+    CLEAT_FAKE_REMOTE_CLAUDE="2.1.149"
+    _image_claude_version() { echo "2.1.40"; }
+    out="$( _maybe_prompt_claude_update <<< "y"; printf "SENTINEL\n" )"
+    last="$(printf "%s\n" "$out" | tail -2 | head -1)"
+    [[ -z "$last" ]] || { echo "NO TRAILING BLANK; last=[$last]" >&2; exit 1; }
+    echo "BLANK_OK"
+  '
+  assert_success
+  assert_output --partial "BLANK_OK"
+}
+
+@test "regression v0.16.4: the Docker VM size rounds to the slider, not the kernel's reported floor" {
+  # img_1.png: a 16 GB Docker Desktop slider is reported by `docker info` as the
+  # guest kernel's MemTotal (~15.6 GiB; the kernel reserves some at boot). Flooring
+  # that printed a misleading "15 GB" and false-positived the undersized advisory on
+  # a VM that was sized right. Rounding to the nearest GB recovers the slider's 16;
+  # a genuine 15 GB slider (~14.6 GiB) still rounds to 15, so the two stay distinct.
+  run bash -c '
+    source "'"$CLI"'"
+    [[ "$(_vm_gb_rounded 16750372454)" == "16" ]] || { echo "16 GB slider misread as $(_vm_gb_rounded 16750372454)" >&2; exit 1; }
+    [[ "$(_vm_gb_rounded 15676000000)" == "15" ]] || { echo "15 GB slider misread" >&2; exit 1; }
+    [[ "$(_vm_gb_rounded 8589934592)"  == "8"  ]] || { echo "8 GiB exact misread" >&2; exit 1; }
+    # A digit-only value with a leading zero must read base-10, not abort as octal.
+    [[ "$(_vm_gb_rounded 016750372454)" == "16" ]] || { echo "zero-padded value misread as [$(_vm_gb_rounded 016750372454)]" >&2; exit 1; }
+    echo "ROUNDS_OK"
+  '
+  assert_success
+  assert_output --partial "ROUNDS_OK"
+}
+
+@test "regression v0.16.4: the prune notice and the VM advisory are separated by a blank line" {
+  # img_1.png: on a daily check both the bloat→prune prompt and the undersized-VM
+  # advisory fire. They ran flush ("Pruned N images." directly above "Docker VM
+  # memory is ..."). The advisory must own a blank line above it even when an earlier
+  # notice already printed (the old `$printed || echo ""` suppressed that separator).
+  run bash -c '
+    source "'"$CLI"'"
+    PRESSURE_CHECK_FILE="'"$TEST_TEMP"'/regr-pressure-nostamp"; rm -f "$PRESSURE_CHECK_FILE"
+    _is_tty() { return 0; }
+    _cleat_prunable_stats() { printf "7\t8192"; }     # bloat → prune offered (stamp absent → due)
+    _docker_vm_memory() { echo "8589934592"; }        # 8 GiB VM (undersized)
+    _host_total_memory() { echo "34359738368"; }      # 32 GiB Mac
+    _running_memory_limits_sum() { echo "0"; }
+    _is_docker_desktop() { return 0; }
+    cmd_prune() { echo "PRUNE_DONE"; }
+    out="$(_maybe_check_docker_pressure <<< "y")"
+    before="$(printf "%s\n" "$out" | grep -B1 "Docker VM memory is" | head -1)"
+    [[ -z "${before// /}" ]] || { echo "NOT SEPARATED; line above=[$before]" >&2; exit 1; }
+    echo "SEPARATED_OK"
+  '
+  assert_success
+  assert_output --partial "SEPARATED_OK"
 }

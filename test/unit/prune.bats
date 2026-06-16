@@ -417,6 +417,47 @@ teardown() { _common_teardown; }
   refute_output --partial "Docker VM memory is"
 }
 
+@test "pressure: a 16 GB slider reported as ~15.6 GiB is sized right, not flagged undersized" {
+  # Regression (v0.16.4, from img_1.png): `docker info` reports the guest kernel's
+  # MemTotal, ~15.6 GiB for a 16 GB Docker Desktop slider (the kernel reserves some
+  # at boot). The old code floored that to "15 GB" AND compared the raw bytes against
+  # an exact 16 GiB target, so a correctly sized VM tripped the undersized warning.
+  # Rounding to the nearest GB recovers the slider's 16 and the warning stays silent.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "16750372454"; }           # ~15.6 GiB = a 16 GB slider
+  _host_total_memory() { echo "34359738368"; }          # 32 GiB Mac → rec 16
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  refute_output --partial "Docker VM memory is"          # meets the target once rounded: no warn
+}
+
+@test "pressure: a blank line separates the prune notice from the VM advisory" {
+  # Regression (v0.16.4, from img_1.png): when the daily bloat prompt AND the
+  # undersized-VM advisory both fired, they ran flush together ("Pruned N images."
+  # immediately followed by "Docker VM memory is..."). Each notice must own a blank
+  # line above it, so the advisory reads as its own block, not part of the prune one.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '7\t8192'; }          # bloat → prune offered
+  _docker_vm_memory() { echo "8589934592"; }             # 8 GiB VM (undersized)
+  _host_total_memory() { echo "34359738368"; }           # 32 GiB Mac
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  cmd_prune() { echo "PRUNE_DONE"; }
+  # The line directly above "Docker VM memory is" must be blank. Drop the separator
+  # (revert to `$printed || echo ""`) and PRUNE_DONE sits flush above it → NOTBLANK.
+  local out cls
+  out="$(_maybe_check_docker_pressure <<< 'y')"
+  cls="$(printf '%s\n' "$out" | awk '
+    /Docker VM memory is/ { print (p ~ /^[[:space:]]*$/ ? "BLANK" : "NOTBLANK"); f=1; exit }
+    { p=$0 }
+    END { if (!f) print "NOTFOUND" }')"
+  run echo "$cls"
+  assert_output "BLANK"
+}
+
 @test "pressure: overload takes precedence but STILL prints the grow-the-VM fix" {
   _is_tty() { return 0; }
   _cleat_prunable_stats() { printf '0\t0'; }
@@ -559,6 +600,19 @@ teardown() { _common_teardown; }
   refute_output --partial "Docker tuned for Cleat"
 }
 
+@test "ready: confirms a 16 GB slider reported as ~15.6 GiB, shown as 16 GB" {
+  # Inverse of the pressure regression and in lockstep with it: the same ~15.6 GiB a
+  # 16 GB slider reports must read as a tuned 16 GB VM, never stay silent as if
+  # undersized (which would contradict the warning's own rounded display).
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "16750372454"; }           # ~15.6 GiB = a 16 GB slider
+  _host_total_memory() { echo "34359738368"; }          # 32 GiB host → rec 16 (met once rounded)
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"
+  assert_output --partial "16 GB"                        # the recovered slider value, not 15
+}
+
 @test "ready: silent on a non-TTY run" {
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
@@ -650,6 +704,179 @@ teardown() { _common_teardown; }
   [ -f "$TEST_TEMP/ready_announced" ]
 }
 
+# ── VM swap detection ────────────────────────────────────────────────────────
+# `docker info` reports MemTotal but never swap, so swap is read from Docker
+# Desktop's own settings file (settings-store.json, newer PascalCase keys; else
+# settings.json, older camelCase). Pure-bash scrape, fail-soft to empty so the
+# swap advisory never fires on a guess.
+
+@test "swap: reads SwapMiB from settings-store.json (newer Docker Desktop)" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "Cpus": 4, "MemoryMiB": 16384, "SwapMiB": 1024 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
+  assert_output "1073741824"                               # 1024 MiB → bytes
+}
+
+@test "swap: reads lowercase swapMiB from settings.json (older Docker Desktop)" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "cpus": 4, "memoryMiB": 16384, "swapMiB": 2048 }\n' > "$dir/settings.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
+  assert_output "2147483648"                               # 2048 MiB → bytes
+}
+
+@test "swap: prefers settings-store.json over the older settings.json" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "SwapMiB": 4096 }\n' > "$dir/settings-store.json"
+  printf '{ "swapMiB": 512 }\n' > "$dir/settings.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
+  assert_output "4294967296"                               # 4096 MiB (the newer file wins)
+}
+
+@test "swap: empty when no settings file exists (fail soft)" {
+  local dir="$TEST_TEMP/dd-empty"; mkdir -p "$dir"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
+  assert_success
+  assert_output ""
+}
+
+@test "swap: empty when the value is missing or garbled (never guess)" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "Cpus": 4, "MemoryMiB": 16384 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
+  assert_success
+  assert_output ""
+}
+
+@test "swap: _DD_SWAP_BYTES override is the test seam" {
+  _DD_SWAP_BYTES="1073741824" run _docker_vm_swap_bytes
+  assert_output "1073741824"
+}
+
+@test "swap: a leading-zero value is read as base-10, not octal" {
+  # "08"/"09" pass the digit guard but are invalid octal: $(( 08 * … )) would abort
+  # under set -e and leak an error. 10# forces decimal: "08" → 8 MiB, never a crash.
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "SwapMiB": 08 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
+  assert_success
+  assert_output "8388608"                                 # 8 MiB, not an octal error
+}
+
+@test "swap: a zero-padded value is decimal, not silently misread as octal" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "SwapMiB": 0001024 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
+  assert_output "1073741824"                              # 1024 MiB, NOT octal 532 MiB
+}
+
+# ── swap branch of the on-start confirmation ─────────────────────────────────
+# Memory and swap are separate Docker Desktop sliders: a user who bumps memory
+# (often on our advice) can leave swap at the default. When memory is right but
+# swap is below target, say so instead of a blanket "tuned".
+
+@test "ready: well-sized VM but low swap shows the swap advisory, not the all-clear" {
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "17179869184"; }            # 16 GiB VM (memory is fine)
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo "1073741824"; }         # 1 GiB swap, below the 2 GiB target
+  run _maybe_announce_docker_ready
+  assert_success
+  refute_output --partial "Docker tuned for Cleat"       # not a blanket all-clear
+  assert_output --partial "swap"
+  assert_output --partial "Swap ≥ 2 GB"                  # the concrete fix step
+  assert_output --partial "1 GB"                         # names the current (low) swap
+}
+
+@test "ready: a sub-2GB swap is not rounded UP to '2 GB' (no self-contradiction)" {
+  # _human_bytes rounds, so 1.5 GB would read "2 GB" and the advisory would tell
+  # the user to set swap to a value it claims they already have. Floored GB never
+  # rounds a sub-target value up.
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "17179869184"; }
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo "1610612736"; }         # 1.5 GiB (1536 MiB)
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "swap is only"
+  assert_output --partial "1 GB"                         # floored, the honest sub-target figure
+  refute_output --partial "only ${BOLD}2 GB"             # never the contradictory round-up
+}
+
+@test "ready: disabled swap reads 'disabled', never a bare '?'" {
+  # _human_bytes renders 0 as "?", so "swap is only ?" would leak. Docker Desktop
+  # lets you set swap to 0, so the branch is reachable; it must read naturally.
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "17179869184"; }
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo "0"; }                  # swap disabled
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "swap is"
+  assert_output --partial "disabled"                     # BOLD-wrapped, so matched on its own
+  refute_output --partial "only ?"
+  refute_output --partial "Docker tuned for Cleat"       # still an advisory, not the all-clear
+}
+
+@test "ready: well-sized VM with healthy swap gives the all-clear" {
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "17179869184"; }
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo "4294967296"; }         # 4 GiB swap, healthy
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"
+  refute_output --partial "swap"
+}
+
+@test "ready: swap at exactly the 2 GiB target is healthy (not flagged)" {
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "17179869184"; }
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo "2147483648"; }         # exactly 2 GiB → not below target
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"
+}
+
+@test "ready: unreadable swap falls through to the all-clear (never warn on a guess)" {
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "17179869184"; }
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo ""; }                   # can't read swap
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"       # memory is good; don't claim swap is bad
+}
+
+@test "ready: an undersized VM shows the memory warning, never the swap branch" {
+  # Swap only matters once memory is right; an undersized VM is the bigger problem
+  # and is handled by the pressure check, so the swap branch must not fire here.
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "8589934592"; }             # 8 GiB VM, undersized for a 32 GiB host
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo "1073741824"; }         # low swap, but memory gate fails first
+  run _maybe_announce_docker_ready
+  assert_success
+  refute_output --partial "swap"
+  refute_output --partial "Docker tuned"
+}
+
+@test "ready: the swap advisory keeps the whitespace contract (blank above, none below)" {
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "17179869184"; }
+  _host_total_memory() { echo "34359738368"; }
+  _docker_vm_swap_bytes() { echo "1073741824"; }
+  _ONSTART_GAP_OPEN=0
+  local out first last
+  out="$( { _maybe_announce_docker_ready; printf 'SENTINEL\n'; } )"
+  first="$(printf '%s\n' "$out" | sed -n '1p')"
+  run echo "first=[$first]"
+  assert_output "first=[]"                               # one leading blank (own section)
+  last="$(printf '%s\n' "$out" | tail -2 | head -1)"     # line just before SENTINEL
+  run echo "$last"
+  refute_output ""                                       # the fix step, not a trailing blank
+}
+
 # ── cmd_status VM budget line ────────────────────────────────────────────────
 # Distinct from the on-start warn above: status renders its own overcommit
 # line so the state is visible on demand, not just once a day.
@@ -671,6 +898,17 @@ teardown() { _common_teardown; }
   run cmd_status "$TEST_TEMP/project"
   assert_success
   refute_output --partial "overcommitted"
+}
+
+@test "status: the overcommitted VM size is rounded to the slider, not floored" {
+  # Consistency with the on-start advisory: a 16 GB slider reads ~15.6 GiB from
+  # `docker info`. status must show the rounded "16 GB VM", never a floored "15".
+  mkdir -p "$TEST_TEMP/project"
+  _docker_vm_memory() { echo "16750372454"; }           # ~15.6 GiB = a 16 GB slider
+  _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB promised → overcommitted
+  run cmd_status "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "of a 16 GB VM"               # rounded, not floored to 15
 }
 
 # ── sum helper ───────────────────────────────────────────────────────────────

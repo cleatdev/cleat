@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.16.3"
+VERSION="0.16.4"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="0.16.3"
+RELEASE_HIGHLIGHT_VERSION="0.16.4"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -684,6 +684,68 @@ _docker_vm_memory() {
   docker info --format '{{.MemTotal}}' 2>/dev/null || true
 }
 
+# Round a byte count to the NEAREST whole GB. `docker info` reports the guest
+# kernel's MemTotal, which is always a few hundred MB UNDER the Docker Desktop
+# memory slider (the kernel reserves some at boot), so a 16 GB slider reports
+# ~15.6 GiB. Flooring that prints a misleading "15 GB" AND, compared against an
+# exact 16 GiB target, false-positives the undersized advisory on a VM that is
+# in fact sized right. The slider moves in whole-GB steps and the reserve is
+# under half a GB, so rounding to the nearest GB recovers the configured value:
+# 15.6 → 16, while a genuine 15 GB slider (~14.6 GiB) still rounds to 15. Used
+# for BOTH the displayed size and the threshold so the two can never contradict
+# (no "shows 16 GB but warns it's too small"). Arg: $1 = bytes. Echoes whole GB
+# (0 on missing/non-numeric input).
+_vm_gb_rounded() {
+  local b="${1:-0}"
+  [[ "$b" =~ ^[0-9]+$ ]] || { echo 0; return; }
+  # 10# forces base-10: a digit-only value can still carry a leading zero, which is
+  # invalid octal and would abort the arithmetic under set -e (same guard the swap
+  # reader uses). +0.5 GiB then floor = round-to-nearest.
+  echo $(( (10#$b + 536870912) / 1073741824 ))
+}
+
+# The Docker Desktop settings file (empty when none is readable). `docker info`
+# reports the VM's MemTotal but NOT its configured swap, so swap can only be read
+# from Docker Desktop's own settings, which on macOS live under
+# ~/Library/Group Containers/group.com.docker/. Newer Docker Desktop writes
+# settings-store.json (PascalCase keys); older writes settings.json (camelCase).
+# Try the newer one first. The base dir is overridable for tests.
+_docker_desktop_settings_file() {
+  local base="${_DD_SETTINGS_DIR:-$HOME/Library/Group Containers/group.com.docker}"
+  local f
+  for f in "$base/settings-store.json" "$base/settings.json"; do
+    [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 0   # no file is the common case (non-Docker-Desktop, or a moved path):
+             # return clean so a caller's `f="$(...)"` can never trip set -e.
+}
+
+# The Docker Desktop VM's configured SWAP size in bytes, empty when it can't be
+# read. Scrapes "SwapMiB": <n> (case-insensitive, so it matches both the newer
+# `SwapMiB` and the older `swapMiB`) from the settings file with a pure-bash grep
+# (no jq dependency). Fail-soft is deliberate: a parse miss returns empty so the
+# swap advisory NEVER fires on a guess, only on a value we definitely read. The
+# raw value is overridable for tests via _DD_SWAP_BYTES.
+_docker_vm_swap_bytes() {
+  if [[ -n "${_DD_SWAP_BYTES:-}" ]]; then
+    [[ "${_DD_SWAP_BYTES}" =~ ^[0-9]+$ ]] && printf '%s' "${_DD_SWAP_BYTES}"
+    return 0
+  fi
+  local f mib
+  f="$(_docker_desktop_settings_file)"
+  [[ -n "$f" ]] || return 0
+  # `|| true` keeps a no-match (grep exits 1) from tripping `set -e` inside the
+  # assignment under pipefail; the regex guard below handles the empty result.
+  mib="$(grep -iEo '"swapmib"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null \
+           | grep -Eo '[0-9]+' | tail -1 || true)"
+  [[ "$mib" =~ ^[0-9]+$ ]] || return 0
+  # 10# forces base-10: a leading-zero value (a hand-edited "08"/"09") passes the
+  # digit guard but is invalid octal, which under set -e aborts the arithmetic and
+  # leaks an error to the user; "0001024" would silently misread as octal. Same
+  # guard _mem_to_bytes uses. Fail-soft stays intact.
+  printf '%s' "$(( 10#$mib * 1048576 ))"
+}
+
 # Total physical RAM of the HOST machine in BYTES, empty when unknown. Used to
 # judge whether the Docker Desktop VM is sized sensibly *relative to the host*
 # (concept/22: a VM of ~half the host RAM). macOS: `sysctl hw.memsize` (already
@@ -815,6 +877,52 @@ resolve_box_cpus() {
     fi
     warn "Ignoring invalid cpus '$v' in global config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
   fi
+}
+
+# ── Configured resources, for the config fingerprint ONLY ────────────────────
+# The fingerprint must reflect what the USER declared in config, never a value
+# the CLI derives at runtime. resolve_box_memory falls back to a VM-derived
+# default (_default_box_memory) and resolve_box_cpus clamps to the daemon's core
+# count, so both MOVE when the Docker VM is resized or the CLI's own default
+# formula changes between versions, even though the user touched nothing. Folding
+# those into the fingerprint quietly reintroduced the very version/VM coupling the
+# VERSION exclusion was meant to kill: a CLI upgrade or a memory-slider change
+# would shift the hash and fire a false "config changed, recreate?" on an
+# untouched box. These variants read config files ONLY (project box > project >
+# global) and emit nothing when unset, so an unconfigured box hashes the same
+# regardless of VM size or CLI version. Values are validated but NOT warned about
+# here (the real resolvers warn during the actual run); an invalid value is
+# ignored so a typo can't change the fingerprint either.
+_configured_box_memory() {
+  local project="$1" box="${2:-main}" v
+  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" memory)"
+  if [[ -n "$v" ]] && _valid_memory_value "$v"; then
+    # Mirror resolve_box_memory's project clamp so the fingerprint matches the
+    # ceiling the container would actually get (deterministic, not VM-dependent).
+    if (( $(_mem_to_bytes "$v") > 8589934592 )); then echo "8g"; else echo "$v"; fi
+    return 0
+  fi
+  v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory)"
+  if [[ -n "$v" ]] && _valid_memory_value "$v"; then
+    echo "$v"
+    return 0
+  fi
+  return 0
+}
+
+_configured_box_cpus() {
+  local project="$1" box="${2:-main}" v
+  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" cpus)"
+  if [[ -n "$v" ]] && _valid_cpus_value "$v"; then
+    echo "$v"
+    return 0
+  fi
+  v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" cpus)"
+  if [[ -n "$v" ]] && _valid_cpus_value "$v"; then
+    echo "$v"
+    return 0
+  fi
+  return 0
 }
 
 # ── Box descriptions (host-side metadata) ────────────────────────────────────
@@ -1329,6 +1437,16 @@ _env_summary() {
 }
 
 # ── Configuration drift detection ──────────────────────────────────────────
+# Fingerprint storage-format version. Bump whenever the fingerprint INPUTS change
+# (v0.16.4 dropped the VM-derived resource values). It is stored as a `v<N>:`
+# prefix on the container's config-hash label, so a hash written under an OLDER
+# format is recognisable as legacy: its bytes can't be recomputed here (we no
+# longer know the old formula or the VM size at creation), so a mismatch against
+# it can't be trusted to mean real drift. Legacy-format containers are therefore
+# NOT nagged to recreate; they adopt the current format the next time they're
+# recreated for a genuine reason. See _resolve_config_drift.
+_CONFIG_FP_VERSION=2
+
 # Compute a fingerprint from sorted caps + sorted env keys ONLY.
 # Env VALUES are intentionally excluded: only structural changes (adding/removing
 # keys or capabilities) trigger drift. Value changes don't require container
@@ -1340,6 +1458,15 @@ _env_summary() {
 # offered remedy (recreate the container from the *same* image) does nothing for a
 # version change. Version drift is handled separately by _maybe_prompt_image_rebuild,
 # which offers a real rebuild and only when the image is genuinely older.
+#
+# Same principle for resources (fixed v0.16.4): the fingerprint uses CONFIGURED
+# memory/cpus (_configured_box_*), never the VM-derived default or the daemon
+# clamp, both of which move when the VM is resized or the CLI's default formula
+# changes between releases. Folding those in had quietly re-coupled the hash to
+# VM size and CLI version, so a memory-slider tweak or a routine upgrade fired a
+# false recreate prompt on a box the user never touched. The stored hash carries a
+# format-version prefix (_CONFIG_FP_VERSION) so a future formula change is
+# detectable rather than silently mistaken for real drift; see _resolve_config_drift.
 compute_config_fingerprint() {
   local project="${1:-}"
   local fingerprint_input=""
@@ -1367,13 +1494,15 @@ compute_config_fingerprint() {
   fi
   fingerprint_input+=$'\n'
 
-  # Resources: the limits a NEW container would be created with. Baked into
-  # the fingerprint so changing [resources] memory (or resizing the VM, which
-  # moves the derived default) surfaces the existing config-drift notice,
-  # limits are set at `docker run` and can't be applied to a live container.
-  fingerprint_input+="resources:memory=$(resolve_box_memory "$project" "${_BOX:-main}")"
+  # Resources: only what the user DECLARED in config (_configured_box_*), so an
+  # explicit `[resources] memory = 8g` still triggers a recreate (the ceiling is
+  # baked at `docker run`, not changeable on a live container) while an
+  # unconfigured box stays stable across VM resizes and CLI upgrades. Never the
+  # VM-derived default or the daemon-clamped cpus: those move underfoot and were
+  # the source of the v0.16.4 false-positive recreate.
+  fingerprint_input+="resources:memory=$(_configured_box_memory "$project" "${_BOX:-main}")"
   fingerprint_input+=$'\n'
-  fingerprint_input+="resources:cpus=$(resolve_box_cpus "$project" "${_BOX:-main}")"
+  fingerprint_input+="resources:cpus=$(_configured_box_cpus "$project" "${_BOX:-main}")"
   fingerprint_input+=$'\n'
 
   if command -v sha256sum &>/dev/null; then
@@ -1624,11 +1753,20 @@ _notice_box() {
   echo ""
 }
 
-# Resolve configuration drift between current caps/env and the existing container.
-# Most-common trigger: user ran `cleat config --enable <cap>` and re-typed `cleat`.
-# On TTY: prompt to recreate; on accept, stop+rm container and clean tmp dirs so
-# the caller's existing "no container" path (cmd_run) recreates with the new caps.
-# On non-TTY or declined: print a warning and continue with the stale container.
+# Resolve configuration drift between the current config and the existing
+# container. Triggers: a changed capability (`cleat config --enable <cap>`), a
+# changed env key, or a changed EXPLICITLY-configured resource limit
+# ([resources] memory/cpus in .cleat). On TTY: prompt to recreate; on accept,
+# stop+rm container and clean tmp dirs so the caller's existing "no container"
+# path (cmd_run) recreates with the new config. On non-TTY or declined: print a
+# warning and continue with the stale container.
+#
+# Only hashes written in the current storage format (the v<N>: prefix) are
+# comparable. A legacy or unlabelled hash can't be recomputed (we no longer know
+# the old formula or the VM size at creation), so a mismatch against it would be
+# a guess: such containers are NOT nagged, and silently adopt the current format
+# the next time they're recreated for a real reason. This is what makes a CLI
+# upgrade that changes the fingerprint formula recreate-free.
 _resolve_config_drift() {
   local cname="$1"
   local project="${2:-}"
@@ -1637,11 +1775,12 @@ _resolve_config_drift() {
 
   local stored_hash current_hash
   stored_hash="$(_container_config_hash "$cname")"
-  current_hash="$(compute_config_fingerprint "$project")"
-  [[ -z "$stored_hash" || "$stored_hash" == "$current_hash" ]] && return 0
+  [[ "$stored_hash" == "v${_CONFIG_FP_VERSION}:"* ]] || return 0
+  current_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project")"
+  [[ "$stored_hash" == "$current_hash" ]] && return 0
 
   if _is_tty; then
-    info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created: caps or env keys differ from the running setup"
+    info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created: its capabilities, environment, or resource limits differ from your current setup"
     local yn=""
     _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
     if [[ -z "$yn" || "$yn" == [yY]* ]]; then
@@ -2732,6 +2871,11 @@ PRESSURE_CHECK_INTERVAL=86400
 # session count (it would read as a limit that isn't real); it says "many".
 _PRESSURE_TARGET_VM_GB=16                     # comfortable default VM, not a session cap
 _PRESSURE_VM_ADVISORY_BYTES=8589934592        # 8 GiB fallback floor (host RAM unknown)
+# Minimum healthy Docker VM swap. Memory can be sized right while swap is left at
+# the Docker Desktop default (often 1 GB): too little overflow for a brief spike,
+# so a session can freeze instead of paging out. Matches the "Swap ≥ 2 GB" target
+# the fix steps already recommend. Keep this value and that copy in sync.
+_SWAP_ADVISORY_BYTES=2147483648               # 2 GiB
 
 # Set to 1 by an on-start notice (the Docker pressure block) once it has emitted
 # its own trailing blank line, so the release highlight below it knows the gap
@@ -2942,9 +3086,14 @@ _maybe_show_release_highlight() {
   printf '    %bChangelog:%b %b%b%s%b\n' \
     "$DIM" "$RESET" "$BLUE" "$UNDERLINE" \
     "$(_hyperlink "https://cleat.sh/changelog#v0.14.0" "cleat.sh/changelog#v0.14.0")" "$RESET"
-  # Trailing blank: the highlight owns its own separation from the bring-up
-  # block that follows, so the bring-up needs no leading blank of its own.
+  # Trailing blank: the highlight owns its own separation from whatever follows
+  # (the bring-up, or the "Docker tuned"/swap line that runs after it), so flag
+  # the gap open. Without this, a post-upgrade start with a well-sized VM (pressure
+  # check silent, so it never set the flag) doubled the blank: the highlight's
+  # trailing blank PLUS the confirmation's own leading blank. Same convention the
+  # pressure block follows.
   echo ""
+  _ONSTART_GAP_OPEN=1
 }
 
 # Fetch the newest released Claude Code version for a channel from the public
@@ -3029,6 +3178,13 @@ _maybe_prompt_claude_update() {
   if [[ -z "$yn" || "$yn" == [yY]* ]]; then
     _upgrade_claude_image "$channel" || warn "Update failed. Starting with the current version."
   fi
+  # Close the block with one blank line: this prompt opened with a leading blank
+  # (above), so the bring-up that follows (Container started → Auth shared → …)
+  # reads as its own contiguous group instead of sitting flush against the
+  # "Claude Code upgraded" confirmation. Only reached when the prompt fired (all
+  # the no-op early returns are above), so a start with no Claude update prints
+  # neither blank.
+  echo ""
 }
 
 # ── Commands ────────────────────────────────────────────────────────────────
@@ -3640,9 +3796,10 @@ cmd_run() {
   box_cpus="$(resolve_box_cpus "$project" "$box")"
   [[ -n "$box_cpus" ]] && cpu_args=(--cpus "$box_cpus")
 
-  # ── Compute config fingerprint and store as label
+  # ── Compute config fingerprint and store as label, prefixed with the storage
+  # format version so a later formula change is detectable (see _CONFIG_FP_VERSION).
   local config_hash
-  config_hash="$(compute_config_fingerprint "$project")"
+  config_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project")"
 
   local label_args=(
     --label "sh.cleat.config-hash=$config_hash"
@@ -4290,7 +4447,7 @@ cmd_status() {
     _limit_sum="$(_running_memory_limits_sum)"
     if [[ "$_limit_sum" =~ ^[0-9]+$ ]] && (( _limit_sum > _vm_bytes )); then
       echo ""
-      echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers are promised $(( _limit_sum / 1073741824 )) GB of a $(( _vm_bytes / 1073741824 )) GB VM${RESET}"
+      echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers are promised $(( _limit_sum / 1073741824 )) GB of a $(_vm_gb_rounded "$_vm_bytes") GB VM${RESET}"
     fi
   fi
   echo ""
@@ -4480,14 +4637,16 @@ _maybe_check_docker_pressure() {
   fi
   (( now - last < PRESSURE_CHECK_INTERVAL )) && bloat_due=false
 
-  # Tracks whether we emitted ANY notice. It gates both sides of the section's
-  # whitespace: a single LEADING blank before the first notice (so the advisory
-  # lands in its own block, not flush against the update/restart lines above it),
-  # and a single TRAILING blank after the last (so the release highlight / bring-up
-  # below is separated). Both are owned HERE, not inside the Docker-Desktop fix
-  # block, so the gap survives when that block is skipped (non-Docker-Desktop, or a
-  # host already at its safe max where growing the VM can't help). The trailing
-  # blank also flags _ONSTART_GAP_OPEN so the highlight doesn't add a second.
+  # Whitespace model: every notice owns ONE blank line ABOVE it. For the first
+  # notice that blank separates the section from the update/restart lines above;
+  # for a later notice it separates it from the previous one (the prune prompt and
+  # the VM advisory can both fire on the daily check, and ran flush together before
+  # v0.16.4). The prune notice prints its leading blank only when nothing came
+  # before it (`$printed || echo ""`); the VM advisories print theirs always (so
+  # the prune→advisory gap is never lost). `printed` also gates a single TRAILING
+  # blank after the last notice (owned HERE, not inside the Docker-Desktop fix
+  # block, so the gap survives when that block is skipped), which flags
+  # _ONSTART_GAP_OPEN so the highlight doesn't add a second.
   local printed=false
 
   # 1. Bloat → prune prompt (periodic; only on the daily check).
@@ -4515,7 +4674,7 @@ _maybe_check_docker_pressure() {
   local vm_bytes sum host_bytes vm_gb rec_gb is_dd=false host_note=""
   vm_bytes="$(_docker_vm_memory)"
   if [[ "$vm_bytes" =~ ^[0-9]+$ ]] && (( vm_bytes > 0 )); then
-    vm_gb=$(( vm_bytes / 1073741824 ))
+    vm_gb="$(_vm_gb_rounded "$vm_bytes")"   # round, not floor: a 16 GB slider reads ~15.6 GiB
     sum="$(_running_memory_limits_sum)"
     host_bytes="$(_host_total_memory)"
     rec_gb="$(_recommended_vm_gb "$host_bytes")"
@@ -4539,7 +4698,7 @@ _maybe_check_docker_pressure() {
     #     Never suggests a VM target below the current. Shown on the daily check
     #     only (it's transient, not a config error worth nagging every start).
     if $overloaded && $bloat_due; then
-      $printed || echo ""
+      echo ""
       warn "Running sessions are promised $(( sum / 1073741824 )) GB but the Docker VM has only ${vm_gb} GB${host_note}. Under load everything swaps and sessions freeze."
       if $is_dd && (( rec_gb > vm_gb )); then
         echo -e "    ${DIM}Stop a session, or give Docker more memory (Docker Desktop only):${RESET}"
@@ -4559,13 +4718,18 @@ _maybe_check_docker_pressure() {
     #     Host RAM unknown → conservative 8 GiB floor so we never over-recommend.
     elif $is_dd; then
       local bad=false
+      # Compare in WHOLE rounded GB (vm_gb), never raw bytes: the kernel's
+      # MemTotal undershoots the slider, so a byte compare against an exact GiB
+      # target false-positives a correctly-sized VM (a 16 GB slider reads ~15.6
+      # GiB < 16 GiB). vm_gb already rounds that back to 16. The announce-ready
+      # all-clear mirrors this test exactly; keep the two in lockstep.
       if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
-        (( vm_bytes < rec_gb * 1073741824 )) && bad=true
+        (( vm_gb < rec_gb )) && bad=true
       else
-        (( vm_bytes < _PRESSURE_VM_ADVISORY_BYTES )) && bad=true
+        (( vm_gb < _PRESSURE_VM_ADVISORY_BYTES / 1073741824 )) && bad=true
       fi
       if $bad; then
-        $printed || echo ""
+        echo ""
         warn "Docker VM memory is ${BOLD}${vm_gb} GB${RESET}${host_note}. Tight for parallel sessions."
         echo -e "    ${DIM}Each box/worktree gets a ~4 GB ceiling. Give Docker more memory (Docker Desktop only):${RESET}"
         _print_docker_vm_fix "$host_bytes" "$rec_gb"
@@ -4592,11 +4756,16 @@ _maybe_check_docker_pressure() {
 # contradictory: a correctly sized VM shows this, an undersized one shows the
 # warning. Costs a single `docker info` (MemTotal); the host read is local.
 #
+# One twist on top of the inverse: even with memory sized right, swap may be left
+# at the Docker Desktop default. So when memory passes but swap reads below the
+# target, this prints a focused swap advisory in place of the all-clear (memory is
+# good, swap needs a nudge). Swap that can't be read falls through to the all-clear.
+#
 # Whitespace: one blank ABOVE unless an earlier notice already opened the gap, and
 # NEVER a trailing blank, so "Image ready" flows straight on from this line and
-# the two read as one contiguous green block (the placement the maintainer asked
-# for). Silent off a TTY, when the VM size can't be read, or when the VM is
-# undersized (don't claim "tuned" when it isn't, and don't fight the warning).
+# the two read as one contiguous block (the placement the maintainer asked for).
+# Silent off a TTY, when the VM size can't be read, or when the VM is undersized
+# (don't claim "tuned" when it isn't, and don't fight the warning).
 _maybe_announce_docker_ready() {
   _is_tty || return 0
   # Defer to the warning: if the pressure check already flagged the VM (overload or
@@ -4606,17 +4775,55 @@ _maybe_announce_docker_ready() {
   local vm_bytes vm_gb host_bytes rec_gb
   vm_bytes="$(_docker_vm_memory)"
   [[ "$vm_bytes" =~ ^[0-9]+$ ]] && (( vm_bytes > 0 )) || return 0
-  vm_gb=$(( vm_bytes / 1073741824 ))
+  vm_gb="$(_vm_gb_rounded "$vm_bytes")"   # round, not floor (see _vm_gb_rounded)
   host_bytes="$(_host_total_memory)"
   rec_gb="$(_recommended_vm_gb "$host_bytes")"
-  # Adequately sized? Mirror the 2b "bad" test EXACTLY (host-aware target when host
-  # RAM is known, else the conservative 8 GiB floor) so this and the warning are
-  # perfect complements. Anything below it is "undersized" and stays silent here.
+  # Adequately sized? Mirror the 2b "bad" test EXACTLY: compare WHOLE rounded GB
+  # (host-aware target when host RAM is known, else the conservative 8 GiB floor)
+  # so this and the warning are perfect complements. A byte compare here would
+  # disagree with the rounded vm_gb the warning shows (a 16 GB slider reading
+  # ~15.6 GiB would stay silent here AND trip the warning there). Anything below
+  # the target is "undersized" and stays silent.
   if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
-    (( vm_bytes < rec_gb * 1073741824 )) && return 0
+    (( vm_gb < rec_gb )) && return 0
   else
-    (( vm_bytes < _PRESSURE_VM_ADVISORY_BYTES )) && return 0
+    (( vm_gb < _PRESSURE_VM_ADVISORY_BYTES / 1073741824 )) && return 0
   fi
+
+  # Memory is sized right. One more check before the all-clear: swap. The memory
+  # slider and the swap slider are separate, so a user who bumps memory (often on
+  # our own advice) can leave swap at the Docker Desktop default, too little
+  # overflow for a brief spike, so a session freezes instead of paging out. When
+  # swap reads below the target, say what's right (memory) AND what still needs a
+  # nudge (swap) rather than a blanket "tuned". `docker info` can't report swap,
+  # so this reads Docker Desktop's settings file; a value we can't trust returns
+  # empty and falls through to the all-clear (never warn on a guess). Same
+  # whitespace as the tuned line: one blank above unless a gap is open, none below.
+  local swap_bytes
+  swap_bytes="$(_docker_vm_swap_bytes)"
+  if [[ "$swap_bytes" =~ ^[0-9]+$ ]] && (( swap_bytes < _SWAP_ADVISORY_BYTES )); then
+    [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
+    # Describe the shortfall honestly. NOT _human_bytes here: it rounds (%.0f), so
+    # 1.5 GB would read "2 GB" and contradict the "set Swap ≥ 2 GB" step below, and
+    # 0 would render "?". Floored GB never rounds a sub-2 GB value up; sub-GB shows
+    # MB; 0 reads as "disabled".
+    if (( swap_bytes == 0 )); then
+      warn "Docker memory is sized right, but swap is ${BOLD}disabled${RESET}. A memory spike can freeze a session instead of paging out."
+    else
+      local swap_human
+      if (( swap_bytes < 1073741824 )); then
+        swap_human="$(( swap_bytes / 1048576 )) MB"
+      else
+        swap_human="$(( swap_bytes / 1073741824 )) GB"
+      fi
+      warn "Docker memory is sized right, but its swap is only ${BOLD}${swap_human}${RESET}. A memory spike can freeze a session instead of paging out."
+    fi
+    echo -e "    ${DIM}Add overflow headroom (Docker Desktop only):${RESET}"
+    echo -e "    ${DIM}•${RESET} ${BOLD}Settings → Resources → Advanced${RESET}${DIM}: set ${RESET}${BOLD}Swap ≥ 2 GB${RESET}${DIM}, then Apply & restart${RESET}"
+    _VM_ADVISORY_SHOWN=1   # defensive symmetry with the pressure check; no on-start step reads it after this today
+    return 0
+  fi
+
   [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
   # No session count: "many" is honest (light sessions run dozens), a number reads
   # as a hard cap and isn't true. A box can OOM only if it does genuinely heavy

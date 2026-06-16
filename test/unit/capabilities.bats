@@ -759,7 +759,9 @@ EOF
 
   run cmd_run "$TEST_TEMP/project"
   assert_success
-  run assert_docker_run_has "$cname" "sh.cleat.config-hash="
+  # Stored with the storage-format prefix (v2:) so a later formula change is
+  # detectable instead of mistaken for real drift. See _CONFIG_FP_VERSION.
+  run assert_docker_run_has "$cname" "sh.cleat.config-hash=v2:"
   assert_success
 }
 
@@ -874,7 +876,7 @@ EOF
   run bash -c '
     source "'"$CLI"'"
     container_exists() { return 0; }
-    _container_config_hash() { echo "abc123"; }
+    _container_config_hash() { echo "v2:abc123"; }
     compute_config_fingerprint() { echo "abc123"; }
     _resolve_config_drift "cleat-foo" ""
   '
@@ -886,7 +888,7 @@ EOF
   run bash -c '
     source "'"$CLI"'"
     container_exists() { return 0; }
-    _container_config_hash() { echo "old"; }
+    _container_config_hash() { echo "v2:old"; }
     compute_config_fingerprint() { echo "new"; }
     _is_tty() { return 1; }
     _resolve_config_drift "cleat-foo" ""
@@ -898,11 +900,26 @@ EOF
   refute_output --partial "┌"
 }
 
+@test "_resolve_config_drift: message names caps/env/resources (not just caps or env)" {
+  # v0.16.4: explicitly-configured [resources] can drift too, so the message must
+  # not claim only "caps or env keys" changed (the old, misleading wording).
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "v2:old"; }
+    compute_config_fingerprint() { echo "new"; }
+    _is_tty() { return 0; }
+    echo "n" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_output --partial "resource limits"
+  refute_output --partial "caps or env keys"
+}
+
 @test "_resolve_config_drift: TTY + accept removes the container" {
   run bash -c '
     source "'"$CLI"'"
     container_exists() { return 0; }
-    _container_config_hash() { echo "old"; }
+    _container_config_hash() { echo "v2:old"; }
     compute_config_fingerprint() { echo "new"; }
     _is_tty() { return 0; }
     is_running() { return 1; }
@@ -919,7 +936,7 @@ EOF
   run bash -c '
     source "'"$CLI"'"
     container_exists() { return 0; }
-    _container_config_hash() { echo "old"; }
+    _container_config_hash() { echo "v2:old"; }
     compute_config_fingerprint() { echo "new"; }
     _is_tty() { return 0; }
     is_running() { return 1; }
@@ -930,6 +947,51 @@ EOF
   assert_output --partial "Skipped"
   run cat "$DOCKER_CALLS"
   refute_output --partial "rm -f cleat-foo"
+}
+
+@test "_resolve_config_drift: legacy hash (no version prefix) is never nagged" {
+  # A container created before the v0.16.4 fingerprint format carries a bare hash
+  # we can't reconstruct. Treating a mismatch against it as drift was the source
+  # of the false recreate on a CLI upgrade, so legacy hashes are left alone: the
+  # box keeps working and adopts the current format on its next real recreate.
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "deadbeef0badf00d"; }
+    compute_config_fingerprint() { echo "totally-different"; }
+    _is_tty() { return 0; }
+    echo "y" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  refute_output --partial "Config changed"
+}
+
+@test "_resolve_config_drift: a newer/unknown format prefix is also left alone" {
+  # Only the EXACT current format (v2:) is comparable; a v3:/v99: hash from a
+  # future CLI must not be mistaken for drift by an older binary.
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo "v99:whatever"; }
+    compute_config_fingerprint() { echo "abc123"; }
+    _is_tty() { return 0; }
+    echo "y" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  refute_output --partial "Config changed"
+}
+
+@test "_resolve_config_drift: absent config-hash label is a no-op" {
+  run bash -c '
+    source "'"$CLI"'"
+    container_exists() { return 0; }
+    _container_config_hash() { echo ""; }
+    compute_config_fingerprint() { echo "abc123"; }
+    _is_tty() { return 0; }
+    echo "y" | _resolve_config_drift "cleat-foo" ""
+  '
+  assert_success
+  refute_output --partial "Config changed"
 }
 
 # ── Caps categorization (mount / sandbox) ──────────────────────────────────

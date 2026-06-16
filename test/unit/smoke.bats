@@ -791,3 +791,42 @@ EOF
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
 }
+
+@test "smoke: VM swap detection + advisory survive strict mode" {
+  # The swap scrape is a grep pipeline + bash arithmetic, exactly the shape that
+  # trips set -e/pipefail (a no-match grep) and set -u (unbound _DD_* seams).
+  # Exercise both the empty (no-match) path and the live advisory under the
+  # binary's REAL strict mode, the condition macOS users run under.
+  cat > "$TEST_TEMP/swap_strict.sh" <<EOF
+set -euo pipefail
+source "$CLI"
+_is_tty() { return 0; }
+_docker_vm_memory() { echo 17179869184; }     # 16 GiB VM (memory is fine)
+_host_total_memory() { echo 34359738368; }    # 32 GiB host
+dd="\$(mktemp -d)"
+export _DD_SETTINGS_DIR="\$dd"
+# 1. SwapMiB absent → the no-match grep must NOT abort (the || true guard).
+printf '{ "MemoryMiB": 16384 }\n' > "\$dd/settings-store.json"
+empty="\$(_docker_vm_swap_bytes)"; echo "empty=[\$empty]"
+# 2. A leading-zero value must read base-10, never abort on invalid octal.
+printf '{ "SwapMiB": 08 }\n' > "\$dd/settings-store.json"
+octal="\$(_docker_vm_swap_bytes)"; echo "octal=[\$octal]"
+# 3. No settings file at all (the common non-Docker-Desktop case) must not abort.
+rm -f "\$dd/settings-store.json"
+nofile="\$(_docker_vm_swap_bytes)"; echo "nofile=[\$nofile]"
+# 4. Low SwapMiB → the advisory branch runs end to end.
+printf '{ "SwapMiB": 1024 }\n' > "\$dd/settings-store.json"
+_ONSTART_GAP_OPEN=0
+_maybe_announce_docker_ready
+rm -rf "\$dd"
+EOF
+  run bash "$TEST_TEMP/swap_strict.sh"
+  assert_success
+  assert_output --partial "empty=[]"
+  assert_output --partial "octal=[8388608]"              # "08" read as base-10 (8 MiB), no abort
+  assert_output --partial "nofile=[]"                    # no settings file, clean empty
+  assert_output --partial "Swap ≥ 2 GB"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+  refute_output --partial "value too great for base"     # the octal arithmetic error must not leak
+}

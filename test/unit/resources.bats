@@ -304,29 +304,132 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+# ── configured-resource resolvers (fingerprint-only) ─────────────────────────
+#
+# _configured_box_memory / _configured_box_cpus read DECLARED config only, never
+# the VM-derived default or the daemon clamp, so the fingerprint can't move when
+# the VM is resized or the CLI's default formula changes (the v0.16.4 false-recreate fix).
+
+@test "configured memory: empty when nothing is declared" {
+  run _configured_box_memory "$PROJECT" main
+  assert_success
+  assert_output ""
+}
+
+@test "configured memory: returns the project [resources] value" {
+  printf '[resources]\nmemory = 4g\n' > "$PROJECT/.cleat"
+  run _configured_box_memory "$PROJECT" main
+  assert_output "4g"
+}
+
+@test "configured memory: clamps a project value over 8g (matches resolve_box_memory)" {
+  printf '[resources]\nmemory = 32g\n' > "$PROJECT/.cleat"
+  run _configured_box_memory "$PROJECT" main
+  assert_output "8g"
+}
+
+@test "configured memory: ignores an invalid project value (no drift on a typo)" {
+  printf '[resources]\nmemory = lots\n' > "$PROJECT/.cleat"
+  run _configured_box_memory "$PROJECT" main
+  assert_success
+  assert_output ""
+}
+
+@test "configured cpus: empty when nothing is declared" {
+  run _configured_box_cpus "$PROJECT" main
+  assert_success
+  assert_output ""
+}
+
+@test "configured cpus: returns the configured value WITHOUT the daemon clamp" {
+  # resolve_box_cpus clamps to the core count; the fingerprint variant must NOT,
+  # so resizing the VM's cores can't drift the hash of a box that declared cpus.
+  printf '[resources]\ncpus = 64\n' > "$PROJECT/.cleat"
+  _daemon_ncpu() { echo "4"; }
+  run _configured_box_cpus "$PROJECT" main
+  assert_output "64"
+}
+
+@test "configured memory: falls back to the global config (uncapped, matching resolve_box_memory)" {
+  rm -f "$PROJECT/.cleat"                                  # nothing at project level
+  printf '[resources]\nmemory = 12g\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _configured_box_memory "$PROJECT" main
+  assert_output "12g"                                      # global is read AND not clamped to 8g
+}
+
+@test "configured cpus: falls back to the global config value" {
+  rm -f "$PROJECT/.cleat"
+  printf '[resources]\ncpus = 6\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _configured_box_cpus "$PROJECT" main
+  assert_output "6"
+}
+
 # ── drift fingerprint ────────────────────────────────────────────────────────
 
-@test "resources: changing the memory limit changes the config fingerprint" {
+@test "resources: changing configured [resources] memory changes the fingerprint" {
   ACTIVE_CAPS=()
   _RESOLVED_ENV_ARGS=()
-  resolve_box_memory() { echo "2g"; }
+  printf '[resources]\nmemory = 2g\n' > "$PROJECT/.cleat"
   local before after
   before="$(compute_config_fingerprint "$PROJECT")"
-  resolve_box_memory() { echo "4g"; }
+  printf '[resources]\nmemory = 4g\n' > "$PROJECT/.cleat"
   after="$(compute_config_fingerprint "$PROJECT")"
   [ "$before" != "$after" ]
 }
 
-@test "resources: changing the cpus limit changes the config fingerprint" {
+@test "resources: changing configured [resources] cpus changes the fingerprint" {
   ACTIVE_CAPS=()
   _RESOLVED_ENV_ARGS=()
-  resolve_box_memory() { echo "2g"; }
-  resolve_box_cpus() { echo "2"; }
+  printf '[resources]\ncpus = 2\n' > "$PROJECT/.cleat"
   local before after
   before="$(compute_config_fingerprint "$PROJECT")"
-  resolve_box_cpus() { echo "4"; }
+  printf '[resources]\ncpus = 4\n' > "$PROJECT/.cleat"
   after="$(compute_config_fingerprint "$PROJECT")"
   [ "$before" != "$after" ]
+}
+
+@test "resources: resizing the Docker VM does NOT change the fingerprint (unconfigured box)" {
+  # THE v0.16.4 FIX. With the old code (resolve_box_memory in the fingerprint) a
+  # 7 GiB VM hashed memory=4g and a 40 GiB VM hashed memory=8g, so a memory-slider
+  # change fired a false "config changed, recreate?" on an untouched box. The
+  # fingerprint now reads configured-only, so an unconfigured box is VM-invariant.
+  ACTIVE_CAPS=()
+  _RESOLVED_ENV_ARGS=()
+  rm -f "$PROJECT/.cleat"
+  local small large
+  _docker_vm_memory() { echo "$(( 7 * 1073741824 ))"; }
+  small="$(compute_config_fingerprint "$PROJECT")"
+  _docker_vm_memory() { echo "$(( 40 * 1073741824 ))"; }
+  large="$(compute_config_fingerprint "$PROJECT")"
+  [ "$small" == "$large" ]
+}
+
+@test "resources: the daemon core count does NOT change the fingerprint (unconfigured box)" {
+  ACTIVE_CAPS=()
+  _RESOLVED_ENV_ARGS=()
+  rm -f "$PROJECT/.cleat"
+  local few many
+  _daemon_ncpu() { echo "2"; }
+  few="$(compute_config_fingerprint "$PROJECT")"
+  _daemon_ncpu() { echo "32"; }
+  many="$(compute_config_fingerprint "$PROJECT")"
+  [ "$few" == "$many" ]
+}
+
+@test "resources: a configured cpus above the cores does NOT drift the fingerprint when cores change" {
+  # resolve_box_cpus clamps a configured value to the daemon's core count, so if
+  # the fingerprint used IT, a VM core-count change would drift a box that
+  # declared cpus. The configured-only variant keeps the declared value, so the
+  # hash stays put. This is the cpus half of the v0.16.4 decoupling.
+  ACTIVE_CAPS=()
+  _RESOLVED_ENV_ARGS=()
+  printf '[resources]\ncpus = 64\n' > "$PROJECT/.cleat"
+  local few many
+  _daemon_ncpu() { echo "4"; }
+  few="$(compute_config_fingerprint "$PROJECT")"
+  _daemon_ncpu() { echo "8"; }
+  many="$(compute_config_fingerprint "$PROJECT")"
+  [ "$few" == "$many" ]
 }
 
 # ── node heap pin ────────────────────────────────────────────────────────────

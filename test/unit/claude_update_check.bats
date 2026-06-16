@@ -153,6 +153,36 @@ teardown() { _common_teardown; }
   assert_output --partial "2.1.149"
 }
 
+# ── trailing blank: separate the upgrade from the bring-up ───────────────────
+# The prompt block opens with a blank line; it must also CLOSE with one so the
+# "Claude Code upgraded" confirmation doesn't sit flush against the bring-up
+# ("Container started" …) that follows. Only when the prompt actually fired.
+
+@test "startup check: a fired prompt closes with a trailing blank line" {
+  _is_tty() { return 0; }
+  CLEAT_FORCE_CLAUDE_CHECK=1
+  CLEAT_FAKE_REMOTE_CLAUDE="2.1.149"
+  _image_claude_version() { echo "2.1.40"; }
+  # SENTINEL stands in for the bring-up that follows in cmd_run. $(...) strips the
+  # FINAL newline only, so the function's own trailing blank survives just before it.
+  local out last
+  out="$( _maybe_prompt_claude_update <<< "y"; printf 'SENTINEL\n' )"
+  last="$(printf '%s\n' "$out" | tail -2 | head -1)"
+  run echo "last=[$last]"
+  assert_output "last=[]"
+}
+
+@test "startup check: no trailing blank when the prompt never fired (throttled)" {
+  _is_tty() { return 0; }
+  # A recent check → throttled early return, before any output. No stray blank.
+  echo "$(date +%s) 2.1.149" > "$CLAUDE_CHECK_FILE"
+  _image_claude_version() { echo "2.1.40"; }
+  local out
+  out="$( _maybe_prompt_claude_update; printf 'SENTINEL\n' )"
+  run echo "$out"
+  assert_output "SENTINEL"
+}
+
 @test "startup check: no prompt when the image already runs the remote version" {
   _is_tty() { return 0; }
   CLEAT_FORCE_CLAUDE_CHECK=1

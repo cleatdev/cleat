@@ -2190,3 +2190,43 @@ ${overlay_dir}/project-settings.local.json"
   assert_success
   assert_output --partial "SEPARATED_OK"
 }
+
+@test "regression v0.16.5: a 24 GB Docker Desktop slider displays as 24 GB, not 23" {
+  # img: "Docker tuned for Cleat (23 GB VM ...)" while the slider was set to 24. The
+  # guest kernel's MemTotal for a 24 GB VM lands ~23.4 GiB (the kernel reserve grows
+  # with VM size), and round-to-nearest reads that as 23, indistinguishable from a
+  # genuine 23 GB slider. The configured slider value (MemoryMiB) must drive the
+  # display. Revert _docker_vm_display_gb to _vm_gb_rounded and this reads 23.
+  run bash -c '
+    source "'"$CLI"'"
+    cfg="$(_DD_MEMORY_MIB=24576 _docker_vm_display_gb 25125558681)"   # ~23.4 GiB MemTotal
+    [[ "$cfg" == "24" ]] || { echo "24 GB slider displayed as [$cfg]" >&2; exit 1; }
+    # The disambiguation MemTotal alone cannot make: rounding ~23.4 GiB reads 23.
+    [[ "$(_vm_gb_rounded 25125558681)" == "23" ]] || { echo "expected the rounded MemTotal to read 23" >&2; exit 1; }
+    # No settings and no override falls back to rounding the MemTotal.
+    fb="$(_DD_SETTINGS_DIR="'"$TEST_TEMP"'/no-dd" _docker_vm_display_gb 17179869184)"
+    [[ "$fb" == "16" ]] || { echo "fallback misread 16 GiB as [$fb]" >&2; exit 1; }
+    echo "SLIDER_OK"
+  '
+  assert_success
+  assert_output --partial "SLIDER_OK"
+}
+
+@test "regression v0.16.5: the bridge does not re-open a plain link the terminal already opened" {
+  # The link double-open (a 2nd tab ~0.5s later): the host terminal opens a clicked
+  # URL itself AND the in-container open shim writes the bridge, so the watcher
+  # opened it a second time. On an interactive terminal the bridge must DEFER plain
+  # links. Drop the host_opens_clicks gate and this opens (the duplicate returns).
+  run bash -c '
+    source "'"$CLI"'"
+    # auto + interactive terminal + plain link -> defer (rc 1).
+    if _browser_should_open auto 1 0; then echo "PLAIN OPENED (duplicate)" >&2; exit 1; fi
+    # auto + interactive + auth URL -> still opens (the bridge owns login URLs).
+    _browser_should_open auto 1 1 || { echo "auth URL wrongly deferred" >&2; exit 1; }
+    # auto + no terminal + plain -> opens (nothing else will).
+    _browser_should_open auto 0 0 || { echo "plain link wrongly deferred off a TTY" >&2; exit 1; }
+    echo "NO_DUP_OK"
+  '
+  assert_success
+  assert_output --partial "NO_DUP_OK"
+}

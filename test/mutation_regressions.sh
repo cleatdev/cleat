@@ -1157,7 +1157,7 @@ try "vnext_pressure_bloat_threshold" "offers prune when bloat passes" "$CLI" "$P
 # vnext: the overload notice must compare promised limits to the VM size.
 # Invert the comparison out of existence: the overcommit warning test fails.
 cat > "$SED_TMP" << 'SED'
-s|(( sum > vm_bytes ))|(( sum > vm_bytes * 1000 ))|
+s|(( sum_gb > vm_gb ))|(( sum_gb > vm_gb * 1000 ))|
 SED
 try "vnext_pressure_overcommit" "warns when running limits overcommit" "$CLI" "$PRUNE_BATS"
 
@@ -1241,7 +1241,7 @@ try "vnext_status_overcommit_line" "flags an overcommitted VM" "$CLI" "$PRUNE_BA
 # ~15.6 GiB), never floor to a misleading 15. Revert the rounded display to a floor:
 # the "rounded to the slider, not floored" status test sees "15 GB VM".
 cat > "$SED_TMP" << 'SED'
-s@$(_vm_gb_rounded "$_vm_bytes") GB VM@$(( _vm_bytes / 1073741824 )) GB VM@
+s@$(_docker_vm_display_gb "$_vm_bytes") GB VM@$(( _vm_bytes / 1073741824 )) GB VM@
 SED
 try "vnext_status_vm_size_rounds" "rounded to the slider, not floored" "$CLI" "$PRUNE_BATS"
 
@@ -1852,6 +1852,100 @@ s@echo ""@$printed || echo ""@
 }
 SED
 try "vnext_prune_advisory_blank" "separated by a blank line" "$CLI" "$REGRESSIONS"
+
+# v0.16.5: the displayed VM size must PREFER the configured Docker Desktop slider
+# (MemoryMiB) over the kernel's MemTotal, which a 24 GB slider under-reports to
+# ~23.4 GiB and rounds to 23. Disable the prefer-configured branch (never taken)
+# so it always falls back to rounding MemTotal: the 24 GB slider reads 23 and the
+# "displays as 24 GB, not 23" regression fails.
+cat > "$SED_TMP" << 'SED'
+s|cfg > 0|cfg > 999999|
+SED
+try "vnext_vm_display_prefers_slider" "24 GB Docker Desktop slider" "$CLI" "$REGRESSIONS"
+
+# v0.16.5: _docker_vm_configured_gb must read the MEMORY slider (memoryMiB), not
+# some other key. Point the grep anchor at swapmib instead: the settings-store
+# read returns the swap value, so "reads MemoryMiB from settings-store" reads 2
+# (the 2048 MiB swap) instead of 24 and fails.
+cat > "$SED_TMP" << 'SED'
+s|"memorymib"|"swapmib"|
+SED
+try "vnext_vm_configured_reads_memorymib" "reads MemoryMiB from settings-store" "$CLI" "$PRUNE_BATS"
+
+# v0.16.5: the link double-open fix. On an interactive terminal the bridge must
+# DEFER a plain link (the terminal opens the click itself). Flip the defer to an
+# open: the plain link opens a second tab and the "does not re-open a plain link"
+# regression fails.
+cat > "$SED_TMP" << 'SED'
+s|return 1  # plain link, terminal owns it|return 0  # plain link, terminal owns it|
+SED
+try "vnext_bridge_defers_plain_link" "does not re-open a plain link" "$CLI" "$REGRESSIONS"
+
+# v0.16.5: CLEAT_BROWSER_BRIDGE must default to the safe "auto" policy. Change the
+# fallback to "always": an unset var no longer reads "auto" and the "defaults to
+# auto when unset" test fails.
+cat > "$SED_TMP" << 'SED'
+s|printf 'auto' ;;|printf 'always' ;;|
+SED
+try "vnext_bridge_mode_default_auto" "defaults to auto when unset" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# v0.16.5: the configured slider must ROUND MiB->GB (via _vm_gb_rounded), not
+# truncate, so a non-1024-aligned MemoryMiB reports the slider the user set
+# (7936 -> 8) instead of under-reporting (7) and re-tripping the undersized nag.
+# Revert the settings path to the old truncating arithmetic: the 7936->8 test reads 7.
+cat > "$SED_TMP" << 'SED'
+s@_vm_gb_rounded "$(( 10#$mib \* 1048576 ))"@printf '%s' "$(( 10#$mib \* 1048576 / 1073741824 ))"@
+SED
+try "vnext_vm_configured_rounds" "non-1024-aligned MemoryMiB rounds to nearest" "$CLI" "$PRUNE_BATS"
+
+# v0.16.5: the configured slider must scale MiB->bytes (* 1048576) before rounding.
+# Drop the multiplier: _vm_gb_rounded sees raw MiB and a 24576 slider reads ~0, so
+# "reads MemoryMiB from settings-store" no longer reads 24.
+cat > "$SED_TMP" << 'SED'
+s@10#$mib \* 1048576@10#$mib@
+SED
+try "vnext_vm_configured_mib_scale" "reads MemoryMiB from settings-store" "$CLI" "$PRUNE_BATS"
+
+# v0.16.5: the overload trigger must compare in the SAME whole-GB unit it prints
+# (sum_gb > vm_gb), never raw bytes, or a slider that rounds above MemTotal makes
+# the warning fire while reading "promised 24 of 24". Revert to the byte compare:
+# the "never contradicts itself" test sees the self-contradicting line and fails.
+cat > "$SED_TMP" << 'SED'
+s|sum_gb > vm_gb|sum > vm_bytes|
+SED
+try "vnext_overload_compares_gb" "never contradicts itself" "$CLI" "$PRUNE_BATS"
+
+# v0.16.5: cmd_login must pass host_opens_clicks=0 (the login watcher only ever
+# sees a programmatically launched auth URL, never a clicked link). Flip it to 1:
+# a non-loopback console auth URL would be deferred to a terminal that never opens
+# it, so the "passes host_opens_clicks=0" test sees 1 and fails.
+cat > "$SED_TMP" << 'SED'
+s|"$_login_bridge_mode" "0" &|"$_login_bridge_mode" "1" &|
+SED
+try "vnext_login_opens_auth" "passes host_opens_clicks=0" "$CLI" "$HOOKS_BATS"
+
+# v0.16.5: CLEAT_BROWSER_BRIDGE=off must suppress every browser open. Flip the off
+# branch to open: the "off mode opens nothing" test sees a tab open and fails.
+cat > "$SED_TMP" << 'SED'
+s|off)    return 1 ;;|off)    return 0 ;;|
+SED
+try "vnext_bridge_off_suppresses" "off mode opens nothing" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# v0.16.5: cmd_login's off-mode message must differ from the auto-open promise.
+# Invert the mode test so off prints "open automatically": the off-message test,
+# which asserts the CLEAT_BROWSER_BRIDGE=off manual-open line, fails.
+cat > "$SED_TMP" << 'SED'
+s|"$_login_bridge_mode" = off|"$_login_bridge_mode" != off|
+SED
+try "vnext_login_off_message" "off mode prints the manual-open message" "$CLI" "$HOOKS_BATS"
+
+# v0.16.5: an auth URL (localhost OAuth callback) must ALWAYS open via the bridge,
+# even on an interactive terminal, so cleat login works. Flip the is_auth gate to
+# defer: the "auto OPENS an auth URL even on an interactive" test fails.
+cat > "$SED_TMP" << 'SED'
+s|return 0            # auth URL: the bridge owns it|return 1            # auth URL: the bridge owns it|
+SED
+try "vnext_bridge_auth_always_opens" "OPENS an auth URL even on an interactive" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

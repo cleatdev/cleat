@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="0.16.4"
+VERSION="0.16.5"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="0.16.4"
+RELEASE_HIGHLIGHT_VERSION="0.16.5"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -744,6 +744,55 @@ _docker_vm_swap_bytes() {
   # leaks an error to the user; "0001024" would silently misread as octal. Same
   # guard _mem_to_bytes uses. Fail-soft stays intact.
   printf '%s' "$(( 10#$mib * 1048576 ))"
+}
+
+# The Docker Desktop VM's CONFIGURED memory slider in whole GB, empty when it
+# can't be read. `docker info` reports the guest kernel's MemTotal, which sits a
+# few hundred MB to over a GiB UNDER the slider (the kernel reserves memory at
+# boot and the reserve GROWS with VM size), so on a large VM round-to-nearest
+# can't recover the slider: a 24 GB slider reads ~23.4 GiB and rounds to 23, and
+# MemTotal alone can't even tell a 23 GB slider from a 24 GB one once the reserve
+# is ~0.6 GiB. The true value lives only in Docker Desktop's settings: MemoryMiB
+# (newer, PascalCase) or memoryMiB (older, camelCase). Docker Desktop labels
+# these GiB as "GB", which is exactly what we print. Fail-soft: a parse miss
+# returns empty so the caller falls back to MemTotal rounding (Linux, no Docker
+# Desktop, a moved path). Rounds MiB -> GB through `_vm_gb_rounded` (the same
+# round-to-nearest the fallback uses), so a non-1024-aligned MemoryMiB (a
+# hand-edited or non-standard-default value) reports the slider the user set
+# (7936 -> 8) instead of truncating it (7) and re-tripping the undersized nag.
+# Whole-GB sliders stay exact (24576 -> 24). Overridable for tests via _DD_MEMORY_MIB.
+_docker_vm_configured_gb() {
+  if [[ -n "${_DD_MEMORY_MIB:-}" ]]; then
+    # 10# forces base-10 (a hand-edited leading-zero value is invalid octal and
+    # would abort the arithmetic under set -e), same guard the swap reader uses.
+    [[ "${_DD_MEMORY_MIB}" =~ ^[0-9]+$ ]] && _vm_gb_rounded "$(( 10#${_DD_MEMORY_MIB} * 1048576 ))"
+    return 0
+  fi
+  local f mib
+  f="$(_docker_desktop_settings_file)"
+  [[ -n "$f" ]] || return 0
+  # `|| true` keeps a no-match (grep exits 1) from tripping `set -e` under
+  # pipefail; the regex guard below handles the empty result. The leading-quote
+  # anchor ("memorymib") never matches SwapMiB / DiskSizeMiB / *ReservationMiB.
+  mib="$(grep -iEo '"memorymib"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null \
+           | grep -Eo '[0-9]+' | tail -1 || true)"
+  [[ "$mib" =~ ^[0-9]+$ ]] || return 0
+  _vm_gb_rounded "$(( 10#$mib * 1048576 ))"
+}
+
+# The VM size to DISPLAY and to THRESHOLD against, in whole GB. Prefer the
+# configured Docker Desktop slider (exact); fall back to rounding the kernel's
+# MemTotal when the settings can't be read. Display AND every threshold must
+# call THIS one helper so a "shows 24 GB but warns it's too small" contradiction
+# is impossible by construction. Arg: $1 = MemTotal bytes (for the fallback).
+_docker_vm_display_gb() {
+  local cfg
+  cfg="$(_docker_vm_configured_gb)"
+  if [[ "$cfg" =~ ^[0-9]+$ ]] && (( cfg > 0 )); then
+    printf '%s' "$cfg"
+    return 0
+  fi
+  _vm_gb_rounded "${1:-0}"
 }
 
 # Total physical RAM of the HOST machine in BYTES, empty when unknown. Used to
@@ -2380,10 +2429,48 @@ _browser_recently_opened() {
   return 0     # a fresh marker exists → another watcher already opened this URL
 }
 
+# Resolve the bridge open policy from CLEAT_BROWSER_BRIDGE. An unknown value
+# falls back to the safe default rather than erroring, so a typo never wedges a
+# session. Echoes one of: auto | always | off.
+#   auto   (default): open auth/callback URLs always; defer PLAIN links to the
+#                     host terminal when one is attached (it opens a clicked or
+#                     autodetected URL itself), so the bridge never makes a
+#                     duplicate tab. Off a terminal (piped) the bridge opens
+#                     plain links too, since nothing else will.
+#   always:           open every claimed http(s) URL (the pre-toggle behavior).
+#   off:              never open a browser; the auth callback proxy still runs
+#                     so `cleat login` works when the URL is opened by hand.
+_browser_bridge_mode() {
+  case "${CLEAT_BROWSER_BRIDGE:-auto}" in
+    always) printf 'always' ;;
+    off)    printf 'off' ;;
+    *)      printf 'auto' ;;
+  esac
+}
+
+# Decide whether the bridge should open a claimed URL on the host. Pure (no I/O)
+# so it is exhaustively unit-tested. Returns 0 to OPEN, 1 to DEFER.
+# Args: $1 mode (auto|always|off), $2 host_opens_clicks (1 when an interactive
+# host terminal is attached and will open the link itself), $3 is_auth (1 when
+# the URL carries a localhost OAuth callback the user does not click).
+_browser_should_open() {
+  local mode="$1" host_opens_clicks="${2:-0}" is_auth="${3:-0}"
+  case "$mode" in
+    always) return 0 ;;
+    off)    return 1 ;;
+    *)  # auto
+        [ "$is_auth" = 1 ] && return 0            # auth URL: the bridge owns it
+        [ "$host_opens_clicks" = 1 ] && return 1  # plain link, terminal owns it
+        return 0 ;;                               # plain link, no terminal: open
+  esac
+}
+
 _browser_watcher() {
   local clip_dir="$1"
   local open_cmd="$2"
   local cname="${3:-}"
+  local bridge_mode="${4:-auto}"
+  local host_opens_clicks="${5:-0}"   # 1 when an interactive host terminal is attached
   local bridge_file="$clip_dir/.browser-open"
   local _proxy_pid=""
   # $$ is the spawning cleat process even inside this backgrounded function,
@@ -2416,10 +2503,15 @@ _browser_watcher() {
         url=""   # duplicate of a just-opened URL; drop it
       fi
       if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
-        # Start auth callback proxy if URL has a localhost redirect_uri
+        local _is_auth=0 cb_port
+        # Start auth callback proxy if URL has a localhost redirect_uri. This
+        # runs in every mode (off included): the proxy forwards the OAuth
+        # callback into the box, so `cleat login` completes even when the user
+        # opens the URL by hand.
         if [ -n "$cname" ]; then
-          local cb_port proxy_log="$clip_dir/.proxy-log"
+          local proxy_log="$clip_dir/.proxy-log"
           cb_port=$(_extract_callback_port "$url" 2>/dev/null) && {
+            _is_auth=1
             _bw_cleanup  # kill any previous proxy
             echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
             _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" &
@@ -2429,7 +2521,13 @@ _browser_watcher() {
             echo "[browser-watcher $(date +%H:%M:%S)] no redirect_uri port found in URL" >> "$clip_dir/.proxy-log"
           }
         fi
-        $open_cmd "$url" >/dev/null 2>&1 || true
+        # Open on the host unless the policy defers to the terminal. A plain link
+        # the user clicked is already opened by the host terminal itself; opening
+        # it again here is the duplicate tab the maintainer reported. Auth URLs
+        # and non-interactive sessions always open here (nothing else does).
+        if _browser_should_open "$bridge_mode" "$host_opens_clicks" "$_is_auth"; then
+          $open_cmd "$url" >/dev/null 2>&1 || true
+        fi
       fi
     fi
     sleep 0.5
@@ -2722,11 +2820,15 @@ exec_claude() {
     disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
   fi
 
-  # Start browser watcher (always-on, like host connectivity)
+  # Start browser watcher (always-on, like host connectivity). Pass whether an
+  # interactive host terminal is attached: if so, it opens clicked links itself,
+  # so the bridge defers plain links (no duplicate tab). See _browser_should_open.
   local open_cmd
   open_cmd="$(_host_open_cmd)"
   if [ -n "$open_cmd" ]; then
-    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" &
+    local _bw_interactive=0
+    _is_tty && _bw_interactive=1
+    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" "$(_browser_bridge_mode)" "$_bw_interactive" &
     _BROWSER_WATCHER_PID=$!
     disown "$_BROWSER_WATCHER_PID" 2>/dev/null || true
   fi
@@ -4140,10 +4242,22 @@ cmd_login() {
 
   if [ -n "$_login_open_cmd" ]; then
     mkdir -p "$_login_clip_dir"
-    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" &
+    local _login_bridge_mode
+    _login_bridge_mode="$(_browser_bridge_mode)"
+    # host_opens_clicks=0: this watcher only ever sees the auth URL `claude login`
+    # launches programmatically through the open shim, never a link the user
+    # clicked, so the terminal will NOT open it and deferral is never correct here.
+    # The bridge must open it in auto/always (the console code-paste flow uses a
+    # non-loopback redirect_uri, so it isn't even detected as an auth URL); only
+    # CLEAT_BROWSER_BRIDGE=off withholds the auto-open (the callback proxy still runs).
+    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" &
     _login_browser_pid=$!
     disown "$_login_browser_pid" 2>/dev/null || true
-    echo -e "  ${DIM}Your browser will open automatically for sign-in.${RESET}"
+    if [ "$_login_bridge_mode" = off ]; then
+      echo -e "  ${DIM}A URL will appear. Open it in your browser to sign in ${RESET}${DIM}(CLEAT_BROWSER_BRIDGE=off).${RESET}"
+    else
+      echo -e "  ${DIM}Your browser will open automatically for sign-in.${RESET}"
+    fi
   else
     echo -e "  ${DIM}A URL will appear. Open it in your browser to sign in.${RESET}"
   fi
@@ -4447,7 +4561,7 @@ cmd_status() {
     _limit_sum="$(_running_memory_limits_sum)"
     if [[ "$_limit_sum" =~ ^[0-9]+$ ]] && (( _limit_sum > _vm_bytes )); then
       echo ""
-      echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers are promised $(( _limit_sum / 1073741824 )) GB of a $(_vm_gb_rounded "$_vm_bytes") GB VM${RESET}"
+      echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers are promised $(( _limit_sum / 1073741824 )) GB of a $(_docker_vm_display_gb "$_vm_bytes") GB VM${RESET}"
     fi
   fi
   echo ""
@@ -4674,7 +4788,7 @@ _maybe_check_docker_pressure() {
   local vm_bytes sum host_bytes vm_gb rec_gb is_dd=false host_note=""
   vm_bytes="$(_docker_vm_memory)"
   if [[ "$vm_bytes" =~ ^[0-9]+$ ]] && (( vm_bytes > 0 )); then
-    vm_gb="$(_vm_gb_rounded "$vm_bytes")"   # round, not floor: a 16 GB slider reads ~15.6 GiB
+    vm_gb="$(_docker_vm_display_gb "$vm_bytes")"   # prefer the configured slider; fall back to rounding MemTotal
     sum="$(_running_memory_limits_sum)"
     host_bytes="$(_host_total_memory)"
     rec_gb="$(_recommended_vm_gb "$host_bytes")"
@@ -4685,8 +4799,14 @@ _maybe_check_docker_pressure() {
     [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )) \
       && host_note=" of your ${BOLD}$(( host_bytes / 1073741824 )) GB${RESET}"
 
-    local overloaded=false
-    [[ "$sum" =~ ^[0-9]+$ ]] && (( sum > vm_bytes )) && overloaded=true
+    # Compare in the SAME whole-GB unit the message prints (vm_gb, the configured
+    # slider via _docker_vm_display_gb), not raw MemTotal bytes: a slider that
+    # rounds UP relative to MemTotal would otherwise let the trigger fire while the
+    # printed "promised X of Y" reads as parity (X == Y) or even inverted, the
+    # "shows X but warns it's too small" contradiction _vm_gb_rounded forbids.
+    local overloaded=false sum_gb=0
+    [[ "$sum" =~ ^[0-9]+$ ]] && sum_gb=$(( sum / 1073741824 ))
+    [[ "$sum" =~ ^[0-9]+$ ]] && (( sum_gb > vm_gb )) && overloaded=true
 
     # 2a. OVERLOAD (periodic): the sessions running RIGHT NOW are promised more
     #     memory than the VM has. Real on any engine, so the warn always fires and
@@ -4699,7 +4819,7 @@ _maybe_check_docker_pressure() {
     #     only (it's transient, not a config error worth nagging every start).
     if $overloaded && $bloat_due; then
       echo ""
-      warn "Running sessions are promised $(( sum / 1073741824 )) GB but the Docker VM has only ${vm_gb} GB${host_note}. Under load everything swaps and sessions freeze."
+      warn "Running sessions are promised ${sum_gb} GB but the Docker VM has only ${vm_gb} GB${host_note}. Under load everything swaps and sessions freeze."
       if $is_dd && (( rec_gb > vm_gb )); then
         echo -e "    ${DIM}Stop a session, or give Docker more memory (Docker Desktop only):${RESET}"
         _print_docker_vm_fix "$host_bytes" "$rec_gb"
@@ -4775,7 +4895,7 @@ _maybe_announce_docker_ready() {
   local vm_bytes vm_gb host_bytes rec_gb
   vm_bytes="$(_docker_vm_memory)"
   [[ "$vm_bytes" =~ ^[0-9]+$ ]] && (( vm_bytes > 0 )) || return 0
-  vm_gb="$(_vm_gb_rounded "$vm_bytes")"   # round, not floor (see _vm_gb_rounded)
+  vm_gb="$(_docker_vm_display_gb "$vm_bytes")"   # prefer the configured slider (see _docker_vm_display_gb)
   host_bytes="$(_host_total_memory)"
   rec_gb="$(_recommended_vm_gb "$host_bytes")"
   # Adequately sized? Mirror the 2b "bad" test EXACTLY: compare WHOLE rounded GB

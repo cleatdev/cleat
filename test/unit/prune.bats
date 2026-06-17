@@ -510,6 +510,26 @@ teardown() { _common_teardown; }
   refute_output --partial "Apply & restart"
 }
 
+@test "pressure: the overload line never contradicts itself when the slider rounds above MemTotal" {
+  # Regression (v0.16.5): the overload trigger compared raw bytes (sum > MemTotal)
+  # but the message printed the slider-rounded VM size. On a 24 GB slider whose
+  # MemTotal reads ~23.4 GiB, six 4g boxes promise exactly 24 GiB: the byte trigger
+  # fired while the line read "promised 24 GB but only 24 GB" (or inverted). The
+  # trigger must compare in the same whole-GB unit it prints, so it can never
+  # contradict the displayed numbers.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "25125558681"; }            # ~23.4 GiB MemTotal
+  _DD_MEMORY_MIB="24576"                                  # 24 GB slider
+  _host_total_memory() { echo "68719476736"; }           # 64 GiB host (rec met → no undersized either)
+  _running_memory_limits_sum() { echo "25769803776"; }   # exactly 24 GiB promised (6 × 4g)
+  _is_docker_desktop() { return 0; }
+  run _maybe_check_docker_pressure
+  assert_success
+  refute_output --partial "promised 24 GB but the Docker VM has only 24 GB"   # no self-contradiction
+  refute_output --partial "everything swaps"                                   # 24 !> 24 → no false overload
+}
+
 @test "pressure: a non-numeric running-limits sum does not abort the VM advisory" {
   # v0.16.1 folded v0.16.0's standalone `[[ $sum =~ ^[0-9]+$ ]] || return 0` into
   # the overload `if`. A non-numeric/empty sum must therefore NOT overload AND
@@ -875,6 +895,106 @@ teardown() { _common_teardown; }
   last="$(printf '%s\n' "$out" | tail -2 | head -1)"     # line just before SENTINEL
   run echo "$last"
   refute_output ""                                       # the fix step, not a trailing blank
+}
+
+# ── VM size display (configured slider, not the kernel's MemTotal) ────────────
+# `docker info` reports the guest kernel's MemTotal, which sits UNDER the Docker
+# Desktop slider by a reserve that grows with VM size, so round-to-nearest reads
+# a 24 GB slider as 23 (and can't tell a 23 GB slider from a 24 GB one). The
+# configured slider lives only in Docker Desktop's settings, read exactly like
+# swap. Display AND thresholds share _docker_vm_display_gb so they never contradict.
+
+@test "vm display: reads MemoryMiB from settings-store.json (24576 -> 24)" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "Cpus": 8, "MemoryMiB": 24576, "SwapMiB": 2048 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
+  assert_output "24"
+}
+
+@test "vm display: reads lowercase memoryMiB from settings.json (16384 -> 16)" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "cpus": 4, "memoryMiB": 16384, "swapMiB": 1024 }\n' > "$dir/settings.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
+  assert_output "16"
+}
+
+@test "vm display: empty when no MemoryMiB key (fail soft, never a false read)" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "SwapMiB": 2048, "DiskSizeMiB": 65536 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
+  assert_success
+  assert_output ""                                       # SwapMiB/DiskSizeMiB never match the memorymib anchor
+}
+
+@test "vm display: empty when no settings file exists (fail soft)" {
+  local dir="$TEST_TEMP/dd-empty"; mkdir -p "$dir"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
+  assert_success
+  assert_output ""
+}
+
+@test "vm display: a leading-zero MemoryMiB is read base-10, not octal" {
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "MemoryMiB": 024576 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
+  assert_output "24"                                     # 10# guard: not aborted as invalid octal
+}
+
+@test "vm display: a non-1024-aligned MemoryMiB rounds to nearest (7936 -> 8), not truncates" {
+  # The slider normally steps in whole GB (MiB a multiple of 1024), but a hand-edited
+  # or non-standard value must round like the MemTotal fallback, not truncate. 7936
+  # MiB = 7.75 GiB: truncation reads 7 (which would false-trip the 8 GB advisory
+  # floor); round-to-nearest reads 8, the value the user actually set.
+  local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
+  printf '{ "MemoryMiB": 7936 }\n' > "$dir/settings-store.json"
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
+  assert_output "8"
+}
+
+@test "vm display: _DD_MEMORY_MIB override is the test seam" {
+  _DD_MEMORY_MIB="24576" run _docker_vm_configured_gb
+  assert_output "24"
+}
+
+@test "vm display: resolver PREFERS the configured slider over MemTotal rounding" {
+  # The core bug: MemTotal of a 24 GB slider rounds to 23. The configured slider
+  # (24576 MiB) must win, so the displayed size reads 24.
+  _DD_MEMORY_MIB="24576" run _docker_vm_display_gb 25125558681   # ~23.4 GiB MemTotal
+  assert_output "24"
+}
+
+@test "vm display: resolver falls back to MemTotal rounding when settings unreadable" {
+  local dir="$TEST_TEMP/dd-empty"; mkdir -p "$dir"
+  # No _DD_MEMORY_MIB, no settings file: round the kernel MemTotal as before.
+  _DD_SETTINGS_DIR="$dir" run _docker_vm_display_gb 17179869184  # 16 GiB
+  assert_output "16"
+}
+
+@test "ready: a 24 GB slider prints '24 GB VM', not 23" {
+  # img: "Docker tuned for Cleat (23 GB VM ...)" when the slider is 24. The slider
+  # value, not the kernel's MemTotal, must drive the displayed size.
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "25125558681"; }            # ~23.4 GiB MemTotal (a 24 GB slider)
+  _host_total_memory() { echo "68719476736"; }           # 64 GiB host
+  _DD_MEMORY_MIB="24576"                                  # the configured slider
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"
+  assert_output --partial "24 GB VM"
+  refute_output --partial "23 GB VM"
+}
+
+@test "ready: the undersized threshold uses the configured slider, not MemTotal" {
+  # A 16 GB slider whose MemTotal reads ~15.6 GiB must NOT trip the undersized
+  # path: the configured value (16) meets the rec. Display and threshold agree.
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo "16750372454"; }            # ~15.6 GiB
+  _host_total_memory() { echo "34359738368"; }           # 32 GiB host -> rec 16
+  _DD_MEMORY_MIB="16384"                                  # 16 GB slider
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"
+  assert_output --partial "16 GB VM"
 }
 
 # ── cmd_status VM budget line ────────────────────────────────────────────────

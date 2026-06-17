@@ -618,6 +618,8 @@ cleat --cap hooks start        # enable for one session
 
 When Claude Code or any tool inside the container calls `open` or `xdg-open` with a URL, it opens in your host browser. OAuth callbacks are automatically proxied back to the container. `cleat login` and any auth flow work seamlessly without manual URL copy-paste. No capability needed.
 
+**One click, one tab.** Your terminal already opens a clicked link itself, so on an interactive terminal the bridge defers plain links to it and opens via the bridge only what the terminal won't: auth/OAuth-callback URLs and non-interactive runs. Clicking a link opens a single tab, on any terminal. Override with `CLEAT_BROWSER_BRIDGE=always` (open every URL through the bridge) or `off` (never auto-open; the login callback proxy still runs).
+
 ---
 
 ## Host connectivity

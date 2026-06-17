@@ -1496,6 +1496,65 @@ SCRIPT
   assert_output --partial "A URL will appear"
 }
 
+@test "cmd_login: passes host_opens_clicks=0 so the auth URL always opens (never deferred)" {
+  # Regression (v0.16.5): the login watcher only ever sees the auth URL claude
+  # login launches programmatically (not a link the user clicked), so the terminal
+  # won't open it. If cmd_login passed host_opens_clicks=1, a non-loopback console
+  # auth URL (is_auth=0) would be DEFERRED to a terminal that never opens it, and
+  # nothing would open despite the "browser will open automatically" promise.
+  is_running() { return 0; }
+  require_running() { true; }
+  local bw_args="$TEST_TEMP/login-bw-args"
+  _browser_watcher() {
+    echo "$5" > "$bw_args"          # the host_opens_clicks argument
+    sleep 60 &
+    local pid=$!
+    trap "kill $pid 2>/dev/null; exit 0" TERM
+    wait $pid
+  }
+  _host_open_cmd() { echo "true"; }
+  export DOCKER_EXIT_CODE=0
+
+  run cmd_login "$TEST_TEMP"
+  [[ "$(cat "$bw_args" 2>/dev/null)" == "0" ]] || { echo "login passed host_opens_clicks=[$(cat "$bw_args" 2>/dev/null)], expected 0"; return 1; }
+}
+
+@test "cmd_login: off mode prints the manual-open message, not the auto-open promise" {
+  is_running() { return 0; }
+  require_running() { true; }
+  _browser_watcher() {
+    sleep 60 &
+    local pid=$!
+    trap "kill $pid 2>/dev/null; exit 0" TERM
+    wait $pid
+  }
+  _host_open_cmd() { echo "true"; }
+  export DOCKER_EXIT_CODE=0
+  export CLEAT_BROWSER_BRIDGE=off
+
+  run cmd_login "$TEST_TEMP"
+  assert_output --partial "CLEAT_BROWSER_BRIDGE=off"
+  refute_output --partial "open automatically"
+}
+
+@test "cmd_login: default mode promises the browser opens automatically" {
+  is_running() { return 0; }
+  require_running() { true; }
+  _browser_watcher() {
+    sleep 60 &
+    local pid=$!
+    trap "kill $pid 2>/dev/null; exit 0" TERM
+    wait $pid
+  }
+  _host_open_cmd() { echo "true"; }
+  export DOCKER_EXIT_CODE=0
+  unset CLEAT_BROWSER_BRIDGE
+
+  run cmd_login "$TEST_TEMP"
+  assert_output --partial "open automatically"
+  refute_output --partial "CLEAT_BROWSER_BRIDGE=off"
+}
+
 @test "cmd_login: cleans up browser watcher even when login fails" {
   is_running() { return 0; }
   require_running() { true; }

@@ -830,3 +830,42 @@ EOF
   refute_output --partial "command not found"
   refute_output --partial "value too great for base"     # the octal arithmetic error must not leak
 }
+
+@test "smoke: VM configured-size read + bridge policy survive strict mode" {
+  # The configured-slider read is a grep pipeline + 10# arithmetic (the set -e /
+  # pipefail / set -u shape), and the bridge policy helpers run on every session
+  # start. Exercise them under the binary's REAL strict mode, the condition macOS
+  # users run under, including the no-settings and unset-env-var paths.
+  cat > "$TEST_TEMP/vmbridge_strict.sh" <<EOF
+set -euo pipefail
+source "$CLI"
+_is_tty() { return 0; }
+_docker_vm_memory() { echo 25125558681; }      # ~23.4 GiB MemTotal (a 24 GB slider)
+_host_total_memory() { echo 68719476736; }     # 64 GiB host
+dd="\$(mktemp -d)"
+export _DD_SETTINGS_DIR="\$dd"
+# 1. Configured slider read from settings: a 24 GB slider must display 24, not 23.
+printf '{ "MemoryMiB": 24576, "SwapMiB": 4096 }\n' > "\$dd/settings-store.json"
+_ONSTART_GAP_OPEN=0
+_maybe_announce_docker_ready
+# 2. No settings file: the resolver must fall back to MemTotal rounding, no abort.
+rm -f "\$dd/settings-store.json"
+fb="\$(_docker_vm_display_gb 17179869184)"; echo "fallback=[\$fb]"
+# 3. Bridge policy with the env var UNSET (set -u) and on a typo.
+unset CLEAT_BROWSER_BRIDGE
+echo "mode=[\$(_browser_bridge_mode)]"
+if _browser_should_open auto 1 0; then echo "plain=open"; else echo "plain=defer"; fi
+if _browser_should_open auto 1 1; then echo "auth=open"; else echo "auth=defer"; fi
+rm -rf "\$dd"
+EOF
+  run bash "$TEST_TEMP/vmbridge_strict.sh"
+  assert_success
+  assert_output --partial "24 GB VM"                     # configured slider drives the display
+  refute_output --partial "23 GB VM"
+  assert_output --partial "fallback=[16]"                # MemTotal rounding when settings are gone
+  assert_output --partial "mode=[auto]"                  # unset env var defaults to auto, no unbound-var
+  assert_output --partial "plain=defer"                  # no duplicate tab on an interactive terminal
+  assert_output --partial "auth=open"                    # login URLs still open
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+}

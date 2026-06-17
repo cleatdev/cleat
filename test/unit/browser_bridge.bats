@@ -201,3 +201,128 @@ EOF
   kill "$wpid" 2>/dev/null || true
   [ "$dead" = 1 ] || { echo "watcher outlived its dead parent"; return 1; }
 }
+
+# ── No-duplicate bridge policy (CLEAT_BROWSER_BRIDGE) ──────────────────────────
+# A clicked link is opened by the HOST TERMINAL itself (it makes URLs clickable);
+# the in-container `open` shim ALSO writes the bridge, so the watcher opening it
+# again is a second tab ~0.5s later. The watcher cannot see the terminal's open,
+# so on an interactive terminal it DEFERS plain links to the terminal. Auth URLs
+# (a localhost OAuth callback the user never clicks) and non-interactive sessions
+# (nothing else opens them) always open via the bridge. CLEAT_BROWSER_BRIDGE
+# overrides: always = open everything (pre-toggle behavior), off = open nothing.
+
+@test "bridge mode: defaults to auto when unset" {
+  unset CLEAT_BROWSER_BRIDGE
+  run _browser_bridge_mode
+  assert_output "auto"
+}
+
+@test "bridge mode: honors always and off, and falls back to auto on a typo" {
+  CLEAT_BROWSER_BRIDGE=always run _browser_bridge_mode
+  assert_output "always"
+  CLEAT_BROWSER_BRIDGE=off run _browser_bridge_mode
+  assert_output "off"
+  CLEAT_BROWSER_BRIDGE=banana run _browser_bridge_mode    # unknown never wedges
+  assert_output "auto"
+}
+
+@test "bridge policy: auto DEFERS a plain link on an interactive terminal (no duplicate)" {
+  # mode=auto, host_opens_clicks=1, is_auth=0 -> the terminal owns it -> defer.
+  run _browser_should_open auto 1 0
+  assert_failure
+}
+
+@test "bridge policy: auto OPENS an auth URL even on an interactive terminal" {
+  # The user never clicks an auth URL; the bridge + callback proxy own it.
+  run _browser_should_open auto 1 1
+  assert_success
+}
+
+@test "bridge policy: auto OPENS a plain link when no terminal is attached" {
+  # Off a TTY (piped, scripted) nothing else opens the link, so the bridge must.
+  run _browser_should_open auto 0 0
+  assert_success
+}
+
+@test "bridge policy: always opens every URL; off opens none" {
+  run _browser_should_open always 1 0   # plain + interactive: forced open
+  assert_success
+  run _browser_should_open always 0 0
+  assert_success
+  run _browser_should_open off 0 1      # even an auth URL: off opens nothing
+  assert_failure
+  run _browser_should_open off 0 0
+  assert_failure
+}
+
+@test "browser bridge: auto mode does NOT re-open a plain link the terminal handled" {
+  # Integration: drive the real watcher loop with an interactive terminal flag.
+  # The plain link must never reach the opener (the visible duplicate tab).
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  # cname="" so the auth branch is skipped (is_auth stays 0); host_opens_clicks=1.
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7                                  # let it pass the startup rm -f
+  printf '%s' "https://example.com/plain" > "$dir/.browser-open"
+  sleep 2                                    # several poll cycles
+  kill -0 "$wpid" 2>/dev/null || { echo "watcher died before the assertion"; return 1; }
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ ! -f "$TEST_TEMP/opened.log" ] || { echo "bridge re-opened a plain link the terminal already opened"; return 1; }
+}
+
+@test "browser bridge: auto mode still opens an auth URL on an interactive terminal" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _extract_callback_port() { echo "1455"; return 0; }   # force the auth branch
+  _auth_callback_proxy() { :; }                          # never start a real proxy
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$TEST_TEMP/opened.log" ] && break
+    sleep 0.5
+  done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ -f "$TEST_TEMP/opened.log" ] || { echo "auth URL was not opened by the bridge"; return 1; }
+}
+
+@test "browser bridge: off mode opens nothing yet still starts the auth proxy (login works)" {
+  # off withholds every browser open, even an auth URL, but the OAuth callback
+  # proxy must STILL start so `cleat login` completes when the URL is opened by
+  # hand. The proxy is started before the open gate, so it runs in every mode.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _extract_callback_port() { echo "1455"; return 0; }   # force the auth branch
+  _auth_callback_proxy() { touch "$TEST_TEMP/proxy_started"; }
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "mybox" "off" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$TEST_TEMP/proxy_started" ] && break
+    sleep 0.5
+  done
+  sleep 1                                                # give any (wrong) open a chance to land
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ -f "$TEST_TEMP/proxy_started" ] || { echo "off mode did not start the auth proxy; cleat login would hang"; return 1; }
+  [ ! -f "$TEST_TEMP/opened.log" ] || { echo "off mode opened a browser; it must suppress every open"; return 1; }
+}

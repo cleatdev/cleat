@@ -472,3 +472,44 @@ EOF
   assert_success
   refute_output --partial "Trust this project"
 }
+
+# ── _trust_prompt: aligned startup style + default-deny ────────────────────
+
+@test "trust prompt: approves on an explicit yes" {
+  run _trust_prompt "$TEST_TEMP/proj" env <<< "y"
+  assert_success
+  assert_output --partial "Trust this project's .cleat?"
+  assert_output --partial "env"
+}
+
+@test "trust prompt: denies on no" {
+  run _trust_prompt "$TEST_TEMP/proj" env <<< "n"
+  assert_failure
+}
+
+@test "trust prompt: empty answer defaults to DENY" {
+  # Security: an untrusted project's caps must never auto-apply on a bare Enter.
+  run _trust_prompt "$TEST_TEMP/proj" env <<< ""
+  assert_failure
+}
+
+@test "trust prompt: EOF or closed stdin defaults to DENY" {
+  run _trust_prompt "$TEST_TEMP/proj" env < /dev/null
+  assert_failure
+}
+
+@test "trust prompt: uses the aligned info style, not the old notice box" {
+  run _trust_prompt "$TEST_TEMP/proj" env <<< "n"
+  assert_output --partial "requests host access"
+  refute_output --partial "Requested:"
+  refute_output --partial "Project:"
+  refute_output --partial "┌"
+  refute_output --partial "│"
+}
+
+@test "trust prompt: re-prompt wording when a trusted .cleat changed" {
+  # A stored record makes _trust_lookup non-empty, so this is the re-prompt path.
+  _trust_record "$TEST_TEMP/proj" "deadbeefdeadbeef" "main"
+  run _trust_prompt "$TEST_TEMP/proj" env <<< "n"
+  assert_output --partial "changed since you trusted it"
+}

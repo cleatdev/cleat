@@ -46,6 +46,7 @@ PRUNE_BATS="$REPO_ROOT/test/unit/prune.bats"
 CLAUDE_JSON_BATS="$REPO_ROOT/test/unit/claude_json.bats"
 CREDENTIALS_BATS="$REPO_ROOT/test/unit/credentials.bats"
 IMAGE_REBUILD_BATS="$REPO_ROOT/test/unit/image_rebuild_check.bats"
+TRUST_BATS="$REPO_ROOT/test/unit/trust.bats"
 DOCKER_COMMANDS_BATS="$REPO_ROOT/test/unit/docker_commands.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
@@ -1472,6 +1473,35 @@ cat > "$SED_TMP" << 'SED'
 s|(( 10#$stored_spec < 10#$_IMAGE_SPEC_VERSION ))|[[ "$stored_spec" -lt "$_IMAGE_SPEC_VERSION" ]]|
 SED
 try "vnext_image_spec_base10" "an older leading-zero spec label prompts with no octal stderr leak" "$CLI" "$IMAGE_REBUILD_BATS"
+
+# The caps reader must keep a final line with no trailing newline (else a
+# hand-edited .cleat ending in a cap silently drops it: no trust prompt, cap
+# never applied). Revert the `|| [[ -n "$line" ]]` fallback INSIDE
+# _read_caps_from_file only (range-scoped so _parse_env_file is untouched): the
+# no-trailing-newline regression test then sees an empty read and fails.
+cat > "$SED_TMP" << 'SED'
+/^_read_caps_from_file()/,/^}/ s#while IFS= read -r line || \[\[ -n "\$line" \]\]; do#while IFS= read -r line; do#
+SED
+try "vnext_caps_reader_no_trailing_newline" "caps reader keeps a final line" "$CLI" "$REGRESSIONS"
+
+# Same class for the [resources] reader: a hand-edited .cleat ending in
+# `memory = 8g` with no trailing newline must still apply the ceiling. Revert
+# the `|| [[ -n "$line" ]]` fallback INSIDE _read_resource_from_file only
+# (range-scoped so the caps/env readers are untouched): the [resources]
+# no-trailing-newline regression test then sees an empty read and fails.
+cat > "$SED_TMP" << 'SED'
+/^_read_resource_from_file()/,/^}/ s#while IFS= read -r line || \[\[ -n "\$line" \]\]; do#while IFS= read -r line; do#
+SED
+try "vnext_resources_reader_no_trailing_newline" "resources. reader keeps a final line" "$CLI" "$REGRESSIONS"
+
+# The workspace-trust prompt MUST default-deny: only an explicit yes grants an
+# untrusted project's caps. Flip the catch-all branch to return 0 (approve) so
+# empty/EOF input would auto-trust: the "empty answer defaults to DENY" test then
+# sees success instead of failure and fails. Scoped to _trust_prompt only.
+cat > "$SED_TMP" << 'SED'
+/^_trust_prompt()/,/^}/ s#\*) return 1 ;;#*) return 0 ;;#
+SED
+try "vnext_trust_prompt_default_deny" "empty answer defaults to DENY" "$CLI" "$TRUST_BATS"
 
 # OOM guidance fires on exit 137 (SIGKILL, the kernel OOM-killer's signature).
 # Break the 137 arm: the "infers OOM from exit 137" test sees no guidance.

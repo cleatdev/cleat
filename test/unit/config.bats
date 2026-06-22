@@ -86,6 +86,40 @@ EOF
   assert_line --index 1 "ssh"
 }
 
+@test "read_caps: reads the last cap when the file has NO trailing newline" {
+  # The exact shape of a hand-edited .cleat that dropped its last cap before the
+  # fix: `printf '[caps]\nenv'` with no final newline.
+  printf '[caps]\nenv' > "$TEST_TEMP/config"
+  run _read_caps_from_file "$TEST_TEMP/config"
+  assert_success
+  assert_output "env"
+}
+
+@test "read_caps: reads the last cap with CRLF AND no trailing newline" {
+  printf '[caps]\r\ngit\r\nenv' > "$TEST_TEMP/config"
+  run _read_caps_from_file "$TEST_TEMP/config"
+  assert_success
+  assert_line --index 0 "git"
+  assert_line --index 1 "env"
+}
+
+@test "read_caps: a no-newline final line is still filtered if it's a comment" {
+  # The trailing-line fallback must not start emitting comments/blank lines.
+  printf '[caps]\ngit\n# trailing comment no newline' > "$TEST_TEMP/config"
+  run _read_caps_from_file "$TEST_TEMP/config"
+  assert_success
+  assert_output "git"
+  refute_output --partial "comment"
+}
+
+@test "read_caps: a no-newline final line outside [caps] is ignored" {
+  printf '[caps]\ngit\n[other]\nnot_a_cap' > "$TEST_TEMP/config"
+  run _read_caps_from_file "$TEST_TEMP/config"
+  assert_success
+  assert_output "git"
+  refute_output --partial "not_a_cap"
+}
+
 @test "write_caps: preserves sections from CRLF file" {
   printf '[other]\r\nsomething\r\n[caps]\r\ngit\r\n' > "$TEST_TEMP/config"
   _write_caps_to_file "$TEST_TEMP/config" ssh

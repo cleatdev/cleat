@@ -564,7 +564,11 @@ _read_caps_from_file() {
   local file="$1"
   [[ -f "$file" ]] || return 0
   local in_caps=false
-  while IFS= read -r line; do
+  # `|| [[ -n "$line" ]]` so a final line with no trailing newline (common in
+  # hand-edited .cleat/config files, e.g. `printf '[caps]\nenv'`) is still read;
+  # without it `read` returns non-zero at EOF and the last capability is silently
+  # dropped. Matches the env-file parser (_parse_env_file).
+  while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip carriage return (CRLF from Windows editors)
     line="${line%$'\r'}"
     # Strip leading/trailing whitespace
@@ -660,7 +664,11 @@ _read_resource_from_file() {
   local file="$1" key="$2"
   [[ -f "$file" ]] || return 0
   local in_section=false line k v
-  while IFS= read -r line; do
+  # `|| [[ -n "$line" ]]` so a final line with no trailing newline (a hand-edited
+  # `.cleat` ending in `memory = 8g`) is still read; without it `read` returns
+  # non-zero at EOF and the configured ceiling is silently dropped, falling back
+  # to the VM-derived default. Matches _read_caps_from_file and _parse_env_file.
+  while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
@@ -1187,50 +1195,30 @@ _trust_prompt() {
   local is_reprompt=0
   [[ -n "$(_trust_lookup "$project" "${_BOX:-main}")" ]] && is_reprompt=1
 
-  local -a lines=()
-  if [[ $is_reprompt -eq 1 ]]; then
-    lines+=(
-      "This project's {BOLD}.cleat{/BOLD} has changed since you trusted it."
-      ""
-      "Re-approving would grant these capabilities:"
-    )
-  else
-    lines+=(
-      "This project's {BOLD}.cleat{/BOLD} file requests capabilities"
-      "that extend what the sandbox can access on your host."
-      ""
-      "Requested:"
-    )
-  fi
-  lines+=("")
-  local cap desc
+  # Comma-joined cap names for the notice line; docker is amber because it
+  # breaks the sandbox. Same aligned startup-prompt style (info + _ask_yn) as the
+  # image-rebuild, Claude-update, and recreate prompts, not the old notice box.
+  local cap _list=""
   for cap in "${caps[@]}"; do
-    desc="$(_cap_description "$cap")"
     if [[ "$cap" == "docker" ]]; then
-      lines+=("  {BOLD}${cap}{/BOLD}  ${desc}")
+      _list="${_list:+$_list, }${AMBER}${cap}${RESET}"
     else
-      lines+=("  {BOLD}${cap}{/BOLD}  ${desc}")
+      _list="${_list:+$_list, }${BOLD}${cap}${RESET}"
     fi
   done
-  lines+=(
-    ""
-    "Project: ${project}"
-  )
 
-  _notice_box "${lines[@]}"
-
-  local answer=""
-  # Read the answer. Use /dev/tty to survive stdin redirection from callers.
-  if [[ -r /dev/tty ]]; then
-    printf "  %bTrust this project's .cleat?%b [y/N]: " "${BOLD}" "${RESET}" > /dev/tty
-    IFS= read -r answer < /dev/tty || answer=""
-    printf "\n" > /dev/tty
+  if [[ $is_reprompt -eq 1 ]]; then
+    info "Project ${BOLD}.cleat${RESET} changed since you trusted it: it now grants ${_list} ${DIM}on your host${RESET}"
   else
-    IFS= read -r -p "  Trust this project's .cleat? [y/N]: " answer || answer=""
-    printf "\n"
+    info "Project ${BOLD}.cleat${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
   fi
-  case "${answer}" in
-    y|Y|yes|YES|Yes) return 0 ;;
+
+  # Default-DENY ([y/N]): only an explicit yes grants the caps. Empty / EOF / no
+  # all decline, so untrusted project input never auto-applies.
+  local yn=""
+  _ask_yn yn "Trust this project's .cleat? ${DIM}(applies its caps; approve once, undo with cleat untrust)${RESET} [y/N] "
+  case "$yn" in
+    [yY]*) return 0 ;;
     *) return 1 ;;
   esac
 }

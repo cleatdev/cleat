@@ -1944,6 +1944,34 @@ ${overlay_dir}/project-settings.local.json"
   assert_output --partial "STABLE"
 }
 
+@test "regression: caps reader keeps a final line that lacks a trailing newline" {
+  # A hand-edited .cleat ending in a capability with no trailing newline
+  # (printf '[caps]\nenv') silently dropped that last cap: _read_caps_from_file
+  # looped with a bare `while IFS= read -r line` and no `|| [[ -n "$line" ]]`, so
+  # the unterminated final line was lost. The project's requested cap was never
+  # seen, so no trust prompt fired and the cap never applied (and the box drifted
+  # because it had been created when the cap still applied). Fix mirrors
+  # _parse_env_file. Reproduce the exact input: env on the last line, no newline.
+  printf '[caps]\nenv' > "$TEST_TEMP/.cleat"
+  run _read_caps_from_file "$TEST_TEMP/.cleat"
+  assert_success
+  [[ "$output" == *"env"* ]] \
+    || { echo "REGRESSION: last capability dropped from a no-trailing-newline .cleat"; return 1; }
+}
+
+@test "regression: [resources] reader keeps a final line that lacks a trailing newline" {
+  # Same class as the caps-reader bug: _read_resource_from_file looped with a
+  # bare `while IFS= read -r line` and no `|| [[ -n "$line" ]]`, so a hand-edited
+  # .cleat ending in `memory = 8g` with no trailing newline silently dropped the
+  # configured ceiling and the box fell back to the VM-derived default. The
+  # header comment even claimed "Same parsing hygiene as [caps]", which was false.
+  printf '[resources]\nmemory = 8g' > "$TEST_TEMP/.cleat"
+  run _read_resource_from_file "$TEST_TEMP/.cleat" memory
+  assert_success
+  [[ "$output" == "8g" ]] \
+    || { echo "REGRESSION: configured ceiling dropped from a no-trailing-newline [resources]"; return 1; }
+}
+
 @test "regression v0.15.1: rotated SSH-agent socket after reboot recreates instead of failing to start" {
   # macOS launchd regenerates the SSH agent socket directory
   # (…/com.apple.launchd.XXXX/Listeners) on every reboot, so SSH_AUTH_SOCK

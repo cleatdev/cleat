@@ -42,6 +42,30 @@ teardown() { _common_teardown; }
   assert_output ""
 }
 
+@test "resources: reads memory when the file has NO trailing newline" {
+  # A hand-edited .cleat ending in `memory = 8g` with no final newline silently
+  # dropped the ceiling before the fix (read returns non-zero at EOF), so the
+  # box fell back to the VM-derived default instead of the configured limit.
+  printf '[resources]\nmemory = 8g' > "$PROJECT/.cleat"
+  run _read_resource_from_file "$PROJECT/.cleat" memory
+  assert_success
+  assert_output "8g"
+}
+
+@test "resources: reads cpus when the file has NO trailing newline" {
+  printf '[resources]\ncpus = 2' > "$PROJECT/.cleat"
+  run _read_resource_from_file "$PROJECT/.cleat" cpus
+  assert_success
+  assert_output "2"
+}
+
+@test "resources: first value wins on a duplicate key" {
+  printf '[resources]\nmemory = 4g\nmemory = 8g\n' > "$PROJECT/.cleat"
+  run _read_resource_from_file "$PROJECT/.cleat" memory
+  assert_success
+  assert_output "4g"
+}
+
 @test "resources: missing file yields nothing" {
   run _read_resource_from_file "$PROJECT/.does-not-exist" memory
   assert_success

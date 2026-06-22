@@ -880,12 +880,13 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.15.0_highlight_bounded_cap" "first 3 launches" "$CLI" "$WHATS_NEW_BATS"
 
-# v0.15.0: the release-highlight version label is editorial: hardcoded to the
-# feature's introduction version (v0.14.0 for Boxes), NOT the dynamic ${VERSION}.
-# Revert it to ${VERSION}: with VERSION past 0.14.0 the label renders wrong and
-# the "fresh install" test (which pins "New in v0.14.0") fails.
+# The release-highlight headline must announce the correct version. At the 1.0.0
+# milestone the highlight's editorial version equals VERSION, so the old
+# hardcoded-vs-${VERSION} distinction is unobservable; this instead guards that
+# the copy literally says the right version. Corrupt the version in the headline:
+# the "fresh install" test (which pins "New in v1.0.0") then fails.
 cat > "$SED_TMP" << 'SED'
-s/New in v0.14.0/New in v${VERSION}/
+s/New in v1.0.0/New in v9.9.9/
 SED
 try "v0.15.0_highlight_label_frozen" "fresh install" "$CLI" "$WHATS_NEW_BATS"
 
@@ -1588,10 +1589,10 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "bugfix_highlight_changelog_line" "version-anchored changelog link" "$CLI" "$WHATS_NEW_BATS"
 
-# That changelog link must deep-link to the feature's release section (#v0.14.0),
+# That changelog link must deep-link to this release's section (#v1.0.0),
 # not the bare page. Strip the anchor: the "version-anchored" test fails.
 cat > "$SED_TMP" << 'SED'
-s|cleat.sh/changelog#v0.14.0|cleat.sh/changelog|
+s|cleat.sh/changelog#v1.0.0|cleat.sh/changelog|
 SED
 try "bugfix_highlight_changelog_anchor" "version-anchored changelog link" "$CLI" "$WHATS_NEW_BATS"
 

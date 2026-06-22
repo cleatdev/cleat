@@ -551,7 +551,7 @@ When you change **capabilities or env keys** after a container was created, Clea
 
 Accepting removes the container and rebuilds it with the new caps/env. Sessions persist on the host (`~/.claude/projects/<key>/`) and are never touched. Declining keeps the existing container.
 
-A Cleat version bump on its own does **not** trigger this: the drift check looks only at caps and env keys. When a new CLI ships container changes, the separate image-rebuild prompt offers a rebuild (the only thing that actually applies them).
+A Cleat version bump on its own does **not** trigger this: the drift check looks only at caps and env keys. Image freshness is handled separately and is also content-aware: the on-start image-refresh prompt fires only when the image's actual contents change (the entrypoint, the clipboard or browser bridge, the Dockerfile, or the pinned base), not on every version bump. The base image is pinned by digest, so a routine release leaves your container and everything you installed in it untouched, and a base or security update ships through the same refresh prompt.
 
 Non-TTY runs (CI, scripts) print the notice and continue with the existing container. They never auto-destroy.
 

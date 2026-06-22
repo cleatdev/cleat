@@ -28,20 +28,22 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v0.14.0"
-  assert_output --partial "Boxes"
+  assert_output --partial "New in v1.0.0"
+  # "stable" carries the cyan accent, so it is wrapped in color codes; assert the
+  # accent word and the contiguous tail separately rather than the split phrase.
+  assert_output --partial "stable"
+  assert_output --partial "release is out"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
 }
 
-@test "whats-new: copy carries the try-command and the version-anchored changelog link" {
+@test "whats-new: copy carries the version-anchored changelog link" {
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "cleat start dev"
-  # Anchored to the feature's release section (#v0.14.0), not the bare changelog
-  # page, the /changelog page IDs each release by its version.
-  assert_output --partial "cleat.sh/changelog#v0.14.0"
+  # Anchored to this release's section (#v1.0.0), not the bare changelog page:
+  # the /changelog page IDs each release by its version.
+  assert_output --partial "cleat.sh/changelog#v1.0.0"
 }
 
 @test "whats-new: the changelog link is a clickable OSC 8 hyperlink in supporting terminals" {
@@ -50,25 +52,20 @@ teardown() { _common_teardown; }
   run _maybe_show_release_highlight
   assert_success
   # OSC 8 link target is the full https URL (the visible label can be the short form).
-  assert_output --partial "$(printf '\033]8;;https://cleat.sh/changelog#v0.14.0\033\\')"
+  assert_output --partial "$(printf '\033]8;;https://cleat.sh/changelog#v1.0.0\033\\')"
 }
 
-@test "whats-new: the try-command and changelog sit on their own lines, not crammed onto the prose" {
-  # The cramped layout tacked "Try: cleat start dev · cleat.sh/changelog" onto
-  # the end of the description line. They now each get a labelled line. Falsify
-  # the run-on layout: the line that holds the try-command must not also hold the
-  # prose tail, and the changelog must not share the try-command's line.
+@test "whats-new: the changelog link sits on its own line, not crammed onto the prose" {
+  # The link gets its own labelled "Changelog:" line below the news, so it stays
+  # scannable and the URL is unmistakable. Falsify a run-on layout: the changelog
+  # line must not also carry the headline or a support-prose sentence.
   _is_tty() { return 0; }
-  local out; out="$(_maybe_show_release_highlight)"
-  local try_line cl_line
-  try_line="$(printf '%s\n' "$out" | grep -F 'cleat start dev')"
+  local out cl_line; out="$(_maybe_show_release_highlight)"
   cl_line="$(printf '%s\n' "$out" | grep -F 'cleat.sh/changelog')"
-  # The try-command is not buried in the prose sentence.
-  printf '%s' "$try_line" | grep -qF "reaches the other" \
-    && { echo "try-command crammed onto the prose line"; return 1; } || true
-  # The changelog link is on its own line, not appended after the try-command.
-  printf '%s' "$cl_line" | grep -qF 'cleat start dev' \
-    && { echo "changelog crammed onto the try-command line"; return 1; } || true
+  printf '%s' "$cl_line" | grep -qF "New in v1.0.0" \
+    && { echo "changelog crammed onto the headline line"; return 1; } || true
+  printf '%s' "$cl_line" | grep -qF "Leave it running" \
+    && { echo "changelog crammed onto a support line"; return 1; } || true
 }
 
 @test "whats-new: a trailing blank separates the highlight from the bring-up block" {

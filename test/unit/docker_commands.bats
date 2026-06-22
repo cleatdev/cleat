@@ -776,7 +776,7 @@ EOF
 
 @test "help: shows all sections" {
   run cmd_help
-  assert_output --partial "Run anything. Break nothing."
+  assert_output --partial "Give the agent a cage, not your keys."
   assert_output --partial "QUICK START"
   assert_output --partial "LIFECYCLE"
 }

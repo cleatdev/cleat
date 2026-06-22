@@ -1,4 +1,10 @@
-FROM node:24-bookworm-slim
+# Base pinned by digest (the node:24-bookworm-slim multi-arch OCI index) so the
+# image is reproducible and base/security updates are a deliberate, reviewed
+# change rather than silent drift on a floating tag. To refresh the base: resolve
+# the new INDEX digest (must cover linux/amd64 + linux/arm64), update it here, and
+# bump _IMAGE_SPEC_VERSION in bin/cleat so users are offered the rebuilt image.
+# See concept/24-image-spec-versioning.md.
+FROM node:24-bookworm-slim@sha256:c2d5ade763cacfb03fe9cb8e8af5d1be5041ff331921fa26a9b231ca3a4f780a
 
 # Install packages (node/npm pre-installed in base image)
 # gh:     GitHub CLI from official apt repo

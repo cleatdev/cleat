@@ -1910,14 +1910,16 @@ ${overlay_dir}/project-settings.local.json"
 @test "regression v0.15.0: image-rebuild notice has no leading blank line" {
   _is_tty() { return 0; }
   image_exists() { return 0; }
-  _image_cleat_version() { echo "0.0.1"; }   # older than VERSION → prompt fires
+  # Pre-stamping image older than the content intro → prompt fires.
+  _image_spec_version() { echo ""; }
+  _image_cleat_version() { echo "0.0.1"; }
   cmd_rebuild() { :; }
   container_exists() { return 1; }
   is_running() { return 1; }
   _REBUILD_PROMPTED=0
   local out
   out="$(_maybe_prompt_image_rebuild "cleat-x-12345678" <<< "n" 2>&1)"
-  [[ "$out" == *"Cleat image is outdated"* ]] \
+  [[ "$out" == *"out of date"* ]] \
     || { echo "notice missing: $out"; return 1; }
   [[ "$out" != $'\n'* ]] \
     || { echo "REGRESSION: leading blank line before rebuild notice"; return 1; }

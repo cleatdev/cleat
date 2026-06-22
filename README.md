@@ -5,11 +5,13 @@
 [![Release](https://img.shields.io/github/v/release/cleatdev/cleat?label=release)](https://github.com/cleatdev/cleat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Run anything. Break nothing.**
+**Give the agent a cage, not your keys.**
+
+*Unattended, not unguarded.*
 
 Run AI coding agents with full autonomous permissions, safely sandboxed in Docker.
 
-One command. Per-project isolation. Zero risk to your host.
+One command. Per-project isolation. Your host stays untouched.
 
 ```bash
 curl -fsSL https://cleat.sh/install | bash
@@ -55,7 +57,7 @@ Claude Code with `--dangerously-skip-permissions` is the fastest way to build so
 - Packages can be installed, upgraded, or removed system-wide
 - Dotfiles, SSH keys, or credentials can be read or overwritten
 - Other projects on your machine can be accessed or changed
-- A single bad command can render your OS unbootable
+- A single bad command can irreversibly delete your work -- on a Mac's internal SSD, TRIM means there is no undo and no undelete, only your last backup -- or leak a live credential to the internet, where it is abused in minutes
 
 ### The solution
 
@@ -97,17 +99,19 @@ Cleat gives you the best of both worlds:
 
 ## The story behind this
 
-I was deep into vibe coding. Shipping features fast, letting Claude Code run with `--dangerously-skip-permissions` so it could execute anything without interrupting my flow. It was incredible. I'd kick off tasks, step away, come back to working code. I was running multiple projects on my Mac, sometimes leaving Claude running overnight while it worked through larger refactors.
+I was deep into vibe coding, letting Claude Code run with `--dangerously-skip-permissions` so it could ship without interrupting my flow. Kick off a task, step away, come back to working code. Multiple projects on my Mac, sometimes left running overnight through a big refactor.
 
-Then one morning I opened my laptop and nothing worked. The system was completely broken. Apps wouldn't launch, the terminal was unusable, core system files had been modified. Claude had been working autonomously through the night, and somewhere along the way it had started making changes outside the project directory. It tried to fix a dependency issue by modifying system-level configs, which cascaded into more "fixes" across the filesystem. By the time it was done, macOS was unrecoverable.
+The campfire version of the story is that one night it went rogue and bricked my Mac. The honest version is scarier, because it actually happens. The hardware was never in danger -- Apple sealed the OS so thoroughly that not even root can modify `/System` in place, and any Mac you can boot into Internet Recovery or DFU you can bring back. What an agent running with no gates can actually destroy is everything that *isn't* the OS. It runs as *you*.
 
-I had to restore my entire machine from a Time Machine backup. Hours of setup, re-authenticating everything, recreating local state that wasn't backed up. All because I gave an AI unrestricted access to my actual system.
+So it installs packages system-wide and litters configs across your home directory until the machine you keep clean is quietly rotting. It reads `~/.ssh`, `~/.aws`, your `.npmrc` tokens, and your `.env` files -- and it can commit or deploy those secrets straight to the internet. That one isn't hypothetical for us: one night an agent wired up a deploy and an API key rode along into a public static deployment. Nothing was "hacked" -- it was running as us, it had the key, it shipped it. Public keys get scraped and abused in minutes, not days, and providers rarely refund fraud on technically-valid requests. By the time we rotated it, roughly $10,000 was already gone.
 
-The thing is, I didn't want to stop using `--dangerously-skip-permissions`. The productivity gain is real. Claude Code without permission gates is a different experience entirely: it moves fast, installs what it needs, runs builds and tests, iterates on errors, all without waiting for you to click "allow" fifty times. Going back to the default permission mode felt like putting the brakes back on.
+And one bad glob ends the rest: developers have wiped entire home folders with a trailing `~/` on an `rm -rf`, where the shell expands the tilde to your whole home directory *after* the agent's own check passes. On a Mac's internal SSD, TRIM is on by default, so the freed blocks are discarded and the per-file encryption key is destroyed within seconds. No undo. No undelete. Only your last backup, if you had one. Gemini CLI destroyed a user's project files the same way; Replit's agent dropped a production database. These are not hypotheticals -- they are documented, and all within the last year. Data and credentials die. The hardware survives them.
 
-So I built Cleat. Same unrestricted power, but inside a Docker container where the blast radius is zero. Claude can `rm -rf /` inside the sandbox and my Mac won't even notice. Each project gets its own container, my host system is completely untouched, and I never have to worry about what Claude does when I'm not looking.
+You can defend the host by hand: never run `--dangerously-skip-permissions` on your machine, never give the agent passwordless sudo, never pre-approve broad globs like `Bash(sudo *)` or `Bash(*)`, and keep real backups. That is a lot of discipline to maintain on every project, forever, at 2am.
 
-I haven't restored from a backup since.
+So I built Cleat. Same unrestricted power, but inside a per-project Docker sandbox where, by default, the blast radius stops at the container. Your host system stays untouched. Capabilities -- ssh, git, env, gh, docker -- are all off until you opt in. Claude can `rm -rf /` inside the container and the rest of your Mac won't even notice. Give the agent a cage, not your keys.
+
+We haven't leaked a key, lost a home folder, or restored from a backup since.
 
 ---
 
@@ -781,4 +785,4 @@ The installer and updater both resolve the latest semver tag automatically. No r
 
 ---
 
-<sub>Cleat. Run anything. Break nothing. | Docker sandbox for AI coding agents | cleat.sh</sub>
+<sub>Cleat. Give the agent a cage, not your keys. | Docker sandbox for AI coding agents | cleat.sh</sub>

@@ -19,6 +19,43 @@ IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
 REPO_URL="https://github.com/cleatdev/cleat"
+
+# Image content identity, DELIBERATELY decoupled from VERSION.
+#
+# The on-start rebuild prompt used to fire whenever the image's baked CLI
+# version was older than this CLI, so a version-only release (no change under
+# docker/) still nagged every user to re-pull and recreate their container,
+# discarding its writable layer for nothing. ~Two-thirds of recent releases
+# were version-only. This integer tracks the IMAGE CONTENT instead.
+#
+# Bump _IMAGE_SPEC_VERSION by one (1 -> 2 -> 3 ...) whenever anything that lands
+# in the built image changes: docker/Dockerfile, docker/entrypoint.sh,
+# docker/clip, docker/clip-daemon, docker/open-bridge, docker/CLAUDE.md, or a
+# pinned base. A CLI-only release leaves it untouched and no one is nagged.
+# It is stamped onto the image as the sh.cleat.image-spec label (by _do_build,
+# cmd_rebuild, and the publish CI) and read back by _maybe_prompt_image_rebuild,
+# which prompts only when the local image's spec is OLDER than this value.
+#
+# A unit test (test/unit/image_spec.bats) hashes the build inputs and FAILS if
+# they change without this being bumped, so it can never be silently forgotten.
+# See concept/24-image-spec-versioning.md.
+#
+# Spec history (what each value shipped):
+#   1  initial scheme; floating node:24-bookworm-slim base
+#   2  base image pinned by digest (reproducible base; see docker/Dockerfile)
+_IMAGE_SPEC_VERSION=2
+# Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
+# existed, so they carry no spec label): their content is inferred from the
+# version they were built at. v0.16.3 was the LAST docker/ content change before
+# stamping, so a label-less image built at or after it carries that pre-pin,
+# floating-base content == spec 1; an older label-less image predates even that
+# and is treated as spec 0. Both are then compared against _IMAGE_SPEC_VERSION,
+# so on the release that introduces this scheme (spec 2, pinned base) a label-less
+# spec-1 image is correctly offered the one-time refresh to the pinned base. This
+# anchor never moves: every image built from the stamping release on carries an
+# explicit label, so the inference path only ever sees genuinely pre-stamping
+# images.
+_IMAGE_SPEC_INTRO_VERSION="0.16.3"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -91,9 +128,11 @@ RESET='\033[0m'
 
 header() {
   echo ""
-  echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────┐${RESET}"
-  echo -e "${BOLD}${CYAN}  │   Cleat: Run anything. Break nothing.   │${RESET}"
-  echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────┘${RESET}"
+  echo -e "${BOLD}${CYAN}  ┌───────────────────────────────────────────┐${RESET}"
+  echo -e "${BOLD}${CYAN}  │   Cleat                                   │${RESET}"
+  echo -e "${BOLD}${CYAN}  │   Give the agent a cage, not your keys.   │${RESET}"
+  echo -e "${BOLD}${CYAN}  │   Unattended, not unguarded.              │${RESET}"
+  echo -e "${BOLD}${CYAN}  └───────────────────────────────────────────┘${RESET}"
   echo ""
 }
 
@@ -1572,6 +1611,24 @@ _image_cleat_version() {
   docker inspect "$IMAGE_NAME" --format '{{index .Config.Labels "sh.cleat.version"}}' 2>/dev/null || echo ""
 }
 
+# Read the image-content spec stamped on the Docker image label. Empty for
+# pre-stamping images (built before sh.cleat.image-spec existed) and for any
+# image the daemon can't inspect. See _IMAGE_SPEC_VERSION.
+_image_spec_version() {
+  docker inspect "$IMAGE_NAME" --format '{{index .Config.Labels "sh.cleat.image-spec"}}' 2>/dev/null || echo ""
+}
+
+# True when version $1 is >= version $2 (dotted numeric, prerelease/build suffix
+# stripped). Used to classify a pre-stamping image's content from the version it
+# was built at. Pure integer field sort, bash 3.2 safe.
+_version_ge() {
+  local a="${1%%[-+]*}" b="${2%%[-+]*}"
+  [[ "$a" == "$b" ]] && return 0
+  local newest
+  newest="$(printf '%s\n%s\n' "$a" "$b" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+  [[ "$newest" == "$a" ]]
+}
+
 # Read the Claude Code version bundled in the image. The `claude` launcher is a
 # symlink into ~/.local/share/claude/versions/<v>, so the target's basename is
 # the version. Prints the version string, or nothing if it can't be determined
@@ -1849,16 +1906,23 @@ _resolve_config_drift() {
   info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created. Recreate to apply: ${BOLD}cleat rm && cleat${RESET}"
 }
 
-# Image-version drift: the local image was built by an OLDER Cleat than the CLI
-# now running, so it may lack the latest container setup. Offer to rebuild it as
-# an interactive startup action: the same aligned Y/n prompt style (_ask_yn) as
-# the other startup prompts, rather than printing a static "run cleat rebuild"
-# notice.
+# Image-content drift: the local image's baked content spec is OLDER than the
+# spec this CLI ships, so it predates a real change under docker/ (entrypoint,
+# clipboard/browser shims, the Dockerfile, a pinned base). Offer to refresh it
+# as an interactive startup action, the same aligned Y/n prompt style (_ask_yn)
+# as the other startup prompts. This is keyed to IMAGE CONTENT, not the CLI
+# version: a version-only release leaves _IMAGE_SPEC_VERSION untouched and never
+# nags. See concept/24-image-spec-versioning.md.
 #
-# On accept: rebuild the image, then drop this project's container so the normal
-# start flow recreates it from the fresh image (the same mechanism
+# Pre-stamping images (built before sh.cleat.image-spec existed) carry no spec
+# label; their content is inferred from the version they were built at, so an
+# image already at today's content stays silent and the cutover to this scheme
+# forces no recreate. An image with neither label is left alone (fail open).
+#
+# On accept: acquire the current image, then drop this project's container so the
+# normal start flow recreates it from the fresh image (the same mechanism
 # _resolve_config_drift uses). Runs at most once per process, TTY-only, and only
-# when the image is strictly OLDER than the CLI (never nags the reverse).
+# when the image content is strictly OLDER (never nags an equal-or-newer image).
 _REBUILD_PROMPTED=0
 _maybe_prompt_image_rebuild() {
   local cname="$1"
@@ -1866,22 +1930,34 @@ _maybe_prompt_image_rebuild() {
   [[ "$_REBUILD_PROMPTED" == "1" ]] && return 0
   image_exists || return 0
 
-  local image_version
-  image_version="$(_image_cleat_version)"
-  [[ -n "$image_version" && "$image_version" != "$VERSION" ]] || return 0
-  # Only prompt when the image is OLDER than the CLI. Compare on the numeric base
-  # (strip any prerelease/build suffix) so the sort's whole-line tiebreak can't
-  # mis-rank e.g. an image built at `X.Y.Z-rc1` against CLI `X.Y.Z`.
-  local base_img="${image_version%%[-+]*}" base_cli="${VERSION%%[-+]*}"
-  local newest
-  newest="$(printf '%s\n%s\n' "$base_img" "$base_cli" \
-    | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
-  [[ "$newest" == "$base_cli" && "$base_img" != "$base_cli" ]] || return 0
+  # Resolve the local image's content spec. Newer images carry an explicit
+  # integer label; pre-stamping images infer it from their build version against
+  # _IMAGE_SPEC_INTRO_VERSION (at/after intro == today's content == spec 1). An
+  # image with no spec AND no version is exotic/hand-built: fail open, never nag.
+  local stored_spec
+  stored_spec="$(_image_spec_version)"
+  if [[ -z "$stored_spec" ]]; then
+    local image_version
+    image_version="$(_image_cleat_version)"
+    [[ -n "$image_version" ]] || return 0
+    if _version_ge "$image_version" "$_IMAGE_SPEC_INTRO_VERSION"; then
+      stored_spec=1
+    else
+      stored_spec=0
+    fi
+  fi
+  # Guard a malformed label, then prompt only when the image content is strictly
+  # older than what this CLI ships. Equal (current) or greater (a dev image
+  # pulled ahead of the CLI) never nags. The 10# forces base 10 so a tampered
+  # leading-zero label (e.g. 08) can't be misread as invalid octal and leak an
+  # arithmetic error to stderr on the otherwise-silent start path.
+  [[ "$stored_spec" =~ ^[0-9]+$ ]] || return 0
+  (( 10#$stored_spec < 10#$_IMAGE_SPEC_VERSION )) || return 0
   _REBUILD_PROMPTED=1
 
-  info "Cleat image is outdated: built with ${DIM}v${image_version}${RESET} → CLI is ${BOLD}v${VERSION}${RESET}"
+  info "Cleat image is out of date: its setup predates this release ${DIM}(image content changed, not just the version)${RESET}"
   local yn=""
-  _ask_yn yn "Update the image now? ${DIM}(downloads the prebuilt v${VERSION}, or builds it locally; recreates this project's container)${RESET} [Y/n] "
+  _ask_yn yn "Refresh the image now? ${DIM}(downloads the prebuilt v${VERSION}, or builds it locally; recreates this project's container, discarding its writable layer)${RESET} [Y/n] "
   if [[ -z "$yn" || "$yn" == [yY]* ]]; then
     # Prefer pulling the released multi-arch image for THIS version: it ships
     # the exact tested setup and Claude build, and a download beats a ~2 min
@@ -3442,7 +3518,8 @@ _do_build() {
   spin "Building image..."
   local rc=0
   docker build -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" \
-    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker" >"$build_log" 2>&1 || rc=$?
+    --label "sh.cleat.version=$VERSION" \
+    --label "sh.cleat.image-spec=$_IMAGE_SPEC_VERSION" "$REPO_DIR/docker" >"$build_log" 2>&1 || rc=$?
   spin_stop "$rc" "Image ready" "Image build failed"
   if [[ $rc -ne 0 ]]; then
     echo ""
@@ -3464,7 +3541,8 @@ cmd_rebuild() {
   spin "Rebuilding image..."
   local rc=0
   docker build --no-cache -f "$REPO_DIR/docker/Dockerfile" -t "$IMAGE_NAME" \
-    --label "sh.cleat.version=$VERSION" "$REPO_DIR/docker" >"$build_log" 2>&1 || rc=$?
+    --label "sh.cleat.version=$VERSION" \
+    --label "sh.cleat.image-spec=$_IMAGE_SPEC_VERSION" "$REPO_DIR/docker" >"$build_log" 2>&1 || rc=$?
   spin_stop "$rc" "Image rebuilt" "Image build failed"
   if [[ $rc -ne 0 ]]; then
     echo ""

@@ -901,7 +901,7 @@ try "v0.15.0_drift_notice_plain_text" "config-drift notice is plain text"
 # Re-add the `echo ""` (inline, before the info) so the notice is preceded by a
 # newline again: the "no leading blank line" regression test then trips.
 cat > "$SED_TMP" << 'SED'
-s|info "Cleat image is outdated|echo ""; info "Cleat image is outdated|
+s|info "Cleat image is out of date|echo ""; info "Cleat image is out of date|
 SED
 try "v0.15.0_rebuild_notice_no_leading_blank" "image-rebuild notice has no leading blank line"
 
@@ -1446,6 +1446,32 @@ cat > "$SED_TMP" << 'SED'
 s#_do_pull "\$VERSION" || _do_build#cmd_rebuild#
 SED
 try "bugfix_image_outdated_pulls" "PULLS this version on accept" "$CLI" "$IMAGE_REBUILD_BATS"
+
+# The refresh prompt is keyed to IMAGE CONTENT: it fires only when the local
+# image's spec is STRICTLY OLDER than the CLI's _IMAGE_SPEC_VERSION. Flip the
+# comparison direction: an older-content image no longer prompts, so the
+# older-spec test sees no notice and fails.
+cat > "$SED_TMP" << 'SED'
+s|10#$stored_spec < 10#$_IMAGE_SPEC_VERSION|10#$stored_spec > 10#$_IMAGE_SPEC_VERSION|
+SED
+try "vnext_image_spec_older_prompts" "PROMPTS when the image spec is older than the CLI" "$CLI" "$IMAGE_REBUILD_BATS"
+
+# A pre-stamping image at/after the content intro version carries today's
+# content (spec 1) and must stay silent at cutover. Mutate the inferred spec to
+# 0 so such an image looks older than the CLI: the recreate-free-cutover test
+# sees a spurious notice and fails.
+cat > "$SED_TMP" << 'SED'
+s|      stored_spec=1|      stored_spec=0|
+SED
+try "vnext_image_spec_legacy_intro" "a pre-stamping image at the intro version stays silent" "$CLI" "$IMAGE_REBUILD_BATS"
+
+# The spec comparison forces base 10 so a leading-zero label (08/09) can't leak
+# an invalid-octal arithmetic error to stderr. Revert to a bare integer test:
+# the leading-zero test sees the "value too great for base" stderr and fails.
+cat > "$SED_TMP" << 'SED'
+s|(( 10#$stored_spec < 10#$_IMAGE_SPEC_VERSION ))|[[ "$stored_spec" -lt "$_IMAGE_SPEC_VERSION" ]]|
+SED
+try "vnext_image_spec_base10" "an older leading-zero spec label prompts with no octal stderr leak" "$CLI" "$IMAGE_REBUILD_BATS"
 
 # OOM guidance fires on exit 137 (SIGKILL, the kernel OOM-killer's signature).
 # Break the 137 arm: the "infers OOM from exit 137" test sees no guidance.

@@ -105,9 +105,11 @@ trap _cleanup_spin EXIT
 
 # ── Header ─────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────┐${RESET}"
-echo -e "${BOLD}${CYAN}  │   Cleat. Run anything. Break nothing.   │${RESET}"
-echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────┘${RESET}"
+echo -e "${BOLD}${CYAN}  ┌───────────────────────────────────────────┐${RESET}"
+echo -e "${BOLD}${CYAN}  │   Cleat                                   │${RESET}"
+echo -e "${BOLD}${CYAN}  │   Give the agent a cage, not your keys.   │${RESET}"
+echo -e "${BOLD}${CYAN}  │   Unattended, not unguarded.              │${RESET}"
+echo -e "${BOLD}${CYAN}  └───────────────────────────────────────────┘${RESET}"
 echo ""
 
 # Check dependencies

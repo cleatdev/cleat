@@ -654,7 +654,8 @@ EOF
 @test "header: prints branded banner" {
   run header
   assert_output --partial "Cleat"
-  assert_output --partial "Run anything. Break nothing."
+  assert_output --partial "Give the agent a cage, not your keys."
+  assert_output --partial "Unattended, not unguarded."
 }
 
 # ── info/success/warn/error prefix functions ─────────────────────────────

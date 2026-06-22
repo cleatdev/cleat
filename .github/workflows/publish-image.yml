@@ -12,9 +12,14 @@ name: publish-image
 # user who pulls runs the box under emulation, the documented trigger for
 # node crashes and garbled TTYs (see concept/22-performance-and-resources.md).
 #
-# INVARIANT: the sh.cleat.version label must be present on the final image.
-# The CLI's image-version drift detection (_image_cleat_version) reads it and
-# silently disables when it's missing.
+# INVARIANT: the sh.cleat.version AND sh.cleat.image-spec labels must be present
+# on the final image. The CLI reads sh.cleat.image-spec (_image_spec_version) to
+# decide whether a user's image is behind on CONTENT, decoupled from the CLI
+# version; an empty label would make it mis-infer content from the version. The
+# spec value is read straight from _IMAGE_SPEC_VERSION in bin/cleat so the
+# stamped label always matches the CLI that shipped the image. The merge job
+# verifies both labels are present and fails the publish loudly if either is
+# missing. See concept/24-image-spec-versioning.md.
 on:
   push:
     tags: ['v*']
@@ -62,6 +67,17 @@ jobs:
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Extract image-spec from CLI
+        id: spec
+        run: |
+          # Single source of truth: read the integer the CLI compares against, so
+          # the stamped label can never drift from _maybe_prompt_image_rebuild.
+          SPEC="$(grep -E '^_IMAGE_SPEC_VERSION=' bin/cleat | head -1 | grep -oE '[0-9]+' | head -1)"
+          if [ -z "$SPEC" ]; then
+            echo "::error::could not read _IMAGE_SPEC_VERSION from bin/cleat"; exit 1
+          fi
+          echo "spec=$SPEC" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Build and push by digest
@@ -73,6 +89,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: |
             sh.cleat.version=${{ steps.meta.outputs.version }}
+            sh.cleat.image-spec=${{ steps.spec.outputs.spec }}
             org.opencontainers.image.source=https://github.com/cleatdev/cleat
           # provenance attestations would turn each per-arch manifest into a
           # nested index and confuse `docker manifest inspect` consumers,
@@ -135,3 +152,17 @@ jobs:
           docker buildx imagetools inspect "$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}" | tee /tmp/manifest
           grep -q 'linux/amd64' /tmp/manifest
           grep -q 'linux/arm64' /tmp/manifest
+
+      - name: Verify image carries the content-spec and version labels
+        run: |
+          # The CLI's rebuild prompt reads sh.cleat.image-spec to decide whether a
+          # user's image is behind on content; sh.cleat.version is the diagnostics
+          # label. Both MUST be present on every published image (see the INVARIANT
+          # note at the top of this file). Inspect the per-arch image configs and
+          # fail the publish loudly if either label is missing, so a wiring
+          # regression can never ship an image the CLI would mis-classify.
+          docker buildx imagetools inspect \
+            "$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}" \
+            --format '{{ json .Image }}' | tee /tmp/configs
+          grep -q 'sh.cleat.image-spec' /tmp/configs
+          grep -q 'sh.cleat.version' /tmp/configs

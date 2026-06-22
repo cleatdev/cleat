@@ -513,3 +513,16 @@ EOF
   run _trust_prompt "$TEST_TEMP/proj" env <<< "n"
   assert_output --partial "changed since you trusted it"
 }
+
+@test "trust prompt: docker is rendered in sandbox-amber, other caps are not" {
+  # docker breaks the sandbox, so it gets the amber color in the requested list
+  # while a plain mount cap (git) does not. Render the real escape from the
+  # sourced AMBER var (same approach as prune.bats), then assert it precedes
+  # docker but not git.
+  # "n" makes the prompt return 1 (deny); we only care about the rendered list,
+  # which `run` captures regardless of status.
+  local amber; amber="$(printf '%b' "$AMBER")"
+  run _trust_prompt "$TEST_TEMP/proj" git docker <<< "n"
+  assert_output --partial "${amber}docker"
+  refute_output --partial "${amber}git"
+}

@@ -45,6 +45,7 @@ RESOURCES_BATS="$REPO_ROOT/test/unit/resources.bats"
 PRUNE_BATS="$REPO_ROOT/test/unit/prune.bats"
 CLAUDE_JSON_BATS="$REPO_ROOT/test/unit/claude_json.bats"
 CREDENTIALS_BATS="$REPO_ROOT/test/unit/credentials.bats"
+IDLE_SWEEP_BATS="$REPO_ROOT/test/unit/idle_sweep.bats"
 IMAGE_REBUILD_BATS="$REPO_ROOT/test/unit/image_rebuild_check.bats"
 TRUST_BATS="$REPO_ROOT/test/unit/trust.bats"
 DOCKER_COMMANDS_BATS="$REPO_ROOT/test/unit/docker_commands.bats"
@@ -1235,7 +1236,7 @@ try "vnext_resume_init_recreate_callsite" "cmd_resume consults the reaper-drift 
 # vnext: status's own VM-overcommit line (distinct from the on-start warn).
 # Push the comparison out of reach: the status overcommit test fails.
 cat > "$SED_TMP" << 'SED'
-s|(( _limit_sum > _vm_bytes ))|(( _limit_sum > _vm_bytes * 1000 ))|
+s|(( _sum_gb > _vm_gb ))|(( _sum_gb > _vm_gb * 1000 ))|
 SED
 try "vnext_status_overcommit_line" "flags an overcommitted VM" "$CLI" "$PRUNE_BATS"
 
@@ -1243,7 +1244,7 @@ try "vnext_status_overcommit_line" "flags an overcommitted VM" "$CLI" "$PRUNE_BA
 # ~15.6 GiB), never floor to a misleading 15. Revert the rounded display to a floor:
 # the "rounded to the slider, not floored" status test sees "15 GB VM".
 cat > "$SED_TMP" << 'SED'
-s@$(_docker_vm_display_gb "$_vm_bytes") GB VM@$(( _vm_bytes / 1073741824 )) GB VM@
+s@_vm_gb="$(_docker_vm_display_gb "$_vm_bytes")"@_vm_gb="$(( _vm_bytes / 1073741824 ))"@
 SED
 try "vnext_status_vm_size_rounds" "rounded to the slider, not floored" "$CLI" "$PRUNE_BATS"
 
@@ -1412,10 +1413,11 @@ s|mv -f "\$tmp" "\$cred" 2>/dev/null|false|
 SED
 try "bugfix_keychain_seed_write" "writes the keychain blob" "$CLI" "$CREDENTIALS_BATS"
 
-# Seeding must NEVER clobber an existing (possibly fresher) in-box token. Drop
-# the early-return guard: the "never clobbers" test sees its token overwritten.
+# Seeding must NEVER clobber a still-valid in-box token (the box refreshes its
+# own; concept/23). Drop the file-valid early return: the "never clobbers" test
+# sees its valid token overwritten by the fresher Keychain blob.
 cat > "$SED_TMP" << 'SED'
-/\[\[ -s "\$cred" \]\] && return 0/d
+/(( file_exp > now_ms )) && return 0/d
 SED
 try "bugfix_keychain_no_clobber" "never clobbers an existing" "$CLI" "$CREDENTIALS_BATS"
 
@@ -2003,6 +2005,104 @@ cat > "$SED_TMP" << 'SED'
 s|return 0            # auth URL: the bridge owns it|return 1            # auth URL: the bridge owns it|
 SED
 try "vnext_bridge_auth_always_opens" "OPENS an auth URL even on an interactive" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# ── 2026-06-27 bugfix round (img: 25 GB advisory + fresh-project login) ───────
+
+# AUTH (token): a host re-login leaves the shared .credentials.json expired; a
+# fresh box must re-seed from the fresher, valid Keychain instead of dropping to
+# login. Make the file-token always look still-valid: the re-seed never fires and
+# the "re-seeds when EXPIRED" test sees the stale token survive.
+cat > "$SED_TMP" << 'SED'
+s|(( file_exp > now_ms )) && return 0|(( file_exp > 0 )) \&\& return 0|
+SED
+try "bugfix_token_reseed_expired" "re-seeds when the file token is EXPIRED" "$CLI" "$CREDENTIALS_BATS"
+
+# AUTH (token): the re-seed must NOT overwrite from a Keychain token that is
+# itself expired. Drop the kc-still-valid clause: the "does NOT re-seed from a
+# Keychain token that is itself expired" test sees the stale file clobbered.
+cat > "$SED_TMP" << 'SED'
+s|(( kc_exp > file_exp && kc_exp > now_ms ))|(( kc_exp > file_exp ))|
+SED
+try "bugfix_token_reseed_kc_valid" "does NOT re-seed from a Keychain token that is itself expired" "$CLI" "$CREDENTIALS_BATS"
+
+# AUTH (token): _oauth_expires_at must surface the parsed ms epoch. Break the
+# print so it never returns the number: the extraction test fails.
+cat > "$SED_TMP" << 'SED'
+s|\[\[ "\$n" =~ \^\[0-9\]+\$ \]\] && printf '%s' "\$n"|printf '%s' "BROKEN"|
+SED
+try "bugfix_oauth_expires_extract" "extracts the ms epoch" "$CLI" "$CREDENTIALS_BATS"
+
+# AUTH (onboarding): a fresh project must be born with a /workspace block so a
+# newer bundled Claude does not re-run first-run/onboarding. Empty the seeded
+# defaults: the "seeds /workspace trust + onboarding + bypass" test fails.
+cat > "$SED_TMP" << 'SED'
+s|{hasTrustDialogAccepted:true, hasCompletedProjectOnboarding:true, bypassPermissionsModeAccepted:true}|{}|
+SED
+try "bugfix_claudejson_workspace_seed" "seeds /workspace trust" "$CLI" "$CLAUDE_JSON_BATS"
+
+# AUTH (onboarding): onboarding must be forced complete inside the cage. Drop the
+# force: the "forces hasCompletedOnboarding=true even when the host file lacks it"
+# test sees the key absent.
+cat > "$SED_TMP" << 'SED'
+/+ { hasCompletedOnboarding: true }/d
+SED
+try "bugfix_claudejson_force_onboarding" "forces hasCompletedOnboarding=true even when the host file lacks it" "$CLI" "$CLAUDE_JSON_BATS"
+
+# GB: the status overcommit line must trigger and display in the SAME whole-GB
+# unit. Revert the trigger to raw bytes vs MemTotal: a sum in the (MemTotal,
+# slider) band fires while printing a smaller-than-VM number, and the
+# "never contradicts itself" status test sees "overcommitted" appear.
+cat > "$SED_TMP" << 'SED'
+s|(( _sum_gb > _vm_gb ))|(( _limit_sum > _vm_bytes ))|
+SED
+try "bugfix_status_overcommit_unit" "the overcommit line never contradicts itself" "$CLI" "$PRUNE_BATS"
+
+# GB: the overload notice must name the running-session COUNT. Push the count
+# guard out of reach so it falls back to the generic "Running sessions": the
+# "names the running-session COUNT" test no longer sees "5 sessions still running".
+cat > "$SED_TMP" << 'SED'
+s|(( _n_boxes > 0 ))|(( _n_boxes > 999999 ))|
+SED
+try "bugfix_overload_names_count" "names the running-session COUNT" "$CLI" "$PRUNE_BATS"
+
+# GB: the count pluralization must NOT embed a command substitution in a plain
+# assignment (the sub exits 1 on the singular case, aborting `cleat start` under
+# set -e). Reintroduce the unsafe inline form: the strict-mode n==1 regression
+# test aborts before REACHED_END_OK.
+cat > "$SED_TMP" << 'SED'
+s|(( _n_boxes != 1 )) && _s="s"|_s="$( (( _n_boxes != 1 )) \&\& printf s )"|
+SED
+try "bugfix_overload_count_set_e" "set-e abort start with exactly ONE" "$CLI" "$REGRESSIONS"
+
+# IDLE SWEEP: a box with a live claude/node agent must NEVER be stopped (autonomy:
+# unattended work). Drop the liveness skip: the "NEVER stops a box with a live
+# agent" test sees a working box stopped.
+cat > "$SED_TMP" << 'SED'
+/_box_has_live_agent "\$name" && continue/d
+SED
+try "bugfix_idle_liveness_gate" "NEVER stops a box with a live agent" "$CLI" "$IDLE_SWEEP_BATS"
+
+# IDLE SWEEP: the box being launched must be excluded. Drop the self check: the
+# "never stops the box being launched" test sees the self box stopped.
+cat > "$SED_TMP" << 'SED'
+/\[\[ "\$name" == "\$self" \]\] && continue/d
+SED
+try "bugfix_idle_self_exclusion" "never stops the box being launched" "$CLI" "$IDLE_SWEEP_BATS"
+
+# IDLE SWEEP: a box detached inside the grace window must be left alone. Drop the
+# grace check: the "leaves a recently-detached box alone" test sees it stopped.
+cat > "$SED_TMP" << 'SED'
+/(( now - age < grace_secs )) && continue/d
+SED
+try "bugfix_idle_grace_window" "leaves a recently-detached box alone" "$CLI" "$IDLE_SWEEP_BATS"
+
+# IDLE SWEEP: a box with an unknown activity clock (mtime 0) must be skipped,
+# never stopped on a guess. Weaken the guard to accept 0: the "skips a box with
+# unknown age" test sees it stopped.
+cat > "$SED_TMP" << 'SED'
+s|(( age > 0 ))|(( age >= 0 ))|
+SED
+try "bugfix_idle_unknown_age" "skips a box with unknown age" "$CLI" "$IDLE_SWEEP_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

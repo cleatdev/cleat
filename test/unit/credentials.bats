@@ -115,15 +115,17 @@ EOF
   assert_equal "$mode" "600"
 }
 
-@test "seed: never clobbers an existing (possibly fresher) in-box token" {
+@test "seed: never clobbers an existing, still-valid in-box token (even if the Keychain is fresher)" {
   _is_macos() { return 0; }
-  _macos_keychain_credentials() { printf '%s' "$BLOB"; }   # keychain has a DIFFERENT token
+  # In-box token is still VALID; the Keychain's is even fresher. The box refreshes
+  # its own long-lived token (concept/23), so a valid file is never overwritten.
+  _macos_keychain_credentials() { printf '%s' '{"claudeAiOauth":{"accessToken":"KC-EVEN-FRESHER","expiresAt":9000000000}}'; }
   mkdir -p "${HOME}/.claude"
-  printf '%s' '{"claudeAiOauth":{"accessToken":"IN-BOX-FRESH"}}' > "$CRED"
-  _seed_macos_credentials
+  printf '%s' '{"claudeAiOauth":{"accessToken":"IN-BOX-VALID","expiresAt":5000000000}}' > "$CRED"
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials   # now_ms 2e9: file (5e9) valid, kc (9e9) fresher
   run cat "$CRED"
-  assert_output --partial "IN-BOX-FRESH"
-  refute_output --partial "sk-ant-oat01-abc"
+  assert_output --partial "IN-BOX-VALID"
+  refute_output --partial "KC-EVEN-FRESHER"
 }
 
 @test "seed: no-op off macOS (Linux keeps its existing dir-mounted creds file)" {
@@ -158,4 +160,88 @@ EOF
   _seed_macos_credentials
   run bash -c "ls ${HOME}/.claude/.credentials.json.tmp.* 2>/dev/null | wc -l | tr -d ' '"
   assert_output "0"
+}
+
+# ── _oauth_expires_at ────────────────────────────────────────────────────────
+
+@test "oauth_expires_at: extracts the ms epoch from a credential blob" {
+  local r
+  r="$(printf '%s' '{"claudeAiOauth":{"accessToken":"x","expiresAt":1719000000000,"scopes":["a"]}}' | _oauth_expires_at)"
+  assert_equal "$r" "1719000000000"
+}
+
+@test "oauth_expires_at: empty when there is no expiresAt" {
+  local r
+  r="$(printf '%s' '{"claudeAiOauth":{"accessToken":"x"}}' | _oauth_expires_at)"
+  assert_equal "$r" ""
+}
+
+# ── _seed_macos_credentials: expiresAt-aware re-seed (host re-login propagation) ─
+# A host re-login rotates the Keychain token and invalidates the file's now-stale
+# refresh token. A freshly-created box that has never refreshed reads that dead
+# token and drops to an interactive LOGIN. The re-seed closes that gap WITHOUT
+# ever clobbering a still-valid (possibly fresher) in-box token. now is pinned
+# via _CLEAT_NOW_S (=2,000,000 s -> now_ms 2,000,000,000).
+
+@test "seed: re-seeds when the file token is EXPIRED and the Keychain has a fresher one" {
+  _is_macos() { return 0; }
+  EXPIRED='{"claudeAiOauth":{"accessToken":"STALE-FILE","expiresAt":1000000000}}'
+  FRESH='{"claudeAiOauth":{"accessToken":"FRESH-KC","refreshToken":"new","expiresAt":3000000000}}'
+  _macos_keychain_credentials() { printf '%s' "$FRESH"; }
+  mkdir -p "${HOME}/.claude"
+  printf '%s' "$EXPIRED" > "$CRED"
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials
+  run cat "$CRED"
+  assert_output --partial "FRESH-KC"
+  refute_output --partial "STALE-FILE"
+  [[ "$_SEEDED_CREDS" == "1" ]] || { echo "_SEEDED_CREDS not set on re-seed"; return 1; }
+}
+
+@test "seed: does NOT clobber an expired file when the Keychain token is older" {
+  _is_macos() { return 0; }
+  EXPIRED='{"claudeAiOauth":{"accessToken":"STALE-FILE","expiresAt":1500000000}}'
+  OLDER_KC='{"claudeAiOauth":{"accessToken":"OLDER-KC","expiresAt":1200000000}}'
+  _macos_keychain_credentials() { printf '%s' "$OLDER_KC"; }
+  mkdir -p "${HOME}/.claude"
+  printf '%s' "$EXPIRED" > "$CRED"
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials
+  run cat "$CRED"
+  assert_output --partial "STALE-FILE"
+  refute_output --partial "OLDER-KC"
+}
+
+@test "seed: does NOT re-seed from a Keychain token that is itself expired" {
+  _is_macos() { return 0; }
+  EXPIRED='{"claudeAiOauth":{"accessToken":"STALE-FILE","expiresAt":1000000000}}'
+  NEWER_BUT_EXPIRED='{"claudeAiOauth":{"accessToken":"KC-EXPIRED","expiresAt":1800000000}}'
+  _macos_keychain_credentials() { printf '%s' "$NEWER_BUT_EXPIRED"; }
+  mkdir -p "${HOME}/.claude"
+  printf '%s' "$EXPIRED" > "$CRED"
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials
+  run cat "$CRED"
+  assert_output --partial "STALE-FILE"
+  refute_output --partial "KC-EXPIRED"
+}
+
+@test "seed: keeps the file when the Keychain blob has no parseable expiry" {
+  _is_macos() { return 0; }
+  EXPIRED='{"claudeAiOauth":{"accessToken":"STALE-FILE","expiresAt":1000000000}}'
+  _macos_keychain_credentials() { printf '%s' '{"claudeAiOauth":{"accessToken":"NOEXP-KC"}}'; }
+  mkdir -p "${HOME}/.claude"
+  printf '%s' "$EXPIRED" > "$CRED"
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials
+  run cat "$CRED"
+  assert_output --partial "STALE-FILE"
+  refute_output --partial "NOEXP-KC"
+}
+
+@test "seed: keeps a file token that has no parseable expiry (cannot prove it stale)" {
+  _is_macos() { return 0; }
+  _macos_keychain_credentials() { printf '%s' "$BLOB"; }
+  mkdir -p "${HOME}/.claude"
+  printf '%s' '{"claudeAiOauth":{"accessToken":"NOEXP-FILE"}}' > "$CRED"
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials
+  run cat "$CRED"
+  assert_output --partial "NOEXP-FILE"
+  refute_output --partial "sk-ant-oat01-abc"
 }

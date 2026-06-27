@@ -86,13 +86,62 @@ teardown() { _common_teardown; }
   local out_a="$CLEAT_PROJECTS_DIR/proj-a/claude.json"
   local out_b="$CLEAT_PROJECTS_DIR/proj-b/claude.json"
   mkdir -p "$(dirname "$out_a")"
-  echo '{"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > "$out_a"
+  # A granted a DISTINCTIVE, project-specific approval (a tool allow-list and an
+  # MCP server). These must never appear in B. (B does get the generic born-in-
+  # the-cage /workspace defaults, asserted separately below; those are not a bleed.)
+  echo '{"projects":{"/workspace":{"hasTrustDialogAccepted":true,"allowedTools":["LeakTool"],"mcpServers":{"secret":1}}}}' > "$out_a"
 
-  # Building project B (with no prior state) must not inherit A's approval.
   _build_project_claude_json "$out_b"
 
-  run jq -r '.projects["/workspace"].hasTrustDialogAccepted // "absent"' "$out_b"
+  run jq -r '.projects["/workspace"].allowedTools // "absent"' "$out_b"
   assert_output "absent"
+  run jq -r '.projects["/workspace"].mcpServers // "absent"' "$out_b"
+  assert_output "absent"
+}
+
+# ── fresh project is born trusted + onboarded INSIDE the cage (auth hardening) ──
+# The sandbox is the trust boundary and cleat always launches claude with
+# --dangerously-skip-permissions, so a brand-new /workspace must arrive pre-
+# accepted. Without this, a newer bundled Claude re-runs first-run/onboarding
+# (which can surface as a LOGIN screen) in a project that has no persisted block.
+
+@test "build: a fresh project seeds /workspace trust + onboarding + bypass accept" {
+  # Host has identity but never ran Claude in THIS dir (no /workspace), and there
+  # is no persisted per-project copy: the exact state of a brand-new project.
+  echo '{"oauthAccount":{"emailAddress":"real@b.com"},"hasCompletedOnboarding":true,"lastOnboardingVersion":"2.1.150"}' > "$HOST_JSON"
+  rm -f "$OUT"
+
+  _build_project_claude_json "$OUT"
+
+  run jq -r '.projects["/workspace"].hasTrustDialogAccepted' "$OUT"
+  assert_output "true"
+  run jq -r '.projects["/workspace"].hasCompletedProjectOnboarding' "$OUT"
+  assert_output "true"
+  run jq -r '.projects["/workspace"].bypassPermissionsModeAccepted' "$OUT"
+  assert_output "true"
+}
+
+@test "build: forces hasCompletedOnboarding=true even when the host file lacks it" {
+  echo '{"oauthAccount":{"emailAddress":"real@b.com"}}' > "$HOST_JSON"
+  rm -f "$OUT"
+  _build_project_claude_json "$OUT"
+  run jq -r '.hasCompletedOnboarding' "$OUT"
+  assert_output "true"
+}
+
+@test "build: a persisted /workspace value still wins over the seeded default" {
+  echo '{"oauthAccount":{"emailAddress":"real@b.com"}}' > "$HOST_JSON"
+  mkdir -p "$(dirname "$OUT")"
+  # The project explicitly turned bypass OFF and granted a tool: both must survive.
+  echo '{"projects":{"/workspace":{"bypassPermissionsModeAccepted":false,"allowedTools":["Bash"]}}}' > "$OUT"
+  _build_project_claude_json "$OUT"
+  run jq -r '.projects["/workspace"].bypassPermissionsModeAccepted' "$OUT"
+  assert_output "false"
+  run jq -r '.projects["/workspace"].allowedTools[0]' "$OUT"
+  assert_output "Bash"
+  # the seeded defaults still fill the gaps the persisted block left open
+  run jq -r '.projects["/workspace"].hasTrustDialogAccepted' "$OUT"
+  assert_output "true"
 }
 
 # ── fresh machine: onboarding done inside a container sticks ─────────────────
@@ -110,7 +159,7 @@ teardown() { _common_teardown; }
   assert_output "true"
 }
 
-@test "build: with neither host nor persisted file, output is valid empty JSON" {
+@test "build: with neither host nor persisted file, output is valid JSON" {
   rm -f "$HOST_JSON"
   rm -f "$OUT"
 
@@ -119,6 +168,9 @@ teardown() { _common_teardown; }
   [[ -f "$OUT" ]]
   run jq -e . "$OUT"
   assert_success
+  # Even with no host/persisted state, the box is born onboarded + trusted.
+  run jq -r '.hasCompletedOnboarding' "$OUT"
+  assert_output "true"
 }
 
 # ── installMethod (container is always a native install) ────────────────────

@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.0.0"
+VERSION="1.1.0"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="1.0.0"
+RELEASE_HIGHLIGHT_VERSION="1.1.0"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -513,23 +513,65 @@ _macos_keychain_credentials() {
   return 1
 }
 
+# Extract the OAuth token's expiry (epoch MILLISECONDS) from a Claude credentials
+# blob on stdin; empty when absent or unparseable. Pure-bash grep (no jq dep),
+# case-insensitive so it matches `expiresAt` whatever the wrapper key around it,
+# same leading-zero-safe style as the swap reader. Claude stores expiresAt in ms;
+# a missing, non-numeric, or seconds-scaled value just fails the validity compare
+# in _seed_macos_credentials, which then keeps the existing file untouched (the
+# safe path). Overridable indirectly via the blob the caller pipes in.
+_oauth_expires_at() {
+  local n
+  n="$(grep -iEo '"expiresat"[[:space:]]*:[[:space:]]*[0-9]+' 2>/dev/null \
+         | grep -Eo '[0-9]+' | tail -1 || true)"
+  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n"
+  # Always succeed: the caller assigns this in `x="$(...)"`, and a non-zero exit
+  # there trips the CLI's `set -e` (a missing/absent expiresAt is normal, not an
+  # error). The empty stdout is the signal; the exit code must stay 0.
+  return 0
+}
+
 # On macOS, materialize the Keychain-stored OAuth credential into
 # ~/.claude/.credentials.json (the path Claude reads on Linux), so the box,
 # which only sees the mounted ~/.claude dir, never the Keychain, starts
-# authenticated instead of re-prompting. Only when that file is absent/empty:
-# once a box has a token it refreshes its own (the refresh token is long-lived),
-# so we never clobber a fresher in-box token with a staler Keychain copy. The
-# blob is validated as a JSON object and written 0600. No-op off macOS, when the
-# Keychain has nothing, or when the file already exists (Linux hosts keep it
-# there already; this never runs for them). Sets _SEEDED_CREDS=1 on a write.
+# authenticated instead of re-prompting. The blob is validated as a JSON object
+# and written 0600. No-op off macOS or when the Keychain has nothing.
+#
+# When to (re)seed:
+#   - File ABSENT/empty  -> seed (Linux hosts already have it; this never runs).
+#   - File PRESENT       -> re-seed ONLY when its OAuth token has EXPIRED *and*
+#                           the Keychain holds a fresher, still-valid one.
+# The re-seed closes the host-re-login gap (concept/23 open item): a host
+# re-login rotates the Keychain token and invalidates the file's now-stale
+# refresh token, so a freshly-created box that has never refreshed reads a dead
+# token from the shared file and drops to an interactive LOGIN. A still-valid
+# file token is never touched (the box refreshes its own and may be fresher than
+# the Keychain). Anything we can't parse (no expiresAt, non-numeric, seconds
+# scale) falls through to "keep the file", so an unrecognized schema can never
+# trigger a clobber. Sets _SEEDED_CREDS=1 on a write. _CLEAT_NOW_S overrides the
+# clock for tests.
 _SEEDED_CREDS=0
 _seed_macos_credentials() {
   _is_macos || return 0
   local cred="${HOME}/.claude/.credentials.json"
-  [[ -s "$cred" ]] && return 0
-  local blob
-  blob="$(_macos_keychain_credentials)" || return 0
-  [[ -n "$blob" ]] || return 0
+  local blob=""
+  if [[ -s "$cred" ]]; then
+    local file_exp kc_exp now_ms
+    file_exp="$(_oauth_expires_at < "$cred" 2>/dev/null)"
+    [[ "$file_exp" =~ ^[0-9]+$ ]] || return 0          # unparseable file token -> keep
+    now_ms=$(( ${_CLEAT_NOW_S:-$(date +%s)} * 1000 ))
+    (( file_exp > now_ms )) && return 0                # file token still valid -> keep
+    blob="$(_macos_keychain_credentials)" || return 0
+    [[ -n "$blob" ]] || return 0
+    kc_exp="$(printf '%s' "$blob" | _oauth_expires_at 2>/dev/null)"
+    [[ "$kc_exp" =~ ^[0-9]+$ ]] || return 0            # unparseable keychain token -> keep
+    # Only a Keychain token that is BOTH fresher than the file's AND not itself
+    # expired earns the overwrite; otherwise keep what we have.
+    (( kc_exp > file_exp && kc_exp > now_ms )) || return 0
+  else
+    blob="$(_macos_keychain_credentials)" || return 0
+    [[ -n "$blob" ]] || return 0
+  fi
   mkdir -p "${HOME}/.claude" 2>/dev/null || return 0
   local tmp="${cred}.tmp.$$"
   ( umask 077; printf '%s' "$blob" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
@@ -1780,12 +1822,28 @@ _build_project_claude_json() {
     if jq -n --slurpfile h "$hf" --slurpfile p "$pf" '
         ($h[0] // {}) as $host |
         ($p[0] // {}) as $proj |
+        (($host.projects // {}) + ($proj.projects // {})) as $projects |
+        # What a brand-new /workspace is born with INSIDE the cage. The sandbox
+        # IS the trust boundary and cleat always launches claude with
+        # --dangerously-skip-permissions, so pre-accepting folder trust, project
+        # onboarding, and bypass mode for /workspace is correct, and it stops a
+        # newer bundled Claude from re-running its first-run/onboarding flow (which
+        # can surface as a login screen) in a fresh project that has no persisted
+        # block. Defaults are on the LEFT of `+`, so any persisted/host /workspace
+        # value wins per key (jq `+` is right-biased). Unknown future key names are
+        # harmless extras; the real ones gate the prompts.
+        ({hasTrustDialogAccepted:true, hasCompletedProjectOnboarding:true, bypassPermissionsModeAccepted:true}) as $wsdefaults |
         $host
-        + { projects: (($host.projects // {}) + ($proj.projects // {})) }
-        + ( ["oauthAccount","userID","hasCompletedOnboarding","lastOnboardingVersion"]
+        + { projects: ($projects + { "/workspace": ($wsdefaults + ($projects["/workspace"] // {})) }) }
+        + ( ["oauthAccount","userID","lastOnboardingVersion"]
             | map({ (.): ($host[.] // $proj[.]) })
             | add
             | with_entries(select(.value != null)) )
+        # Onboarding is complete by construction inside the cage (identity still
+        # comes from oauthAccount above; a box with no token still shows login).
+        # Forcing it stops a newer in-box Claude from re-onboarding a fresh
+        # project whose host lastOnboardingVersion lags (or is absent).
+        + { hasCompletedOnboarding: true }
         # The container always runs the native installer build (~/.local/bin/
         # claude → versions/), but this file is rebuilt from the host every run,
         # shadowing the installMethod the installer wrote at image-build time.
@@ -2841,6 +2899,13 @@ exec_claude() {
   _BROWSER_WATCHER_PID=""
   _HOOK_BRIDGE_PID=""
   mkdir -p "$_CLIP_DIR"
+  # Stamp this box's run dir with an ATTACH timestamp for the idle sweep's grace
+  # gate. The dir's own mtime would otherwise freeze at creation (writes go into
+  # the clip/ subdir, not the dir itself), so the grace would measure age-since
+  # -creation, not idle-since-detach. _cleanup_session re-stamps it on detach, so
+  # `now - mtime(run dir)` is the true time since the session last had a host
+  # process. Fail-soft.
+  touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
 
   # On macOS, bridge the host Keychain's OAuth token into the box before Claude
   # launches (the ~/.claude mount is live, so a write here is visible inside the
@@ -2873,6 +2938,10 @@ exec_claude() {
     if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
       rm -f "$_CLIP_DIR/.host-ready"
     fi
+    # Re-stamp the run dir on detach so the idle sweep's grace measures time since
+    # THIS session let go, not since the container was created (see the attach
+    # touch above). Fail-soft.
+    touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
   }
 
   local clip_cmd
@@ -3022,9 +3091,17 @@ UPDATE_CHECK_INTERVAL=600   # 10 minutes; a release cut minutes after a launch
 # minute, and the check costs a handful of docker calls.
 PRESSURE_CHECK_FILE="$REPO_DIR/.pressure_check"
 PRESSURE_CHECK_INTERVAL=86400
+# Idle-session sweep: on every interactive start, stop OTHER cleat boxes that are
+# provably safe to stop (detached, no agent running, idle past the grace window),
+# so a day of closed-terminal boxes stops silently reserving Docker VM memory.
+# Closing a terminal ends the foreground exec but leaves the container running;
+# this reclaims those. Grace defaults to 30 min so a box you stepped away from
+# and will resume in a minute is left alone. Override with CLEAT_IDLE_GRACE_MINS;
+# disable the whole sweep with CLEAT_NO_IDLE_SWEEP=1. See concept/25.
+_IDLE_SWEEP_GRACE_SECS=1800
 # Docker Desktop resources advisory (the VM memory/swap/file-sharing tuning the
 # `docker` CLI cannot change). A box and a worktree are the same thing here:
-# each is one session with its own ~4g ceiling. 16 GiB is a comfortable default
+# each is one session with its own quarter-of-VM ceiling (4-8g). 16 GiB is a comfortable default
 # (a handful of sessions can each spike near their ceiling at once and still fit),
 # NOT a hard cap: ceilings aren't reservations, so you can run many more sessions
 # than that, and only simultaneous genuinely-heavy memory work across them swaps
@@ -4617,13 +4694,23 @@ cmd_status() {
   # ── VM memory budget: running containers' limits vs what the VM actually
   # has. Overcommit means the limits can't bind and a runaway process swap-
   # thrashes EVERY session at once (counts all containers: the VM is shared).
-  local _vm_bytes _limit_sum
+  # Trigger AND display in the SAME whole-GB unit (the configured slider via
+  # _docker_vm_display_gb), mirroring the on-start overload path: comparing raw
+  # bytes against the kernel's MemTotal while PRINTING the rounded slider let the
+  # line fire and then print parity ("promised 24 GB of a 24 GB VM") or even an
+  # inverted "promised 23 GB of a 24 GB VM" whenever the sum landed in the gap
+  # between MemTotal and the slider. One unit for both makes that impossible.
+  local _vm_bytes _limit_sum _sum_gb _vm_gb
   _vm_bytes="$(_docker_vm_memory)"
   if [[ "$_vm_bytes" =~ ^[0-9]+$ ]] && (( _vm_bytes > 0 )); then
     _limit_sum="$(_running_memory_limits_sum)"
-    if [[ "$_limit_sum" =~ ^[0-9]+$ ]] && (( _limit_sum > _vm_bytes )); then
-      echo ""
-      echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers are promised $(( _limit_sum / 1073741824 )) GB of a $(_docker_vm_display_gb "$_vm_bytes") GB VM${RESET}"
+    if [[ "$_limit_sum" =~ ^[0-9]+$ ]]; then
+      _sum_gb=$(( _limit_sum / 1073741824 ))
+      _vm_gb="$(_docker_vm_display_gb "$_vm_bytes")"
+      if (( _sum_gb > _vm_gb )); then
+        echo ""
+        echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers reserve ${_sum_gb} GB of ceilings on a ${_vm_gb} GB VM${RESET}"
+      fi
     fi
   fi
   echo ""
@@ -4756,9 +4843,25 @@ _running_memory_limits_sum() {
   echo "$sum"
 }
 
+# Names of RUNNING cleat boxes, one per line (the sh.cleat.version label is on
+# every box this CLI creates; non-cleat containers never carry it). Seam for the
+# overload message's session count and the idle sweep. Empty on a down daemon.
+_running_cleat_boxes() {
+  docker ps --filter "label=sh.cleat.version" --format '{{.Names}}' 2>/dev/null || true
+}
+
+# Count of running cleat boxes (0 on any failure).
+_running_cleat_box_count() {
+  local n=0 name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && n=$(( n + 1 ))
+  done < <(_running_cleat_boxes)
+  echo "$n"
+}
+
 # Recommended Docker VM size in whole GB: the comfortable-default target
 # (_PRESSURE_TARGET_VM_GB, 16 GiB, room for several sessions to each spike near
-# their ~4g ceiling at once, NOT a session cap), but never more than half the
+# their quarter-of-VM ceiling at once, NOT a session cap), but never more than half the
 # host's RAM (leave the rest for macOS + apps). Host RAM unknown → just the
 # target. Always ≥ 1. Arg: $1 = host RAM bytes (may be empty).
 _recommended_vm_gb() {
@@ -4792,6 +4895,84 @@ _print_docker_vm_fix() {
   fi
   echo -e "    ${DIM}•${RESET} ${BOLD}Settings → Resources → Advanced${RESET}${DIM}: set ${RESET}${BOLD}Memory limit ${rec_gb} GB${RESET}${DIM} and ${RESET}${BOLD}Swap ≥ 2 GB${RESET}${DIM}, then Apply & restart${RESET}${max_note}"
   echo -e "    ${DIM}•${RESET} ${DIM}Faster I/O: ${RESET}${BOLD}Settings → General → Virtual Machine Options${RESET}${DIM} → ${RESET}${BOLD}VirtioFS${RESET}"
+}
+
+# ── Idle-session sweep ───────────────────────────────────────────────────────
+# True when a real agent is running inside the box: claude (a node process) or a
+# bare node shows in the container's process list. A DETACHED box (terminal
+# closed, the foreground exec gone) runs only docker-init/su/bash, so this is
+# false. A box working UNATTENDED keeps its host `docker exec` (and thus the
+# claude/node process) alive, so this is TRUE and the sweep leaves it strictly
+# alone (the "leave it running, walk away" promise). `docker top` reads the
+# process list from the daemon (the image ships no `ps`), so no exec is needed.
+# Fails SAFE: any error, or output we can't read, is treated as "live" → skip.
+_box_has_live_agent() {
+  local top
+  top="$(docker top "$1" 2>/dev/null)" || return 0     # unreadable → assume live (safe)
+  [[ -n "$top" ]] || return 0                          # empty → assume live (safe)
+  printf '%s\n' "$top" | grep -qiE 'claude|node'
+}
+
+# Stop cleat boxes that are PROVABLY safe to stop: detached (no live agent) AND
+# idle past the grace window. Never stops $1 (the box being launched now) or any
+# box with a live agent. A stopped box is preserved on disk; running `cleat` in
+# its project brings it right back, so the notice does not nag about resuming.
+# Prints ONE summary line when it stops anything. Args: $1 = self cname to skip,
+# $2 = grace seconds. Fail-soft; TTY-gating is the caller's job.
+_sweep_idle_boxes() {
+  local self="${1:-}" grace_secs="${2:-$_IDLE_SWEEP_GRACE_SECS}"
+  local now name age mem victims=() freed=0
+  now="$(date +%s)"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$name" == "$self" ]] && continue
+    # Grace gate FIRST (cheap, local, and decisive for cost): the run dir's mtime
+    # is re-stamped on attach AND detach (exec_claude / _cleanup_session), so
+    # `now - mtime` is the time since this box last had a host session. Skip boxes
+    # inside the grace window, and skip an unknown age (0/unreadable) rather than
+    # stop on an unknown clock. Running this before the `docker top` round-trip
+    # avoids one daemon call per within-grace box AND shrinks the window where a
+    # box another terminal just re-attached to (mtime freshly stamped) could be
+    # caught during its bring-up, before claude shows up in the process list.
+    age="$(_path_mtime "$CLEAT_RUN_DIR/$name")"
+    [[ "$age" =~ ^[0-9]+$ ]] && (( age > 0 )) || continue
+    (( now - age < grace_secs )) && continue
+    # Liveness gate: a claude/node process means the box is attached or working
+    # unattended → never touch it. Fail-safe (an unreadable `docker top` = live).
+    _box_has_live_agent "$name" && continue
+    mem="$(docker inspect --format '{{.HostConfig.Memory}}' "$name" 2>/dev/null)" || mem=0
+    [[ "$mem" =~ ^[0-9]+$ ]] && (( mem > 0 )) && freed=$(( freed + mem ))
+    victims+=("$name")
+  done < <(_running_cleat_boxes)
+
+  [[ ${#victims[@]} -gt 0 ]] || return 0
+  docker stop "${victims[@]}" >/dev/null 2>&1 || true
+  local n=${#victims[@]} gb=$(( (freed + 536870912) / 1073741824 )) freed_note=""
+  (( gb > 0 )) && freed_note=", freed ${gb} GB"
+  echo ""
+  info "Stopped ${n} idle session$( (( n != 1 )) && printf s )${freed_note}. ${DIM}A detached box keeps its memory ceiling until stopped.${RESET}"
+}
+
+# On-start wrapper: TTY-only (never on a pipe or in cron), opt-out via
+# CLEAT_NO_IDLE_SWEEP=1, grace override via CLEAT_IDLE_GRACE_MINS. Resolves the
+# box being launched from the same [box] positional the dispatch passes, so the
+# sweep never stops the session you are starting. Entirely fail-soft.
+_maybe_sweep_idle_boxes() {
+  _is_tty || return 0
+  [[ "${CLEAT_NO_IDLE_SWEEP:-}" == "1" ]] && return 0
+  command -v docker >/dev/null 2>&1 || return 0
+  # Don't sweep for a malformed invocation that _set_box is about to reject (an
+  # extra positional, or an invalid box name): a command that won't run must not
+  # stop any box. Let validation error first.
+  [[ $# -gt 1 ]] && return 0
+  [[ -n "${1:-}" ]] && ! _validate_box_name "$1" 2>/dev/null && return 0
+  local grace_secs="$_IDLE_SWEEP_GRACE_SECS"
+  [[ "${CLEAT_IDLE_GRACE_MINS:-}" =~ ^[0-9]+$ ]] && grace_secs=$(( CLEAT_IDLE_GRACE_MINS * 60 ))
+  local self_project self_box="main" self_cname=""
+  self_project="$(resolve_project 2>/dev/null || printf '%s' "$PWD")"
+  [[ -n "${1:-}" ]] && self_box="$1"   # already validated above
+  self_cname="$(container_name_for "$self_project" "$self_box" 2>/dev/null || true)"
+  _sweep_idle_boxes "$self_cname" "$grace_secs"
 }
 
 _maybe_check_docker_pressure() {
@@ -4845,7 +5026,7 @@ _maybe_check_docker_pressure() {
   fi
 
   # 2. VM memory vs the host + the running sessions. A box and a worktree are
-  #    the same thing here: one session, one ~4g ceiling. Both point at the one
+  #    the same thing here: one session, one quarter-of-VM ceiling. Both point at the one
   #    knob the `docker` CLI can't change: the Docker Desktop memory slider.
   local vm_bytes sum host_bytes vm_gb rec_gb is_dd=false host_note=""
   vm_bytes="$(_docker_vm_memory)"
@@ -4881,12 +5062,32 @@ _maybe_check_docker_pressure() {
     #     only (it's transient, not a config error worth nagging every start).
     if $overloaded && $bloat_due; then
       echo ""
-      warn "Running sessions are promised ${sum_gb} GB but the Docker VM has only ${vm_gb} GB${host_note}. Under load everything swaps and sessions freeze."
+      # Name the COUNT of running cleat sessions, not just a GB number: "promised
+      # 25 GB" next to a 24 GB slider reads like an off-by-one rounding bug, when
+      # it's really N boxes each reserving a quarter-of-VM ceiling. The GB clause
+      # has a SEPARATE subject ("running containers"), because the sum spans ALL
+      # running containers (the VM is shared) while the count is cleat-only: a
+      # non-cleat stack must not be mislabeled as cleat sessions. "reserve
+      # ceilings" (not "promised") also stops the number reading as a hard
+      # reservation or live usage (idle boxes touch a fraction of their ceiling).
+      # _s is computed with a standalone `(( )) && _s=s` (set -e safe: a failing
+      # non-final command of a top-level &&-list is exempt), NOT inside the
+      # assignment, where the substitution's exit 1 on the singular case would
+      # abort `cleat start` under `set -euo pipefail`.
+      local _n_boxes _who _s=""
+      _n_boxes="$(_running_cleat_box_count)"
+      if [[ "$_n_boxes" =~ ^[0-9]+$ ]] && (( _n_boxes > 0 )); then
+        (( _n_boxes != 1 )) && _s="s"
+        _who="${_n_boxes} session${_s} still running"
+      else
+        _who="Sessions are still running"
+      fi
+      warn "${_who}; running containers reserve ${sum_gb} GB of memory ceilings but the Docker VM holds only ${vm_gb} GB${host_note}. Under load they swap together and freeze."
       if $is_dd && (( rec_gb > vm_gb )); then
-        echo -e "    ${DIM}Stop a session, or give Docker more memory (Docker Desktop only):${RESET}"
+        echo -e "    ${DIM}Closing a terminal does not stop its box. Stop one you are done with, or give Docker more memory (Docker Desktop only):${RESET}"
         _print_docker_vm_fix "$host_bytes" "$rec_gb"
       else
-        echo -e "    ${DIM}Run fewer sessions at once, or lower a box's ceiling with ${RESET}${BOLD}[resources] memory${RESET}${DIM} in .cleat.${RESET}"
+        echo -e "    ${DIM}Closing a terminal does not stop its box. Stop ones you are done with (${RESET}${BOLD}cleat stop${RESET}${DIM}), or lower a box's ceiling with ${RESET}${BOLD}[resources] memory${RESET}${DIM} in .cleat.${RESET}"
       fi
       printed=true
       _VM_ADVISORY_SHOWN=1
@@ -4913,7 +5114,7 @@ _maybe_check_docker_pressure() {
       if $bad; then
         echo ""
         warn "Docker VM memory is ${BOLD}${vm_gb} GB${RESET}${host_note}. Tight for parallel sessions."
-        echo -e "    ${DIM}Each box/worktree gets a ~4 GB ceiling. Give Docker more memory (Docker Desktop only):${RESET}"
+        echo -e "    ${DIM}Each box reserves a memory ceiling (a quarter of the VM). Give Docker more memory (Docker Desktop only):${RESET}"
         _print_docker_vm_fix "$host_bytes" "$rec_gb"
         printed=true
         _VM_ADVISORY_SHOWN=1
@@ -5908,6 +6109,7 @@ main() {
   case "$cmd" in
     start|resume|r|run|claude|shell|sh)
       _maybe_prompt_cli_update
+      _maybe_sweep_idle_boxes "$@"
       _maybe_check_docker_pressure
       _maybe_show_release_highlight
       _maybe_announce_docker_ready

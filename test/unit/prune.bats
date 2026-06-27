@@ -202,8 +202,23 @@ teardown() { _common_teardown; }
   _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB promised
   run _maybe_check_docker_pressure
   assert_success
-  assert_output --partial "promised 40 GB"
+  assert_output --partial "reserve 40 GB of memory ceilings"
   assert_output --partial "8 GB"
+}
+
+@test "pressure: the overload notice names the running-session COUNT, not just GB" {
+  # "promised 25 GB" next to a 24 GB slider read like a rounding bug. Naming the
+  # session count makes it legible as "you have N sessions still running", and the
+  # mental-model line explains why closing a terminal did not free the memory.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }            # 8 GiB VM
+  _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB → overcommitted
+  _running_cleat_box_count() { echo "5"; }              # 5 boxes still running
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "5 sessions still running"
+  assert_output --partial "Closing a terminal does not stop its box"
 }
 
 @test "pressure: silent when limits fit the VM" {
@@ -213,7 +228,7 @@ teardown() { _common_teardown; }
   _running_memory_limits_sum() { echo "4294967296"; }
   run _maybe_check_docker_pressure
   assert_success
-  refute_output --partial "promised"
+  refute_output --partial "memory ceilings but"
 }
 
 # ── Docker Desktop memory advisory (a comfortable default VM for parallel work) ─
@@ -467,10 +482,10 @@ teardown() { _common_teardown; }
   _is_docker_desktop() { return 0; }
   run _maybe_check_docker_pressure
   assert_success
-  assert_output --partial "promised 40 GB"
+  assert_output --partial "reserve 40 GB of memory ceilings"
   assert_output --partial "Resources"           # the how-to is appended to the overload notice
-  assert_output --partial "Stop a session"       # the overload (2a) lead-in
-  refute_output --partial "Each box/worktree"    # but NOT the 2b undersized-VM lead-in (overload returns first)
+  assert_output --partial "Stop one you are done with"   # the overload (2a) lead-in
+  refute_output --partial "Each box reserves a memory ceiling"   # but NOT the 2b undersized-VM lead-in (overload returns first)
 }
 
 @test "pressure: overload off Docker Desktop warns without the (inapplicable) Docker Desktop steps" {
@@ -482,7 +497,7 @@ teardown() { _common_teardown; }
   _is_docker_desktop() { return 1; }                    # native engine, no slider
   run _maybe_check_docker_pressure
   assert_success
-  assert_output --partial "promised 40 GB"
+  assert_output --partial "reserve 40 GB of memory ceilings"
   refute_output --partial "Resources"        # no Docker Desktop click-path on a native engine
 }
 
@@ -500,10 +515,10 @@ teardown() { _common_teardown; }
   _is_docker_desktop() { return 0; }                    # Docker Desktop, but can't grow
   run _maybe_check_docker_pressure
   assert_success
-  assert_output --partial "promised 16 GB"
+  assert_output --partial "reserve 16 GB of memory ceilings"
   assert_output --partial "of your"                      # names the real host RAM …
   assert_output --partial "8 GB"                         # … the 8 GB Mac
-  assert_output --partial "Run fewer sessions"           # reduce demand …
+  assert_output --partial "Stop ones you are done with"  # reduce demand …
   assert_output --partial "[resources] memory"           # … or lower a box's own ceiling
   # Must NOT tell the user to set the VM to a number it already exceeds.
   refute_output --partial "Settings"
@@ -526,8 +541,8 @@ teardown() { _common_teardown; }
   _is_docker_desktop() { return 0; }
   run _maybe_check_docker_pressure
   assert_success
-  refute_output --partial "promised 24 GB but the Docker VM has only 24 GB"   # no self-contradiction
-  refute_output --partial "everything swaps"                                   # 24 !> 24 → no false overload
+  refute_output --partial "reserve 24 GB of memory ceilings but the Docker VM holds only 24 GB"   # no self-contradiction
+  refute_output --partial "swap together and freeze"                           # 24 !> 24 → no false overload
 }
 
 @test "pressure: a non-numeric running-limits sum does not abort the VM advisory" {
@@ -543,7 +558,7 @@ teardown() { _common_teardown; }
   run _maybe_check_docker_pressure
   assert_success
   assert_output --partial "Docker VM memory is"   # 2b advisory still reached
-  refute_output --partial "promised"              # overload must NOT fire on a non-numeric sum
+  refute_output --partial "memory ceilings but"   # overload must NOT fire on a non-numeric sum
 }
 
 @test "pressure: throttled to once per interval" {
@@ -1008,7 +1023,7 @@ teardown() { _common_teardown; }
   run cmd_status "$TEST_TEMP/project"
   assert_success
   assert_output --partial "overcommitted"
-  assert_output --partial "promised 40 GB of a 8 GB VM"
+  assert_output --partial "reserve 40 GB of ceilings on a 8 GB VM"
 }
 
 @test "status: no VM line when the running limits fit" {
@@ -1025,10 +1040,25 @@ teardown() { _common_teardown; }
   # `docker info`. status must show the rounded "16 GB VM", never a floored "15".
   mkdir -p "$TEST_TEMP/project"
   _docker_vm_memory() { echo "16750372454"; }           # ~15.6 GiB = a 16 GB slider
-  _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB promised → overcommitted
+  _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB reserved → overcommitted
   run cmd_status "$TEST_TEMP/project"
   assert_success
-  assert_output --partial "of a 16 GB VM"               # rounded, not floored to 15
+  assert_output --partial "on a 16 GB VM"               # rounded, not floored to 15
+}
+
+@test "status: the overcommit line never contradicts itself (trigger and display share one unit)" {
+  # The on-start fix (v0.16.5) coupled the overload trigger and display to whole
+  # GB; the status line lagged, still triggering on raw bytes vs MemTotal while
+  # printing the rounded slider, so a sum in the band (MemTotal, slider) fired and
+  # printed an inverted "reserve 23 GB ... on a 24 GB VM". Trigger and display must
+  # share _docker_vm_display_gb so the line can never claim less-than-the-VM.
+  mkdir -p "$TEST_TEMP/project"
+  _docker_vm_memory() { echo "25125558681"; }           # ~23.4 GiB MemTotal
+  _DD_MEMORY_MIB="24576"                                 # 24 GB slider
+  _running_memory_limits_sum() { echo "25340000000"; }  # ~23.6 GiB: > MemTotal but < the 24 GB slider
+  run cmd_status "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "overcommitted"               # 23 !> 24 → never fires in the band
 }
 
 # ── sum helper ───────────────────────────────────────────────────────────────

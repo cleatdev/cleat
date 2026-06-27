@@ -398,6 +398,8 @@ Containers run with these protections by default:
 
 Images are published multi-arch (amd64 + arm64): Apple Silicon runs natively, never under emulation. `cleat prune` clears cleat's own stale images (cleat also offers this automatically when they pile up); boxes and other projects' images are never touched.
 
+Closing a terminal ends the session but leaves the box running, still reserving its memory ceiling. On every interactive start, Cleat stops other idle boxes that are safe to stop (detached, no agent running, idle past a 30-minute grace) and tells you what it freed. A box working unattended (terminal left open, agent still running) is never touched. Disable with `CLEAT_NO_IDLE_SWEEP=1`; tune the grace with `CLEAT_IDLE_GRACE_MINS`.
+
 ---
 
 ## Capabilities

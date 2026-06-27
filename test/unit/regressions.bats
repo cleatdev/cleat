@@ -2260,3 +2260,28 @@ ${overlay_dir}/project-settings.local.json"
   assert_success
   assert_output --partial "NO_DUP_OK"
 }
+
+@test "regression v1.1.0: overload notice does not set-e abort start with exactly ONE running session" {
+  # The session-count pluralization `session$( (( n != 1 )) && printf s )` in a
+  # PLAIN assignment returns exit 1 when n==1 (the && short-circuits the sub),
+  # which under the CLI's `set -euo pipefail` aborted the start/resume/run path
+  # before launching the box. Strict mode is LIVE here because we source the RAW
+  # CLI (not source_cli, which strips set -e). Reverting the fix re-crashes this
+  # (the assertions after the assignment are never reached).
+  run bash -c '
+    source "'"$CLI"'"
+    PRESSURE_CHECK_FILE=/dev/null
+    _is_tty() { return 0; }
+    _cleat_prunable_stats() { printf "0\t0"; }
+    _docker_vm_memory() { echo 8589934592; }            # 8 GiB VM
+    _running_memory_limits_sum() { echo 42949672960; }  # 40 GiB -> overloaded
+    _running_cleat_box_count() { echo 1; }              # the singular case
+    _host_total_memory() { echo 34359738368; }
+    _is_docker_desktop() { return 1; }
+    _maybe_check_docker_pressure
+    echo "REACHED_END_OK"
+  '
+  assert_success
+  assert_output --partial "1 session still running"
+  assert_output --partial "REACHED_END_OK"
+}

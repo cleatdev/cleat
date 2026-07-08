@@ -13,6 +13,10 @@ Run AI coding agents with full autonomous permissions, safely sandboxed in Docke
 
 One command. Per-project isolation. Your host stays untouched.
 
+<p align="center">
+  <img src="assets/cleat-demo.gif" alt="Cleat demo: an agent runs in a Docker box, deletes the box's own OS on purpose, and the host machine (SSH keys, files) is untouched" width="800">
+</p>
+
 ```bash
 curl -fsSL https://cleat.sh/install | bash
 ```

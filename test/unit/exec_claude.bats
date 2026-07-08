@@ -160,3 +160,95 @@ teardown() { _common_teardown; }
   run exec_claude "test-ctr" --dangerously-skip-permissions
   assert_output --partial "Out of memory"
 }
+
+# ── attach heal (_refresh_attached_claude_json) ──────────────────────────────
+# The end-to-end heal (poisoned flag fixed in place, same inode) is pinned in
+# regressions.bats; these pin the guards around it.
+
+@test "attach heal: skips when a live agent is in the box" {
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$_RESOLVED_PROJECT"
+  local key
+  key="$(_derive_project_session_key "$_RESOLVED_PROJECT" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  local f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  echo '{"hasCompletedOnboarding":false}' > "$f"
+  _box_has_live_agent() { return 0; }   # another session's claude is live
+
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+
+  run jq -r '.hasCompletedOnboarding' "$f"
+  assert_output "false"
+}
+
+@test "attach heal: a failed rebuild never truncates the live file" {
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$_RESOLVED_PROJECT"
+  local key
+  key="$(_derive_project_session_key "$_RESOLVED_PROJECT" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  local f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  echo '{"hasCompletedOnboarding":false,"projects":{"/workspace":{"x":1}}}' > "$f"
+  _box_has_live_agent() { return 1; }
+  _build_project_claude_json() { echo '{}' > "$1"; }   # simulate a failed merge
+
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+
+  run jq -r '.projects."/workspace".x' "$f"
+  assert_output "1"
+}
+
+@test "attach heal: a healthy file costs no docker probe" {
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$_RESOLVED_PROJECT"
+  local key
+  key="$(_derive_project_session_key "$_RESOLVED_PROJECT" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  echo '{"hasCompletedOnboarding":true,"oauthAccount":{"emailAddress":"a@b.c"}}' > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  _box_has_live_agent() { touch "$TEST_TEMP/probed"; return 0; }
+
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+
+  [ ! -f "$TEST_TEMP/probed" ] || { echo "a healthy file still hit docker top on attach"; return 1; }
+}
+
+@test "attach heal: an onboarded API-key box (no oauthAccount) short-circuits, no probe" {
+  # An ANTHROPIC_API_KEY user never has an oauthAccount, but is onboarded and
+  # shows no login screen. The gate keys on hasCompletedOnboarding alone, so
+  # this box must NOT run the pipeline (and its box-only state stays untouched)
+  # on every attach. Gating on oauthAccount here was the wipe bug.
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$_RESOLVED_PROJECT"
+  local key
+  key="$(_derive_project_session_key "$_RESOLVED_PROJECT" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  echo '{"hasCompletedOnboarding":true,"mcpServers":{"foo":{"cmd":"x"}}}' > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  _box_has_live_agent() { touch "$TEST_TEMP/probed"; return 0; }
+
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+
+  [ ! -f "$TEST_TEMP/probed" ] || { echo "onboarded API-key box hit docker top on attach"; return 1; }
+}
+
+@test "attach heal: healing a poisoned box preserves box-only top-level state (mcpServers)" {
+  # The confirmed review finding: a logout-poisoned box (onboarding false) that
+  # also carries user-scoped mcpServers must be healed WITHOUT dropping the
+  # mcpServers. A host-as-base rebuild wiped them; the proj-then-host base keeps
+  # them.
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$_RESOLVED_PROJECT"
+  local key
+  key="$(_derive_project_session_key "$_RESOLVED_PROJECT" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  local f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  echo '{"hasCompletedOnboarding":false,"mcpServers":{"foo":{"command":"run-foo"}}}' > "$f"
+  rm -f "${HOME}/.claude.json"   # host has no mcpServers to restore from
+  _box_has_live_agent() { return 1; }
+
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+
+  run jq -r '.hasCompletedOnboarding' "$f"
+  assert_output "true"
+  run jq -r '.mcpServers.foo.command' "$f"
+  assert_output "run-foo"
+}

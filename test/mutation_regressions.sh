@@ -45,6 +45,7 @@ RESOURCES_BATS="$REPO_ROOT/test/unit/resources.bats"
 PRUNE_BATS="$REPO_ROOT/test/unit/prune.bats"
 CLAUDE_JSON_BATS="$REPO_ROOT/test/unit/claude_json.bats"
 CREDENTIALS_BATS="$REPO_ROOT/test/unit/credentials.bats"
+START_RESUME_BATS="$REPO_ROOT/test/unit/start_resume.bats"
 IDLE_SWEEP_BATS="$REPO_ROOT/test/unit/idle_sweep.bats"
 IMAGE_REBUILD_BATS="$REPO_ROOT/test/unit/image_rebuild_check.bats"
 TRUST_BATS="$REPO_ROOT/test/unit/trust.bats"
@@ -205,7 +206,7 @@ try "v0.6.0_claude_guard" "skip project overlay when .claude/ missing"
 
 # v0.6.1: _browser_watcher must remove stale bridge file at startup
 cat > "$SED_TMP" << 'SED'
-/^  # Remove any URL left over from a previous session$/,/^  rm -f "\$bridge_file"$/d
+/^  # Remove any URL left over from a previous session, and any debounce$/,/^  rm -f "\$bridge_file"$/d
 SED
 try "v0.6.1_browser_stale" "browser bridge removes stale file"
 
@@ -2103,6 +2104,111 @@ cat > "$SED_TMP" << 'SED'
 s|(( age > 0 ))|(( age >= 0 ))|
 SED
 try "bugfix_idle_unknown_age" "skips a box with unknown age" "$CLI" "$IDLE_SWEEP_BATS"
+
+# ── 2026-07-07 login regressions (code-paste flow + cross-box identity) ──────
+
+# BRIDGE: a code-paste login URL (redirect_uri on console.anthropic.com, no
+# loopback port) must classify as auth in the watcher. Gut the classification:
+# is_auth stays 0, the interactive auto session defers the login URL, and the
+# "code-paste login URL ... still auto-opens" regression test sees no open.
+cat > "$SED_TMP" << 'SED'
+s|_is_auth_url "$url" && _is_auth=1|:|
+SED
+try "bugfix_codepaste_url_is_auth" "still auto-opens in an interactive session" "$CLI" "$REGRESSIONS"
+
+# BRIDGE: _is_auth_url must match a redirect_uri= that arrives after & (every
+# real authorize URL). Kill the &-alternative: the truth-table test's code-paste
+# URL no longer classifies and "classifies as auth" fails.
+cat > "$SED_TMP" << 'SED'
+s|\*\\&redirect_uri=\*) return 0 ;;|__nomatch__) return 0 ;;|
+SED
+try "bugfix_is_auth_url_amp_param" "console callback, no loopback" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# BROWSER ENV: the box must be created with BROWSER pointing at the open shim
+# (claude 2.1.191+ invokes no opener on a display-less Linux without it). Drop
+# the -e line: the "created with BROWSER pointing at the open shim" test fails.
+cat > "$SED_TMP" << 'SED'
+\|-e "BROWSER=/usr/local/bin/open-bridge"|d
+SED
+try "bugfix_browser_env_at_create" "BROWSER pointing at the open shim" "$CLI" "$REGRESSIONS"
+
+# IDENTITY: keys absent from BOTH the host file and this project's copy must
+# fall through to the newest sibling box that holds a login. Revert to the
+# host//proj rule: the "inherits identity from the newest sibling box" build
+# test and the cmd_start regression both lose the oauthAccount.
+cat > "$SED_TMP" << 'SED'
+s|$proj\[.\] // $sib\[.\]|$proj[.]|
+SED
+try "bugfix_identity_sibling_fallback" "inherits identity from the newest sibling box" "$CLI" "$CLAUDE_JSON_BATS"
+
+# IDENTITY: cmd_start of a STOPPED box must rebuild its claude.json first
+# (docker start re-resolves the bind source; without the refresh only a full
+# recreate picks up a login done in another box). Drop the refresh call INSIDE
+# cmd_start only: the "carries the login in" regression test (which drives
+# cmd_start) finds no oauthAccount.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /_refresh_project_claude_json "\$project" "\$box"/d
+}
+SED
+try "bugfix_identity_refresh_start" "carries the login in" "$CLI" "$REGRESSIONS"
+
+# IDENTITY: cmd_resume must do the SAME refresh (the resume entrypoint is a
+# distinct call site; deleting only it slips past the cmd_start test). Drop the
+# refresh call INSIDE cmd_resume only: the "folds an in-box login" resume test
+# finds no oauthAccount.
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  /_refresh_project_claude_json "\$project" "\$box"/d
+}
+SED
+try "bugfix_identity_refresh_resume" "folds an in-box login" "$CLI" "$START_RESUME_BATS"
+
+# IDENTITY: attaching to a RUNNING box must heal a logged-out claude.json in
+# place (liveness-gated; the bind mount pins the inode, so the start/create
+# rebuilds cannot reach it). Drop the exec_claude call: the "running
+# logged-out box heals" regression test sees the poisoned flag stay false.
+cat > "$SED_TMP" << 'SED'
+/_refresh_attached_claude_json "\$cname" "\${_RESOLVED_PROJECT:-}" "\${_BOX:-main}"/d
+SED
+try "bugfix_identity_attach_heal" "running logged-out box heals" "$CLI" "$REGRESSIONS"
+
+# IDENTITY: the attach-heal gate must key on hasCompletedOnboarding ALONE. Add
+# back the oauthAccount clause: an onboarded API-key box (no oauthAccount) then
+# fails the gate and runs the pipeline + docker probe on every attach, so the
+# "onboarded API-key box short-circuits" test sees the probe fire.
+cat > "$SED_TMP" << 'SED'
+s|jq -e '\.hasCompletedOnboarding == true' "\$f" >/dev/null 2>&1 \&\& return 0|jq -e '(.hasCompletedOnboarding == true) and has("oauthAccount")' "$f" >/dev/null 2>\&1 \&\& return 0|
+SED
+try "bugfix_attach_heal_gate_onboarding" "onboarded API-key box" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# IDENTITY: the claude.json merge base must be proj-then-host so a box-only
+# top-level key (e.g. user-scoped mcpServers) survives the rebuild that now
+# re-runs on every start/resume/attach. Revert the base to host-only: the
+# "box-only top-level key survives the rebuild" test sees mcpServers dropped.
+cat > "$SED_TMP" << 'SED'
+s|(\$proj + \$host)|$host|
+SED
+try "bugfix_claudejson_preserves_box_keys" "box-only top-level key survives" "$CLI" "$CLAUDE_JSON_BATS"
+
+# BROWSER ENV ORDERING: the shim -e BROWSER must precede the user [env] args so
+# docker's last-wins lets a .cleat BROWSER= override the shim. Move the shim
+# line to AFTER _RESOLVED_ENV_ARGS: the ordering test sees the user override
+# lose.
+cat > "$SED_TMP" << 'SED'
+/-e "BROWSER=\/usr\/local\/bin\/open-bridge" \\/d
+s|"\${_RESOLVED_ENV_ARGS\[@\]+"\${_RESOLVED_ENV_ARGS\[@\]}"}" \\|"${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \\\n    -e "BROWSER=/usr/local/bin/open-bridge" \\|
+SED
+try "bugfix_browser_env_ordering" "BROWSER shim is passed before user env" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# BRIDGE LOG: a deferred URL must be logged (a silent defer is what made the
+# regression hard to diagnose). Garble the defer log string (deleting the line
+# would leave an empty else): the "auto mode does NOT re-open a plain link"
+# test no longer finds the "deferring URL to terminal" line.
+cat > "$SED_TMP" << 'SED'
+s|deferring URL to terminal|silently dropping URL|
+SED
+try "bugfix_browser_defer_logged" "does NOT re-open a plain link" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

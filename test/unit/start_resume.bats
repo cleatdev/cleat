@@ -99,6 +99,33 @@ teardown() { _common_teardown; }
   rm -rf "$CLEAT_RUN_DIR/${cname}/settings"
 }
 
+@test "resume: folds an in-box login from another box into a stopped box (login once, every box)" {
+  # cmd_resume must refresh the per-project claude.json before docker start,
+  # exactly like cmd_start, so a login done in another box carries in on resume
+  # too. Without the cmd_resume-side call this assertion fails while every other
+  # test stays green (the cmd_start test cannot see a resume-only regression).
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
+  rm -f "${HOME}/.claude.json"
+  mkdir -p "$CLEAT_PROJECTS_DIR/box-login-elsewhere"
+  echo '{"oauthAccount":{"emailAddress":"resume@login.dev"},"userID":"ur"}' > "$CLEAT_PROJECTS_DIR/box-login-elsewhere/claude.json"
+  local key
+  key="$(_derive_project_session_key "$TEST_TEMP/project" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  echo '{"projects":{}}' > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_output --partial "Session resumed"
+  run jq -r '.oauthAccount.emailAddress' "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  assert_output "resume@login.dev"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings"
+}
+
 @test "resume: attaches to running container without restarting" {
   mkdir -p "$TEST_TEMP/project"
   local cname

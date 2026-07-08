@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.1.0"
+VERSION="1.1.1"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="1.1.0"
+RELEASE_HIGHLIGHT_VERSION="1.1.1"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -43,7 +43,9 @@ REPO_URL="https://github.com/cleatdev/cleat"
 # Spec history (what each value shipped):
 #   1  initial scheme; floating node:24-bookworm-slim base
 #   2  base image pinned by digest (reproducible base; see docker/Dockerfile)
-_IMAGE_SPEC_VERSION=2
+#   3  ENV BROWSER=open shim, so Claude Code 2.1.191+ opens login URLs through
+#      the bridge instead of dropping to the code-paste flow
+_IMAGE_SPEC_VERSION=3
 # Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
 # existed, so they carry no spec label): their content is inferred from the
 # version they were built at. v0.16.3 was the LAST docker/ content change before
@@ -1755,12 +1757,16 @@ _container_bind_sources_present() {
 #   2. Cross-project bleed: all containers share projects["/workspace"], so
 #      trust-dialog / MCP / allowedTools approvals leak between unrelated projects.
 #
-# Strategy (per-project, host-as-base): on each (re)create take the host file
+# Strategy (per-project, host-as-base): on each (re)create AND on each start of
+# a stopped container (see _refresh_project_claude_json) take the host file
 # WHOLE as the base, preserving Claude's global identity, onboarding, migration
 # flags, and whatever schema the installed host version writes (no drift), then
 # overlay this project's persisted projects["/workspace"] block on top. Global
 # identity/onboarding keys fall back to the persisted copy when the host lacks
-# them, so onboarding done inside a container on a fresh machine still sticks.
+# them, so onboarding done inside a container on a fresh machine still sticks;
+# when BOTH lack them they fall back to the newest sibling box that holds a
+# login (_newest_sibling_identity), so a login done inside any box satisfies
+# the login gate of every box built or started afterwards.
 # The result is written ATOMICALLY (temp + mv) to a persistent, project-keyed
 # file that the container mounts. The container never writes the host file, so
 # the corruption race and the cross-project bleed are gone by construction.
@@ -1776,9 +1782,34 @@ _looks_like_json_object() {
   [[ -n "$content" && "${content:0:1}" == "{" && "${content: -1}" == "}" ]]
 }
 
+# Print the path of the newest sibling per-project claude.json that carries an
+# oauthAccount, excluding $1 (the file being rebuilt). A login done INSIDE a
+# box writes oauthAccount only into that box's mounted per-project file, and
+# nothing ever writes the host ~/.claude.json (by design, see the strategy
+# note above _build_project_claude_json), so this scan is how a login reaches
+# every OTHER box that gets built or started afterwards: login once, every box.
+# Prints nothing when no sibling has one. Requires jq (callers only use the
+# result on the jq path). Fail-soft: any unreadable/corrupt sibling is skipped.
+_newest_sibling_identity() {
+  local exclude="$1" f best="" best_m=0 m
+  command -v jq &>/dev/null || return 0
+  for f in "$CLEAT_PROJECTS_DIR"/*/claude.json; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == "$exclude" ]] && continue
+    jq -e '.oauthAccount? != null' "$f" >/dev/null 2>&1 || continue
+    m="$(_path_mtime "$f")"
+    if (( m > best_m )); then best_m=$m; best="$f"; fi
+  done
+  [[ -n "$best" ]] && printf '%s' "$best"
+  return 0
+}
+
 # Args: $1 = output path (the mount source / persisted per-project file)
+#       $2 = optional persisted-input path (defaults to $1; the attached-box
+#            in-place refresh writes a TEMP output while reading the real file)
 _build_project_claude_json() {
   local out="$1"
+  local proj_src="${2:-$1}"
   mkdir -p "$(dirname "$out")"
 
   # Defensive: a stray directory at the output path (e.g. Docker auto-created a
@@ -1814,14 +1845,23 @@ _build_project_claude_json() {
 
   if command -v jq &>/dev/null; then
     local tmp="${out}.tmp.$$"
-    local hf pf
+    local hf pf sf sib
     if [[ -n "$host_src" && -f "$host_src" && -s "$host_src" ]]; then hf="$host_src"; else hf=/dev/null; fi
-    if [[ -f "$out" && -s "$out" ]]; then pf="$out"; else pf=/dev/null; fi
+    if [[ -f "$proj_src" && -s "$proj_src" ]]; then pf="$proj_src"; else pf=/dev/null; fi
+    # Identity gained inside another box (its mounted per-project file is the
+    # only place an in-box login lands) fills identity keys that BOTH the host
+    # file and this project's own copy lack. Without it, a login done in box A
+    # leaves every box built afterwards on the login screen, despite the fresh
+    # shared ~/.claude/.credentials.json (the second half of the login gate).
+    sf=/dev/null
+    sib="$(_newest_sibling_identity "$out")"
+    [[ -n "$sib" && -f "$sib" && -s "$sib" ]] && sf="$sib"
     # slurpfile reads each input fully before output is written, so reading $out
     # while writing $tmp is safe; mv makes the swap atomic.
-    if jq -n --slurpfile h "$hf" --slurpfile p "$pf" '
+    if jq -n --slurpfile h "$hf" --slurpfile p "$pf" --slurpfile s "$sf" '
         ($h[0] // {}) as $host |
         ($p[0] // {}) as $proj |
+        ($s[0] // {}) as $sib |
         (($host.projects // {}) + ($proj.projects // {})) as $projects |
         # What a brand-new /workspace is born with INSIDE the cage. The sandbox
         # IS the trust boundary and cleat always launches claude with
@@ -1833,16 +1873,32 @@ _build_project_claude_json() {
         # value wins per key (jq `+` is right-biased). Unknown future key names are
         # harmless extras; the real ones gate the prompts.
         ({hasTrustDialogAccepted:true, hasCompletedProjectOnboarding:true, bypassPermissionsModeAccepted:true}) as $wsdefaults |
-        $host
+        # Base is proj-then-host (host wins any shared top-level key, so there is
+        # no schema drift from the installed host version), but a top-level key
+        # present ONLY in this per-project copy SURVIVES. That matters because
+        # this rebuild now re-runs on accumulated box state (stopped-box
+        # start/resume and the running-box attach heal, not just first create),
+        # and a host-only base would silently drop box-written top-level state
+        # like a user-scoped mcpServers (claude mcp add -s user) on every start.
+        # At first create $proj is {} so this is identical to a host-only base.
+        # .projects and identity are still overlaid explicitly below, so their
+        # precedence is unchanged.
+        ($proj + $host)
         + { projects: ($projects + { "/workspace": ($wsdefaults + ($projects["/workspace"] // {})) }) }
+        # Identity precedence: host wins, then the persisted copy of THIS
+        # project, then the newest sibling box that holds a login (see
+        # _newest_sibling_identity). jq // falls through per key on null.
         + ( ["oauthAccount","userID","lastOnboardingVersion"]
-            | map({ (.): ($host[.] // $proj[.]) })
+            | map({ (.): ($host[.] // $proj[.] // $sib[.]) })
             | add
             | with_entries(select(.value != null)) )
-        # Onboarding is complete by construction inside the cage (identity still
-        # comes from oauthAccount above; a box with no token still shows login).
-        # Forcing it stops a newer in-box Claude from re-onboarding a fresh
-        # project whose host lastOnboardingVersion lags (or is absent).
+        # Onboarding is complete by construction inside the cage. This flag is
+        # load-bearing: Claude 2.1.x gates its startup login/onboarding screen
+        # on hasCompletedOnboarding ALONE (verified in the 2.1.202 binary; an
+        # in-box /logout sets it false, which is what re-prompted every later
+        # session), while oauthAccount above is identity/org metadata that some
+        # Claude flows also treat as login state. A dead token surfaces as a
+        # runtime "revoked, run /login" error instead.
         + { hasCompletedOnboarding: true }
         # The container always runs the native installer build (~/.local/bin/
         # claude → versions/), but this file is rebuilt from the host every run,
@@ -1868,6 +1924,68 @@ _build_project_claude_json() {
       echo '{}' > "$out"
     fi
   fi
+}
+
+# Rebuild the per-project ~/.claude.json bind source for a STOPPED container,
+# just before `docker start`. Bind sources are re-resolved at start and a
+# stopped box has no writer, so this is the safe moment to fold in host-side
+# changes and identity gained in other boxes since it stopped (the login-once
+# -every-box guarantee; without this, only a full recreate would pick it up).
+# Never call it for a RUNNING container: the mount pins the file's old inode
+# (the atomic mv swaps inodes) and the container may be mid-write.
+_refresh_project_claude_json() {
+  local project="$1" box="$2"
+  local key
+  key="$(_derive_project_session_key "$project" "$box")"
+  _build_project_claude_json "$CLEAT_PROJECTS_DIR/${key}/claude.json"
+}
+
+# The RUNNING-box counterpart, for session attach. The create/start rebuilds
+# cannot run here: the bind mount pins the file's inode (the atomic temp+mv
+# swap would detach it) and a live box may hold concurrent writers. But a
+# running box carries exactly the poisoned state the rebuild exists to fix:
+# an in-box /logout writes hasCompletedOnboarding:false into the live file.
+# Claude 2.1.x gates its startup login/onboarding screen on that flag ALONE
+# (verified in the binary), so every later session in the box re-prompts for
+# login despite fresh shared credentials. The gate below therefore keys on
+# hasCompletedOnboarding only: an already-onboarded box shows no login screen
+# regardless of oauthAccount, so it short-circuits with no docker probe and no
+# rewrite (this is what keeps an API-key box, which never has an oauthAccount,
+# from running the pipeline on every single attach). oauthAccount is still
+# injected from a sibling at create/start; a running box that is onboarded but
+# identity-less simply doesn't need it to avoid the re-prompt.
+#
+# When it DOES heal (onboarding false) it goes through _build_project_claude_json,
+# whose proj-then-host base preserves any box-written top-level state (e.g. a
+# user-scoped mcpServers), then copies the temp over the SAME inode with a
+# truncating cat (the bind mount pins the inode; an atomic mv would detach the
+# container's view). It runs only past the liveness gate (docker top shows no
+# claude/node; fail-safe: unknown counts as live), so no concurrent writer
+# exists and the only reader (the claude this session is about to exec) starts
+# after the write completes. Two simultaneous attaches can both heal; they
+# write near-identical objects microseconds apart (last writer wins), a benign
+# host-side race left deliberately unlocked.
+_refresh_attached_claude_json() {
+  local cname="$1" project="$2" box="$3"
+  [[ -n "$project" ]] || return 0
+  command -v jq &>/dev/null || return 0
+  local key f
+  key="$(_derive_project_session_key "$project" "$box")"
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  [[ -f "$f" && -s "$f" ]] || return 0
+  # Cheap gate first: an onboarded box shows no login screen, nothing to fix,
+  # no docker call. Only a logout-poisoned (or never-onboarded) box proceeds.
+  jq -e '.hasCompletedOnboarding == true' "$f" >/dev/null 2>&1 && return 0
+  _box_has_live_agent "$cname" && return 0
+  local tmp="${f}.attach.$$"
+  _build_project_claude_json "$tmp" "$f"
+  # Refuse to copy anything that is not a healed object (a failed build leaves
+  # {} or nothing): a truncating write must never make the file worse.
+  if [[ -s "$tmp" ]] && jq -e '.hasCompletedOnboarding == true' "$tmp" >/dev/null 2>&1; then
+    cat "$tmp" > "$f" 2>/dev/null || true
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 0
 }
 
 # Print a notice box with dynamic width. Each argument is a line of plain text.
@@ -2287,6 +2405,25 @@ _host_open_cmd() {
   fi
 }
 
+# True when a URL is an OAuth authorization request: it carries a redirect_uri=
+# query parameter. Claude Code logs in through two flows: the loopback flow
+# (redirect_uri=http://localhost:PORT/callback, which the callback proxy
+# completes hands-free) and the manual code-paste flow (redirect_uri on
+# console.anthropic.com; the user pastes a code back into the terminal). BOTH
+# must count as auth for _browser_should_open: an OAuth URL emitted
+# programmatically through the container's open shim is never a terminal
+# click, so deferring it like a plain link strands the login. Claude 2.1.x
+# happens to hand its opener only the loopback URL today; this guards
+# gh-auth-style flows and any future claude change that opens a non-loopback
+# authorize URL. Only the loopback flow additionally earns a callback proxy;
+# that stays keyed on _extract_callback_port below.
+_is_auth_url() {
+  case "$1" in
+    *\?redirect_uri=*|*\&redirect_uri=*) return 0 ;;
+  esac
+  return 1
+}
+
 # Extracts the localhost port from a redirect_uri in an OAuth URL.
 # Returns 0 and prints the port if found, returns 1 otherwise.
 _extract_callback_port() {
@@ -2528,18 +2665,28 @@ _path_mtime() {
 # later and stale markers can't accumulate. Different URLs hash to different
 # markers and never dedupe.
 _BROWSER_DEBOUNCE_SECS=2
-_browser_recently_opened() {
-  local clip_dir="$1" url="$2"
-  local now hash lock d
+# Remove debounce markers older than the window. Fresh markers are load-bearing
+# (a concurrent watcher's debounce), so ONLY expired ones go. Called on each
+# claim and once at watcher start: a box whose last session never claims again
+# would otherwise keep its final markers forever.
+_browser_sweep_stale_markers() {
+  local clip_dir="$1" now d
   now="$(date +%s)"
-  # Sweep markers past the window (runs only when a URL was actually claimed, over
-  # a handful of recent markers, so the cost is negligible).
   for d in "$clip_dir"/.open.*; do
     [ -d "$d" ] || continue
     if [ $(( now - $(_path_mtime "$d") )) -gt "$_BROWSER_DEBOUNCE_SECS" ]; then
       rm -rf "$d" 2>/dev/null || true
     fi
   done
+  return 0
+}
+_browser_recently_opened() {
+  local clip_dir="$1" url="$2"
+  local now hash lock
+  now="$(date +%s)"
+  # Sweep markers past the window (runs only when a URL was actually claimed, over
+  # a handful of recent markers, so the cost is negligible).
+  _browser_sweep_stale_markers "$clip_dir"
   # Filesystem-safe per-URL key. cksum is POSIX (present on macOS and Linux); a
   # collision would only over-dedupe two URLs fired within the same 2s, which
   # never happens in practice.
@@ -2608,8 +2755,11 @@ _browser_watcher() {
   }
   trap '_bw_cleanup; exit 0' TERM INT HUP
 
-  # Remove any URL left over from a previous session
+  # Remove any URL left over from a previous session, and any debounce
+  # markers that outlived their window (a box with no further claims never
+  # sweeps them otherwise).
   rm -f "$bridge_file"
+  _browser_sweep_stale_markers "$clip_dir"
   while true; do
     # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
     # an orphan from a now-gone session: stop polling instead of spinning forever.
@@ -2626,6 +2776,10 @@ _browser_watcher() {
       fi
       if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
         local _is_auth=0 cb_port
+        # Auth is ANY OAuth authorization URL, not just loopback ones: the
+        # code-paste login flow has no localhost callback but must still open
+        # (see _is_auth_url). The proxy below stays loopback-only.
+        _is_auth_url "$url" && _is_auth=1
         # Start auth callback proxy if URL has a localhost redirect_uri. This
         # runs in every mode (off included): the proxy forwards the OAuth
         # callback into the box, so `cleat login` completes even when the user
@@ -2633,7 +2787,6 @@ _browser_watcher() {
         if [ -n "$cname" ]; then
           local proxy_log="$clip_dir/.proxy-log"
           cb_port=$(_extract_callback_port "$url" 2>/dev/null) && {
-            _is_auth=1
             _bw_cleanup  # kill any previous proxy
             echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
             _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" &
@@ -2647,8 +2800,14 @@ _browser_watcher() {
         # the user clicked is already opened by the host terminal itself; opening
         # it again here is the duplicate tab the maintainer reported. Auth URLs
         # and non-interactive sessions always open here (nothing else does).
+        # Both outcomes are logged: a deferred URL is invisible otherwise, and
+        # that silence is what made the code-paste login regression hard to
+        # diagnose from the field.
         if _browser_should_open "$bridge_mode" "$host_opens_clicks" "$_is_auth"; then
+          echo "[browser-watcher $(date +%H:%M:%S)] opening URL on host (mode=$bridge_mode auth=$_is_auth)" >> "$clip_dir/.proxy-log"
           $open_cmd "$url" >/dev/null 2>&1 || true
+        else
+          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (mode=$bridge_mode interactive=$host_opens_clicks auth=$_is_auth)" >> "$clip_dir/.proxy-log"
         fi
       fi
     fi
@@ -2911,6 +3070,10 @@ exec_claude() {
   # launches (the ~/.claude mount is live, so a write here is visible inside the
   # running container). No-op off macOS or once the box already has a token.
   _seed_macos_credentials
+
+  # Heal a logged-out or identity-less ~/.claude.json in the RUNNING box before
+  # Claude launches (in-place, liveness-gated; see _refresh_attached_claude_json).
+  _refresh_attached_claude_json "$cname" "${_RESOLVED_PROJECT:-}" "${_BOX:-main}"
 
   _cleanup_session() {
     # Kill clipboard watcher
@@ -4054,6 +4217,14 @@ cmd_run() {
     host_args+=(--add-host "host.docker.internal:host-gateway")
   fi
 
+  # BROWSER points at the in-container open shim. Claude Code 2.1.191+ refuses
+  # to invoke any opener on a display-less Linux system unless $BROWSER is set,
+  # and its login drops to the manual code-paste flow; with BROWSER set it
+  # opens through the shim and keeps the hands-free loopback login, which the
+  # host-side callback proxy completes. Passed at create (not only baked into
+  # the image) so boxes recreated from an older image get it too. Placed BEFORE
+  # the user's [env] args: docker's last -e wins, so a .cleat `BROWSER=` can
+  # override the shim.
   local _docker_err="/tmp/cleat-err.$$"
   local run_rc=0
   docker run -d \
@@ -4062,6 +4233,7 @@ cmd_run() {
     "${ssh_args[@]+"${ssh_args[@]}"}" \
     "${docker_args[@]+"${docker_args[@]}"}" \
     "${host_args[@]+"${host_args[@]}"}" \
+    -e "BROWSER=/usr/local/bin/open-bridge" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
     "${label_args[@]}" \
     -e "HOST_UID=$(id -u)" \
@@ -4133,6 +4305,10 @@ cmd_start() {
       else
         # Restarting a stopped container: image already exists
         success "Image ready ${RESET}${DIM}(cached)"
+        # Fold host-side changes and logins from other boxes into this box's
+        # ~/.claude.json while it is safely stopped (docker start re-resolves
+        # the bind source). See _refresh_project_claude_json.
+        _refresh_project_claude_json "$project" "$box"
         spin "Starting container..."
         local _docker_err="/tmp/cleat-err.$$"
         local start_rc=0
@@ -4265,6 +4441,9 @@ cmd_resume() {
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
       else
+        # Same stopped-container refresh as cmd_start: fold in host changes and
+        # logins from other boxes before the bind source is re-resolved.
+        _refresh_project_claude_json "$project" "$box"
         local _docker_err="/tmp/cleat-err.$$"
         local resume_rc=0
         docker start "$cname" > /dev/null 2>"$_docker_err" || resume_rc=$?
@@ -4351,11 +4530,37 @@ cmd_shell() {
   resolve_caps "$project"
   resolve_env_args "$project"
   _ensure_docker_access "$cname"
+
+  # Browser bridge for shell sessions too. $BROWSER in the box points at the
+  # open shim, so a `claude /login` (or gh auth, etc.) run from this shell
+  # emits its URL through the bridge file; without a watcher the URL would go
+  # nowhere and a loopback login would wait forever on a callback. Same
+  # parameters as exec_claude: auto mode defers plain links to this terminal,
+  # auth URLs open on the host.
+  local _shell_clip_dir="$CLEAT_RUN_DIR/${cname}/clip"
+  mkdir -p "$_shell_clip_dir"
+  local _shell_open_cmd _shell_bw_pid=""
+  _shell_open_cmd="$(_host_open_cmd)"
+  if [ -n "$_shell_open_cmd" ]; then
+    local _shell_interactive=0
+    _is_tty && _shell_interactive=1
+    _browser_watcher "$_shell_clip_dir" "$_shell_open_cmd" "$cname" "$(_browser_bridge_mode)" "$_shell_interactive" &
+    _shell_bw_pid=$!
+    disown "$_shell_bw_pid" 2>/dev/null || true
+  fi
+
   info "Container ${BOLD}${cname}${RESET}"
   local shell_rc=0
   docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
     runuser -u coder -- bash || shell_rc=$?
+
+  if [ -n "$_shell_bw_pid" ]; then
+    kill "$_shell_bw_pid" 2>/dev/null || true
+    wait "$_shell_bw_pid" 2>/dev/null || true
+  fi
+  rm -f "$_shell_clip_dir/.browser-open"
+
   _restore_terminal
   return "$shell_rc"
 }

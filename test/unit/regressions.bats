@@ -2285,3 +2285,124 @@ ${overlay_dir}/project-settings.local.json"
   assert_output --partial "1 session still running"
   assert_output --partial "REACHED_END_OK"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-07-07 login regressions (in-box code-paste flow + cross-box identity)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 2026-07-07 hardening: _is_auth was keyed on the loopback port, so any OAuth
+# authorize URL WITHOUT a localhost callback (Claude's code-paste login URL,
+# gh-auth-style flows) classified as a PLAIN link and, in an interactive
+# session (auto mode, host_opens_clicks=1), was deferred to a terminal that
+# never opens programmatically emitted URLs: a stranded login. Claude 2.1.x
+# hands its opener only the loopback URL today (the primary regression was the
+# missing $BROWSER, see the next test), but a non-loopback authorize URL
+# reaching the bridge must never strand a login again.
+@test "regression v1.1.1: code-paste login URL (no loopback callback) still auto-opens in an interactive session" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _auth_callback_proxy() { :; }   # must not be reached: there is no port
+  cat > "$TEST_TEMP/fake_open" <<SCRIPT
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+SCRIPT
+  chmod +x "$TEST_TEMP/fake_open"
+  # _extract_callback_port is intentionally NOT mocked: the URL has no
+  # loopback callback, and the watcher must open it anyway.
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf '%s' "https://claude.ai/oauth/authorize?code=true&client_id=abc&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=user" > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$TEST_TEMP/opened.log" ] && break
+    sleep 0.5
+  done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ -f "$TEST_TEMP/opened.log" ] || { echo "code-paste login URL was deferred; in-session login never reaches a browser"; return 1; }
+  run cat "$TEST_TEMP/opened.log"
+  assert_output --partial "console.anthropic.com"
+}
+
+# Claude Code 2.1.191+ refuses to invoke ANY opener on a display-less Linux
+# system unless \$BROWSER is set, and its login drops to the manual code-paste
+# flow: the open shim never fired, so the bridge never even saw the login URL.
+# Creating the box with BROWSER pointing at the shim flips both gates (URLs
+# open through the bridge, and the hands-free loopback login returns).
+@test "regression v1.1.1: container is created with BROWSER pointing at the open shim" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "BROWSER=/usr/local/bin/open-bridge"
+  assert_success
+}
+
+# An in-box login writes oauthAccount only into THAT box's per-project
+# claude.json; the host file never learns it. After a logout wiped the shared
+# credentials, the user logged in again in one box, opened a second terminal,
+# and was asked to log in AGAIN: the other box's claude.json had no
+# oauthAccount (the login gate) even though the shared .credentials.json was
+# fresh. Starting a stopped box must fold the newest sibling login in.
+@test "regression v1.1.1: starting a stopped box after an in-box login elsewhere carries the login in" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }   # container exists but is NOT running
+  mock_docker_ps_a "$cname"
+  mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
+  rm -f "${HOME}/.claude.json"   # the host never logs in
+  # the login happened inside ANOTHER box
+  mkdir -p "$CLEAT_PROJECTS_DIR/box-elsewhere"
+  echo '{"oauthAccount":{"emailAddress":"inbox@login.dev"},"userID":"u9"}' > "$CLEAT_PROJECTS_DIR/box-elsewhere/claude.json"
+  # this box's copy predates that login (the logout wiped its oauthAccount)
+  local key
+  key="$(_derive_project_session_key "$TEST_TEMP/project" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  echo '{"projects":{}}' > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_output --partial "Container started"
+  run jq -r '.oauthAccount.emailAddress' "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  assert_output "inbox@login.dev"
+  rm -rf "$CLEAT_RUN_DIR/${cname}/settings"
+}
+
+# An in-box /logout leaves hasCompletedOnboarding:false in that box's live
+# bind-mounted ~/.claude.json (and deletes the shared credentials). Claude
+# 2.1.x gates its startup login/onboarding screen on that flag ALONE, and
+# cleat re-forced it only at container (re)create, so every new session in the
+# still-running box demanded a login again, even after a fresh login elsewhere
+# had restored the shared credentials. Attaching must heal the file in place
+# (same inode: the bind mount pins it) when no live agent is in the box.
+@test "regression v1.1.1: attaching to a running logged-out box heals its claude.json in place" {
+  local cname="heal-ctr"
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$_RESOLVED_PROJECT"
+  local key
+  key="$(_derive_project_session_key "$_RESOLVED_PROJECT" "main")"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  local f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  echo '{"hasCompletedOnboarding":false,"projects":{}}' > "$f"
+  # the identity to inherit lives in a sibling box (where the user logged in)
+  mkdir -p "$CLEAT_PROJECTS_DIR/box-elsewhere2"
+  echo '{"oauthAccount":{"emailAddress":"heal@login.dev"}}' > "$CLEAT_PROJECTS_DIR/box-elsewhere2/claude.json"
+  rm -f "${HOME}/.claude.json"
+  _box_has_live_agent() { return 1; }   # no claude/node running in the box
+
+  local inode_before inode_after
+  inode_before="$(ls -i "$f" | awk '{print $1}')"
+  run exec_claude "$cname" --dangerously-skip-permissions
+  inode_after="$(ls -i "$f" | awk '{print $1}')"
+
+  run jq -r '.hasCompletedOnboarding' "$f"
+  assert_output "true"
+  run jq -r '.oauthAccount.emailAddress' "$f"
+  assert_output "heal@login.dev"
+  [ "$inode_before" = "$inode_after" ] || { echo "inode changed: the bind-mounted file was swapped, the running box would keep reading the old one"; return 1; }
+}

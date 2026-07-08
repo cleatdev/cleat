@@ -36,6 +36,8 @@ That's it. First run pulls the prebuilt image from GHCR (~30s), starts an isolat
 └─────────────────────┘      └─────────────────────────────────┘
 ```
 
+**Stay updated:** Watch → Custom → Releases on this repo, and upgrade any time with `cleat update`.
+
 ---
 
 ## Requirements
@@ -180,7 +182,7 @@ cleat start          # start the container
 cleat login          # opens a browser URL to sign in
 ```
 
-Credentials are saved to `~/.claude` on your host and shared across all containers automatically. Log in once, every container picks it up. On macOS, where Claude keeps its login in the **Keychain** rather than a file, Cleat bridges that token into the box for you on launch, so a login you did on the host (not just inside a box) carries in too.
+Credentials are saved to `~/.claude` on your host and shared across all containers automatically. Log in once, every container picks it up: whether you signed in on the host or inside any box, the next box you start or create carries the login. On macOS, where Claude keeps its login in the **Keychain** rather than a file, Cleat bridges that token into the box for you on launch.
 
 ### 2. Use it
 

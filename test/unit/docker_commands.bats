@@ -144,6 +144,29 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+@test "run: BROWSER shim is passed before user env so a .cleat BROWSER wins" {
+  # The shim BROWSER default must sit BEFORE the user's [env] args on the docker
+  # run line: docker's last -e wins, so a user's .cleat BROWSER= overrides the
+  # shim only if the shim comes first. This pins the ordering the comment relies
+  # on (assert_docker_run_has is substring-only and cannot see position).
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  printf '[caps]\nenv\n'             > "$TEST_TEMP/project/.cleat"
+  printf 'BROWSER=/custom/browser\n' > "$TEST_TEMP/project/.cleat.env"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local line before_shim before_user
+  line="$(grep 'docker run' "$DOCKER_CALLS" | head -1)"
+  [[ "$line" == *"BROWSER=/usr/local/bin/open-bridge"* ]] || { echo "shim BROWSER absent"; return 1; }
+  [[ "$line" == *"BROWSER=/custom/browser"* ]] || { echo "user BROWSER absent"; return 1; }
+  before_shim="${line%%BROWSER=/usr/local/bin/open-bridge*}"
+  before_user="${line%%BROWSER=/custom/browser*}"
+  [ "${#before_shim}" -lt "${#before_user}" ] || { echo "shim BROWSER not before user BROWSER; the .cleat override would lose"; return 1; }
+}
+
 # ── Session isolation ───────────────────────────────────────────────────────
 
 @test "run: mounts per-project session overlay at projects/-workspace" {
@@ -595,6 +618,25 @@ teardown() { _common_teardown; }
   assert_success
   run assert_docker_exec_has "bash"
   assert_success
+}
+
+@test "shell: starts a browser watcher so in-shell logins reach the host" {
+  # $BROWSER in the box points at the open shim, so `claude /login` run from a
+  # cleat shell emits its URL through the bridge file. Without a watcher the
+  # URL goes nowhere and a loopback login waits forever on its callback.
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "fake-open"; }
+  _browser_watcher() { printf '%s %s %s %s %s' "$1" "$2" "$3" "$4" "$5" > "$TEST_TEMP/bw_args"; }
+
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  [ -f "$TEST_TEMP/bw_args" ] || { echo "cmd_shell started no browser watcher; an in-shell login has no bridge"; return 1; }
+  run cat "$TEST_TEMP/bw_args"
+  assert_output --partial "$cname"
+  assert_output --partial "auto"
 }
 
 @test "shell: passes resolved env args to docker exec" {

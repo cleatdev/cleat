@@ -62,6 +62,24 @@ teardown() { _common_teardown; }
   assert_output "HostTool"
 }
 
+@test "build: a box-only top-level key survives the rebuild (not wiped by host base)" {
+  # A user-scoped mcpServers (claude mcp add -s user) is written by the box into
+  # its persisted copy, never into the host file. The rebuild now re-runs on
+  # start/resume/attach, so a host-only base would silently drop it every start.
+  # The proj-then-host base keeps box-only top-level keys while host still wins
+  # any shared key.
+  echo '{"oauthAccount":{"emailAddress":"host@a.com"},"sharedKey":"HOSTWINS"}' > "$HOST_JSON"
+  mkdir -p "$(dirname "$OUT")"
+  echo '{"mcpServers":{"foo":{"command":"run-foo"}},"sharedKey":"projLoses"}' > "$OUT"
+
+  _build_project_claude_json "$OUT"
+
+  run jq -r '.mcpServers.foo.command' "$OUT"
+  assert_output "run-foo"
+  run jq -r '.sharedKey' "$OUT"
+  assert_output "HOSTWINS"
+}
+
 # ── per-project /workspace block ────────────────────────────────────────────
 
 @test "build: the project's own /workspace block persists across rebuilds" {
@@ -350,4 +368,70 @@ teardown() { _common_teardown; }
   printf '{"a": {'          > "$TEST_TEMP/trunc.json"     && ! _looks_like_json_object "$TEST_TEMP/trunc.json"
   printf '[1,2,3]'          > "$TEST_TEMP/arr.json"       && ! _looks_like_json_object "$TEST_TEMP/arr.json"
   printf ''                 > "$TEST_TEMP/empty.json"     && ! _looks_like_json_object "$TEST_TEMP/empty.json"
+}
+
+# ── cross-box identity: login once, every box ────────────────────────────────
+# An in-box login writes oauthAccount only into THAT box's mounted per-project
+# file; nothing ever writes the host ~/.claude.json. Identity keys that both
+# the host and this project lack must fall through to the newest sibling box
+# that holds a login, or every box built after a logout re-prompts despite a
+# fresh shared ~/.claude/.credentials.json.
+
+@test "build: identity falls through per key when the host file exists but lacks it" {
+  echo '{"numStartups":7}' > "$HOST_JSON"
+  mkdir -p "$(dirname "$OUT")"
+  echo '{"oauthAccount":{"emailAddress":"kept@box.dev"}}' > "$OUT"
+
+  _build_project_claude_json "$OUT"
+
+  run jq -r '.oauthAccount.emailAddress' "$OUT"
+  assert_output "kept@box.dev"
+}
+
+@test "build: fresh project inherits identity from the newest sibling box" {
+  echo '{"numStartups":7}' > "$HOST_JSON"
+  mkdir -p "$CLEAT_PROJECTS_DIR/proj-old" "$CLEAT_PROJECTS_DIR/proj-new"
+  echo '{"oauthAccount":{"emailAddress":"old@login.dev"},"userID":"u-old"}' > "$CLEAT_PROJECTS_DIR/proj-old/claude.json"
+  echo '{"oauthAccount":{"emailAddress":"new@login.dev"},"userID":"u-new"}' > "$CLEAT_PROJECTS_DIR/proj-new/claude.json"
+  touch -t 202001010000 "$CLEAT_PROJECTS_DIR/proj-old/claude.json"
+
+  _build_project_claude_json "$OUT"
+
+  run jq -r '.oauthAccount.emailAddress' "$OUT"
+  assert_output "new@login.dev"
+  run jq -r '.userID' "$OUT"
+  assert_output "u-new"
+}
+
+@test "build: host identity still wins over a sibling box" {
+  echo '{"oauthAccount":{"emailAddress":"host@a.com"}}' > "$HOST_JSON"
+  mkdir -p "$CLEAT_PROJECTS_DIR/proj-b"
+  echo '{"oauthAccount":{"emailAddress":"sibling@b.com"}}' > "$CLEAT_PROJECTS_DIR/proj-b/claude.json"
+
+  _build_project_claude_json "$OUT"
+
+  run jq -r '.oauthAccount.emailAddress' "$OUT"
+  assert_output "host@a.com"
+}
+
+@test "build: corrupt siblings are skipped; an older valid sibling still supplies identity" {
+  rm -f "$HOST_JSON"
+  mkdir -p "$CLEAT_PROJECTS_DIR/proj-corrupt" "$CLEAT_PROJECTS_DIR/proj-valid"
+  echo '{"oauthAccount":{"emailAddress":"good@b.com"}}' > "$CLEAT_PROJECTS_DIR/proj-valid/claude.json"
+  touch -t 202001010000 "$CLEAT_PROJECTS_DIR/proj-valid/claude.json"
+  printf '{"oauthAccount":' > "$CLEAT_PROJECTS_DIR/proj-corrupt/claude.json"
+
+  _build_project_claude_json "$OUT"
+
+  run jq -r '.oauthAccount.emailAddress' "$OUT"
+  assert_output "good@b.com"
+}
+
+@test "build: no identity anywhere invents no account (login gate stays visible)" {
+  rm -f "$HOST_JSON"
+
+  _build_project_claude_json "$OUT"
+
+  run jq 'has("oauthAccount")' "$OUT"
+  assert_output "false"
 }

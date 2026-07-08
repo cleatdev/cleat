@@ -856,6 +856,10 @@ unset CLEAT_BROWSER_BRIDGE
 echo "mode=[\$(_browser_bridge_mode)]"
 if _browser_should_open auto 1 0; then echo "plain=open"; else echo "plain=defer"; fi
 if _browser_should_open auto 1 1; then echo "auth=open"; else echo "auth=defer"; fi
+# 4. Auth classification under strict mode: the code-paste login URL (no
+#    loopback callback) is auth; a plain link is not; neither aborts set -e.
+if _is_auth_url "https://claude.ai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Fcb"; then echo "codepaste=auth"; else echo "codepaste=plain"; fi
+if _is_auth_url "https://example.com/docs"; then echo "docs=auth"; else echo "docs=plain"; fi
 rm -rf "\$dd"
 EOF
   run bash "$TEST_TEMP/vmbridge_strict.sh"
@@ -866,6 +870,8 @@ EOF
   assert_output --partial "mode=[auto]"                  # unset env var defaults to auto, no unbound-var
   assert_output --partial "plain=defer"                  # no duplicate tab on an interactive terminal
   assert_output --partial "auth=open"                    # login URLs still open
+  assert_output --partial "codepaste=auth"               # code-paste login URL counts as auth
+  assert_output --partial "docs=plain"                   # plain links still defer
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
 }

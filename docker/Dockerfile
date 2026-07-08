@@ -80,6 +80,12 @@ RUN chmod +x /usr/local/bin/open-bridge && \
     ln -sf open-bridge /usr/local/bin/open && \
     ln -sf open-bridge /usr/local/bin/xdg-open && \
     ln -sf open-bridge /usr/local/bin/sensible-browser
+# Claude Code 2.1.191+ only invokes an opener (and keeps the hands-free
+# loopback login instead of the manual code-paste flow) when a browser is
+# discoverable; the box has no display, so name the shim explicitly. The CLI
+# also passes this at `docker run` so containers created from older images get
+# it on recreate.
+ENV BROWSER=/usr/local/bin/open-bridge
 
 # Hook event forwarder directory (used when hooks capability is active)
 RUN mkdir -p /var/log/cleat && chown coder:coder /var/log/cleat

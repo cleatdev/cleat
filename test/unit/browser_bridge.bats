@@ -255,6 +255,67 @@ EOF
   assert_failure
 }
 
+# ── _is_auth_url: OAuth URL classification ──────────────────────────────────
+# Auth means "carries a redirect_uri= query param", NOT "has a loopback
+# callback": Claude Code's code-paste login flow points redirect_uri at
+# console.anthropic.com and still must auto-open (the user cannot click a URL
+# claude emits programmatically through the open shim).
+
+@test "auth url: loopback authorize URL classifies as auth" {
+  run _is_auth_url "https://claude.ai/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback&scope=a"
+  assert_success
+}
+
+@test "auth url: code-paste authorize URL (console callback, no loopback) classifies as auth" {
+  run _is_auth_url "https://claude.ai/oauth/authorize?code=true&client_id=x&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=user"
+  assert_success
+}
+
+@test "auth url: redirect_uri as the first query param classifies as auth" {
+  run _is_auth_url "https://example.test/authorize?redirect_uri=https%3A%2F%2Fapp%2Fcb"
+  assert_success
+}
+
+@test "auth url: plain links do not classify as auth" {
+  run _is_auth_url "https://example.com/docs/oauth"
+  assert_failure
+  run _is_auth_url "https://example.com/redirect_uris"
+  assert_failure
+  # redirect_uri in the PATH, not as a query param, is not an OAuth request
+  run _is_auth_url "https://example.com/path/redirect_uri=abc"
+  assert_failure
+}
+
+# ── stale debounce markers ──────────────────────────────────────────────────
+
+@test "marker sweep: removes expired debounce markers, keeps fresh ones" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  mkdir "$dir/.open.stale_9"
+  touch -t 202001010000 "$dir/.open.stale_9"     # long past the 2s window
+  mkdir "$dir/.open.fresh_9"                     # now: inside the window
+  _browser_sweep_stale_markers "$dir"
+  [ ! -d "$dir/.open.stale_9" ] || { echo "expired debounce marker survived the sweep"; return 1; }
+  [ -d "$dir/.open.fresh_9" ] || { echo "fresh debounce marker was swept; a live debounce would break"; return 1; }
+}
+
+@test "marker sweep: watcher start clears markers a dead session left behind" {
+  # A box whose last session never claims another URL keeps its final markers
+  # forever (the per-claim sweep never runs again); watcher startup must sweep.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  mkdir "$dir/.open.leftover_3"
+  touch -t 202001010000 "$dir/.open.leftover_3"
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 1
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ ! -d "$dir/.open.leftover_3" ] || { echo "watcher start did not sweep a stale marker"; return 1; }
+}
+
 @test "browser bridge: auto mode does NOT re-open a plain link the terminal handled" {
   # Integration: drive the real watcher loop with an interactive terminal flag.
   # The plain link must never reach the opener (the visible duplicate tab).
@@ -274,6 +335,10 @@ EOF
   kill "$wpid" 2>/dev/null || true
   wait "$wpid" 2>/dev/null || true
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "bridge re-opened a plain link the terminal already opened"; return 1; }
+  # The deferral is logged: a silent defer is exactly what made the code-paste
+  # login regression hard to diagnose from the field.
+  run cat "$dir/.proxy-log"
+  assert_output --partial "deferring URL to terminal"
 }
 
 @test "browser bridge: auto mode still opens an auth URL on an interactive terminal" {

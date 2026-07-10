@@ -279,6 +279,33 @@ have *fewer* caps than `.cleat`). One caveat: `~/.claude` (your Anthropic auth)
 is shared across boxes. A box isolates host capabilities and the writable layer,
 not your Claude login.
 
+### Kits: curated Claude pre-configurations, per box
+
+A **kit** is a curated Claude Code setup (a CLAUDE.md policy plus custom
+subagents) that you enable for one box with one command. The flagship kit,
+`plan-big-execute-small`, adapts the orchestration pattern from
+[Anthropic's cookbook](https://github.com/anthropics/claude-cookbooks/tree/main/managed_agents):
+run your session on Fable 5 and it plans and reviews while Sonnet 5
+`worker`/`scout` subagents execute and explore. Flagship judgment on every
+decision, most tokens billed at Sonnet rates, so multi-file work burns your
+rate limit far slower. Prefer different economics? Pin or swap the agent
+models under a `[kits]` section in `~/.config/cleat/config`
+(`worker_model = haiku`); the planner is always your session's model.
+
+```bash
+cleat kit                              # library + this project's selections
+cleat kit plan-big-execute-small       # enable for this project's main box
+cleat kit off                          # back to your own config next session
+cleat kit show plan-big-execute-small  # read every line it injects, first
+```
+
+A kit merges on top of your own config inside the box (your global CLAUDE.md
+and agents keep working; the kit section is appended and clearly marked) and
+never touches the host: `~/.claude` on the host is never written, and native
+`claude` never sees it. Different boxes can run different kits on the same
+repo. Kits contain instructions and subagents only, no hooks and no settings,
+and whatever they steer the agent to do happens inside the cage.
+
 ### Command reference
 
 #### Quick start
@@ -315,6 +342,15 @@ not your Claude login.
 | `cleat trust [path]` | Record approval for a project's `.cleat` capabilities |
 | `cleat trust --list` | List trusted projects (yellow = `.cleat` changed since approval) |
 | `cleat untrust [path]` | Remove a project's trust entry |
+
+#### Kits
+| Command | Description |
+|---|---|
+| `cleat kit` | Interactive picker: pick a kit, then its agent models (TUI, like `cleat config`) |
+| `cleat kit list` | Plain kit library and this project's selections |
+| `cleat kit <name> [box]` | Enable a kit for a box (merges on top of your config; next session) |
+| `cleat kit off [box]` | Disable the box's kit (back to your own config) |
+| `cleat kit show <name>` | Print everything a kit injects |
 
 #### Flags (apply to `start`, `run`, `resume`, `claude`, `shell`, `login`)
 | Flag | Description |

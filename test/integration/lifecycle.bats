@@ -207,3 +207,59 @@ EOF
   assert_success
   [[ "$output" == v24* ]] || { echo "expected Node 24, got: $output"; return 1; }
 }
+
+# ── Kits (concept/34): merged read-only view in the box, host untouched ──────
+# Only an integration test can prove the three load-bearing claims at once:
+# the mask is truly read-only from inside the cage (mount-level, even as
+# root), the merge is what Claude actually reads, and a `kit off` lands in a
+# RUNNING container without a restart (the inode-stable in-place rewrite).
+
+@test "integration: kitted box sees the merged view read-only; host untouched; kit off lands live" {
+  cd "$INT_PROJECT"
+  local cname
+  cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+
+  # Host global memory + a personal agent that must survive the merge.
+  echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"
+  mkdir -p "$HOME/.claude/agents"
+  echo "mine" > "$HOME/.claude/agents/my-agent.md"
+
+  # Enable the kit (piped confirm), then create the box.
+  run bash -c "echo y | '$CLI' kit plan-big-execute-small"
+  assert_success
+  run "$CLI" run
+  assert_success
+
+  # Inside the box: user content first, kit section appended.
+  run docker exec "$cname" head -1 /home/coder/.claude/CLAUDE.md
+  assert_output "MY GLOBAL RULES"
+  run docker exec "$cname" cat /home/coder/.claude/CLAUDE.md
+  assert_output --partial "Cleat kit: plan-big-execute-small"
+
+  # Agents: the user's own beside the kit's.
+  run docker exec "$cname" ls /home/coder/.claude/agents
+  assert_output --partial "my-agent.md"
+  assert_output --partial "kit-worker.md"
+
+  # The masks are read-only from inside the cage, even as root.
+  run docker exec "$cname" sh -c 'echo pwned >> /home/coder/.claude/CLAUDE.md'
+  assert_failure
+  run docker exec "$cname" sh -c 'echo pwned > /home/coder/.claude/agents/evil.md'
+  assert_failure
+
+  # The host is untouched: no kit content in the real ~/.claude.
+  run cat "$HOME/.claude/CLAUDE.md"
+  assert_output "MY GLOBAL RULES"
+  [ ! -e "$HOME/.claude/agents/kit-worker.md" ]
+
+  # `kit off` regenerates in place: the RUNNING container's bind (same inode)
+  # shows the vanilla view immediately, no restart.
+  run bash -c "'$CLI' kit off"
+  assert_success
+  run docker exec "$cname" cat /home/coder/.claude/CLAUDE.md
+  assert_output "MY GLOBAL RULES"
+  run docker exec "$cname" ls /home/coder/.claude/agents
+  refute_output --partial "kit-worker.md"
+
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+}

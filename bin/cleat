@@ -79,6 +79,22 @@ CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 # writable layer (e.g. an `az login`). See concept/20-boxes.md.
 CLEAT_BOXES_DIR="$CLEAT_CONFIG_DIR/boxes"
 
+# Host-side per-box kit selection, keyed by container name: one file per box
+# holding the enabled kit's name. Same rationale as CLEAT_BOXES_DIR (not a
+# Docker label: labels are immutable, editing one would force a recreate). A
+# separate dir, not a suffixed file inside CLEAT_BOXES_DIR, so the description
+# display globs never iterate a non-description file. See concept/34-kits.md.
+CLEAT_KITS_DIR="$CLEAT_CONFIG_DIR/kits"
+
+# Curated kit library (maintainer-authored, embedded as heredocs in _kit_emit;
+# no cache, no network: the CLI release is the single source of truth). Order
+# matters for display.
+KNOWN_KITS=(plan-big-execute-small)
+# Default model alias for kit agents (floats to the current Sonnet with the
+# bundled Claude), and the cycle order the interactive picker offers.
+_KIT_DEFAULT_MODEL="sonnet"
+_KIT_MODEL_CHOICES=(sonnet haiku opus inherit)
+
 # Persistent per-project Claude global-state (.claude.json) store. Unlike
 # $CLEAT_RUN_DIR (per-container, wiped on `cleat rm`/recreate), this is keyed by
 # PROJECT and deliberately survives recreate so a project's trust/MCP approvals
@@ -701,24 +717,24 @@ _project_env_file() {
 }
 
 # ── Resources: per-box memory limit ──────────────────────────────────────────
-# Read one key from a config file's [resources] section. Lines are
+# Read one key from a config file's [<section>] section. Lines are
 # `key = value` (spaces optional). Same parsing hygiene as [caps]: CRLF-safe,
 # comment- and whitespace-tolerant. Prints the value, or nothing when absent.
-_read_resource_from_file() {
-  local file="$1" key="$2"
+_read_section_from_file() {
+  local file="$1" section="$2" key="$3"
   [[ -f "$file" ]] || return 0
   local in_section=false line k v
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (a hand-edited
   # `.cleat` ending in `memory = 8g`) is still read; without it `read` returns
-  # non-zero at EOF and the configured ceiling is silently dropped, falling back
-  # to the VM-derived default. Matches _read_caps_from_file and _parse_env_file.
+  # non-zero at EOF and the configured value is silently dropped, falling back
+  # to the default. Matches _read_caps_from_file and _parse_env_file.
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
     if [[ "$line" == "["*"]" ]]; then
-      [[ "$line" == "[resources]" ]] && in_section=true || in_section=false
+      [[ "$line" == "[$section]" ]] && in_section=true || in_section=false
       continue
     fi
     $in_section || continue
@@ -732,6 +748,11 @@ _read_resource_from_file() {
       return 0
     fi
   done < "$file"
+}
+
+# Back-compat wrapper: every existing [resources] call site keeps its shape.
+_read_resource_from_file() {
+  _read_section_from_file "$1" resources "$2"
 }
 
 # A docker memory value: positive integer with optional b/k/m/g suffix.
@@ -1091,6 +1112,257 @@ _box_desc_write() {
 
 _box_desc_remove() {
   rm -f "$(_box_desc_file "$1")" 2>/dev/null || true
+}
+
+# ── Kits ─────────────────────────────────────────────────────────────────────
+#
+# A kit is a maintainer-curated Claude Code pre-configuration (a CLAUDE.md
+# policy fragment + custom subagents) enabled per box: `cleat kit <name>`.
+# Inside the box, two read-only masks over the shared ~/.claude mount replace
+# what Claude sees at ~/.claude/CLAUDE.md and ~/.claude/agents with content
+# generated host-side in $CLEAT_RUN_DIR/<cname>/kit/ on every create/start:
+# the user's own config first, the kit merged on top. The host ~/.claude is
+# never written; native claude never sees the kit. Kits ship instructions and
+# subagents only: no hooks, no settings, nothing that executes as a program.
+# Full design: concept/34-kits.md.
+
+_box_kit_file() {
+  echo "$CLEAT_KITS_DIR/$1"
+}
+
+_box_kit_read() {
+  local f
+  f="$(_box_kit_file "$1")"
+  [[ -f "$f" ]] && cat "$f" || true
+}
+
+_box_kit_write() {
+  local cname="$1" kit="$2"
+  mkdir -p "$CLEAT_KITS_DIR"
+  printf '%s\n' "$kit" > "$(_box_kit_file "$cname")"
+}
+
+_box_kit_remove() {
+  rm -f "$(_box_kit_file "$1")" 2>/dev/null || true
+}
+
+_kit_known() {
+  local k
+  for k in "${KNOWN_KITS[@]}"; do
+    [[ "$k" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# Effective model for a kit agent role. Users can pin or swap the models kits
+# use via a [kits] section in the GLOBAL config (trusted, user-authored):
+#   [kits]
+#   worker_model = claude-sonnet-5
+#   scout_model  = haiku
+# Read at every overlay generation, so a change lands next session with no
+# recreate. Global-only by design: the value is written into agent YAML
+# frontmatter, so it must never come from a project's untrusted .cleat.
+# Values are sanitized to a bare model token (letters, digits, dot, dash,
+# underscore); anything else falls back to the default alias, fail-safe
+# (this is the frontmatter-injection guard, do not widen it). The planner has
+# no knob: it is the session's main-loop model by definition.
+_kit_agent_model() {
+  local role="$1" default="$2" v
+  v="$(_read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits "${role}_model")"
+  if [[ -n "$v" && "$v" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "$v"
+  else
+    echo "$default"
+  fi
+}
+
+# One-paragraph description for the library listing and the confirm screen.
+# Deliberately mechanical claims only: planning runs on your session's model,
+# execution bills at worker rates. Never add outcome/quality percentages here;
+# the cookbook's benchmark numbers belong to its API harness, not this
+# adaptation (concept/34).
+_kit_description() {
+  case "$1" in
+    plan-big-execute-small)
+      echo "Run your session on Fable 5: it plans and reviews while Sonnet 5 workers execute and scout. Flagship judgment on every decision, most tokens billed at Sonnet rates, so multi-file work burns your rate limit far slower. Adapted from Anthropic's plan-big-execute-small cookbook pattern."
+      ;;
+  esac
+}
+
+# The confirm screen's "what this kit adds" lines. Models shown are the
+# EFFECTIVE ones (after [kits] overrides), so the screen never lies.
+_kit_confirm_lines() {
+  case "$1" in
+    plan-big-execute-small)
+      local _w _s
+      _w="$(_kit_agent_model worker sonnet)"
+      _s="$(_kit_agent_model scout sonnet)"
+      echo -e "    ${DIM}agents${RESET}     worker (model: ${_w}), scout (model: ${_s}, read-only)"
+      echo -e "    ${DIM}CLAUDE.md${RESET}  a delegation policy section (appended, yours stays)"
+      echo -e "    ${DIM}planner${RESET}    your session's model, not changed by the kit"
+      ;;
+  esac
+}
+
+# Emit a kit's files into <destdir>: CLAUDE.md (the policy fragment appended
+# under the marked header by _generate_kit_overlay) and agents/kit-*.md. The
+# heredocs here are the kit: `cleat kit show` prints from this function, and
+# kits update in lockstep with CLI releases. Kit content deliberately makes no
+# performance-number claims: the cookbook's benchmarks belong to its API
+# harness, not this prompt-level adaptation (concept/34).
+_kit_emit() {
+  local kit="$1" dest="$2"
+  mkdir -p "$dest/agents"
+  case "$kit" in
+    plan-big-execute-small)
+      cat > "$dest/CLAUDE.md" << 'KIT_EOF'
+You are the planner in a plan-big / execute-small team.
+
+- For any task touching more than one file: write the plan first, then
+  dispatch each self-contained chunk to the `worker` agent, one at a time
+  or in parallel when independent.
+- Review every worker result before dispatching the next dependent chunk.
+  You own integration and the final review.
+- Use the `scout` agent for all code exploration (call sites, structure,
+  impact) instead of searching in the main loop.
+- Keep the main loop for: planning, judgment calls, reviewing diffs,
+  integration, and talking to the user.
+- Do not delegate trivial single-file edits; just make them.
+KIT_EOF
+      # Frontmatter via an UNQUOTED heredoc so the effective (possibly
+      # [kits]-overridden) model lands in it; bodies stay quoted. The model
+      # value is sanitized by _kit_agent_model, never raw config text.
+      local _worker_model _scout_model
+      _worker_model="$(_kit_agent_model worker sonnet)"
+      _scout_model="$(_kit_agent_model scout sonnet)"
+      cat > "$dest/agents/kit-worker.md" << KIT_FM
+---
+name: worker
+description: Implementation executor. Dispatch one precise, self-contained
+  task with full context. It executes exactly that and reports back.
+model: ${_worker_model}
+---
+KIT_FM
+      cat >> "$dest/agents/kit-worker.md" << 'KIT_EOF'
+
+You execute exactly the task you are given, nothing more.
+
+- Implement precisely what the dispatch describes. Do not expand scope,
+  refactor adjacent code, or re-plan the approach.
+- If the task is ambiguous or turns out to be impossible as specified,
+  stop and report the blocker instead of improvising.
+- Match the surrounding code style. Run the narrowest relevant test if
+  one is named in the dispatch.
+- Report back: what changed (files and line ranges), the diff of your
+  changes, test output if any, and anything the planner must know.
+KIT_EOF
+      cat > "$dest/agents/kit-scout.md" << KIT_FM
+---
+name: scout
+description: Read-only codebase scout. Use for all exploration: finding
+  call sites, mapping structure, locating definitions, sizing a change.
+tools: Read, Grep, Glob, Bash
+model: ${_scout_model}
+---
+KIT_FM
+      cat >> "$dest/agents/kit-scout.md" << 'KIT_EOF'
+
+You explore and report. You never modify anything.
+
+- Answer the specific question asked: locations (file:line), shapes,
+  call sites, blast radius.
+- Read only what the question needs. Prefer excerpts over whole files.
+- Bash is for read-only inspection (ls, git log, git grep) only.
+- Report findings compactly: paths, line numbers, one-line conclusions.
+KIT_EOF
+      ;;
+  esac
+}
+
+# Does this container mount the kit overlay? Boxes created before the kit
+# feature do not (bind mounts are baked at create); they gain the mounts on
+# their next natural recreate, or explicitly via `cleat kit` which offers the
+# rebuild. Unreadable inspect degrades to "no mounts", the safe answer for
+# both callers (skip the regen / route the enable through the rebuild offer).
+_container_has_kit_mounts() {
+  local dests
+  dests="$(docker inspect "$1" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)" || return 1
+  printf '%s\n' "$dests" | grep -qx '/home/coder/.claude/CLAUDE.md'
+}
+
+# (Re)generate the kit overlay content for a box: the two files masked over
+# ~/.claude inside the container. Called at create (cmd_run) and refreshed on
+# every start/resume, mirroring the settings overlay. Merge semantics
+# (concept/34): the user's real global CLAUDE.md comes FIRST byte-for-byte
+# with the kit fragment appended under a marked header; the agents dir is a
+# copy of the user's agents plus the kit's kit-*.md files (a same-named user
+# file wins). Vanilla boxes (no kit) get a plain pass-through copy, so the
+# mount shape is uniform and a kit change is never a recreate.
+_generate_kit_overlay() {
+  local cname="$1"
+  local kit_dir="$CLEAT_RUN_DIR/${cname}/kit"
+  local kit
+  kit="$(_box_kit_read "$cname")"
+  # An unknown selection (hand-edited file, or written by a different CLI
+  # version) degrades to vanilla rather than failing the start.
+  if [[ -n "$kit" ]] && ! _kit_known "$kit"; then
+    kit=""
+  fi
+
+  # Self-heal wrong types from manual tampering: a directory where the file
+  # goes (or vice versa) would fail the writes below under strict mode.
+  [[ -d "$kit_dir/CLAUDE.md" ]] && rm -rf "$kit_dir/CLAUDE.md"
+  [[ -f "$kit_dir/agents" ]] && rm -f "$kit_dir/agents"
+  mkdir -p "$kit_dir/agents"
+
+  # Rewrite IN PLACE (truncate the file, clear inside the dir; never rm the
+  # sources themselves): both are bind-mounted, and a running container keeps
+  # the original inodes, so in-place rewrites are what make a kit change
+  # visible to the box's next session without a container restart.
+  local _f
+  for _f in "$kit_dir/agents"/*; do
+    [[ -e "$_f" ]] || continue
+    rm -rf "$_f"
+  done
+
+  # CLAUDE.md: the user's real global memory first, byte-for-byte.
+  if [[ -f "${HOME}/.claude/CLAUDE.md" ]]; then
+    cat "${HOME}/.claude/CLAUDE.md" > "$kit_dir/CLAUDE.md"
+  else
+    : > "$kit_dir/CLAUDE.md"
+  fi
+
+  # agents/: the user's own agents, as-is.
+  if [[ -d "${HOME}/.claude/agents" ]]; then
+    for _f in "${HOME}/.claude/agents"/*; do
+      [[ -f "$_f" ]] || continue
+      cp "$_f" "$kit_dir/agents/" 2>/dev/null || true
+    done
+  fi
+
+  [[ -n "$kit" ]] || return 0
+
+  # Merge the kit on top: fragment appended under a marked header; agents
+  # added without clobbering a same-named user file (the user wins; the
+  # near-impossible collision is warned about at enable time, not here,
+  # where a spinner may own the terminal).
+  local stage="$kit_dir/.stage"
+  rm -rf "$stage"
+  _kit_emit "$kit" "$stage"
+  {
+    echo ""
+    echo "# ── Cleat kit: $kit ──"
+    echo ""
+    cat "$stage/CLAUDE.md"
+  } >> "$kit_dir/CLAUDE.md"
+  local _base
+  for _f in "$stage/agents"/*; do
+    [[ -f "$_f" ]] || continue
+    _base="$(basename "$_f")"
+    [[ -e "$kit_dir/agents/$_base" ]] && continue
+    cp "$_f" "$kit_dir/agents/$_base"
+  done
+  rm -rf "$stage"
 }
 
 # ── Workspace trust ─────────────────────────────────────────────────────────
@@ -2278,6 +2550,14 @@ _print_summary_block() {
     else
       echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
     fi
+  fi
+  # A box's personality must never be invisible: show the enabled kit. The
+  # selection file is hand-editable, so print its content as DATA (%s), never
+  # through echo -e (same convention as cmd_describe).
+  local _summary_kit
+  _summary_kit="$(_box_kit_read "$cname")"
+  if [[ -n "$_summary_kit" ]]; then
+    printf '  %bKit:%b        %b%s%b\n' "$DIM" "$RESET" "$BLUE" "$_summary_kit" "$RESET"
   fi
   _print_caps "  " "Caps:" "       "
   _env_summary_inline "$project"
@@ -4071,6 +4351,30 @@ cmd_run() {
   touch "${HOME}/.claude/history.jsonl"
   # Also ensure the overlay target exists in the base mount (Docker needs it)
   mkdir -p "${HOME}/.claude/projects/-workspace"
+  # Also ensure the settings-mask target exists in the base mount. Same
+  # VirtioFS constraint as history.jsonl above: on macOS the nested file
+  # mount fails when its target is missing inside the parent bind source. A
+  # fresh host that never ran native claude has no ~/.claude/settings.json
+  # (found 2026-07-10 running the integration suite against a real macOS
+  # daemon; every developer machine masked it because the file existed).
+  # Write '{}', not an empty file, so native claude still reads valid JSON.
+  [[ -f "${HOME}/.claude/settings.json" ]] || echo '{}' > "${HOME}/.claude/settings.json"
+
+  # ── Kit overlay (concept/34) ──────────────────────────────────────────────
+  # Two read-only masks over the base ~/.claude mount replace what the box
+  # sees at ~/.claude/CLAUDE.md and ~/.claude/agents with host-generated
+  # merges (the user's own content + the enabled kit, or a plain copy when no
+  # kit). Mounted on EVERY box so enabling, switching, or disabling a kit
+  # later is a content regeneration, never a recreate. :ro so the caged agent
+  # cannot rewrite its own instructions (and, as a hardening side effect, can
+  # no longer write the host's user-level CLAUDE.md/agents through the base
+  # mount, which native host claude would then obey).
+  _generate_kit_overlay "$cname"
+  # VirtioFS rejects nested mounts whose target is missing inside the parent
+  # bind source; ensure both targets exist on the host (inert for native
+  # claude: an empty CLAUDE.md / empty agents dir means nothing to it).
+  touch "${HOME}/.claude/CLAUDE.md"
+  mkdir -p "${HOME}/.claude/agents"
 
   local mount_args=(
     -v "$project":/workspace
@@ -4078,6 +4382,8 @@ cmd_run() {
     -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
     -v "${project_session_dir}:/home/coder/.claude/projects/-workspace"
     -v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"
+    -v "$CLEAT_RUN_DIR/${cname}/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro"
+    -v "$CLEAT_RUN_DIR/${cname}/kit/agents:/home/coder/.claude/agents:ro"
     -v "$clip_dir":/tmp/cleat-clip
   )
 
@@ -4288,6 +4594,13 @@ cmd_start() {
   # a recreate (the branches below then recreate it with the current flags).
   _maybe_prompt_init_recreate "$cname"
 
+  # Refresh the kit overlay (the selection or the user's own CLAUDE.md/agents
+  # may have changed between sessions). In-place, so it lands for stopped AND
+  # running boxes; pre-kit boxes (no mask mounts) are skipped, see concept/34.
+  if container_exists "$cname" && _container_has_kit_mounts "$cname"; then
+    _generate_kit_overlay "$cname"
+  fi
+
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
@@ -4381,6 +4694,12 @@ cmd_resume() {
   # Reaper drift: a box created without --init wedges on long sessions; offer
   # a recreate (the missing-container path below then recreates it).
   _maybe_prompt_init_recreate "$cname"
+
+  # Refresh the kit overlay (selection or the user's own CLAUDE.md/agents may
+  # have changed between sessions); pre-kit boxes are skipped, see concept/34.
+  if container_exists "$cname" && _container_has_kit_mounts "$cname"; then
+    _generate_kit_overlay "$cname"
+  fi
 
   # Refresh settings overlays (user may have changed hooks between stop/resume)
   local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
@@ -4513,9 +4832,11 @@ cmd_rm() {
   else
     info "No container to remove."
   fi
-  # Remove the box's host-side description unconditionally: `cleat rm <box>` is
-  # the documented removal path even for a box that was only ever describe'd.
+  # Remove the box's host-side description and kit selection unconditionally:
+  # `cleat rm <box>` is the documented removal path even for a box that was
+  # only ever describe'd or kitted.
   _box_desc_remove "$cname"
+  _box_kit_remove "$cname"
 }
 
 cmd_shell() {
@@ -5505,6 +5826,10 @@ cmd_nuke() {
     rm -rf "$CLEAT_BOXES_DIR" 2>/dev/null || true
   fi
 
+  if [[ -d "$CLEAT_KITS_DIR" ]]; then
+    rm -rf "$CLEAT_KITS_DIR" 2>/dev/null || true
+  fi
+
   local dangling
   dangling=$(docker images -f "dangling=true" -q 2>/dev/null)
   if [[ -n "$dangling" ]]; then
@@ -6100,6 +6425,565 @@ cmd_describe() {
   fi
 }
 
+# `cleat kit`: enable/disable/inspect curated Claude pre-configurations per
+# box. Two positionals (`kit <name> [box]`), so like `describe` it parses
+# inside cmd_kit and never routes through _set_box (which rejects a second
+# positional). Reserved words (off/list/show) resolve before the kit registry.
+# See concept/34-kits.md.
+cmd_kit() {
+  case "${1:-}" in
+    --help|-h)
+      echo "Usage: cleat kit                       Interactive picker: kit, then models"
+      echo "       cleat kit list                  Plain library + this project's selections"
+      echo "       cleat kit <name> [box]          Enable a kit for a box (default: main)"
+      echo "       cleat kit off [box]             Disable (back to your own config)"
+      echo "       cleat kit show <name>           Print everything a kit injects"
+      return 0 ;;
+  esac
+
+  local sub="${1:-}"
+  # Bare `cleat kit` is interactive, exactly like bare `cleat config`: the
+  # arrow-key TUI on a terminal, the typed text mode otherwise. The plain
+  # listing stays available as `cleat kit list` (and for scripts).
+  if [[ -z "$sub" ]]; then
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+      _kit_picker_tui
+    else
+      _kit_picker_text
+    fi
+    return 0
+  fi
+  if [[ "$sub" == "list" ]]; then
+    _kit_print_library
+    return 0
+  fi
+  shift
+
+  case "$sub" in
+    show)
+      local name="${1:-}"
+      if [[ -z "$name" ]] || ! _kit_known "$name"; then
+        error "Unknown kit: ${BOLD}${name:-<none>}${RESET}"
+        echo -e "    ${DIM}Available kits: ${KNOWN_KITS[*]}${RESET}"
+        exit 1
+      fi
+      _kit_show "$name"
+      ;;
+    off)
+      _kit_disable "${1:-main}"
+      ;;
+    *)
+      if ! _kit_known "$sub"; then
+        error "Unknown kit: ${BOLD}${sub}${RESET}"
+        echo -e "    ${DIM}Available kits: ${KNOWN_KITS[*]}${RESET}"
+        echo -e "    ${DIM}Run ${BOLD}cleat kit${RESET}${DIM} for descriptions.${RESET}"
+        exit 1
+      fi
+      _kit_enable "$sub" "${1:-main}"
+      ;;
+  esac
+}
+
+_kit_require_box() {
+  if ! _validate_box_name "$1"; then
+    error "Invalid box name: ${BOLD}$1${RESET}"
+    echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars.${RESET}"
+    exit 1
+  fi
+}
+
+# Boxes created before the kit feature lack the mask mounts (bind mounts are
+# baked at create): offer the rebuild instead of silently "enabling" a kit the
+# box would ignore. Declining changes nothing. Shared by the direct grammar
+# and the interactive picker. Returns 0 = continue to the normal apply,
+# 1 = handled here (rebuild accepted or declined), caller stops either way.
+_kit_prekit_offer() {
+  local kit="$1" box="$2" cname="$3"
+  if container_exists "$cname" && ! _container_has_kit_mounts "$cname"; then
+    echo ""
+    info "This box was created before kits existed and needs a rebuild to gain"
+    echo -e "    the kit mount points. ${DIM}Your project, auth, and sessions are safe;${RESET}"
+    echo -e "    ${DIM}ad-hoc installs inside the box are not.${RESET}"
+    echo ""
+    local yn=""
+    _ask_yn yn "Rebuild now? [y/N] "
+    if [[ "$yn" == [yY]* ]]; then
+      docker rm -f "$cname" > /dev/null 2>&1 || true
+      rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+      _box_kit_write "$cname" "$kit"
+      success "Kit ${BOLD}${kit}${RESET} enabled for box ${BOLD}${box}${RESET}."
+      echo -e "    ${DIM}Next ${BOLD}cleat${RESET}${DIM} rebuilds the box with the kit active.${RESET}"
+    else
+      info "Kept as is. Nothing changed."
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# Post-consent apply, shared by the direct grammar (after its [Y/n]) and the
+# interactive picker (where selecting IS the consent): collision heads-up,
+# selection write, in-place overlay refresh, success + next-session note.
+_kit_apply() {
+  local kit="$1" box="$2" cname="$3"
+
+  # Collision heads-up: the overlay generation silently prefers a same-named
+  # user agent (concept/34); say so here, where no spinner owns the terminal.
+  local _ck_tmp="${TMPDIR:-/tmp}/cleat-kit-check.$$" _ck_f _ck_base
+  _kit_emit "$kit" "$_ck_tmp"
+  for _ck_f in "$_ck_tmp/agents"/*; do
+    [[ -f "$_ck_f" ]] || continue
+    _ck_base="$(basename "$_ck_f")"
+    if [[ -e "${HOME}/.claude/agents/$_ck_base" ]]; then
+      warn "You already have an agent named ${BOLD}${_ck_base}${RESET}; yours wins, the kit's copy is skipped."
+    fi
+  done
+  rm -rf "$_ck_tmp"
+
+  _box_kit_write "$cname" "$kit"
+
+  # Refresh the overlay now when the box already has the mounts (in-place, so
+  # it lands even for a running box; a currently-attached session already read
+  # its config, hence "next session").
+  if container_exists "$cname" && _container_has_kit_mounts "$cname"; then
+    _generate_kit_overlay "$cname"
+  fi
+
+  success "Kit ${BOLD}${kit}${RESET} enabled for box ${BOLD}${box}${RESET}."
+  if container_exists "$cname" && _box_has_live_agent "$cname"; then
+    echo -e "    ${DIM}A session is live in this box; the kit applies from the next session.${RESET}"
+  else
+    echo -e "    ${DIM}Takes effect next session: ${BOLD}cleat${RESET}"
+  fi
+}
+
+_kit_enable() {
+  local kit="$1" box="$2"
+  _kit_require_box "$box"
+  local project cname
+  project="$(resolve_project)"
+  cname="$(container_name_for "$project" "$box")"
+
+  _kit_prekit_offer "$kit" "$box" "$cname" || return 0
+
+  echo ""
+  echo -e "  ${BOLD}Enable kit ${kit} for box ${box}?${RESET}"
+  echo ""
+  _kit_description "$kit" | fold -s -w 66 | sed 's/^/  /'
+  echo ""
+  echo -e "  This kit adds, ${BOLD}inside the box only${RESET}:"
+  _kit_confirm_lines "$kit"
+  echo ""
+  echo -e "  ${DIM}Your host ~/.claude and this repo are not touched.${RESET}"
+  echo ""
+  local yn=""
+  _ask_yn yn "Enable? [Y/n] "
+  if [[ -n "$yn" && "$yn" != [yY]* ]]; then
+    info "Cancelled."
+    return 0
+  fi
+
+  _kit_apply "$kit" "$box" "$cname"
+}
+
+_kit_disable() {
+  local box="$1"
+  _kit_require_box "$box"
+  local project cname
+  project="$(resolve_project)"
+  cname="$(container_name_for "$project" "$box")"
+
+  local cur
+  cur="$(_box_kit_read "$cname")"
+  if [[ -z "$cur" ]]; then
+    info "No kit enabled for box ${BOLD}${box}${RESET}."
+    return 0
+  fi
+  _box_kit_remove "$cname"
+  if container_exists "$cname" && _container_has_kit_mounts "$cname"; then
+    _generate_kit_overlay "$cname"
+  fi
+  # $cur comes from the hand-editable selection file: print it as data.
+  printf '  %b✔ Kit %b%s%b disabled for box %b%s%b.%b\n' "$GREEN" "$BOLD" "$cur" "$RESET$GREEN" "$BOLD" "$box" "$RESET$GREEN" "$RESET"
+  echo -e "    ${DIM}Back to your own config next session.${RESET}"
+}
+
+_kit_print_library() {
+  local project base
+  project="$(resolve_project)"
+  base="$(container_name_for "$project" "main")"
+
+  echo ""
+  echo -e "  ${BOLD}Cleat Kits${RESET} ${DIM}(curated Claude pre-configurations, per box)${RESET}"
+  echo ""
+  local k
+  for k in "${KNOWN_KITS[@]}"; do
+    echo -e "  ${GREEN}${k}${RESET}"
+    _kit_description "$k" | fold -s -w 62 | sed 's/^/    /'
+  done
+
+  # This project's current selections (any box).
+  local _kf _bname _blabel _kname _shown=false
+  if [[ -d "$CLEAT_KITS_DIR" ]]; then
+    for _kf in "$CLEAT_KITS_DIR"/*; do
+      [[ -f "$_kf" ]] || continue
+      _bname="$(basename "$_kf")"
+      case "$_bname" in
+        "$base")   _blabel="main" ;;
+        "$base"-*) _blabel="${_bname#${base}-}" ;;
+        *) continue ;;
+      esac
+      _kname="$(cat "$_kf")"
+      if ! $_shown; then
+        echo ""
+        echo -e "  ${DIM}This project:${RESET}"
+        _shown=true
+      fi
+      # Selection files are hand-editable: print their content as data.
+      printf '    %s: %b%s%b\n' "$_blabel" "$BLUE" "$_kname" "$RESET"
+    done
+  fi
+
+  echo ""
+  echo -e "  ${DIM}Enable:  ${BOLD}cleat kit <name> [box]${RESET}${DIM}    Disable: ${BOLD}cleat kit off [box]${RESET}"
+  echo -e "  ${DIM}Inspect: ${BOLD}cleat kit show <name>${RESET}"
+  echo -e "  ${DIM}Models:  set ${BOLD}worker_model${RESET}${DIM} / ${BOLD}scout_model${RESET}${DIM} under ${BOLD}[kits]${RESET}${DIM} in ~/.config/cleat/config${RESET}"
+}
+
+# Write the [kits] model overrides to a config file, preserving everything
+# outside the [kits] section (same shape as _write_caps_to_file). Defaults are
+# OMITTED so an untouched setup keeps a clean config: when both roles are the
+# default alias, no [kits] section is written at all.
+_write_kits_to_file() {
+  local file="$1" worker="$2" scout="$3"
+  mkdir -p "$(dirname "$file")"
+
+  local preserved="" in_kits=false line
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      if [[ "$line" == "[kits]" ]]; then
+        in_kits=true
+        continue
+      fi
+      if $in_kits; then
+        if [[ "$line" == "["*"]" ]]; then
+          in_kits=false
+          preserved+="$line"$'\n'
+        fi
+        continue
+      fi
+      preserved+="$line"$'\n'
+    done < "$file"
+  fi
+
+  # Explicit ifs, never `[[ ]] && echo`: a false test as the block's last
+  # list would make this function return 1 and kill the strict-mode caller
+  # (found live: the text picker died silently on "done" with default models).
+  {
+    if [[ -n "$preserved" ]]; then
+      printf '%s' "$preserved"
+    fi
+    if [[ "$worker" != "$_KIT_DEFAULT_MODEL" || "$scout" != "$_KIT_DEFAULT_MODEL" ]]; then
+      echo "[kits]"
+      if [[ "$worker" != "$_KIT_DEFAULT_MODEL" ]]; then
+        echo "worker_model = $worker"
+      fi
+      if [[ "$scout" != "$_KIT_DEFAULT_MODEL" ]]; then
+        echo "scout_model = $scout"
+      fi
+    fi
+  } > "$file"
+}
+
+# Next model in the picker cycle for a role. The cycle is _KIT_MODEL_CHOICES;
+# a custom value from a hand-edited config (a pinned ID like claude-sonnet-5)
+# is kept reachable by cycling back to it after the last stock choice.
+_kit_next_model() {
+  local current="$1" custom="$2"
+  local n=${#_KIT_MODEL_CHOICES[@]} i
+  for ((i = 0; i < n; i++)); do
+    if [[ "${_KIT_MODEL_CHOICES[$i]}" == "$current" ]]; then
+      if [[ $((i + 1)) -lt $n ]]; then
+        echo "${_KIT_MODEL_CHOICES[$((i + 1))]}"
+      elif [[ -n "$custom" ]]; then
+        echo "$custom"
+      else
+        echo "${_KIT_MODEL_CHOICES[0]}"
+      fi
+      return 0
+    fi
+  done
+  # current IS the custom value (or unknown): wrap to the first stock choice.
+  echo "${_KIT_MODEL_CHOICES[0]}"
+}
+
+# ── Interactive kit picker (mirrors _config_picker_tui / _config_picker_text) ─
+
+# Screen 1 rows: every known kit + "none". Radio marker on the current
+# selection, cursor pointer like the caps picker.
+_kit_picker_draw() {
+  local cursor="$1" selected="$2"
+  local rows=("${KNOWN_KITS[@]}" "none")
+  local i=0 label marker
+  while [[ $i -lt ${#rows[@]} ]]; do
+    local row="${rows[$i]}"
+    if [[ "$row" == "none" ]]; then
+      label="none  ${DIM}(your own config, no kit)${RESET}"
+      [[ -z "$selected" ]] && marker="${GREEN}●${RESET}" || marker="${DIM}○${RESET}"
+    else
+      label="${BOLD}${row}${RESET}"
+      [[ "$selected" == "$row" ]] && marker="${GREEN}●${RESET}" || marker="${DIM}○${RESET}"
+    fi
+    printf '\033[2K'
+    if [[ $i -eq $cursor ]]; then
+      echo -e "  ${CYAN}▸${RESET} ${marker} ${label}"
+    else
+      echo -e "    ${marker} ${label}"
+    fi
+    i=$((i + 1))
+  done
+}
+
+# Screen 2 rows: worker + scout with their effective models.
+_kit_models_draw() {
+  local cursor="$1" worker="$2" scout="$3"
+  printf '\033[2K'
+  if [[ $cursor -eq 0 ]]; then
+    echo -e "  ${CYAN}▸${RESET} worker  ${BOLD}${worker}${RESET}  ${DIM}(executes implementation chunks)${RESET}"
+  else
+    echo -e "    worker  ${worker}  ${DIM}(executes implementation chunks)${RESET}"
+  fi
+  printf '\033[2K'
+  if [[ $cursor -eq 1 ]]; then
+    echo -e "  ${CYAN}▸${RESET} scout   ${BOLD}${scout}${RESET}  ${DIM}(read-only exploration)${RESET}"
+  else
+    echo -e "    scout   ${scout}  ${DIM}(read-only exploration)${RESET}"
+  fi
+}
+
+# Screen 2: pick the models, save on ⏎ (writes [kits] to the GLOBAL config,
+# then applies the kit to the box). q/ESC cancels with nothing written.
+_kit_models_tui() {
+  local kit="$1" box="$2" cname="$3"
+  local worker scout worker_custom="" scout_custom=""
+  worker="$(_kit_agent_model worker "$_KIT_DEFAULT_MODEL")"
+  scout="$(_kit_agent_model scout "$_KIT_DEFAULT_MODEL")"
+  # A hand-pinned custom ID stays reachable in the cycle.
+  case " ${_KIT_MODEL_CHOICES[*]} " in
+    *" $worker "*) ;;
+    *) worker_custom="$worker" ;;
+  esac
+  case " ${_KIT_MODEL_CHOICES[*]} " in
+    *" $scout "*) ;;
+    *) scout_custom="$scout" ;;
+  esac
+
+  echo ""
+  echo -e "  ${BOLD}Kit ${kit}${RESET} ${DIM}· agent models (global, all kitted boxes)${RESET}"
+  echo -e "  ${DIM}planner = your session's model, not changed by the kit${RESET}"
+  echo ""
+
+  local cursor=0
+  tput civis 2>/dev/null || true
+  _kit_models_draw "$cursor" "$worker" "$scout"
+  echo ""
+  echo -e "  ${DIM}↑/↓ navigate  ␣ cycle model  ⏎ enable kit  q cancel${RESET}"
+  printf '\033[%dA' 4
+
+  while true; do
+    local key
+    key="$(_read_keypress)"
+    case "$key" in
+      UP)   [[ $cursor -gt 0 ]] && cursor=0 ;;
+      DOWN) [[ $cursor -lt 1 ]] && cursor=1 ;;
+      SPACE)
+        if [[ $cursor -eq 0 ]]; then
+          worker="$(_kit_next_model "$worker" "$worker_custom")"
+        else
+          scout="$(_kit_next_model "$scout" "$scout_custom")"
+        fi
+        ;;
+      ENTER)
+        tput cnorm 2>/dev/null || true
+        printf '\033[%dB' 4
+        printf '\033[2K'
+        echo ""
+        _write_kits_to_file "$CLEAT_GLOBAL_CONFIG" "$worker" "$scout"
+        _kit_apply "$kit" "$box" "$cname"
+        return 0
+        ;;
+      QUIT|ESC)
+        tput cnorm 2>/dev/null || true
+        printf '\033[%dB' 4
+        printf '\033[2K'
+        echo ""
+        info "Cancelled."
+        return 0
+        ;;
+    esac
+    _kit_models_draw "$cursor" "$worker" "$scout"
+    printf '\033[%dA' 2
+  done
+}
+
+# Screen 1: pick a kit (or none) for the default box, then fall through to
+# the models screen. ⏎ selects, q/ESC cancels.
+_kit_picker_tui() {
+  local box="main" project cname
+  project="$(resolve_project)"
+  cname="$(container_name_for "$project" "$box")"
+  local selected
+  selected="$(_box_kit_read "$cname")"
+
+  echo ""
+  echo -e "  ${BOLD}Cleat Kits${RESET} ${DIM}(curated Claude pre-configurations)${RESET}"
+  echo -e "  ${DIM}Box: ${box} ${DIM}· other boxes: ${BOLD}cleat kit <name> <box>${RESET}"
+  echo ""
+
+  local rows=$(( ${#KNOWN_KITS[@]} + 1 ))
+  local cursor=0
+  tput civis 2>/dev/null || true
+  _kit_picker_draw "$cursor" "$selected"
+  echo ""
+  echo -e "  ${DIM}↑/↓ navigate  ⏎ select  q cancel${RESET}"
+  printf '\033[%dA' "$((rows + 2))"
+
+  while true; do
+    local key
+    key="$(_read_keypress)"
+    case "$key" in
+      UP)   [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
+      DOWN) [[ $cursor -lt $((rows - 1)) ]] && cursor=$((cursor + 1)) ;;
+      ENTER)
+        tput cnorm 2>/dev/null || true
+        printf '\033[%dB' "$((rows + 2))"
+        printf '\033[2K'
+        if [[ $cursor -eq $((rows - 1)) ]]; then
+          echo ""
+          _kit_disable "$box"
+          return 0
+        fi
+        local kit="${KNOWN_KITS[$cursor]}"
+        _kit_prekit_offer "$kit" "$box" "$cname" || return 0
+        _kit_models_tui "$kit" "$box" "$cname"
+        return 0
+        ;;
+      QUIT|ESC)
+        tput cnorm 2>/dev/null || true
+        printf '\033[%dB' "$((rows + 2))"
+        printf '\033[2K'
+        echo ""
+        info "Cancelled."
+        return 0
+        ;;
+    esac
+    _kit_picker_draw "$cursor" "$selected"
+    printf '\033[%dA' "$rows"
+  done
+}
+
+# Text-mode fallback for non-TTY (mirrors _config_picker_text): type a kit
+# name (or "none"), worker=<model> / scout=<model>, "done" to save + enable,
+# "q" to cancel. EOF cancels.
+_kit_picker_text() {
+  local box="main" project cname
+  project="$(resolve_project)"
+  cname="$(container_name_for "$project" "$box")"
+  local selected worker scout
+  selected="$(_box_kit_read "$cname")"
+  worker="$(_kit_agent_model worker "$_KIT_DEFAULT_MODEL")"
+  scout="$(_kit_agent_model scout "$_KIT_DEFAULT_MODEL")"
+
+  echo ""
+  echo -e "  ${BOLD}Cleat Kits${RESET} ${DIM}(box: ${box})${RESET}"
+  echo ""
+  local k marker
+  for k in "${KNOWN_KITS[@]}"; do
+    [[ "$selected" == "$k" ]] && marker="${GREEN}●${RESET}" || marker="${DIM}○${RESET}"
+    echo -e "    ${marker} ${BOLD}${k}${RESET}"
+  done
+  [[ -z "$selected" ]] && marker="${GREEN}●${RESET}" || marker="${DIM}○${RESET}"
+  echo -e "    ${marker} none ${DIM}(your own config, no kit)${RESET}"
+  echo ""
+  echo -e "  ${DIM}models: worker=${worker} scout=${scout} (planner = your session's model)${RESET}"
+  echo ""
+  echo -e "  ${DIM}Select: a kit name or \"none\"; worker=<model> / scout=<model>;${RESET}"
+  echo -e "  ${DIM}\"done\" to save, \"q\" to cancel${RESET}"
+
+  local choice="$selected"
+  while true; do
+    echo -n "  > "
+    local input
+    read -r input || { echo ""; info "Cancelled."; return 0; }
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+
+    case "$input" in
+      done)
+        _write_kits_to_file "$CLEAT_GLOBAL_CONFIG" "$worker" "$scout"
+        if [[ -z "$choice" ]]; then
+          if [[ -n "$selected" ]]; then
+            _kit_disable "$box"
+          else
+            info "No kit enabled. Models saved."
+          fi
+        else
+          _kit_prekit_offer "$choice" "$box" "$cname" || return 0
+          _kit_apply "$choice" "$box" "$cname"
+        fi
+        return 0
+        ;;
+      q|Q)
+        info "Cancelled."
+        return 0
+        ;;
+      none)
+        choice=""
+        echo -e "    ${DIM}selection: none${RESET}"
+        ;;
+      worker=*|scout=*)
+        local _role="${input%%=*}" _val="${input#*=}"
+        if [[ -n "$_val" && "$_val" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          [[ "$_role" == "worker" ]] && worker="$_val" || scout="$_val"
+          echo -e "    ${DIM}${_role} model: ${_val}${RESET}"
+        else
+          warn "Not a model token (letters, digits, '.', '_', '-'): ${BOLD}${_val}${RESET}"
+        fi
+        ;;
+      *)
+        if _kit_known "$input"; then
+          choice="$input"
+          echo -e "    ${DIM}selection: ${input}${RESET}"
+        else
+          warn "Unknown kit: ${BOLD}${input}${RESET} ${DIM}(available: ${KNOWN_KITS[*]}, or \"none\")${RESET}"
+        fi
+        ;;
+    esac
+  done
+}
+
+_kit_show() {
+  local kit="$1"
+  local tmp="${TMPDIR:-/tmp}/cleat-kit-show.$$"
+  _kit_emit "$kit" "$tmp"
+  echo ""
+  echo -e "  ${BOLD}Kit: ${kit}${RESET}"
+  echo ""
+  _kit_description "$kit" | fold -s -w 66 | sed 's/^/  /'
+  echo ""
+  echo -e "  ${DIM}── CLAUDE.md fragment (appended after your own content) ──${RESET}"
+  sed 's/^/  /' "$tmp/CLAUDE.md"
+  local f
+  for f in "$tmp/agents"/*; do
+    [[ -f "$f" ]] || continue
+    echo ""
+    echo -e "  ${DIM}── agents/$(basename "$f") ──${RESET}"
+    sed 's/^/  /' "$f"
+  done
+  rm -rf "$tmp"
+}
+
 # ── Version & Update ──────────────────────────────────────────────────────
 cmd_version() {
   echo -e "  ${BOLD}cleat${RESET} ${DIM}v${VERSION}${RESET}"
@@ -6183,6 +7067,13 @@ cmd_help() {
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --list       List effective capabilities"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --enable ${DIM}<cap>${RESET}   Enable a capability"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --disable ${DIM}<cap>${RESET}  Disable a capability"
+  echo ""
+  echo -e "  ${BOLD}KITS${RESET} ${DIM}(curated Claude pre-configurations, per box)${RESET}"
+  echo -e "    ${GREEN}kit${RESET}                Interactive picker ${DIM}(pick a kit, then its models)${RESET}"
+  echo -e "    ${GREEN}kit${RESET} ${DIM}list${RESET}           Plain library + this project's selections"
+  echo -e "    ${GREEN}kit${RESET} ${DIM}<name> [box]${RESET}   Enable a kit ${DIM}(merges on top of your own config)${RESET}"
+  echo -e "    ${GREEN}kit${RESET} ${DIM}off [box]${RESET}      Disable ${DIM}(back to your own config)${RESET}"
+  echo -e "    ${GREEN}kit${RESET} ${DIM}show <name>${RESET}    Print everything a kit injects"
   echo ""
   echo -e "  ${BOLD}INTERACT${RESET}"
   echo -e "    ${GREEN}claude${RESET}  ${DIM}[box]${RESET}      Attach Claude Code (--dangerously-skip-permissions)"
@@ -6339,6 +7230,7 @@ main() {
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;
+    kit)       cmd_kit "$@" ;;
     trust)     cmd_trust "$@" ;;
     untrust)   cmd_untrust "$@" ;;
     clean)     cmd_clean "$@" ;;

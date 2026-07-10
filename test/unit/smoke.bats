@@ -472,6 +472,87 @@ cleat_bin_timeout() {
   refute_output --partial "unbound variable"
 }
 
+# ── Kits ────────────────────────────────────────────────────────────────────
+
+@test "smoke: bare cleat kit (non-TTY text picker) cancels cleanly on EOF" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit < /dev/null
+  assert_success
+  assert_output --partial "Cleat Kits"
+  assert_output --partial "Cancelled"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat kit text picker enables end to end under strict mode" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit <<< $'plan-big-execute-small\nworker=haiku\ndone'
+  assert_success
+  assert_output --partial "enabled for box"
+  refute_output --partial "unbound variable"
+  run cleat_bin kit list
+  assert_success
+  assert_output --partial "This project:"
+}
+
+@test "smoke: cleat kit list exits 0 and shows the library" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit list
+  assert_success
+  assert_output --partial "Cleat Kits"
+  assert_output --partial "plan-big-execute-small"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat kit show prints the kit contents" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit show plan-big-execute-small
+  assert_success
+  assert_output --partial "kit-worker.md"
+  assert_output --partial "model: sonnet"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat kit enable + kit list reflect the selection end to end" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit plan-big-execute-small <<< "y"
+  assert_success
+  assert_output --partial "enabled for box"
+  run cleat_bin kit list
+  assert_success
+  assert_output --partial "This project:"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat kit off with no selection exits 0" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit off
+  assert_success
+  assert_output --partial "No kit enabled"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat kit rejects an unknown kit with exit 1" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit definitely-not-a-kit
+  assert_failure
+  assert_output --partial "Unknown kit"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat kit --help exits 0" {
+  run cleat_bin kit --help
+  assert_success
+  assert_output --partial "cleat kit <name> [box]"
+  refute_output --partial "unbound variable"
+}
+
 @test "smoke: cleat status exits 0 even when the docker daemon is unavailable" {
   # Box discovery must not abort status under set -euo pipefail when docker errs
   # (regression guard for the bare command-substitution strict-mode crash).

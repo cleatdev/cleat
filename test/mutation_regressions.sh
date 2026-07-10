@@ -50,6 +50,7 @@ IDLE_SWEEP_BATS="$REPO_ROOT/test/unit/idle_sweep.bats"
 IMAGE_REBUILD_BATS="$REPO_ROOT/test/unit/image_rebuild_check.bats"
 TRUST_BATS="$REPO_ROOT/test/unit/trust.bats"
 DOCKER_COMMANDS_BATS="$REPO_ROOT/test/unit/docker_commands.bats"
+KITS_BATS="$REPO_ROOT/test/unit/kits.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
@@ -1488,13 +1489,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_caps_reader_no_trailing_newline" "caps reader keeps a final line" "$CLI" "$REGRESSIONS"
 
-# Same class for the [resources] reader: a hand-edited .cleat ending in
-# `memory = 8g` with no trailing newline must still apply the ceiling. Revert
-# the `|| [[ -n "$line" ]]` fallback INSIDE _read_resource_from_file only
-# (range-scoped so the caps/env readers are untouched): the [resources]
-# no-trailing-newline regression test then sees an empty read and fails.
+# Same class for the section reader (serves [resources] and [kits]; the
+# _read_resource_from_file wrapper delegates here): a hand-edited .cleat
+# ending in `memory = 8g` with no trailing newline must still apply the
+# ceiling. Revert the `|| [[ -n "$line" ]]` fallback INSIDE
+# _read_section_from_file only (range-scoped so the caps/env readers are
+# untouched): the [resources] no-trailing-newline regression test then sees
+# an empty read and fails.
 cat > "$SED_TMP" << 'SED'
-/^_read_resource_from_file()/,/^}/ s#while IFS= read -r line || \[\[ -n "\$line" \]\]; do#while IFS= read -r line; do#
+/^_read_section_from_file()/,/^}/ s#while IFS= read -r line || \[\[ -n "\$line" \]\]; do#while IFS= read -r line; do#
 SED
 try "vnext_resources_reader_no_trailing_newline" "resources. reader keeps a final line" "$CLI" "$REGRESSIONS"
 
@@ -2209,6 +2212,61 @@ cat > "$SED_TMP" << 'SED'
 s|deferring URL to terminal|silently dropping URL|
 SED
 try "bugfix_browser_defer_logged" "does NOT re-open a plain link" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# SETTINGS-MASK TARGET PRE-CREATE: a fresh host without ~/.claude/settings.json
+# must still create a box on macOS (VirtioFS rejects a nested file mount whose
+# target is missing inside the parent bind's source). Remove the pre-create:
+# the virtiofs-simulated cmd_run fails.
+cat > "$SED_TMP" << 'SED'
+\|echo '{}' > "${HOME}/.claude/settings.json"|d
+SED
+try "bugfix_settings_mask_target_precreate" "fresh host without" "$CLI" "$REGRESSIONS"
+
+# KIT RO MASKS: the two kit overlay mounts must be read-only. :ro is
+# load-bearing twice (concept/34): it keeps the copied mask from becoming an
+# agent-writable scratch that regen clobbers, and it closes the in-box write
+# channel to the host's user-level CLAUDE.md/agents. Drop :ro from both: the
+# mount test no longer finds the read-only flags.
+cat > "$SED_TMP" << 'SED'
+s|/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro|/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md|
+s|/kit/agents:/home/coder/.claude/agents:ro|/kit/agents:/home/coder/.claude/agents|
+SED
+try "kits_ro_masks" "cmd_run mounts the kit masks read-only" "$CLI" "$KITS_BATS"
+
+# KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
+# content, first and byte-for-byte. Drop the user-content copy (truncate
+# instead): the merge test no longer sees the user's line at the top.
+cat > "$SED_TMP" << 'SED'
+s|cat "${HOME}/.claude/CLAUDE.md" > "$kit_dir/CLAUDE.md"|: > "$kit_dir/CLAUDE.md"|
+SED
+try "kits_user_content_first" "merged CLAUDE.md keeps user content first" "$CLI" "$KITS_BATS"
+
+# KIT PRE-KIT GATE: enabling a kit on a box created before the feature (no
+# mask mounts baked in) must offer a rebuild, never silently "enable" a kit
+# the box would ignore. Disable the gate: the rebuild-offer test sees the
+# normal confirm screen instead.
+cat > "$SED_TMP" << 'SED'
+s|if container_exists "$cname" \&\& ! _container_has_kit_mounts "$cname"; then|if false; then|
+SED
+try "kits_prekit_rebuild_gate" "offers a rebuild and declining changes nothing" "$CLI" "$KITS_BATS"
+
+# KIT MODEL SANITIZER: a [kits] model override is written into agent YAML
+# frontmatter, so it must be a bare model token; anything else falls back to
+# the default. Drop the token check (accept any non-empty value): the
+# injection-guard test sees the hostile value emitted verbatim.
+cat > "$SED_TMP" << 'SED'
+s|&& "$v" =~ ^\[A-Za-z0-9._-]+\$ ||
+SED
+try "kits_model_sanitizer" "injection guard" "$CLI" "$KITS_BATS"
+
+# KIT CONFIG WRITER PRESERVATION: _write_kits_to_file must carry every line
+# outside [kits] (the user's [caps] and [resources]) into the rewritten file.
+# Drop the preserved-content emit (scoped to that function; the caps writer
+# has an identical line): the preserve test loses git/ssh and 8g.
+cat > "$SED_TMP" << 'SED'
+/^_write_kits_to_file()/,/^}/ s|printf '%s' "$preserved"|:|
+SED
+try "kits_writer_preserves_config" "preserves .caps. and .resources" "$CLI" "$KITS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

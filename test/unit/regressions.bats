@@ -2406,3 +2406,27 @@ SCRIPT
   assert_output "heal@login.dev"
   [ "$inode_before" = "$inode_after" ] || { echo "inode changed: the bind-mounted file was swapped, the running box would keep reading the old one"; return 1; }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.1.1 (latent since the settings mask): a fresh host that never ran native
+# claude has no ~/.claude/settings.json, and on macOS Docker Desktop the
+# settings mask (a FILE bind nested inside the ~/.claude bind) fails with an
+# opaque OCI "outside of rootfs" error when its target is missing inside the
+# parent bind's source (VirtioFS cannot create files at nested bind targets).
+# Every developer machine masked the bug because the file existed; the
+# integration suite run against a real macOS daemon (2026-07-10) exposed it.
+# The fix pre-creates the target as '{}' (valid JSON, inert for native
+# claude), exactly like the history.jsonl touch above it in cmd_run.
+@test "regression v1.1.1: fresh host without ~/.claude/settings.json can create a box under virtiofs" {
+  export DOCKER_STUB_SIMULATE_VIRTIOFS=1
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  rm -f "$HOME/.claude/settings.json"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # The pre-created target must be valid JSON so native claude still parses it.
+  run cat "$HOME/.claude/settings.json"
+  assert_output "{}"
+}

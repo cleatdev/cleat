@@ -159,20 +159,26 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FINDING: The global settings overlay at line 1362 of bin/cleat has the
-# same structural risk as v0.6.5. It mounts
+# FINDING (fixed 2026-07-10): The global settings overlay mounts
 #   $settings_overlay_dir/settings.json → /home/coder/.claude/settings.json
 # while simultaneously mounting
 #   $HOME/.claude → /home/coder/.claude
 # On macOS Docker Desktop virtiofs, if $HOME/.claude/settings.json doesn't
-# exist on the host, the nested mount will fail. This only affects brand-new
-# installs that have never run Claude Code. The virtiofs stub catches it;
-# see the test below which intentionally omits the host file.
+# exist on the host, the nested mount fails. This test documented the open
+# finding for a long time ("until this is fixed, the test confirms the stub
+# correctly identifies the issue"); the integration suite run against a real
+# macOS daemon reproduced it on 2026-07-10 and cmd_run now pre-creates the
+# target as '{}' next to the history.jsonl touch. The test below now asserts
+# the FIX at the real-binary e2e layer; the canonical mutation-anchored guard
+# is "regression v1.1.1: fresh host without ~/.claude/settings.json" in
+# regressions.bats, and the stub's own rejection machinery stays covered by
+# the synthetic "rejects nested bind-mount when target file missing" test.
 # ─────────────────────────────────────────────────────────────────────────────
 
-@test "stub virtiofs: finding, global overlay fails when ~/.claude/settings.json missing" {
+@test "stub virtiofs e2e: cleat start succeeds without a host ~/.claude/settings.json (target pre-created)" {
   export DOCKER_STUB_SIMULATE_VIRTIOFS=1
-  # Deliberately do NOT create $HOME/.claude/settings.json
+  # Deliberately do NOT create $HOME/.claude/settings.json: a fresh host that
+  # never ran native claude.
   mkdir -p "$TEST_TEMP/project"
   cat > "$XDG_CONFIG_HOME/cleat/config" << 'EOF'
 [caps]
@@ -189,11 +195,11 @@ EOF
     DOCKER_STUB_SIMULATE_VIRTIOFS=1 \
     "$CLI" start
 
-  # This test documents the finding: when $HOME/.claude/settings.json does
-  # not exist, cleat currently mounts an overlay over it anyway, which would
-  # fail on real macOS virtiofs. Until this is fixed, the test confirms the
-  # stub correctly identifies the issue.
-  assert_output --partial "outside of rootfs"
+  refute_output --partial "outside of rootfs"
+  assert_output --partial "Container started"
+  # The pre-created target is valid JSON, inert for native claude.
+  run cat "$HOME/.claude/settings.json"
+  assert_output "{}"
 }
 
 # ── DOCKER_STUB_STRICT doesn't break default tests ─────────────────────────

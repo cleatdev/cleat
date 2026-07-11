@@ -37,7 +37,7 @@ teardown() { _common_teardown; }
   assert_success
 }
 
-@test "session env: CLAUDE_ENV injects exactly HOME, DISABLE_AUTOUPDATER, PATH, TERM (+ COLORTERM when set)" {
+@test "session env: CLAUDE_ENV injects exactly BROWSER, HOME, DISABLE_AUTOUPDATER, PATH, TERM (+ COLORTERM when set)" {
   # CLAUDE_ENV is forced into every session (docker exec -it "${CLAUDE_ENV[@]}").
   # Pin the EXACT key set so a future addition (especially one templated from
   # host state (PATH=$PATH, LANG, USER)) can't silently leak the host's shell
@@ -45,7 +45,9 @@ teardown() { _common_teardown; }
   # TERM and COLORTERM are the two DELIBERATE host-templated entries: docker
   # exec -t doesn't propagate the terminal type, and a terminfo mismatch
   # corrupts key sequences and colors. COLORTERM is filtered here because it's
-  # only present when the invoking environment has it.
+  # only present when the invoking environment has it. BROWSER is fixed (never
+  # host-templated): it points at the in-image open shim so login URLs reach
+  # the bridge even in boxes whose create predates the -e BROWSER at run.
   local keys="" e
   for e in "${CLAUDE_ENV[@]}"; do
     [[ "$e" == "-e" ]] && continue
@@ -55,7 +57,21 @@ teardown() { _common_teardown; }
   local sorted
   sorted="$(printf '%s' "$keys" | sort | tr '\n' ' ' | sed 's/ *$//')"
   run echo "$sorted"
-  assert_output "DISABLE_AUTOUPDATER HOME PATH TERM"
+  assert_output "BROWSER DISABLE_AUTOUPDATER HOME PATH TERM"
+}
+
+@test "session env: BROWSER points at the open shim, never a host-templated value" {
+  # The exec-time BROWSER is what heals boxes created before v1.1.1 (their
+  # Config.Env is frozen without it, so claude 2.1.191+ falls back to the
+  # manual code-paste login). It must be the fixed in-image shim path: a
+  # host-templated BROWSER would leak the host's browser command into the box
+  # where it doesn't exist.
+  local e found=""
+  for e in "${CLAUDE_ENV[@]}"; do
+    [[ "${e%%=*}" == "BROWSER" ]] && found="$e"
+  done
+  run echo "$found"
+  assert_output "BROWSER=/usr/local/bin/open-bridge"
 }
 
 @test "session env: COLORTERM is forwarded only when the host sets it" {

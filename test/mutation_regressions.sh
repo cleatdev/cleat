@@ -207,9 +207,12 @@ s|if \[\[ -d "\$project/.claude" \]\]; then|if true; then|
 SED
 try "v0.6.0_claude_guard" "skip project overlay when .claude/ missing"
 
-# v0.6.1: _browser_watcher must remove stale bridge file at startup
+# v0.6.1: _browser_watcher must remove stale bridge file at startup. The
+# sweep is age-gated since the 2026-07-11 round (an if-block ending in fi),
+# so the range runs comment through fi: an end anchor on the rm line alone
+# would leave the range unterminated and gut the file (silent SKIPPED).
 cat > "$SED_TMP" << 'SED'
-/^  # Remove any URL left over from a previous session, and any debounce$/,/^  rm -f "\$bridge_file"$/d
+/^  # Remove any URL left over from a previous session, and any debounce$/,/^  fi$/d
 SED
 try "v0.6.1_browser_stale" "browser bridge removes stale file"
 
@@ -2136,6 +2139,47 @@ cat > "$SED_TMP" << 'SED'
 \|-e "BROWSER=/usr/local/bin/open-bridge"|d
 SED
 try "bugfix_browser_env_at_create" "BROWSER pointing at the open shim" "$CLI" "$REGRESSIONS"
+
+# BROWSER AT EXEC: docker exec inherits the container's Config.Env, frozen at
+# create, so a box created before v1.1.1 never sees the create-time -e BROWSER
+# and login stays on the manual code-paste flow forever (real-hardware report
+# 2026-07-11). Delete ONLY the exec-time CLAUDE_ENV entry (create-time -e
+# stays, exactly the pre-fix state): the "attaching to a box created before
+# v1.1.1" regression loses BROWSER on the recorded exec line.
+cat > "$SED_TMP" << 'SED'
+\|^CLAUDE_ENV+=(-e "BROWSER=/usr/local/bin/open-bridge")$|d
+SED
+try "vnext_browser_exec_env" "still gets BROWSER at exec time" "$CLI" "$REGRESSIONS"
+
+# BROWSER PER EXEC SITE: the heal rests on CLAUDE_ENV riding all three exec
+# sites. A refactor that swaps the array on ONE site for hand-built -e entries
+# keeps HOME, a .local/bin PATH, and TERM (so every older assertion stays
+# green) while silently losing BROWSER there: standalone `cleat shell` or
+# `cleat login` on a pre-v1.1.1 box drops back to code-paste. One mutation per
+# site; only the per-site BROWSER assertion can catch each.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  s|"\${CLAUDE_ENV\[@\]}"|-e HOME=/home/coder -e PATH=/home/coder/.local/bin:/usr/local/bin:/usr/bin:/bin -e TERM=xterm|
+}
+SED
+try "vnext_browser_shell_env" "execs bash as coder" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  s|"\${CLAUDE_ENV\[@\]}"|-e HOME=/home/coder -e PATH=/home/coder/.local/bin:/usr/local/bin:/usr/bin:/bin -e TERM=xterm|
+}
+SED
+try "vnext_browser_login_env" "runs claude login as coder" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# BRIDGE STARTUP AGE GATE: the watcher's startup sweep must only remove a
+# STALE leftover bridge file. Reverting the gate to always-true (age > -1 is
+# unconditional) restores the pre-fix swallow: a watcher starting moments
+# after claude wrote a login URL deletes it before any sibling watcher's poll
+# can claim it, stranding that login.
+cat > "$SED_TMP" << 'SED'
+s|)) -gt 5 \]|)) -gt -1 ]|
+SED
+try "vnext_bridge_startup_age_gate" "keeps a FRESH pending URL" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 # IDENTITY: keys absent from BOTH the host file and this project's copy must
 # fall through to the newest sibling box that holds a login. Revert to the

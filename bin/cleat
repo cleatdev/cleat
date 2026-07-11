@@ -3246,6 +3246,21 @@ if [[ -n "${COLORTERM:-}" ]]; then
   CLAUDE_ENV+=(-e "COLORTERM=${COLORTERM}")
 fi
 
+# BROWSER must ride every exec, not just `docker run`: exec inherits the
+# CONTAINER's Config.Env, frozen at create. A box created before v1.1.1 has no
+# BROWSER there (and its image predates the ENV), so claude 2.1.191+ refuses to
+# invoke any opener and login drops to the manual code-paste flow, silently,
+# forever: the config fingerprint excludes cleat-injected env, so nothing ever
+# nags a recreate. Injecting it here heals every existing box on its next
+# session. The shim itself has shipped in the image since the bridge landed, so
+# the target exists even in old boxes. CLAUDE_ENV precedes the user's [env]
+# args on every exec line and docker's last -e wins, so a .cleat `BROWSER=`
+# override still beats this, matching the create-time ordering. A one-shot
+# `--env BROWSER=...` given only at create is overridden here on later
+# sessions (exec -e beats the frozen Config.Env, as it already did for
+# HOME/PATH/TERM); a lasting override belongs in the [env] config.
+CLAUDE_ENV+=(-e "BROWSER=/usr/local/bin/open-bridge")
+
 _host_clip_cmd() {
   if command -v pbcopy &>/dev/null; then echo pbcopy
   elif command -v xclip &>/dev/null; then echo "xclip -selection clipboard"
@@ -3616,8 +3631,11 @@ _browser_recently_opened() {
 #                     duplicate tab. Off a terminal (piped) the bridge opens
 #                     plain links too, since nothing else will.
 #   always:           open every claimed http(s) URL (the pre-toggle behavior).
-#   off:              never open a browser; the auth callback proxy still runs
-#                     so `cleat login` works when the URL is opened by hand.
+#   off:              never open a browser; the auth callback proxy still runs,
+#                     and the claimed URL lands in the box's .proxy-log. The
+#                     loopback URL is never printed by claude (2.1.191+ hands
+#                     it only to $BROWSER), so the log is where to find it to
+#                     open by hand; the printed code-paste flow needs no proxy.
 _browser_bridge_mode() {
   case "${CLEAT_BROWSER_BRIDGE:-auto}" in
     always) printf 'always' ;;
@@ -3666,8 +3684,15 @@ _browser_watcher() {
 
   # Remove any URL left over from a previous session, and any debounce
   # markers that outlived their window (a box with no further claims never
-  # sweeps them otherwise).
-  rm -f "$bridge_file"
+  # sweeps them otherwise). Age-gated: concurrent watchers on one box are
+  # supported (a login alongside a session, two shells), and a FRESH bridge
+  # file is a live URL some sibling watcher is about to claim within one 0.5s
+  # poll. The unconditional rm here swallowed it, stranding that login. Only a
+  # file older than several polls is a true leftover. _path_mtime returns 0 on
+  # failure, which reads as ancient and still gets swept, so this fails safe.
+  if [ -f "$bridge_file" ] && [ $(( $(date +%s) - $(_path_mtime "$bridge_file") )) -gt 5 ]; then
+    rm -f "$bridge_file"
+  fi
   _browser_sweep_stale_markers "$clip_dir"
   while true; do
     # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
@@ -3712,11 +3737,17 @@ _browser_watcher() {
         # Both outcomes are logged: a deferred URL is invisible otherwise, and
         # that silence is what made the code-paste login regression hard to
         # diagnose from the field.
+        # Both lines carry the URL itself: the claim above consumed the bridge
+        # file, so this log is the only place a deferred or off-mode URL still
+        # exists. Claude 2.1.191+ hands the loopback authorize URL ONLY to
+        # $BROWSER (never the terminal), so without the URL here an off-mode
+        # loopback login would be unrecoverable by hand. Same trust domain as
+        # the bridge file (the box's own run dir), so no new exposure.
         if _browser_should_open "$bridge_mode" "$host_opens_clicks" "$_is_auth"; then
-          echo "[browser-watcher $(date +%H:%M:%S)] opening URL on host (mode=$bridge_mode auth=$_is_auth)" >> "$clip_dir/.proxy-log"
+          echo "[browser-watcher $(date +%H:%M:%S)] opening URL on host (mode=$bridge_mode auth=$_is_auth) url=$url" >> "$clip_dir/.proxy-log"
           $open_cmd "$url" >/dev/null 2>&1 || true
         else
-          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (mode=$bridge_mode interactive=$host_opens_clicks auth=$_is_auth)" >> "$clip_dir/.proxy-log"
+          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (mode=$bridge_mode interactive=$host_opens_clicks auth=$_is_auth) url=$url" >> "$clip_dir/.proxy-log"
         fi
       fi
     fi
@@ -5545,9 +5576,10 @@ cmd_login() {
     # host_opens_clicks=0: this watcher only ever sees the auth URL `claude login`
     # launches programmatically through the open shim, never a link the user
     # clicked, so the terminal will NOT open it and deferral is never correct here.
-    # The bridge must open it in auto/always (the console code-paste flow uses a
-    # non-loopback redirect_uri, so it isn't even detected as an auth URL); only
-    # CLEAT_BROWSER_BRIDGE=off withholds the auto-open (the callback proxy still runs).
+    # The bridge must open it in auto/always: _is_auth_url matches any
+    # redirect_uri= URL, the console code-paste authorize URL included, so both
+    # login flows auto-open; only CLEAT_BROWSER_BRIDGE=off withholds the
+    # auto-open (the callback proxy still runs).
     _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" &
     _login_browser_pid=$!
     disown "$_login_browser_pid" 2>/dev/null || true

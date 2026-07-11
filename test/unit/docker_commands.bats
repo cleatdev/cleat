@@ -618,6 +618,13 @@ teardown() { _common_teardown; }
   assert_success
   run assert_docker_exec_has "bash"
   assert_success
+  # BROWSER must ride the shell exec too: an in-shell `claude /login` on a box
+  # created before v1.1.1 (frozen Config.Env, no BROWSER) otherwise drops to
+  # the code-paste flow. Pinned per exec site: a refactor that swaps
+  # CLAUDE_ENV for hand-built -e entries here would keep every other
+  # assertion green while silently losing this.
+  run assert_docker_exec_has "BROWSER=/usr/local/bin/open-bridge"
+  assert_success
 }
 
 @test "shell: starts a browser watcher so in-shell logins reach the host" {
@@ -688,6 +695,12 @@ EOF
   run assert_docker_exec_has "runuser -u coder"
   assert_success
   run assert_docker_exec_has ".local/bin"
+  assert_success
+  # BROWSER must ride the login exec: `cleat login` is the primary login path
+  # for a box created before v1.1.1 (frozen Config.Env, no BROWSER), and
+  # without it claude 2.1.191+ never fires the open shim. Pinned per exec
+  # site, same rationale as the shell test above.
+  run assert_docker_exec_has "BROWSER=/usr/local/bin/open-bridge"
   assert_success
 }
 

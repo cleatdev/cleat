@@ -1136,9 +1136,12 @@ SCRIPT
   local marker="$TEST_TEMP/browser-should-not-open-old"
   mkdir -p "$clip_dir"
 
-  # Simulate a leftover URL from a previous session
+  # Simulate a leftover URL from a previous session. A real one is minutes to
+  # days old, and the startup sweep is age-gated (a FRESH file is a live URL a
+  # sibling watcher is about to claim, see browser_bridge.bats), so the
+  # leftover must be demonstrably stale to be swept.
   printf 'https://old-session.example.com' > "$clip_dir/.browser-open"
-  sleep 0.1  # ensure stable timestamp
+  touch -t 202001010000 "$clip_dir/.browser-open"
 
   local mock_open="$TEST_TEMP/mock-open-old"
   cat > "$mock_open" << 'SCRIPT'
@@ -1175,8 +1178,10 @@ SCRIPT
   local marker="$TEST_TEMP/browser-same-second"
   mkdir -p "$clip_dir"
 
-  # Simulate a leftover URL from a previous session
+  # Simulate a leftover URL from a previous session (stale mtime: the startup
+  # sweep is age-gated and only removes a demonstrably old file)
   printf 'https://stale.example.com' > "$clip_dir/.browser-open"
+  touch -t 202001010000 "$clip_dir/.browser-open"
 
   local mock_open="$TEST_TEMP/mock-open-same-second"
   cat > "$mock_open" << 'SCRIPT'

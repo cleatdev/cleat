@@ -316,6 +316,30 @@ EOF
   [ ! -d "$dir/.open.leftover_3" ] || { echo "watcher start did not sweep a stale marker"; return 1; }
 }
 
+@test "browser bridge: watcher startup keeps a FRESH pending URL (no sibling swallow)" {
+  # Concurrent watchers on one box are supported (a login alongside a session,
+  # two shells). The startup sweep used to rm the bridge file unconditionally,
+  # so a watcher starting moments after claude wrote a login URL swallowed it
+  # before any sibling's 0.5s poll could claim it: no tab, no proxy, stranded
+  # login. A fresh file must survive startup and get claimed and opened.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  printf '%s' "https://example.com/pending" > "$dir/.browser-open"
+  # host_opens_clicks=0: non-interactive, so auto mode opens plain links too.
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "" "auto" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 2
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ -f "$TEST_TEMP/opened.log" ] || { echo "startup sweep swallowed a fresh pending URL"; return 1; }
+  run cat "$TEST_TEMP/opened.log"
+  assert_output --partial "https://example.com/pending"
+}
+
 @test "browser bridge: auto mode does NOT re-open a plain link the terminal handled" {
   # Integration: drive the real watcher loop with an interactive terminal flag.
   # The plain link must never reach the opener (the visible duplicate tab).

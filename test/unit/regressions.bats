@@ -2341,6 +2341,24 @@ SCRIPT
   assert_success
 }
 
+# The v1.1.1 fix above only lands at CREATE: docker exec inherits the
+# container's Config.Env, frozen at create time, so a box created before
+# v1.1.1 never sees that -e BROWSER and claude 2.1.191+ still drops to the
+# manual code-paste login on every /login, forever. Nothing ever nags a
+# recreate (the config fingerprint deliberately excludes cleat-injected env),
+# so long-lived boxes stayed broken across releases; reported on real
+# hardware 2026-07-11. Every session exec must therefore carry BROWSER
+# itself, healing existing boxes with no recreate.
+@test "regression: attaching to a box created before v1.1.1 still gets BROWSER at exec time" {
+  # exec_claude alone, no cmd_run first: the recorded exec is the ONLY place
+  # BROWSER can come from, exactly like a pre-v1.1.1 container's frozen env.
+  run exec_claude "prev111-ctr" --dangerously-skip-permissions
+  run assert_docker_exec_has "prev111-ctr"
+  assert_success
+  run assert_docker_exec_has "BROWSER=/usr/local/bin/open-bridge"
+  assert_success
+}
+
 # An in-box login writes oauthAccount only into THAT box's per-project
 # claude.json; the host file never learns it. After a logout wiped the shared
 # credentials, the user logged in again in one box, opened a second terminal,

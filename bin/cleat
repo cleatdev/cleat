@@ -514,6 +514,540 @@ _is_macos() {
   [[ "${OSTYPE:-}" == darwin* ]] || [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]
 }
 
+# ── Docker autopilot (concept/29) ────────────────────────────────────────────
+#
+# A down daemon after a reboot is the single most common "Docker is friction"
+# moment. On the session verbs, in an interactive terminal, cleat starts the
+# user's own Docker (Docker Desktop / OrbStack / Colima on macOS, Docker
+# Desktop or a rootless engine on Linux, the Windows-side Docker Desktop from
+# WSL2), waits on a bounded poll, then continues the original command. Where
+# it cannot start Docker safely (remote endpoints, a root-owned Linux engine)
+# it prints the exact one-line command instead of guessing. One-shot: cleat
+# launches the user's own Docker and adds no persistent process of its own.
+
+# Is the docker CLI on PATH at all? Overridable in tests.
+_docker_cli_present() {
+  command -v docker > /dev/null 2>&1
+}
+
+# Daemon reachable? An EXIT-CODE gate, deliberately NOT a stderr string match:
+# the "Cannot connect to the Docker daemon" text is version- and locale-
+# dependent (Docker 29 says "failed to connect to the docker API").
+# Overridable in tests.
+_daemon_up() {
+  docker info > /dev/null 2>&1
+}
+
+# The current context's daemon endpoint / name, both readable with NO live
+# daemon (unlike _is_docker_desktop, which needs `docker info`). Empty when
+# unreadable. Overridable in tests.
+_docker_context_endpoint() {
+  docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true
+}
+
+_docker_context_name() {
+  docker context show 2>/dev/null || true
+}
+
+# True inside WSL2 (Docker Desktop for Windows integrates via WSL; the
+# Windows-side app can be launched from here). Overridable in tests.
+_is_wsl() {
+  grep -qi microsoft /proc/version 2>/dev/null
+}
+
+# Where Docker Desktop for Windows lives, as seen from WSL (empty when
+# absent). Overridable in tests.
+_wsl_desktop_exe() {
+  # Docker Desktop for Windows, as seen from WSL. Probe the default install
+  # under any drvfs mount root (automount.root may not be /mnt, the system
+  # drive may not be C:), so a non-C: or custom-mount install is still found.
+  local exe root
+  for root in /mnt/c /mnt/*; do
+    exe="$root/Program Files/Docker/Docker/Docker Desktop.exe"
+    if [[ -e "$exe" ]]; then
+      printf '%s' "$exe"
+      return 0
+    fi
+  done
+}
+
+# WSL interop is live (the kernel can exec Windows .exe binaries). When
+# interop is disabled, the drvfs mount still shows Docker Desktop.exe but
+# launching it fails, so gate wsl-desktop on this. Overridable in tests.
+_wsl_interop_ok() {
+  [[ -e /proc/sys/fs/binfmt_misc/WSLInterop ]] \
+    || [[ -e /proc/sys/fs/binfmt_misc/WSLInterop-late ]]
+}
+
+# A macOS app bundle is installed, checking both the system and per-user
+# (no-admin install) Applications dirs. Overridable in tests (Linux CI has
+# no /Applications).
+_app_bundle_present() {
+  [[ -d "/Applications/$1.app" ]] || [[ -d "$HOME/Applications/$1.app" ]]
+}
+
+_colima_present() {
+  command -v colima > /dev/null 2>&1
+}
+
+# Docker Desktop for Linux installs a per-user systemd unit; its presence is
+# daemon-down-safe evidence. Overridable in tests.
+_desktop_linux_unit_present() {
+  local units
+  units="$(systemctl --user list-unit-files docker-desktop.service 2>/dev/null)" || units=""
+  [[ "$units" == *docker-desktop* ]]
+}
+
+# Evidence of an in-distro Docker engine (native Linux or inside a WSL
+# distro), from daemon-down-safe signals: a system docker unit, a sysv/init
+# script, or the dockerd binary. Used inside WSL to prefer the in-distro
+# engine over the Windows-side Desktop (attaching to the wrong engine is
+# worse than a slower start). Overridable in tests.
+_distro_docker_present() {
+  local units
+  units="$(systemctl list-unit-files docker.service 2>/dev/null)" || units=""
+  [[ "$units" == *docker.service* ]] && return 0
+  [[ -e /etc/init.d/docker ]] && return 0
+  command -v dockerd > /dev/null 2>&1
+}
+
+# Pick the launcher for a DOWN daemon, from daemon-down-safe evidence only:
+# the docker context (the user's explicit choice), then app/unit presence.
+# _is_docker_desktop() is useless here (it needs `docker info`). Prints one
+# of: desktop-macos | orbstack | colima | colima:<profile> | wsl-desktop |
+# wsl-none | desktop-linux | rootless-linux | engine-linux | none.
+_autostart_pick() {
+  local ctx endpoint p
+  ctx="$(_docker_context_name)"
+  endpoint="$(_docker_context_endpoint)"
+
+  if _is_macos; then
+    # A stale context (backend uninstalled) must not be trusted for a
+    # backgrounded launcher (colima) whose spawn failure we can't catch, so
+    # colima arms verify _colima_present and otherwise fall through to app
+    # detection. colima names its context `colima` (default) or
+    # `colima-<profile>`; a named profile MUST be plumbed through or a bare
+    # `colima start` boots the wrong VM and the poll waits on a socket that
+    # never comes up.
+    case "$ctx" in
+      orbstack) echo orbstack; return 0 ;;
+      colima)   _colima_present && { echo colima; return 0; } ;;
+      colima-*) _colima_present && { echo "colima:${ctx#colima-}"; return 0; } ;;
+      desktop-linux) echo desktop-macos; return 0 ;;
+    esac
+    case "$endpoint" in
+      *"/.orbstack/"*) echo orbstack; return 0 ;;
+      *"/.colima/"*)
+        if _colima_present; then
+          p="${endpoint#*/.colima/}"; p="${p%%/*}"
+          if [[ -n "$p" && "$p" != "default" ]]; then echo "colima:$p"; else echo colima; fi
+          return 0
+        fi
+        ;;
+    esac
+    # No usable context: fall back to what's installed, Desktop first
+    # (the overwhelmingly common install).
+    if _app_bundle_present Docker; then
+      echo desktop-macos
+    elif _app_bundle_present OrbStack; then
+      echo orbstack
+    elif _colima_present; then
+      echo colima
+    else
+      echo none
+    fi
+    return 0
+  fi
+
+  # Linux, native or inside a WSL distro. In-distro evidence wins FIRST, so a
+  # docker-ce / rootless engine inside the distro is chosen over the
+  # Windows-side Desktop (attaching a session to the wrong engine is worse
+  # than a slower start).
+  if [[ "$ctx" == "desktop-linux" ]] || _desktop_linux_unit_present; then
+    echo desktop-linux
+    return 0
+  fi
+  case "$ctx" in
+    rootless) echo rootless-linux; return 0 ;;
+  esac
+  case "$endpoint" in
+    *"/run/user/"*) echo rootless-linux; return 0 ;;
+  esac
+  # Rootless socket under a non-standard XDG_RUNTIME_DIR (not /run/user/<uid>).
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "$endpoint" && "$endpoint" == *"${XDG_RUNTIME_DIR}"* ]]; then
+    echo rootless-linux
+    return 0
+  fi
+
+  if _is_wsl; then
+    # No in-distro Desktop/rootless context above. Prefer an in-distro root
+    # engine if there's evidence; otherwise launch the Windows-side Desktop,
+    # but only when interop can actually exec it.
+    if _distro_docker_present; then
+      echo engine-linux
+      return 0
+    fi
+    if _wsl_interop_ok && [[ -n "$(_wsl_desktop_exe)" ]]; then
+      echo wsl-desktop
+    else
+      echo wsl-none
+    fi
+    return 0
+  fi
+
+  # Native Linux: a root-owned engine is the catch-all.
+  echo engine-linux
+}
+
+# Human name for messages.
+_autostart_label() {
+  case "$1" in
+    desktop-macos|desktop-linux) echo "Docker Desktop" ;;
+    orbstack)             echo "OrbStack" ;;
+    colima|colima:*)      echo "Colima" ;;
+    wsl-desktop|wsl-none) echo "Docker Desktop (Windows)" ;;
+    rootless-linux)       echo "rootless Docker" ;;
+    *)                    echo "Docker" ;;
+  esac
+}
+
+# The exact start command (or, for kinds that have no single command, a plain
+# instruction) for when autopilot can't or won't launch. Callers must NOT glue
+# this into a "start it with: <hint>" template unconditionally; use
+# _autostart_hint_is_command to tell the two apart.
+_autostart_hint() {
+  case "$1" in
+    desktop-macos)  echo "open -a Docker" ;;
+    orbstack)       echo "open -a OrbStack" ;;
+    colima)         echo "colima start" ;;
+    colima:*)       echo "colima start -p ${1#colima:}" ;;
+    wsl-desktop|wsl-none) echo "start Docker Desktop on Windows (enable WSL integration for this distro)" ;;
+    desktop-linux)  echo "systemctl --user start docker-desktop" ;;
+    rootless-linux)
+      if command -v systemctl > /dev/null 2>&1; then
+        echo "systemctl --user start docker"
+      else
+        echo "dockerd-rootless.sh (or your init's rootless docker service)"
+      fi
+      ;;
+    engine-linux)
+      if command -v systemctl > /dev/null 2>&1; then
+        echo "sudo systemctl start docker"
+      else
+        echo "sudo service docker start"
+      fi
+      ;;
+    *) echo "start Docker, then retry" ;;
+  esac
+}
+
+# True when _autostart_hint returns a copy-pasteable command (vs a plain
+# instruction), so callers phrase "start it with: X" vs a bare sentence.
+_autostart_hint_is_command() {
+  case "$1" in
+    wsl-desktop|wsl-none|none) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Launch the picked backend, one-shot, output suppressed. Blocking starters
+# (colima, the Windows exe) go to a disowning subshell; `open` and systemctl
+# return immediately on their own. Overridable in tests. Non-zero when the
+# launch command itself failed to spawn (or the kind is not launchable).
+_autostart_launch() {
+  case "$1" in
+    desktop-macos)  open -g -a Docker > /dev/null 2>&1 ;;
+    orbstack)       open -g -a OrbStack > /dev/null 2>&1 ;;
+    colima)         ( colima start > /dev/null 2>&1 & ) ;;
+    colima:*)       ( colima start -p "${1#colima:}" > /dev/null 2>&1 & ) ;;
+    wsl-desktop)    ( "$(_wsl_desktop_exe)" > /dev/null 2>&1 & ) ;;
+    desktop-linux)  systemctl --user start docker-desktop > /dev/null 2>&1 ;;
+    rootless-linux) systemctl --user start docker > /dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# VM-backed backends show "the Docker VM"; a rootless/root host daemon has no
+# VM, so the poll says "the Docker daemon" instead.
+_autostart_poll_noun() {
+  case "$1" in
+    rootless-linux|engine-linux) echo "the Docker daemon" ;;
+    *) echo "the Docker VM" ;;
+  esac
+}
+
+# ── Docker install offer (the autopilot's missing-CLI branch) ───────────────
+#
+# Installing Docker is privileged and system-mutating, so unlike the launcher
+# it is CONSENT-FIRST everywhere: the exact command is shown, the default is
+# No, non-TTY never prompts (it prints the per-OS command and exits), and
+# CLEAT_NO_AUTOSTART=1 suppresses the offer along with the rest of autopilot.
+# macOS asks WHICH flavor because the choice is licensing as much as tech
+# (Docker Desktop and OrbStack are paid for larger companies; Colima is open
+# source); automation goes through Homebrew's official casks. Linux installs
+# the engine via Docker's official convenience script, downloaded to a file
+# first (never a blind curl-pipe-sh), then offers the docker-group add. WSL2
+# installs the Windows-side Docker Desktop through winget when reachable.
+
+# Seams, overridable in tests (which must never run a real installer).
+_brew_present()   { command -v brew > /dev/null 2>&1; }
+_winget_present() { command -v winget.exe > /dev/null 2>&1; }
+
+# Run one visible install step: echo the exact command, then execute it
+# attached to the terminal (sudo and brew may prompt). Overridable in tests
+# (records instead of running).
+_install_run() {
+  echo -e "    ${DIM}\$ $*${RESET}"
+  "$@"
+}
+
+# The per-OS one-line install command, for non-TTY and declined offers. Kept
+# to a single copy-pasteable command that fits ~80 cols with its "Install it
+# with: " prefix (the interactive menu is where the OrbStack/Colima
+# alternatives live); the Linux get.docker.com line is inherently long but is
+# one pasteable unit.
+_docker_install_hint() {
+  if _is_macos; then
+    echo "brew install --cask docker"
+  elif _is_wsl; then
+    echo "winget.exe install -e --id Docker.DockerDesktop"
+  else
+    echo "curl -fsSL https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh"
+  fi
+}
+
+# Interactive install offer. Returns 0 when an install ran and the docker CLI
+# is now present (the caller re-enters the autopilot flow), non-zero exit
+# otherwise. TTY-only by contract (the caller gates).
+_offer_docker_install() {
+  if _is_macos; then
+    if ! _brew_present; then
+      echo -e "    ${DIM}Homebrew isn't installed, so cleat won't automate this. Official installers:${RESET}"
+      echo -e "    ${DIM}Docker Desktop: https://docker.com/products/docker-desktop${RESET}"
+      echo -e "    ${DIM}OrbStack:       https://orbstack.dev${RESET}"
+      echo -e "    ${DIM}Colima:         https://github.com/abiosoft/colima${RESET}"
+      exit 1
+    fi
+    echo ""
+    echo -e "  Install Docker now? ${DIM}(via Homebrew)${RESET}"
+    echo ""
+    echo -e "    ${BOLD}1${RESET}) Docker Desktop  ${DIM}(the standard; free for personal use, paid for larger companies)${RESET}"
+    echo -e "    ${BOLD}2${RESET}) OrbStack        ${DIM}(fast, mac-native; free for personal use, paid commercially)${RESET}"
+    echo -e "    ${BOLD}3${RESET}) Colima          ${DIM}(open source, CLI-only, no GUI)${RESET}"
+    echo -e "    ${BOLD}n${RESET}) no"
+    echo ""
+    local choice=""
+    echo -en "    Choice [1/2/3/n] "
+    read -r choice || choice=""
+    case "$choice" in
+      1) _install_run brew install --cask docker || { error "Install failed."; exit 1; } ;;
+      2) _install_run brew install --cask orbstack || { error "Install failed."; exit 1; } ;;
+      3) _install_run brew install docker colima || { error "Install failed."; exit 1; } ;;
+      *)
+        info "Skipped. Install later with: ${BOLD}$(_docker_install_hint)${RESET}"
+        exit 1
+        ;;
+    esac
+    return 0
+  fi
+
+  if _is_wsl; then
+    if ! _winget_present; then
+      echo -e "    ${DIM}Install Docker Desktop on Windows (docker.com/products/docker-desktop),${RESET}"
+      echo -e "    ${DIM}enable WSL integration for this distro, then retry.${RESET}"
+      exit 1
+    fi
+    echo ""
+    local yn=""
+    _ask_yn yn "Install Docker Desktop on Windows now (via winget)? [y/N] "
+    if [[ "$yn" != [yY]* ]]; then
+      info "Skipped. Install later with: ${BOLD}$(_docker_install_hint)${RESET}"
+      exit 1
+    fi
+    _install_run winget.exe install -e --id Docker.DockerDesktop || { error "Install failed."; exit 1; }
+    echo -e "    ${DIM}Start Docker Desktop on Windows and enable WSL integration for this distro.${RESET}"
+    return 0
+  fi
+
+  # Linux: Docker's official convenience script, downloaded first so what
+  # runs under sudo is a file you could have inspected, never a blind pipe.
+  if ! command -v curl > /dev/null 2>&1 && ! command -v wget > /dev/null 2>&1; then
+    error "Need curl or wget to fetch the Docker install script."
+    echo -e "    ${DIM}Install one, or install Docker from your distro's packages.${RESET}"
+    exit 1
+  fi
+  echo ""
+  echo -e "  Install Docker Engine now? ${DIM}(Docker's official install script for mainstream distros, run with sudo)${RESET}"
+  local yn=""
+  _ask_yn yn "Download get.docker.com and run it? [y/N] "
+  if [[ "$yn" != [yY]* ]]; then
+    info "Skipped. Install later with: ${BOLD}$(_docker_install_hint)${RESET}"
+    exit 1
+  fi
+  # Stage in a private 0700 dir created atomically by mktemp, NOT a predictable
+  # $$-named file in world-writable /tmp: the download is then run under sudo,
+  # so a pre-created/symlinked attacker-owned temp file would be a local root
+  # TOCTOU (curl -o has no O_EXCL). mktemp -d makes the dir unguessable and
+  # owned exclusively by us, so nothing can pre-plant or rewrite the script.
+  local stage script
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/cleat-docker.XXXXXX")" || { error "Could not create a temp dir."; exit 1; }
+  script="$stage/get-docker.sh"
+  if command -v curl > /dev/null 2>&1; then
+    if ! _install_run curl -fsSL https://get.docker.com -o "$script"; then
+      rm -rf "$stage"; error "Download failed."; exit 1
+    fi
+  else
+    if ! _install_run wget -qO "$script" https://get.docker.com; then
+      rm -rf "$stage"; error "Download failed."; exit 1
+    fi
+  fi
+  if ! _install_run sudo sh "$script"; then
+    rm -rf "$stage"
+    error "Install failed."
+    exit 1
+  fi
+  rm -rf "$stage"
+  # $USER can be unset under `su -c` or minimal PTYs; set -u would abort here.
+  local u="${USER:-$(id -un 2>/dev/null)}"
+  local gyn=""
+  _ask_yn gyn "Add ${u} to the docker group (run docker without sudo)? [y/N] "
+  if [[ "$gyn" == [yY]* ]]; then
+    _install_run sudo usermod -aG docker "$u" || true
+    success "Docker Engine installed."
+    echo -e "    ${DIM}Log out and back in for the docker group to apply, then run ${BOLD}cleat${RESET}${DIM} again.${RESET}"
+  else
+    success "Docker Engine installed."
+    echo -e "    ${DIM}Without the docker group you'll need sudo for docker. Run ${BOLD}cleat${RESET}${DIM} again to continue.${RESET}"
+  fi
+  # The fresh engine's socket isn't usable by this shell yet (group membership
+  # applies at next login), so the session can't continue in the same breath.
+  exit 1
+}
+
+# Ensure the daemon is reachable before a session verb. Remote endpoints are
+# refused (launching a local app is wrong for them), the GUI pop is TTY-gated
+# with a CLEAT_NO_AUTOSTART=1 opt-out (consistent with CLEAT_NO_IDLE_SWEEP /
+# CLEAT_NO_UPDATE_CHECK), and the wait is a bounded foreground poll
+# (CLEAT_AUTOSTART_TIMEOUT_SECS, default 90: a Docker Desktop cold boot is
+# often 30-60s). Exits non-zero when Docker stays down; never loops forever.
+_ensure_daemon() {
+  if ! _docker_cli_present; then
+    error "Docker isn't installed."
+    if [[ "${CLEAT_NO_AUTOSTART:-}" == "1" ]] || ! _is_tty; then
+      echo -e "    ${DIM}Install it with: ${BOLD}$(_docker_install_hint)${RESET}"
+      exit 1
+    fi
+    # Consent-first install offer; on success the CLI exists now, so fall
+    # through to the normal autopilot flow (down daemon → launch → poll).
+    _offer_docker_install
+    if ! _docker_cli_present; then
+      if _is_wsl; then
+        error "docker isn't on PATH yet."
+        echo -e "    ${DIM}Start Docker Desktop on Windows, enable WSL integration for this distro, then retry.${RESET}"
+      else
+        error "docker still isn't on PATH ${DIM}(open a new terminal, then retry)${RESET}."
+      fi
+      exit 1
+    fi
+    success "Docker installed."
+  fi
+
+  _daemon_up && return 0
+
+  # Remote endpoints: say where the daemon runs instead of popping a local
+  # GUI. DOCKER_HOST wins over the context (docker's own precedence). Strip
+  # control chars before display: the endpoint can carry terminal escapes
+  # from a poisoned DOCKER_HOST or an imported context, and error() uses
+  # echo -e which would render them raw.
+  local endpoint="${DOCKER_HOST:-}"
+  [[ -n "$endpoint" ]] || endpoint="$(_docker_context_endpoint)"
+  local endpoint_show
+  endpoint_show="$(printf '%s' "$endpoint" | tr -d '\000-\037')"
+  case "$endpoint" in
+    tcp://*|ssh://*|npipe://*|fd://*)
+      error "Remote Docker daemon unreachable ${DIM}(${endpoint_show})${RESET}."
+      echo -e "    ${DIM}Start it where it runs, then retry.${RESET}"
+      exit 1
+      ;;
+  esac
+
+  # Permission, not down: a local unix socket that EXISTS but isn't accessible
+  # means the daemon is up and the user just isn't in the docker group. Saying
+  # "start Docker" here would loop the user (worst case: right after cleat's own
+  # installer told them to re-login). Only when the socket is a real, present,
+  # inaccessible socket, so a genuinely-down daemon (no socket) still autostarts.
+  case "$endpoint" in
+    unix://*)
+      local sock="${endpoint#unix://}"
+      if [[ -S "$sock" && ! -w "$sock" ]]; then
+        error "Docker is running, but you can't reach its socket ${DIM}(${sock})${RESET}."
+        local u="${USER:-$(id -un 2>/dev/null)}"
+        echo -e "    ${DIM}Add yourself to the docker group: ${BOLD}sudo usermod -aG docker ${u}${RESET}${DIM}, then log out and back in.${RESET}"
+        exit 1
+      fi
+      ;;
+  esac
+
+  local kind
+  kind="$(_autostart_pick)"
+
+  # Kinds that cannot be safely auto-launched (root engine, remote-less WSL
+  # with no interop, nothing recognized) message and exit; the rest launch.
+  if [[ "${CLEAT_NO_AUTOSTART:-}" == "1" ]] || ! _is_tty \
+     || [[ "$kind" == "engine-linux" || "$kind" == "none" || "$kind" == "wsl-none" ]]; then
+    error "Docker isn't running."
+    if _autostart_hint_is_command "$kind"; then
+      echo -e "    ${DIM}Start it with: ${BOLD}$(_autostart_hint "$kind")${RESET}"
+    else
+      echo -e "    ${DIM}To fix: $(_autostart_hint "$kind").${RESET}"
+    fi
+    exit 1
+  fi
+
+  warn "Docker isn't running. Starting $(_autostart_label "$kind")..."
+  if ! _autostart_launch "$kind"; then
+    error "Could not launch $(_autostart_label "$kind")."
+    echo -e "    ${DIM}Start it with: ${BOLD}$(_autostart_hint "$kind")${RESET}"
+    exit 1
+  fi
+
+  # Bounded foreground poll with the _do_pull frame idiom (no background
+  # watcher: a daemon poll has no natural terminator, so it needs an explicit
+  # deadline and a non-zero exit, or a broken install hangs the CLI forever).
+  local deadline="${CLEAT_AUTOSTART_TIMEOUT_SECS:-90}"
+  if ! [[ "$deadline" =~ ^[0-9]+$ ]] || (( deadline < 1 )); then
+    deadline=90
+  fi
+  local frames
+  if _has_unicode; then
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  else
+    frames=('-' '\' '|' '/')
+  fi
+  { command -v tput &>/dev/null && tput civis 2>/dev/null; } || true
+  local poll_noun
+  poll_noun="$(_autostart_poll_noun "$kind")"
+  local start now elapsed=0 i=0
+  start="$(date +%s)"
+  while ! _daemon_up; do
+    now="$(date +%s)"
+    elapsed=$(( now - start ))
+    if (( elapsed >= deadline )); then
+      { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+      printf "\r\033[K"
+      error "Docker did not come up in ${deadline}s. Open it manually, then retry."
+      exit 1
+    fi
+    printf "\r\033[K  ${BLUE}%s${RESET} waiting for %s ${DIM}(%ss)${RESET}" "${frames[$i]}" "$poll_noun" "$elapsed"
+    i=$(( (i + 1) % ${#frames[@]} ))
+    sleep 0.5
+  done
+  { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+  printf "\r\033[K"
+  success "Docker ready"
+  return 0
+}
+
 # Read Claude Code's OAuth credential blob from the macOS login Keychain. Claude
 # stores it as a generic-password under the service "Claude Code-credentials"
 # (older builds: "Claude Code"); `-w` prints just the secret (the JSON blob).
@@ -922,7 +1456,12 @@ _host_total_memory() {
   elif [[ -r "${_MEMINFO_FILE:-/proc/meminfo}" ]]; then
     local kb
     kb="$(awk '/^MemTotal:/ { print $2; exit }' "${_MEMINFO_FILE:-/proc/meminfo}" 2>/dev/null)"
-    [[ "$kb" =~ ^[0-9]+$ ]] && echo $(( kb * 1024 ))
+    # Explicit if, not a tail `[[ ]] && echo`: a garbled MemTotal would make
+    # that list rc 1, and a function ending on rc 1 kills the strict-mode
+    # binary at the caller (the kit-writer class of bug).
+    if [[ "$kb" =~ ^[0-9]+$ ]]; then
+      echo $(( kb * 1024 ))
+    fi
   fi
 }
 
@@ -1118,11 +1657,13 @@ _box_desc_remove() {
 #
 # A kit is a maintainer-curated Claude Code pre-configuration (a CLAUDE.md
 # policy fragment + custom subagents) enabled per box: `cleat kit <name>`.
-# Inside the box, two read-only masks over the shared ~/.claude mount replace
-# what Claude sees at ~/.claude/CLAUDE.md and ~/.claude/agents with content
-# generated host-side in $CLEAT_RUN_DIR/<cname>/kit/ on every create/start:
-# the user's own config first, the kit merged on top. The host ~/.claude is
-# never written; native claude never sees the kit. Kits ship instructions and
+# Inside the box, three read-only masks over the shared ~/.claude mount
+# replace what Claude sees at ~/.claude/CLAUDE.md, ~/.claude/agents, and
+# ~/.claude/commands with content generated host-side in
+# $CLEAT_RUN_DIR/<cname>/kit/ on every create/start: the user's own config
+# first, the kit merged on top (commands is always a plain pass-through copy;
+# kits ship no commands). The kit content is never written to the host
+# ~/.claude; native claude never sees the kit. Kits ship instructions and
 # subagents only: no hooks, no settings, nothing that executes as a program.
 # Full design: concept/34-kits.md.
 
@@ -1184,7 +1725,7 @@ _kit_agent_model() {
 _kit_description() {
   case "$1" in
     plan-big-execute-small)
-      echo "Run your session on Fable 5: it plans and reviews while Sonnet 5 workers execute and scout. Flagship judgment on every decision, most tokens billed at Sonnet rates, so multi-file work burns your rate limit far slower. Adapted from Anthropic's plan-big-execute-small cookbook pattern."
+      echo "Run your session on Fable 5: it plans and reviews while cheaper workers (Sonnet 5 by default) execute and scout. Flagship judgment on every decision, most tokens billed at the worker model's rate, so multi-file work burns your rate limit far slower. Adapted from Anthropic's plan-big-execute-small cookbook pattern."
       ;;
   esac
 }
@@ -1210,6 +1751,17 @@ _kit_confirm_lines() {
 # kits update in lockstep with CLI releases. Kit content deliberately makes no
 # performance-number claims: the cookbook's benchmarks belong to its API
 # harness, not this prompt-level adaptation (concept/34).
+# The `name:` a Claude Code agent declares in its YAML frontmatter (this is
+# what Claude dispatches by, NOT the filename). Prints empty when absent.
+_agent_name() {
+  local f="$1" line
+  line="$(grep -m1 '^name:' "$f" 2>/dev/null)" || true
+  line="${line#name:}"
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  printf '%s' "$line"
+}
+
 _kit_emit() {
   local kit="$1" dest="$2"
   mkdir -p "$dest/agents"
@@ -1290,8 +1842,47 @@ _container_has_kit_mounts() {
   printf '%s\n' "$dests" | grep -qx '/home/coder/.claude/CLAUDE.md'
 }
 
-# (Re)generate the kit overlay content for a box: the two files masked over
-# ~/.claude inside the container. Called at create (cmd_run) and refreshed on
+# Boxes created before the read-only ~/.claude masks existed (or before the
+# third, commands, mask landed) keep those host-level surfaces writable until
+# recreated: bind mounts are baked at create, and the config fingerprint
+# deliberately excludes mounts. Say so on every start until fixed, the same
+# always-on treatment as the undersized-VM advisory: a silent protection gap
+# is worse than a repeated note. Unreadable inspect stays silent, matching
+# _container_has_kit_mounts (the box may be mid-recreate).
+_maybe_note_missing_kit_masks() {
+  local cname="$1"
+  container_exists "$cname" || return 0
+  local dests d
+  dests="$(docker inspect "$cname" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)" || return 0
+  for d in /home/coder/.claude/CLAUDE.md /home/coder/.claude/agents /home/coder/.claude/commands; do
+    if ! printf '%s\n' "$dests" | grep -qx "$d"; then
+      info "This box predates the read-only ~/.claude masks. Recreate to enable them: ${BOLD}cleat rm && cleat${RESET}"
+      return 0
+    fi
+  done
+}
+
+# VirtioFS rejects nested mounts whose target is missing inside the parent
+# bind source; ensure all three mask targets exist on the host (inert for
+# native claude: an empty CLAUDE.md / empty agents / empty commands dir is
+# nothing to it). A broken symlink at any target would make the touch/mkdir
+# fail with a raw trace under strict mode; refuse it with a clear remedy
+# instead. We never delete a user's symlink, even a dangling one: it may
+# point into a dotfiles repo that is simply not checked out yet.
+_ensure_kit_mask_targets() {
+  local _t
+  for _t in "${HOME}/.claude/CLAUDE.md" "${HOME}/.claude/agents" "${HOME}/.claude/commands"; do
+    if [[ -L "$_t" && ! -e "$_t" ]]; then
+      error "${_t/#${HOME}/~} is a broken symlink. Fix or remove it, then rerun."
+      return 1
+    fi
+  done
+  touch "${HOME}/.claude/CLAUDE.md"
+  mkdir -p "${HOME}/.claude/agents" "${HOME}/.claude/commands"
+}
+
+# (Re)generate the kit overlay content for a box: the three surfaces masked
+# over ~/.claude inside the container. Called at create (cmd_run) and refreshed on
 # every start/resume, mirroring the settings overlay. Merge semantics
 # (concept/34): the user's real global CLAUDE.md comes FIRST byte-for-byte
 # with the kit fragment appended under a marked header; the agents dir is a
@@ -1313,15 +1904,23 @@ _generate_kit_overlay() {
   # goes (or vice versa) would fail the writes below under strict mode.
   [[ -d "$kit_dir/CLAUDE.md" ]] && rm -rf "$kit_dir/CLAUDE.md"
   [[ -f "$kit_dir/agents" ]] && rm -f "$kit_dir/agents"
-  mkdir -p "$kit_dir/agents"
+  [[ -f "$kit_dir/commands" ]] && rm -f "$kit_dir/commands"
+  mkdir -p "$kit_dir/agents" "$kit_dir/commands"
 
   # Rewrite IN PLACE (truncate the file, clear inside the dir; never rm the
-  # sources themselves): both are bind-mounted, and a running container keeps
+  # sources themselves): all are bind-mounted, and a running container keeps
   # the original inodes, so in-place rewrites are what make a kit change
   # visible to the box's next session without a container restart.
   local _f
+  # -e alone misses dangling symlinks (a symlinked host command whose target
+  # moved), which would then linger in the overlay across every future regen;
+  # -L catches them regardless of target state.
   for _f in "$kit_dir/agents"/*; do
-    [[ -e "$_f" ]] || continue
+    [[ -e "$_f" || -L "$_f" ]] || continue
+    rm -rf "$_f"
+  done
+  for _f in "$kit_dir/commands"/* "$kit_dir/commands"/.[!.]*; do
+    [[ -e "$_f" || -L "$_f" ]] || continue
     rm -rf "$_f"
   done
 
@@ -1340,12 +1939,40 @@ _generate_kit_overlay() {
     done
   fi
 
+  # commands/: a read-only PASS-THROUGH of the user's own slash commands
+  # (recursive, so namespaced subdirs survive). Kits add no commands, so this
+  # is a plain copy. Its purpose is the :ro mask: with it, a caged agent can
+  # read the user's commands but cannot plant a NEW host-user-level command
+  # that native host claude would run on invocation, closing the third
+  # instruction surface after CLAUDE.md and agents. Project-level
+  # /workspace/.claude/commands is unaffected (still writable in the repo).
+  # -L dereferences: dotfile-repo users symlink their commands, and a copied
+  # symlink would point at a host path that does not exist inside the box. A
+  # dangling source link makes cp error on that entry and continue; the
+  # swallow-and-continue matches the agents copy above.
+  if [[ -d "${HOME}/.claude/commands" ]]; then
+    cp -RL "${HOME}/.claude/commands/." "$kit_dir/commands/" 2>/dev/null || true
+  fi
+
   [[ -n "$kit" ]] || return 0
 
+  # Collect the NAMES the user's agents declare (Claude dispatches by name,
+  # not filename). A kit agent whose name a user agent already claims must be
+  # skipped, or the box ends up with two agents named e.g. `worker` and the
+  # kit's read-only guarantee dissolves into an ambiguous dispatch. "User
+  # wins" is the documented contract; here it is enforced by name, not just
+  # by the near-impossible filename collision.
+  local _user_names=" " _n
+  for _f in "$kit_dir/agents"/*; do
+    [[ -f "$_f" ]] || continue
+    _n="$(_agent_name "$_f")"
+    [[ -n "$_n" ]] && _user_names="${_user_names}${_n} "
+  done
+
   # Merge the kit on top: fragment appended under a marked header; agents
-  # added without clobbering a same-named user file (the user wins; the
-  # near-impossible collision is warned about at enable time, not here,
-  # where a spinner may own the terminal).
+  # added without clobbering a same-FILENAME or same-NAME user agent (the
+  # user wins; the collision is also warned about at enable time, where no
+  # spinner owns the terminal).
   local stage="$kit_dir/.stage"
   rm -rf "$stage"
   _kit_emit "$kit" "$stage"
@@ -1355,11 +1982,13 @@ _generate_kit_overlay() {
     echo ""
     cat "$stage/CLAUDE.md"
   } >> "$kit_dir/CLAUDE.md"
-  local _base
+  local _base _kn
   for _f in "$stage/agents"/*; do
     [[ -f "$_f" ]] || continue
     _base="$(basename "$_f")"
     [[ -e "$kit_dir/agents/$_base" ]] && continue
+    _kn="$(_agent_name "$_f")"
+    [[ -n "$_kn" && "$_user_names" == *" $_kn "* ]] && continue
     cp "$_f" "$kit_dir/agents/$_base"
   done
   rm -rf "$stage"
@@ -4361,20 +4990,21 @@ cmd_run() {
   [[ -f "${HOME}/.claude/settings.json" ]] || echo '{}' > "${HOME}/.claude/settings.json"
 
   # ── Kit overlay (concept/34) ──────────────────────────────────────────────
-  # Two read-only masks over the base ~/.claude mount replace what the box
-  # sees at ~/.claude/CLAUDE.md and ~/.claude/agents with host-generated
-  # merges (the user's own content + the enabled kit, or a plain copy when no
-  # kit). Mounted on EVERY box so enabling, switching, or disabling a kit
-  # later is a content regeneration, never a recreate. :ro so the caged agent
-  # cannot rewrite its own instructions (and, as a hardening side effect, can
-  # no longer write the host's user-level CLAUDE.md/agents through the base
-  # mount, which native host claude would then obey).
+  # Three read-only masks over the base ~/.claude mount replace what the box
+  # sees at ~/.claude/CLAUDE.md, ~/.claude/agents, and ~/.claude/commands with
+  # host-generated content (the user's own content + the enabled kit for
+  # CLAUDE.md/agents, or a plain pass-through copy). Mounted on EVERY box so
+  # enabling, switching, or disabling a kit later is a content regeneration,
+  # never a recreate. :ro so the caged agent cannot rewrite its own
+  # instructions, and (the hardening property) can no longer write ANY of the
+  # three host-user-level instruction surfaces through the base mount that
+  # native host claude would obey: memory, subagents, and slash commands. The
+  # box still READS the user's real content (pass-through copy). Project-level
+  # /workspace/.claude/* is unaffected (still writable in the repo).
   _generate_kit_overlay "$cname"
-  # VirtioFS rejects nested mounts whose target is missing inside the parent
-  # bind source; ensure both targets exist on the host (inert for native
-  # claude: an empty CLAUDE.md / empty agents dir means nothing to it).
-  touch "${HOME}/.claude/CLAUDE.md"
-  mkdir -p "${HOME}/.claude/agents"
+  # Mask targets must exist on the host before the nested mounts (VirtioFS);
+  # dies with a clear remedy on a broken symlink. See _ensure_kit_mask_targets.
+  _ensure_kit_mask_targets
 
   local mount_args=(
     -v "$project":/workspace
@@ -4384,6 +5014,7 @@ cmd_run() {
     -v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"
     -v "$CLEAT_RUN_DIR/${cname}/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/agents:/home/coder/.claude/agents:ro"
+    -v "$CLEAT_RUN_DIR/${cname}/kit/commands:/home/coder/.claude/commands:ro"
     -v "$clip_dir":/tmp/cleat-clip
   )
 
@@ -4600,6 +5231,7 @@ cmd_start() {
   if container_exists "$cname" && _container_has_kit_mounts "$cname"; then
     _generate_kit_overlay "$cname"
   fi
+  _maybe_note_missing_kit_masks "$cname"
 
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
@@ -4700,6 +5332,7 @@ cmd_resume() {
   if container_exists "$cname" && _container_has_kit_mounts "$cname"; then
     _generate_kit_overlay "$cname"
   fi
+  _maybe_note_missing_kit_masks "$cname"
 
   # Refresh settings overlays (user may have changed hooks between stop/resume)
   local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
@@ -4965,6 +5598,7 @@ cmd_claude() {
   if ! container_exists "$cname"; then
     cmd_run "$project"
   fi
+  _maybe_note_missing_kit_masks "$cname"
 
   # Refresh project-level settings overlays (hooks may have changed)
   local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
@@ -5123,6 +5757,24 @@ cmd_status() {
     fi
   elif container_exists "$cname"; then
     echo -e "  ${BOLD}Status:${RESET}    ${YELLOW}● stopped${RESET}"
+  elif ! _docker_cli_present; then
+    # Not installed is distinct from not running: hand over the install command,
+    # not a "start it" that can't work. Read-only verbs never act, only tell.
+    echo -e "  ${BOLD}Status:${RESET}    ${AMBER}● Docker isn't installed${RESET} ${DIM}(install it with: $(_docker_install_hint))${RESET}"
+  elif ! _daemon_up; then
+    # Don't claim "not created" when the daemon is merely off: is_running and
+    # container_exists are both false-negative against a down daemon, and the
+    # old line lied after every reboot. Read-only verbs never auto-start;
+    # they just tell the truth. Only glue a real command into "start it with:";
+    # for kinds with no single command, print the instruction bare.
+    local _sk _sh
+    _sk="$(_autostart_pick)"
+    _sh="$(_autostart_hint "$_sk")"
+    if _autostart_hint_is_command "$_sk"; then
+      echo -e "  ${BOLD}Status:${RESET}    ${AMBER}● Docker isn't running${RESET} ${DIM}(start it with: ${_sh})${RESET}"
+    else
+      echo -e "  ${BOLD}Status:${RESET}    ${AMBER}● Docker isn't running${RESET} ${DIM}(${_sh})${RESET}"
+    fi
   else
     echo -e "  ${BOLD}Status:${RESET}    ${DIM}○ not created${RESET}"
   fi
@@ -5187,6 +5839,10 @@ cmd_status() {
       echo -e "    ${GREEN}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}running${RESET}"
     elif container_exists "$_cn"; then
       echo -e "    ${YELLOW}●${RESET} ${BOLD}${_bx}${RESET} ${DIM}stopped${RESET}"
+    elif ! _daemon_up; then
+      # Same honesty rule as the Status line above: against a down daemon the
+      # probes are blind, so "not created" would lie about every box.
+      echo -e "    ${DIM}○ ${_bx}${RESET} ${DIM}unknown (Docker isn't running)${RESET}"
     else
       echo -e "    ${DIM}○ ${_bx}${RESET} ${DIM}not created${RESET}"
     fi
@@ -6462,8 +7118,13 @@ cmd_kit() {
   case "$sub" in
     show)
       local name="${1:-}"
-      if [[ -z "$name" ]] || ! _kit_known "$name"; then
-        error "Unknown kit: ${BOLD}${name:-<none>}${RESET}"
+      if [[ -z "$name" ]]; then
+        error "Usage: ${BOLD}cleat kit show <name>${RESET}"
+        echo -e "    ${DIM}Available kits: ${KNOWN_KITS[*]}${RESET}"
+        exit 1
+      fi
+      if ! _kit_known "$name"; then
+        error "Unknown kit: ${BOLD}${name}${RESET}"
         echo -e "    ${DIM}Available kits: ${KNOWN_KITS[*]}${RESET}"
         exit 1
       fi
@@ -6527,18 +7188,34 @@ _kit_prekit_offer() {
 _kit_apply() {
   local kit="$1" box="$2" cname="$3"
 
-  # Collision heads-up: the overlay generation silently prefers a same-named
-  # user agent (concept/34); say so here, where no spinner owns the terminal.
-  local _ck_tmp="${TMPDIR:-/tmp}/cleat-kit-check.$$" _ck_f _ck_base
-  _kit_emit "$kit" "$_ck_tmp"
-  for _ck_f in "$_ck_tmp/agents"/*; do
-    [[ -f "$_ck_f" ]] || continue
-    _ck_base="$(basename "$_ck_f")"
-    if [[ -e "${HOME}/.claude/agents/$_ck_base" ]]; then
-      warn "You already have an agent named ${BOLD}${_ck_base}${RESET}; yours wins, the kit's copy is skipped."
+  # Collision heads-up, checked by agent NAME (what Claude dispatches by), not
+  # filename: the overlay generation prefers a same-named user agent
+  # (concept/34), so tell the user which agent Claude will actually use.
+  # mktemp -d, not a predictable $$ path, so nothing can pre-plant the staging
+  # tree on a shared host.
+  local _ck_tmp _ck_f _kn
+  _ck_tmp="$(mktemp -d "${TMPDIR:-/tmp}/cleat-kit-check.XXXXXX")" || _ck_tmp=""
+  if [[ -n "$_ck_tmp" ]]; then
+    # Names the user's agents already claim.
+    local _un=" " _uf _unn
+    if [[ -d "${HOME}/.claude/agents" ]]; then
+      for _uf in "${HOME}/.claude/agents"/*; do
+        [[ -f "$_uf" ]] || continue
+        _unn="$(_agent_name "$_uf")"
+        [[ -n "$_unn" ]] && _un="${_un}${_unn} "
+      done
     fi
-  done
-  rm -rf "$_ck_tmp"
+    _kit_emit "$kit" "$_ck_tmp"
+    for _ck_f in "$_ck_tmp/agents"/*; do
+      [[ -f "$_ck_f" ]] || continue
+      _kn="$(_agent_name "$_ck_f")"
+      if [[ -n "$_kn" && "$_un" == *" $_kn "* ]]; then
+        warn "You already have an agent named ${BOLD}${_kn}${RESET}. Yours wins."
+        echo -e "    ${DIM}The kit's ${_kn} is skipped, so dispatch to that name uses your agent.${RESET}"
+      fi
+    done
+    rm -rf "$_ck_tmp"
+  fi
 
   _box_kit_write "$cname" "$kit"
 
@@ -6906,7 +7583,7 @@ _kit_picker_text() {
   [[ -z "$selected" ]] && marker="${GREEN}●${RESET}" || marker="${DIM}○${RESET}"
   echo -e "    ${marker} none ${DIM}(your own config, no kit)${RESET}"
   echo ""
-  echo -e "  ${DIM}models: worker=${worker} scout=${scout} (planner = your session's model)${RESET}"
+  echo -e "  ${DIM}models: worker=${worker} scout=${scout} (global, all kitted boxes; planner = your session's model)${RESET}"
   echo ""
   echo -e "  ${DIM}Select: a kit name or \"none\"; worker=<model> / scout=<model>;${RESET}"
   echo -e "  ${DIM}\"done\" to save, \"q\" to cancel${RESET}"
@@ -6965,7 +7642,8 @@ _kit_picker_text() {
 
 _kit_show() {
   local kit="$1"
-  local tmp="${TMPDIR:-/tmp}/cleat-kit-show.$$"
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/cleat-kit-show.XXXXXX")" || { error "Could not create a temp dir."; return 1; }
   _kit_emit "$kit" "$tmp"
   echo ""
   echo -e "  ${BOLD}Kit: ${kit}${RESET}"
@@ -7205,6 +7883,11 @@ main() {
   case "$cmd" in
     start|resume|r|run|claude|shell|sh)
       _maybe_prompt_cli_update
+      # Docker autopilot (concept/29): a down daemon is started for the user
+      # (TTY-gated, bounded, remote-refusing) BEFORE the sweep/pressure/
+      # announce preflights, which all no-op against a down daemon. Session
+      # verbs only: stop/status/nuke must never boot a VM.
+      _ensure_daemon
       _maybe_sweep_idle_boxes "$@"
       _maybe_check_docker_pressure
       _maybe_show_release_highlight

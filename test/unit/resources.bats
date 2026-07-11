@@ -225,6 +225,19 @@ teardown() { _common_teardown; }
   assert_output ""
 }
 
+@test "resources: _host_total_memory stays rc 0 on garbled meminfo" {
+  # The elif branch used to end on a false `[[ ]] && echo` list, so a
+  # non-numeric MemTotal returned rc 1 and killed the strict-mode CLI at the
+  # callers' bare assignments (_maybe_check_docker_pressure and
+  # _maybe_announce_docker_ready run bare in main's dispatch).
+  uname() { echo "Linux"; }
+  local mi="$TEST_TEMP/meminfo"
+  printf 'MemTotal:       lots kB\n' > "$mi"
+  _MEMINFO_FILE="$mi" run _host_total_memory
+  assert_success
+  assert_output ""
+}
+
 # ── cpus ─────────────────────────────────────────────────────────────────────
 # CPU has NO default limit: it's work-conserving (an idle core costs nothing,
 # the scheduler balances competing boxes), unlike memory which is held. The

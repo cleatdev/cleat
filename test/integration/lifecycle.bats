@@ -241,10 +241,13 @@ EOF
   assert_output --partial "my-agent.md"
   assert_output --partial "kit-worker.md"
 
-  # The masks are read-only from inside the cage, even as root.
+  # All three instruction-surface masks are read-only from inside the cage,
+  # even as root: memory, subagents, AND slash commands.
   run docker exec "$cname" sh -c 'echo pwned >> /home/coder/.claude/CLAUDE.md'
   assert_failure
   run docker exec "$cname" sh -c 'echo pwned > /home/coder/.claude/agents/evil.md'
+  assert_failure
+  run docker exec "$cname" sh -c 'echo pwned > /home/coder/.claude/commands/evil.md'
   assert_failure
 
   # The host is untouched: no kit content in the real ~/.claude.

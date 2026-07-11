@@ -496,6 +496,18 @@ cleat_bin_timeout() {
   assert_output --partial "This project:"
 }
 
+@test "smoke: cleat kit picker 'done' with DEFAULT models survives strict mode (F35)" {
+  # The exact input that once killed the real binary: enabling with both
+  # models at the default drives _write_kits_to_file down the both-default
+  # branch, whose trailing && list used to return 1 and abort under set -e.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin kit <<< $'plan-big-execute-small\ndone'
+  assert_success
+  assert_output --partial "enabled for box"
+  refute_output --partial "unbound variable"
+}
+
 @test "smoke: cleat kit list exits 0 and shows the library" {
   mkdir -p "$TEST_TEMP/project"
   cd "$TEST_TEMP/project"
@@ -561,6 +573,76 @@ cleat_bin_timeout() {
   cd "$TEST_TEMP/project"
   run cleat_bin status
   assert_success
+  # Autopilot's status honesty: a down daemon is named, not "not created".
+  assert_output --partial "Docker isn't running"
+  refute_output --partial "unbound variable"
+}
+
+# ── Docker autopilot ────────────────────────────────────────────────────────
+
+@test "smoke: a session verb with the daemon down fails clean, no raw docker error" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1
+  run cleat_bin start
+  assert_failure
+  assert_output --partial "Docker isn't running"
+  assert_output --partial "Start it with:"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: a remote DOCKER_HOST is refused with a clear message" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1
+  export DOCKER_HOST="tcp://ci-runner:2376"
+  run cleat_bin start
+  assert_failure
+  assert_output --partial "Remote Docker daemon unreachable"
+  unset DOCKER_HOST
+}
+
+@test "smoke: resume also autopilots a down daemon (F33: hook membership)" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1
+  run cleat_bin resume
+  assert_failure
+  assert_output --partial "Docker isn't running"
+  refute_output --partial "Cannot connect to the Docker daemon"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: shell also autopilots a down daemon (F33: hook membership)" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1
+  run cleat_bin shell
+  assert_failure
+  assert_output --partial "Docker isn't running"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: autopilot is a no-op when the daemon is up (exit-code gate)" {
+  # A session verb against an up daemon must never claim Docker is down. With
+  # no container, `cleat claude` fails at require_running, NOT at autopilot;
+  # a stderr-string-matching _daemon_up would misread the stub's silence as
+  # down and flip this output.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin claude
+  assert_failure
+  refute_output --partial "Docker isn't running"
+  assert_output --partial "is not running"
+}
+
+@test "smoke: stop with the daemon down is not gated by autopilot" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  export DOCKER_EXIT_CODE=1
+  run cleat_bin stop
+  assert_success
+  refute_output --partial "Docker isn't running"
   refute_output --partial "unbound variable"
 }
 

@@ -293,18 +293,32 @@ models under a `[kits]` section in `~/.config/cleat/config`
 (`worker_model = haiku`); the planner is always your session's model.
 
 ```bash
-cleat kit                              # library + this project's selections
-cleat kit plan-big-execute-small       # enable for this project's main box
+cleat kit                              # interactive picker: kit, then models
+cleat kit list                         # plain library + this project's selections
+cleat kit plan-big-execute-small       # or enable directly, for the main box
 cleat kit off                          # back to your own config next session
 cleat kit show plan-big-execute-small  # read every line it injects, first
 ```
 
 A kit merges on top of your own config inside the box (your global CLAUDE.md
 and agents keep working; the kit section is appended and clearly marked) and
-never touches the host: `~/.claude` on the host is never written, and native
-`claude` never sees it. Different boxes can run different kits on the same
+its content stays off the host: kits live in generated mask files mounted
+into the box, nothing kit-related lands in your `~/.claude`, and native
+`claude` never sees them. (Creating a box does seed inert placeholders there
+when missing, an empty `CLAUDE.md` and empty `agents`/`commands` dirs: mount
+targets, not content.) Different boxes can run different kits on the same
 repo. Kits contain instructions and subagents only, no hooks and no settings,
-and whatever they steer the agent to do happens inside the cage.
+and whatever they steer the agent to do happens inside the cage. As a
+hardening side effect, your three user-level instruction surfaces
+(`~/.claude/CLAUDE.md`, `agents`, and `commands`) are mounted read-only in
+every box: the agent reads them but can't plant a host-user-level command or
+agent that your host `claude` would later obey. Author those at project level
+(`.claude/agents/`, `.claude/commands/`) instead. The read-only copies
+dereference symlinks (a dotfile-repo `commands` dir shows up as real files in
+the box), a broken symlink at one of the three paths stops box create with a
+clear fix-or-remove error (your symlink is never deleted), and a box created
+before these masks existed prints a recreate note on every start until you
+run `cleat rm && cleat`.
 
 ### Command reference
 
@@ -572,6 +586,31 @@ Known limitations in v0.10.0:
 - Literal `/workspace/…` paths in `-v` aren't translated. Docker errors cleanly that the source doesn't exist. Use `$(pwd)` or the host path instead.
 - Paths created inside Cleat at locations that don't exist on the host (e.g. `/tmp/scratch` after `mkdir -p /tmp/scratch` inside Cleat) will be created on the host as empty directories. Keep bind-mount sources under your project path.
 
+### Docker autopilot
+
+Daemon down after a reboot? Run `cleat` and it starts Docker for you (Docker
+Desktop, OrbStack, or Colima on macOS, named Colima profiles included; Docker
+Desktop or a rootless engine on Linux via `systemctl --user`; the Windows-side
+Docker Desktop from WSL2 when interop is enabled), waits with a spinner, then
+continues your command. Where it can't start Docker safely it prints the
+exact fix instead: a root-owned Linux engine (or an in-distro engine inside
+WSL2, which wins over the Windows Desktop) gets `sudo systemctl start docker`,
+a socket you can't write means Docker is up and you're not in the `docker`
+group (the message hands you `sudo usermod -aG docker <user>`), and a remote
+endpoint (`tcp://`, `ssh://`, `npipe://`, `fd://`) is refused with "start it
+where it runs". Fires only on session verbs and only in an interactive
+terminal, so scripts and CI are untouched; the wait is bounded
+(`CLEAT_AUTOSTART_TIMEOUT_SECS`, default 90s) and `CLEAT_NO_AUTOSTART=1`
+turns it off.
+
+No Docker installed at all? Cleat offers to install it, consent-first: on
+macOS a menu of Docker Desktop / OrbStack / Colima via Homebrew's official
+packages (casks for Desktop/OrbStack, formulae for Colima, with the licensing
+difference stated), on Linux Docker's official install script downloaded to a
+private temp dir and run under sudo only after you say yes, on WSL2 the
+Windows-side Desktop via winget. The exact command is always shown, the
+default is No, and scripts are never prompted.
+
 ### Environment variables
 
 The `env` capability controls automatic loading of env files. The `--env` and `--env-file` flags always work, regardless of whether the capability is enabled:
@@ -753,11 +792,17 @@ If `pbcopy`/`xclip`/`xsel` inside the container doesn't copy to your host clipbo
 
 ### Docker not running
 
-```
-Cannot connect to the Docker daemon
-```
-
-Start Docker Desktop or the Docker daemon, then retry.
+An interactive `cleat` starts Docker for you (see **Docker autopilot** above), so
+you rarely see a raw daemon error now. If Cleat prints `Docker isn't running`, run
+the exact start command it shows. This happens by design when the auto-launch can't
+help: a script or CI run (no TTY), `CLEAT_NO_AUTOSTART=1`, a root-owned Linux engine
+or an in-distro WSL2 engine (the message hands you `sudo systemctl start docker`), a
+WSL2 distro with interop disabled (start Docker Desktop on Windows and enable WSL
+integration for the distro), or a remote `tcp://`/`ssh://`/`npipe://`/`fd://`
+endpoint (start it where it runs). `Docker is running, but you can't reach its
+socket` is permission, not a down daemon: add yourself to the docker group with the
+printed `sudo usermod -aG docker <user>`, then log out and back in. `Docker isn't
+installed` instead? Take the install offer, or run the printed install command.
 
 ### Permission denied on install
 

@@ -67,6 +67,20 @@ teardown() { _common_teardown; }
   [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
 }
 
+@test "kit: cmd_rm removes the kit selection AND run-dir overlay when the container exists (F36)" {
+  mock_docker_ps ""
+  mock_docker_ps_a "$CNAME"
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  mkdir -p "$CLEAT_RUN_DIR/$CNAME/kit/agents"
+  : > "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  run cmd_rm
+  assert_success
+  run grep -q "^docker rm $CNAME" "$DOCKER_CALLS"
+  assert_success
+  [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
+  [ ! -d "$CLEAT_RUN_DIR/$CNAME" ]
+}
+
 # ── Overlay generation: merge semantics ──────────────────────────────────────
 
 @test "kit: merged CLAUDE.md keeps user content first, kit section appended" {
@@ -106,13 +120,50 @@ teardown() { _common_teardown; }
   assert_output --partial "model: sonnet"
 }
 
-@test "kit: a same-named user agent wins over the kit's copy" {
+@test "kit: a same-FILENAME user agent wins over the kit's copy" {
   mkdir -p "$HOME/.claude/agents"
   echo "USER OWNS THIS NAME" > "$HOME/.claude/agents/kit-worker.md"
   _box_kit_write "$CNAME" "plan-big-execute-small"
   _generate_kit_overlay "$CNAME"
   run cat "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md"
   assert_output "USER OWNS THIS NAME"
+}
+
+@test "kit: a user agent with the SAME NAME (different filename) suppresses the kit's agent" {
+  # The realistic collision: a user's own scout.md declaring name: scout.
+  # Claude dispatches by name, so two agents named 'scout' would be ambiguous
+  # and could hand the read-only role to the user's writable agent. The kit's
+  # scout must be skipped, leaving exactly one 'scout' (the user's).
+  mkdir -p "$HOME/.claude/agents"
+  printf -- '---\nname: scout\ntools: Read, Write, Edit\n---\nmine\n' > "$HOME/.claude/agents/my-scout.md"
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  # the user's file is present, the kit's kit-scout.md is NOT (name collision)
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/my-scout.md" ]
+  [ ! -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-scout.md" ]
+  # exactly one agent declares name: scout
+  run bash -c "grep -l '^name: scout' \"$CLEAT_RUN_DIR/$CNAME/kit/agents\"/*.md | wc -l"
+  assert_output "1"
+  # the kit's worker (no user collision) still lands
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md" ]
+}
+
+@test "kit: _agent_name reads the frontmatter name, not the filename" {
+  local f="$TEST_TEMP/some-file.md"
+  printf -- '---\nname: reviewer\nmodel: sonnet\n---\nbody\n' > "$f"
+  run _agent_name "$f"
+  assert_output "reviewer"
+}
+
+@test "kit: enable warns by AGENT NAME when a user agent shadows a kit agent" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  mkdir -p "$HOME/.claude/agents"
+  printf -- '---\nname: worker\n---\nmine\n' > "$HOME/.claude/agents/my-worker.md"
+  run cmd_kit plan-big-execute-small <<< "y"
+  assert_success
+  assert_output --partial "already have an agent named"
+  assert_output --partial "worker"
 }
 
 @test "kit: unknown selection name degrades to vanilla instead of failing" {
@@ -219,13 +270,34 @@ EOF
 
 # ── cmd_run: mask mounts ─────────────────────────────────────────────────────
 
-@test "kit: cmd_run mounts the kit masks read-only" {
+@test "kit: cmd_run mounts all three kit masks read-only" {
   mock_docker_images "cleat"
   run cmd_run "$TEST_TEMP/project"
   assert_success
   run assert_docker_run_has "$CNAME" "/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro"
   assert_success
   run assert_docker_run_has "$CNAME" "/kit/agents:/home/coder/.claude/agents:ro"
+  assert_success
+  run assert_docker_run_has "$CNAME" "/kit/commands:/home/coder/.claude/commands:ro"
+  assert_success
+}
+
+@test "kit: the commands mask is USER-level only; project commands stay writable via /workspace" {
+  # A user-level ~/.claude/commands is masked :ro. A PROJECT command
+  # (<project>/.claude/commands) must NOT be masked: it rides the /workspace
+  # bind mount read-write, is version-controlled, and is the intended escape
+  # hatch for authoring commands inside a box. Guard that cmd_run masks the
+  # HOME path but never mounts anything :ro over /workspace/.claude/commands.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude/commands"
+  echo "ship it" > "$TEST_TEMP/project/.claude/commands/deploy.md"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # the project is bind-mounted whole, so /workspace carries .claude/commands
+  run assert_docker_run_has "$CNAME" "$TEST_TEMP/project:/workspace"
+  assert_success
+  # and cleat never masks the project-level commands path (only the user-level one)
+  run assert_docker_run_lacks "$CNAME" "/workspace/.claude/commands"
   assert_success
 }
 
@@ -236,9 +308,63 @@ EOF
   assert_success
   [ -f "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md" ]
   [ -d "$CLEAT_RUN_DIR/$CNAME/kit/agents" ]
+  [ -d "$CLEAT_RUN_DIR/$CNAME/kit/commands" ]
   # VirtioFS nested-mount prerequisite: targets exist in the base mount source
   [ -f "$HOME/.claude/CLAUDE.md" ]
   [ -d "$HOME/.claude/agents" ]
+  [ -d "$HOME/.claude/commands" ]
+}
+
+@test "kit: overlay pass-through-copies the user's slash commands (read-only mask seed)" {
+  mkdir -p "$HOME/.claude/commands/frontend"
+  echo "deploy the app" > "$HOME/.claude/commands/deploy.md"
+  echo "make a component" > "$HOME/.claude/commands/frontend/component.md"
+  _generate_kit_overlay "$CNAME"
+  # top-level and namespaced (subdir) commands both survive
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/commands/deploy.md"
+  assert_output "deploy the app"
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/commands/frontend/component.md" ]
+}
+
+@test "kit: commands overlay is an empty dir when the user has no commands" {
+  rm -rf "$HOME/.claude/commands"
+  _generate_kit_overlay "$CNAME"
+  [ -d "$CLEAT_RUN_DIR/$CNAME/kit/commands" ]
+  run bash -c "ls -A \"$CLEAT_RUN_DIR/$CNAME/kit/commands\""
+  assert_output ""
+}
+
+@test "kit: commands regen drops a command the user deleted (in-place refresh)" {
+  mkdir -p "$HOME/.claude/commands"
+  echo "old" > "$HOME/.claude/commands/gone.md"
+  _generate_kit_overlay "$CNAME"
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/commands/gone.md" ]
+  rm -f "$HOME/.claude/commands/gone.md"
+  _generate_kit_overlay "$CNAME"
+  [ ! -f "$CLEAT_RUN_DIR/$CNAME/kit/commands/gone.md" ]
+}
+
+@test "kit: commands pass-through dereferences symlinked commands" {
+  # Dotfile-repo users symlink their commands; a copied symlink would point
+  # at a host path that does not exist inside the box.
+  mkdir -p "$HOME/.claude/commands" "$HOME/dotfiles"
+  echo "real content" > "$HOME/dotfiles/deploy.md"
+  ln -s "$HOME/dotfiles/deploy.md" "$HOME/.claude/commands/deploy.md"
+  _generate_kit_overlay "$CNAME"
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/commands/deploy.md" ]
+  [ ! -L "$CLEAT_RUN_DIR/$CNAME/kit/commands/deploy.md" ]
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/commands/deploy.md"
+  assert_output "real content"
+}
+
+@test "kit: a dangling symlink in the commands overlay is cleared on regen" {
+  # -e alone skips dangling symlinks in the clear loop, so a deleted host
+  # command copied as a symlink would stay visible in the box forever.
+  mkdir -p "$CLEAT_RUN_DIR/$CNAME/kit/commands"
+  ln -s "$TEST_TEMP/gone-target" "$CLEAT_RUN_DIR/$CNAME/kit/commands/stale.md"
+  _generate_kit_overlay "$CNAME"
+  [ ! -L "$CLEAT_RUN_DIR/$CNAME/kit/commands/stale.md" ]
+  [ ! -e "$CLEAT_RUN_DIR/$CNAME/kit/commands/stale.md" ]
 }
 
 @test "kit: cmd_run bakes an enabled kit into the overlay" {
@@ -286,6 +412,43 @@ EOF
   [ ! -e "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md" ]
 }
 
+@test "kit: cmd_start refreshes the kit overlay for a kitted box" {
+  mock_docker_images "cleat"
+  mock_docker_ps "$CNAME"
+  mock_docker_ps_a "$CNAME"
+  _container_has_kit_mounts() { return 0; }
+  _maybe_prompt_image_rebuild() { true; }
+  _maybe_prompt_init_recreate() { true; }
+  _maybe_prompt_claude_update() { true; }
+  exec_claude() { true; }
+  _print_summary_block() { true; }
+  show_first_run_tip() { true; }
+  echo "FRESH RULES" > "$HOME/.claude/CLAUDE.md"
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  run cmd_start
+  assert_success
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "FRESH RULES"
+  assert_output --partial "Cleat kit: plan-big-execute-small"
+}
+
+@test "kit: cmd_start skips the refresh for a pre-kit box" {
+  mock_docker_images "cleat"
+  mock_docker_ps "$CNAME"
+  mock_docker_ps_a "$CNAME"
+  _container_has_kit_mounts() { return 1; }
+  _maybe_prompt_image_rebuild() { true; }
+  _maybe_prompt_init_recreate() { true; }
+  _maybe_prompt_claude_update() { true; }
+  exec_claude() { true; }
+  _print_summary_block() { true; }
+  show_first_run_tip() { true; }
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  run cmd_start
+  assert_success
+  [ ! -e "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md" ]
+}
+
 @test "kit: _container_has_kit_mounts reads the inspected mount destinations" {
   mock_docker_inspect "/home/coder/.claude/CLAUDE.md"
   run _container_has_kit_mounts "$CNAME"
@@ -293,6 +456,70 @@ EOF
   mock_docker_inspect "/workspace"
   run _container_has_kit_mounts "$CNAME"
   assert_failure
+}
+
+# ── Pre-mask boxes: recreate note ────────────────────────────────────────────
+
+@test "kit: a box missing the commands mask gets the recreate note" {
+  container_exists() { return 0; }
+  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents'
+  run _maybe_note_missing_kit_masks "$CNAME"
+  assert_success
+  assert_output --partial "predates the read-only ~/.claude masks"
+  assert_output --partial "cleat rm && cleat"
+}
+
+@test "kit: a fully masked box gets no recreate note" {
+  container_exists() { return 0; }
+  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands'
+  run _maybe_note_missing_kit_masks "$CNAME"
+  assert_success
+  refute_output --partial "predates"
+}
+
+@test "kit: no container, no recreate note" {
+  container_exists() { return 1; }
+  run _maybe_note_missing_kit_masks "$CNAME"
+  assert_success
+  refute_output --partial "predates"
+}
+
+@test "kit: cmd_start surfaces the recreate note for a pre-mask box" {
+  mock_docker_images "cleat"
+  mock_docker_ps "$CNAME"
+  mock_docker_ps_a "$CNAME"
+  mock_docker_inspect "/workspace"
+  _container_has_kit_mounts() { return 1; }
+  _maybe_prompt_image_rebuild() { true; }
+  _maybe_prompt_init_recreate() { true; }
+  _maybe_prompt_claude_update() { true; }
+  exec_claude() { true; }
+  _print_summary_block() { true; }
+  show_first_run_tip() { true; }
+  run cmd_start
+  assert_success
+  assert_output --partial "predates the read-only ~/.claude masks"
+}
+
+# ── Mask targets on the host (VirtioFS pre-create) ───────────────────────────
+
+@test "kit: create refuses a broken symlink at ~/.claude/commands with a clear remedy" {
+  mkdir -p "$HOME/.claude"
+  rm -rf "$HOME/.claude/commands"
+  ln -s "$HOME/no-such-target" "$HOME/.claude/commands"
+  run _ensure_kit_mask_targets
+  assert_failure
+  assert_output --partial "broken symlink"
+}
+
+@test "kit: mask targets are created when absent and a healthy symlink passes" {
+  mkdir -p "$HOME/.claude" "$HOME/real-commands"
+  rm -rf "$HOME/.claude/commands"
+  ln -s "$HOME/real-commands" "$HOME/.claude/commands"
+  run _ensure_kit_mask_targets
+  assert_success
+  [ -f "$HOME/.claude/CLAUDE.md" ]
+  [ -d "$HOME/.claude/agents" ]
 }
 
 # ── cmd_kit: command surface ─────────────────────────────────────────────────
@@ -349,16 +576,6 @@ EOF
   assert_output --partial "plan-big-execute-small"
 }
 
-@test "kit: enable warns when a user agent shadows a kit agent" {
-  mock_docker_ps ""
-  mock_docker_ps_a ""
-  mkdir -p "$HOME/.claude/agents"
-  echo "mine" > "$HOME/.claude/agents/kit-worker.md"
-  run cmd_kit plan-big-execute-small <<< "y"
-  assert_success
-  assert_output --partial "yours wins"
-}
-
 @test "kit: enabling on a pre-kit box offers a rebuild and declining changes nothing" {
   mock_docker_ps ""
   mock_docker_ps_a "$CNAME"
@@ -389,6 +606,22 @@ EOF
   run cmd_kit plan-big-execute-small <<< "y"
   assert_success
   assert_output --partial "applies from the next session"
+}
+
+@test "kit: enable on an existing mounted box regenerates the overlay immediately (F34)" {
+  # _kit_apply's in-place regen is the only refresh for cleat claude/shell
+  # (no regen hook there), so it must actually rewrite the overlay now.
+  mock_docker_ps "$CNAME"
+  mock_docker_ps_a "$CNAME"
+  _container_has_kit_mounts() { return 0; }
+  _box_has_live_agent() { return 1; }
+  echo "MY RULES" > "$HOME/.claude/CLAUDE.md"
+  run cmd_kit plan-big-execute-small <<< "y"
+  assert_success
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "MY RULES"
+  assert_output --partial "Cleat kit: plan-big-execute-small"
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md" ]
 }
 
 @test "kit: off removes the selection and reports the kit" {
@@ -529,6 +762,79 @@ EOF
   assert_output "claude-sonnet-5"
   run _kit_next_model claude-sonnet-5 "claude-sonnet-5"
   assert_output "sonnet"
+}
+
+# ── Interactive TUI event loops (F32; driven via the _read_keypress seam) ─────
+#
+# The real _read_keypress is called via $(...) command substitution, so any
+# counter it increments lives in a subshell and is lost. The scripted queue
+# must therefore be file-backed (state on disk survives the subshell). The
+# fallback key ends any loop that over-reads, so a bug can't hang the suite.
+
+_tui_keys() {   # usage: _tui_keys ENTER SPACE ENTER   (last arg = the over-read fallback)
+  printf '%s\n' "$@" > "$TEST_TEMP/keys"
+  _read_keypress() {
+    local f="$TEST_TEMP/keys" k
+    k="$(head -n1 "$f" 2>/dev/null)"
+    tail -n +2 "$f" > "$f.rest" 2>/dev/null && mv "$f.rest" "$f" 2>/dev/null
+    [ -n "$k" ] && echo "$k" || echo ENTER
+  }
+}
+
+@test "kit: TUI picker ENTER on a kit → models screen ENTER enables it" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  _tui_keys ENTER ENTER
+  run _kit_picker_tui
+  assert_success
+  assert_output --partial "enabled for box"
+  run _box_kit_read "$CNAME"
+  assert_output "plan-big-execute-small"
+}
+
+@test "kit: TUI models SPACE cycles the worker model and saves it to the RIGHT role" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  # ENTER (pick kit) → SPACE (cursor 0 = worker: sonnet→haiku) → ENTER (save)
+  _tui_keys ENTER SPACE ENTER
+  run _kit_picker_tui
+  assert_success
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits worker_model
+  assert_output "haiku"
+  # scout untouched (swap-guard: worker override must not land as scout_model)
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits scout_model
+  assert_output ""
+}
+
+@test "kit: TUI picker DOWN to 'none' + ENTER disables an enabled kit" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _tui_keys DOWN ENTER
+  run _kit_picker_tui
+  assert_success
+  assert_output --partial "disabled"
+  [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
+}
+
+@test "kit: TUI picker q cancels with nothing written" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  _tui_keys QUIT QUIT
+  run _kit_picker_tui
+  assert_success
+  assert_output --partial "Cancelled"
+  [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
+}
+
+@test "kit: TUI models q cancels without enabling (kit picked, models cancelled)" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  _tui_keys ENTER QUIT QUIT
+  run _kit_picker_tui
+  assert_success
+  assert_output --partial "Cancelled"
+  [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
 }
 
 # ── [kits] config writer ─────────────────────────────────────────────────────

@@ -51,6 +51,8 @@ IMAGE_REBUILD_BATS="$REPO_ROOT/test/unit/image_rebuild_check.bats"
 TRUST_BATS="$REPO_ROOT/test/unit/trust.bats"
 DOCKER_COMMANDS_BATS="$REPO_ROOT/test/unit/docker_commands.bats"
 KITS_BATS="$REPO_ROOT/test/unit/kits.bats"
+AUTOSTART_BATS="$REPO_ROOT/test/unit/autostart.bats"
+SMOKE_BATS="$REPO_ROOT/test/unit/smoke.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
@@ -2230,8 +2232,25 @@ try "bugfix_settings_mask_target_precreate" "fresh host without" "$CLI" "$REGRES
 cat > "$SED_TMP" << 'SED'
 s|/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro|/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md|
 s|/kit/agents:/home/coder/.claude/agents:ro|/kit/agents:/home/coder/.claude/agents|
+s|/kit/commands:/home/coder/.claude/commands:ro|/kit/commands:/home/coder/.claude/commands|
 SED
-try "kits_ro_masks" "cmd_run mounts the kit masks read-only" "$CLI" "$KITS_BATS"
+try "kits_ro_masks" "cmd_run mounts all three kit masks read-only" "$CLI" "$KITS_BATS"
+
+# KIT COMMANDS MASK MOUNT: the third :ro mask (slash commands) must be present,
+# or a caged agent can plant a host-user-level command native claude runs.
+# Drop the commands mount entirely: the three-masks test loses it.
+cat > "$SED_TMP" << 'SED'
+/-v "\$CLEAT_RUN_DIR\/\${cname}\/kit\/commands:\/home\/coder\/\.claude\/commands:ro"/d
+SED
+try "kits_commands_mask_mount" "cmd_run mounts all three kit masks read-only" "$CLI" "$KITS_BATS"
+
+# KIT COMMANDS PASS-THROUGH: the box must still READ the user's own slash
+# commands (the mask seeds a copy). Break the copy: the pass-through test no
+# longer finds the user's command in the overlay.
+cat > "$SED_TMP" << 'SED'
+s|cp -RL "${HOME}/.claude/commands/." "$kit_dir/commands/" 2>/dev/null \|\| true|true|
+SED
+try "kits_commands_passthrough" "pass-through-copies the user's slash commands" "$CLI" "$KITS_BATS"
 
 # KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
 # content, first and byte-for-byte. Drop the user-content copy (truncate
@@ -2267,6 +2286,163 @@ cat > "$SED_TMP" << 'SED'
 /^_write_kits_to_file()/,/^}/ s|printf '%s' "$preserved"|:|
 SED
 try "kits_writer_preserves_config" "preserves .caps. and .resources" "$CLI" "$KITS_BATS"
+
+# AUTOPILOT EXIT-CODE GATE: daemon-down detection must be the `docker info`
+# exit code, never a stderr string match (the "Cannot connect" text is
+# version- and locale-dependent). Swap the gate for a string match: against
+# the silent up-daemon stub the string never appears, autopilot misreads "up"
+# as "down", and the no-op smoke test sees "Docker isn't running".
+cat > "$SED_TMP" << 'SED'
+s#^  docker info > /dev/null 2>&1$#  docker info 2>/dev/null | grep -q "Cannot connect to the Docker daemon"#
+SED
+try "autostart_exit_code_gate" "no-op when the daemon is up" "$CLI" "$SMOKE_BATS"
+
+# AUTOPILOT REMOTE GUARD: a tcp:// (or ssh://) endpoint must refuse to launch
+# a local app. Break the tcp match: the refusal test falls through to the
+# generic hint path and loses the "Remote Docker daemon unreachable" message.
+cat > "$SED_TMP" << 'SED'
+s|tcp://\*|zzz://*|
+SED
+try "autostart_remote_guard" "tcp:// DOCKER_HOST is refused" "$CLI" "$AUTOSTART_BATS"
+
+# AUTOPILOT TIMEOUT IS AN ERROR: a daemon that never comes up must exit
+# non-zero within the bounded deadline. Flip every exit in _ensure_daemon to
+# success: the timeout test's assert_failure fails.
+cat > "$SED_TMP" << 'SED'
+/^_ensure_daemon()/,/^}$/ s|exit 1|exit 0|
+SED
+try "autostart_timeout_exits_nonzero" "never-up daemon exits non-zero" "$CLI" "$AUTOSTART_BATS"
+
+# AUTOPILOT KILL SWITCH: CLEAT_NO_AUTOSTART=1 must suppress the launch.
+# Disable the check: the opt-out test sees a recorded launch.
+cat > "$SED_TMP" << 'SED'
+s|\[\[ "${CLEAT_NO_AUTOSTART:-}" == "1" \]\]|false|
+SED
+try "autostart_kill_switch" "CLEAT_NO_AUTOSTART=1 prints the hint" "$CLI" "$AUTOSTART_BATS"
+
+# INSTALL CONSENT DEFAULT-NO: installing Docker is privileged and system-
+# mutating; declining (or EOF) must run nothing. Force the consent checks
+# open: the declining test sees a recorded install.
+cat > "$SED_TMP" << 'SED'
+s|if \[\[ "$yn" != \[yY\]\* \]\]; then|if false; then|
+SED
+try "install_consent_default_no" "Linux declining the install runs nothing" "$CLI" "$AUTOSTART_BATS"
+
+# INSTALL TTY GATE: CI and scripts must never be prompted to install
+# software. Remove the gate: the non-TTY test loses its one-line hint and
+# gets a prompt instead.
+cat > "$SED_TMP" << 'SED'
+s|if \[\[ "${CLEAT_NO_AUTOSTART:-}" == "1" \]\] \|\| ! _is_tty; then|if false; then|
+SED
+try "install_tty_gate" "non-TTY prints the per-OS command" "$CLI" "$AUTOSTART_BATS"
+
+# INSTALL DOWNLOAD-THEN-RUN: the engine script must be downloaded to a file
+# and run from it, never a blind curl-pipe-sh. Regress to the pipe: the
+# consent test's recorded commands show "| sh" and lose the "-o".
+cat > "$SED_TMP" << 'SED'
+s#_install_run curl -fsSL https://get.docker.com -o "$script"#_install_run sh -c "curl -fsSL https://get.docker.com | sh"#
+SED
+try "install_download_then_run" "downloads the script to a file" "$CLI" "$AUTOSTART_BATS"
+
+# INSTALL PRIVATE TEMP DIR (F01): the Linux install must stage the script in an
+# unguessable mktemp -d dir, never a predictable /tmp/cleat-get-docker.$$ file
+# fed to sudo (local root TOCTOU). Revert to the predictable path: the recorded
+# curl target shows cleat-get-docker., failing the F01 assertions.
+cat > "$SED_TMP" << 'SED'
+s#mktemp -d "${TMPDIR:-/tmp}/cleat-docker.XXXXXX"#echo "${TMPDIR:-/tmp}/cleat-get-docker.$$"#
+SED
+try "install_mktemp_private_dir" "downloads the script to a file" "$CLI" "$AUTOSTART_BATS"
+
+# AUTOPILOT unix:// FALL-THROUGH (F30): on every real machine the endpoint is a
+# unix socket, so unix:// MUST fall through the remote-refusal gate to the
+# launcher. Widen the case to *://* (the easy refactor slip): a unix:// endpoint
+# is then misread as remote and autopilot dies on every user's machine.
+cat > "$SED_TMP" << 'SED'
+s|tcp://\*|*://*|
+SED
+try "autostart_unix_not_remote" "unix:// context endpoint is NOT treated as remote" "$CLI" "$AUTOSTART_BATS"
+
+# KIT cmd_start REGEN (F31): the bare `cleat` (start) path must regenerate the
+# kit overlay for existing boxes, or host CLAUDE.md/agents edits and kit updates
+# freeze at create. Neuter the call in cmd_start only.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/ s|_generate_kit_overlay "\$cname"|true|
+SED
+try "kits_cmd_start_regen" "cmd_start refreshes the kit overlay" "$CLI" "$KITS_BATS"
+
+# KIT _kit_apply REGEN (F34): enabling on an existing mounted box must rewrite
+# the overlay immediately (cleat claude/shell have no regen hook). Neuter the
+# call in _kit_apply only.
+cat > "$SED_TMP" << 'SED'
+/^_kit_apply()/,/^}$/ s|_generate_kit_overlay "\$cname"|true|
+SED
+try "kits_apply_regen" "regenerates the overlay immediately" "$CLI" "$KITS_BATS"
+
+# KIT COLLISION BY NAME (F13/F27): a user agent declaring the same frontmatter
+# `name` as a kit agent must suppress the kit's (Claude dispatches by name;
+# two same-named agents defeat the read-only guarantee). Break the name guard:
+# the kit agent is copied anyway and two agents claim the same name.
+cat > "$SED_TMP" << 'SED'
+s|"\$_user_names" == \*" \$_kn "\*|false|
+SED
+try "kits_collision_by_name" "user agent with the SAME NAME" "$CLI" "$KITS_BATS"
+
+# KIT WRITER STRICT-MODE (F35): _write_kits_to_file must return 0 on the
+# both-default path, or the text picker dies under set -e on `done`. Append a
+# trailing test that is false when both models are default, reproducing the
+# original silent-death return code.
+cat > "$SED_TMP" << 'SED'
+/^_write_kits_to_file()/,/^}$/ s|\} > "\$file"|} > "$file"; [[ "$worker" != "$_KIT_DEFAULT_MODEL" ]]|
+SED
+try "kits_writer_strict_return" "DEFAULT models survives" "$CLI" "$SMOKE_BATS"
+
+# COMMANDS PASS-THROUGH DEREFERENCE: dotfile-repo users symlink their slash
+# commands; a copied symlink dangles inside the box. Revert -RL to -R: the
+# deref test finds a symlink in the overlay and fails.
+cat > "$SED_TMP" << 'SED'
+s|cp -RL |cp -R |
+SED
+try "kits_commands_deref" "dereferences symlinked commands" "$CLI" "$KITS_BATS"
+
+# OVERLAY CLEAR GUARD: -e alone skips dangling symlinks, so a deleted host
+# command copied as a symlink lingers in the box forever. Drop the -L half of
+# the guard: the dangling-clear test fails.
+cat > "$SED_TMP" << 'SED'
+s#|| -L "$_f" ##
+SED
+try "kits_clear_dangling" "dangling symlink in the commands overlay" "$CLI" "$KITS_BATS"
+
+# PRE-MASK RECREATE NOTE: a box missing any of the three masks must say so.
+# Drop the commands mask from the checked list: a two-mask box goes silent
+# and the advisory test fails.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_note_missing_kit_masks()/,/^}$/ s# /home/coder/.claude/commands##
+SED
+try "kits_mask_advisory" "missing the commands mask gets the recreate note" "$CLI" "$KITS_BATS"
+
+# PRE-MASK NOTE WIRING: the note must actually run on the session path.
+# Delete the call sites: the cmd_start wiring test fails.
+cat > "$SED_TMP" << 'SED'
+/^  _maybe_note_missing_kit_masks "$cname"$/d
+SED
+try "kits_mask_advisory_wiring" "cmd_start surfaces the recreate note" "$CLI" "$KITS_BATS"
+
+# MASK TARGET GUARD: a broken symlink at a mask target must be refused with a
+# clear remedy, not a raw mkdir trace. Neutralize the guard: the create dies
+# on the raw mkdir error without the message and the test fails.
+cat > "$SED_TMP" << 'SED'
+/^_ensure_kit_mask_targets()/,/^}$/ s#-L "$_t" && ! -e "$_t"#-n ""#
+SED
+try "kits_mask_target_guard" "broken symlink at ~/.claude/commands" "$CLI" "$KITS_BATS"
+
+# HOST MEMORY STRICT TAIL: _host_total_memory must return rc 0 on a garbled
+# MemTotal (its doc contract: empty on any failure). Reintroduce the tail
+# `[[ ]] &&` list: rc 1 escapes to the strict-mode callers and the garbled
+# meminfo test fails.
+cat > "$SED_TMP" << 'SED'
+s#if \[\[ "$kb" =~ \^\[0-9\]+\$ \]\]; then#[[ "$kb" =~ ^[0-9]+$ ]] \&\& if true; then#
+SED
+try "vnext_host_memory_strict_tail" "garbled meminfo" "$CLI" "$RESOURCES_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -1725,7 +1725,20 @@ _kit_agent_model() {
 _kit_description() {
   case "$1" in
     plan-big-execute-small)
-      echo "Run your session on Fable 5: it plans and reviews while cheaper workers (Sonnet 5 by default) execute and scout. Flagship judgment on every decision, most tokens billed at the worker model's rate, so multi-file work burns your rate limit far slower. Adapted from Anthropic's plan-big-execute-small cookbook pattern."
+      echo "Run your session on Fable 5: it plans and reviews while cheaper workers (Sonnet 5 by default) execute and scout. Flagship judgment on the plan and every review, most tokens billed at the worker model's rate, so multi-file work burns your rate limit far slower. Adapted from Anthropic's plan-big-execute-small cookbook pattern."
+      ;;
+  esac
+}
+
+# Post-enable nudge, per kit. The flagship pairing names Fable 5 as the
+# planner, but the kit never touches the session model (concept/34): the
+# user's knob is /model inside the session, so name it at the moment they
+# are about to start one. Claude Code saves /model as the default for new
+# sessions, so this is a one-time step, not a ritual.
+_kit_post_enable_hint() {
+  case "$1" in
+    plan-big-execute-small)
+      echo -e "    ${DIM}The planner is your session's model: pick Fable 5 with ${RESET}${BOLD}/model${RESET}${DIM} in-session (it sticks for new sessions).${RESET}"
       ;;
   esac
 }
@@ -1774,12 +1787,15 @@ You are the planner in a plan-big / execute-small team.
   dispatch each self-contained chunk to the `worker` agent, one at a time
   or in parallel when independent.
 - Review every worker result before dispatching the next dependent chunk.
-  You own integration and the final review.
-- Use the `scout` agent for all code exploration (call sites, structure,
-  impact) instead of searching in the main loop.
+  If a result is wrong or incomplete, dispatch a corrected chunk instead
+  of fixing it yourself. You own integration and the final review.
+- Use the `scout` agent for code exploration (call sites, structure,
+  impact) instead of searching in the main loop. When the judgment is in
+  the raw code itself (a subtle bug, a delicate refactor), read it
+  yourself.
 - Keep the main loop for: planning, judgment calls, reviewing diffs,
   integration, and talking to the user.
-- Do not delegate trivial single-file edits; just make them.
+- Do not delegate trivial edits, even multi-file ones; just make them.
 KIT_EOF
       # Frontmatter via an UNQUOTED heredoc so the effective (possibly
       # [kits]-overridden) model lands in it; bodies stay quoted. The model
@@ -1806,7 +1822,9 @@ You execute exactly the task you are given, nothing more.
 - Match the surrounding code style. Run the narrowest relevant test if
   one is named in the dispatch.
 - Report back: what changed (files and line ranges), the diff of your
-  changes, test output if any, and anything the planner must know.
+  changes, test results distilled to pass or fail plus the failing
+  cases, and anything the planner must know. Never paste full logs or
+  files you only read.
 KIT_EOF
       cat > "$dest/agents/kit-scout.md" << KIT_FM
 ---
@@ -1826,6 +1844,8 @@ You explore and report. You never modify anything.
 - Read only what the question needs. Prefer excerpts over whole files.
 - Bash is for read-only inspection (ls, git log, git grep) only.
 - Report findings compactly: paths, line numbers, one-line conclusions.
+- If you find nothing, say so: what you searched and what remains
+  unknown. Never guess.
 KIT_EOF
       ;;
   esac
@@ -7264,6 +7284,7 @@ _kit_apply() {
   else
     echo -e "    ${DIM}Takes effect next session: ${BOLD}cleat${RESET}"
   fi
+  _kit_post_enable_hint "$kit"
 }
 
 _kit_enable() {

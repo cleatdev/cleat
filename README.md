@@ -284,11 +284,12 @@ not your Claude login.
 A **kit** is a curated Claude Code setup (a CLAUDE.md policy plus custom
 subagents) that you enable for one box with one command. The flagship kit,
 `plan-big-execute-small`, adapts the orchestration pattern from
-[Anthropic's cookbook](https://github.com/anthropics/claude-cookbooks/tree/main/managed_agents):
-run your session on Fable 5 and it plans and reviews while Sonnet 5
-`worker`/`scout` subagents execute and explore. Flagship judgment on every
-decision, most tokens billed at Sonnet rates, so multi-file work burns your
-rate limit far slower. Prefer different economics? Pin or swap the agent
+[Anthropic's cookbook](https://github.com/anthropics/claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb):
+run your session on Fable 5 (set once with `/model` inside the session) and
+it plans and reviews while Sonnet 5 `worker`/`scout` subagents execute and
+explore. Flagship judgment on the plan
+and every review, most tokens billed at Sonnet rates, so multi-file work burns
+your rate limit far slower. Prefer different economics? Pin or swap the agent
 models under a `[kits]` section in `~/.config/cleat/config`
 (`worker_model = haiku`); the planner is always your session's model.
 

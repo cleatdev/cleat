@@ -2535,6 +2535,53 @@ s|Use for all exploration. It finds|Use for all exploration: finding|
 SED
 try "v1.2.0_kit_scout_frontmatter_colon" "kit agent frontmatter stays parseable"
 
+# WORKFLOW ROUTING: the fragment must route implementation stages to the
+# worker agentType, not the planner. Rename the routed role: the routing
+# assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|agentType: 'worker' on implementation stages|the worker agent on implementation stages|
+SED
+try "vnext_kit_fragment_workflow_routing" "fragment routes workflow stages" "$CLI" "$KITS_BATS"
+
+# BUILT-IN AGENT BAN: worker/scout must be the ONLY subagents dispatched, not
+# merely preferred. Soften the ban to a preference: the ban assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|are the only subagents you dispatch|are the preferred subagents|
+SED
+try "vnext_kit_fragment_builtin_ban" "bans built-in agents" "$CLI" "$KITS_BATS"
+
+# LOUD KIT FAILURE: a missing worker/scout must be reported, never silently
+# worked around. Flip the guidance to silent workaround: the loud-failure
+# assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|kit is broken instead of quietly working around it|kit is broken, so quietly work around it|
+SED
+try "vnext_kit_fragment_loud_failure" "loud kit failure" "$CLI" "$KITS_BATS"
+
+# SINGLE-FILE TRIGGER: the dispatch trigger must cover a sizable change
+# within one file, not just huge ones. Reword the trigger: the sizable
+# single-file assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|multi-file, or a sizable|multi-file, or a huge|
+SED
+try "vnext_kit_fragment_singlefile_trigger" "sizable single-file work" "$CLI" "$KITS_BATS"
+
+# SCOUT-LOCATES CARVE-OUT: even a judgment read must have scout locate the
+# code first, not skip straight to reading it. Drop the scout-locates step:
+# the carve-out assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|have scout locate it, then read the located code yourself|read it yourself|
+SED
+try "vnext_kit_fragment_scout_locates" "locating on scout" "$CLI" "$KITS_BATS"
+
+# WORKER TOOL PIN: the worker agent must be pinned to Read, Edit, Write,
+# Grep, Glob, Bash, not a narrower toolset. Collapse the pin to Bash only:
+# the tool-pin assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|tools: Read, Edit, Write, Grep, Glob, Bash|tools: Bash|
+SED
+try "vnext_kit_worker_tools_pin" "tool-pinned to executor tools" "$CLI" "$KITS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

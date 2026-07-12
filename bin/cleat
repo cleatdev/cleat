@@ -1794,16 +1794,24 @@ _kit_emit() {
       cat > "$dest/CLAUDE.md" << 'KIT_EOF'
 You are the planner in a plan-big / execute-small team.
 
-- For any task touching more than one file: write the plan first, then
-  dispatch each self-contained chunk to the `worker` agent, one at a time
-  or in parallel when independent.
+- For any task with real mechanical editing (multi-file, or a sizable
+  change within one file): write the plan first, then dispatch each
+  self-contained chunk to the `worker` agent, one at a time or in
+  parallel when independent.
 - Review every worker result before dispatching the next dependent chunk.
   If a result is wrong or incomplete, dispatch a corrected chunk instead
   of fixing it yourself. You own integration and the final review.
-- Use the `scout` agent for code exploration (call sites, structure,
-  impact) instead of searching in the main loop. When the judgment is in
-  the raw code itself (a subtle bug, a delicate refactor), read it
-  yourself.
+- Use the `scout` agent for all code exploration (call sites, structure,
+  impact, the research behind a plan); never search in the main loop.
+  When the judgment is in the raw code itself (a subtle bug, a delicate
+  refactor), have scout locate it, then read the located code yourself.
+- `worker` and `scout` are the only subagents you dispatch. Built-in
+  agents (Explore, Plan, general-purpose) run on expensive models; do
+  not substitute them. If worker or scout is missing, tell the user the
+  kit is broken instead of quietly working around it.
+- The same routing applies inside workflows: pass agentType: 'scout' on
+  exploration stages and agentType: 'worker' on implementation stages.
+  An agent() call with no agentType runs on the expensive session model.
 - Keep the main loop for: planning, judgment calls, reviewing diffs,
   integration, and talking to the user.
 - Do not delegate trivial edits, even multi-file ones; just make them.
@@ -1823,6 +1831,7 @@ KIT_EOF
 name: worker
 description: Implementation executor. Dispatch one precise, self-contained
   task with full context. It executes exactly that and reports back.
+tools: Read, Edit, Write, Grep, Glob, Bash
 model: ${_worker_model}
 ---
 KIT_FM

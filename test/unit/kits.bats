@@ -94,6 +94,45 @@ teardown() { _common_teardown; }
   assert_output --partial "plan-big / execute-small team"
 }
 
+@test "kit: fragment routes workflow stages through kit agents" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "agentType: 'scout' on"
+  assert_output --partial "agentType: 'worker' on implementation stages"
+  assert_output --partial "runs on the expensive session model"
+}
+
+@test "kit: fragment bans built-in agents and demands a loud kit failure" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "are the only subagents you dispatch"
+  assert_output --partial "kit is broken instead of quietly working around it"
+}
+
+@test "kit: fragment dispatch trigger covers sizable single-file work" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "or a sizable"
+  assert_output --partial "change within one file"
+}
+
+@test "kit: fragment keeps locating on scout even for judgment reads" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "have scout locate it, then read the located code yourself"
+}
+
+@test "kit: worker agent is tool-pinned to executor tools" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md"
+  assert_output --partial "tools: Read, Edit, Write, Grep, Glob, Bash"
+}
+
 @test "kit: vanilla box gets a plain pass-through copy, no kit marker" {
   echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"
   _generate_kit_overlay "$CNAME"

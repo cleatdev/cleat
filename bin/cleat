@@ -514,6 +514,17 @@ _is_macos() {
   [[ "${OSTYPE:-}" == darwin* ]] || [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]
 }
 
+# Whether the daemon's memory pool is a VM: Docker Desktop on any OS, and every
+# macOS backend (Desktop, OrbStack, and Colima all run the daemon in a Linux
+# VM). A native or rootless Linux engine (and a WSL2 in-distro engine) draws
+# from the host's own RAM: no VM exists, so the memory advisories must not
+# call the pool one. macOS short-circuits without touching the daemon; the
+# Linux branch costs one `docker info` field read. Overridable in tests.
+_docker_pool_is_vm() {
+  _is_macos && return 0
+  _is_docker_desktop
+}
+
 # ── Docker autopilot (concept/29) ────────────────────────────────────────────
 #
 # A down daemon after a reboot is the single most common "Docker is friction"
@@ -5956,7 +5967,14 @@ cmd_status() {
       _vm_gb="$(_docker_vm_display_gb "$_vm_bytes")"
       if (( _sum_gb > _vm_gb )); then
         echo ""
-        echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers reserve ${_sum_gb} GB of ceilings on a ${_vm_gb} GB VM${RESET}"
+        # Same engine-aware noun as the on-start overload warning: a native
+        # Linux engine has no VM, the pool is the host's RAM. Detected only
+        # inside this rare branch so a healthy status pays no extra round-trip.
+        if _docker_pool_is_vm 2>/dev/null; then
+          echo -e "  ${BOLD}VM memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers reserve ${_sum_gb} GB of ceilings on a ${_vm_gb} GB VM${RESET}"
+        else
+          echo -e "  ${BOLD}Host memory:${RESET} ${AMBER}● overcommitted${RESET}${DIM}: running containers reserve ${_sum_gb} GB of ceilings on a ${_vm_gb} GB host${RESET}"
+        fi
       fi
     fi
   fi
@@ -6275,7 +6293,7 @@ _maybe_check_docker_pressure() {
   # 2. VM memory vs the host + the running sessions. A box and a worktree are
   #    the same thing here: one session, one quarter-of-VM ceiling. Both point at the one
   #    knob the `docker` CLI can't change: the Docker Desktop memory slider.
-  local vm_bytes sum host_bytes vm_gb rec_gb is_dd=false host_note=""
+  local vm_bytes sum host_bytes vm_gb rec_gb is_dd=false pool_vm=false host_note=""
   vm_bytes="$(_docker_vm_memory)"
   if [[ "$vm_bytes" =~ ^[0-9]+$ ]] && (( vm_bytes > 0 )); then
     vm_gb="$(_docker_vm_display_gb "$vm_bytes")"   # prefer the configured slider; fall back to rounding MemTotal
@@ -6284,8 +6302,10 @@ _maybe_check_docker_pressure() {
     rec_gb="$(_recommended_vm_gb "$host_bytes")"
     # Detect the engine ONCE: every `docker info` is a round-trip to a daemon
     # that's slow precisely when this fires (under swap), so we never call it
-    # again per-branch.
+    # again per-branch. pool_vm (what noun the warnings use) derives from the
+    # is_dd already in hand instead of _docker_pool_is_vm for the same reason.
     _is_docker_desktop 2>/dev/null && is_dd=true
+    if _is_macos || $is_dd; then pool_vm=true; fi
     [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )) \
       && host_note=" of your ${BOLD}$(( host_bytes / 1073741824 )) GB${RESET}"
 
@@ -6329,7 +6349,14 @@ _maybe_check_docker_pressure() {
       else
         _who="Sessions are still running"
       fi
-      warn "${_who}; running containers reserve ${sum_gb} GB of memory ceilings but the Docker VM holds only ${vm_gb} GB${host_note}. Under load they swap together and freeze."
+      # Name the pool truthfully: a native Linux engine has no VM, the ceilings
+      # overcommit the host's own RAM (host_note would read "N GB of your N GB"
+      # there, pure noise, so it stays VM-only).
+      if $pool_vm; then
+        warn "${_who}; running containers reserve ${sum_gb} GB of memory ceilings but the Docker VM holds only ${vm_gb} GB${host_note}. Under load they swap together and freeze."
+      else
+        warn "${_who}; running containers reserve ${sum_gb} GB of memory ceilings but the host has only ${vm_gb} GB of RAM. Under load they swap together and freeze."
+      fi
       if $is_dd && (( rec_gb > vm_gb )); then
         echo -e "    ${DIM}Closing a terminal does not stop its box. Stop one you are done with, or give Docker more memory (Docker Desktop only):${RESET}"
         _print_docker_vm_fix "$host_bytes" "$rec_gb"
@@ -6384,7 +6411,9 @@ _maybe_check_docker_pressure() {
 # the warning: the reassurance is wanted each time), and is the exact inverse of
 # the 2b "undersized" test, so the two are complementary, never both, never
 # contradictory: a correctly sized VM shows this, an undersized one shows the
-# warning. Costs a single `docker info` (MemTotal); the host read is local.
+# warning. Costs one `docker info` for MemTotal plus, on Linux only, a second
+# single-field read for the engine noun (_docker_pool_is_vm; macOS
+# short-circuits); the host read is local.
 #
 # One twist on top of the inverse: even with memory sized right, swap may be left
 # at the Docker Desktop default. So when memory passes but swap reads below the
@@ -6458,7 +6487,23 @@ _maybe_announce_docker_ready() {
   # No session count: "many" is honest (light sessions run dozens), a number reads
   # as a hard cap and isn't true. A box can OOM only if it does genuinely heavy
   # memory work, the same way Claude Code can outside Docker, and that is rare.
-  success "Docker tuned for Cleat ${RESET}${DIM}(${vm_gb} GB VM, room for many parallel sessions)${RESET}"
+  #
+  # Name the pool truthfully. VM-backed engines (Docker Desktop anywhere, every
+  # macOS backend) keep "tuned" and "VM": a slider exists and it is sized right.
+  # A native Linux engine has no VM and no knob was tuned, so it reads "ready"
+  # and "RAM". And a small native host (below the 8 GiB advisory floor, which
+  # the undersized warning never covers because there is nothing to resize)
+  # earns no parallel-headroom claim: four 1 GB ceilings is not "room for
+  # many", so the line states the size and stops.
+  local pool_vm=false
+  _docker_pool_is_vm 2>/dev/null && pool_vm=true
+  if $pool_vm; then
+    success "Docker tuned for Cleat ${RESET}${DIM}(${vm_gb} GB VM, room for many parallel sessions)${RESET}"
+  elif (( vm_gb >= _PRESSURE_VM_ADVISORY_BYTES / 1073741824 )); then
+    success "Docker ready for Cleat ${RESET}${DIM}(${vm_gb} GB RAM, room for many parallel sessions)${RESET}"
+  else
+    success "Docker ready for Cleat ${RESET}${DIM}(${vm_gb} GB RAM available to boxes)${RESET}"
+  fi
 }
 
 cmd_clean() {

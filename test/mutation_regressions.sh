@@ -2504,6 +2504,28 @@ s|"$(id -u)" == "0" ]]; then|"$(id -u)" != "0" ]]; then|
 SED
 try "v1.2.0_root_is_sandbox_gate" "root host rides IS_SANDBOX"
 
+# ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
+# Collapse the predicate to always-VM: the native ready test fails.
+cat > "$SED_TMP" << 'SED'
+/^_docker_pool_is_vm()/,/^}$/ s|  _is_docker_desktop$|  return 0|
+SED
+try "vnext_pool_noun_predicate" "native Linux engine reads ready" "$CLI" "$PRUNE_BATS"
+
+# HEADROOM FLOOR: a small native host must not claim "room for many parallel
+# sessions". Zero the floor so every size claims headroom: the small-host test
+# (which refutes the claim at 4 GB) fails.
+cat > "$SED_TMP" << 'SED'
+s|vm_gb >= _PRESSURE_VM_ADVISORY_BYTES / 1073741824|vm_gb >= 0|
+SED
+try "vnext_pool_headroom_floor" "small native host states its size" "$CLI" "$PRUNE_BATS"
+
+# OVERLOAD NOUN: the native overload warning names the host's RAM. Force the
+# VM wording unconditionally: the native overload test fails.
+cat > "$SED_TMP" << 'SED'
+s#if _is_macos || $is_dd; then pool_vm=true; fi#pool_vm=true#
+SED
+try "vnext_pool_overload_noun" "native-engine overload names the host" "$CLI" "$PRUNE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

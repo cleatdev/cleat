@@ -221,6 +221,24 @@ teardown() { _common_teardown; }
   assert_output --partial "Closing a terminal does not stop its box"
 }
 
+@test "pressure: a native-engine overload names the host's RAM, not a Docker VM" {
+  # The overload warning fires on every engine, but a native Linux engine has
+  # no VM: the ceilings overcommit the host's own RAM and the redundant
+  # "of your N GB" host note (host == pool there) must not print.
+  _is_tty() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _is_macos() { return 1; }                             # a Linux host
+  _is_docker_desktop() { return 1; }                    # native engine
+  _docker_vm_memory() { echo "8589934592"; }            # 8 GiB host RAM
+  _host_total_memory() { echo "8589934592"; }
+  _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB → overcommitted
+  run _maybe_check_docker_pressure
+  assert_success
+  assert_output --partial "the host has only 8 GB of RAM"
+  refute_output --partial "Docker VM holds"
+  refute_output --partial "of your"
+}
+
 @test "pressure: silent when limits fit the VM" {
   _is_tty() { return 0; }
   _cleat_prunable_stats() { printf '0\t0'; }
@@ -616,6 +634,7 @@ teardown() { _common_teardown; }
 
 @test "ready: confirms a well-sized VM with its size and parallel headroom" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                    # VM-backed engine (pin: the noun is engine-aware)
   _docker_vm_memory() { echo "17179869184"; }           # 16 GiB VM
   _host_total_memory() { echo "34359738368"; }          # 32 GiB host → rec 16 (met)
   run _maybe_announce_docker_ready
@@ -633,6 +652,7 @@ teardown() { _common_teardown; }
   run _maybe_announce_docker_ready
   assert_success
   refute_output --partial "Docker tuned for Cleat"
+  refute_output --partial "Docker ready for Cleat"      # nor the native-engine reading
 }
 
 @test "ready: confirms a 16 GB slider reported as ~15.6 GiB, shown as 16 GB" {
@@ -640,6 +660,7 @@ teardown() { _common_teardown; }
   # 16 GB slider reports must read as a tuned 16 GB VM, never stay silent as if
   # undersized (which would contradict the warning's own rounded display).
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                    # VM-backed engine
   _docker_vm_memory() { echo "16750372454"; }           # ~15.6 GiB = a 16 GB slider
   _host_total_memory() { echo "34359738368"; }          # 32 GiB host → rec 16 (met once rounded)
   run _maybe_announce_docker_ready
@@ -648,12 +669,61 @@ teardown() { _common_teardown; }
   assert_output --partial "16 GB"                        # the recovered slider value, not 15
 }
 
+@test "ready: a native Linux engine reads ready and RAM, never tuned or VM" {
+  # A native engine's pool IS the host's RAM: no VM exists and no slider was
+  # tuned, so the nod must claim neither (a 4 GB VPS read "Docker tuned for
+  # Cleat (4 GB VM, ...)" before this). Exercises the real _docker_pool_is_vm.
+  _is_tty() { return 0; }
+  _is_macos() { return 1; }                              # a Linux host
+  _is_docker_desktop() { return 1; }                     # native engine, no VM
+  _docker_vm_memory() { echo "17179869184"; }            # 16 GiB host RAM
+  _host_total_memory() { echo "17179869184"; }
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker ready for Cleat"
+  assert_output --partial "16 GB RAM, room for many parallel sessions"
+  refute_output --partial "VM"
+  refute_output --partial "tuned"
+}
+
+@test "ready: a small native host states its size without the parallel-headroom claim" {
+  # Four 1 GB ceilings is not "room for many parallel sessions". Below the
+  # 8 GiB advisory floor (which never warns natively: there is nothing to
+  # resize) the line states the size and stops. This is the exact shape of the
+  # 4 GB root-VPS screenshot that prompted the wording fix.
+  _is_tty() { return 0; }
+  _is_macos() { return 1; }
+  _is_docker_desktop() { return 1; }
+  _docker_vm_memory() { echo "4294967296"; }             # a 4 GB VPS
+  _host_total_memory() { echo "4294967296"; }            # host == pool → rec 2, gate passes
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "4 GB RAM available to boxes"
+  refute_output --partial "many parallel sessions"
+  refute_output --partial "VM"
+}
+
+@test "ready: macOS keeps the VM wording even off Docker Desktop (OrbStack/Colima run one)" {
+  # Every macOS backend runs the daemon in a Linux VM, so _docker_pool_is_vm
+  # must short-circuit on _is_macos without consulting _is_docker_desktop.
+  _is_tty() { return 0; }
+  _is_macos() { return 0; }
+  _is_docker_desktop() { return 1; }                     # not Desktop; the pool is still a VM
+  _docker_vm_memory() { echo "17179869184"; }
+  _host_total_memory() { echo "34359738368"; }
+  run _maybe_announce_docker_ready
+  assert_success
+  assert_output --partial "Docker tuned for Cleat"
+  assert_output --partial "16 GB VM"
+}
+
 @test "ready: silent on a non-TTY run" {
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
   run _maybe_announce_docker_ready
   assert_success
   refute_output --partial "Docker tuned"
+  refute_output --partial "Docker ready"
 }
 
 @test "ready: defers to a warning the pressure check already showed (no contradiction)" {
@@ -667,10 +737,12 @@ teardown() { _common_teardown; }
   run _maybe_announce_docker_ready
   assert_success
   refute_output --partial "Docker tuned"
+  refute_output --partial "Docker ready"                 # the native reading must defer too
 }
 
 @test "ready: shows on every start, not throttled like the daily check" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                    # VM-backed engine
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
   run _maybe_announce_docker_ready
@@ -681,6 +753,7 @@ teardown() { _common_teardown; }
 
 @test "ready: uses the 8 GiB floor when host RAM is unknown" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                     # VM-backed engine
   _host_total_memory() { echo ""; }                      # host RAM unreadable
   _docker_vm_memory() { echo "8589934592"; }             # exactly 8 GiB → meets floor
   run _maybe_announce_docker_ready
@@ -695,10 +768,12 @@ teardown() { _common_teardown; }
   run _maybe_announce_docker_ready
   assert_success
   refute_output --partial "Docker tuned"
+  refute_output --partial "Docker ready"
 }
 
 @test "ready: a blank PRECEDES the confirmation but none follows (sticks to Image ready)" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                    # VM-backed engine
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
   _ONSTART_GAP_OPEN=0
@@ -717,6 +792,7 @@ teardown() { _common_teardown; }
 
 @test "ready: no leading blank when an earlier notice already opened the gap" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                    # VM-backed engine
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
   _ONSTART_GAP_OPEN=1                                    # advisory/highlight already spaced
@@ -817,6 +893,7 @@ teardown() { _common_teardown; }
   run _maybe_announce_docker_ready
   assert_success
   refute_output --partial "Docker tuned for Cleat"       # not a blanket all-clear
+  refute_output --partial "Docker ready for Cleat"       # nor the native-engine reading of it
   assert_output --partial "swap"
   assert_output --partial "Swap ≥ 2 GB"                  # the concrete fix step
   assert_output --partial "1 GB"                         # names the current (low) swap
@@ -854,6 +931,7 @@ teardown() { _common_teardown; }
 
 @test "ready: well-sized VM with healthy swap gives the all-clear" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                     # VM-backed engine
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
   _docker_vm_swap_bytes() { echo "4294967296"; }         # 4 GiB swap, healthy
@@ -865,6 +943,7 @@ teardown() { _common_teardown; }
 
 @test "ready: swap at exactly the 2 GiB target is healthy (not flagged)" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                     # VM-backed engine
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
   _docker_vm_swap_bytes() { echo "2147483648"; }         # exactly 2 GiB → not below target
@@ -875,6 +954,7 @@ teardown() { _common_teardown; }
 
 @test "ready: unreadable swap falls through to the all-clear (never warn on a guess)" {
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                     # VM-backed engine
   _docker_vm_memory() { echo "17179869184"; }
   _host_total_memory() { echo "34359738368"; }
   _docker_vm_swap_bytes() { echo ""; }                   # can't read swap
@@ -894,6 +974,7 @@ teardown() { _common_teardown; }
   assert_success
   refute_output --partial "swap"
   refute_output --partial "Docker tuned"
+  refute_output --partial "Docker ready"
 }
 
 @test "ready: the swap advisory keeps the whitespace contract (blank above, none below)" {
@@ -989,6 +1070,7 @@ teardown() { _common_teardown; }
   # img: "Docker tuned for Cleat (23 GB VM ...)" when the slider is 24. The slider
   # value, not the kernel's MemTotal, must drive the displayed size.
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                     # Docker Desktop (slider tests are DD by nature)
   _docker_vm_memory() { echo "25125558681"; }            # ~23.4 GiB MemTotal (a 24 GB slider)
   _host_total_memory() { echo "68719476736"; }           # 64 GiB host
   _DD_MEMORY_MIB="24576"                                  # the configured slider
@@ -1003,6 +1085,7 @@ teardown() { _common_teardown; }
   # A 16 GB slider whose MemTotal reads ~15.6 GiB must NOT trip the undersized
   # path: the configured value (16) meets the rec. Display and threshold agree.
   _is_tty() { return 0; }
+  _is_docker_desktop() { return 0; }                     # Docker Desktop
   _docker_vm_memory() { echo "16750372454"; }            # ~15.6 GiB
   _host_total_memory() { echo "34359738368"; }           # 32 GiB host -> rec 16
   _DD_MEMORY_MIB="16384"                                  # 16 GB slider
@@ -1018,6 +1101,7 @@ teardown() { _common_teardown; }
 
 @test "status: flags an overcommitted VM with the promised/actual sizes" {
   mkdir -p "$TEST_TEMP/project"
+  _docker_pool_is_vm() { return 0; }                    # VM-backed engine
   _docker_vm_memory() { echo "8589934592"; }            # 8 GiB VM
   _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB promised
   run cmd_status "$TEST_TEMP/project"
@@ -1039,6 +1123,7 @@ teardown() { _common_teardown; }
   # Consistency with the on-start advisory: a 16 GB slider reads ~15.6 GiB from
   # `docker info`. status must show the rounded "16 GB VM", never a floored "15".
   mkdir -p "$TEST_TEMP/project"
+  _docker_pool_is_vm() { return 0; }                    # VM-backed engine
   _docker_vm_memory() { echo "16750372454"; }           # ~15.6 GiB = a 16 GB slider
   _running_memory_limits_sum() { echo "42949672960"; }  # 40 GiB reserved → overcommitted
   run cmd_status "$TEST_TEMP/project"

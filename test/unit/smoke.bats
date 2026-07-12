@@ -942,9 +942,17 @@ EOF
 set -euo pipefail
 source "$CLI"
 _is_tty() { return 0; }
+_is_docker_desktop() { return 0; }            # VM-backed engine (the noun is engine-aware)
 _docker_vm_memory() { echo 17179869184; }     # 16 GiB VM
 _host_total_memory() { echo 34359738368; }    # 32 GiB host → rec 16 (met)
 _ONSTART_GAP_OPEN=0
+_maybe_announce_docker_ready
+# Native-engine reading of the same nod (small host, no VM): exercises the
+# engine predicate and the headroom-floor arithmetic under real strict mode.
+_is_macos() { return 1; }
+_is_docker_desktop() { return 1; }
+_docker_vm_memory() { echo 4294967296; }      # a 4 GB native host
+_host_total_memory() { echo 4294967296; }
 _maybe_announce_docker_ready
 # Exercise the debounce sweep over a stale marker via the real if-condition call.
 clip="\$(mktemp -d)"
@@ -955,6 +963,7 @@ EOF
   run bash "$TEST_TEMP/ready_strict.sh"
   assert_success
   assert_output --partial "Docker tuned for Cleat"
+  assert_output --partial "4 GB RAM available to boxes"  # the native reading, no VM claim
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
 }
@@ -1007,6 +1016,7 @@ EOF
 set -euo pipefail
 source "$CLI"
 _is_tty() { return 0; }
+_is_docker_desktop() { return 0; }             # Docker Desktop (the slider read is DD by nature)
 _docker_vm_memory() { echo 25125558681; }      # ~23.4 GiB MemTotal (a 24 GB slider)
 _host_total_memory() { echo 68719476736; }     # 64 GiB host
 dd="\$(mktemp -d)"

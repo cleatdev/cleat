@@ -806,6 +806,27 @@ EOF
   assert_output --partial "running"
 }
 
+@test "status: overcommit line names the VM on a VM-backed engine" {
+  mkdir -p "$TEST_TEMP/project"
+  _docker_vm_memory() { echo "8589934592"; }             # 8 GiB pool
+  _running_memory_limits_sum() { echo "42949672960"; }   # 40 GiB of ceilings
+  _docker_pool_is_vm() { return 0; }
+  run cmd_status "$TEST_TEMP/project"
+  assert_output --partial "VM memory:"
+  assert_output --partial "reserve 40 GB of ceilings on a 8 GB VM"
+}
+
+@test "status: overcommit line names the host on a native engine (no VM exists)" {
+  mkdir -p "$TEST_TEMP/project"
+  _docker_vm_memory() { echo "8589934592"; }
+  _running_memory_limits_sum() { echo "42949672960"; }
+  _docker_pool_is_vm() { return 1; }                     # native Linux engine
+  run cmd_status "$TEST_TEMP/project"
+  assert_output --partial "Host memory:"
+  assert_output --partial "reserve 40 GB of ceilings on a 8 GB host"
+  refute_output --partial "GB VM"
+}
+
 # ── ps / help ───────────────────────────────────────────────────────────────
 
 @test "ps: shows empty message" {

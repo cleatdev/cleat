@@ -3281,6 +3281,19 @@ fi
 # HOME/PATH/TERM); a lasting override belongs in the [env] config.
 CLAUDE_ENV+=(-e "BROWSER=/usr/local/bin/open-bridge")
 
+# IS_SANDBOX rides every exec only when the HOST user is root. Claude hard-
+# refuses --dangerously-skip-permissions under uid 0 (its root/sudo guard,
+# anthropics/claude-code#9184), and on a root-only host (a stock VPS image,
+# `sudo cleat`) the entrypoint's uid remap makes coder uid 0, so every session
+# died at launch with "Claude exited with code 1" right after a green
+# bring-up. IS_SANDBOX=1 is upstream's own escape hatch for exactly this
+# case, a sandboxed container (Anthropic's reference devcontainer sets it).
+# Scoped to a root host so ordinary boxes keep an unchanged env, and injected
+# at exec (not create) so existing root boxes heal on their next session.
+if [[ "$(id -u)" == "0" ]]; then
+  CLAUDE_ENV+=(-e "IS_SANDBOX=1")
+fi
+
 _host_clip_cmd() {
   if command -v pbcopy &>/dev/null; then echo pbcopy
   elif command -v xclip &>/dev/null; then echo "xclip -selection clipboard"

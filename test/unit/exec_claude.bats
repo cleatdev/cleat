@@ -52,6 +52,10 @@ teardown() { _common_teardown; }
   for e in "${CLAUDE_ENV[@]}"; do
     [[ "$e" == "-e" ]] && continue
     [[ "${e%%=*}" == "COLORTERM" ]] && continue
+    # IS_SANDBOX is the second conditional entry (root hosts only, so it only
+    # shows up when the suite itself runs as root); its behavior is pinned by
+    # the v1.2.0 regression test.
+    [[ "${e%%=*}" == "IS_SANDBOX" ]] && continue
     keys+="${e%%=*}"$'\n'
   done
   local sorted

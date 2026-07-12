@@ -2448,3 +2448,28 @@ SCRIPT
   run cat "$HOME/.claude/settings.json"
   assert_output "{}"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.0: on a root-only host (a stock VPS image, `sudo cleat`) the
+# entrypoint's uid remap makes the box user uid 0, and claude hard-refuses
+# --dangerously-skip-permissions under uid 0 (its root/sudo guard,
+# anthropics/claude-code#9184), so every session died at launch with "Claude
+# exited with code 1" right after a green bring-up. IS_SANDBOX=1 is upstream's
+# own bypass for sandboxed containers (their reference devcontainer sets it).
+# It must ride CLAUDE_ENV (every exec, like the BROWSER heal) so existing root
+# boxes heal on their next session, and must stay OUT of the env on non-root
+# hosts so an ordinary box's environment is unchanged.
+@test "regression v1.2.0: root host rides IS_SANDBOX=1 on every session exec, non-root stays clean" {
+  # CLAUDE_ENV is built at SOURCE time from `id -u`, so both branches must be
+  # exercised in fresh subprocesses with a shimmed id (a shell function beats
+  # the PATH binary inside command substitution), same technique as the
+  # COLORTERM test in exec_claude.bats.
+  local stripped="$TEST_TEMP/cli_stripped_rootenv"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$stripped"
+  run bash -c "id() { echo 0; }; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
+  assert_success
+  assert_output --partial "IS_SANDBOX=1"
+  run bash -c "id() { echo 501; }; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
+  assert_success
+  refute_output --partial "IS_SANDBOX"
+}

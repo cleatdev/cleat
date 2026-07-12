@@ -2488,6 +2488,22 @@ s#if \[\[ "$kb" =~ \^\[0-9\]+\$ \]\]; then#[[ "$kb" =~ ^[0-9]+$ ]] \&\& if true;
 SED
 try "vnext_host_memory_strict_tail" "garbled meminfo" "$CLI" "$RESOURCES_BATS"
 
+# v1.2.0 ROOT HOST: sessions on a root host must ride IS_SANDBOX=1 (claude
+# refuses --dangerously-skip-permissions under uid 0). Mutate the injected
+# value: upstream only recognizes exactly 1, so the assert on the exact value
+# must fail.
+cat > "$SED_TMP" << 'SED'
+s|IS_SANDBOX=1|IS_SANDBOX=0|g
+SED
+try "v1.2.0_root_is_sandbox_value" "root host rides IS_SANDBOX"
+
+# v1.2.0 ROOT HOST scope: invert the uid gate so non-root hosts get the flag
+# and root hosts lose it. Both halves of the regression test fail.
+cat > "$SED_TMP" << 'SED'
+s|"$(id -u)" == "0" ]]; then|"$(id -u)" != "0" ]]; then|
+SED
+try "v1.2.0_root_is_sandbox_gate" "root host rides IS_SANDBOX"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -2526,6 +2526,15 @@ s#if _is_macos || $is_dd; then pool_vm=true; fi#pool_vm=true#
 SED
 try "vnext_pool_overload_noun" "native-engine overload names the host" "$CLI" "$PRUNE_BATS"
 
+# ── 2026-07-12 kit scout frontmatter fix ─────────────────────────────────────
+# Reintroduce the colon-space in the scout description's unquoted YAML scalar
+# (the exact v1.2.0 text): the frontmatter goes invalid and Claude Code drops
+# the scout agent silently. The plain-scalar regression check must fail.
+cat > "$SED_TMP" << 'SED'
+s|Use for all exploration. It finds|Use for all exploration: finding|
+SED
+try "v1.2.0_kit_scout_frontmatter_colon" "kit agent frontmatter stays parseable"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

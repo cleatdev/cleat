@@ -2473,3 +2473,43 @@ SCRIPT
   assert_success
   refute_output --partial "IS_SANDBOX"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.0: the kit scout's generated frontmatter wrapped its description as an
+# unquoted YAML plain scalar containing colon-space ("all exploration:
+# finding"), which is invalid YAML ("mapping values are not allowed here").
+# Claude Code silently drops an agent whose frontmatter fails to parse, so
+# every kit box shipped with a dead scout: the planner CLAUDE.md kept telling
+# the model to dispatch it, and every dispatch errored "Agent type 'scout'
+# not found". The worker survived only because its wrapped description
+# happens to contain no colon.
+@test "regression v1.2.0: kit agent frontmatter stays parseable YAML, no colon-space in unquoted scalars" {
+  CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
+  CLEAT_KITS_DIR="$CLEAT_CONFIG_DIR/kits"
+  mkdir -p "$TEST_TEMP/project" && cd "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  _box_kit_write "$cname" "plan-big-execute-small"
+  _generate_kit_overlay "$cname"
+  [ -f "$CLEAT_RUN_DIR/$cname/kit/agents/kit-scout.md" ]
+  [ -f "$CLEAT_RUN_DIR/$cname/kit/agents/kit-worker.md" ]
+  # Minimal plain-scalar YAML check over every generated agent frontmatter:
+  # inside the --- block, strip the "key: " prefix, skip quoted values, then
+  # reject any remaining colon-space or trailing colon on any line (either
+  # one flips a plain scalar into a mapping and kills the parse).
+  local f
+  for f in "$CLEAT_RUN_DIR/$cname/kit/agents"/kit-*.md; do
+    run awk '
+      NR==1 && $0=="---" { infm=1; next }
+      infm && $0=="---" { exit bad }
+      infm {
+        line=$0
+        if (line ~ /^[A-Za-z_-]+:([ \t]|$)/) sub(/^[A-Za-z_-]+:[ \t]*/, "", line)
+        if (line ~ /^["'\'']/) next
+        if (line ~ /: / || line ~ /:[ \t]*$/) { print FILENAME ": bad plain scalar: " $0; bad=1 }
+      }
+      END { exit bad }
+    ' "$f"
+    assert_success
+  done
+}

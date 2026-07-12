@@ -1811,6 +1811,10 @@ KIT_EOF
       # Frontmatter via an UNQUOTED heredoc so the effective (possibly
       # [kits]-overridden) model lands in it; bodies stay quoted. The model
       # value is sanitized by _kit_agent_model, never raw config text.
+      # Frontmatter is strict YAML: an unquoted value (description) must
+      # never contain colon-space or end in a colon, on any wrapped line.
+      # Claude Code silently drops an agent whose frontmatter fails to
+      # parse (the v1.2.0 scout bug: "all exploration: finding").
       local _worker_model _scout_model
       _worker_model="$(_kit_agent_model worker sonnet)"
       _scout_model="$(_kit_agent_model scout sonnet)"
@@ -1840,8 +1844,8 @@ KIT_EOF
       cat > "$dest/agents/kit-scout.md" << KIT_FM
 ---
 name: scout
-description: Read-only codebase scout. Use for all exploration: finding
-  call sites, mapping structure, locating definitions, sizing a change.
+description: Read-only codebase scout. Use for all exploration. It finds
+  call sites, maps structure, locates definitions, and sizes a change.
 tools: Read, Grep, Glob, Bash
 model: ${_scout_model}
 ---

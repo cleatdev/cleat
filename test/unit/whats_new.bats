@@ -28,11 +28,11 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v1.0.0"
-  # "stable" carries the cyan accent, so it is wrapped in color codes; assert the
+  assert_output --partial "New in v1.2.0"
+  # "Kits" carries the cyan accent, so it is wrapped in color codes; assert the
   # accent word and the contiguous tail separately rather than the split phrase.
-  assert_output --partial "stable"
-  assert_output --partial "release is out"
+  assert_output --partial "Kits"
+  assert_output --partial "one command enables a tuned Claude team"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
 }
@@ -41,9 +41,9 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
-  # Anchored to this release's section (#v1.0.0), not the bare changelog page:
+  # Anchored to this release's section (#v1.2.0), not the bare changelog page:
   # the /changelog page IDs each release by its version.
-  assert_output --partial "cleat.sh/changelog#v1.0.0"
+  assert_output --partial "cleat.sh/changelog#v1.2.0"
 }
 
 @test "whats-new: the changelog link is a clickable OSC 8 hyperlink in supporting terminals" {
@@ -52,7 +52,7 @@ teardown() { _common_teardown; }
   run _maybe_show_release_highlight
   assert_success
   # OSC 8 link target is the full https URL (the visible label can be the short form).
-  assert_output --partial "$(printf '\033]8;;https://cleat.sh/changelog#v1.0.0\033\\')"
+  assert_output --partial "$(printf '\033]8;;https://cleat.sh/changelog#v1.2.0\033\\')"
 }
 
 @test "whats-new: the changelog link sits on its own line, not crammed onto the prose" {
@@ -62,9 +62,9 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   local out cl_line; out="$(_maybe_show_release_highlight)"
   cl_line="$(printf '%s\n' "$out" | grep -F 'cleat.sh/changelog')"
-  printf '%s' "$cl_line" | grep -qF "New in v1.0.0" \
+  printf '%s' "$cl_line" | grep -qF "New in v1.2.0" \
     && { echo "changelog crammed onto the headline line"; return 1; } || true
-  printf '%s' "$cl_line" | grep -qF "Leave it running" \
+  printf '%s' "$cl_line" | grep -qF "off in one command" \
     && { echo "changelog crammed onto a support line"; return 1; } || true
 }
 

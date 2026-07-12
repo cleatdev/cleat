@@ -587,7 +587,11 @@ cleat_bin_timeout() {
   run cleat_bin start
   assert_failure
   assert_output --partial "Docker isn't running"
-  assert_output --partial "Start it with:"
+  # The remedy phrasing depends on what engine the real host detects:
+  # a copy-pasteable command gets "Start it with:", an instruction-only
+  # environment (e.g. a macOS runner with no Docker.app) gets "To fix:".
+  # Both are the clean-failure contract this smoke test guards.
+  assert_output --regexp "Start it with:|To fix:"
   refute_output --partial "unbound variable"
 }
 

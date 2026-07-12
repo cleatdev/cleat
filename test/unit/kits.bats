@@ -141,8 +141,8 @@ teardown() { _common_teardown; }
   # the user's file is present, the kit's kit-scout.md is NOT (name collision)
   [ -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/my-scout.md" ]
   [ ! -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-scout.md" ]
-  # exactly one agent declares name: scout
-  run bash -c "grep -l '^name: scout' \"$CLEAT_RUN_DIR/$CNAME/kit/agents\"/*.md | wc -l"
+  # exactly one agent declares name: scout (tr strips BSD wc's padding)
+  run bash -c "grep -l '^name: scout' \"$CLEAT_RUN_DIR/$CNAME/kit/agents\"/*.md | wc -l | tr -d ' '"
   assert_output "1"
   # the kit's worker (no user collision) still lands
   [ -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md" ]

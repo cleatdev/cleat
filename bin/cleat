@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.1.1"
+VERSION="1.2.0"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="1.1.1"
+RELEASE_HIGHLIGHT_VERSION="1.2.0"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -4433,11 +4433,11 @@ _maybe_show_release_highlight() {
   # v0.16.1). We still own our OWN trailing blank below, so the bring-up that
   # follows needs none.
   [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
-  info "${BOLD}New in v1.0.0${RESET}. The first ${CYAN}stable${RESET} release is out."
-  echo -e "    ${DIM}The cage is solid. Your keys still never enter it.${RESET}"
-  echo -e "    ${DIM}Leave it running, walk away. Upgrades stay quiet.${RESET}"
+  info "${BOLD}New in v1.2.0${RESET}. ${CYAN}Kits${RESET}: one command enables a tuned Claude team."
+  echo -e "    ${DIM}Fable-grade planning, Sonnet-priced execution: ${RESET}${BOLD}cleat kit${RESET}"
+  echo -e "    ${DIM}Per box, on top of your config, off in one command.${RESET}"
   # A clickable, version-anchored changelog link. The /changelog page IDs each
-  # release `id="vX.Y.Z"` (changelog.astro), so #v1.0.0 deep-links to the 1.0.0
+  # release `id="vX.Y.Z"` (changelog.astro), so #v1.2.0 deep-links to the 1.2.0
   # release; _hyperlink makes it a real OSC 8 link where supported (clean short
   # text), else a bare clickable URL. Blue + underline reads as a link either
   # way. Keep the anchor version in lockstep with the "New in vX.Y.Z" label above.
@@ -4447,7 +4447,7 @@ _maybe_show_release_highlight() {
   # %s passes the already-rendered link through untouched.
   printf '    %bChangelog:%b %b%b%s%b\n' \
     "$DIM" "$RESET" "$BLUE" "$UNDERLINE" \
-    "$(_hyperlink "https://cleat.sh/changelog#v1.0.0" "cleat.sh/changelog#v1.0.0")" "$RESET"
+    "$(_hyperlink "https://cleat.sh/changelog#v1.2.0" "cleat.sh/changelog#v1.2.0")" "$RESET"
   # Trailing blank: the highlight owns its own separation from whatever follows
   # (the bring-up, or the "Docker tuned"/swap line that runs after it), so flag
   # the gap open. Without this, a post-upgrade start with a well-sized VM (pressure

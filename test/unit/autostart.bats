@@ -107,7 +107,11 @@ teardown() { _common_teardown; }
   run _ensure_daemon
   assert_failure
   assert_output --partial "Docker isn't running"
-  assert_output --partial "docker start"
+  # The printed remedy is environment-dependent (systemd hosts get
+  # "sudo systemctl start docker", others "sudo service docker start");
+  # what the test guards is that a ROOT engine is never launched, only
+  # advised, and both remedies are sudo commands.
+  assert_output --partial "sudo"
   [ ! -f "$TEST_TEMP/launched" ]
 }
 

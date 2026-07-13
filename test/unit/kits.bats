@@ -845,6 +845,18 @@ EOF
   assert_output --partial "coordinator-pattern cookbook"
 }
 
+@test "kit: every kit description fits the picker detail pane" {
+  local k lines
+  for k in "${KNOWN_KITS[@]}"; do
+    lines="$(_kit_description "$k" | fold -s -w 60 | wc -l | tr -d ' ')"
+    if [[ "$lines" -gt "$_KIT_PANE_LINES" ]]; then
+      echo "kit $k: description folds to $lines lines, pane holds $_KIT_PANE_LINES"
+    fi
+    run test "$lines" -le "$_KIT_PANE_LINES"
+    assert_success
+  done
+}
+
 @test "kit: models draw shows both roles with their models" {
   run _kit_models_draw 0 sonnet haiku
   assert_output --partial "worker"

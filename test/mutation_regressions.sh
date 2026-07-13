@@ -2624,6 +2624,14 @@ s|Do NOT try to verify clipboard contents after copying.|Verify clipboard conten
 SED
 try "vnext_box_notes_image_lockstep" "byte-identical to the image" "$CLI" "$KITS_BATS"
 
+# PANE FIT: every kit description must fold into the picker's fixed detail
+# pane. Shrink the pane below the flagship description's height: the fit
+# guard must fail (a silent truncation would eat the pitch's closing lines).
+cat > "$SED_TMP" << 'SED'
+s|_KIT_PANE_LINES=7|_KIT_PANE_LINES=3|
+SED
+try "vnext_kit_pane_fits" "fits the picker detail pane" "$CLI" "$KITS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

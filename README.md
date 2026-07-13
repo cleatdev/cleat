@@ -283,13 +283,15 @@ not your Claude login.
 
 A **kit** is a curated Claude Code setup (a CLAUDE.md policy plus custom
 subagents) that you enable for one box with one command. The flagship kit,
-`plan-big-execute-small`, adapts the orchestration pattern from
-[Anthropic's cookbook](https://github.com/anthropics/claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb):
+`plan-big-execute-small`, adapts the coordinator pattern from
+[Anthropic's cookbook](https://github.com/anthropics/claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb)
+(big models for planning, small models for execution):
 run your session on Fable 5 (set once with `/model` inside the session) and
-it plans and reviews while Sonnet 5 `worker`/`scout` subagents execute and
-explore. Flagship judgment on the plan
-and every review, most tokens billed at Sonnet rates, so multi-file work burns
-your rate limit far slower. Prefer different economics? Pin or swap the agent
+it plans and reviews while `worker` and `scout` subagents (Sonnet 5 by
+default) execute and explore, each in its own context window so the main
+session stays lean. Flagship judgment on the plan
+and every review, the mechanical bulk billed at the worker model's rate, so
+heavy work burns your rate limit far slower. Prefer different economics? Pin or swap the agent
 models under a `[kits]` section in `~/.config/cleat/config`
 (`worker_model = haiku`); the planner is always your session's model.
 
@@ -302,8 +304,9 @@ cleat kit show plan-big-execute-small  # read every line it injects, first
 ```
 
 A kit merges on top of your own config inside the box (your global CLAUDE.md
-and agents keep working; the kit section is appended and clearly marked) and
-its content stays off the host: kits live in generated mask files mounted
+and agents keep working; the kit section is appended and clearly marked, after
+a `Cleat box notes` section every box carries with the clipboard-bridge rules)
+and its content stays off the host: kits live in generated mask files mounted
 into the box, nothing kit-related lands in your `~/.claude`, and native
 `claude` never sees them. (Creating a box does seed inert placeholders there
 when missing, an empty `CLAUDE.md` and empty `agents`/`commands` dirs: mount

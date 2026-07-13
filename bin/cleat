@@ -1739,6 +1739,26 @@ _kit_agent_model() {
   fi
 }
 
+# In-box operational notes composed into EVERY box's ~/.claude/CLAUDE.md
+# (vanilla and kitted) by _generate_kit_overlay. The same text is baked into
+# the image at this path (docker/CLAUDE.md) since v0.1.0, but a bake below a
+# bind mount is invisible: the host ~/.claude dir mount (and now the mask)
+# always shadowed it, so no box ever saw these rules until the overlay
+# started carrying them. MUST stay byte-identical to docker/CLAUDE.md (a
+# guard test enforces it): the bake still covers any box without the mask.
+_box_notes_claude_md() {
+  cat << 'BOX_NOTES_EOF'
+# Clipboard
+
+This environment runs inside Docker with clipboard bridge forwarding.
+`xclip`, `pbcopy`, `xsel`, and `clip` all work for COPYING text to the host clipboard.
+The primary mechanism writes to a shared file that the host picks up automatically.
+OSC 52 terminal escape sequences are used as a fallback when the bridge is unavailable.
+Paste/read-back (`xclip -o`, `xsel -o`, `pbpaste`) is not supported. Do NOT try to verify clipboard contents after copying.
+The copy succeeded if the command exits 0. Do not run a second command to check.
+BOX_NOTES_EOF
+}
+
 # One-paragraph description for the library listing and the confirm screen.
 # Deliberately mechanical claims only: planning runs on your session's model,
 # execution bills at worker rates. Never add outcome/quality percentages here;
@@ -1997,6 +2017,17 @@ _generate_kit_overlay() {
   else
     : > "$kit_dir/CLAUDE.md"
   fi
+
+  # Box notes second, under a marked header: operational guidance every box
+  # needs (the clipboard-bridge rules). This is the only path that actually
+  # reaches the box; see _box_notes_claude_md for why the image bake never
+  # did. A kit section, if any, follows below.
+  {
+    echo ""
+    echo "# ── Cleat box notes ──"
+    echo ""
+    _box_notes_claude_md
+  } >> "$kit_dir/CLAUDE.md"
 
   # agents/: the user's own agents, as-is.
   if [[ -d "${HOME}/.claude/agents" ]]; then

@@ -133,18 +133,46 @@ teardown() { _common_teardown; }
   assert_output --partial "tools: Read, Edit, Write, Grep, Glob, Bash"
 }
 
-@test "kit: vanilla box gets a plain pass-through copy, no kit marker" {
+@test "kit: vanilla box keeps user content first and gets no kit marker" {
   echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"
   _generate_kit_overlay "$CNAME"
-  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  run head -1 "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
   assert_output "MY GLOBAL RULES"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "Cleat box notes"
+  refute_output --partial "Cleat kit:"
 }
 
-@test "kit: missing host CLAUDE.md yields an empty (not absent) mask source" {
+@test "kit: missing host CLAUDE.md still yields a mask source with the box notes" {
   rm -f "$HOME/.claude/CLAUDE.md"
   _generate_kit_overlay "$CNAME"
   [ -f "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md" ]
-  [ ! -s "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md" ]
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "clipboard bridge forwarding"
+  refute_output --partial "Cleat kit:"
+}
+
+@test "kit: box notes sit between user content and the kit section" {
+  echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run head -1 "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output "MY GLOBAL RULES"
+  run awk '/Cleat box notes/{n=NR} /Cleat kit:/{k=NR} END{exit !(n && k && n < k)}' \
+    "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_success
+}
+
+@test "kit: box notes forbid clipboard read-back verification" {
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "Do NOT try to verify clipboard contents after copying"
+  assert_output --partial "The copy succeeded if the command exits 0."
+}
+
+@test "kit: box notes heredoc stays byte-identical to the image's docker/CLAUDE.md" {
+  run diff <(_box_notes_claude_md) "$PROJECT_ROOT/docker/CLAUDE.md"
+  assert_success
 }
 
 @test "kit: agents dir merges user agents with kit-prefixed agents" {
@@ -210,8 +238,10 @@ teardown() { _common_teardown; }
   _box_kit_write "$CNAME" "no-such-kit"
   run _generate_kit_overlay "$CNAME"
   assert_success
-  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  run head -1 "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
   assert_output "MY GLOBAL RULES"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  refute_output --partial "Cleat kit:"
 }
 
 @test "kit: regeneration rewrites in place (inodes stable for live binds)" {
@@ -233,8 +263,10 @@ teardown() { _common_teardown; }
   _generate_kit_overlay "$CNAME"
   _box_kit_remove "$CNAME"
   _generate_kit_overlay "$CNAME"
-  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  run head -1 "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
   assert_output "MY GLOBAL RULES"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  refute_output --partial "Cleat kit:"
   [ ! -f "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md" ]
 }
 

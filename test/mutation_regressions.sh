@@ -2608,6 +2608,22 @@ s|echo "\${_KIT_MODEL_CHOICES\[\$((i - 1))\]}"|echo "\${_KIT_MODEL_CHOICES\[\$((
 SED
 try "vnext_kit_prev_model_reverse" "reverse model cycle" "$CLI" "$KITS_BATS"
 
+# BOX NOTES REACH THE BOX: the overlay must append the clipboard-bridge notes
+# after the user's content. Silence the append: the v0.1.0 regression test
+# (notes actually reach the box CLAUDE.md) must fail.
+cat > "$SED_TMP" << 'SED'
+s|    _box_notes_claude_md$|    :|
+SED
+try "v0.1.0_box_notes_compose" "box notes actually reach the box"
+
+# BOX NOTES LOCKSTEP: the heredoc must stay byte-identical to the image's
+# docker/CLAUDE.md bake. Weaken the read-back rule in the heredoc only: the
+# byte-identity guard test must fail.
+cat > "$SED_TMP" << 'SED'
+s|Do NOT try to verify clipboard contents after copying.|Verify clipboard contents after copying.|
+SED
+try "vnext_box_notes_image_lockstep" "byte-identical to the image" "$CLI" "$KITS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

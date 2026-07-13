@@ -2542,3 +2542,28 @@ SCRIPT
   assert_success
   assert_output "OTHER"
 }
+
+# v0.1.0 baked in-box guidance (docker/CLAUDE.md: the clipboard-bridge rules)
+# at /home/coder/.claude/CLAUDE.md in the image, and v0.1.0 also mounted the
+# host's ~/.claude directory over that same path, which shadows everything
+# beneath it. So no box ever saw the rules: Claude inside the box did not
+# know pbcopy/xclip reach the host clipboard, and wasted turns running the
+# forbidden read-back checks (xclip -o) the notes exist to prevent. The fix
+# composes the notes into the generated overlay CLAUDE.md (the mask that owns
+# the path in every v1.2.0+ box), user content first, notes under a marked
+# header, kit section after.
+@test "regression v0.1.0: clipboard-bridge box notes actually reach the box CLAUDE.md" {
+  CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
+  CLEAT_KITS_DIR="$CLEAT_CONFIG_DIR/kits"
+  mkdir -p "$TEST_TEMP/project" && cd "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mkdir -p "$HOME/.claude"
+  echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"
+  _generate_kit_overlay "$cname"
+  run head -1 "$CLEAT_RUN_DIR/$cname/kit/CLAUDE.md"
+  assert_output "MY GLOBAL RULES"
+  run cat "$CLEAT_RUN_DIR/$cname/kit/CLAUDE.md"
+  assert_output --partial "clipboard bridge forwarding"
+  assert_output --partial "Do NOT try to verify clipboard contents after copying"
+}

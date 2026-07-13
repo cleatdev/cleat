@@ -94,6 +94,10 @@ KNOWN_KITS=(plan-big-execute-small)
 # bundled Claude), and the cycle order the interactive picker offers.
 _KIT_DEFAULT_MODEL="sonnet"
 _KIT_MODEL_CHOICES=(sonnet haiku opus inherit)
+# Fixed height of the kit picker's detail pane (kit description under the
+# list). Fixed so the TUI redraw math stays constant per frame. Must hold
+# the longest _kit_description folded at 60 columns.
+_KIT_PANE_LINES=7
 
 # Persistent per-project Claude global-state (.claude.json) store. Unlike
 # $CLEAT_RUN_DIR (per-container, wiped on `cleat rm`/recreate), this is keyed by
@@ -311,12 +315,19 @@ _read_keypress() {
   if [[ "$key" == $'\e' ]]; then
     # Read the rest of the escape sequence in one call.
     # Arrow keys send \e[A/B/C/D. Read up to 2 chars with a timeout.
+    # Only a BARE Escape (nothing follows) is ESC. Every unrecognized
+    # sequence (PgUp \e[5~, F-keys, Home/End) must be OTHER: mapping the
+    # unknown to ESC made any stray arrow or function key close the
+    # pickers, because the TUI loops treat ESC as cancel.
     local seq=""
     IFS= read -rsn2 -t 1 seq 2>/dev/null || true
     case "$seq" in
       "[A") echo "UP" ;;
       "[B") echo "DOWN" ;;
-      *)    echo "ESC" ;;
+      "[C") echo "RIGHT" ;;
+      "[D") echo "LEFT" ;;
+      "")   echo "ESC" ;;
+      *)    echo "OTHER" ;;
     esac
   elif [[ "$key" == " " ]]; then
     echo "SPACE"
@@ -1736,7 +1747,7 @@ _kit_agent_model() {
 _kit_description() {
   case "$1" in
     plan-big-execute-small)
-      echo "Run your session on Fable 5: it plans and reviews while cheaper workers (Sonnet 5 by default) execute and scout. Flagship judgment on the plan and every review, most tokens billed at the worker model's rate, so multi-file work burns your rate limit far slower. Adapted from Anthropic's plan-big-execute-small cookbook pattern."
+      echo "Run your session on Fable 5: it plans and reviews while worker and scout subagents (Sonnet 5 by default) execute and explore, each in its own context window so the main session stays lean. Flagship judgment on the plan and every review, the mechanical bulk billed at the worker model's rate, so heavy work burns your rate limit far slower. Adapted from Anthropic's coordinator-pattern cookbook."
       ;;
   esac
 }
@@ -1746,6 +1757,18 @@ _kit_description() {
 # user's knob is /model inside the session, so name it at the moment they
 # are about to start one. Claude Code saves /model as the default for new
 # sessions, so this is a one-time step, not a ritual.
+# One dim provenance line for the confirm screen. The full URL is long, so
+# it lives in `cleat kit show`; this line says where the pattern comes from
+# and where to read it. Same claim discipline as _kit_description.
+_kit_reference_line() {
+  case "$1" in
+    plan-big-execute-small)
+      echo -e "  ${DIM}Pattern from Anthropic's cookbook: big models for planning,${RESET}"
+      echo -e "  ${DIM}small models for execution. Link: cleat kit show $1${RESET}"
+      ;;
+  esac
+}
+
 _kit_post_enable_hint() {
   case "$1" in
     plan-big-execute-small)
@@ -7372,6 +7395,8 @@ _kit_enable() {
   echo ""
   _kit_description "$kit" | fold -s -w 66 | sed 's/^/  /'
   echo ""
+  _kit_reference_line "$kit"
+  echo ""
   echo -e "  This kit adds, ${BOLD}inside the box only${RESET}:"
   _kit_confirm_lines "$kit"
   echo ""
@@ -7519,6 +7544,27 @@ _kit_next_model() {
   echo "${_KIT_MODEL_CHOICES[0]}"
 }
 
+# Previous model in the picker cycle: the exact reverse of _kit_next_model's
+# ring (stock choices, then the custom pin if one exists).
+_kit_prev_model() {
+  local current="$1" custom="$2"
+  local n=${#_KIT_MODEL_CHOICES[@]} i
+  for ((i = 0; i < n; i++)); do
+    if [[ "${_KIT_MODEL_CHOICES[$i]}" == "$current" ]]; then
+      if [[ $i -gt 0 ]]; then
+        echo "${_KIT_MODEL_CHOICES[$((i - 1))]}"
+      elif [[ -n "$custom" ]]; then
+        echo "$custom"
+      else
+        echo "${_KIT_MODEL_CHOICES[$((n - 1))]}"
+      fi
+      return 0
+    fi
+  done
+  # current IS the custom value (or unknown): wrap to the last stock choice.
+  echo "${_KIT_MODEL_CHOICES[$((n - 1))]}"
+}
+
 # ── Interactive kit picker (mirrors _config_picker_tui / _config_picker_text) ─
 
 # Screen 1 rows: every known kit + "none". Radio marker on the current
@@ -7544,20 +7590,46 @@ _kit_picker_draw() {
     fi
     i=$((i + 1))
   done
+  # Detail pane: what the cursored kit actually is, so nobody has to enable
+  # one to find out. Fixed height (_KIT_PANE_LINES) keeps the redraw math
+  # constant; short content pads with cleared blanks.
+  printf '\033[2K'
+  echo ""
+  local pane_text
+  if [[ "${rows[$cursor]}" == "none" ]]; then
+    pane_text="Your own Claude config, exactly as you set it up. Kits merge on top and never replace it; switch back here any time."
+  else
+    pane_text="$(_kit_description "${rows[$cursor]}")"
+  fi
+  local printed=0 line
+  while IFS= read -r line; do
+    [[ $printed -ge $_KIT_PANE_LINES ]] && break
+    printf '\033[2K'
+    echo -e "    ${DIM}${line}${RESET}"
+    printed=$((printed + 1))
+  done << PANE_EOF
+$(echo "$pane_text" | fold -s -w 60)
+PANE_EOF
+  while [[ $printed -lt $_KIT_PANE_LINES ]]; do
+    printf '\033[2K'
+    echo ""
+    printed=$((printed + 1))
+  done
 }
 
 # Screen 2 rows: worker + scout with their effective models.
 _kit_models_draw() {
   local cursor="$1" worker="$2" scout="$3"
+  # Chevrons on the active row advertise that ←/→ cycles the model.
   printf '\033[2K'
   if [[ $cursor -eq 0 ]]; then
-    echo -e "  ${CYAN}▸${RESET} worker  ${BOLD}${worker}${RESET}  ${DIM}(executes implementation chunks)${RESET}"
+    echo -e "  ${CYAN}▸${RESET} worker  ${BOLD}‹ ${worker} ›${RESET}  ${DIM}(executes implementation chunks)${RESET}"
   else
     echo -e "    worker  ${worker}  ${DIM}(executes implementation chunks)${RESET}"
   fi
   printf '\033[2K'
   if [[ $cursor -eq 1 ]]; then
-    echo -e "  ${CYAN}▸${RESET} scout   ${BOLD}${scout}${RESET}  ${DIM}(read-only exploration)${RESET}"
+    echo -e "  ${CYAN}▸${RESET} scout   ${BOLD}‹ ${scout} ›${RESET}  ${DIM}(read-only exploration)${RESET}"
   else
     echo -e "    scout   ${scout}  ${DIM}(read-only exploration)${RESET}"
   fi
@@ -7589,7 +7661,7 @@ _kit_models_tui() {
   tput civis 2>/dev/null || true
   _kit_models_draw "$cursor" "$worker" "$scout"
   echo ""
-  echo -e "  ${DIM}↑/↓ navigate  ␣ cycle model  ⏎ enable kit  q cancel${RESET}"
+  echo -e "  ${DIM}↑/↓ navigate  ←/→ change model  ⏎ enable kit  q cancel${RESET}"
   printf '\033[%dA' 4
 
   while true; do
@@ -7598,11 +7670,18 @@ _kit_models_tui() {
     case "$key" in
       UP)   [[ $cursor -gt 0 ]] && cursor=0 ;;
       DOWN) [[ $cursor -lt 1 ]] && cursor=1 ;;
-      SPACE)
+      RIGHT|SPACE)
         if [[ $cursor -eq 0 ]]; then
           worker="$(_kit_next_model "$worker" "$worker_custom")"
         else
           scout="$(_kit_next_model "$scout" "$scout_custom")"
+        fi
+        ;;
+      LEFT)
+        if [[ $cursor -eq 0 ]]; then
+          worker="$(_kit_prev_model "$worker" "$worker_custom")"
+        else
+          scout="$(_kit_prev_model "$scout" "$scout_custom")"
         fi
         ;;
       ENTER)
@@ -7643,12 +7722,14 @@ _kit_picker_tui() {
   echo ""
 
   local rows=$(( ${#KNOWN_KITS[@]} + 1 ))
+  # The redraw block is the rows plus the detail pane (and its separator).
+  local block=$(( rows + 1 + _KIT_PANE_LINES ))
   local cursor=0
   tput civis 2>/dev/null || true
   _kit_picker_draw "$cursor" "$selected"
   echo ""
-  echo -e "  ${DIM}↑/↓ navigate  ⏎ select  q cancel${RESET}"
-  printf '\033[%dA' "$((rows + 2))"
+  echo -e "  ${DIM}↑/↓ navigate  ⏎/→ select  q cancel${RESET}"
+  printf '\033[%dA' "$((block + 2))"
 
   while true; do
     local key
@@ -7656,9 +7737,9 @@ _kit_picker_tui() {
     case "$key" in
       UP)   [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
       DOWN) [[ $cursor -lt $((rows - 1)) ]] && cursor=$((cursor + 1)) ;;
-      ENTER)
+      ENTER|RIGHT)
         tput cnorm 2>/dev/null || true
-        printf '\033[%dB' "$((rows + 2))"
+        printf '\033[%dB' "$((block + 2))"
         printf '\033[2K'
         if [[ $cursor -eq $((rows - 1)) ]]; then
           echo ""
@@ -7672,7 +7753,7 @@ _kit_picker_tui() {
         ;;
       QUIT|ESC)
         tput cnorm 2>/dev/null || true
-        printf '\033[%dB' "$((rows + 2))"
+        printf '\033[%dB' "$((block + 2))"
         printf '\033[2K'
         echo ""
         info "Cancelled."
@@ -7680,7 +7761,7 @@ _kit_picker_tui() {
         ;;
     esac
     _kit_picker_draw "$cursor" "$selected"
-    printf '\033[%dA' "$rows"
+    printf '\033[%dA' "$block"
   done
 }
 
@@ -7703,6 +7784,9 @@ _kit_picker_text() {
   for k in "${KNOWN_KITS[@]}"; do
     [[ "$selected" == "$k" ]] && marker="${GREEN}●${RESET}" || marker="${DIM}○${RESET}"
     echo -e "    ${marker} ${BOLD}${k}${RESET}"
+    _kit_description "$k" | fold -s -w 60 | sed "s/^/      /" | while IFS= read -r _dl; do
+      echo -e "${DIM}${_dl}${RESET}"
+    done
   done
   [[ -z "$selected" ]] && marker="${GREEN}●${RESET}" || marker="${DIM}○${RESET}"
   echo -e "    ${marker} none ${DIM}(your own config, no kit)${RESET}"
@@ -7784,6 +7868,11 @@ _kit_show() {
     sed 's/^/  /' "$f"
   done
   rm -rf "$tmp"
+  if [[ "$kit" == "plan-big-execute-small" ]]; then
+    echo ""
+    echo -e "  ${DIM}Adapted from Anthropic's coordinator-pattern cookbook:${RESET}"
+    echo "  https://github.com/anthropics/claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb"
+  fi
 }
 
 # ── Version & Update ──────────────────────────────────────────────────────

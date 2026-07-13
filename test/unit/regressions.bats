@@ -2513,3 +2513,32 @@ SCRIPT
     assert_success
   done
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.0: _read_keypress mapped every unrecognized escape sequence to the same
+# case as a bare Escape key: ESC. Arrow-key variants it didn't decode (only
+# UP/DOWN were handled) and every other escape sequence (PgUp \e[5~, PgDn,
+# Home, End, F-keys) all fell through to ESC. Both the kit picker and the
+# caps picker's event loops treat ESC as "cancel with nothing written", so a
+# stray right-arrow while cycling a model, or PgUp/PgDn muscle memory, closed
+# the picker outright. Fix: decode \e[C/\e[D as RIGHT/LEFT, and return OTHER
+# (not ESC) for any other escape sequence; only a BARE escape (nothing
+# follows the \e) is still ESC.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.2.0: stray arrows and unknown escape sequences never cancel the pickers" {
+  run _read_keypress <<< $'\033[C'
+  assert_success
+  assert_output "RIGHT"
+
+  run _read_keypress <<< $'\033[D'
+  assert_success
+  assert_output "LEFT"
+
+  run _read_keypress <<< $'\033[A'
+  assert_success
+  assert_output "UP"
+
+  run _read_keypress <<< $'\033[5~'
+  assert_success
+  assert_output "OTHER"
+}

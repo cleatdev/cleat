@@ -573,6 +573,14 @@ EOF
   assert_output "plan-big-execute-small"
 }
 
+@test "kit: enable confirm screen credits the Anthropic pattern" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  run cmd_kit plan-big-execute-small <<< "y"
+  assert_success
+  assert_output --partial "Pattern from Anthropic's cookbook"
+}
+
 @test "kit: enable defaults to yes on empty confirm" {
   mock_docker_ps ""
   mock_docker_ps_a ""
@@ -693,6 +701,12 @@ EOF
   assert_output --partial "planner"
 }
 
+@test "kit: kit show prints the cookbook reference" {
+  run cmd_kit show plan-big-execute-small
+  assert_success
+  assert_output --partial "claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb"
+}
+
 @test "kit: cmd_kit list shows the library and this project's selections" {
   _box_kit_write "$CNAME" "plan-big-execute-small"
   local dev_cname
@@ -777,12 +791,26 @@ EOF
   [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
 }
 
+@test "kit: text picker lists kit descriptions" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  run _kit_picker_text <<< "q"
+  assert_success
+  assert_output --partial "Flagship judgment"
+}
+
 @test "kit: picker draw marks the selected kit and the cursor row" {
   run _kit_picker_draw 0 "plan-big-execute-small"
   assert_output --partial "▸"
   assert_output --partial "●"
   assert_output --partial "plan-big-execute-small"
   assert_output --partial "none"
+}
+
+@test "kit: picker detail pane shows the cursored kit description" {
+  run _kit_picker_draw 0 ""
+  assert_output --partial "its own context window"
+  assert_output --partial "coordinator-pattern cookbook"
 }
 
 @test "kit: models draw shows both roles with their models" {
@@ -804,6 +832,15 @@ EOF
   assert_output "claude-sonnet-5"
   run _kit_next_model claude-sonnet-5 "claude-sonnet-5"
   assert_output "sonnet"
+}
+
+@test "kit: reverse model cycle mirrors the forward ring" {
+  run _kit_prev_model sonnet ""
+  assert_output "inherit"
+  run _kit_prev_model haiku ""
+  assert_output "sonnet"
+  run _kit_prev_model sonnet "claude-sonnet-5"
+  assert_output "claude-sonnet-5"
 }
 
 # ── Interactive TUI event loops (F32; driven via the _read_keypress seam) ─────
@@ -834,6 +871,19 @@ _tui_keys() {   # usage: _tui_keys ENTER SPACE ENTER   (last arg = the over-read
   assert_output "plan-big-execute-small"
 }
 
+@test "kit: TUI picker RIGHT selects like ENTER" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  # RIGHT stands in for the real \033[C sequence _read_keypress now decodes
+  # (regression v1.2.0): screen 1's row select accepts RIGHT same as ENTER.
+  _tui_keys RIGHT ENTER
+  run _kit_picker_tui
+  assert_success
+  assert_output --partial "enabled for box"
+  run _box_kit_read "$CNAME"
+  assert_output "plan-big-execute-small"
+}
+
 @test "kit: TUI models SPACE cycles the worker model and saves it to the RIGHT role" {
   mock_docker_ps ""
   mock_docker_ps_a ""
@@ -844,6 +894,34 @@ _tui_keys() {   # usage: _tui_keys ENTER SPACE ENTER   (last arg = the over-read
   run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits worker_model
   assert_output "haiku"
   # scout untouched (swap-guard: worker override must not land as scout_model)
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits scout_model
+  assert_output ""
+}
+
+@test "kit: TUI models RIGHT cycles the worker model like SPACE" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  # ENTER (pick kit) → RIGHT (cursor 0 = worker: sonnet→haiku) → ENTER (save)
+  # RIGHT stands in for the real \033[C sequence (regression v1.2.0).
+  _tui_keys ENTER RIGHT ENTER
+  run _kit_picker_tui
+  assert_success
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits worker_model
+  assert_output "haiku"
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits scout_model
+  assert_output ""
+}
+
+@test "kit: TUI models LEFT cycles the model backwards" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  # ENTER (pick kit) → LEFT (cursor 0 = worker: sonnet→inherit, no custom
+  # pin so the ring wraps to the last stock choice) → ENTER (save)
+  _tui_keys ENTER LEFT ENTER
+  run _kit_picker_tui
+  assert_success
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits worker_model
+  assert_output "inherit"
   run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits scout_model
   assert_output ""
 }
@@ -866,6 +944,23 @@ _tui_keys() {   # usage: _tui_keys ENTER SPACE ENTER   (last arg = the over-read
   run _kit_picker_tui
   assert_success
   assert_output --partial "Cancelled"
+  [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
+}
+
+@test "kit: TUI picker survives PgUp without cancelling" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  # OTHER stands in for an unrecognized escape sequence like PgUp (\033[5~),
+  # which _read_keypress now decodes as OTHER, not ESC (regression v1.2.0).
+  # The picker loop has no case for OTHER, so it must be a no-op, not a
+  # cancel: only the trailing QUIT should produce "Cancelled.".
+  _tui_keys OTHER QUIT QUIT
+  run _kit_picker_tui
+  assert_success
+  assert_output --partial "Cancelled."
+  local cancel_count
+  cancel_count="$(grep -c "Cancelled\." <<< "$output")"
+  [ "$cancel_count" -eq 1 ]
   [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
 }
 

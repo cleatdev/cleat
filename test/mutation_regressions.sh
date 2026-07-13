@@ -2582,6 +2582,32 @@ s|tools: Read, Edit, Write, Grep, Glob, Bash|tools: Bash|
 SED
 try "vnext_kit_worker_tools_pin" "tool-pinned to executor tools" "$CLI" "$KITS_BATS"
 
+# ── 2026-07-13 picker keypress decode fix ────────────────────────────────────
+# RIGHT ARROW DECODE: \e[C must decode as RIGHT, not ESC. Reverting the
+# branch to ESC recreates the bug where a stray right-arrow closed both TUI
+# pickers outright (their event loops treat ESC as cancel).
+cat > "$SED_TMP" << 'SED'
+s|"\[C") echo "RIGHT" ;;|"[C") echo "ESC" ;;|
+SED
+try "v1.2.0_keypress_right_not_esc" "never cancel the pickers"
+
+# UNKNOWN ESCAPE SEQUENCES: any unrecognized sequence (PgUp \e[5~, PgDn,
+# Home, End, F-keys) must decode as OTHER, not ESC. Mapping the wildcard
+# case back to ESC recreates the same picker-closing bug for every key the
+# reader doesn't otherwise know.
+cat > "$SED_TMP" << 'SED'
+s|\*)    echo "OTHER" ;;|*)    echo "ESC" ;;|
+SED
+try "v1.2.0_keypress_unknown_not_esc" "never cancel the pickers"
+
+# REVERSE MODEL RING: _kit_prev_model must step to the PREVIOUS stock choice
+# (i - 1), not the next one. Flipping the arithmetic makes LEFT behave like
+# RIGHT: the reverse-cycle assertions fail.
+cat > "$SED_TMP" << 'SED'
+s|echo "\${_KIT_MODEL_CHOICES\[\$((i - 1))\]}"|echo "\${_KIT_MODEL_CHOICES\[\$((i + 1))\]}"|
+SED
+try "vnext_kit_prev_model_reverse" "reverse model cycle" "$CLI" "$KITS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

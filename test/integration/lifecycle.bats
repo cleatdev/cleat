@@ -230,10 +230,11 @@ EOF
   run "$CLI" run
   assert_success
 
-  # Inside the box: user content first, kit section appended.
+  # Inside the box: user content first, then box notes, kit section appended.
   run docker exec "$cname" head -1 /home/coder/.claude/CLAUDE.md
   assert_output "MY GLOBAL RULES"
   run docker exec "$cname" cat /home/coder/.claude/CLAUDE.md
+  assert_output --partial "Cleat box notes"
   assert_output --partial "Cleat kit: plan-big-execute-small"
 
   # Agents: the user's own beside the kit's.
@@ -256,11 +257,15 @@ EOF
   [ ! -e "$HOME/.claude/agents/kit-worker.md" ]
 
   # `kit off` regenerates in place: the RUNNING container's bind (same inode)
-  # shows the vanilla view immediately, no restart.
+  # drops the kit section immediately, no restart. The box notes remain: they
+  # ride every composed CLAUDE.md, kit or not.
   run bash -c "'$CLI' kit off"
   assert_success
-  run docker exec "$cname" cat /home/coder/.claude/CLAUDE.md
+  run docker exec "$cname" head -1 /home/coder/.claude/CLAUDE.md
   assert_output "MY GLOBAL RULES"
+  run docker exec "$cname" cat /home/coder/.claude/CLAUDE.md
+  refute_output --partial "Cleat kit:"
+  assert_output --partial "Cleat box notes"
   run docker exec "$cname" ls /home/coder/.claude/agents
   refute_output --partial "kit-worker.md"
 

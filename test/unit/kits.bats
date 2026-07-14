@@ -126,11 +126,52 @@ teardown() { _common_teardown; }
   assert_output --partial "have scout locate it, then read the located code yourself"
 }
 
+@test "kit: fragment separates errored dispatches from bad results" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "re-dispatch the same chunk unchanged"
+  assert_output --partial "never absorb its work"
+}
+
+@test "kit: fragment demands premise verification before dispatching workers" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "Plan from scout's findings, not from memory"
+  assert_output --partial "verify it before you dispatch workers"
+}
+
+@test "kit: fragment teaches dispatch craft and chunk sizing" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "A dispatch names the files"
+  assert_output --partial "Prefer fewer, larger chunks"
+}
+
+@test "kit: fragment dispatches workers sequentially, parallel is banned" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
+  assert_output --partial "Never launch several workers in one"
+  assert_output --partial "parallel dispatch has scrambled briefs and clobbered files"
+  refute_output --partial "in parallel when independent"
+}
+
 @test "kit: worker agent is tool-pinned to executor tools" {
   _box_kit_write "$CNAME" "plan-big-execute-small"
   _generate_kit_overlay "$CNAME"
   run cat "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md"
   assert_output --partial "tools: Read, Edit, Write, Grep, Glob, Bash"
+}
+
+@test "kit: worker report opens with a status and keeps large diffs out" {
+  _box_kit_write "$CNAME" "plan-big-execute-small"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/agents/kit-worker.md"
+  assert_output --partial "Open the report with a status"
+  assert_output --partial "for a large change, per-file line ranges and one line per"
 }
 
 @test "kit: vanilla box keeps user content first and gets no kit marker" {
@@ -233,6 +274,16 @@ teardown() { _common_teardown; }
   assert_output --partial "worker"
 }
 
+@test "kit: collision warning says the kit policy steers the user agent" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  mkdir -p "$HOME/.claude/agents"
+  printf -- '---\nname: worker\n---\nmine\n' > "$HOME/.claude/agents/my-worker.md"
+  run cmd_kit plan-big-execute-small <<< "y"
+  assert_success
+  assert_output --partial "its model and tools apply, not the kit's"
+}
+
 @test "kit: unknown selection name degrades to vanilla instead of failing" {
   echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"
   _box_kit_write "$CNAME" "no-such-kit"
@@ -327,6 +378,14 @@ EOF
   assert_success
   assert_output --partial "worker (model: haiku)"
   assert_output --partial "your session's model"
+}
+
+@test "kit: confirm screen scopes the scout read-only claim to contract" {
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  run cmd_kit plan-big-execute-small <<< "n"
+  assert_success
+  assert_output --partial "read-only by contract"
 }
 
 @test "kit: kit show reflects the overridden models" {
@@ -737,6 +796,13 @@ EOF
   run cmd_kit show plan-big-execute-small
   assert_success
   assert_output --partial "claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb"
+}
+
+@test "kit: kit show prints the usage verification note" {
+  run cmd_kit show plan-big-execute-small
+  assert_success
+  assert_output --partial "Verify it is routing"
+  assert_output --partial "means delegation is not happening"
 }
 
 @test "kit: cmd_kit list shows the library and this project's selections" {

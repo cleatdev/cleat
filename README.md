@@ -14,7 +14,7 @@ Run AI coding agents with full autonomous permissions, safely sandboxed in Docke
 One command. Per-project isolation. Your host stays untouched.
 
 <p align="center">
-  <img src="assets/cleat-demo.gif" alt="A real Claude Code session inside a Cleat box: credential probes come up empty, the agent deletes the box's own OS on purpose, and the host machine (SSH keys, files) is untouched" width="800">
+  <img src="assets/cleat-demo.gif" alt="A real Claude Code session inside a Cleat box: credential probes come up empty, the agent deletes the box's own OS on purpose and the host machine (SSH keys, files) is untouched" width="800">
 </p>
 <p align="center">
   <sub>A real session, not a mockup: Claude Code hunts for keys, finds nothing, then <code>rm -rf</code>'s the box's own OS. The host doesn't notice.</sub>
@@ -28,7 +28,7 @@ curl -fsSL https://cleat.sh/install | bash
 cd ~/your-project && cleat
 ```
 
-That's it. First run pulls the prebuilt image from GHCR (~30s), starts an isolated container for your project, and drops you into Claude Code with full permissions, all sandboxed. If the prebuilt image is unavailable for your CLI version, it falls back to a local build (~2 min) automatically.
+That's it. First run pulls the prebuilt image from GHCR (~30s), starts an isolated container for your project and drops you into Claude Code with full permissions, all sandboxed. If the prebuilt image is unavailable for your CLI version, it falls back to a local build (~2 min) automatically.
 
 ```
 ┌─────────────────────┐      ┌─────────────────────────────────┐
@@ -43,7 +43,7 @@ That's it. First run pulls the prebuilt image from GHCR (~30s), starts an isolat
 └─────────────────────┘      └─────────────────────────────────┘
 ```
 
-**Stay updated:** Watch → Custom → Releases on this repo, and upgrade any time with `cleat update`.
+**Stay updated:** Watch → Custom → Releases on this repo and upgrade any time with `cleat update`.
 
 ---
 
@@ -86,15 +86,15 @@ Cleat gives you the best of both worlds:
 
 ### Key features
 
-- **One command** -- `cleat` pulls (or builds) the image, starts a container, and launches Claude Code
+- **One command** -- `cleat` pulls (or builds) the image, starts a container and launches Claude Code
 - **Per-project isolation** -- each project gets its own container, run multiple projects in parallel
 - **Session persistence** -- stop and resume sessions without losing context, each project's history is isolated
 - **Safe for unattended use** -- let Claude work overnight without risking your system
 - **Zero file permission issues** -- container user matches your host UID/GID automatically
 - **Shared auth** -- log in once, all containers use the same credentials
-- **Clipboard support** -- `pbcopy`, `xclip`, and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
-- **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq, and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), and host Docker daemon for testing dockerized apps (`--cap docker`); all disabled by default
+- **Clipboard support** -- `pbcopy`, `xclip` and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
+- **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq and socat
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`) and host Docker daemon for testing dockerized apps (`--cap docker`). All disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
@@ -110,13 +110,13 @@ Cleat gives you the best of both worlds:
 
 I was deep into vibe coding, letting Claude Code run with `--dangerously-skip-permissions` so it could ship without interrupting my flow. Kick off a task, step away, come back to working code. Multiple projects on my Mac, sometimes left running overnight through a big refactor.
 
-The campfire version of the story is that one night it went rogue and bricked my Mac. The honest version is scarier, because it actually happens. The hardware was never in danger -- Apple sealed the OS so thoroughly that not even root can modify `/System` in place, and any Mac you can boot into Internet Recovery or DFU you can bring back. What an agent running with no gates can actually destroy is everything that *isn't* the OS. It runs as *you*.
+The campfire version of the story is that one night it went rogue and bricked my Mac. The honest version is scarier, because it actually happens. The hardware was never in danger -- Apple sealed the OS so thoroughly that not even root can modify `/System` in place. Any Mac you can boot into Internet Recovery or DFU you can bring back. What an agent running with no gates can actually destroy is everything that *isn't* the OS. It runs as *you*.
 
-So it installs packages system-wide and litters configs across your home directory until the machine you keep clean is quietly rotting. It reads `~/.ssh`, `~/.aws`, your `.npmrc` tokens, and your `.env` files -- and it can commit or deploy those secrets straight to the internet. That one isn't hypothetical for us: one night an agent wired up a deploy and an API key rode along into a public static deployment. Nothing was "hacked" -- it was running as us, it had the key, it shipped it. Public keys get scraped and abused in minutes, not days, and providers rarely refund fraud on technically-valid requests. By the time we rotated it, roughly $10,000 was already gone.
+So it installs packages system-wide and litters configs across your home directory until the machine you keep clean is quietly rotting. It reads `~/.ssh`, `~/.aws`, your `.npmrc` tokens and your `.env` files -- and it can commit or deploy those secrets straight to the internet. That one isn't hypothetical for us: one night an agent wired up a deploy and an API key rode along into a public static deployment. Nothing was "hacked" -- it was running as us, it had the key, it shipped it. Public keys get scraped and abused in minutes, not days. Providers rarely refund fraud on technically-valid requests. By the time we rotated it, roughly $10,000 was already gone.
 
-And one bad glob ends the rest: developers have wiped entire home folders with a trailing `~/` on an `rm -rf`, where the shell expands the tilde to your whole home directory *after* the agent's own check passes. On a Mac's internal SSD, TRIM is on by default, so the freed blocks are discarded and the per-file encryption key is destroyed within seconds. No undo. No undelete. Only your last backup, if you had one. Gemini CLI destroyed a user's project files the same way; Replit's agent dropped a production database. These are not hypotheticals -- they are documented, and all within the last year. Data and credentials die. The hardware survives them.
+And one bad glob ends the rest: developers have wiped entire home folders with a trailing `~/` on an `rm -rf`, where the shell expands the tilde to your whole home directory *after* the agent's own check passes. On a Mac's internal SSD, TRIM is on by default, so the freed blocks are discarded and the per-file encryption key is destroyed within seconds. No undo. No undelete. Only your last backup, if you had one. Gemini CLI destroyed a user's project files the same way. Replit's agent dropped a production database. These are not hypotheticals -- they are documented and all within the last year. Data and credentials die. The hardware survives them.
 
-You can defend the host by hand: never run `--dangerously-skip-permissions` on your machine, never give the agent passwordless sudo, never pre-approve broad globs like `Bash(sudo *)` or `Bash(*)`, and keep real backups. That is a lot of discipline to maintain on every project, forever, at 2am.
+You can defend the host by hand: never run `--dangerously-skip-permissions` on your machine, never give the agent passwordless sudo, never pre-approve broad globs like `Bash(sudo *)` or `Bash(*)` and keep real backups. That is a lot of discipline to maintain on every project, forever, at 2am.
 
 So I built Cleat. Same unrestricted power, but inside a per-project Docker sandbox where, by default, the blast radius stops at the container. Your host system stays untouched. Capabilities -- ssh, git, env, gh, docker -- are all off until you opt in. Claude can `rm -rf /` inside the container and the rest of your Mac won't even notice. Give the agent a cage, not your keys.
 
@@ -132,7 +132,7 @@ We haven't leaked a key, lost a home folder, or restored from a backup since.
 curl -fsSL https://cleat.sh/install | bash
 ```
 
-This clones the repo to `~/.cleat`, checks out the latest stable release tag, and symlinks `cleat` into your PATH. The short URL resolves to the same `install.sh` served from the latest tagged release on GitHub.
+This clones the repo to `~/.cleat`, checks out the latest stable release tag and symlinks `cleat` into your PATH. The short URL resolves to the same `install.sh` served from the latest tagged release on GitHub.
 
 ### Dev install (from local clone)
 
@@ -162,7 +162,7 @@ cleat upgrade-claude 2.1.156    # pin a version
 
 This re-runs the official installer in the image and commits it back, then offers to recreate the current project's container so the new version takes effect immediately. The change is local-only. `cleat rebuild`/`update`/`nuke` reset the image to a fresh release build (which already bundles a current Claude Code).
 
-You don't have to remember to run it: when you start `cleat` interactively, it checks (at most once every 10 minutes) whether a newer Claude Code is out and offers to upgrade before starting. The check is skipped for non-interactive runs, never blocks on a slow network, defaults to the `latest` channel (`CLEAT_CLAUDE_CHANNEL=stable` to change it), and can be turned off with `CLEAT_NO_CLAUDE_UPDATE_CHECK=1`.
+You don't have to remember to run it: when you start `cleat` interactively, it checks (at most once every 10 minutes) whether a newer Claude Code is out and offers to upgrade before starting. The check is skipped for non-interactive runs, never blocks on a slow network, defaults to the `latest` channel (`CLEAT_CLAUDE_CHANNEL=stable` to change it) and can be turned off with `CLEAT_NO_CLAUDE_UPDATE_CHECK=1`.
 
 To rebuild the whole image from scratch instead:
 
@@ -259,8 +259,8 @@ cleat ps
 
 A **box** is a named, isolated container scoped to the current directory. Every
 box mounts the **same** live files, but each has its own capabilities, writable
-layer, and Claude session, so a locked-down `dev` box can run beside a
-cloud-capable `az` box over the same repo, and the agent in `dev` can't reach the
+layer and Claude session, so a locked-down `dev` box can run beside a
+cloud-capable `az` box over the same repo. The agent in `dev` can't reach the
 Docker socket or cloud token that `az` holds.
 
 ```bash
@@ -293,7 +293,7 @@ session stays lean. Flagship judgment on the plan
 and every review, the mechanical bulk billed at the worker model's rate, so
 heavy work burns your rate limit far slower. Prefer different economics? Pin or swap the agent
 models under a `[kits]` section in `~/.config/cleat/config`
-(`worker_model = haiku`); the planner is always your session's model.
+(`worker_model = haiku`). The planner is always your session's model.
 
 ```bash
 cleat kit                              # interactive picker: kit, then models
@@ -303,24 +303,24 @@ cleat kit off                          # back to your own config next session
 cleat kit show plan-big-execute-small  # read every line it injects, first
 ```
 
-A kit merges on top of your own config inside the box (your global CLAUDE.md
-and agents keep working; the kit section is appended and clearly marked, after
-a `Cleat box notes` section every box carries with the clipboard-bridge rules)
-and its content stays off the host: kits live in generated mask files mounted
-into the box, nothing kit-related lands in your `~/.claude`, and native
-`claude` never sees them. (Creating a box does seed inert placeholders there
+A kit merges on top of your own config inside the box, so your global
+CLAUDE.md and agents keep working: the kit section is appended and clearly
+marked, after a `Cleat box notes` section every box carries with the
+clipboard-bridge rules. Its content stays off the host: kits live in generated
+mask files mounted into the box, nothing kit-related lands in your `~/.claude`
+and native `claude` never sees them. (Creating a box does seed inert placeholders there
 when missing, an empty `CLAUDE.md` and empty `agents`/`commands` dirs: mount
 targets, not content.) Different boxes can run different kits on the same
-repo. Kits contain instructions and subagents only, no hooks and no settings,
-and whatever they steer the agent to do happens inside the cage. As a
+repo. Kits contain instructions and subagents only, no hooks and no settings.
+Whatever they steer the agent to do happens inside the cage. As a
 hardening side effect, your three user-level instruction surfaces
-(`~/.claude/CLAUDE.md`, `agents`, and `commands`) are mounted read-only in
+(`~/.claude/CLAUDE.md`, `agents` and `commands`) are mounted read-only in
 every box: the agent reads them but can't plant a host-user-level command or
 agent that your host `claude` would later obey. Author those at project level
 (`.claude/agents/`, `.claude/commands/`) instead. The read-only copies
 dereference symlinks (a dotfile-repo `commands` dir shows up as real files in
 the box), a broken symlink at one of the three paths stops box create with a
-clear fix-or-remove error (your symlink is never deleted), and a box created
+clear fix-or-remove error (your symlink is never deleted) and a box created
 before these masks existed prints a recreate note on every start until you
 run `cleat rm && cleat`.
 
@@ -340,9 +340,9 @@ run `cleat rm && cleat`.
 | `cleat stop-all` | Stop all Cleat containers |
 | `cleat build` | Build the Docker image |
 | `cleat rebuild` | Force rebuild the image from scratch |
-| `cleat upgrade-claude [stable\|latest\|VERSION]` | Update the bundled Claude Code in place (default `latest`); offers to recreate the current container |
+| `cleat upgrade-claude [stable\|latest\|VERSION]` | Update the bundled Claude Code in place (default `latest`). Offers to recreate the current container |
 | `cleat clean` | Stop everything and remove the image |
-| `cleat nuke` | Remove **all** containers, images, and build cache |
+| `cleat nuke` | Remove **all** containers, images and build cache |
 
 #### Capabilities
 | Command | Description |
@@ -352,7 +352,7 @@ run `cleat rm && cleat`.
 | `cleat config --enable <cap>` | Enable a capability (e.g. `git`, `ssh`, `env`) |
 | `cleat config --disable <cap>` | Disable a capability |
 | `cleat config --project --enable <cap>` | Project-level config (saved to `.cleat`) |
-| `cleat config <box> --enable <cap>` | Per-box config (saved to `.cleat.<box>`; replaces `.cleat` for that box) |
+| `cleat config <box> --enable <cap>` | Per-box config (saved to `.cleat.<box>`, replaces `.cleat` for that box) |
 
 #### Workspace trust
 | Command | Description |
@@ -366,7 +366,7 @@ run `cleat rm && cleat`.
 |---|---|
 | `cleat kit` | Interactive picker: pick a kit, then its agent models (TUI, like `cleat config`) |
 | `cleat kit list` | Plain kit library and this project's selections |
-| `cleat kit <name> [box]` | Enable a kit for a box (merges on top of your config; next session) |
+| `cleat kit <name> [box]` | Enable a kit for a box (merges on top of your config, next session) |
 | `cleat kit off [box]` | Disable the box's kit (back to your own config) |
 | `cleat kit show <name>` | Print everything a kit injects |
 
@@ -378,7 +378,7 @@ run `cleat rm && cleat`.
 | `--env KEY` | Inherit from host environment |
 | `--env-file PATH` | Load env vars from file |
 | `--trust-project` | Auto-approve the current project's `.cleat` without prompting |
-| `--desc <text>` | Set the box's description at start (host-side; never recreates) |
+| `--desc <text>` | Set the box's description at start (host-side, never recreates) |
 
 #### Interact
 | Command | Description |
@@ -391,8 +391,8 @@ run `cleat rm && cleat`.
 #### Info
 | Command | Description |
 |---|---|
-| `cleat status` | Show this project's boxes, image, and auth status |
-| `cleat describe [box] [text]` | Show or set a box's description (host-side; never recreates) |
+| `cleat status` | Show this project's boxes, image and auth status |
+| `cleat describe [box] [text]` | Show or set a box's description (host-side, never recreates) |
 | `cleat ps` | List all Cleat containers (running and stopped, with a box column) |
 | `cleat update` | Check for updates and install the latest version |
 | `cleat version` | Show current version |
@@ -442,7 +442,7 @@ named sandbox for the project (default: `main`). See **Boxes** above.
 
 ### What happens when you run `cleat`
 
-1. **Pulls or builds the Docker image** (first run only) -- pulls pre-built image from registry (~30s), falls back to local build if unavailable. Image includes Node.js, Python, Git, GitHub CLI, jq, socat, and Claude Code CLI
+1. **Pulls or builds the Docker image** (first run only) -- pulls pre-built image from registry (~30s), falls back to local build if unavailable. Image includes Node.js, Python, Git, GitHub CLI, jq, socat and Claude Code CLI
 2. **Starts a container** named `cleat-<dirname>-<hash>` (hash derived from the full project path) with your project mounted at `/workspace`
 3. **Maps your UID/GID** into the container so files created by Claude are owned by you on the host
 4. **Mounts `~/.claude`** for shared authentication across all containers
@@ -454,20 +454,20 @@ named sandbox for the project (default: `main`). See **Boxes** above.
 Containers run with these protections by default:
 
 - `--pids-limit 4096` -- prevents fork bombs from affecting the host
-- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 4-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Override with a `[resources]` section (`memory = 4g`, optionally `cpus = 2`) in `~/.config/cleat/config` or `<project>/.cleat`; repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing. If a session is ever OOM-killed (often a test runner spawning one worker per host core), Cleat says so and how to fix it: raise `memory`, cap workers (`jest --maxWorkers=2`), or set `cpus`
+- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 4-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Override with a `[resources]` section (`memory = 4g`, optionally `cpus = 2`) in `~/.config/cleat/config` or `<project>/.cleat`. Repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing. If a session is ever OOM-killed (often a test runner spawning one worker per host core), Cleat says so and how to fix it: raise `memory`, cap workers (`jest --maxWorkers=2`), or set `cpus`
 - `--init` -- a real PID 1 reaps orphaned processes, so long sessions can't wedge on zombie buildup and `cleat stop` is instant
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
 - Node.js bookworm-slim base image with minimal attack surface
 
-Images are published multi-arch (amd64 + arm64): Apple Silicon runs natively, never under emulation. `cleat prune` clears cleat's own stale images (cleat also offers this automatically when they pile up); boxes and other projects' images are never touched.
+Images are published multi-arch (amd64 + arm64): Apple Silicon runs natively, never under emulation. `cleat prune` clears cleat's own stale images (cleat also offers this automatically when they pile up). Boxes and other projects' images are never touched.
 
-Closing a terminal ends the session but leaves the box running, still reserving its memory ceiling. On every interactive start, Cleat stops other idle boxes that are safe to stop (detached, no agent running, idle past a 30-minute grace) and tells you what it freed. A box working unattended (terminal left open, agent still running) is never touched. Disable with `CLEAT_NO_IDLE_SWEEP=1`; tune the grace with `CLEAT_IDLE_GRACE_MINS`.
+Closing a terminal ends the session but leaves the box running, still reserving its memory ceiling. On every interactive start, Cleat stops other idle boxes that are safe to stop (detached, no agent running, idle past a 30-minute grace) and tells you what it freed. A box working unattended (terminal left open, agent still running) is never touched. Disable with `CLEAT_NO_IDLE_SWEEP=1`. Tune the grace with `CLEAT_IDLE_GRACE_MINS`.
 
 ---
 
 ## Capabilities
 
-Capabilities are opt-in features that extend what the container can access from the host. They are **disabled by default**: the baseline container is locked down, and each capability explicitly widens the boundary.
+Capabilities are opt-in features that extend what the container can access from the host. They are **disabled by default**: the baseline container is locked down and each capability explicitly widens the boundary.
 
 ### Enable capabilities
 
@@ -493,7 +493,7 @@ cleat --cap ssh start
 | `env` | mount | Auto-loads env vars from `~/.config/cleat/env` (global) and `.cleat.env` (project). |
 | `hooks` | mount | Runs your Claude Code hooks on the host (global and project-level). |
 | `gh` | mount | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
-| `docker` | sandbox | Mounts `/var/run/docker.sock`. `docker`, `docker compose`, and anything that talks to the daemon run against your host: sibling containers, zero overhead. **Sandbox-escaping. See security note below.** |
+| `docker` | sandbox | Mounts `/var/run/docker.sock`. `docker`, `docker compose` and anything that talks to the daemon run against your host: sibling containers, zero overhead. **Sandbox-escaping. See security note below.** |
 
 > Cloud CLI caps (`az`, `aws`, `gcloud`) and the lazy-install framework that backed them shipped in v0.11.0 / v0.12.0 and were removed after v0.12.3. They bloated first-run time without earning their weight. Install the CLI on the host and pass credentials via the `env` cap.
 
@@ -561,7 +561,7 @@ cleat untrust ~/proj         # remove a project's trust entry
 
 ### Docker capability: testing dockerized apps
 
-When `docker` is enabled, the container mounts the host Docker socket and can build, run, and manage containers against the **host** daemon. Containers you launch from inside Cleat run as **siblings** on the host (not nested), so there's zero virtualization overhead:
+When `docker` is enabled, the container mounts the host Docker socket and can build, run and manage containers against the **host** daemon. Containers you launch from inside Cleat run as **siblings** on the host (not nested), so there's zero virtualization overhead:
 
 ```bash
 cleat config --enable docker        # persistent
@@ -584,7 +584,7 @@ The `CLEAT_HOST_PROJECT` environment variable is exported with your project's ho
 >   ! Docker socket mounted. Container can create host-level processes
 > ```
 >
-> Enable this capability only in projects you trust, and disable it when you don't need it. It's off by default and every activation is explicit (`cleat config --enable docker` or `--cap docker`).
+> Enable this capability only in projects you trust and disable it when you don't need it. It's off by default and every activation is explicit (`cleat config --enable docker` or `--cap docker`).
 
 Known limitations in v0.10.0:
 - Literal `/workspace/…` paths in `-v` aren't translated. Docker errors cleanly that the source doesn't exist. Use `$(pwd)` or the host path instead.
@@ -592,18 +592,18 @@ Known limitations in v0.10.0:
 
 ### Docker autopilot
 
-Daemon down after a reboot? Run `cleat` and it starts Docker for you (Docker
-Desktop, OrbStack, or Colima on macOS, named Colima profiles included; Docker
-Desktop or a rootless engine on Linux via `systemctl --user`; the Windows-side
-Docker Desktop from WSL2 when interop is enabled), waits with a spinner, then
-continues your command. Where it can't start Docker safely it prints the
+Daemon down after a reboot? Run `cleat` and it starts Docker for you, waits
+with a spinner, then continues your command. On macOS that means Docker
+Desktop, OrbStack, or Colima (named Colima profiles included), on Linux Docker
+Desktop or a rootless engine via `systemctl --user`, from WSL2 the
+Windows-side Docker Desktop when interop is enabled. Where it can't start Docker safely it prints the
 exact fix instead: a root-owned Linux engine (or an in-distro engine inside
 WSL2, which wins over the Windows Desktop) gets `sudo systemctl start docker`,
 a socket you can't write means Docker is up and you're not in the `docker`
-group (the message hands you `sudo usermod -aG docker <user>`), and a remote
+group (the message hands you `sudo usermod -aG docker <user>`) and a remote
 endpoint (`tcp://`, `ssh://`, `npipe://`, `fd://`) is refused with "start it
 where it runs". Fires only on session verbs and only in an interactive
-terminal, so scripts and CI are untouched; the wait is bounded
+terminal, so scripts and CI are untouched. The wait is bounded
 (`CLEAT_AUTOSTART_TIMEOUT_SECS`, default 90s) and `CLEAT_NO_AUTOSTART=1`
 turns it off.
 
@@ -613,7 +613,7 @@ packages (casks for Desktop/OrbStack, formulae for Colima, with the licensing
 difference stated), on Linux Docker's official install script downloaded to a
 private temp dir and run under sudo only after you say yes, on WSL2 the
 Windows-side Desktop via winget. The exact command is always shown, the
-default is No, and scripts are never prompted.
+default is No and scripts are never prompted.
 
 ### Environment variables
 
@@ -641,7 +641,7 @@ When you change **capabilities or env keys** after a container was created, Clea
 
 Accepting removes the container and rebuilds it with the new caps/env. Sessions persist on the host (`~/.claude/projects/<key>/`) and are never touched. Declining keeps the existing container.
 
-A Cleat version bump on its own does **not** trigger this: the drift check looks only at caps and env keys. Image freshness is handled separately and is also content-aware: the on-start image-refresh prompt fires only when the image's actual contents change (the entrypoint, the clipboard or browser bridge, the Dockerfile, or the pinned base), not on every version bump. The base image is pinned by digest, so a routine release leaves your container and everything you installed in it untouched, and a base or security update ships through the same refresh prompt.
+A Cleat version bump on its own does **not** trigger this: the drift check looks only at caps and env keys. Image freshness is handled separately and is also content-aware: the on-start image-refresh prompt fires only when the image's actual contents change (the entrypoint, the clipboard or browser bridge, the Dockerfile, or the pinned base), not on every version bump. The base image is pinned by digest, so a routine release leaves your container and everything you installed in it untouched. A base or security update ships through the same refresh prompt.
 
 Non-TTY runs (CI, scripts) print the notice and continue with the existing container. They never auto-destroy.
 
@@ -704,7 +704,7 @@ cleat --cap hooks start        # enable for one session
 2. Project-level hook settings are also overlaid to prevent double-execution
 3. A host-side bridge reads forwarded events and executes the original hook commands on the host
 4. Event JSON is piped to stdin, matchers are respected, 30s timeout per command
-5. Commands like `osascript`, local scripts, and anything host-specific work transparently
+5. Commands like `osascript`, local scripts and anything host-specific work transparently
 
 ---
 
@@ -712,13 +712,13 @@ cleat --cap hooks start        # enable for one session
 
 When Claude Code or any tool inside the container calls `open` or `xdg-open` with a URL, it opens in your host browser. OAuth callbacks are automatically proxied back to the container. `cleat login` and any auth flow work seamlessly without manual URL copy-paste. No capability needed.
 
-**One click, one tab.** Your terminal already opens a clicked link itself, so on an interactive terminal the bridge defers plain links to it and opens via the bridge only what the terminal won't: auth/OAuth-callback URLs and non-interactive runs. Clicking a link opens a single tab, on any terminal. Override with `CLEAT_BROWSER_BRIDGE=always` (open every URL through the bridge) or `off` (never auto-open; the login callback proxy still runs).
+**One click, one tab.** Your terminal already opens a clicked link itself, so on an interactive terminal the bridge defers plain links to it and opens via the bridge only what the terminal won't: auth/OAuth-callback URLs and non-interactive runs. Clicking a link opens a single tab, on any terminal. Override with `CLEAT_BROWSER_BRIDGE=always` (open every URL through the bridge) or `off` (never auto-open, the login callback proxy still runs).
 
 ---
 
 ## Host connectivity
 
-Containers can always reach services on the host via `host.docker.internal`. No capability needed. User-defined hooks, MCP servers, and HTTP endpoints on the host work out of the box.
+Containers can always reach services on the host via `host.docker.internal`. No capability needed. User-defined hooks, MCP servers and HTTP endpoints on the host work out of the box.
 
 ```bash
 # In .cleat.env (with env capability enabled)
@@ -753,7 +753,7 @@ Clipboard works out of the box. When Claude Code (or any tool) calls `pbcopy`, `
 
 ### How it works
 
-A host-side clipboard watcher starts automatically alongside every Claude Code session. The container writes clipboard data to a shared file via a bind mount, and the watcher detects changes and copies the content to your real clipboard using `pbcopy` (macOS), `xclip`, `xsel`, or `wl-copy` (Linux).
+A host-side clipboard watcher starts automatically alongside every Claude Code session. The container writes clipboard data to a shared file via a bind mount. The watcher detects changes and copies the content to your real clipboard using `pbcopy` (macOS), `xclip`, `xsel`, or `wl-copy` (Linux).
 
 ```
 ┌─────────────────────────────┐      ┌──────────────────────────────┐

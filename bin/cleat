@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.2.3"
+VERSION="1.2.4"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="1.2.3"
+RELEASE_HIGHLIGHT_VERSION="1.2.4"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -1805,7 +1805,7 @@ _kit_confirm_lines() {
       local _w _s
       _w="$(_kit_agent_model worker sonnet)"
       _s="$(_kit_agent_model scout sonnet)"
-      echo -e "    ${DIM}agents${RESET}     worker (model: ${_w}), scout (model: ${_s}, read-only)"
+      echo -e "    ${DIM}agents${RESET}     worker (model: ${_w}), scout (model: ${_s}, read-only by contract)"
       echo -e "    ${DIM}CLAUDE.md${RESET}  a delegation policy section (appended, yours stays)"
       echo -e "    ${DIM}planner${RESET}    your session's model, not changed by the kit"
       ;;
@@ -1839,13 +1839,22 @@ You are the planner in a plan-big / execute-small team.
 
 - For any task with real mechanical editing (multi-file, or a sizable
   change within one file): write the plan first, then dispatch each
-  self-contained chunk to the `worker` agent, one at a time or in
-  parallel when independent.
+  self-contained chunk to the `worker` agent, one at a time. Dispatch,
+  review, then dispatch the next. Never launch several workers in one
+  message; parallel dispatch has scrambled briefs and clobbered files.
+  A dispatch names the files, the exact change, the constraints, and
+  the test to run; the worker executes, it does not re-derive context.
+  Prefer fewer, larger chunks; every dispatch pays a fixed overhead.
 - Review every worker result before dispatching the next dependent chunk.
   If a result is wrong or incomplete, dispatch a corrected chunk instead
-  of fixing it yourself. You own integration and the final review.
+  of fixing it yourself. If a dispatch fails with an error instead of a
+  report, re-dispatch the same chunk unchanged; never absorb its work
+  into the main loop. You own integration and the final review.
 - Use the `scout` agent for all code exploration (call sites, structure,
   impact, the research behind a plan); never search in the main loop.
+  Plan from scout's findings, not from memory: when a premise decides
+  the plan's shape (a call-site list, an assumed behavior), have scout
+  verify it before you dispatch workers.
   When the judgment is in the raw code itself (a subtle bug, a delicate
   refactor), have scout locate it, then read the located code yourself.
 - `worker` and `scout` are the only subagents you dispatch. Built-in
@@ -1888,10 +1897,13 @@ You execute exactly the task you are given, nothing more.
   stop and report the blocker instead of improvising.
 - Match the surrounding code style. Run the narrowest relevant test if
   one is named in the dispatch.
-- Report back: what changed (files and line ranges), the diff of your
-  changes, test results distilled to pass or fail plus the failing
-  cases, and anything the planner must know. Never paste full logs or
-  files you only read.
+- Open the report with a status: done as dispatched, done with
+  deviations (name them), partial (what remains), or blocked (why).
+- Report back: what changed (files and line ranges), the diff when it
+  is short (for a large change, per-file line ranges and one line per
+  change; the planner reviews with git diff), test results distilled
+  to pass or fail plus the failing cases, and anything the planner
+  must know. Never paste full logs or files you only read.
 KIT_EOF
       cat > "$dest/agents/kit-scout.md" << KIT_FM
 ---
@@ -7389,6 +7401,7 @@ _kit_apply() {
       if [[ -n "$_kn" && "$_un" == *" $_kn "* ]]; then
         warn "You already have an agent named ${BOLD}${_kn}${RESET}. Yours wins."
         echo -e "    ${DIM}The kit's ${_kn} is skipped, so dispatch to that name uses your agent.${RESET}"
+        echo -e "    ${DIM}The kit's policy now steers your agent: its model and tools apply, not the kit's.${RESET}"
       fi
     done
     rm -rf "$_ck_tmp"
@@ -7405,7 +7418,7 @@ _kit_apply() {
 
   success "Kit ${BOLD}${kit}${RESET} enabled for box ${BOLD}${box}${RESET}."
   if container_exists "$cname" && _box_has_live_agent "$cname"; then
-    echo -e "    ${DIM}A session is live in this box; the kit applies from the next session.${RESET}"
+    echo -e "    ${DIM}A session is live in this box. The kit applies from the next session.${RESET}"
   else
     echo -e "    ${DIM}Takes effect next session: ${BOLD}cleat${RESET}"
   fi
@@ -7903,6 +7916,10 @@ _kit_show() {
     echo ""
     echo -e "  ${DIM}Adapted from Anthropic's coordinator-pattern cookbook:${RESET}"
     echo "  https://github.com/anthropics/claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb"
+    echo ""
+    echo -e "  ${DIM}Verify it is routing: after a heavy session, /usage should show the${RESET}"
+    echo -e "  ${DIM}bulk of tokens on the worker model. Only your session model there${RESET}"
+    echo -e "  ${DIM}means delegation is not happening.${RESET}"
   fi
 }
 

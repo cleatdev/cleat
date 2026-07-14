@@ -2582,6 +2582,76 @@ s|tools: Read, Edit, Write, Grep, Glob, Bash|tools: Bash|
 SED
 try "vnext_kit_worker_tools_pin" "tool-pinned to executor tools" "$CLI" "$KITS_BATS"
 
+# ── vnext plan-big-execute-small payload additions ───────────────────────────
+# ERROR HANDLING: a dispatch that errors out must be re-dispatched unchanged,
+# never quietly absorbed into the main loop. Flip the guidance to silent
+# absorption: the errored-dispatch assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|re-dispatch the same chunk unchanged|quietly do the chunk yourself|
+SED
+try "vnext_kit_fragment_error_redispatch" "errored dispatches" "$CLI" "$KITS_BATS"
+
+# PREMISE VERIFICATION: the plan must be built from scout's verified findings,
+# not from memory. Invert the guidance: the premise-verification assertion
+# fails.
+cat > "$SED_TMP" << 'SED'
+s|Plan from scout's findings, not from memory|Plan from memory, not from scout's findings|
+SED
+try "vnext_kit_fragment_premise_verify" "premise verification" "$CLI" "$KITS_BATS"
+
+# DISPATCH CRAFT: chunks should be fewer and larger, not many and small (every
+# dispatch pays a fixed overhead). Reverse the sizing advice: the dispatch
+# craft assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|Prefer fewer, larger chunks|Prefer many small chunks|
+SED
+try "vnext_kit_fragment_dispatch_craft" "dispatch craft" "$CLI" "$KITS_BATS"
+
+# SEQUENTIAL DISPATCH: workers are dispatched one at a time; parallel dispatch
+# scrambled briefs and clobbered files in two recorded incidents (upstream
+# issues #64080, #68080, #64095 unfixed). Restore the old parallel permission:
+# the sequential-dispatch assertions fail.
+cat > "$SED_TMP" << 'SED'
+s|one at a time. Dispatch,|one at a time or in|
+s|review, then dispatch the next. Never launch several workers in one|parallel when independent. Review results as they arrive and|
+s|message; parallel dispatch has scrambled briefs and clobbered files.|batch further chunks freely.|
+SED
+try "vnext_kit_fragment_sequential_dispatch" "workers sequentially" "$CLI" "$KITS_BATS"
+
+# WORKER REPORT STATUS: the worker's report must open with a status (done as
+# dispatched, done with deviations, partial, or blocked). Reword the opening:
+# the report-status assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|Open the report with a status|Give a quick status|
+SED
+try "vnext_kit_worker_report_status" "report opens with a status" "$CLI" "$KITS_BATS"
+
+# CONFIRM SCREEN SCOUT CONTRACT: the confirm screen must scope the scout's
+# read-only claim to "by contract", not state it as a bare, unscoped fact.
+# "read-only by contract" is a unique string in bin/cleat (verified), so
+# dropping the qualifier cannot collide with any other occurrence.
+cat > "$SED_TMP" << 'SED'
+s|read-only by contract|read-only|
+SED
+try "vnext_kit_confirm_scout_contract" "read-only claim to contract" "$CLI" "$KITS_BATS"
+
+# COLLISION POLICY NOTE: when a user agent shadows a kit agent, the warning
+# must say the kit's policy still steers the user's agent (its model and
+# tools apply, not the kit's). Drop that line: the policy-note assertion
+# fails.
+cat > "$SED_TMP" << 'SED'
+/its model and tools apply/d
+SED
+try "vnext_kit_collision_policy_note" "kit policy steers" "$CLI" "$KITS_BATS"
+
+# USAGE VERIFICATION NOTE: `kit show` must tell the user how to verify
+# delegation actually happened (check /usage after a heavy session). Reword
+# the prompt: the usage-verification assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|Verify it is routing|Confirm it works|
+SED
+try "vnext_kit_show_usage_note" "usage verification note" "$CLI" "$KITS_BATS"
+
 # ── 2026-07-13 picker keypress decode fix ────────────────────────────────────
 # RIGHT ARROW DECODE: \e[C must decode as RIGHT, not ESC. Reverting the
 # branch to ESC recreates the bug where a stray right-arrow closed both TUI

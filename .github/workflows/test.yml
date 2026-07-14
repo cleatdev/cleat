@@ -38,10 +38,16 @@ jobs:
         run: shellcheck --severity=error --shell=bash install.sh
 
   # ── Full test suite on Linux ──────────────────────────────────────────────
+  # Suite and mutation output goes to a file, then cat. The runner holds a step
+  # open until every process sharing its output pipe exits, so a single test
+  # straggler (a backgrounded watcher losing a kill race) used to stall the
+  # step for minutes after the suite passed; a 2026-07-14 run blew the job
+  # timeout that way with the suite green. A straggler holding a plain file
+  # blocks nobody. Costs live streaming, buys deterministic step exit.
   test-linux:
     name: test (ubuntu, bash 5.x)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,9 +55,13 @@ jobs:
       - name: Bash version
         run: bash --version
       - name: Run full BATS suite
-        run: ./test.sh
+        run: |
+          rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/suite.log"; exit "$rc"
       - name: Mutation test the regression registry
-        run: ./test/mutation_regressions.sh
+        run: |
+          rc=0; ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/mutation.log"; exit "$rc"
 
   # ── Full test suite on macOS via /bin/bash (bash 3.2, catches bash 4+ bugs) ─
   # macOS ships both /bin/bash (Apple's 3.2.57, unchanged since 2009 due to the
@@ -68,7 +78,12 @@ jobs:
   test-macos-bash32:
     name: test (macos, bash 3.2)
     runs-on: macos-15
-    timeout-minutes: 20
+    # 30, not 20: on 2026-07-14 a run was cancelled with the suite green and the
+    # mutation harness mid-flight. Suite (~10 min on the macOS runner) plus the
+    # 290-entry harness (~10 min) had outgrown 20; v1.2.2's run finished 19s
+    # under the wire. File-redirected steps (see test-linux) reclaim the
+    # straggler dead-air too.
+    timeout-minutes: 30
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -eo pipefail {0}
@@ -101,9 +116,13 @@ jobs:
           echo "=== locale ==="
           locale 2>&1 || true
       - name: Run full BATS suite via /bin/bash
-        run: /bin/bash ./test.sh
+        run: |
+          rc=0; /bin/bash ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/suite.log"; exit "$rc"
       - name: Mutation test the regression registry via /bin/bash
-        run: /bin/bash ./test/mutation_regressions.sh
+        run: |
+          rc=0; /bin/bash ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/mutation.log"; exit "$rc"
 
   # ── Integration tests against real Docker (Linux only, runners have it) ──
   test-integration:

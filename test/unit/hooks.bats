@@ -1479,9 +1479,16 @@ SCRIPT
   local bw_marker="$TEST_TEMP/login-bw-started"
   _browser_watcher() {
     echo "$1 $2 $3" > "$bw_marker"
-    sleep 60 &
-    local pid=$!
-    trap "kill $pid 2>/dev/null; exit 0" TERM
+    # Trap BEFORE forking: cmd_login's kill can land before a later trap line
+    # registers, and the default TERM disposition would end this function and
+    # orphan the sleep. The orphan inherits bats' output pipes and stalls the
+    # file for the full 60s (and can hold the CI step open past its timeout).
+    # Detaching the sleep's stdio is the second belt: even a lost race then
+    # holds nothing.
+    local pid=""
+    trap 'kill "$pid" 2>/dev/null; exit 0' TERM
+    sleep 60 >/dev/null 2>&1 3>&- &
+    pid=$!
     wait $pid
   }
   _host_open_cmd() { echo "true"; }
@@ -1512,9 +1519,10 @@ SCRIPT
   local bw_args="$TEST_TEMP/login-bw-args"
   _browser_watcher() {
     echo "$5" > "$bw_args"          # the host_opens_clicks argument
-    sleep 60 &
-    local pid=$!
-    trap "kill $pid 2>/dev/null; exit 0" TERM
+    local pid=""
+    trap 'kill "$pid" 2>/dev/null; exit 0' TERM
+    sleep 60 >/dev/null 2>&1 3>&- &
+    pid=$!
     wait $pid
   }
   _host_open_cmd() { echo "true"; }
@@ -1528,9 +1536,10 @@ SCRIPT
   is_running() { return 0; }
   require_running() { true; }
   _browser_watcher() {
-    sleep 60 &
-    local pid=$!
-    trap "kill $pid 2>/dev/null; exit 0" TERM
+    local pid=""
+    trap 'kill "$pid" 2>/dev/null; exit 0' TERM
+    sleep 60 >/dev/null 2>&1 3>&- &
+    pid=$!
     wait $pid
   }
   _host_open_cmd() { echo "true"; }
@@ -1546,9 +1555,10 @@ SCRIPT
   is_running() { return 0; }
   require_running() { true; }
   _browser_watcher() {
-    sleep 60 &
-    local pid=$!
-    trap "kill $pid 2>/dev/null; exit 0" TERM
+    local pid=""
+    trap 'kill "$pid" 2>/dev/null; exit 0' TERM
+    sleep 60 >/dev/null 2>&1 3>&- &
+    pid=$!
     wait $pid
   }
   _host_open_cmd() { echo "true"; }
@@ -1568,12 +1578,14 @@ SCRIPT
   local bw_killed="$TEST_TEMP/login-bw-killed2"
   _browser_watcher() {
     touch "$bw_started"
-    sleep 60 &
-    local pid=$!
     # Kill the backgrounded sleep inside the trap (like the success-path test
     # above). Leaving it orphaned keeps the `run` output pipe open for the full
-    # 60s, turning a fast assertion into a 60s stall.
-    trap "touch '$bw_killed'; kill $pid 2>/dev/null; exit 0" TERM
+    # 60s, turning a fast assertion into a 60s stall. Trap first, stdio
+    # detached: see the first cmd_login mock.
+    local pid=""
+    trap "touch '$bw_killed'; kill \"\$pid\" 2>/dev/null; exit 0" TERM
+    sleep 60 >/dev/null 2>&1 3>&- &
+    pid=$!
     wait "$pid"
   }
   _host_open_cmd() { echo "true"; }

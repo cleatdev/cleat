@@ -2591,8 +2591,7 @@ SCRIPT
   _clipboard_watcher "$clip_dir" "cat >> '$TEST_TEMP/copied'" >/dev/null 2>&1 &
   local pid=$!
   sleep 2
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_watcher "$pid" "$clip_dir"
 
   [ ! -f "$TEST_TEMP/copied" ] || { echo "REGRESSION: stale payload was redelivered to the host clipboard"; return 1; }
   [ ! -f "$clip_dir/clipboard" ] || { echo "REGRESSION: stale payload survived watcher startup"; return 1; }
@@ -2615,9 +2614,87 @@ SCRIPT
   _clipboard_watcher "$clip_dir" "cat >> '$TEST_TEMP/copied'" >/dev/null 2>&1 &
   local pid=$!
   sleep 2
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_watcher "$pid" "$clip_dir"
 
   [ ! -f "$TEST_TEMP/copied" ] || { echo "REGRESSION: future-dated leftover was redelivered"; return 1; }
   [ ! -f "$clip_dir/clipboard" ] || { echo "REGRESSION: future-dated leftover survived watcher startup"; return 1; }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.5: on hosts with inotify-tools (or fswatch), _cleanup_session's plain
+# `kill` on the clipboard watcher never reached the blocking inotifywait
+# child: bash defers a subprocess's own TERM trap while it sits blocked in a
+# foreground command, so the watcher (and inotifywait under it) survived
+# cleanup as an orphan. Fix: cleanup also kills the watcher's blocking child
+# (pkill -P) before waiting, which reaps it for real.
+#
+# NOTE on how this is verified: exec_claude disowns the watcher PID right
+# after spawning it, and bash's `wait` on an already-disowned PID returns
+# immediately whether or not the process has actually exited (confirmed by
+# hand: it returns in the same tick, before or after the fix). So this test
+# does NOT assert on `_cleanup_session` returning quickly, since it always
+# does. The mutation-sensitive signal, confirmed empirically both ways, is
+# whether inotifywait is still alive afterward: with the fix it is killed
+# outright; without it, it (and the watcher shell wrapping it) are orphaned
+# and linger. That leftover process is the real-world symptom (it keeps
+# holding the run dir/terminal open), so this is what the test checks.
+#
+# This test only bites where inotifywait exists (the Linux CI leg installs
+# it); elsewhere the polling fallback never had the leak and the test skips.
+#
+# It calls the REAL exec_claude (production code, not a copy) in a helper
+# process, which defines and runs the REAL _cleanup_session. A slow-motion
+# docker stub delays only the final `docker exec -it ...` launch call, giving
+# the clipboard watcher exec_claude spawns time to actually enter its
+# blocking inotifywait read before cleanup runs, so this reproduces the real
+# race instead of a same-tick race that would pass either way.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.2.5: session cleanup reaps a watcher blocked in inotifywait" {
+  command -v inotifywait >/dev/null 2>&1 || skip "inotifywait not installed"
+  local cname="cleanup-hang-ctr"
+  # The REAL clip dir exec_claude will compute for this cname: CLEAT_RUN_DIR
+  # resolves from HOME (isolated to $TEST_TEMP/home by _common_setup), so this
+  # must match _CLIP_DIR="$CLEAT_RUN_DIR/${cname}/clip", not a throwaway dir,
+  # or the straggler check below silently watches the wrong path.
+  local clip_dir="$HOME/.config/cleat/run/${cname}/clip"
+
+  mkdir -p "$TEST_TEMP/shim"
+  cat > "$TEST_TEMP/shim/docker" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "exec" ]; then
+  case " \$* " in
+    *" -it "*) sleep 1 ;;
+  esac
+fi
+exec "$MOCK_BIN/docker" "\$@"
+EOF
+  chmod +x "$TEST_TEMP/shim/docker"
+
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  # Only _host_clip_cmd/_host_open_cmd are stubbed, to spawn just the clipboard
+  # watcher (with a harmless "true" clip command) and skip the browser
+  # watcher/hook bridge, which are out of scope here.
+  cat > "$TEST_TEMP/cleanup_spawner.sh" <<EOF
+export PATH="$TEST_TEMP/shim:\$PATH"
+source "$TEST_TEMP/cli_stripped"
+_host_clip_cmd() { echo "true"; }
+_host_open_cmd() { echo ""; }
+exec_claude "$cname" --dangerously-skip-permissions >/dev/null 2>&1
+EOF
+
+  # Bounded regardless: _cleanup_session's wait on this (disowned) watcher
+  # PID never actually blocks, so the helper always returns quickly. The
+  # timeout below is just a safety net against an unrelated wedge.
+  _portable_timeout 15 bash "$TEST_TEMP/cleanup_spawner.sh"
+
+  # Give a straggler inotifywait a brief moment to actually be reaped (or
+  # not) before checking; the fix kills it synchronously inside cleanup, so
+  # this is generous, not load-bearing.
+  sleep 0.3
+
+  if pgrep -f "inotifywait.*$clip_dir" >/dev/null 2>&1; then
+    echo "REGRESSION: session cleanup left the clipboard watcher's inotifywait running" >&2
+    pkill -9 -f "inotifywait.*$clip_dir" 2>/dev/null || true
+    return 1
+  fi
 }

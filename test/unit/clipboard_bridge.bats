@@ -20,8 +20,7 @@ teardown() { _common_teardown; }
   _clipboard_watcher "$clip_dir" "true" &
   local pid=$!
   sleep 0.2
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_watcher "$pid" "$clip_dir"
 
   [[ -f "$clip_dir/.host-ready" ]]  || return 1
 }
@@ -63,8 +62,7 @@ EOF
   echo "fresh-copy" > "$TEST_TEMP/payload"
   mv "$TEST_TEMP/payload" "$clip_dir/clipboard"
   sleep 2
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_watcher "$pid" "$clip_dir"
 
   run cat "$TEST_TEMP/copied"
   assert_success
@@ -89,8 +87,7 @@ EOF
   echo "payload" > "$TEST_TEMP/payload"
   mv "$TEST_TEMP/payload" "$clip_dir/clipboard"
   sleep 2
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_watcher "$pid" "$clip_dir"
 
   run cat "$TEST_TEMP/copied"
   assert_success

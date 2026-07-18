@@ -1445,6 +1445,14 @@ s|mv "\$clip_dir/clipboard" "\$claim" 2>/dev/null \|\| return 0|cat "\$clip_dir/
 SED
 try "v1.2.5_clipboard_consume_on_read" "consumes the payload" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
 
+# v1.2.5: on hosts with inotify-tools/fswatch, _cleanup_session's plain kill
+# never reaches the watcher's blocking child, so it (and inotifywait under
+# it) survive as an orphan. Drop the pkill -P step that kills it directly.
+cat > "$SED_TMP" << 'SED'
+s|pkill -P "\$_CLIP_WATCHER_PID" 2>/dev/null \|\| true|true|
+SED
+try "v1.2.5_cleanup_watcher_child_kill" "reaps a watcher" "$CLI" "$REGRESSIONS"
+
 # vnext: an orphaned hook bridge must exit BEFORE processing late events
 # (host hooks for a dead session). Drop the loop-top check: the orphan-bridge
 # test fails.

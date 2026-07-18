@@ -107,6 +107,23 @@ process_exited() {
   return 1
 }
 
+# Stop a backgrounded _clipboard_watcher without hanging the test: a TERM to
+# the watcher subshell is deferred while it sits blocked in inotifywait or
+# fswatch, so kill the blocking watch tool (scoped to the watched dir) right
+# after signalling, then reap. Polling-mode watchers need only the kill+wait.
+# The wait is gated on process_exited so a watcher that survives the reap (a
+# box with the watch tools but no pkill) skips the wait instead of blocking;
+# the teardown sweep catches the straggler.
+stop_watcher() {
+  local pid="$1" dir="$2"
+  kill "$pid" 2>/dev/null || true
+  pkill -f "inotifywait.*$dir" 2>/dev/null || true
+  pkill -f "fswatch.*$dir" 2>/dev/null || true
+  if process_exited "$pid"; then
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
 # Portable timeout: GNU timeout on Linux, perl alarm on macOS.
 # Available to all test files via setup.bash.
 _portable_timeout() {
@@ -124,6 +141,12 @@ _common_teardown() {
   # Restore real HOME so later tests in the same process don't accidentally
   # inherit the isolated home
   [[ -n "${_REAL_HOME:-}" ]] && HOME="$_REAL_HOME"
+  # Reap any watch tool a test (or a code path under test, e.g. exec_claude's
+  # real watcher) left blocked on this test's temp dir: a deferred TERM never
+  # lands while inotifywait/fswatch blocks, and the straggler holds bats' fd
+  # and hangs the file. Scoped to TEST_TEMP so nothing else is touched.
+  pkill -f "inotifywait.*$TEST_TEMP" 2>/dev/null || true
+  pkill -f "fswatch.*$TEST_TEMP" 2>/dev/null || true
   rm -rf "$TEST_TEMP"
 }
 

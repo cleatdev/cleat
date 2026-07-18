@@ -52,6 +52,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Install inotify-tools (exercise the inotifywait watcher branch)
+        # The Linux leg runs the suite with inotifywait present so the event
+        # branch of _clipboard_watcher is really executed; the macOS leg has
+        # neither inotifywait nor fswatch and keeps covering the polling
+        # fallback. Together the matrix exercises both watch paths.
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools
       - name: Bash version
         run: bash --version
       - name: Run full BATS suite

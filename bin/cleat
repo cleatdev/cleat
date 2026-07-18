@@ -4183,6 +4183,15 @@ exec_claude() {
     # Kill clipboard watcher
     if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
       kill "$_CLIP_WATCHER_PID" 2>/dev/null || true
+      # A TERM is deferred while the watcher sits blocked in its foreground
+      # inotifywait/fswatch (bash runs traps only after the foreground
+      # command returns), and the wait below cannot reap it (the watcher was
+      # disowned at spawn, so wait returns at once). Without killing the
+      # blocking child too, the watcher and its inotifywait outlive the
+      # session as orphans that exit only on the next clipboard event, if
+      # ever. Harmless in the polling fallback (the child is at worst a
+      # sleep). No-op where pkill is absent.
+      pkill -P "$_CLIP_WATCHER_PID" 2>/dev/null || true
       wait "$_CLIP_WATCHER_PID" 2>/dev/null || true
       _CLIP_WATCHER_PID=""
     fi

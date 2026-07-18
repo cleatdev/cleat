@@ -52,6 +52,54 @@ EOF
   [ ! -f "$TEST_TEMP/copied" ] || { echo "orphan watcher copied a dead session's clipboard"; return 1; }
 }
 
+@test "_clipboard_watcher delivers a fresh copy once and consumes the payload" {
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir"
+
+  _clipboard_watcher "$clip_dir" "cat >> '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 0.3
+  # Deliver a clipboard write the way the box shim does (mv → fires moved_to)
+  echo "fresh-copy" > "$TEST_TEMP/payload"
+  mv "$TEST_TEMP/payload" "$clip_dir/clipboard"
+  sleep 2
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  run cat "$TEST_TEMP/copied"
+  assert_success
+  assert_output "fresh-copy"
+  # Delivered means claimed: the payload must not remain on disk for a later
+  # session's watcher to replay.
+  [ ! -f "$clip_dir/clipboard" ] || { echo "payload not consumed on delivery"; return 1; }
+}
+
+@test "_clipboard_watcher claims live outside the .clipboard.* cleanup namespace" {
+  # Every session's exit sweep runs rm -f on .clipboard.* in the SHARED clip
+  # dir, so a claim named inside that namespace can be deleted by a sibling
+  # session exiting mid-delivery (the copy is silently lost). The claim must
+  # live under .claim.* instead. The snoop clip command records the claim
+  # path at the moment of delivery, while the claim file exists.
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir"
+
+  _clipboard_watcher "$clip_dir" "ls '$clip_dir'/.claim.* >> '$TEST_TEMP/claims-seen' 2>/dev/null; cat > '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 0.3
+  echo "payload" > "$TEST_TEMP/payload"
+  mv "$TEST_TEMP/payload" "$clip_dir/clipboard"
+  sleep 2
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  run cat "$TEST_TEMP/copied"
+  assert_success
+  assert_output "payload"
+  [ -s "$TEST_TEMP/claims-seen" ] || { echo "no .claim.* file existed at delivery time (claim is misnamed)"; return 1; }
+  run grep -c "/\.claim\." "$TEST_TEMP/claims-seen"
+  assert_success
+}
+
 # ── _cleanup_clipboard ──────────────────────────────────────────────────────
 
 @test "cleanup removes session marker" {

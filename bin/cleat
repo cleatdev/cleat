@@ -3403,11 +3403,56 @@ _clipboard_watcher() {
   # single copy choke point so all three watch modes are covered.
   local _cw_parent=$$
 
+  # Remove any payload left over from an earlier session before advertising
+  # readiness. A leftover means no watcher claimed it (teardown race, or a
+  # crash that skipped cleanup); replaying it now would shove a dead
+  # session's copy over whatever the user currently has on the host
+  # clipboard (the stale-redelivery bug). Age-gated like the browser
+  # bridge's startup sweep: concurrent watchers share this dir, and a FRESH
+  # file is a live copy a sibling is about to claim, so only a file older
+  # than several poll ticks is a true leftover. A NEGATIVE age (mtime ahead
+  # of the clock after a backward clock step) also sweeps: failing toward
+  # "never replay old bytes into the clipboard" is this bridge's safe
+  # direction. _path_mtime returns 0 on failure, which reads as ancient and
+  # still gets swept, so unreadable files fail safe too.
+  local leftover_age
+  if [ -f "$clip_dir/clipboard" ]; then
+    leftover_age=$(( $(date +%s) - $(_path_mtime "$clip_dir/clipboard") ))
+    if [ "$leftover_age" -gt 5 ] || [ "$leftover_age" -lt 0 ]; then
+      rm -f "$clip_dir/clipboard" 2>/dev/null || true
+    fi
+  fi
+  # Claims stranded by a watcher killed between rename and delivery are the
+  # same kind of leftover: same age gate. A live claim is milliseconds old
+  # and never matches.
+  local stale_claim
+  for stale_claim in "$clip_dir"/.claim.*; do
+    [ -f "$stale_claim" ] || continue
+    if [ $(( $(date +%s) - $(_path_mtime "$stale_claim") )) -gt 5 ]; then
+      rm -f "$stale_claim" 2>/dev/null || true
+    fi
+  done
+
   touch "$clip_dir/.host-ready"
 
+  # Consume-on-read, mirroring _browser_claim_url: atomically claim the
+  # payload before piping it to the host clipboard, so a delivered copy no
+  # longer exists on disk and can never be replayed by a later session's
+  # watcher. When several watchers race (two sessions on one box), the
+  # rename hands the payload to exactly one. Claiming also retires the old
+  # mtime-second dedup, which silently swallowed a second copy written in
+  # the same wall-clock second. The claim lives OUTSIDE the .clipboard.*
+  # namespace on purpose: every session's exit sweeps .clipboard.* (the
+  # shim's temp files) unconditionally, and a sibling exiting mid-delivery
+  # must never delete this watcher's in-flight claim. Our own exit removes
+  # .claim.$$.* and the startup sweep above catches claims stranded by a
+  # crash.
   _do_copy() {
     kill -0 "$_cw_parent" 2>/dev/null || exit 0
-    [ -f "$clip_dir/clipboard" ] && eval "$clip_cmd" < "$clip_dir/clipboard" 2>/dev/null || true
+    local claim="$clip_dir/.claim.$$.${RANDOM}"
+    mv "$clip_dir/clipboard" "$claim" 2>/dev/null || return 0
+    eval "$clip_cmd" < "$claim" 2>/dev/null || true
+    rm -f "$claim" 2>/dev/null || true
   }
 
   if command -v inotifywait &>/dev/null; then
@@ -3425,17 +3470,13 @@ _clipboard_watcher() {
     return
   fi
 
-  local last_ts=""
+  # Polling fallback. No mtime tracking: the payload only exists while a
+  # copy is undelivered (the claim renames it away), so presence IS the
+  # signal, and a pre-existing file can never masquerade as a fresh copy.
   while true; do
     kill -0 "$_cw_parent" 2>/dev/null || exit 0
     if [ -f "$clip_dir/clipboard" ]; then
-      local cur_ts
-      cur_ts=$(stat -c '%Y%N' "$clip_dir/clipboard" 2>/dev/null \
-            || stat -f '%m' "$clip_dir/clipboard" 2>/dev/null || echo "")
-      if [ -n "$cur_ts" ] && [ "$cur_ts" != "$last_ts" ]; then
-        last_ts="$cur_ts"
-        _do_copy
-      fi
+      _do_copy
     fi
     sleep 1
   done
@@ -3680,12 +3721,12 @@ _browser_claim_url() {
 }
 
 # Epoch mtime of a path, or 0 when it can't be read. GNU stat (-c) first, then
-# BSD/macOS (-f), mirroring the clipboard watcher's probe above.
+# BSD/macOS (-f).
 _path_mtime() {
   local m
   # Trailing `|| echo ""` guarantees a zero exit (and empty output) when both
   # stats fail, so the binary's `set -e` can't trip on this assignment if the
-  # marker is removed between the glob and the stat (mirrors the clipboard probe).
+  # marker is removed between the glob and the stat.
   m="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "")"
   case "$m" in ''|*[!0-9]*) m=0 ;; esac
   printf '%s' "$m"
@@ -4159,6 +4200,9 @@ exec_claude() {
     fi
     _cleanup_spin
     rm -f "${_CLIP_DIR:?}/.clipboard."*
+    # Own claims only: another session's live claim in this shared dir must
+    # survive our exit (see _do_copy's claim-name note).
+    rm -f "${_CLIP_DIR:?}/.claim.$$."*
     rm -f "${_CLIP_DIR:?}/.browser-open"
     rm -f "$_CLIP_DIR/.watcher.$$"
     if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then

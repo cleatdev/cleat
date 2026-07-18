@@ -2567,3 +2567,57 @@ SCRIPT
   assert_output --partial "clipboard bridge forwarding"
   assert_output --partial "Do NOT try to verify clipboard contents after copying"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.5: The clipboard payload file ($CLEAT_RUN_DIR/<cname>/clip/clipboard)
+# was never removed anywhere: _cleanup_session only sweeps dot-prefixed
+# markers, and mkdir -p at attach never purges. Every attach spawns a fresh
+# watcher whose polling fallback started from last_ts="", so its very first
+# tick saw the leftover file as "changed" and piped a PREVIOUS session's copy
+# into the host clipboard right after start. Fix is layered like the browser
+# bridge's v0.6.1 fix: an age-gated sweep of the leftover at watcher startup,
+# plus consume-on-read (atomic mv claim) in _do_copy so a delivered payload
+# no longer exists to replay. This test seeds an old payload BEFORE the
+# watcher spawns: it must be swept, not delivered, in every watch mode.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.2.5: clipboard watcher never redelivers a previous session's payload" {
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir"
+  echo "stale-secret" > "$clip_dir/clipboard"
+  touch -t 202001010000 "$clip_dir/clipboard"
+  echo "stranded" > "$clip_dir/.claim.4242.7"
+  touch -t 202001010000 "$clip_dir/.claim.4242.7"
+
+  _clipboard_watcher "$clip_dir" "cat >> '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 2
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  [ ! -f "$TEST_TEMP/copied" ] || { echo "REGRESSION: stale payload was redelivered to the host clipboard"; return 1; }
+  [ ! -f "$clip_dir/clipboard" ] || { echo "REGRESSION: stale payload survived watcher startup"; return 1; }
+  [ ! -f "$clip_dir/.claim.4242.7" ] || { echo "REGRESSION: stranded claim survived watcher startup"; return 1; }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.5 (hardening): a backward host clock step (NTP correction, VM clock
+# catch-up after macOS sleep) makes a leftover payload's mtime sit AHEAD of
+# now, so "age > 5" never fires and the polling watcher would redeliver it,
+# reproducing the stale-redelivery bug through the side door. A negative age
+# must sweep too: never replaying old bytes is the fail-safe direction.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.2.5: clipboard sweep treats a future-dated leftover as stale" {
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir"
+  echo "stale-from-the-future" > "$clip_dir/clipboard"
+  touch -t 203001010000 "$clip_dir/clipboard"
+
+  _clipboard_watcher "$clip_dir" "cat >> '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 2
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  [ ! -f "$TEST_TEMP/copied" ] || { echo "REGRESSION: future-dated leftover was redelivered"; return 1; }
+  [ ! -f "$clip_dir/clipboard" ] || { echo "REGRESSION: future-dated leftover survived watcher startup"; return 1; }
+}

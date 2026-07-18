@@ -1394,6 +1394,57 @@ s|kill -0 "\$_cw_parent" 2>/dev/null \|\| exit 0|true|
 SED
 try "vnext_clipboard_watcher_liveness" "never copies" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
 
+# v1.2.5: the clipboard watcher's startup sweep must only remove a STALE
+# leftover payload (age-gated, like the browser bridge's sweep). The age
+# gate was later restructured onto a $leftover_age variable (to also cover
+# the negative-age case below), so the old sed matching the inline
+# "_path_mtime ... -gt 5" expression no longer lands. Push the threshold out
+# to effectively never (a file would need to sit for ~317 years before the
+# gate fires), which restores the pre-fix bug: the fresh watcher's poll loop
+# sees the leftover payload as new and redelivers a previous session's
+# clipboard to the host.
+cat > "$SED_TMP" << 'SED'
+s|"\$leftover_age" -gt 5|"\$leftover_age" -gt 9999999999|
+SED
+try "v1.2.5_clipboard_startup_sweep" "never redelivers a previous session" "$CLI" "$REGRESSIONS"
+
+# v1.2.5 (hardening): a backward host clock step makes a leftover's mtime
+# sit ahead of now, so age is negative and "-gt 5" alone never fires. Drop
+# the "|| [ ... -lt 0 ]" branch: the sweep only catches a positive age
+# again, so a future-dated leftover is redelivered.
+cat > "$SED_TMP" << 'SED'
+s|\[ "\$leftover_age" -gt 5 \] \|\| \[ "\$leftover_age" -lt 0 \]|\[ "\$leftover_age" -gt 5 \]|
+SED
+try "v1.2.5_clipboard_negative_age_sweep" "future-dated leftover" "$CLI" "$REGRESSIONS"
+
+# v1.2.5 (hardening): a claim stranded by a watcher killed between rename
+# and delivery must be swept at startup, same as the leftover payload.
+# Short-circuit the loop body to an unconditional `continue`, making the
+# stranded-claim sweep a no-op.
+cat > "$SED_TMP" << 'SED'
+s|\[ -f "\$stale_claim" \] \|\| continue|continue|
+SED
+try "v1.2.5_clipboard_stranded_claim_sweep" "never redelivers a previous session" "$CLI" "$REGRESSIONS"
+
+# v1.2.5 (hardening): the claim file must live OUTSIDE the .clipboard.*
+# namespace, since every session's exit sweep clears that namespace
+# unconditionally and would delete a sibling's in-flight claim. Regress the
+# claim name back into that namespace.
+cat > "$SED_TMP" << 'SED'
+s|\.claim\.\$\$\.\${RANDOM}|.clipboard.claim.\$\$.\${RANDOM}|
+SED
+try "v1.2.5_clipboard_claim_namespace" "cleanup namespace" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# v1.2.5: _do_copy must CONSUME the payload (atomic rename), so a delivered
+# copy no longer exists on disk for a later session's watcher to replay.
+# Swap the consuming `mv` for a non-consuming `cat > claim`: delivery still
+# works (the clip command still gets the bytes), but the source file
+# survives, so the "consumes the payload" assertion fails.
+cat > "$SED_TMP" << 'SED'
+s|mv "\$clip_dir/clipboard" "\$claim" 2>/dev/null \|\| return 0|cat "\$clip_dir/clipboard" > "\$claim" 2>/dev/null \|\| return 0|
+SED
+try "v1.2.5_clipboard_consume_on_read" "consumes the payload" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
 # vnext: an orphaned hook bridge must exit BEFORE processing late events
 # (host hooks for a dead session). Drop the loop-top check: the orphan-bridge
 # test fails.

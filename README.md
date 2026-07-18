@@ -753,19 +753,19 @@ Clipboard works out of the box. When Claude Code (or any tool) calls `pbcopy`, `
 
 ### How it works
 
-A host-side clipboard watcher starts automatically alongside every Claude Code session. The container writes clipboard data to a shared file via a bind mount. The watcher detects changes and copies the content to your real clipboard using `pbcopy` (macOS), `xclip`, `xsel`, or `wl-copy` (Linux).
+A host-side clipboard watcher starts automatically alongside every Claude Code session. The container writes clipboard data to a shared file via a bind mount. The watcher claims the file and copies the content to your real clipboard using `pbcopy` (macOS), `xclip`, `xsel`, or `wl-copy` (Linux). Each copy is picked up once and never replayed: the watcher consumes the payload as it delivers it and discards anything left over from an earlier session instead of replaying it onto your clipboard.
 
 ```
-┌─────────────────────────────┐      ┌──────────────────────────────┐
-│  Docker container            │      │  Host                         │
-│                              │      │                               │
-│  Claude Code                 │      │                               │
-│    └─ echo "text" | pbcopy   │      │                               │
-│         └─ writes to ────────────>  │  /tmp/cleat-clip-*/clipboard  │
-│           /tmp/cleat-clip/   │      │    └─ watcher detects change  │
-│                              │      │         └─ pbcopy / xclip     │
-│                              │      │              └─ ✔ clipboard!  │
-└─────────────────────────────┘      └──────────────────────────────┘
+┌─────────────────────────────┐      ┌─────────────────────────────────┐
+│  Docker container           │      │  Host                           │
+│                             │      │                                 │
+│  Claude Code                │      │                                 │
+│    └─ echo "text" | pbcopy  │      │                                 │
+│         └─ writes to ──────────────>  ~/.config/cleat/run/<box>/clip/│
+│           /tmp/cleat-clip/  │      │    └─ watcher claims the file   │
+│                             │      │         └─ pbcopy / xclip       │
+│                             │      │              └─ ✔ clipboard!    │
+└─────────────────────────────┘      └─────────────────────────────────┘
 ```
 
 An [OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands) fallback is available for terminals that support it, used automatically when the file bridge is not active.

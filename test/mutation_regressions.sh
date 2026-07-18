@@ -1448,10 +1448,16 @@ try "v1.2.5_clipboard_consume_on_read" "consumes the payload" "$CLI" "$CLIPBOARD
 # v1.2.5: on hosts with inotify-tools/fswatch, _cleanup_session's plain kill
 # never reaches the watcher's blocking child, so it (and inotifywait under
 # it) survive as an orphan. Drop the pkill -P step that kills it directly.
+# Registered only where inotifywait exists: without it (stock macOS, the
+# macOS CI leg) the polling fallback has no blocking child and no observable
+# defect, so the paired regression test skips, and a skipped test reads as a
+# missed mutation (seen live on the v1.2.5 macOS CI run).
+if command -v inotifywait >/dev/null 2>&1; then
 cat > "$SED_TMP" << 'SED'
 s|pkill -P "\$_CLIP_WATCHER_PID" 2>/dev/null \|\| true|true|
 SED
 try "v1.2.5_cleanup_watcher_child_kill" "reaps a watcher" "$CLI" "$REGRESSIONS"
+fi
 
 # vnext: an orphaned hook bridge must exit BEFORE processing late events
 # (host hooks for a dead session). Drop the loop-top check: the orphan-bridge

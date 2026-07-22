@@ -11,14 +11,22 @@
 git
 
 [setup]
-# The base box is node:24-bookworm-slim (Debian 12 "bookworm"). Add
-# Microsoft's package feed, then install the SDK. The feed serves amd64 and
-# arm64 for .NET 8. If a package is ever missing for your architecture, use
-# the official script instead:
-#   curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0
-curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb
-sudo dpkg -i /tmp/packages-microsoft-prod.deb
-rm /tmp/packages-microsoft-prod.deb
-sudo apt-get update
-sudo apt-get install -y dotnet-sdk-8.0
+# The base box is node:24-bookworm-slim (Debian 12 "bookworm"), amd64 or arm64.
+# Microsoft's Debian apt feed only ships .NET 8 for amd64, so on arm64 (e.g.
+# Apple Silicon) use the official arch-agnostic install script instead.
+if [ "$(dpkg --print-architecture)" = "amd64" ]; then
+  curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb
+  sudo dpkg -i /tmp/packages-microsoft-prod.deb
+  rm /tmp/packages-microsoft-prod.deb
+  sudo apt-get update
+  sudo apt-get install -y dotnet-sdk-8.0
+else
+  curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+  bash /tmp/dotnet-install.sh --channel 8.0 --install-dir "$HOME/.dotnet"
+  rm /tmp/dotnet-install.sh
+  if ! grep -q '.dotnet' "$HOME/.bashrc" 2>/dev/null; then
+    echo 'export PATH="$HOME/.dotnet:$PATH"' >> "$HOME/.bashrc"
+  fi
+  export PATH="$HOME/.dotnet:$PATH"
+fi
 dotnet --info

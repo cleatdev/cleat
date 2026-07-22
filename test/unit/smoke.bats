@@ -298,7 +298,10 @@ cleat_bin_timeout() {
   assert_output --partial "[web]"
   run cleat_bin trust --list
   assert_success
+  # main survives (path present) and only the web row is gone (no [web] tag);
+  # this fails a wrong impl that removed main and kept web.
   assert_output --partial "$TEST_TEMP/proj"
+  refute_output --partial "[web]"
 }
 
 @test "smoke: cleat start with --trust-project auto-approves project .cleat" {

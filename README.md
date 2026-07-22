@@ -590,6 +590,10 @@ sudo apt-get update
 sudo apt-get install -y dotnet-sdk-8.0
 ```
 
+That snippet shows the syntax on amd64. Microsoft's Debian feed ships .NET 8
+for amd64 only, so the runnable [`examples/setup/dotnet`](examples/setup/dotnet)
+example uses the official `dotnet-install.sh` on arm64 (Apple Silicon).
+
 A `script <path>` line inlines a project-relative script file at that position
 instead of writing commands inline. List as many `script` directives as you
 like, mixed with inline commands, in any order. Copy-paste examples live in

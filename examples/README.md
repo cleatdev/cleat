@@ -9,8 +9,8 @@ A `[setup]` section in your project's `.cleat` file installs a toolchain the
 base box does not ship. The commands run once per container, as the `coder`
 user, in `/workspace`, right after the box is created. Cleat shows you the
 exact commands and asks once before running them. See
-[docs/cli.md](../../docs/cli.md#provisioning-setup-section) for the full
-reference.
+[the `[setup]` section in the README](../README.md#provision-the-box-the-setup-section)
+for the full reference.
 
 | Example | Shows |
 |---|---|

@@ -1175,13 +1175,32 @@ _th_record_setup() {
   [[ "${output##*$'\t'}" == "web" ]] || { echo "box: ${output##*$'\t'}"; return 1; }
 }
 
-@test "trust_target: a lone existing directory is a path, not a box" {
-  # A token that also names a real subdir stays a path (pre-box behavior); use
-  # `. <box>` to force the box reading. This guards that disambiguation.
+@test "trust_target: a lone valid box name is a box even when a same-named dir exists" {
+  # Disambiguation is syntax-only (a '/' makes a path): a bare valid box name
+  # is ALWAYS that box, regardless of a same-named subdir. This keeps trust and
+  # untrust symmetric over time (a build creating ./web must not silently turn
+  # `cleat untrust web` into a no-op). Guards the security fix.
   mkdir -p "$PROJECT/web"
   run _trust_target web
   assert_success
+  [[ "${output##*$'\t'}" == "web" ]] || { echo "box: ${output##*$'\t'}"; return 1; }
+}
+
+@test "trust_target: a lone token that is neither a path shape nor a valid box name is a path" {
+  # The fallthrough else-branch: box stays main, project is the literal token,
+  # so the caller's 'no .cleat file' error names what the user typed.
+  run _trust_target 'Weird Name'
+  assert_success
   [[ "${output##*$'\t'}" == "main" ]] || { echo "box: ${output##*$'\t'}"; return 1; }
+  [[ "${output%%$'\t'*}" == "$(resolve_project 'Weird Name')" ]] || { echo "proj: ${output%%$'\t'*}"; return 1; }
+}
+
+@test "trust_target: a project path containing a tab is refused (control-char guard)" {
+  # Mirrors _trust_record's refusal, before the tab-delimited print, so a tab
+  # in the path can't split wrong and slip past that guard.
+  run _trust_target "$(printf 'a\tb')"
+  assert_failure
+  assert_output --partial "control characters"
 }
 
 @test "trust_target: an invalid box name in the box slot fails" {
@@ -1245,16 +1264,36 @@ _th_record_setup() {
   [[ "$got" == "$expected" ]] || { echo "expected: $expected"; echo "got:      $got"; return 1; }
 }
 
-@test "cmd_trust . <box>: the explicit-path form trusts a box that also names a dir" {
+@test "cmd_trust <path> <box>: the two-arg form resolves the path's box" {
+  # `.` resolves to the current project (cwd); the second positional is the box.
   printf '[caps]\ngit\n' > "$PROJECT/.cleat"
   printf '[caps]\ndocker\n' > "$PROJECT/.cleat.web"
-  mkdir -p "$PROJECT/web"   # would shadow a lone `cleat trust web`
   run cmd_trust . web
   assert_success
   assert_output --partial "[web]"
   local wh
   wh="$(_trust_lookup "$PROJECT" web)"
   [[ -n "$wh" ]] || { echo "no web row"; return 1; }
+}
+
+@test "cmd_trust --list: a box row flips green to yellow when its .cleat.<box> changes" {
+  # Colors are empty when stdout isn't a TTY (bats), so set distinct sentinels
+  # to tell the green (trusted) marker from the yellow (changed) one.
+  GREEN='<G>'; YELLOW='<Y>'
+  printf '[caps]\ngit\n' > "$PROJECT/.cleat.web"
+  cmd_trust web >/dev/null
+  # Fresh approval: the web row carries the green marker, not yellow.
+  run cmd_trust --list
+  assert_success
+  local line
+  line="$(printf '%s\n' "$output" | grep '\[web\]')"
+  [[ "$line" == *'<G>'* && "$line" != *'<Y>'* ]] || { echo "fresh web row not green: $line"; return 1; }
+  # Edit the box's caps: the row must now warn (yellow) that it changed.
+  printf '[caps]\ngit\ndocker\n' > "$PROJECT/.cleat.web"
+  run cmd_trust --list
+  assert_success
+  line="$(printf '%s\n' "$output" | grep '\[web\]')"
+  [[ "$line" == *'<Y>'* ]] || { echo "edited web row not yellow: $line"; return 1; }
 }
 
 @test "cmd_untrust <box>: removes only that box's row, main survives" {

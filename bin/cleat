@@ -7743,18 +7743,21 @@ cmd_config() {
 # ALL diagnostics go to stderr (this runs inside $(...)) and a bad target
 # returns 1 so the caller can `|| exit 1`.
 #
-# Grammar, backward compatible with the historical lone-[path] form (an
-# absolute path or existing directory still selects that project's main box):
+# Grammar, backward compatible with the historical lone-[path] form:
 #   (none)          current dir, main box
 #   <box>           current dir, that box   (a lone valid box name, no '/')
-#   <path>          that path, main box     (contains '/' or is an existing dir)
+#   <path>          that path, main box     (a token containing '/')
 #   <path> <box>    that path, that box     (path first, then box)
 #
-# The one-arg case only reads as a box when the token is a valid box name AND
-# not a filesystem path, so `cleat trust /abs/proj` and `cleat trust ./sub`
-# keep meaning exactly what they did before boxes were box-aware here. To force
-# the box reading for a name that also names a local directory, pass the path
-# explicitly: `cleat trust . <box>`.
+# Whether the one-arg token is a box or a path is decided PURELY by syntax: a
+# token containing '/' is a path, otherwise a valid box name is that box. This
+# is deliberately NOT a filesystem check (`-d`): a `-d` test would be
+# time-dependent, so `cleat trust web` could record box "web" today and
+# `cleat untrust web` could silently resolve to the ./web directory tomorrow
+# (once a build created it) and fail to revoke the box, leaving a stale
+# approval live. Syntax-only keeps trust and untrust symmetric. To trust the
+# project in a bare-named subdirectory, give it a path shape: `cleat trust
+# ./web` or `cleat trust . web` for that subdir's box.
 _trust_target() {
   local proj box="main" a1="${1:-}" n=$#
   if [[ $n -gt 2 ]]; then
@@ -7766,13 +7769,13 @@ _trust_target() {
     proj="$(resolve_project "$a1")"
     box="$2"
   elif [[ $n -eq 1 ]]; then
-    if [[ "$a1" == */* || -d "$a1" ]]; then
+    if [[ "$a1" == */* ]]; then
       proj="$(resolve_project "$a1")"
     elif _validate_box_name "$a1"; then
       proj="$(resolve_project "")"
       box="$a1"
     else
-      # Neither an obvious path nor a valid box name: treat as a path so the
+      # Neither a path shape nor a valid box name: treat as a path so the
       # caller's "no .cleat file" error still names what the user typed.
       proj="$(resolve_project "$a1")"
     fi
@@ -7784,6 +7787,15 @@ _trust_target() {
     echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars.${RESET}" >&2
     return 1
   fi
+  # Mirror _trust_record's control-char refusal here, before the tab-delimited
+  # print: a project path with an embedded tab/newline/CR would otherwise split
+  # wrong in the caller and slip past that guard (it only sees the truncated
+  # project column).
+  case "$proj" in
+    *$'\t'*|*$'\n'*|*$'\r'*)
+      error "Refusing to trust a project path containing control characters" >&2
+      return 1 ;;
+  esac
   printf '%s\t%s\n' "$proj" "$box"
 }
 

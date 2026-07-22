@@ -2911,16 +2911,39 @@ try "vnext_trust_interactive_col4_preserve" "interactive caps-approval" "$CLI" "
 
 # ── Box-aware trust/untrust ──────────────────────────────────────────────────
 
-# DISAMBIGUATION: _trust_target must treat a lone token that names an existing
-# directory as a PATH (pre-box behavior), not a box. Drop the `-d "$a1"` arm so
-# a real subdir would instead read as a box name: the "lone existing directory
-# is a path" assertion must fail.
+# DISAMBIGUATION: _trust_target decides box-vs-path purely by syntax (a '/'
+# makes it a path), so a lone valid box name is ALWAYS that box even when a
+# same-named directory exists (keeps trust/untrust symmetric over time). Widen
+# the path test to match everything: a lone box name would then resolve as a
+# path (box main), so the "lone valid box name is a box even when a same-named
+# dir exists" assertion must fail.
 cat > "$SED_TMP" << 'SED'
 /^_trust_target()/,/^}$/{
-s@if \[\[ "\$a1" == \*/\* || -d "\$a1" \]\]; then@if [[ "\$a1" == \*/\* ]]; then@
+s@if \[\[ "\$a1" == \*/\* \]\]; then@if [[ "\$a1" == \* ]]; then@
 }
 SED
-try "vnext_trust_target_dir_disambig" "a lone existing directory is a path" "$CLI" "$PROVISION_BATS"
+try "vnext_trust_target_slash_is_path" "a lone valid box name is a box even when" "$CLI" "$PROVISION_BATS"
+
+# CONTROL-CHAR GUARD: _trust_target must refuse a project path with an embedded
+# tab/newline/CR before the tab-delimited print, mirroring _trust_record, so a
+# tab can't split wrong in the caller and slip past that guard. Delete the
+# guard: the "project path containing a tab is refused" assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^_trust_target()/,/^}$/{
+/Refusing to trust a project path containing control characters/d
+}
+SED
+try "vnext_trust_target_ctrl_char_guard" "project path containing a tab is refused" "$CLI" "$PROVISION_BATS"
+
+# PER-BOX STALENESS MARKER: cmd_trust --list must flip a box row from green to
+# yellow when its .cleat.<box> hash no longer matches what was approved. Force
+# the comparison to never trip (equal hash): every row stays green, so the
+# "flips green to yellow" assertion (which needs the yellow marker after an
+# edit) must fail.
+cat > "$SED_TMP" << 'SED'
+s@if \[\[ -f "\$_cf" && -n "\$_cur" && "\$_stored" != "\$_cur" \]\]; then@if [[ -f "$_cf" \&\& -n "$_cur" \&\& "$_stored" == "$_cur" ]]; then@
+SED
+try "vnext_trust_list_box_staleness" "flips green to yellow when its" "$CLI" "$PROVISION_BATS"
 
 # PER-BOX TRUST ROW: `cleat trust <box>` must record under the named box, so
 # the row is byte-identical to what the box-start prompt writes. Pin the box to

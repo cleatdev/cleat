@@ -1148,3 +1148,227 @@ _th_record_setup() {
   refute_output --partial "${esc}BADESC"
   assert_output --partial "033"
 }
+
+# ── 12. Box-aware trust/untrust ──────────────────────────────────────────────
+#
+# _trust_target is the shared (project, box) parser for `cleat trust` and
+# `cleat untrust`. The grammar is backward compatible: a lone path (absolute or
+# an existing dir) still selects the main box, a lone valid box name selects
+# that box of the current dir, and `<path> <box>` names both.
+
+@test "trust_target: a lone path keeps the main box (legacy form)" {
+  run _trust_target "$PROJECT"
+  assert_success
+  assert_output "$PROJECT"$'\t'main
+}
+
+@test "trust_target: path + box selects that box" {
+  run _trust_target "$PROJECT" web
+  assert_success
+  assert_output "$PROJECT"$'\t'web
+}
+
+@test "trust_target: a lone valid box name selects that box of the current dir" {
+  # cwd is $PROJECT (see setup); no ./web dir exists, so 'web' reads as a box.
+  run _trust_target web
+  assert_success
+  [[ "${output##*$'\t'}" == "web" ]] || { echo "box: ${output##*$'\t'}"; return 1; }
+}
+
+@test "trust_target: a lone existing directory is a path, not a box" {
+  # A token that also names a real subdir stays a path (pre-box behavior); use
+  # `. <box>` to force the box reading. This guards that disambiguation.
+  mkdir -p "$PROJECT/web"
+  run _trust_target web
+  assert_success
+  [[ "${output##*$'\t'}" == "main" ]] || { echo "box: ${output##*$'\t'}"; return 1; }
+}
+
+@test "trust_target: an invalid box name in the box slot fails" {
+  run _trust_target "$PROJECT" "Bad Box"
+  assert_failure
+  assert_output --partial "Invalid box name"
+}
+
+@test "trust_target: too many positionals fail" {
+  run _trust_target "$PROJECT" web extra
+  assert_failure
+  assert_output --partial "Unexpected argument"
+}
+
+@test "cmd_trust <box>: records a per-box row from .cleat.<box>" {
+  printf '[caps]\ngit\n' > "$PROJECT/.cleat"
+  printf '[caps]\ngit\ndocker\n' > "$PROJECT/.cleat.web"
+  run cmd_trust web
+  assert_success
+  assert_output --partial "[web]"
+  assert_output --partial "Approved caps: docker,git"
+  local wh
+  wh="$(_trust_lookup "$PROJECT" web)"
+  [[ -n "$wh" ]] || { echo "no web row"; return 1; }
+}
+
+@test "cmd_trust <box>: falls back to .cleat when .cleat.<box> is absent" {
+  printf '[caps]\ngit\n' > "$PROJECT/.cleat"
+  run cmd_trust web
+  assert_success
+  assert_output --partial "[web]"
+  assert_output --partial "Approved caps: git"
+  local wh mh
+  wh="$(_trust_lookup "$PROJECT" web)"
+  mh="$(_trust_lookup "$PROJECT" main)"
+  [[ -n "$wh" && -z "$mh" ]] || { echo "web=$wh main=$mh"; return 1; }
+}
+
+@test "cmd_trust: a box and main are independent trust rows" {
+  printf '[caps]\ngit\n' > "$PROJECT/.cleat"
+  printf '[caps]\ndocker\n' > "$PROJECT/.cleat.web"
+  cmd_trust web >/dev/null
+  cmd_trust >/dev/null
+  local web_h main_h
+  web_h="$(_trust_lookup "$PROJECT" web)"
+  main_h="$(_trust_lookup "$PROJECT" main)"
+  [[ -n "$web_h" && -n "$main_h" && "$web_h" != "$main_h" ]] || { echo "web=$web_h main=$main_h"; return 1; }
+}
+
+@test "cmd_trust <box>: writes the byte-identical row the box-start prompt would" {
+  # Caps + [setup] approved for a box must produce the SAME 4-col row whether
+  # via the interactive start prompt (_resolve_project_trust + _resolve_setup_
+  # trust) or `cleat trust <box>`.
+  printf '[caps]\ndocker\n\n[setup]\necho provision\n' > "$PROJECT/.cleat.web"
+  local caps_hash setup_hash expected got
+  caps_hash="$(_hash_cleat_caps "$PROJECT/.cleat.web")"
+  setup_hash="$(_setup_payload_hash "$(_build_setup_payload "$PROJECT" web)")"
+  expected="$(printf '%s\t%s\t%s\t%s' "$PROJECT" web "$caps_hash" "$setup_hash")"
+  cmd_trust web >/dev/null
+  got="$(awk -F'\t' -v p="$PROJECT" '$1==p {print; exit}' "$CLEAT_TRUST_FILE")"
+  [[ "$got" == "$expected" ]] || { echo "expected: $expected"; echo "got:      $got"; return 1; }
+}
+
+@test "cmd_trust . <box>: the explicit-path form trusts a box that also names a dir" {
+  printf '[caps]\ngit\n' > "$PROJECT/.cleat"
+  printf '[caps]\ndocker\n' > "$PROJECT/.cleat.web"
+  mkdir -p "$PROJECT/web"   # would shadow a lone `cleat trust web`
+  run cmd_trust . web
+  assert_success
+  assert_output --partial "[web]"
+  local wh
+  wh="$(_trust_lookup "$PROJECT" web)"
+  [[ -n "$wh" ]] || { echo "no web row"; return 1; }
+}
+
+@test "cmd_untrust <box>: removes only that box's row, main survives" {
+  printf '[caps]\ngit\n' > "$PROJECT/.cleat"
+  printf '[caps]\ndocker\n' > "$PROJECT/.cleat.web"
+  cmd_trust >/dev/null
+  cmd_trust web >/dev/null
+  run cmd_untrust web
+  assert_success
+  assert_output --partial "Removed trust"
+  assert_output --partial "[web]"
+  local web_h main_h
+  web_h="$(_trust_lookup "$PROJECT" web)"
+  main_h="$(_trust_lookup "$PROJECT" main)"
+  [[ -z "$web_h" && -n "$main_h" ]] || { echo "web=$web_h main=$main_h"; return 1; }
+}
+
+@test "cmd_untrust <box>: reports 'was not trusted' with the box tag" {
+  run cmd_untrust web
+  assert_success
+  assert_output --partial "was not trusted"
+  assert_output --partial "[web]"
+}
+
+# ── 13. Multiple script directives ───────────────────────────────────────────
+#
+# A [setup] section may list any number of `script <path>` directives, mixed
+# with inline commands, in any order. Each is inlined at its position.
+
+@test "build_setup: two script directives inline in order, each framed" {
+  printf 'echo first\n' > "$PROJECT/a.sh"
+  printf 'echo second\n' > "$PROJECT/b.sh"
+  printf '[setup]\nscript ./a.sh\nscript ./b.sh\n' > "$PROJECT/.cleat"
+  run _build_setup_payload "$PROJECT" main
+  assert_success
+  assert_output --partial "# cleat setup: begin script a.sh"
+  assert_output --partial "echo first"
+  assert_output --partial "# cleat setup: end script a.sh"
+  assert_output --partial "# cleat setup: begin script b.sh"
+  assert_output --partial "echo second"
+  local ai bi
+  ai="$(printf '%s\n' "$output" | grep -n "begin script a.sh" | cut -d: -f1)"
+  bi="$(printf '%s\n' "$output" | grep -n "begin script b.sh" | cut -d: -f1)"
+  [[ "$ai" -lt "$bi" ]] || { echo "a=$ai b=$bi"; return 1; }
+}
+
+@test "build_setup: scripts and inline commands preserve their interleaved order" {
+  printf 'echo from-script\n' > "$PROJECT/mid.sh"
+  printf '[setup]\necho before\nscript ./mid.sh\necho after\n' > "$PROJECT/.cleat"
+  run _build_setup_payload "$PROJECT" main
+  assert_success
+  local before mid after
+  before="$(printf '%s\n' "$output" | grep -n '^echo before$' | cut -d: -f1)"
+  mid="$(printf '%s\n' "$output" | grep -n 'begin script mid.sh' | cut -d: -f1)"
+  after="$(printf '%s\n' "$output" | grep -n '^echo after$' | cut -d: -f1)"
+  [[ "$before" -lt "$mid" && "$mid" -lt "$after" ]] || { echo "b=$before m=$mid a=$after"; return 1; }
+}
+
+@test "setup_hash: changing the second of two scripts changes the payload hash" {
+  printf 'echo first\n' > "$PROJECT/a.sh"
+  printf 'echo second\n' > "$PROJECT/b.sh"
+  printf '[setup]\nscript ./a.sh\nscript ./b.sh\n' > "$PROJECT/.cleat"
+  local h1 h2
+  h1="$(_setup_payload_hash "$(_build_setup_payload "$PROJECT" main)")"
+  printf 'echo second-CHANGED\n' > "$PROJECT/b.sh"
+  h2="$(_setup_payload_hash "$(_build_setup_payload "$PROJECT" main)")"
+  [[ -n "$h1" && "$h1" != "$h2" ]] || { echo "h1=$h1 h2=$h2"; return 1; }
+}
+
+@test "build_setup: a bad second script fails the whole payload" {
+  printf 'echo ok\n' > "$PROJECT/a.sh"
+  printf '[setup]\nscript ./a.sh\nscript ./missing.sh\n' > "$PROJECT/.cleat"
+  run _build_setup_payload "$PROJECT" main
+  assert_failure
+  assert_output --partial "script not found"
+}
+
+# ── 14. Shipped examples (examples/setup/*) ──────────────────────────────────
+#
+# Guard the copy-paste examples from rotting: they must parse, and their script
+# directives must resolve, through the real builder.
+
+@test "examples: the shipped dotnet .cleat builds a non-empty [setup] payload" {
+  local dir="$PROJECT_ROOT/examples/setup/dotnet"
+  [[ -f "$dir/.cleat" ]] || { echo "missing $dir/.cleat"; return 1; }
+  run _build_setup_payload "$dir" main
+  assert_success
+  assert_output --partial "dotnet-sdk-8.0"
+}
+
+@test "examples: the shipped python .cleat inlines provision.sh via the script directive" {
+  local dir="$PROJECT_ROOT/examples/setup/python"
+  run _build_setup_payload "$dir" main
+  assert_success
+  assert_output --partial "# cleat setup: begin script provision.sh"
+  assert_output --partial "astral.sh/uv"
+}
+
+@test "examples: the shipped rust .cleat inlines both scripts, in order" {
+  local dir="$PROJECT_ROOT/examples/setup/rust"
+  run _build_setup_payload "$dir" main
+  assert_success
+  assert_output --partial "begin script scripts/toolchain.sh"
+  assert_output --partial "begin script scripts/tools.sh"
+  local t1 t2
+  t1="$(printf '%s\n' "$output" | grep -n "begin script scripts/toolchain.sh" | cut -d: -f1)"
+  t2="$(printf '%s\n' "$output" | grep -n "begin script scripts/tools.sh" | cut -d: -f1)"
+  [[ "$t1" -lt "$t2" ]] || { echo "toolchain=$t1 tools=$t2"; return 1; }
+}
+
+@test "examples: every shipped example .cleat declares a [setup] section" {
+  local base="$PROJECT_ROOT/examples/setup" d
+  for d in "$base"/*/; do
+    [[ -f "${d}.cleat" ]] || { echo "no .cleat in $d"; return 1; }
+    [[ -n "$(_read_setup_from_file "${d}.cleat")" ]] || { echo "no [setup] in ${d}.cleat"; return 1; }
+  done
+}

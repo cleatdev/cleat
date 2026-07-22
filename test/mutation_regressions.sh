@@ -2909,6 +2909,35 @@ s/_trust_record "\$project" "\$hash" "\$box" "\$(_trust_lookup_setup "\$project"
 SED
 try "vnext_trust_interactive_col4_preserve" "interactive caps-approval" "$CLI" "$PROVISION_BATS"
 
+# ── Box-aware trust/untrust ──────────────────────────────────────────────────
+
+# DISAMBIGUATION: _trust_target must treat a lone token that names an existing
+# directory as a PATH (pre-box behavior), not a box. Drop the `-d "$a1"` arm so
+# a real subdir would instead read as a box name: the "lone existing directory
+# is a path" assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^_trust_target()/,/^}$/{
+s@if \[\[ "\$a1" == \*/\* || -d "\$a1" \]\]; then@if [[ "\$a1" == \*/\* ]]; then@
+}
+SED
+try "vnext_trust_target_dir_disambig" "a lone existing directory is a path" "$CLI" "$PROVISION_BATS"
+
+# PER-BOX TRUST ROW: `cleat trust <box>` must record under the named box, so
+# the row is byte-identical to what the box-start prompt writes. Pin the box to
+# main on cmd_trust's 4-col record: the byte-identity assertion must fail.
+cat > "$SED_TMP" << 'SED'
+s@_trust_record "\$project" "\$hash" "\$box" "\$setup_hash" || exit 1@_trust_record "\$project" "\$hash" main "\$setup_hash" || exit 1@
+SED
+try "vnext_trust_box_record_box" "byte-identical row the box-start prompt" "$CLI" "$PROVISION_BATS"
+
+# PER-BOX UNTRUST SCOPE: `cleat untrust <box>` must remove only that box's row.
+# Drop the box arg so it defaults to main: untrusting a box would then clear the
+# main row instead, so the "removes only that box's row" assertion must fail.
+cat > "$SED_TMP" << 'SED'
+s@_trust_remove "\$project" "\$box"@_trust_remove "\$project"@
+SED
+try "vnext_untrust_box_scope" "removes only that box" "$CLI" "$PROVISION_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

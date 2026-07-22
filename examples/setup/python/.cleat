@@ -1,0 +1,13 @@
+# Python toolchain for a Cleat box, via a single script file.
+#
+# `script <path>` inlines a project-relative file's contents into the [setup]
+# payload at that position. The file is part of what you approve: editing it
+# re-triggers the trust prompt, exactly like editing [setup] itself. Keeping
+# the steps in provision.sh means your teammates and CI run the identical
+# bytes you approved.
+
+[caps]
+git
+
+[setup]
+script ./provision.sh

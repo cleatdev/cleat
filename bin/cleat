@@ -7730,12 +7730,62 @@ cmd_config() {
 
 # ── Workspace trust subcommands ────────────────────────────────────────────
 #
-# `cleat trust [path]`   : record approval for a project's .cleat caps
-# `cleat trust --list`   : list all trusted projects
-# `cleat untrust [path]` : remove approval for a project
+# `cleat trust [path] [box]`   : record approval for a project's .cleat (or a
+#                                box's .cleat.<box>) caps and [setup]
+# `cleat trust --list`         : list all trusted projects and boxes
+# `cleat untrust [path] [box]` : remove approval for a project (or a box)
 #
 # Normally users will be prompted automatically on first run. These
 # subcommands exist for scripting, manual approval, and inspection.
+
+# Resolve the (project, box) a trust/untrust verb targets from its
+# positionals. Prints "<project><TAB><box>" on stdout for the caller to split;
+# ALL diagnostics go to stderr (this runs inside $(...)) and a bad target
+# returns 1 so the caller can `|| exit 1`.
+#
+# Grammar, backward compatible with the historical lone-[path] form (an
+# absolute path or existing directory still selects that project's main box):
+#   (none)          current dir, main box
+#   <box>           current dir, that box   (a lone valid box name, no '/')
+#   <path>          that path, main box     (contains '/' or is an existing dir)
+#   <path> <box>    that path, that box     (path first, then box)
+#
+# The one-arg case only reads as a box when the token is a valid box name AND
+# not a filesystem path, so `cleat trust /abs/proj` and `cleat trust ./sub`
+# keep meaning exactly what they did before boxes were box-aware here. To force
+# the box reading for a name that also names a local directory, pass the path
+# explicitly: `cleat trust . <box>`.
+_trust_target() {
+  local proj box="main" a1="${1:-}" n=$#
+  if [[ $n -gt 2 ]]; then
+    error "Unexpected argument: ${BOLD}${3:-}${RESET}" >&2
+    echo -e "    ${DIM}Usage: cleat trust [path] [box]${RESET}" >&2
+    return 1
+  fi
+  if [[ $n -eq 2 ]]; then
+    proj="$(resolve_project "$a1")"
+    box="$2"
+  elif [[ $n -eq 1 ]]; then
+    if [[ "$a1" == */* || -d "$a1" ]]; then
+      proj="$(resolve_project "$a1")"
+    elif _validate_box_name "$a1"; then
+      proj="$(resolve_project "")"
+      box="$a1"
+    else
+      # Neither an obvious path nor a valid box name: treat as a path so the
+      # caller's "no .cleat file" error still names what the user typed.
+      proj="$(resolve_project "$a1")"
+    fi
+  else
+    proj="$(resolve_project "")"
+  fi
+  if [[ "$box" != "main" ]] && ! _validate_box_name "$box"; then
+    error "Invalid box name: ${BOLD}${box}${RESET}" >&2
+    echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars.${RESET}" >&2
+    return 1
+  fi
+  printf '%s\t%s\n' "$proj" "$box"
+}
 
 cmd_trust() {
   # Flag parsing
@@ -7745,8 +7795,9 @@ cmd_trust() {
     case "$1" in
       --list) list_mode=1; shift ;;
       --help|-h)
-        echo "Usage: cleat trust [path]      Record trust for a project's .cleat"
-        echo "       cleat trust --list      List all trusted projects"
+        echo "Usage: cleat trust [path] [box]   Record trust for a project's .cleat"
+        echo "       cleat trust [box]           Trust a box of the current project"
+        echo "       cleat trust --list          List all trusted projects and boxes"
         return 0 ;;
       *) pos_args+=("$1"); shift ;;
     esac
@@ -7788,43 +7839,56 @@ cmd_trust() {
     return 0
   fi
 
-  # Record trust for a specific project (default: current dir)
-  local project
-  project="$(resolve_project "${pos_args[0]:-}")"
-  if [[ ! -f "$project/.cleat" ]]; then
-    error "No .cleat file found in ${BOLD}${project}${RESET}"
-    echo -e "    ${DIM}Nothing to trust. This project has no per-project capability config.${RESET}"
+  # Record trust for a specific (project, box). Default: current dir, main box.
+  local _t project box
+  _t="$(_trust_target "${pos_args[@]+"${pos_args[@]}"}")" || exit 1
+  project="${_t%%$'\t'*}"
+  box="${_t#*$'\t'}"
+  _BOX="$box"
+  # A named box uses .cleat.<box> when present, else falls back to .cleat: the
+  # same file resolve_caps would prompt for at `cleat run <box>`, so trusting
+  # here records the byte-identical trust row (see _project_caps_file).
+  local caps_file caps_base
+  caps_file="$(_project_caps_file "$project" "$box")"
+  caps_base="$(basename "$caps_file")"
+  if [[ ! -f "$caps_file" ]]; then
+    error "No ${caps_base} file found in ${BOLD}${project}${RESET}"
+    echo -e "    ${DIM}Nothing to trust. This box has no capability config.${RESET}"
     exit 1
   fi
   local hash
-  hash="$(_hash_cleat_caps "$project/.cleat")"
+  hash="$(_hash_cleat_caps "$caps_file")"
   # An explicit `cleat trust` approves the whole file the user is looking
   # at: caps and [setup] both, separate consent classes (concept/16). A
   # caps-less file with a [setup] section is still approvable: setup trust
   # records as a 4th trust-file column, "-" standing in for the caps hash.
   local setup_payload setup_rc=0
-  setup_payload="$(_build_setup_payload "$project" main)" || setup_rc=$?
+  setup_payload="$(_build_setup_payload "$project" "$box")" || setup_rc=$?
   if [[ $setup_rc -ne 0 ]]; then
     # _build_setup_payload already warned about the specific bad directive.
     warn "Project [setup] is invalid, not approved ${DIM}(see the warning above)${RESET}"
     setup_payload=""
   fi
   if [[ -z "$hash" && -z "$setup_payload" ]]; then
-    error "Project .cleat has no capabilities or setup commands to trust"
+    error "Project ${caps_base} has no capabilities or setup commands to trust"
     exit 1
   fi
   local setup_hash="" setup_count=""
   if [[ -n "$setup_payload" ]]; then
     setup_hash="$(_setup_payload_hash "$setup_payload")"
-    setup_count="$(_read_setup_from_file "$project/.cleat" | wc -l | tr -d ' ')"
-    _trust_record "$project" "$hash" main "$setup_hash" || exit 1
-  elif ! _trust_record "$project" "$hash"; then
+    setup_count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+    _trust_record "$project" "$hash" "$box" "$setup_hash" || exit 1
+  elif ! _trust_record "$project" "$hash" "$box"; then
     exit 1
   fi
-  success "Trusted ${BOLD}${project}${RESET}"
+  if [[ "$box" == "main" ]]; then
+    success "Trusted ${BOLD}${project}${RESET}"
+  else
+    success "Trusted ${BOLD}${project}${RESET} ${DIM}[${box}]${RESET}"
+  fi
   if [[ -n "$hash" ]]; then
     local caps
-    caps="$(_read_caps_from_file "$project/.cleat" | _canonical_caps)"
+    caps="$(_read_caps_from_file "$caps_file" | _canonical_caps)"
     echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$caps")${RESET}"
   fi
   if [[ -n "$setup_payload" ]]; then
@@ -7835,18 +7899,28 @@ cmd_trust() {
 cmd_untrust() {
   case "${1:-}" in
     --help|-h)
-      echo "Usage: cleat untrust [path]    Remove trust for a project"
+      echo "Usage: cleat untrust [path] [box]   Remove trust for a project"
+      echo "       cleat untrust [box]           Untrust a box of the current project"
       return 0 ;;
   esac
-  local project
-  project="$(resolve_project "${1:-}")"
+  local -a pos_args=()
+  while [[ $# -gt 0 ]]; do pos_args+=("$1"); shift; done
+  local _t project box
+  _t="$(_trust_target "${pos_args[@]+"${pos_args[@]}"}")" || exit 1
+  project="${_t%%$'\t'*}"
+  box="${_t#*$'\t'}"
+  _BOX="$box"
+  # A trust row (any column) counts as trusted: a setup-only row has "-" in the
+  # caps column, which _trust_lookup returns non-empty, so it's detected here.
   local had
-  had="$(_trust_lookup "$project")"
-  _trust_remove "$project"
+  had="$(_trust_lookup "$project" "$box")"
+  _trust_remove "$project" "$box"
+  local suffix=""
+  [[ "$box" != "main" ]] && suffix=" ${DIM}[${box}]${RESET}"
   if [[ -n "$had" ]]; then
-    success "Removed trust for ${BOLD}${project}${RESET}"
+    success "Removed trust for ${BOLD}${project}${RESET}${suffix}"
   else
-    info "${project} was not trusted"
+    info "${project}${suffix} was not trusted"
   fi
 }
 

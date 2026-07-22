@@ -272,6 +272,35 @@ cleat_bin_timeout() {
   assert_output --partial "No .cleat file"
 }
 
+@test "smoke: cleat trust <box> records a per-box trust row" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
+  printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat.web"
+  cd "$TEST_TEMP/proj"
+  run cleat_bin trust web
+  assert_success
+  assert_output --partial "[web]"
+  run cleat_bin trust --list
+  assert_success
+  assert_output --partial "[web]"
+}
+
+@test "smoke: cleat untrust <box> removes only that box, main survives" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
+  printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat.web"
+  cd "$TEST_TEMP/proj"
+  cleat_bin trust >/dev/null
+  cleat_bin trust web >/dev/null
+  run cleat_bin untrust web
+  assert_success
+  assert_output --partial "Removed trust"
+  assert_output --partial "[web]"
+  run cleat_bin trust --list
+  assert_success
+  assert_output --partial "$TEST_TEMP/proj"
+}
+
 @test "smoke: cleat start with --trust-project auto-approves project .cleat" {
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\nenv\n' > "$TEST_TEMP/proj/.cleat"

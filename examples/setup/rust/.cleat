@@ -1,0 +1,15 @@
+# Rust toolchain for a Cleat box, split across two scripts.
+#
+# A [setup] section can list as many `script <path>` directives as you like,
+# mixed with inline commands, in any order. Each script is inlined at its
+# position, so they run top to bottom as one payload. Splitting a long setup
+# into focused files keeps each one readable and reusable. Here: install the
+# toolchain first, then the extra cargo tools on top of it.
+
+[caps]
+git
+
+[setup]
+script ./scripts/toolchain.sh
+script ./scripts/tools.sh
+echo "Rust box ready: $(rustc --version)"

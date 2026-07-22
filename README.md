@@ -357,9 +357,10 @@ run `cleat rm && cleat`.
 #### Workspace trust
 | Command | Description |
 |---|---|
-| `cleat trust [path]` | Record approval for a project's `.cleat` capabilities |
-| `cleat trust --list` | List trusted projects (yellow = `.cleat` changed since approval) |
-| `cleat untrust [path]` | Remove a project's trust entry |
+| `cleat trust [path] [box]` | Record approval for a project's (or a box's) `.cleat` capabilities and `[setup]` |
+| `cleat trust [box]` | Trust a box of the current project (a lone valid box name) |
+| `cleat trust --list` | List trusted projects and boxes (yellow = config changed since approval) |
+| `cleat untrust [path] [box]` | Remove a project's (or a box's) trust entry |
 
 #### Kits
 | Command | Description |
@@ -548,7 +549,7 @@ cleat --trust-project                 # one-off session flag, caps only
 CLEAT_TRUST_PROJECT=1 cleat           # env var (same effect)
 cleat --trust-setup                   # one-off session flag, [setup] commands only
 CLEAT_TRUST_SETUP=1 cleat             # env var (same effect)
-cleat trust                           # persist for this project, once (caps and setup, main box)
+cleat trust                           # persist for this project, once (caps and setup)
 ```
 
 #### Subcommands
@@ -556,7 +557,9 @@ cleat trust                           # persist for this project, once (caps and
 ```bash
 cleat trust                  # trust the current dir's .cleat
 cleat trust ~/proj           # trust a specific project
-cleat trust --list           # show all trusted projects
+cleat trust web              # trust the current project's "web" box (.cleat.web)
+cleat trust --list           # show all trusted projects and boxes
+cleat untrust web            # untrust just the "web" box
 cleat untrust ~/proj         # remove a project's trust entry
 ```
 
@@ -587,13 +590,17 @@ sudo apt-get update
 sudo apt-get install -y dotnet-sdk-8.0
 ```
 
-A `script <path>` line inlines a project-relative script file at that
-position instead of writing commands inline.
+A `script <path>` line inlines a project-relative script file at that position
+instead of writing commands inline. List as many `script` directives as you
+like, mixed with inline commands, in any order. Copy-paste examples live in
+[`examples/setup/`](examples/setup): `dotnet` (inline commands), `python` (one
+script file) and `rust` (two script files).
 
 Setup trust is separate from capability trust. `CLEAT_TRUST_SETUP=1` (or
 `--trust-setup`) approves it non-interactively, `cleat trust` approves both
-caps and setup together for the main box and editing `[setup]` re-prompts
-without ever recreating the container.
+caps and setup together and editing `[setup]` re-prompts without ever
+recreating the container. Trust is per (project, box): `cleat trust <box>`
+approves that box's `.cleat.<box>`.
 
 A failed command prints its exit code and the box still opens. Fix `.cleat`
 or the box, then retry with `cleat setup`.

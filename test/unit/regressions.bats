@@ -2747,3 +2747,25 @@ EOF
   tabs="$(printf '%s' "$row" | tr -cd '\t' | wc -c | tr -d ' ')"
   [[ "$tabs" == "2" ]] || { echo "tab count: $tabs (row: $row)"; return 1; }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.5: the [setup] consent preview renders repo-controlled payload lines
+# through echo -e (see _setup_trust_prompt / _sanitize_repo_str), and a lone
+# carriage return (0x0d) rewinds the cursor to column 0. A payload line
+# carrying a raw CR could overwrite what the user already read on that
+# terminal row with different text, hiding what actually runs behind what
+# looks like the approved preview. Guard: CR is in the stripped control-byte
+# set, so it never reaches echo -e in the first place.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.2.5: [setup] consent preview neutralizes a carriage return" {
+  local cr payload
+  cr="$(printf '\r')"
+  payload="$(printf 'echo REAL%secho FAKE' "$cr")"
+  run _setup_trust_prompt "$TEST_TEMP/proj" "$payload" 1 <<< "n"
+  assert_output --partial "echo REAL"
+  assert_output --partial "echo FAKE"
+  # No other rendered text in this prompt legitimately carries a raw CR (the
+  # CLI's own color codes are ESC-based, never CR), so a blanket refute is
+  # safe here, unlike the ESC checks elsewhere which must stay scoped.
+  refute_output --partial "$cr"
+}

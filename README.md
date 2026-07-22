@@ -383,7 +383,8 @@ run `cleat rm && cleat`.
 | `--env KEY=VALUE` | Pass environment variable to container |
 | `--env KEY` | Inherit from host environment |
 | `--env-file PATH` | Load env vars from file |
-| `--trust-project` | Auto-approve the current project's `.cleat` without prompting |
+| `--trust-project` | Auto-approve the current project's `.cleat` caps without prompting |
+| `--trust-setup` | Auto-approve the current project's `[setup]` provisioning without prompting |
 | `--desc <text>` | Set the box's description at start (host-side, never recreates) |
 
 #### Interact
@@ -547,7 +548,7 @@ cleat --trust-project                 # one-off session flag, caps only
 CLEAT_TRUST_PROJECT=1 cleat           # env var (same effect)
 cleat --trust-setup                   # one-off session flag, [setup] commands only
 CLEAT_TRUST_SETUP=1 cleat             # env var (same effect)
-cleat trust                           # persist for this project, once (caps and setup)
+cleat trust                           # persist for this project, once (caps and setup, main box)
 ```
 
 #### Subcommands
@@ -591,8 +592,8 @@ position instead of writing commands inline.
 
 Setup trust is separate from capability trust. `CLEAT_TRUST_SETUP=1` (or
 `--trust-setup`) approves it non-interactively, `cleat trust` approves both
-caps and setup together and editing `[setup]` re-prompts without ever
-recreating the container.
+caps and setup together for the main box and editing `[setup]` re-prompts
+without ever recreating the container.
 
 A failed command prints its exit code and the box still opens. Fix `.cleat`
 or the box, then retry with `cleat setup`.

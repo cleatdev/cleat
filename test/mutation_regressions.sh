@@ -2775,7 +2775,7 @@ try "vnext_kit_pane_fits" "fits the picker detail pane" "$CLI" "$KITS_BATS"
 # strip-bytes assertion must fail.
 cat > "$SED_TMP" << 'SED'
 /^_sanitize_repo_str()/,/^}$/{
-s/ | LC_ALL=C tr -d '\\000-\\010\\013\\014\\016-\\037\\177'//
+s/ | LC_ALL=C tr -d '\\000-\\010\\013-\\037\\177\\200-\\237'//
 }
 SED
 try "vnext_setup_sanitize_strip_ctrl" "strips raw ESC, BEL, and DEL bytes" "$CLI" "$PROVISION_BATS"
@@ -2856,11 +2856,11 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_setup_symlink_reject" "symlinked script file" "$CLI" "$PROVISION_BATS"
 
-# NO SILENT PARTIAL RUNS: the payload must execute under `bash -e -s`, so one
-# failing command aborts the rest instead of silently running the remaining
-# lines. Drop -e: the exec-line assertion must fail.
+# NO SILENT PARTIAL RUNS: the staged payload must execute under `bash -e`, so
+# one failing command aborts the rest instead of silently running the
+# remaining lines. Drop -e: the exec-line assertion must fail.
 cat > "$SED_TMP" << 'SED'
-s/runuser -u coder -- bash -e -s || rc=\$?/runuser -u coder -- bash -s || rc=$?/
+s/runuser -u coder -- bash -e "\$runfile"/runuser -u coder -- bash "$runfile"/
 SED
 try "vnext_setup_exec_no_errexit" "executes the payload as coder" "$CLI" "$PROVISION_BATS"
 
@@ -2881,6 +2881,33 @@ cat > "$SED_TMP" << 'SED'
 s@printf '%s\\t%s\\t%s\\n' "\$project" "\$box" "\$hash"@printf '%s\\t%s\\t%s\\t-\\n' "\$project" "\$box" "\$hash"@
 SED
 try "vnext_setup_trust_record_3col" "keep the exact 3-column format"
+
+# CR GAP: _sanitize_repo_str's stripped control-byte range must include
+# carriage return (0x0d), otherwise a repo-controlled [setup] payload line
+# can rewind the terminal cursor and overwrite what the consent preview
+# already showed. Reintroduce the old gap by splitting the \013-\037 range
+# back into \013\014\016-\037 (skipping \015, octal for CR): the CR-neutralize
+# regression must fail.
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+s/\\013-\\037/\\013\\014\\016-\\037/
+}
+SED
+try "v1.2.5_setup_sanitize_cr_gap" "neutralizes a carriage return" "$CLI" "$REGRESSIONS"
+
+# INTERACTIVE CAPS-APPROVAL COL4: the interactive-accept branch of
+# _resolve_project_trust must pass the existing [setup] hash through as
+# _trust_record's 4th arg, so approving caps at the TTY prompt never drops a
+# prior setup approval. Drop the 4th arg on that specific call (anchored on
+# its own comment so the CLEAT_TRUST_PROJECT=1 opt-in branch above, which
+# shares the identical call shape, is left untouched): the col4-preservation
+# assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/see the opt-in branch/,/_trust_record/{
+s/_trust_record "\$project" "\$hash" "\$box" "\$(_trust_lookup_setup "\$project" "\$box")" || true/_trust_record "\$project" "\$hash" "\$box" || true/
+}
+SED
+try "vnext_trust_interactive_col4_preserve" "interactive caps-approval" "$CLI" "$PROVISION_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

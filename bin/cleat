@@ -191,12 +191,16 @@ _ask_yn() {
 
 # Repo-controlled text (cap names, .cleat lines, section names) is rendered
 # via echo -e (colors above are literal escape strings), so echo -e is
-# load-bearing: raw C0 control bytes AND backslash escapes in that text are
-# both terminal-injection vectors once they reach it. Strip control bytes
-# (keeping tab) and double backslashes so echo -e can't interpret anything
-# attacker-supplied. Sanitize at every render site for repo-controlled text.
+# load-bearing: raw control bytes AND backslash escapes in that text are
+# both terminal-injection vectors once they reach it. Strip every control
+# byte except tab (0x09) and newline (0x0a) and double backslashes so
+# echo -e can't interpret anything attacker-supplied. The stripped set is
+# C0 0x00-0x08 and 0x0b-0x1f (this INCLUDES carriage return 0x0d: a lone CR
+# rewinds the cursor to column 0, so a preview line could overwrite itself
+# and hide what actually runs), DEL 0x7f, and C1 0x80-0x9f. Sanitize at
+# every render site for repo-controlled text.
 _sanitize_repo_str() {
-  printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | sed 's/\\/\\\\/g'
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177\200-\237' | sed 's/\\/\\\\/g'
 }
 
 # ── Spinner ────────────────────────────────────────────────────────────────
@@ -2543,6 +2547,12 @@ _SETUP_TRUSTED=0
 # exit status; session callers ignore it.
 _SETUP_LAST_RC=0
 
+# Containers whose [setup] payload _maybe_run_setup has already attempted to
+# run this process (pipe-delimited, bash 3.2-safe accumulator). Guards the
+# recreate-funnel double-run where a failed payload leaves no marker; see
+# _maybe_run_setup. Force runs (the `cleat setup` verb) ignore it.
+_SETUP_ATTEMPTED=""
+
 # Decide whether to apply a project's .cleat caps. Sets _TRUST_SESSION_* on
 # first call for a given project. Returns 0 = apply, 1 = skip.
 # $1 = project path (must have a .cleat with caps; caller's responsibility).
@@ -2640,11 +2650,20 @@ _resolve_setup_trust() {
   [[ -f "$caps_file" ]] || return 0
 
   local payload
-  if ! payload="$(_build_setup_payload "$project" "$box")"; then
+  if [[ "$mode" == "readonly" ]]; then
+    # Read-only contexts (cleat status) stay fully silent, so swallow the
+    # builder's diagnostic about a bad script directive too. cleat setup
+    # --show re-surfaces the specific error loudly itself.
+    if ! payload="$(_build_setup_payload "$project" "$box" 2>/dev/null)"; then
+      return 0
+    fi
+  else
     # _build_setup_payload already warned about the specific bad directive.
     # A broken [setup] section skips provisioning loudly, it never aborts
     # the session.
-    return 0
+    if ! payload="$(_build_setup_payload "$project" "$box")"; then
+      return 0
+    fi
   fi
   [[ -z "$payload" ]] && return 0
   _SETUP_DECLARED=1
@@ -2697,7 +2716,7 @@ _resolve_setup_trust() {
       _SETUP_TRUSTED=1
       return 0
     else
-      warn "Project [setup] skipped, not approved ${DIM}(box starts without provisioning)${RESET}"
+      warn "Project [setup] skipped, not approved ${DIM}(box starts without provisioning; approve later with cleat setup)${RESET}"
       _SETUP_SESSION_DECISION="rejected"
       _SETUP_SESSION_PROJECT="$project"
       _SETUP_SESSION_BOX="$box"
@@ -4594,6 +4613,18 @@ _maybe_run_setup() {
   [[ "${_SETUP_TRUSTED:-0}" == "1" ]] || return 0  # resolve_caps already messaged any skip
   is_running "$cname" || return 0
 
+  # A single invocation can reach this twice for one container: cmd_start's
+  # stale-mount branch recreates via cmd_run (which runs setup) then falls
+  # through to cmd_start's own post-start call. A success writes the marker
+  # so the second call is a silent no-op, but a FAILED run leaves no marker,
+  # so without this guard the failing payload would run and warn twice. The
+  # explicit verb (force=1) always runs.
+  if [[ "$force" != "1" ]]; then
+    case "$_SETUP_ATTEMPTED" in
+      *"|$cname|"*) return 0 ;;
+    esac
+  fi
+
   # TOCTOU close: rebuild the payload from disk right now and re-hash it, so
   # the bytes that run are byte-identical to what was approved, never a
   # rewrite an in-box agent made to /workspace/.cleat between approval (in
@@ -4623,19 +4654,30 @@ _maybe_run_setup() {
   fi
 
   _wait_for_coder_remap "$cname"
+  _SETUP_ATTEMPTED="${_SETUP_ATTEMPTED}|$cname|"
 
   local caps_file count
   caps_file="$(_project_caps_file "$project" "$box")"
   count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
   info "Running project setup ${DIM}(${count} command(s), [setup] in $(basename "$caps_file"))${RESET}"
 
-  # Use `runuser -u coder` rather than `docker exec --user coder`: see the
-  # rationale next to exec_claude's session exec (docker exec --user skips
-  # initgroups(3), so supplementary groups like the docker socket's owning
-  # group never load).
+  # Stage the payload into a file in the box, then run that file rather than
+  # feeding it on stdin. Two reasons, both about correctness of the exit
+  # code: (1) a setup command that itself reads stdin (ssh, apt without -y,
+  # any `read`) would otherwise swallow the rest of the script off the same
+  # pipe; (2) a large payload where the in-box bash exits before draining
+  # the pipe would SIGPIPE the feeder, and pipefail would report that 141 as
+  # the run's status even on success. The run exec omits -i so the script's
+  # stdin is closed (EOF), decoupling command stdin from the script source.
+  # `runuser -u coder` (not docker exec --user): see exec_claude's rationale
+  # (--user skips initgroups(3), so supplementary groups never load).
+  local runfile="/home/coder/.cleat-setup.run"
+  docker exec "$cname" runuser -u coder -- rm -f "$runfile" >/dev/null 2>&1 || true
+  printf '%s' "$payload" | docker exec -i "$cname" runuser -u coder -- tee "$runfile" >/dev/null 2>&1 || true
   local rc=0
-  printf '%s' "$payload" | docker exec -i -e HOME=/home/coder -w /workspace "$cname" \
-    runuser -u coder -- bash -e -s || rc=$?
+  docker exec -e HOME=/home/coder -w /workspace "$cname" \
+    runuser -u coder -- bash -e "$runfile" || rc=$?
+  docker exec "$cname" runuser -u coder -- rm -f "$runfile" >/dev/null 2>&1 || true
 
   if [[ $rc -eq 0 ]]; then
     printf '%s\n' "$hash" | docker exec -i "$cname" runuser -u coder -- tee /home/coder/.cleat-setup-applied >/dev/null 2>&1 || true
@@ -6197,6 +6239,10 @@ cmd_shell() {
   require_running "$cname"
   _wait_for_coder_remap "$cname"
   resolve_caps "$project"
+  # resolve_caps may have just prompted for and approved [setup]; honor it
+  # here so entering the box actually provisions (a no-op once the marker is
+  # written). Without this the prompt would show but nothing would run.
+  _maybe_run_setup "$cname" "$project" "$box" || true
   resolve_env_args "$project"
   _ensure_docker_access "$cname"
 
@@ -6244,6 +6290,9 @@ cmd_login() {
   require_running "$cname"
   _wait_for_coder_remap "$cname"
   resolve_caps "$project"
+  # Honor a just-approved [setup] so the login prompt to approve it is not
+  # shown without effect (no-op once the marker is written).
+  _maybe_run_setup "$cname" "$project" "$box" || true
   resolve_env_args "$project"
   info "Authenticating with your Anthropic team account..."
 
@@ -8554,9 +8603,12 @@ cmd_setup() {
   if [[ "${_SETUP_DECLARED:-0}" != "1" ]]; then
     # _SETUP_DECLARED stays 0 both when the section is absent and when a
     # `script` directive is invalid: tell those apart here so the explicit
-    # verb doesn't claim "no section" over a broken one.
+    # verb doesn't claim "no section" over a broken one. --show resolves in
+    # readonly mode, which silences the builder, so rebuild loudly here to
+    # surface the specific directive error the user needs.
     if [[ -n "$(_read_setup_from_file "$caps_file")" ]]; then
-      error "Project [setup] is invalid ${DIM}(see the warning above)${RESET}"
+      _build_setup_payload "$project" "$box" >/dev/null || true
+      error "Project [setup] is invalid"
       exit 1
     fi
     info "No [setup] section in $(basename "$caps_file")"

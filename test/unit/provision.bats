@@ -356,6 +356,25 @@ _th_record_setup() {
   [[ "$cols" == "3" ]] || { echo "expected 3 columns, got $cols"; return 1; }
 }
 
+@test "trust store: interactive caps-approval preserves an existing [setup] col4" {
+  printf '[caps]\ndocker\n\n[setup]\necho hi\n' > "$PROJECT/.cleat"
+  local setup_hash
+  setup_hash="$(_th_record_setup "$PROJECT" main)"
+  unset CLEAT_TRUST_PROJECT
+  _is_tty() { return 0; }
+  resolve_caps "$PROJECT" <<< "y" >/dev/null 2>&1
+  run _trust_lookup_setup "$PROJECT" main
+  assert_output "$setup_hash"
+}
+
+@test "trust store: a per-box setup hash is not visible to the main box" {
+  _trust_record "/p" "" dev "devhash"
+  run _trust_lookup_setup "/p" main
+  assert_output ""
+  run _trust_lookup_setup "/p" dev
+  assert_output "devhash"
+}
+
 # ── 4. _resolve_setup_trust ─────────────────────────────────────────────────
 
 @test "resolve_setup_trust: a caps-only file never declares [setup]" {
@@ -466,6 +485,18 @@ _th_record_setup() {
   [[ "$second" != *"wants to run"* ]] || { echo "re-prompted: $second"; return 1; }
 }
 
+@test "resolve_setup_trust: a declined [setup] is not re-prompted in the same process (rejected session cache)" {
+  printf '[setup]\necho hi\n' > "$PROJECT/.cleat"
+  unset CLEAT_TRUST_SETUP
+  _is_tty() { return 0; }
+  resolve_caps "$PROJECT" <<< "n" >/dev/null 2>&1
+  [[ "$_SETUP_TRUSTED" == "0" ]] || { echo "trusted=$_SETUP_TRUSTED"; return 1; }
+  local second
+  second="$(resolve_caps "$PROJECT" 2>&1)"
+  [[ "$second" != *"wants to run"* ]] || { echo "re-prompted: $second"; return 1; }
+  [[ "$second" != *"skipped, not approved"* ]] || { echo "re-warned: $second"; return 1; }
+}
+
 @test "resolve_setup_trust: rewriting [setup] mid-process invalidates the hash-bound session cache" {
   printf '[setup]\necho hi\n' > "$PROJECT/.cleat"
   export CLEAT_TRUST_SETUP=1
@@ -547,14 +578,14 @@ _th_record_setup() {
   run _maybe_run_setup "$CNAME" "$PROJECT" main
   assert_success
   run docker_exec_calls
-  refute_output --partial "bash -e -s"
+  refute_output --partial "bash -e /home/coder/.cleat-setup.run"
 
   # Case 2: declared but untrusted.
   _SETUP_DECLARED=1; _SETUP_TRUSTED=0
   run _maybe_run_setup "$CNAME" "$PROJECT" main
   assert_success
   run docker_exec_calls
-  refute_output --partial "bash -e -s"
+  refute_output --partial "bash -e /home/coder/.cleat-setup.run"
 
   # Case 3: declared, genuinely trusted, but the container isn't running.
   _th_record_setup "$PROJECT" main >/dev/null
@@ -563,7 +594,7 @@ _th_record_setup() {
   run _maybe_run_setup "$CNAME" "$PROJECT" main
   assert_success
   run docker_exec_calls
-  refute_output --partial "bash -e -s"
+  refute_output --partial "bash -e /home/coder/.cleat-setup.run"
 }
 
 @test "maybe_run_setup: execution is gated on the trust file's stored hash, not merely on the caller's flags" {
@@ -577,7 +608,7 @@ _th_record_setup() {
   assert_success
   assert_output --partial "changed since it was approved"
   run docker_exec_calls
-  refute_output --partial "bash -e -s"
+  refute_output --partial "bash -e /home/coder/.cleat-setup.run"
 }
 
 @test "maybe_run_setup: trusted with no run-once marker executes the payload as coder" {
@@ -587,9 +618,9 @@ _th_record_setup() {
   mock_docker_ps "$CNAME"
   run _maybe_run_setup "$CNAME" "$PROJECT" main
   assert_success
-  run assert_docker_exec_has "-i -e HOME=/home/coder -w /workspace"
+  run assert_docker_exec_has "-e HOME=/home/coder -w /workspace"
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
 }
 
@@ -611,7 +642,7 @@ _th_record_setup() {
   run _maybe_run_setup "$CNAME" "$PROJECT" main
   assert_success
   run docker_exec_calls
-  refute_output --partial "bash -e -s"
+  refute_output --partial "bash -e /home/coder/.cleat-setup.run"
 }
 
 @test "maybe_run_setup: a run-once marker for a different hash re-executes" {
@@ -630,7 +661,7 @@ _th_record_setup() {
   }
   run _maybe_run_setup "$CNAME" "$PROJECT" main
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
 }
 
@@ -641,7 +672,7 @@ _th_record_setup() {
   mock_docker_ps "$CNAME"
   run _maybe_run_setup "$CNAME" "$PROJECT" main 1
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
   run docker_exec_calls
   refute_output --partial "cat /home/coder/.cleat-setup-applied"
@@ -665,7 +696,7 @@ _th_record_setup() {
   _SETUP_DECLARED=1; _SETUP_TRUSTED=1
   mock_docker_ps "$CNAME"
   docker() {
-    [[ "$1" == "exec" && "$*" == *"bash -e -s"* ]] && return 5
+    [[ "$1" == "exec" && "$*" == *"bash -e /home/coder/.cleat-setup.run"* ]] && return 5
     command docker "$@"
   }
   _maybe_run_setup "$CNAME" "$PROJECT" main > "$TEST_TEMP/out.txt" 2>&1
@@ -689,7 +720,7 @@ _th_record_setup() {
   assert_success
   assert_output --partial "changed since it was approved"
   run docker_exec_calls
-  refute_output --partial "bash -e -s"
+  refute_output --partial "bash -e /home/coder/.cleat-setup.run"
 }
 
 # ── 7. Integration points ───────────────────────────────────────────────────
@@ -727,7 +758,7 @@ _th_record_setup() {
   }
   run cmd_run "$PROJECT"
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
 }
 
@@ -740,7 +771,7 @@ _th_record_setup() {
   mock_docker_ps_a "$CNAME"
   run cmd_start "$PROJECT"
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
 }
 
@@ -753,7 +784,7 @@ _th_record_setup() {
   mock_docker_ps_a "$CNAME"
   run cmd_resume "$PROJECT"
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
 }
 
@@ -765,7 +796,7 @@ _th_record_setup() {
   mock_docker_ps_a "$CNAME"
   run cmd_claude "$PROJECT"
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
 }
 
@@ -839,6 +870,63 @@ _th_record_setup() {
   refute_output --partial "pending approval"
 }
 
+@test "cmd_setup --show: reports 'unknown (box not running)' when the box is down" {
+  printf '[setup]\necho hi\n' > "$PROJECT/.cleat"
+  _th_record_setup "$PROJECT" main >/dev/null
+  run cmd_setup --show
+  assert_success
+  assert_output --partial "unknown (box not running)"
+}
+
+@test "cmd_setup --show: reports 'applied' when the in-box marker matches" {
+  printf '[setup]\necho hi\n' > "$PROJECT/.cleat"
+  local hash
+  hash="$(_th_record_setup "$PROJECT" main)"
+  mock_docker_ps "$CNAME"
+  docker() {
+    if [[ "$1" == "exec" ]]; then
+      local a
+      for a in "$@"; do
+        [[ "$a" == "/home/coder/.cleat-setup-applied" ]] && { printf '%s' "$hash"; return 0; }
+      done
+    fi
+    command docker "$@"
+  }
+  run cmd_setup --show
+  assert_success
+  assert_output --partial "Marker:"
+  assert_output --partial "applied"
+  refute_output --partial "not applied"
+}
+
+@test "cmd_setup --show: reports 'not applied' when the in-box marker differs" {
+  printf '[setup]\necho hi\n' > "$PROJECT/.cleat"
+  _th_record_setup "$PROJECT" main >/dev/null
+  mock_docker_ps "$CNAME"
+  docker() {
+    if [[ "$1" == "exec" ]]; then
+      local a
+      for a in "$@"; do
+        [[ "$a" == "/home/coder/.cleat-setup-applied" ]] && { printf 'stale-marker'; return 0; }
+      done
+    fi
+    command docker "$@"
+  }
+  run cmd_setup --show
+  assert_success
+  assert_output --partial "not applied"
+}
+
+@test "cmd_setup: <box> --show reads the box's .cleat.<box>" {
+  printf '[setup]\necho from-main\n' > "$PROJECT/.cleat"
+  printf '[setup]\necho from-dev-unique\n' > "$PROJECT/.cleat.dev"
+  run cmd_setup dev --show
+  assert_success
+  assert_output --partial ".cleat.dev"
+  assert_output --partial "echo from-dev-unique"
+  refute_output --partial "from-main"
+}
+
 @test "cmd_setup: run mode on a stopped box requires the box to be running" {
   printf '[setup]\necho hi\n' > "$PROJECT/.cleat"
   run cmd_setup
@@ -862,7 +950,7 @@ _th_record_setup() {
   _is_tty() { return 1; }
   run cmd_setup
   assert_success
-  run assert_docker_exec_has "runuser -u coder -- bash -e -s"
+  run assert_docker_exec_has "runuser -u coder -- bash -e /home/coder/.cleat-setup.run"
   assert_success
 }
 
@@ -872,7 +960,7 @@ _th_record_setup() {
   export CLEAT_TRUST_SETUP=1
   _is_tty() { return 1; }
   docker() {
-    [[ "$1" == "exec" && "$*" == *"bash -e -s"* ]] && return 7
+    [[ "$1" == "exec" && "$*" == *"bash -e /home/coder/.cleat-setup.run"* ]] && return 7
     command docker "$@"
   }
   run cmd_setup
@@ -1007,4 +1095,56 @@ _th_record_setup() {
 @test "sanitize_repo_str: leaves normal text untouched" {
   run _sanitize_repo_str "plain text, nothing special 123"
   assert_output "plain text, nothing special 123"
+}
+
+@test "print_caps: sanitizes an injected control sequence in the single-category caps line" {
+  local cap esc
+  esc="$(printf '\x1b')"
+  cap="$(printf '\x1bBADESC\\033TAIL')"
+  ACTIVE_CAPS=("$cap")
+  run _print_caps "  " "Caps:" "      "
+  # The rendered line legitimately contains OTHER raw ESC bytes (the CLI's
+  # own color codes), so check the specific injected sequence, not any ESC.
+  assert_output --partial "BADESC"
+  refute_output --partial "${esc}BADESC"
+  assert_output --partial "033"
+}
+
+@test "print_caps: sanitizes the mount row when caps split into mount and sandbox categories" {
+  local cap esc
+  esc="$(printf '\x1b')"
+  cap="$(printf '\x1bBADESC\\033TAIL')"
+  ACTIVE_CAPS=("docker" "$cap")
+  run _print_caps "  " "Caps:" "      "
+  assert_output --partial "mount:"
+  assert_output --partial "sandbox:"
+  assert_output --partial "BADESC"
+  refute_output --partial "${esc}BADESC"
+  assert_output --partial "033"
+}
+
+@test "cmd_status: sanitizes an injected control sequence in the caps display" {
+  local cap esc
+  esc="$(printf '\x1b')"
+  cap="$(printf '\x1bBADESC\\033TAIL')"
+  printf '[caps]\n%s\n' "$cap" > "$PROJECT/.cleat"
+  local h
+  h="$(_hash_cleat_caps "$PROJECT/.cleat")"
+  _trust_record "$PROJECT" "$h" main
+  run cmd_status "$PROJECT"
+  assert_output --partial "BADESC"
+  refute_output --partial "${esc}BADESC"
+  assert_output --partial "033"
+}
+
+@test "cmd_trust: sanitizes an injected control sequence in the Approved caps line" {
+  local cap esc
+  esc="$(printf '\x1b')"
+  cap="$(printf '\x1bBADESC\\033TAIL')"
+  printf '[caps]\n%s\n' "$cap" > "$PROJECT/.cleat"
+  run cmd_trust
+  assert_success
+  assert_output --partial "BADESC"
+  refute_output --partial "${esc}BADESC"
+  assert_output --partial "033"
 }

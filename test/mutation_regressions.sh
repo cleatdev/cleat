@@ -55,6 +55,7 @@ AUTOSTART_BATS="$REPO_ROOT/test/unit/autostart.bats"
 SMOKE_BATS="$REPO_ROOT/test/unit/smoke.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
+PROVISION_BATS="$REPO_ROOT/test/unit/provision.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -2766,6 +2767,120 @@ cat > "$SED_TMP" << 'SED'
 s|_KIT_PANE_LINES=7|_KIT_PANE_LINES=3|
 SED
 try "vnext_kit_pane_fits" "fits the picker detail pane" "$CLI" "$KITS_BATS"
+
+# ── [setup] provisioning (concept/16) ────────────────────────────────────────
+
+# SANITIZER STRIP: _sanitize_repo_str must strip control bytes (ESC/BEL/DEL)
+# before repo-controlled text ever reaches echo -e. Drop the tr -d stage: the
+# strip-bytes assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+s/ | LC_ALL=C tr -d '\\000-\\010\\013\\014\\016-\\037\\177'//
+}
+SED
+try "vnext_setup_sanitize_strip_ctrl" "strips raw ESC, BEL, and DEL bytes" "$CLI" "$PROVISION_BATS"
+
+# SANITIZER BACKSLASH DOUBLING: _sanitize_repo_str must double every
+# backslash so a literal `\033`-style sequence stays literal text once
+# echo -e sees it. Drop the doubling stage: the doubles-backslashes
+# assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+s@ | sed 's/\\\\/\\\\\\\\/g'@@
+}
+SED
+try "vnext_setup_sanitize_double_backslash" "doubles backslashes" "$CLI" "$PROVISION_BATS"
+
+# EXECUTOR RC GATE: _maybe_run_setup must only write the run-once marker and
+# report success when the payload's own exit code is 0. Force the success
+# branch unconditionally: a failing payload would still get the marker and
+# "Setup applied", so the failure-path assertions must fail.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_run_setup()/,/^}$/{
+s/if \[\[ \$rc -eq 0 \]\]; then/if true; then/
+}
+SED
+try "vnext_setup_exec_rc_gate" "records the exit code" "$CLI" "$PROVISION_BATS"
+
+# RUN-ONCE MARKER: a marker matching the current hash must skip
+# re-execution. Delete the equality short-circuit: the payload re-runs every
+# time, so the skip assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_run_setup()/,/^}$/{
+/\[\[ "\$marker" == "\$hash" \]\] && return 0/d
+}
+SED
+try "vnext_setup_marker_noop" "skips re-execution" "$CLI" "$PROVISION_BATS"
+
+# TOCTOU CLOSE: _maybe_run_setup rebuilds and re-hashes the payload from disk
+# right before running it, refusing to run when that fresh hash doesn't
+# match what was approved. Neutralize the guard: a [setup] rewritten between
+# approval and exec would run anyway, so the stale-skip assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_run_setup()/,/^}$/{
+s/\[\[ "\$hash" == "\$stored" \]\] || {/true || {/
+}
+SED
+try "vnext_setup_toctou_guard" "rewritten after approval" "$CLI" "$PROVISION_BATS"
+
+# CONSENT CLASS SEPARATION: _resolve_setup_trust's opt-in check must read
+# CLEAT_TRUST_SETUP, never CLEAT_TRUST_PROJECT (a separate consent class,
+# concept/16). Swap the variable: CLEAT_TRUST_PROJECT=1 alone would then
+# also auto-trust [setup], so the "never [setup]" assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_setup_trust()/,/^}$/{
+s/\${CLEAT_TRUST_SETUP:-}/\${CLEAT_TRUST_PROJECT:-}/
+}
+SED
+try "vnext_setup_optin_var_swap" "auto-trusts caps but never" "$CLI" "$PROVISION_BATS"
+
+# ABSOLUTE PATH REJECTED: _build_setup_payload must refuse a `script` path
+# that starts with `/`. Drop the check: the absolute-path assertion must
+# fail.
+cat > "$SED_TMP" << 'SED'
+/^        case "\$path" in$/,/^        esac$/d
+SED
+try "vnext_setup_abs_path_reject" "absolute script path is refused" "$CLI" "$PROVISION_BATS"
+
+# PARENT ESCAPE REJECTED: _build_setup_payload must refuse a `script` path
+# containing '..'. Drop the check: the dotdot-path assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^        case "\/\$path\/" in$/,/^        esac$/d
+SED
+try "vnext_setup_dotdot_reject" "script path containing" "$CLI" "$PROVISION_BATS"
+
+# SYMLINK REJECTED: _build_setup_payload must refuse a `script` path that is
+# itself a symlink. Drop the check: the symlinked-file assertion must fail.
+cat > "$SED_TMP" << 'SED'
+/^        if \[\[ -L "\$full" \]\]; then$/,/^        fi$/d
+SED
+try "vnext_setup_symlink_reject" "symlinked script file" "$CLI" "$PROVISION_BATS"
+
+# NO SILENT PARTIAL RUNS: the payload must execute under `bash -e -s`, so one
+# failing command aborts the rest instead of silently running the remaining
+# lines. Drop -e: the exec-line assertion must fail.
+cat > "$SED_TMP" << 'SED'
+s/runuser -u coder -- bash -e -s || rc=\$?/runuser -u coder -- bash -s || rc=$?/
+SED
+try "vnext_setup_exec_no_errexit" "executes the payload as coder" "$CLI" "$PROVISION_BATS"
+
+# DEFAULT-DENY PROMPT: _setup_trust_prompt must only approve on an explicit
+# y/Y; empty/EOF/no all decline. Widen the accept case to match everything:
+# the empty-answer/decline assertions must fail.
+cat > "$SED_TMP" << 'SED'
+/^_setup_trust_prompt()/,/^}$/{
+s/\[yY\]\*) return 0 ;;/*) return 0 ;;/
+}
+SED
+try "vnext_setup_prompt_default_deny" "warns 'not approved' and records nothing" "$CLI" "$PROVISION_BATS"
+
+# TRUST ROW SHAPE: a 3-arg _trust_record call (caps-only approval) must keep
+# the legacy 3-column row byte-identical, never growing a 4th column.
+# Corrupt the 3-column printf: the exact-format regression must fail.
+cat > "$SED_TMP" << 'SED'
+s@printf '%s\\t%s\\t%s\\n' "\$project" "\$box" "\$hash"@printf '%s\\t%s\\t%s\\t-\\n' "\$project" "\$box" "\$hash"@
+SED
+try "vnext_setup_trust_record_3col" "keep the exact 3-column format"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

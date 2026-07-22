@@ -121,6 +121,9 @@ _BOX="main"
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 _CLI_TRUST_PROJECT=0
+# Separate consent class from _CLI_TRUST_PROJECT: approving caps never
+# approves [setup] provisioning and vice versa (concept/16).
+_CLI_TRUST_SETUP=0
 _CLI_DESC=""
 _CLI_DESC_SET=0
 # Original argv as `main` received it, used by the CLI self-update preflight to
@@ -184,6 +187,16 @@ _ask_yn() {
   local _reply=""
   read -r _reply || { printf -v "$_var" '%s' 'n'; return 0; }
   printf -v "$_var" '%s' "$_reply"
+}
+
+# Repo-controlled text (cap names, .cleat lines, section names) is rendered
+# via echo -e (colors above are literal escape strings), so echo -e is
+# load-bearing: raw C0 control bytes AND backslash escapes in that text are
+# both terminal-injection vectors once they reach it. Strip control bytes
+# (keeping tab) and double backslashes so echo -e can't interpret anything
+# attacker-supplied. Sanitize at every render site for repo-controlled text.
+_sanitize_repo_str() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | sed 's/\\/\\\\/g'
 }
 
 # ── Spinner ────────────────────────────────────────────────────────────────
@@ -1203,6 +1216,31 @@ _read_caps_from_file() {
   done < "$file"
 }
 
+# Read [setup] provisioning lines from a config file. Exact structural
+# mirror of _read_caps_from_file above, matching the literal "[setup]"
+# header instead: same CRLF strip, whitespace trim, blank/# skip, and
+# no-trailing-newline handling. ANY other `[...]` line turns the section
+# off (INI hazard: a stray `[ -f x ]` test line reads as a header; docs say
+# use `test`, and _warn_unknown_cleat_sections surfaces the mistake).
+_read_setup_from_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local in_setup=false
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == "["*"]" ]]; then
+      [[ "$line" == "[setup]" ]] && in_setup=true || in_setup=false
+      continue
+    fi
+    if $in_setup; then
+      echo "$line"
+    fi
+  done < "$file"
+}
+
 # Write capabilities to a config file. Preserves non-[caps] sections.
 _write_caps_to_file() {
   local file="$1"
@@ -1259,6 +1297,88 @@ _project_caps_file() {
   else
     echo "$project/.cleat"
   fi
+}
+
+# Build the executable [setup] payload for (project, box): stdout is the
+# exact byte stream that will run in the box. This framing (the "# cleat
+# setup: begin/end script <path>" markers) is part of the hashed trust
+# input (see _setup_payload_hash) and is FROZEN once shipped: changing it
+# would silently invalidate every prior approval's byte-exactness.
+# Empty stdout + rc 0 when there's no [setup] section (or no cap file).
+# rc 1 (after a warn to stderr naming the bad directive) on an invalid
+# `script <path>` line; the caller treats that as "skip setup, never abort
+# the session", not a hard failure.
+_build_setup_payload() {
+  local project="$1" box="${2:-main}"
+  local caps_file
+  caps_file="$(_project_caps_file "$project" "$box")"
+  [[ -f "$caps_file" ]] || return 0
+
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "script "*)
+        local path="${line#script }"
+        # Trim surrounding whitespace, then one leading "./".
+        path="${path#"${path%%[![:space:]]*}"}"
+        path="${path%"${path##*[![:space:]]}"}"
+        path="${path#./}"
+        # Repo-controlled text rendered via warn()'s echo -e: sanitize the
+        # display copy, keep the raw path for the actual file operations.
+        local path_disp
+        path_disp="$(_sanitize_repo_str "$path")"
+
+        if [[ -z "$path" ]]; then
+          warn "Project [setup] has an empty script path ${DIM}(script <path>)${RESET}" >&2
+          return 1
+        fi
+        case "$path" in
+          /*)
+            warn "Project [setup] script path must be project-relative: ${BOLD}${path_disp}${RESET}" >&2
+            return 1 ;;
+        esac
+        case "/$path/" in
+          */../*)
+            warn "Project [setup] script path may not contain '..': ${BOLD}${path_disp}${RESET}" >&2
+            return 1 ;;
+        esac
+
+        local full="$project/$path"
+        if [[ ! -f "$full" ]]; then
+          warn "Project [setup] script not found: ${BOLD}${path_disp}${RESET}" >&2
+          return 1
+        fi
+        if [[ -L "$full" ]]; then
+          warn "Project [setup] script may not be a symlink: ${BOLD}${path_disp}${RESET}" >&2
+          return 1
+        fi
+
+        local project_root parent_dir
+        project_root="$(cd "$project" 2>/dev/null && pwd -P)" || {
+          warn "Project [setup] script path could not be resolved: ${BOLD}${path_disp}${RESET}" >&2
+          return 1
+        }
+        parent_dir="$(cd "$(dirname "$full")" 2>/dev/null && pwd -P)" || {
+          warn "Project [setup] script path could not be resolved: ${BOLD}${path_disp}${RESET}" >&2
+          return 1
+        }
+        case "$parent_dir/" in
+          "$project_root/"*) ;;
+          *)
+            warn "Project [setup] script escapes the project directory: ${BOLD}${path_disp}${RESET}" >&2
+            return 1 ;;
+        esac
+
+        echo "# cleat setup: begin script $path"
+        cat "$full"
+        printf '\n'
+        echo "# cleat setup: end script $path"
+        ;;
+      *)
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done < <(_read_setup_from_file "$caps_file")
 }
 
 # Same fallback shape for the env file: .cleat.<box>.env else .cleat.env, so
@@ -1759,6 +1879,35 @@ The copy succeeded if the command exits 0. Do not run a second command to check.
 BOX_NOTES_EOF
 }
 
+# Stage-0 "concierge" provisioning notes, composed into EVERY box's
+# ~/.claude/CLAUDE.md (vanilla and kitted) by _generate_kit_overlay, right
+# after the box notes. Unlike _box_notes_claude_md, this fragment is
+# CLI-generated only: it is deliberately not baked into docker/CLAUDE.md,
+# which must stay byte-identical to _box_notes_claude_md per the guard test.
+_provisioning_notes_claude_md() {
+  cat << 'PROVISIONING_NOTES_EOF'
+# Installing tools
+
+You are inside a Cleat box (a Docker container). `sudo apt-get install <pkg>` works
+(passwordless sudo) and installs persist across `cleat stop`/`cleat start`. They do
+NOT survive a container recreate (config changes, image updates, `cleat rm`).
+For tools this project always needs, add a `[setup]` section to the project's
+`.cleat` file. Its lines are shell commands that run automatically once per
+container, as the `coder` user inside the box, after every create or recreate.
+The user reviews and approves them once; editing the section triggers a fresh
+review, never a container recreate.
+
+[setup]
+sudo apt-get update
+sudo apt-get install -y <pkg>
+
+A line `script ./provision.sh` inlines that repo file's contents at that position.
+Never suggest forking Cleat, editing its Dockerfile, or `cleat rebuild` to add
+tools; `[setup]` is the supported path. There is no egress allowlist: the box has
+full network access.
+PROVISIONING_NOTES_EOF
+}
+
 # One-paragraph description for the library listing and the confirm screen.
 # Deliberately mechanical claims only: planning runs on your session's model,
 # execution bills at worker rates. Never add outcome/quality percentages here;
@@ -2041,6 +2190,16 @@ _generate_kit_overlay() {
     _box_notes_claude_md
   } >> "$kit_dir/CLAUDE.md"
 
+  # Provisioning notes third, under its own marked header: the stage-0
+  # concierge guidance ([setup] section, apt-get persistence). CLI-generated
+  # only, same reasoning as the box notes above; see _provisioning_notes_claude_md.
+  {
+    echo ""
+    echo "# ── Cleat box provisioning ──"
+    echo ""
+    _provisioning_notes_claude_md
+  } >> "$kit_dir/CLAUDE.md"
+
   # agents/: the user's own agents, as-is.
   if [[ -d "${HOME}/.claude/agents" ]]; then
     for _f in "${HOME}/.claude/agents"/*; do
@@ -2136,6 +2295,14 @@ _hash_cleat_caps() {
   echo -n "$caps" | _md5 | awk '{print $1}'
 }
 
+# Hash a built [setup] payload (see _build_setup_payload) for trust
+# comparison. Same _md5 note as _hash_cleat_caps above: strip md5sum's
+# trailing "  -" filename artifact so the stored hash is purely hex.
+_setup_payload_hash() {
+  local payload="$1"
+  printf '%s' "$payload" | _md5 | awk '{print $1}'
+}
+
 # Look up the stored trust hash for a (project, box). Empty on miss.
 # The trust file is <path><TAB><box><TAB><hash>. Legacy two-column rows
 # (<path><TAB><hash>) are read as the "main" box (see concept/20-boxes.md).
@@ -2150,19 +2317,43 @@ _trust_lookup() {
   ' "$CLEAT_TRUST_FILE" 2>/dev/null
 }
 
+# Look up the stored [setup] trust hash for a (project, box). Empty on
+# miss. Unlike _trust_lookup, there is no legacy two-column case: setup
+# trust only ever exists in a 4-column row (see _trust_record), since it
+# shipped after the box-aware three-column format.
+_trust_lookup_setup() {
+  local project="$1" box="${2:-main}"
+  [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
+  awk -F'\t' -v p="$project" -v b="$box" '
+    /^#/ { next }
+    $1 != p { next }
+    NF >= 4 { if ($2 == b) { print $4; exit } }
+  ' "$CLEAT_TRUST_FILE" 2>/dev/null
+}
+
 # Append/update a trust entry for a (project, box). Atomic via temp+rename.
 # 0600 permissions. Refuses paths containing tab/newline/carriage-return.
 # Recording the "main" box also supersedes any legacy two-column row.
+# setup_hash is an optional 4th arg, a separate consent class from the caps
+# hash (concept/16): when non-empty the row grows to four columns (path,
+# box, caps hash or "-", setup hash); when empty/omitted the row is
+# byte-identical to the pre-[setup] three-column format, so existing
+# 3-arg callers and existing rows are untouched.
 _trust_record() {
-  # box is the optional LAST arg so legacy 2-arg callers (project, hash) keep
+  # box is the optional 3rd arg so legacy 2-arg callers (project, hash) keep
   # working with box defaulting to "main".
-  local project="$1" hash="$2" box="${3:-main}"
+  local project="$1" hash="$2" box="${3:-main}" setup_hash="${4:-}"
   case "$project" in
     *$'\t'*|*$'\n'*|*$'\r'*)
       error "Refusing to trust a project path containing control characters"
       return 1 ;;
   esac
-  [[ -z "$hash" ]] && return 1
+  # A 3-column row needs a real caps hash (nothing else to record). A
+  # 4-column row can carry setup trust alone, with "-" standing in for an
+  # absent/untrusted caps hash (see printf below).
+  if [[ -z "$setup_hash" ]]; then
+    [[ -z "$hash" ]] && return 1
+  fi
   mkdir -p "$(dirname "$CLEAT_TRUST_FILE")"
   local tmp="${CLEAT_TRUST_FILE}.tmp.$$"
   {
@@ -2182,7 +2373,11 @@ _trust_record() {
         }
       ' "$CLEAT_TRUST_FILE"
     fi
-    printf '%s\t%s\t%s\n' "$project" "$box" "$hash"
+    if [[ -n "$setup_hash" ]]; then
+      printf '%s\t%s\t%s\t%s\n' "$project" "$box" "${hash:--}" "$setup_hash"
+    else
+      printf '%s\t%s\t%s\n' "$project" "$box" "$hash"
+    fi
   } > "$tmp"
   chmod 0600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$CLEAT_TRUST_FILE"
@@ -2253,12 +2448,13 @@ _trust_prompt() {
   # Comma-joined cap names for the notice line; docker is amber because it
   # breaks the sandbox. Same aligned startup-prompt style (info + _ask_yn) as the
   # image-rebuild, Claude-update, and recreate prompts, not the old notice box.
-  local cap _list=""
+  local cap _cap_safe _list=""
   for cap in "${caps[@]}"; do
+    _cap_safe="$(_sanitize_repo_str "$cap")"
     if [[ "$cap" == "docker" ]]; then
-      _list="${_list:+$_list, }${AMBER}${cap}${RESET}"
+      _list="${_list:+$_list, }${AMBER}${_cap_safe}${RESET}"
     else
-      _list="${_list:+$_list, }${BOLD}${cap}${RESET}"
+      _list="${_list:+$_list, }${BOLD}${_cap_safe}${RESET}"
     fi
   done
 
@@ -2278,11 +2474,74 @@ _trust_prompt() {
   esac
 }
 
+# Show the [setup] consent prompt and read y/n. Returns 0 on approval.
+# A separate consent class from _trust_prompt (concept/16): approving caps
+# never approves this, and vice versa.
+# $1 = project path, $2 = the built payload (for the preview), $3 = the
+# number of declared [setup] entries (before script-directive expansion).
+# Must only be called when _is_tty is true.
+_setup_trust_prompt() {
+  local project="$1" payload="$2" entry_count="$3"
+
+  # Detect if this is a re-prompt (stored hash exists but doesn't match).
+  local is_reprompt=0
+  [[ -n "$(_trust_lookup_setup "$project" "${_BOX:-main}")" ]] && is_reprompt=1
+
+  if [[ $is_reprompt -eq 1 ]]; then
+    info "Project ${BOLD}.cleat${RESET} setup changed since you approved it: it runs ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder${RESET}"
+  else
+    info "Project ${BOLD}.cleat${RESET} wants to run ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder (full network access)${RESET}"
+  fi
+
+  # Preview: up to the first 15 payload lines, sanitized (repo-controlled
+  # text rendered via echo -e, see _sanitize_repo_str), with a truncation
+  # note when more remain.
+  local total shown=0 line
+  total="$(printf '%s\n' "$payload" | wc -l | tr -d ' ')"
+  while IFS= read -r line && [[ $shown -lt 15 ]]; do
+    shown=$((shown + 1))
+    echo -e "      ${DIM}$(_sanitize_repo_str "$line")${RESET}"
+  done <<< "$payload"
+  if [[ $total -gt 15 ]]; then
+    echo -e "      ${DIM}… (+$((total - 15)) more lines, see: cleat setup --show)${RESET}"
+  fi
+
+  # Default-DENY ([y/N]): only an explicit yes runs the commands. Empty /
+  # EOF / no all decline, so untrusted project input never auto-runs.
+  local yn=""
+  _ask_yn yn "Run this project's setup commands? ${DIM}(runs once per container; approve once, undo with cleat untrust)${RESET} [y/N] "
+  case "$yn" in
+    [yY]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Session-scoped decision cache: avoid prompting twice per invocation when
 # resolve_caps is called from multiple command paths in the same run.
 _TRUST_SESSION_DECISION=""   # "", "approved", "rejected"
 _TRUST_SESSION_PROJECT=""    # the project path we decided on
 _TRUST_SESSION_BOX=""        # the box we decided on (per-box trust)
+
+# Same idea for [setup] provisioning, a separate consent class (concept/16)
+# so it gets its own session cache. The cached decision carries the hash it
+# was approved at ("approved:<hash>"): a mid-process rewrite of [setup]
+# between two resolve_caps calls must not ride an earlier approval of
+# different content, so a stale hash is treated as no cached decision.
+_SETUP_SESSION_DECISION=""   # "", "approved:<hash>", "rejected"
+_SETUP_SESSION_PROJECT=""    # the project path we decided on
+_SETUP_SESSION_BOX=""        # the box we decided on (per-box trust)
+
+# Whether the active project declares a [setup] section (0/1) and whether
+# it's currently trusted to run (0/1). Set by _resolve_setup_trust, which
+# resets both to 0 on every call: resolve_caps can run for different
+# projects within one process.
+_SETUP_DECLARED=0
+_SETUP_TRUSTED=0
+
+# Exit code of the last _maybe_run_setup payload run (0 on success or any
+# skip). Only the explicit `cleat setup` verb reads this, to propagate a real
+# exit status; session callers ignore it.
+_SETUP_LAST_RC=0
 
 # Decide whether to apply a project's .cleat caps. Sets _TRUST_SESSION_* on
 # first call for a given project. Returns 0 = apply, 1 = skip.
@@ -2312,7 +2571,10 @@ _resolve_project_trust() {
   if [[ "${CLEAT_TRUST_PROJECT:-}" == "1" || "${_CLI_TRUST_PROJECT:-0}" == "1" ]]; then
     local hash
     hash="$(_hash_cleat_caps "$caps_file")"
-    _trust_record "$project" "$hash" "$box" || true
+    # Preserve any existing [setup] trust (col4): approving caps never
+    # creates setup trust, and passing through an empty lookup is exactly
+    # that (a no-op 4th arg keeps the row 3-column, see _trust_record).
+    _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
     _TRUST_SESSION_DECISION="approved"
     _TRUST_SESSION_PROJECT="$project"
     _TRUST_SESSION_BOX="$box"
@@ -2330,7 +2592,9 @@ _resolve_project_trust() {
     if _trust_prompt "$project" "${req_caps[@]}"; then
       local hash
       hash="$(_hash_cleat_caps "$caps_file")"
-      _trust_record "$project" "$hash" "$box" || true
+      # Preserve any existing [setup] trust (col4): see the opt-in branch
+      # above, same reasoning.
+      _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
       _TRUST_SESSION_DECISION="approved"
       _TRUST_SESSION_PROJECT="$project"
       _TRUST_SESSION_BOX="$box"
@@ -2352,6 +2616,157 @@ _resolve_project_trust() {
   return 1
 }
 
+# Decide whether to run a project's [setup] provisioning. Sets
+# _SETUP_DECLARED and _SETUP_TRUSTED (0/1). Never aborts resolve_caps:
+# callers use `_resolve_setup_trust ... || true`. A separate consent class
+# from _resolve_project_trust (concept/16): approving caps never approves
+# setup, and vice versa.
+# $1 = project path. $2 = "prompt" (default) or "readonly" to forbid
+# interactive prompting (box is read from ${_BOX:-main}).
+_resolve_setup_trust() {
+  local project="$1"
+  local mode="${2:-prompt}"
+  local box="${_BOX:-main}"
+  # resolve_caps can run for different projects within one process.
+  _SETUP_DECLARED=0
+  _SETUP_TRUSTED=0
+
+  # Same no-project guard as the caps block in resolve_caps: an empty
+  # project would otherwise resolve to a root-level /.cleat.
+  [[ -n "$project" ]] || return 0
+
+  local caps_file
+  caps_file="$(_project_caps_file "$project" "$box")"
+  [[ -f "$caps_file" ]] || return 0
+
+  local payload
+  if ! payload="$(_build_setup_payload "$project" "$box")"; then
+    # _build_setup_payload already warned about the specific bad directive.
+    # A broken [setup] section skips provisioning loudly, it never aborts
+    # the session.
+    return 0
+  fi
+  [[ -z "$payload" ]] && return 0
+  _SETUP_DECLARED=1
+
+  local hash
+  hash="$(_setup_payload_hash "$payload")"
+
+  # Already approved at the current hash (per box)
+  local stored
+  stored="$(_trust_lookup_setup "$project" "$box")"
+  if [[ -n "$stored" && "$stored" == "$hash" ]]; then
+    _SETUP_TRUSTED=1
+    return 0
+  fi
+
+  # Cached decision for this session/project/box. Only honored when the
+  # cached hash still matches the current one: a rewrite of [setup]
+  # mid-process must not ride an earlier approval of different content.
+  if [[ -n "$_SETUP_SESSION_DECISION" && "$_SETUP_SESSION_PROJECT" == "$project" && "$_SETUP_SESSION_BOX" == "$box" ]]; then
+    case "$_SETUP_SESSION_DECISION" in
+      "approved:$hash") _SETUP_TRUSTED=1; return 0 ;;
+      rejected) return 0 ;;
+    esac
+  fi
+
+  # Read-only contexts never prompt or warn (e.g. cleat status)
+  [[ "$mode" == "readonly" ]] && return 0
+
+  # Explicit non-interactive opt-in
+  if [[ "${CLEAT_TRUST_SETUP:-}" == "1" || "${_CLI_TRUST_SETUP:-0}" == "1" ]]; then
+    # Preserve the existing caps hash (never recompute it here: approving
+    # setup never approves caps); "-" when there's none.
+    _trust_record "$project" "$(_trust_lookup "$project" "$box")" "$box" "$hash" || true
+    _SETUP_SESSION_DECISION="approved:$hash"
+    _SETUP_SESSION_PROJECT="$project"
+    _SETUP_SESSION_BOX="$box"
+    _SETUP_TRUSTED=1
+    return 0
+  fi
+
+  # Interactive prompt
+  if _is_tty; then
+    local entry_count
+    entry_count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+    if _setup_trust_prompt "$project" "$payload" "$entry_count"; then
+      _trust_record "$project" "$(_trust_lookup "$project" "$box")" "$box" "$hash" || true
+      _SETUP_SESSION_DECISION="approved:$hash"
+      _SETUP_SESSION_PROJECT="$project"
+      _SETUP_SESSION_BOX="$box"
+      _SETUP_TRUSTED=1
+      return 0
+    else
+      warn "Project [setup] skipped, not approved ${DIM}(box starts without provisioning)${RESET}"
+      _SETUP_SESSION_DECISION="rejected"
+      _SETUP_SESSION_PROJECT="$project"
+      _SETUP_SESSION_BOX="$box"
+      return 0
+    fi
+  fi
+
+  # Non-TTY, no explicit opt-in: default-deny with an informational warning
+  warn "Project [setup] skipped in non-interactive mode ${DIM}(set CLEAT_TRUST_SETUP=1 or pass --trust-setup to approve)${RESET}"
+  _SETUP_SESSION_DECISION="rejected"
+  _SETUP_SESSION_PROJECT="$project"
+  _SETUP_SESSION_BOX="$box"
+  return 0
+}
+
+# Guard: warn about each unhandled `[...]` section in a .cleat/global config
+# at most once per file per process (no assoc arrays, bash 3.2: a
+# pipe-delimited accumulator string).
+_WARNED_SECTIONS_FILES=""
+
+# Scan a config file for `[...]` section headers and warn about any this
+# CLI version doesn't recognize, so a future or misspelled section degrades
+# loudly instead of silently doing nothing (INI hazard, see
+# _read_caps_from_file / _read_setup_from_file). scope = "project"
+# (.cleat / .cleat.<box>: known sections are caps, resources, setup) or
+# "global" (~/.config/cleat/config: known sections are caps, resources,
+# kits). A section valid in the OTHER scope gets its own hint, so it reads
+# as "wrong file" rather than "ignored".
+_warn_unknown_cleat_sections() {
+  local file="$1" scope="$2"
+  [[ -f "$file" ]] || return 0
+  case "$_WARNED_SECTIONS_FILES" in
+    *"|$file|"*) return 0 ;;
+  esac
+  _WARNED_SECTIONS_FILES="${_WARNED_SECTIONS_FILES}|$file|"
+
+  local base seen=""
+  base="$(basename "$file")"
+  local line name
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == "["*"]" ]] || continue
+    name="${line#[}"; name="${name%]}"
+    case "|$seen|" in *"|$name|"*) continue ;; esac
+    seen="${seen:+$seen|}$name"
+    case "$scope" in
+      project)
+        case "$name" in
+          caps|resources|setup) continue ;;
+          kits)
+            warn "Section [kits] in .cleat is ignored ${DIM}(kit models are read from the global config only)${RESET}"
+            continue ;;
+        esac ;;
+      global)
+        case "$name" in
+          caps|resources|kits) continue ;;
+          setup)
+            warn "Section [setup] in the global config is ignored ${DIM}([setup] is project-only, in .cleat)${RESET}"
+            continue ;;
+        esac ;;
+    esac
+    warn "Unknown section [$(_sanitize_repo_str "$name")] in ${base} ${DIM}(ignored)${RESET}"
+  done < "$file"
+  return 0
+}
+
 # Resolve active capabilities: global config + project config + CLI flags.
 # Sets the global ACTIVE_CAPS array.
 resolve_caps() {
@@ -2363,6 +2778,7 @@ resolve_caps() {
   # 1. Global config
   local global_caps
   global_caps="$(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")"
+  [[ -f "$CLEAT_GLOBAL_CONFIG" ]] && _warn_unknown_cleat_sections "$CLEAT_GLOBAL_CONFIG" global || true
 
   # 2. Project config, gated by workspace trust. A .cleat file sitting in
   # the repo is untrusted input. Apply its caps only if the user has
@@ -2374,6 +2790,7 @@ resolve_caps() {
   if [[ -n "$project" ]]; then
     local caps_file
     caps_file="$(_project_caps_file "$project" "$box")"
+    [[ -f "$caps_file" ]] && _warn_unknown_cleat_sections "$caps_file" project || true
     if [[ -f "$caps_file" ]]; then
       local _raw_project_caps
       _raw_project_caps="$(_read_caps_from_file "$caps_file")"
@@ -2384,6 +2801,10 @@ resolve_caps() {
       fi
     fi
   fi
+
+  # [setup] provisioning trust is a separate consent class from caps trust
+  # (concept/16); never let a bad/untrusted [setup] section abort resolve.
+  _resolve_setup_trust "$project" "$trust_mode" || true
 
   # 3. Merge: global + project (union, deduplicated)
   local seen=""
@@ -3251,6 +3672,7 @@ _print_caps() {
       color="$GREEN"; s="$(printf '%s, ' "${_CAPS_MOUNT[@]}")"
     fi
     s="${s%, }"
+    s="$(_sanitize_repo_str "$s")"
     echo -e "${indent}${label_color}${label}${RESET}${pad}${color}${BOLD}${s}${RESET}"
     return 0
   fi
@@ -3259,10 +3681,12 @@ _print_caps() {
   local s
   if [[ ${#_CAPS_MOUNT[@]} -gt 0 ]]; then
     s="$(printf '%s, ' "${_CAPS_MOUNT[@]}")"; s="${s%, }"
+    s="$(_sanitize_repo_str "$s")"
     echo -e "${indent}  ${DIM}mount:${RESET}    ${GREEN}${BOLD}${s}${RESET}"
   fi
   if [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
     s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"; s="${s%, }"
+    s="$(_sanitize_repo_str "$s")"
     echo -e "${indent}  ${DIM}sandbox:${RESET}  ${AMBER}${BOLD}${s}${RESET} ${DIM}(breaks isolation)${RESET}"
   fi
 }
@@ -4151,6 +4575,77 @@ _ensure_docker_access() {
     echo -e "    ${DIM}A stale socket bind can't be repaired in place. Recover with:${RESET}"
     echo -e "    ${BOLD}cleat stop && cleat resume${RESET}${DIM}  re-binds the socket; your session is preserved.${RESET}"
   fi
+}
+
+# Run a project's [setup] provisioning inside its box, once per container
+# (see _build_setup_payload / concept/16). Never blocks a session: any skip
+# or failure is a warn/info, and the function always returns 0. Sets
+# _SETUP_LAST_RC (0 on success or any skip, the payload's own exit code on a
+# failed run) so the explicit `cleat setup` verb can propagate a real exit
+# status; every session caller (cmd_run/cmd_start/cmd_resume/cmd_claude)
+# ignores it.
+# $1 = container name, $2 = project path, $3 = box (default main), $4 =
+# force (default 0; "1" bypasses the run-once marker, used only by the
+# explicit `cleat setup` verb so the user can deliberately re-run).
+_maybe_run_setup() {
+  local cname="$1" project="$2" box="${3:-main}" force="${4:-0}"
+  _SETUP_LAST_RC=0
+  [[ "${_SETUP_DECLARED:-0}" == "1" ]] || return 0
+  [[ "${_SETUP_TRUSTED:-0}" == "1" ]] || return 0  # resolve_caps already messaged any skip
+  is_running "$cname" || return 0
+
+  # TOCTOU close: rebuild the payload from disk right now and re-hash it, so
+  # the bytes that run are byte-identical to what was approved, never a
+  # rewrite an in-box agent made to /workspace/.cleat between approval (in
+  # resolve_caps, earlier in this invocation) and this exec.
+  local payload
+  payload="$(_build_setup_payload "$project" "$box")" || {
+    # _build_setup_payload already warned about the specific bad directive.
+    warn "Project [setup] is invalid, skipped ${DIM}(run a cleat command again to review)${RESET}"
+    return 0
+  }
+  [[ -z "$payload" ]] && return 0
+
+  local hash stored
+  hash="$(_setup_payload_hash "$payload")"
+  stored="$(_trust_lookup_setup "$project" "$box")"
+  [[ "$hash" == "$stored" ]] || {
+    warn "Project [setup] changed since it was approved, skipped ${DIM}(run a cleat command again to review and approve)${RESET}"
+    return 0
+  }
+
+  # Run-once marker, in-container. The explicit `cleat setup` verb (force=1)
+  # bypasses this so the user can deliberately re-run.
+  if [[ "$force" != "1" ]]; then
+    local marker
+    marker="$(docker exec "$cname" cat /home/coder/.cleat-setup-applied 2>/dev/null || true)"
+    [[ "$marker" == "$hash" ]] && return 0
+  fi
+
+  _wait_for_coder_remap "$cname"
+
+  local caps_file count
+  caps_file="$(_project_caps_file "$project" "$box")"
+  count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+  info "Running project setup ${DIM}(${count} command(s), [setup] in $(basename "$caps_file"))${RESET}"
+
+  # Use `runuser -u coder` rather than `docker exec --user coder`: see the
+  # rationale next to exec_claude's session exec (docker exec --user skips
+  # initgroups(3), so supplementary groups like the docker socket's owning
+  # group never load).
+  local rc=0
+  printf '%s' "$payload" | docker exec -i -e HOME=/home/coder -w /workspace "$cname" \
+    runuser -u coder -- bash -e -s || rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    printf '%s\n' "$hash" | docker exec -i "$cname" runuser -u coder -- tee /home/coder/.cleat-setup-applied >/dev/null 2>&1 || true
+    success "Setup applied ${DIM}(${count} command(s))${RESET}"
+  else
+    warn "Setup failed with exit code ${rc} ${DIM}(the box is up, provisioning did not finish)${RESET}"
+    echo -e "    ${DIM}Fix .cleat or the box, then retry with: cleat setup${RESET}"
+    _SETUP_LAST_RC="$rc"
+  fi
+  return 0
 }
 
 exec_claude() {
@@ -5404,6 +5899,11 @@ cmd_run() {
   if [[ "${_CLI_DESC_SET:-0}" == "1" ]]; then
     _box_desc_write "$cname" "$_CLI_DESC"
   fi
+
+  # First run of this fresh container: apply [setup] provisioning, if any was
+  # approved by the resolve_caps call above. Covers direct `cleat run` and
+  # every recreate funnel that ends up here.
+  _maybe_run_setup "$cname" "$project" "${_BOX:-main}" || true
 }
 
 cmd_start() {
@@ -5503,6 +6003,12 @@ cmd_start() {
   fi
 
   show_first_run_tip
+
+  # A start that funneled through cmd_run above already ran this; this second
+  # call is a silent marker no-op by design (the run-once marker is already
+  # written), so every `cleat start` still gets a chance to apply [setup] on a
+  # container that was created some other way (e.g. a bare `docker run`).
+  _maybe_run_setup "$cname" "$project" "${_BOX:-main}" || true
 
   success "Claude launched"
   _print_summary_block "$cname" "$project"
@@ -5629,6 +6135,8 @@ cmd_resume() {
   if cap_is_active docker; then
     warn_sandbox "Docker socket mounted. Container can create host-level processes"
   fi
+
+  _maybe_run_setup "$cname" "$project" "${_BOX:-main}" || true
 
   success "Session resumed"
   _print_summary_block "$cname" "$project"
@@ -5807,6 +6315,7 @@ cmd_claude() {
     cmd_run "$project"
   fi
   _maybe_note_missing_kit_masks "$cname"
+  _maybe_run_setup "$cname" "$project" "$box" || true
 
   # Refresh project-level settings overlays (hooks may have changed)
   local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
@@ -7240,17 +7749,37 @@ cmd_trust() {
   fi
   local hash
   hash="$(_hash_cleat_caps "$project/.cleat")"
-  if [[ -z "$hash" ]]; then
-    error "Project .cleat has no capabilities to trust"
+  # An explicit `cleat trust` approves the whole file the user is looking
+  # at: caps and [setup] both, separate consent classes (concept/16). A
+  # caps-less file with a [setup] section is still approvable: setup trust
+  # records as a 4th trust-file column, "-" standing in for the caps hash.
+  local setup_payload setup_rc=0
+  setup_payload="$(_build_setup_payload "$project" main)" || setup_rc=$?
+  if [[ $setup_rc -ne 0 ]]; then
+    # _build_setup_payload already warned about the specific bad directive.
+    warn "Project [setup] is invalid, not approved ${DIM}(see the warning above)${RESET}"
+    setup_payload=""
+  fi
+  if [[ -z "$hash" && -z "$setup_payload" ]]; then
+    error "Project .cleat has no capabilities or setup commands to trust"
     exit 1
   fi
-  if _trust_record "$project" "$hash"; then
-    success "Trusted ${BOLD}${project}${RESET}"
+  local setup_hash="" setup_count=""
+  if [[ -n "$setup_payload" ]]; then
+    setup_hash="$(_setup_payload_hash "$setup_payload")"
+    setup_count="$(_read_setup_from_file "$project/.cleat" | wc -l | tr -d ' ')"
+    _trust_record "$project" "$hash" main "$setup_hash" || exit 1
+  elif ! _trust_record "$project" "$hash"; then
+    exit 1
+  fi
+  success "Trusted ${BOLD}${project}${RESET}"
+  if [[ -n "$hash" ]]; then
     local caps
     caps="$(_read_caps_from_file "$project/.cleat" | _canonical_caps)"
-    echo -e "    ${DIM}Approved caps: ${caps}${RESET}"
-  else
-    exit 1
+    echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$caps")${RESET}"
+  fi
+  if [[ -n "$setup_payload" ]]; then
+    echo -e "    ${DIM}Approved setup: ${setup_count} command(s)${RESET}"
   fi
 }
 
@@ -7976,6 +8505,121 @@ _kit_show() {
   fi
 }
 
+# `cleat setup [box] [--show]`: run a project's [setup] provisioning outside
+# the normal session-start flow (see _maybe_run_setup), or inspect it without
+# running anything. Box is a bareword positional exactly like cmd_config's,
+# parsed alongside --show so either can come first.
+cmd_setup() {
+  local box="" show=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --show) show=1; shift ;;
+      --help|-h)
+        echo "Usage: cleat setup [box]           Run this project's [setup] provisioning now"
+        echo "       cleat setup [box] --show     Preview the payload, trust & marker state"
+        return 0 ;;
+      --*)
+        error "Unknown setup option: $1"
+        exit 1 ;;
+      *)
+        if [[ -n "$box" ]]; then
+          error "Unexpected argument: ${BOLD}$1${RESET}"
+          exit 1
+        fi
+        if ! _validate_box_name "$1"; then
+          error "Invalid box name: ${BOLD}$1${RESET}"
+          echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars.${RESET}"
+          exit 1
+        fi
+        box="$1"; shift
+        ;;
+    esac
+  done
+  _BOX="${box:-main}"
+  box="$_BOX"
+
+  local project cname caps_file
+  project="$(resolve_project "")"
+  cname="$(container_name_for "$project" "$box")"
+  _RESOLVED_PROJECT="$project"
+  caps_file="$(_project_caps_file "$project" "$box")"
+
+  if [[ $show -eq 1 ]]; then
+    # A pure inspection command: never prompts, never records trust.
+    resolve_caps "$project" readonly
+  else
+    resolve_caps "$project"
+  fi
+
+  if [[ "${_SETUP_DECLARED:-0}" != "1" ]]; then
+    # _SETUP_DECLARED stays 0 both when the section is absent and when a
+    # `script` directive is invalid: tell those apart here so the explicit
+    # verb doesn't claim "no section" over a broken one.
+    if [[ -n "$(_read_setup_from_file "$caps_file")" ]]; then
+      error "Project [setup] is invalid ${DIM}(see the warning above)${RESET}"
+      exit 1
+    fi
+    info "No [setup] section in $(basename "$caps_file")"
+    exit 0
+  fi
+
+  if [[ $show -eq 1 ]]; then
+    # readonly resolve_caps leaves _SETUP_TRUSTED at 0 for unapproved
+    # content, so trust state for display is derived directly from the
+    # trust store, not the resolved-caps decision.
+    local payload hash stored trust_state marker_state count
+    payload="$(_build_setup_payload "$project" "$box")" || payload=""
+    hash="$(_setup_payload_hash "$payload")"
+    stored="$(_trust_lookup_setup "$project" "$box")"
+    if [[ -n "$stored" && "$stored" == "$hash" ]]; then
+      trust_state="approved"
+    else
+      trust_state="pending approval"
+    fi
+    if is_running "$cname"; then
+      local marker
+      marker="$(docker exec "$cname" cat /home/coder/.cleat-setup-applied 2>/dev/null || true)"
+      if [[ "$marker" == "$hash" ]]; then
+        marker_state="applied"
+      else
+        marker_state="not applied"
+      fi
+    else
+      marker_state="unknown (box not running)"
+    fi
+    count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+
+    echo ""
+    echo -e "  ${BOLD}Source:${RESET}   ${caps_file}"
+    echo -e "  ${BOLD}Commands:${RESET} ${count}"
+    echo -e "  ${BOLD}Hash:${RESET}     ${hash}"
+    echo -e "  ${BOLD}Trust:${RESET}    ${trust_state}"
+    echo -e "  ${BOLD}Marker:${RESET}   ${marker_state}"
+    echo ""
+    if [[ -t 1 ]]; then
+      local line
+      while IFS= read -r line; do
+        echo -e "  ${DIM}$(_sanitize_repo_str "$line")${RESET}"
+      done <<< "$payload"
+    else
+      printf '%s\n' "$payload"
+    fi
+    exit 0
+  fi
+
+  # Run mode: the box must already be running (provisioning execs into it).
+  require_running "$cname"
+
+  if [[ "${_SETUP_TRUSTED:-0}" != "1" ]]; then
+    error "Project [setup] is not approved"
+    echo -e "    ${DIM}Re-run interactively to approve it, or set CLEAT_TRUST_SETUP=1 to approve non-interactively.${RESET}"
+    exit 1
+  fi
+
+  _maybe_run_setup "$cname" "$project" "$box" 1
+  exit "${_SETUP_LAST_RC:-0}"
+}
+
 # ── Version & Update ──────────────────────────────────────────────────────
 cmd_version() {
   echo -e "  ${BOLD}cleat${RESET} ${DIM}v${VERSION}${RESET}"
@@ -8059,6 +8703,8 @@ cmd_help() {
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --list       List effective capabilities"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --enable ${DIM}<cap>${RESET}   Enable a capability"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --disable ${DIM}<cap>${RESET}  Disable a capability"
+  echo -e "    ${GREEN}setup${RESET} ${DIM}[box]${RESET}         Run this project's [setup] provisioning now"
+  echo -e "    ${GREEN}setup${RESET} ${DIM}[box]${RESET} --show  Preview the payload, trust & marker state"
   echo ""
   echo -e "  ${BOLD}KITS${RESET} ${DIM}(curated Claude pre-configurations, per box)${RESET}"
   echo -e "    ${GREEN}kit${RESET}                Interactive picker ${DIM}(pick a kit, then its models)${RESET}"
@@ -8109,6 +8755,7 @@ parse_global_flags() {
   _CLI_ENVS=()
   _CLI_ENV_FILES=()
   _CLI_TRUST_PROJECT=0
+  _CLI_TRUST_SETUP=0
   _CLI_DESC_SET=0
   _REMAINING_ARGS=()
 
@@ -8116,6 +8763,10 @@ parse_global_flags() {
     case "$1" in
       --trust-project)
         _CLI_TRUST_PROJECT=1
+        shift
+        ;;
+      --trust-setup)
+        _CLI_TRUST_SETUP=1
         shift
         ;;
       --cap)
@@ -8228,6 +8879,7 @@ main() {
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;
     kit)       cmd_kit "$@" ;;
+    setup)     cmd_setup "$@" ;;
     trust)     cmd_trust "$@" ;;
     untrust)   cmd_untrust "$@" ;;
     clean)     cmd_clean "$@" ;;

@@ -1052,3 +1052,50 @@ EOF
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
 }
+
+# ── [setup] provisioning (concept/16) ───────────────────────────────────────
+
+@test "smoke: cleat setup reports no [setup] section" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
+  cd "$TEST_TEMP/proj"
+  run cleat_bin setup
+  assert_success
+  assert_output --partial "No [setup] section"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat setup --show previews an approved payload" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[setup]\necho hello-from-setup\n' > "$TEST_TEMP/proj/.cleat"
+  run cleat_bin trust "$TEST_TEMP/proj"
+  assert_success
+  cd "$TEST_TEMP/proj"
+  run cleat_bin setup --show
+  assert_success
+  assert_output --partial "Source:"
+  assert_output --partial "Hash:"
+  assert_output --partial "Trust:"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat setup refuses an unapproved payload non-interactively" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[setup]\necho hello-from-setup\n' > "$TEST_TEMP/proj/.cleat"
+  unset CLEAT_TRUST_SETUP
+  local cname
+  cname="$(_compute_cname "$TEST_TEMP/proj")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  cd "$TEST_TEMP/proj"
+  run cleat_bin setup
+  assert_failure
+  assert_output --partial "not approved"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat help lists the setup verb" {
+  run cleat_bin help
+  assert_success
+  assert_output --partial "Run this project's [setup] provisioning now"
+  refute_output --partial "unbound variable"
+}

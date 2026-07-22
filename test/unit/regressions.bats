@@ -2698,3 +2698,52 @@ EOF
     return 1
   fi
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.5: repo-controlled text (cap names, .cleat lines) is rendered via
+# echo -e (see _sanitize_repo_str), so a cap name carrying a raw ESC byte or a
+# literal backslash-escape sequence is a terminal-injection vector once it
+# reaches _trust_prompt. Guard: a raw ESC byte is stripped before it ever
+# reaches echo -e, and a literal `\033`-style sequence stays literal text
+# (the backslash is doubled first, so echo -e prints it verbatim instead of
+# decoding it into a control byte).
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.2.5: trust prompt neutralizes control bytes in repo cap names" {
+  mkdir -p "$TEST_TEMP/proj"
+  local esc
+  esc="$(printf '\x1b')"
+  {
+    echo "[caps]"
+    printf '%s\n' "cap${esc}BADESC"
+    printf '%s\n' 'cap\033text'
+  } > "$TEST_TEMP/proj/.cleat"
+
+  local -a caps=()
+  local c
+  while IFS= read -r c; do [[ -n "$c" ]] && caps+=("$c"); done < <(_read_caps_from_file "$TEST_TEMP/proj/.cleat")
+
+  run _trust_prompt "$TEST_TEMP/proj" "${caps[@]}" <<< "n"
+  # The rendered prompt legitimately contains OTHER raw ESC bytes (the CLI's
+  # own BOLD/DIM/RESET color codes), so a blanket refute of any ESC byte
+  # would false-fail; check the specific injected sequence instead.
+  assert_output --partial "BADESC"
+  refute_output --partial "${esc}BADESC"
+  assert_output --partial "033"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.2.5: the trust file's 3-column row (path, box, caps hash) predates
+# [setup]'s 4-column extension (see _trust_record) and every legacy row, and
+# every plain caps-only approval, must keep that exact shape. A 3-arg
+# _trust_record call must never grow a 4th column.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.2.5: caps-only trust rows keep the exact 3-column format" {
+  _trust_record "$TEST_TEMP/proj" "capshash123" "main"
+  local row expected
+  row="$(awk -F'\t' -v p="$TEST_TEMP/proj" '$1==p' "$CLEAT_TRUST_FILE")"
+  expected="$(printf '%s\tmain\tcapshash123' "$TEST_TEMP/proj")"
+  [[ "$row" == "$expected" ]] || { echo "got: $row"; return 1; }
+  local tabs
+  tabs="$(printf '%s' "$row" | tr -cd '\t' | wc -c | tr -d ' ')"
+  [[ "$tabs" == "2" ]] || { echo "tab count: $tabs (row: $row)"; return 1; }
+}

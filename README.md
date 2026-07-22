@@ -370,6 +370,12 @@ run `cleat rm && cleat`.
 | `cleat kit off [box]` | Disable the box's kit (back to your own config) |
 | `cleat kit show <name>` | Print everything a kit injects |
 
+#### Setup
+| Command | Description |
+|---|---|
+| `cleat setup [box]` | Run this project's `[setup]` provisioning now (the box must already be running) |
+| `cleat setup [box] --show` | Preview the payload, trust state and marker state without running anything |
+
 #### Flags (apply to `start`, `run`, `resume`, `claude`, `shell`, `login`)
 | Flag | Description |
 |---|---|
@@ -534,10 +540,14 @@ Approval is keyed on the **canonical list of capabilities** declared in `.cleat`
 
 Non-interactive contexts (pipes, CI, `cleat … | tee log`) can't answer a prompt, so they default-deny: project `.cleat` caps are silently dropped, global config and `--cap` flags still apply. To opt in explicitly:
 
+`CLEAT_TRUST_SETUP=1` (or `--trust-setup`) approves a project's `[setup]` commands only. `CLEAT_TRUST_PROJECT=1` never covers it: caps and setup are separate consent classes.
+
 ```bash
-cleat --trust-project                 # one-off session flag
+cleat --trust-project                 # one-off session flag, caps only
 CLEAT_TRUST_PROJECT=1 cleat           # env var (same effect)
-cleat trust                           # persist for this project, once
+cleat --trust-setup                   # one-off session flag, [setup] commands only
+CLEAT_TRUST_SETUP=1 cleat             # env var (same effect)
+cleat trust                           # persist for this project, once (caps and setup)
 ```
 
 #### Subcommands
@@ -556,8 +566,36 @@ cleat untrust ~/proj         # remove a project's trust entry
 | `~/.config/cleat/config` (global) | ✔ always: user's own file |
 | `--cap <name>` CLI flag | ✔ always: affirmative typed action |
 | `<project>/.cleat` | requires approval per-project, per-cap-set |
+| `[setup]` in `<project>/.cleat` | requires approval per-project, a separate consent class from caps |
 
 `cleat status` never prompts: it's read-only and silently omits untrusted project caps when displaying.
+
+### Provision the box: the `[setup]` section
+
+Some stacks need a tool the base image doesn't ship: a runtime, an SDK, a
+database client. A `[setup]` section in `.cleat` lists the shell commands that
+install it, run once per container as the `coder` user right after it's
+created. You approve the exact commands once, the same way you approve
+capabilities.
+
+```ini
+[setup]
+curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/msprod.deb
+sudo dpkg -i /tmp/msprod.deb
+sudo apt-get update
+sudo apt-get install -y dotnet-sdk-8.0
+```
+
+A `script <path>` line inlines a project-relative script file at that
+position instead of writing commands inline.
+
+Setup trust is separate from capability trust. `CLEAT_TRUST_SETUP=1` (or
+`--trust-setup`) approves it non-interactively, `cleat trust` approves both
+caps and setup together and editing `[setup]` re-prompts without ever
+recreating the container.
+
+A failed command prints its exit code and the box still opens. Fix `.cleat`
+or the box, then retry with `cleat setup`.
 
 ### Docker capability: testing dockerized apps
 

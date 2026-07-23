@@ -4945,11 +4945,6 @@ exec_claude() {
   trap - EXIT INT TERM HUP
   _restore_terminal
 
-  # If the host ran out of process slots this session (watcher logged fork
-  # errors), explain it once. Independent of rc: the box session usually
-  # SUCCEEDS while the host-side watchers are the ones that could not fork.
-  _maybe_explain_fork_exhaustion "$_watcher_log" "$_watcher_log_off"
-
   if [[ $rc -eq 0 ]]; then
     # Reclaim claude's leftover trailing line (cursor up, erase it), drop back
     # down, then clear the line success is about to write on. Without that final
@@ -4964,6 +4959,15 @@ exec_claude() {
     [[ -s "$_exec_err" ]] && error "${DIM}$(cat "$_exec_err")${RESET}"
     _maybe_explain_oom "$cname" "$rc" "${_mem_bytes:-}"
   fi
+
+  # If the host ran out of process slots this session (watcher logged fork
+  # errors), explain it once. Placed AFTER the rc==0 reclaim: on success that
+  # reclaim does `\033[A\033[2K` to erase claude's leftover line, and running
+  # this first would put the advisory's last (most actionable) line directly
+  # above the cursor, where the reclaim would wipe it. Independent of rc: the box
+  # session usually SUCCEEDS while the host-side watchers are the ones that could
+  # not fork.
+  _maybe_explain_fork_exhaustion "$_watcher_log" "$_watcher_log_off"
   rm -f "$_exec_err"
 }
 
@@ -5016,7 +5020,12 @@ _maybe_explain_oom() {
 _cap_watcher_log() {
   local log="$1" sz=0
   [ -f "$log" ] || { echo 0; return 0; }
-  sz="$(wc -c < "$log" 2>/dev/null || echo 0)"
+  # `tr -d [:space:]` strips BSD wc's leading padding (macOS prints "      6",
+  # not "6"): without it the ^[0-9]+$ guard below rejects the padded string and
+  # forces sz=0, which on macOS would defeat BOTH the cap (never truncates) and
+  # the offset (always 0 -> a stale prior-session fork error re-fires the
+  # advisory every run). Same normalization the hook bridge already does.
+  sz="$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]' || echo 0)"
   [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
   if (( sz > 1048576 )); then
     : > "$log" 2>/dev/null || true

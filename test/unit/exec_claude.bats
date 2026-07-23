@@ -245,6 +245,34 @@ teardown() { _common_teardown; }
   [ ! -e "$TEST_TEMP/absent-log" ]
 }
 
+@test "watcher log cap: BSD wc padding is stripped (macOS wc -c emits a padded count)" {
+  # macOS/BSD wc -c right-justifies its count ("      6"), which the ^[0-9]+$
+  # guard would reject and force to 0, defeating both the cap and the offset on
+  # the maintainer's platform. This test simulates that padding on Linux CI.
+  local log="$TEST_TEMP/.watcher-log"
+  printf 'hello\n' > "$log"                 # 6 bytes
+  wc() { if [ "$1" = "-c" ]; then printf '      %s\n' "$(command wc -c | command tr -d ' ')"; else command wc "$@"; fi; }
+  run _cap_watcher_log "$log"
+  assert_success
+  assert_output "6"                          # not "0"
+}
+
+@test "fork exhaustion: the advisory is emitted AFTER the session-end reclaim" {
+  # Placement guard: on rc=0 the success path runs a `\033[A\033[2K` reclaim that
+  # erases the line just above it. The advisory must print AFTER that reclaim, or
+  # its last (most actionable) line is wiped. Override the diagnostic to a
+  # sentinel and assert it lands after "Session ended".
+  _maybe_explain_fork_exhaustion() { echo "FORK_ADVISORY_SENTINEL"; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "FORK_ADVISORY_SENTINEL"
+  local end_line adv_line
+  end_line="$(printf '%s\n' "$output" | grep -n 'Session ended' | head -1 | cut -d: -f1)"
+  adv_line="$(printf '%s\n' "$output" | grep -n 'FORK_ADVISORY_SENTINEL' | head -1 | cut -d: -f1)"
+  [ -n "$end_line" ] && [ -n "$adv_line" ] || { echo "end=$end_line adv=$adv_line"; return 1; }
+  [ "$adv_line" -gt "$end_line" ] || { echo "advisory (line $adv_line) not after session-end (line $end_line)"; return 1; }
+}
+
 # ── attach heal (_refresh_attached_claude_json) ──────────────────────────────
 # The end-to-end heal (poisoned flag fixed in place, same inode) is pinned in
 # regressions.bats; these pin the guards around it.

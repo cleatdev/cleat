@@ -3188,6 +3188,36 @@ s@(( sz > 1048576 ))@(( sz > 999999999999 ))@
 SED
 try "vnext_watcher_log_cap" "oversized log is truncated" "$CLI" "$EXEC_CLAUDE_BATS"
 
+# WATCHER LOG CAP: BSD wc padding. macOS `wc -c` emits a space-padded count, so
+# the size must be de-padded before the numeric guard or it drops to 0 (defeating
+# the cap and the offset). Drop the `tr` strip: the padded count fails the regex
+# and the "BSD wc padding is stripped" test fails.
+cat > "$SED_TMP" << 'SED'
+/^_cap_watcher_log()/,/^}$/ s@ | tr -d '\[:space:\]'@@
+SED
+try "vnext_watcher_log_bsd_wc" "BSD wc padding is stripped" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# FORK ADVISORY PLACEMENT. The session-end fork advisory must be emitted after the
+# rc==0 reclaim (which erases the line above it). Delete the call: the advisory
+# never prints, so the "emitted AFTER the session-end reclaim" test fails.
+cat > "$SED_TMP" << 'SED'
+/_maybe_explain_fork_exhaustion "\$_watcher_log" "\$_watcher_log_off"/d
+SED
+try "vnext_fork_advisory_placement" "advisory is emitted AFTER the session-end" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# PRUNE FORMAT STRINGS. The container-reference set resolves via `{{.Image}}` and
+# a candidate via `{{.Id}}`; a wrong field silently reintroduces the over-count.
+# Mutate the format field in each seam and the format-aware-stub tests fail.
+cat > "$SED_TMP" << 'SED'
+/^_container_image_ids()/,/^}$/ s@{{.Image}}@{{.Names}}@
+SED
+try "vnext_prune_container_image_field" "_container_image_ids resolves via" "$CLI" "$PRUNE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_image_id_of()/,/^}$/ s@{{.Id}}@{{.Size}}@
+SED
+try "vnext_prune_image_id_field" "_image_id_of resolves a ref via" "$CLI" "$PRUNE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -128,6 +128,35 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+@test "prune: _container_image_ids resolves via {{.Image}}, run against the REAL seam" {
+  # The exclusion tests override the seams, so the format strings that make the
+  # fix correct are otherwise unpinned. Run the real _container_image_ids against
+  # a format-aware docker: a mutation of {{.Image}} to another field stops
+  # matching and yields no IDs, so the assertion below fails.
+  docker() {
+    case "$*" in
+      *"ps -a -q"*)                 printf 'c1\nc2\n' ;;
+      *"inspect"*"{{.Image}}"*)     printf 'sha256:img1\nsha256:img2\n' ;;
+      *)                            return 0 ;;
+    esac
+  }
+  run _container_image_ids
+  assert_success
+  assert_line --index 0 "sha256:img1"
+  assert_line --index 1 "sha256:img2"
+}
+
+@test "prune: _image_id_of resolves a ref via {{.Id}}, run against the REAL seam" {
+  docker() {
+    case "$*" in
+      *"image inspect"*"{{.Id}}"*)  echo "sha256:resolved" ;;
+      *)                            return 0 ;;
+    esac
+  }
+  run _image_id_of "ghcr.io/cleatdev/cleat:v0.12.2"
+  assert_output "sha256:resolved"
+}
+
 @test "pressure: no prune offer when all bloat is pinned by containers" {
   # The exact 1.png report: 12 GB of old images, every one pinned by a stopped
   # box, so the removable total is 0 and the offer must stay silent (before the

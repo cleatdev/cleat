@@ -208,6 +208,13 @@ _SPIN_PID=""
 
 _is_tty() { [[ -t 1 ]]; }
 
+# Stricter than _is_tty (which checks stdout alone): BOTH stdin and stdout must be
+# a real terminal. Used only by the one place Cleat deliberately BLOCKS for a
+# keypress (_maybe_gate_on_docker_config): a launch with no human to answer
+# (cron, a pipe, `cleat start </dev/null`, CI) must never be held, so the gate
+# needs stdin to be interactive too, not just stdout.
+_is_interactive() { [[ -t 0 && -t 1 ]]; }
+
 _has_unicode() {
   local lang="${LANG:-}${LC_ALL:-}${LC_CTYPE:-}"
   [[ "$lang" == *UTF-8* ]] || [[ "$lang" == *utf8* ]]
@@ -4949,6 +4956,17 @@ _ONSTART_GAP_OPEN=0
 # two can never both appear (or contradict). See _maybe_announce_docker_ready.
 _VM_ADVISORY_SHOWN=0
 
+# Set to 1 by an on-start advisory ONLY when it surfaced a genuine Docker CONFIG
+# error the user must go fix in Docker Desktop settings (an undersized VM memory
+# slider, or swap left at the tiny default), never for the transient overload
+# notice (which a `cleat stop` resolves without touching Docker's config). When
+# set, _maybe_gate_on_docker_config holds the interactive launch for one keypress
+# so the warning can't scroll by unread. _DOCKER_GATE_SUMMARY carries the one-line
+# reason the gate re-states, so the stopped screen is self-contained. See
+# concept/21 (the single documented exception to the "never block" startup rule).
+_DOCKER_GATE_PENDING=0
+_DOCKER_GATE_SUMMARY=""
+
 CLAUDE_CHECK_FILE="$REPO_DIR/.claude_update_check"
 CLAUDE_CHECK_INTERVAL=600   # 10 minutes; the lookup is a tiny GET; the only
                             # real per-check cost is one throwaway container to
@@ -7082,6 +7100,10 @@ _maybe_check_docker_pressure() {
         _print_docker_vm_fix "$host_bytes" "$rec_gb"
         printed=true
         _VM_ADVISORY_SHOWN=1
+        # A real config error (the slider set too low), not a transient state:
+        # arm the gate so the interactive launch stops on it (concept/21).
+        _DOCKER_GATE_PENDING=1
+        _DOCKER_GATE_SUMMARY="Docker VM memory is ${vm_gb} GB (aim for ${rec_gb} GB)."
       fi
     fi
   fi
@@ -7158,6 +7180,7 @@ _maybe_announce_docker_ready() {
     # MB; 0 reads as "disabled".
     if (( swap_bytes == 0 )); then
       warn "Docker memory is sized right, but swap is ${BOLD}disabled${RESET}. A memory spike can freeze a session instead of paging out."
+      _DOCKER_GATE_SUMMARY="Docker swap is disabled (aim for ≥ 2 GB)."
     else
       local swap_human
       if (( swap_bytes < 1073741824 )); then
@@ -7166,10 +7189,14 @@ _maybe_announce_docker_ready() {
         swap_human="$(( swap_bytes / 1073741824 )) GB"
       fi
       warn "Docker memory is sized right, but its swap is only ${BOLD}${swap_human}${RESET}. A memory spike can freeze a session instead of paging out."
+      _DOCKER_GATE_SUMMARY="Docker swap is only ${swap_human} (aim for ≥ 2 GB)."
     fi
     echo -e "    ${DIM}Add overflow headroom (Docker Desktop only):${RESET}"
     echo -e "    ${DIM}•${RESET} ${BOLD}Settings → Resources → Advanced${RESET}${DIM}: set ${RESET}${BOLD}Swap ≥ 2 GB${RESET}${DIM}, then Apply & restart${RESET}"
     _VM_ADVISORY_SHOWN=1   # defensive symmetry with the pressure check; no on-start step reads it after this today
+    # Swap left at the default is a real config error too (freezes under a spike),
+    # so arm the gate to hold the launch on it (concept/21).
+    _DOCKER_GATE_PENDING=1
     return 0
   fi
 
@@ -7194,6 +7221,64 @@ _maybe_announce_docker_ready() {
   else
     success "Docker ready for Cleat ${RESET}${DIM}(${vm_gb} GB RAM available to boxes)${RESET}"
   fi
+}
+
+# The one place Cleat deliberately BLOCKS the launch. concept/21's startup rule is
+# "never block, never nag", and every other on-start notice honors it. This is the
+# single documented exception: when Docker itself is misconfigured (the VM memory
+# slider set too low, or swap left at the tiny default), the non-blocking advisory
+# that already printed above proved missable in the field. A user ran degraded for
+# a long time because the amber warning "just blinked" past on start, then reported
+# Cleat as slow. So for a genuine CONFIG error (never the transient overload notice,
+# which a `cleat stop` resolves) we hold the launch for one keypress, so the warning
+# cannot scroll by unread.
+#
+# Guardrails that keep this from breaking the "walk away" pillar:
+#   - Interactive-only: BOTH stdin and stdout must be a terminal (_is_interactive),
+#     so unattended runs (cron, pipes, `</dev/null`, CI) never reach the read.
+#   - Escape hatch: CLEAT_NO_DOCKER_GATE=1 keeps the printed advisory but skips the
+#     hold, for someone who runs cleat interactively yet has accepted their setup.
+#     This knob earns its keep precisely because the behavior it gates is blocking
+#     (the env-var philosophy in concept/21 reserves opt-outs for network calls and
+#     for blocking prompts, not for cosmetic notices).
+#   - Fail-open: a `read` that hits EOF falls through (|| true) instead of hanging,
+#     and the function always returns 0 (it runs bare in main's dispatch under the
+#     binary's `set -euo pipefail`).
+#
+# Fires only when an advisory ABOVE armed _DOCKER_GATE_PENDING (undersized VM
+# memory in _maybe_check_docker_pressure, or low/disabled swap in
+# _maybe_announce_docker_ready). A well-tuned Docker never arms it, so this stays
+# silent on every healthy start.
+_maybe_gate_on_docker_config() {
+  [[ "${_DOCKER_GATE_PENDING:-0}" == "1" ]] || return 0
+  _is_interactive || return 0
+  [[ "${CLEAT_NO_DOCKER_GATE:-}" == "1" ]] && return 0
+
+  # A prominent, full-width amber banner: the whole point is that this cannot be
+  # mistaken for a passing line or scroll by unnoticed. ASCII rule off a UTF-8
+  # locale so the box never renders as mojibake.
+  local rule
+  if _has_unicode; then
+    rule="────────────────────────────────────────────────"
+  else
+    rule="================================================"
+  fi
+  echo ""
+  echo -e "  ${AMBER}${BOLD}${rule}${RESET}"
+  echo -e "  ${AMBER}${BOLD}  Docker is not tuned for Cleat${RESET}"
+  echo -e "  ${AMBER}${BOLD}${rule}${RESET}"
+  echo ""
+  if [[ -n "${_DOCKER_GATE_SUMMARY:-}" ]]; then
+    echo -e "  ${AMBER}!${RESET} ${BOLD}${_DOCKER_GATE_SUMMARY}${RESET} ${DIM}Sessions will run slow or freeze under load.${RESET}"
+  fi
+  echo -e "    ${DIM}Fix Docker with the steps above, then re-run ${RESET}${BOLD}cleat${RESET}${DIM}.${RESET}"
+  echo -e "    ${DIM}To skip this stop from now on: ${RESET}${BOLD}CLEAT_NO_DOCKER_GATE=1${RESET}${DIM}.${RESET}"
+  echo ""
+  echo -en "  ${BLUE}▸${RESET} Press ${BOLD}Enter${RESET} to launch anyway, or ${BOLD}Ctrl-C${RESET} to stop and fix Docker first "
+  local _ack=""
+  read -r _ack || true
+  echo ""
+  return 0
 }
 
 cmd_clean() {
@@ -8982,7 +9067,10 @@ main() {
   # first, read the news second. The positive "Docker tuned" confirmation runs
   # LAST, directly above the bring-up, so a well-sized VM gets a one-line nod that
   # sticks to "Image ready" (it's silent, and the warning shows instead, when the
-  # VM is undersized).
+  # VM is undersized). Finally, if any of those advisories flagged a genuine Docker
+  # CONFIG error (undersized VM memory or default swap), _maybe_gate_on_docker_config
+  # HOLDS the interactive launch on a keypress: the single deliberate block in the
+  # startup path, so a misconfigured Docker can't "just blink" past unread.
   case "$cmd" in
     start|resume|r|run|claude|shell|sh)
       _maybe_prompt_cli_update
@@ -8995,6 +9083,9 @@ main() {
       _maybe_check_docker_pressure
       _maybe_show_release_highlight
       _maybe_announce_docker_ready
+      # Last: if any advisory above flagged a genuine Docker CONFIG error, hold the
+      # interactive launch on a keypress so it can't scroll by unread (concept/21).
+      _maybe_gate_on_docker_config
       ;;
   esac
 

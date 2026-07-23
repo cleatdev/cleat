@@ -471,6 +471,8 @@ Images are published multi-arch (amd64 + arm64): Apple Silicon runs natively, ne
 
 Closing a terminal ends the session but leaves the box running, still reserving its memory ceiling. On every interactive start, Cleat stops other idle boxes that are safe to stop (detached, no agent running, idle past a 30-minute grace) and tells you what it freed. A box working unattended (terminal left open, agent still running) is never touched. Disable with `CLEAT_NO_IDLE_SWEEP=1`. Tune the grace with `CLEAT_IDLE_GRACE_MINS`.
 
+If your Docker VM memory is set too low, or swap is left at the default, Cleat **holds the launch** on a prominent amber banner and waits for you to press Enter, instead of letting the warning scroll past unread into Claude's TUI. It fires only on a genuine config problem (never the transient overload notice) and only on a real interactive terminal, so cron, pipes and CI never block. Press Enter to launch anyway, Ctrl-C to go fix Docker, or set `CLEAT_NO_DOCKER_GATE=1` to keep the advisory but skip the hold.
+
 ---
 
 ## Capabilities

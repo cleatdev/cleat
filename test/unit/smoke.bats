@@ -1085,6 +1085,39 @@ EOF
   refute_output --partial "command not found"
 }
 
+@test "smoke: the Docker-config gate survives strict mode and never hangs" {
+  # The gate holds an interactive launch on a `read`; that read (and its `|| true`
+  # fail-open) is exactly the shape that trips set -e on EOF, and the whole
+  # function runs bare in main's dispatch under real `set -euo pipefail`. Drive it
+  # directly (a stubbed `cleat start` can't reach the on-start sequence), armed and
+  # with _is_interactive forced true, feeding EOF via </dev/null: it must print the
+  # banner, fall through the read, and exit 0 without hanging or aborting. Also
+  # prove the escape hatch and the non-interactive path stay silent under strict mode.
+  cat > "$TEST_TEMP/gate_strict.sh" <<EOF
+set -euo pipefail
+source "$CLI"
+_is_interactive() { return 0; }
+_DOCKER_GATE_PENDING=1
+_DOCKER_GATE_SUMMARY="Docker VM memory is 8 GB (aim for 16 GB)."
+# 1. Armed + interactive + EOF stdin: banner prints, read fails open, rc 0.
+_maybe_gate_on_docker_config </dev/null
+echo "after-block=[\$?]"
+# 2. Escape hatch: silent, no hold.
+CLEAT_NO_DOCKER_GATE=1 _maybe_gate_on_docker_config </dev/null && echo "hatch=ok"
+# 3. Non-interactive: silent even when armed.
+_is_interactive() { return 1; }
+_maybe_gate_on_docker_config </dev/null && echo "noninteractive=ok"
+EOF
+  run bash "$TEST_TEMP/gate_strict.sh"
+  assert_success
+  assert_output --partial "Docker is not tuned for Cleat"
+  assert_output --partial "after-block=[0]"
+  assert_output --partial "hatch=ok"
+  assert_output --partial "noninteractive=ok"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+}
+
 # ── [setup] provisioning (concept/16) ───────────────────────────────────────
 
 @test "smoke: cleat setup reports no [setup] section" {

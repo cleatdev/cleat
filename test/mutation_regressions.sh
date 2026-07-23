@@ -56,6 +56,7 @@ SMOKE_BATS="$REPO_ROOT/test/unit/smoke.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 PROVISION_BATS="$REPO_ROOT/test/unit/provision.bats"
+DOCKER_GATE_BATS="$REPO_ROOT/test/unit/docker_gate.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -2960,6 +2961,46 @@ cat > "$SED_TMP" << 'SED'
 s@_trust_remove "\$project" "\$box"@_trust_remove "\$project"@
 SED
 try "vnext_untrust_box_scope" "removes only that box" "$CLI" "$PROVISION_BATS"
+
+# DOCKER-CONFIG GATE (concept/21): the single place Cleat deliberately blocks the
+# launch. Five load-bearing behaviors, each mutation-proved.
+
+# 1. INTERACTIVE-ONLY (the walk-away pillar). Drop the _is_interactive guard so a
+#    non-interactive run would reach the read/banner: the "never blocks off a
+#    terminal" test must then fail (the banner leaks into piped output).
+cat > "$SED_TMP" << 'SED'
+s@  _is_interactive || return 0@  :@
+SED
+try "vnext_docker_gate_interactive_only" "NON-interactive never blocks" "$CLI" "$DOCKER_GATE_BATS"
+
+# 2. PENDING GUARD. Remove the "only when armed" guard so a healthy Docker (no
+#    advisory armed the gate) would still print the banner: the silent-when-unarmed
+#    test must fail.
+cat > "$SED_TMP" << 'SED'
+s@\[\[ "\${_DOCKER_GATE_PENDING:-0}" == "1" \]\] || return 0@:@
+SED
+try "vnext_docker_gate_pending_guard" "silent when nothing armed" "$CLI" "$DOCKER_GATE_BATS"
+
+# 3. ESCAPE HATCH. Break the CLEAT_NO_DOCKER_GATE comparison so the opt-out no
+#    longer skips the hold: the "escape hatch skips the hold" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@"\${CLEAT_NO_DOCKER_GATE:-}" == "1"@"\${CLEAT_NO_DOCKER_GATE:-}" == "off"@
+SED
+try "vnext_docker_gate_escape_hatch" "skips the hold" "$CLI" "$DOCKER_GATE_BATS"
+
+# 4. UNDERSIZED ARMS. Disarm the gate flag so an undersized VM would NOT hold the
+#    launch: the "undersized VM arms the gate" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@_DOCKER_GATE_PENDING=1@_DOCKER_GATE_PENDING=0@
+SED
+try "vnext_docker_gate_undersized_arms" "undersized VM in the pressure check arms" "$CLI" "$DOCKER_GATE_BATS"
+
+# 5. SWAP ARMS. Same disarm, proved through the low-swap path in the ready-announce:
+#    a default-swap VM would not hold the launch, so its arming test must fail.
+cat > "$SED_TMP" << 'SED'
+s@_DOCKER_GATE_PENDING=1@_DOCKER_GATE_PENDING=0@
+SED
+try "vnext_docker_gate_swap_arms" "low swap in the ready-announce arms" "$CLI" "$DOCKER_GATE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -3114,6 +3114,29 @@ s@""|"/"|"\$HOME")@""|"/")@
 SED
 try "vnext_config_generate_refuse_home" "refuses to write in" "$CLI" "$CONFIG_BATS"
 
+# 12. LOAD-RESOURCE CUSTOM PIN. Blank the second (custom-pin) field for an off-ring
+#     value so a hand-set 16g is no longer reachable in the TUI cycle: the
+#     _config_load_resource off-ring test (and the round-trip) must fail.
+cat > "$SED_TMP" << 'SED'
+s@"\$v" "\$v"@"$v" ""@
+SED
+try "vnext_config_load_resource_custom_pin" "off-ring value is returned as its own custom pin" "$CLI" "$CONFIG_BATS"
+
+# 13. DRAW LINE-COUNT INVARIANT. Turn the Resources group header echo into a no-op so
+#     the draw emits one fewer physical line than the tui's draw_lines constant expects
+#     (a redraw desync): the "emits exactly ncaps+5 lines" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@  echo -e "  \${DIM}Resources\${RESET}@  : "  ${DIM}Resources${RESET}@
+SED
+try "vnext_config_draw_line_count" "emits exactly ncaps" "$CLI" "$CONFIG_BATS"
+
+# 14. ENV SCAFFOLD GUARD. Break the env-cap match in the editor save path so enabling
+#     env no longer offers to scaffold .cleat.env: the offer test must fail.
+cat > "$SED_TMP" << 'SED'
+s@\*,env,\*)@*,envXX,*)@
+SED
+try "vnext_config_env_scaffold_offer" "enabling env offers to scaffold" "$CLI" "$CONFIG_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

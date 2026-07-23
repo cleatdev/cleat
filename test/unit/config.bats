@@ -784,3 +784,83 @@ EOF
   run _read_resource_from_file "$d/.cleat" memory
   assert_output "4g"
 }
+
+# ── _config_load_resource (the custom-pin derivation the TUI relies on) ─────
+# The second (tab-delimited) field is the "custom pin": a hand-set value NOT on
+# the preset ring, which _config_cycle_value folds back in so it stays reachable.
+# The TUI is the only consumer, so these direct tests are the only guard.
+
+@test "load_resource: an off-ring value is returned as its own custom pin" {
+  printf '[resources]\nmemory = 16g\n' > "$TEST_TEMP/config"
+  run _config_load_resource "$TEST_TEMP/config" memory default
+  assert_output $'16g\t16g'
+}
+
+@test "load_resource: an on-ring value has an empty custom pin" {
+  printf '[resources]\nmemory = 8g\n' > "$TEST_TEMP/config"
+  run _config_load_resource "$TEST_TEMP/config" memory default
+  # field 1 = 8g, field 2 (custom) = empty
+  [[ "${output%%$'\t'*}" == "8g" ]] || { echo "field1: ${output%%$'\t'*}"; return 1; }
+  [[ "${output#*$'\t'}" == "" ]] || { echo "field2 not empty: ${output#*$'\t'}"; return 1; }
+}
+
+@test "load_resource: an unset value maps to the sentinel with no custom pin" {
+  : > "$TEST_TEMP/config"
+  run _config_load_resource "$TEST_TEMP/config" memory default
+  [[ "${output%%$'\t'*}" == "default" ]] || { echo "field1: ${output%%$'\t'*}"; return 1; }
+  [[ "${output#*$'\t'}" == "" ]] || { echo "field2: ${output#*$'\t'}"; return 1; }
+}
+
+@test "load_resource: a decimal off-ring cpus keeps its custom pin" {
+  printf '[resources]\ncpus = 1.5\n' > "$TEST_TEMP/config"
+  run _config_load_resource "$TEST_TEMP/config" cpus all
+  assert_output $'1.5\t1.5'
+}
+
+@test "load_resource: an off-ring value stays reachable through a full cycle round-trip" {
+  # End-to-end: load derives the pin, cycle keeps it reachable. This is what
+  # protects a hand-set 16g in the editor. prev (not next) is the distinguishing
+  # direction: 16g is the ring's last stop, so next wraps to the sentinel in both
+  # the correct and a pin-dropped world, but prev only reaches 16g if the pin survives.
+  printf '[resources]\nmemory = 16g\n' > "$TEST_TEMP/config"
+  local pair mem custom
+  pair="$(_config_load_resource "$TEST_TEMP/config" memory default)"
+  mem="${pair%%$'\t'*}"; custom="${pair#*$'\t'}"
+  run _config_cycle_value prev "$mem" "$custom" "${_CONFIG_MEM_CHOICES[@]}"
+  assert_output "8g"
+}
+
+# ── draw redraw invariant (line count = the tui's draw_lines formula) ───────
+# The TUI's cursor-up math uses draw_lines = ncaps+5 (+2 with the generate row).
+# It MUST equal the physical lines _config_picker_draw emits, or every keypress
+# desyncs the redraw. These pin the draw side of that invariant.
+
+@test "config draw: emits exactly ncaps+5 lines in project scope" {
+  local n
+  n="$(_config_picker_draw 0 "" default all 0 0 | wc -l | tr -d ' ')"
+  [[ "$n" -eq $(( ${#KNOWN_CAPS[@]} + 5 )) ]] || { echo "got $n, want $(( ${#KNOWN_CAPS[@]} + 5 ))"; return 1; }
+}
+
+@test "config draw: emits exactly ncaps+7 lines with the generate row (global scope)" {
+  local n
+  n="$(_config_picker_draw 0 "" default all 1 0 | wc -l | tr -d ' ')"
+  [[ "$n" -eq $(( ${#KNOWN_CAPS[@]} + 7 )) ]] || { echo "got $n, want $(( ${#KNOWN_CAPS[@]} + 7 ))"; return 1; }
+}
+
+# ── env scaffolding via the editor save path ───────────────────────────────
+
+@test "config editor: enabling env offers to scaffold .cleat.env on save" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "$TEST_TEMP" <<< $'env\ndone\ny'
+  assert_success
+  assert_output --partial "Create .cleat.env"
+  [[ -f "$TEST_TEMP/.cleat.env" ]] || { echo ".cleat.env not created"; return 1; }
+}
+
+@test "config editor: an existing .cleat.env is left untouched, no re-offer" {
+  echo "FOO=bar" > "$TEST_TEMP/.cleat.env"
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "$TEST_TEMP" <<< $'env\ndone'
+  assert_success
+  refute_output --partial "Create .cleat.env"
+  run cat "$TEST_TEMP/.cleat.env"
+  assert_output "FOO=bar"
+}

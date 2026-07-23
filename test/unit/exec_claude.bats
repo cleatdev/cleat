@@ -181,6 +181,70 @@ teardown() { _common_teardown; }
   assert_output --partial "Out of memory"
 }
 
+# ── Host fork exhaustion guidance (_maybe_explain_fork_exhaustion) ─────────────
+# During a heavy multi-agent run the HOST per-user process table can fill, and
+# Cleat's background watchers log "fork: Resource temporarily unavailable". The
+# session usually still succeeds; this surfaces one plain host-limit diagnostic
+# from THIS session's slice of the watcher log (never a stale prior session's).
+
+@test "fork exhaustion: explains a fork error logged this session" {
+  local log="$TEST_TEMP/.watcher-log"
+  printf '/usr/local/bin/cleat: fork: retry: Resource temporarily unavailable\n' > "$log"
+  run _maybe_explain_fork_exhaustion "$log" 0
+  assert_success
+  assert_output --partial "process slots"
+  assert_output --partial "maxprocperuid"
+}
+
+@test "fork exhaustion: stays silent on a clean watcher log" {
+  local log="$TEST_TEMP/.watcher-log"
+  printf '[browser-watcher 10:00:00] opening URL on host\n' > "$log"
+  run _maybe_explain_fork_exhaustion "$log" 0
+  assert_success
+  assert_output ""
+}
+
+@test "fork exhaustion: ignores a fork error from a PRIOR session (before the offset)" {
+  local log="$TEST_TEMP/.watcher-log"
+  printf '/usr/local/bin/cleat: fork: retry: Resource temporarily unavailable\n' > "$log"
+  local off; off="$(wc -c < "$log")"     # this session starts AFTER the stale error
+  printf 'clean line this session\n' >> "$log"
+  run _maybe_explain_fork_exhaustion "$log" "$off"
+  assert_success
+  assert_output ""
+}
+
+@test "fork exhaustion: silent when the log does not exist" {
+  run _maybe_explain_fork_exhaustion "$TEST_TEMP/nope" 0
+  assert_success
+  assert_output ""
+}
+
+@test "watcher log cap: a small log is kept and its size is the read offset" {
+  local log="$TEST_TEMP/.watcher-log"
+  printf 'small\n' > "$log"                 # 6 bytes
+  run _cap_watcher_log "$log"
+  assert_success
+  assert_output "6"
+  [ -s "$log" ]                             # not truncated
+}
+
+@test "watcher log cap: an oversized log is truncated and the offset resets to 0" {
+  local log="$TEST_TEMP/.watcher-log"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$log"   # ~1.2 MB, over the 1 MB cap
+  run _cap_watcher_log "$log"
+  assert_success
+  assert_output "0"
+  [ ! -s "$log" ]                           # truncated to empty
+}
+
+@test "watcher log cap: a missing log yields offset 0, creates nothing" {
+  run _cap_watcher_log "$TEST_TEMP/absent-log"
+  assert_success
+  assert_output "0"
+  [ ! -e "$TEST_TEMP/absent-log" ]
+}
+
 # ── attach heal (_refresh_attached_claude_json) ──────────────────────────────
 # The end-to-end heal (poisoned flag fixed in place, same inode) is pinned in
 # regressions.bats; these pin the guards around it.

@@ -2791,3 +2791,67 @@ EOF
   assert_output --partial "git"
   assert_output --partial "env"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Every host-side watcher (clipboard, browser, hook bridge) is backgrounded
+# with its stdout+stderr redirected to a per-box .watcher-log, NOT the
+# interactive terminal. Under a heavy multi-agent load the host hits its
+# process cap, and a backgrounded watcher that inherits the terminal's fd 2
+# prints bash's own "fork: Resource temporarily unavailable" straight into the
+# Claude Code TUI, corrupting it. Guard: a watcher that writes to its stderr
+# lands in the log (proving the redirect targets a debuggable file, not the
+# terminal and not /dev/null), and the caller's fd 2 stays clean.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression: watchers redirect fork-error stderr to a log, not the terminal" {
+  local cname="watcher-fd2-ctr"
+  # The real clip dir exec_claude computes for this cname (isolated HOME).
+  local clip_dir="$HOME/.config/cleat/run/${cname}/clip"
+  mkdir -p "$clip_dir"
+  # A leftover clipboard payload makes the watcher's startup call _path_mtime,
+  # the synchronous stderr-emitting seam overridden below.
+  : > "$clip_dir/clipboard"
+
+  # Docker shim: sleep on the interactive session exec so the backgrounded
+  # watcher has a window to run its startup and write to its stderr before
+  # cleanup kills it (same technique as the cleanup-reap regression above).
+  mkdir -p "$TEST_TEMP/shim"
+  cat > "$TEST_TEMP/shim/docker" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "exec" ]; then
+  case " \$* " in
+    *" -it "*) sleep 1 ;;
+  esac
+fi
+exec "$MOCK_BIN/docker" "\$@"
+EOF
+  chmod +x "$TEST_TEMP/shim/docker"
+
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  cat > "$TEST_TEMP/watcher_spawner.sh" <<EOF
+export PATH="$TEST_TEMP/shim:\$PATH"
+source "$TEST_TEMP/cli_stripped"
+# Spawn only the clipboard watcher (browser watcher + hook bridge skipped).
+_host_clip_cmd() { echo "true"; }
+_host_open_cmd() { echo ""; }
+# Force a synchronous write to the watcher's OWN stderr during its startup.
+# Path-guarded to the clipboard leftover sweep so no parent code path trips it.
+_path_mtime() {
+  case "\$1" in
+    */clipboard) echo "WATCHER_FD2_SENTINEL" >&2 ;;
+  esac
+  echo 0
+}
+# Capture exec_claude's fd 2 (the caller the watcher must not leak into).
+exec_claude "$cname" --dangerously-skip-permissions >/dev/null 2>"$TEST_TEMP/caller-stderr"
+EOF
+
+  _portable_timeout 15 bash "$TEST_TEMP/watcher_spawner.sh" || true
+
+  # The watcher wrote its stderr to the per-box log: proves it ran AND that the
+  # redirect targets a debuggable file, not the terminal and not /dev/null.
+  run grep -q "WATCHER_FD2_SENTINEL" "$clip_dir/.watcher-log"
+  assert_success
+  # ...and it did NOT leak into the caller's fd 2 (the terminal in production).
+  run grep -q "WATCHER_FD2_SENTINEL" "$TEST_TEMP/caller-stderr"
+  assert_failure
+}

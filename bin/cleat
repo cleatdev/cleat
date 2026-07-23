@@ -4386,8 +4386,15 @@ _browser_watcher() {
     # the box's clip dir forever. Leaked watchers are how one click became one
     # tab PER crashed session.
     kill -0 "$_bw_parent" 2>/dev/null || { _bw_cleanup; exit 0; }
-    local url
-    if url="$(_browser_claim_url "$bridge_file")"; then
+    # Gate the claim's command-substitution behind a builtin `[ -f ]` so an IDLE
+    # poll (no bridge file, the overwhelmingly common case) forks nothing but the
+    # loop's `sleep`. Without the guard the `$(...)` forks a subshell every 0.5s
+    # even when _browser_claim_url would immediately return 1, doubling this
+    # watcher's idle fork rate and its contribution to host process pressure under
+    # a heavy multi-agent run. Behavior is identical: _browser_claim_url also
+    # returns 1 when the file is absent.
+    local url=""
+    if [ -f "$bridge_file" ] && url="$(_browser_claim_url "$bridge_file")"; then
       if _browser_recently_opened "$clip_dir" "$url"; then
         url=""   # duplicate of a just-opened URL; drop it
       fi
@@ -4836,11 +4843,25 @@ exec_claude() {
     touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
   }
 
+  # The per-box watcher log (target of the redirects below). Cap it on session
+  # start and record the post-cap size, which is this session's read offset for
+  # the end-of-session fork diagnostic.
+  local _watcher_log="$_CLIP_DIR/.watcher-log" _watcher_log_off
+  _watcher_log_off="$(_cap_watcher_log "$_watcher_log")"
+
   local clip_cmd
   clip_cmd="$(_host_clip_cmd)"
   if [ -n "$clip_cmd" ]; then
     touch "$_CLIP_DIR/.watcher.$$"
-    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" &
+    # Redirect the watcher's own stdout+stderr to a per-box log, NOT the
+    # terminal. Under heavy multi-agent load the host can hit its process cap,
+    # and a backgrounded watcher that inherits the interactive terminal's fd 2
+    # prints bash's own "fork: Resource temporarily unavailable" straight into
+    # the Claude Code TUI, corrupting it. The watcher never has anything the
+    # user should see (it drives pbcopy and marker files, never the terminal),
+    # so a log keeps fork spew and any stray output off-screen but debuggable.
+    # `.watcher-log` (hyphen) stays clear of the `.watcher.*` liveness glob.
+    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
     _CLIP_WATCHER_PID=$!
     disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
   fi
@@ -4853,7 +4874,11 @@ exec_claude() {
   if [ -n "$open_cmd" ]; then
     local _bw_interactive=0
     _is_tty && _bw_interactive=1
-    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" "$(_browser_bridge_mode)" "$_bw_interactive" &
+    # Same terminal-safety redirect as the clipboard watcher: this loop opens
+    # URLs (`$open_cmd ... >/dev/null 2>&1`) and logs to .proxy-log, so it never
+    # needs the terminal, and a fork failure under load must not spew into the
+    # TUI. Its callback-proxy child inherits these fds, so it is covered too.
+    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" "$(_browser_bridge_mode)" "$_bw_interactive" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
     _BROWSER_WATCHER_PID=$!
     disown "$_BROWSER_WATCHER_PID" 2>/dev/null || true
   fi
@@ -4861,7 +4886,11 @@ exec_claude() {
   # Start host-side hook bridge if user has hooks and hooks cap is active
   local hooks_file="$CLEAT_RUN_DIR/${cname}/hooks/events.jsonl"
   if cap_is_active hooks 2>/dev/null && _has_host_hooks 2>/dev/null; then
-    _hook_bridge_watcher "$hooks_file" &
+    # Terminal-safety redirect (see the clipboard watcher). The bridge runs hook
+    # commands `>/dev/null 2>&1` and its `( _execute_host_hooks ) &` children
+    # inherit these fds, so both the bridge and its children keep fork spew off
+    # the TUI while staying debuggable in the log.
+    _hook_bridge_watcher "$hooks_file" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
     _HOOK_BRIDGE_PID=$!
     disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
   fi
@@ -4916,6 +4945,11 @@ exec_claude() {
   trap - EXIT INT TERM HUP
   _restore_terminal
 
+  # If the host ran out of process slots this session (watcher logged fork
+  # errors), explain it once. Independent of rc: the box session usually
+  # SUCCEEDS while the host-side watchers are the ones that could not fork.
+  _maybe_explain_fork_exhaustion "$_watcher_log" "$_watcher_log_off"
+
   if [[ $rc -eq 0 ]]; then
     # Reclaim claude's leftover trailing line (cursor up, erase it), drop back
     # down, then clear the line success is about to write on. Without that final
@@ -4960,6 +4994,48 @@ _maybe_explain_oom() {
   echo -e "    ${DIM}•${RESET} More memory: add ${BOLD}[resources]${RESET} then ${BOLD}memory = 8g${RESET} to ${BOLD}.cleat${RESET} ${DIM}(or your global config)${RESET}"
   echo -e "    ${DIM}•${RESET} Fewer workers: ${BOLD}jest --maxWorkers=2${RESET}, ${BOLD}vitest --poolOptions.threads.maxThreads=2${RESET}"
   echo -e "    ${DIM}•${RESET} Cap CPU so runners self-limit: add ${BOLD}cpus = 2${RESET} under ${BOLD}[resources]${RESET}"
+}
+
+# During a heavy multi-agent run the HOST (not the box) can exhaust its per-user
+# process table, and any host-side fork then fails with EAGAIN. Cleat's background
+# watchers hit this and bash writes "fork: Resource temporarily unavailable" to
+# the per-box watcher log (redirected off the terminal at the watcher spawns, so
+# it no longer corrupts the Claude TUI). This surfaces ONE plain diagnostic when
+# that happened THIS session, so the raw bash spam in the log gets a human
+# explanation and a fix. It reads only the bytes written after `off` (this
+# session's watcher output), so a stale error from a past session never
+# re-triggers it. The failing fork is host-side (the box has its own pid pool and
+# a working session), so this is guidance for the user's machine, not a box fix.
+# Fail-soft: a missing log or `tail`/`grep` hiccup just prints nothing.
+# Cap the per-box watcher log at ~1 MB and echo its post-cap byte size. Nothing
+# else sweeps this log (it dodges the .watcher.* liveness glob by design), so
+# without the cap a host fork storm, which appends many bash retry lines, could
+# grow it unbounded across a long-lived box. The echoed size is the session's
+# read offset so the end-of-session diagnostic scans only this session's slice.
+# Fail-soft: a missing or unreadable log yields 0 (and no truncation).
+_cap_watcher_log() {
+  local log="$1" sz=0
+  [ -f "$log" ] || { echo 0; return 0; }
+  sz="$(wc -c < "$log" 2>/dev/null || echo 0)"
+  [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
+  if (( sz > 1048576 )); then
+    : > "$log" 2>/dev/null || true
+    sz=0
+  fi
+  echo "$sz"
+}
+
+_maybe_explain_fork_exhaustion() {
+  local log="$1" off="${2:-0}"
+  [ -f "$log" ] || return 0
+  tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep -q "Resource temporarily unavailable" || return 0
+  echo ""
+  warn "${BOLD}Your machine ran low on process slots${RESET} during this session ${DIM}(a host limit, not the box)${RESET}."
+  echo -e "    ${DIM}A large multi-agent run can spawn thousands of host processes and hit your per-user cap.${RESET}"
+  echo -e "    ${DIM}The agent kept working. Only Cleat's background helpers logged the fork errors. To avoid it:${RESET}"
+  echo -e "    ${DIM}•${RESET} Run fewer agents at once ${DIM}(dispatch subagents sequentially)${RESET}"
+  echo -e "    ${DIM}•${RESET} Raise this shell's limit before launching: ${BOLD}ulimit -u 4096${RESET}"
+  echo -e "    ${DIM}•${RESET} macOS per-user cap: ${BOLD}sudo sysctl kern.maxprocperuid=4096${RESET} ${DIM}(default is often ~2784)${RESET}"
 }
 
 # ── Update check (every 10 minutes) ─────────────────────────────────────────
@@ -6346,7 +6422,9 @@ cmd_shell() {
   if [ -n "$_shell_open_cmd" ]; then
     local _shell_interactive=0
     _is_tty && _shell_interactive=1
-    _browser_watcher "$_shell_clip_dir" "$_shell_open_cmd" "$cname" "$(_browser_bridge_mode)" "$_shell_interactive" &
+    # Terminal-safety redirect (see exec_claude): keep a fork-starved watcher's
+    # stderr out of this shell's TUI, in a per-box log instead.
+    _browser_watcher "$_shell_clip_dir" "$_shell_open_cmd" "$cname" "$(_browser_bridge_mode)" "$_shell_interactive" >>"$_shell_clip_dir/.watcher-log" 2>&1 &
     _shell_bw_pid=$!
     disown "$_shell_bw_pid" 2>/dev/null || true
   fi
@@ -6400,7 +6478,9 @@ cmd_login() {
     # redirect_uri= URL, the console code-paste authorize URL included, so both
     # login flows auto-open; only CLEAT_BROWSER_BRIDGE=off withholds the
     # auto-open (the callback proxy still runs).
-    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" &
+    # Terminal-safety redirect (see exec_claude): keep a fork-starved watcher's
+    # stderr out of the login TUI, in a per-box log instead.
+    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" >>"$_login_clip_dir/.watcher-log" 2>&1 &
     _login_browser_pid=$!
     disown "$_login_browser_pid" 2>/dev/null || true
     if [ "$_login_bridge_mode" = off ]; then
@@ -6780,19 +6860,67 @@ _prebuilt_image_tags() {
   docker images "$REGISTRY_BASE" --format '{{.Repository}}:{{.Tag}}	{{.Size}}' 2>/dev/null || true
 }
 
+# Full image IDs (sha256:...) pinned by ANY container, running OR stopped, one
+# per line. This is exactly the set `docker rmi` (no -f) refuses to remove: a
+# box, even exited, holds its image by ID. A drift rebuild orphans the old build
+# into a dangling image, but the stopped box built from it still pins it, and
+# Cleat never touches boxes (concept/22), so those pinned images accumulate.
+# Empty on a down daemon. Seam (overridable in tests). `docker ps -a -q` uses
+# separate tokens so the docker stub's token-bounded ` -a ` detection routes it.
+_container_image_ids() {
+  local ids=() id
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && ids+=("$id")
+  done < <(docker ps -a -q 2>/dev/null || true)
+  [[ ${#ids[@]} -eq 0 ]] && return 0
+  docker inspect --format '{{.Image}}' "${ids[@]}" 2>/dev/null || true
+}
+
+# Resolve an image ref (dangling short ID or repo:tag) to its full image ID
+# (sha256:...). Empty when the ref no longer exists. Seam.
+_image_id_of() {
+  docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || true
+}
+
+# True when image ref $1 is pinned by a container in the newline set $2 of
+# container image IDs: `docker rmi` would refuse it, so the prune OFFER must not
+# count it (the action, cmd_prune, keeps it and reports it as "kept"). Resolves
+# $1 to its full ID, tests whole-line (`-x`) membership with fixed strings
+# (`-F`, so a sha256 with no regex metachars matches literally, and a short ID
+# can't substring-match a longer one). False when $1 no longer resolves.
+_image_referenced_by_container() {
+  local iid; iid="$(_image_id_of "$1")"
+  [[ -n "$iid" ]] || return 1
+  printf '%s\n' "${2:-}" | grep -Fxq -- "$iid"
+}
+
 # Count and approximate size (MB) of prunable cleat artifacts: "count<TAB>mb".
 # Sizes are docker's human strings (1.72GB / 971MB): close enough to decide
-# whether a prune is worth offering.
+# whether a prune is worth offering. Images a container still references are
+# EXCLUDED from both the count and the byte total, because cmd_prune (docker rmi,
+# no -f) cannot remove them: counting them made the offer promise a prune that
+# then removed nothing ("N stale images" -> "Nothing to prune. N kept"). The 5 GB
+# gate now measures removable-only bloat too, so the offer never fires on bytes
+# no prune can reclaim.
 _cleat_prunable_stats() {
+  local referenced; referenced="$(_container_image_ids)"
   {
     local id
     while IFS= read -r id; do
       [[ -n "$id" ]] || continue
+      _image_referenced_by_container "$id" "$referenced" && continue
       # Unsizeable still counts: the artifact exists even if inspect hiccups.
       docker image inspect "$id" --format '{{.Size}}B' 2>/dev/null || echo "0B"
     done < <(_dangling_cleat_images)
-    _prebuilt_image_tags | awk -F'\t' -v cur="${REGISTRY_BASE}:v${VERSION}" \
-      '$1 != cur && $1 != "" {print $2}'
+
+    local line tag
+    while IFS= read -r line; do
+      tag="${line%%	*}"
+      [[ -n "$tag" ]] || continue
+      [[ "$tag" == "${REGISTRY_BASE}:v${VERSION}" ]] && continue
+      _image_referenced_by_container "$tag" "$referenced" && continue
+      printf '%s\n' "${line#*	}"
+    done < <(_prebuilt_image_tags)
   } | awk '
     /GB$/ { sub(/GB$/,"");  mb += $0 * 1024;           n++; next }
     /MB$/ { sub(/MB$/,"");  mb += $0;                  n++; next }

@@ -97,6 +97,63 @@ teardown() { _common_teardown; }
   assert_output "$(printf '2\t1536')"
 }
 
+# ── prune OFFER excludes container-pinned images (the 1.png bug) ──────────────
+# The offer count (_cleat_prunable_stats) and the action (cmd_prune, docker rmi
+# without -f) must agree on removability, or the offer promises a prune that then
+# removes nothing ("N stale images" -> "Nothing to prune. N kept"). A stopped box
+# pins its image by ID; Cleat never removes boxes, so those images accumulate but
+# can never be pruned. The offer must not count them.
+
+@test "prune stats: an image still referenced by a container is not counted" {
+  _dangling_cleat_images() { printf 'aaa111\n'; }
+  _prebuilt_image_tags() { printf '%s\t%s\n' "${REGISTRY_BASE}:v0.12.2" "1.5GB"; }
+  _image_id_of() {
+    case "$1" in
+      aaa111)   echo "sha256:pinneddangling" ;;
+      *v0.12.2) echo "sha256:freetag" ;;
+    esac
+  }
+  _container_image_ids() { printf 'sha256:pinneddangling\n'; }
+  run _cleat_prunable_stats
+  # The pinned dangling drops out entirely; only the free 1.5 GB tag counts.
+  assert_output "$(printf '1\t1536')"
+}
+
+@test "prune stats: the referenced set is built from ALL containers (docker ps -a -q)" {
+  # docker rmi refuses an image a STOPPED container references too, so the set
+  # must come from `docker ps -a` (all), not just running containers.
+  run _container_image_ids
+  assert_success
+  run grep -F "ps -a -q" "$DOCKER_CALLS"
+  assert_success
+}
+
+@test "pressure: no prune offer when all bloat is pinned by containers" {
+  # The exact 1.png report: 12 GB of old images, every one pinned by a stopped
+  # box, so the removable total is 0 and the offer must stay silent (before the
+  # fix it fired "2 stale images", then prune removed nothing).
+  _is_tty() { return 0; }
+  _docker_vm_memory() { echo ""; }
+  _dangling_cleat_images() { :; }
+  _prebuilt_image_tags() {
+    printf '%s\t%s\n' \
+      "${REGISTRY_BASE}:v0.12.2" "6GB" \
+      "${REGISTRY_BASE}:v0.14.0" "6GB"
+  }
+  _image_id_of() {
+    case "$1" in
+      *v0.12.2) echo "sha256:pin1" ;;
+      *v0.14.0) echo "sha256:pin2" ;;
+    esac
+  }
+  _container_image_ids() { printf 'sha256:pin1\nsha256:pin2\n'; }
+  cmd_prune() { echo "PRUNE_CALLED"; }
+  run _maybe_check_docker_pressure <<< "y"
+  assert_success
+  refute_output --partial "stale cleat images"
+  refute_output --partial "PRUNE_CALLED"
+}
+
 # ── ownership filters (no seam overrides) ────────────────────────────────────
 # The seams are overridden everywhere else, so this is the ONE test that pins
 # the real queries: the label filter and the repo scope ARE the enforcement of

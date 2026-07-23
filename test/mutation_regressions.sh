@@ -2056,7 +2056,7 @@ try "vnext_overload_compares_gb" "never contradicts itself" "$CLI" "$PRUNE_BATS"
 # a non-loopback console auth URL would be deferred to a terminal that never opens
 # it, so the "passes host_opens_clicks=0" test sees 1 and fails.
 cat > "$SED_TMP" << 'SED'
-s|"$_login_bridge_mode" "0" &|"$_login_bridge_mode" "1" &|
+s|"$_login_bridge_mode" "0" >>|"$_login_bridge_mode" "1" >>|
 SED
 try "vnext_login_opens_auth" "passes host_opens_clicks=0" "$CLI" "$HOOKS_BATS"
 
@@ -3136,6 +3136,57 @@ cat > "$SED_TMP" << 'SED'
 s@\*,env,\*)@*,envXX,*)@
 SED
 try "vnext_config_env_scaffold_offer" "enabling env offers to scaffold" "$CLI" "$CONFIG_BATS"
+
+# WATCHER TERMINAL SAFETY. Every host-side watcher redirects its stdout+stderr
+# to a per-box .watcher-log so a fork-starved watcher's "fork: Resource
+# temporarily unavailable" never corrupts the Claude Code TUI. Strip the
+# redirect from the clipboard watcher spawn: the watcher's stderr leaks onto the
+# caller's fd 2 and the log is never created, so the regression test fails.
+cat > "$SED_TMP" << 'SED'
+s|_clipboard_watcher "\$_CLIP_DIR" "\$clip_cmd" >>"\$_CLIP_DIR/.watcher-log" 2>&1 &|_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" \&|
+SED
+try "watcher_fd2_redirect" "watchers redirect fork-error stderr"
+
+# PRUNE OFFER EXCLUDES REFERENCED IMAGES (the 1.png over-count bug). The offer
+# count must skip images a container still pins (docker rmi, no -f, keeps them),
+# or it promises a prune that removes nothing. Drop the dangling-image filter:
+# a pinned dangling build is counted again, so the "not counted" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_image_referenced_by_container "\$id" "\$referenced" && continue@:@
+SED
+try "vnext_prune_skip_referenced_dangling" "referenced by a container is not counted" "$CLI" "$PRUNE_BATS"
+
+# Same guard, the superseded-tag loop: drop it and the "all bloat pinned" offer
+# scenario counts the pinned tags, so the offer fires and the suppression test fails.
+cat > "$SED_TMP" << 'SED'
+s@_image_referenced_by_container "\$tag" "\$referenced" && continue@:@
+SED
+try "vnext_prune_skip_referenced_tag" "no prune offer when all bloat is pinned" "$CLI" "$PRUNE_BATS"
+
+# HOST FORK-EXHAUSTION DIAGNOSTIC. When the host runs out of process slots, the
+# watcher log carries "fork: Resource temporarily unavailable" and Cleat explains
+# it once. Break the pattern match so a real fork error is not recognized: the
+# "explains a fork error" test fails.
+cat > "$SED_TMP" << 'SED'
+s@grep -q "Resource temporarily unavailable"@grep -q "NEVER_MATCH_SENTINEL"@
+SED
+try "vnext_fork_diag_pattern" "explains a fork error logged this session" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The diagnostic must read only THIS session's slice of the log (from the start
+# offset), or a stale error from a past session re-triggers it every run. Drop
+# the offset so it scans the whole log: the "ignores a PRIOR session" test fails.
+cat > "$SED_TMP" << 'SED'
+s@tail -c "+\$(( off + 1 ))"@tail -c "+1"@
+SED
+try "vnext_fork_diag_offset" "ignores a fork error from a PRIOR session" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# WATCHER LOG CAP. The per-box watcher log has no other sweeper, so an oversized
+# one is truncated on session start. Raise the threshold out of reach so a big
+# log is never capped: the "oversized log is truncated" test fails.
+cat > "$SED_TMP" << 'SED'
+s@(( sz > 1048576 ))@(( sz > 999999999999 ))@
+SED
+try "vnext_watcher_log_cap" "oversized log is truncated" "$CLI" "$EXEC_CLAUDE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -213,6 +213,14 @@ _is_tty() { [[ -t 1 ]]; }
 # keypress (_maybe_gate_on_docker_config): a launch with no human to answer
 # (cron, a pipe, `cleat start </dev/null`, CI) must never be held, so the gate
 # needs stdin to be interactive too, not just stdout.
+#
+# The `-t 0` term is load-bearing and INTENTIONALLY distinct from _is_tty. Do NOT
+# "simplify" this to `[[ -t 1 ]]`: dropping the stdin check would let a launch with
+# a redirected stdin (stdout still a tty) hit the blocking `read`, the exact
+# walk-away-pillar violation the gate exists to avoid. A ttyless test harness can't
+# tell `[[ -t 0 && -t 1 ]]` from `[[ -t 1 ]]` (both false when stdout isn't a tty),
+# so no unit test can catch that specific regression: this comment is the guard.
+# A test + mutation DO catch the coarser "always interactive" regression.
 _is_interactive() { [[ -t 0 && -t 1 ]]; }
 
 _has_unicode() {
@@ -7197,6 +7205,11 @@ _maybe_announce_docker_ready() {
     # Swap left at the default is a real config error too (freezes under a spike),
     # so arm the gate to hold the launch on it (concept/21).
     _DOCKER_GATE_PENDING=1
+    # We printed content and left NO trailing blank, so the gap above the gate is
+    # closed: clear the flag so the gate opens its own single blank (else it would
+    # sit flush against this fix line). The undersized path leaves the flag set (a
+    # trailing blank is genuinely open above the gate), so the gate skips its blank.
+    _ONSTART_GAP_OPEN=0
     return 0
   fi
 
@@ -7263,7 +7276,12 @@ _maybe_gate_on_docker_config() {
   else
     rule="================================================"
   fi
-  echo ""
+  # One blank above the banner, never two. Same convention as the highlight and
+  # the "tuned"/swap line: if the printer above us already left its trailing blank
+  # (_ONSTART_GAP_OPEN=1, e.g. the undersized advisory + highlight both do), don't
+  # add a second. The swap-advisory path closes the gap (it prints content with no
+  # trailing blank and resets the flag), so there we open it ourselves.
+  [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
   echo -e "  ${AMBER}${BOLD}${rule}${RESET}"
   echo -e "  ${AMBER}${BOLD}  Docker is not tuned for Cleat${RESET}"
   echo -e "  ${AMBER}${BOLD}${rule}${RESET}"

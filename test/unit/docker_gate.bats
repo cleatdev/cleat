@@ -159,6 +159,78 @@ teardown() { _common_teardown; }
   assert_equal "$_DOCKER_GATE_PENDING" "0"
 }
 
+# ── the interactive predicate itself ─────────────────────────────────────────
+
+@test "gate: _is_interactive is false without an interactive stdin (guards against always-true)" {
+  # The gate's walk-away guarantee rests on _is_interactive being FALSE off a
+  # terminal. Under this ttyless harness the real predicate returns false, so this
+  # pins it against the pillar-breaking regression where someone makes it always
+  # true (return 0 / true), which would block unattended launches. (A ttyless test
+  # can't distinguish `[[ -t 0 && -t 1 ]]` from `[[ -t 1 ]]`; that narrower drop is
+  # guarded by the source comment on the definition.) Do NOT stub _is_interactive.
+  run _is_interactive </dev/null
+  assert_failure
+}
+
+# ── whitespace: exactly one blank above the banner ───────────────────────────
+
+@test "gate: exactly one blank line above the banner in the undersized end-to-end" {
+  # Wired as main() calls them. The pressure advisory + release highlight each own
+  # a trailing blank and set _ONSTART_GAP_OPEN, so the gate must NOT add its own
+  # leading blank here, or a double blank opens above the amber banner.
+  _is_tty() { return 0; }
+  _is_interactive() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "8589934592"; }      # 8 GiB VM (undersized)
+  _host_total_memory() { echo "34359738368"; }    # 32 GiB host
+  _running_memory_limits_sum() { echo "0"; }
+  _is_docker_desktop() { return 0; }
+  PRESSURE_CHECK_FILE="$TEST_TEMP/ws_pc"
+  _ONSTART_GAP_OPEN=0
+  { _maybe_check_docker_pressure; _maybe_show_release_highlight; _maybe_announce_docker_ready; _maybe_gate_on_docker_config; } \
+    >"$TEST_TEMP/ws.txt" 2>&1 <<< ""
+  # Look two lines up from the banner title: the line directly above is the rule
+  # (non-blank), the one above THAT is the single leading gap. If it is blank AND
+  # the line above it is non-blank, the gap is exactly one line (SINGLE). If both
+  # are blank, the gate doubled it (DOUBLE).
+  run awk '
+    /Docker is not tuned for Cleat/ {
+      print (prev2 ~ /^[[:space:]]*$/) ? "GAP_BLANK" : "GAP_NONBLANK"
+      print (prev3 ~ /^[[:space:]]*$/) ? "DOUBLE" : "SINGLE"
+      f=1; exit
+    }
+    { prev3=prev2; prev2=prev; prev=$0 } END { if (!f) print "NOTFOUND" }' "$TEST_TEMP/ws.txt"
+  assert_line "GAP_BLANK"
+  assert_line "SINGLE"
+}
+
+@test "gate: exactly one blank line above the banner in the low-swap end-to-end" {
+  # The swap advisory prints content with no trailing blank, so it closes the gap
+  # and the gate must open its OWN single blank (never flush against the fix line).
+  _is_tty() { return 0; }
+  _is_interactive() { return 0; }
+  _cleat_prunable_stats() { printf '0\t0'; }
+  _docker_vm_memory() { echo "17179869184"; }     # 16 GiB VM (memory fine)
+  _host_total_memory() { echo "34359738368"; }
+  _running_memory_limits_sum() { echo "0"; }
+  _docker_vm_swap_bytes() { echo "1073741824"; }  # 1 GiB swap (low)
+  _docker_pool_is_vm() { return 0; }
+  _is_docker_desktop() { return 0; }
+  PRESSURE_CHECK_FILE="$TEST_TEMP/ws2_pc"
+  _ONSTART_GAP_OPEN=0
+  { _maybe_check_docker_pressure; _maybe_show_release_highlight; _maybe_announce_docker_ready; _maybe_gate_on_docker_config; } \
+    >"$TEST_TEMP/ws2.txt" 2>&1 <<< ""
+  run awk '
+    /Docker is not tuned for Cleat/ {
+      print (prev2 ~ /^[[:space:]]*$/) ? "GAP_BLANK" : "GAP_NONBLANK"
+      print (prev3 ~ /^[[:space:]]*$/) ? "DOUBLE" : "SINGLE"
+      f=1; exit
+    }
+    { prev3=prev2; prev2=prev; prev=$0 } END { if (!f) print "NOTFOUND" }' "$TEST_TEMP/ws2.txt"
+  assert_line "GAP_BLANK"
+  assert_line "SINGLE"
+}
+
 # ── end-to-end wiring ────────────────────────────────────────────────────────
 
 @test "gate: undersized VM flows advisory → gate in one on-start sequence" {

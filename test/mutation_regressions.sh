@@ -3002,6 +3002,29 @@ s@_DOCKER_GATE_PENDING=1@_DOCKER_GATE_PENDING=0@
 SED
 try "vnext_docker_gate_swap_arms" "low swap in the ready-announce arms" "$CLI" "$DOCKER_GATE_BATS"
 
+# 6. INTERACTIVE PREDICATE not-always-true. Rewrite the _is_interactive definition
+#    to a bare `true` (the pillar-breaking "always interactive" regression that
+#    would block unattended launches): the unstubbed-predicate test must fail.
+cat > "$SED_TMP" << 'SED'
+s@_is_interactive() { \[\[ -t 0 && -t 1 \]\]; }@_is_interactive() { true; }@
+SED
+try "vnext_docker_gate_is_interactive_not_always_true" "_is_interactive is false without an interactive stdin" "$CLI" "$DOCKER_GATE_BATS"
+
+# 7. OVERLOAD MUST NOT ARM. Inject an arm into the transient-overload branch (2a):
+#    the "OVERLOAD never arms the gate" test must then fail, proving it is effective.
+cat > "$SED_TMP" << 'SED'
+s@_who="\${_n_boxes} session\${_s} still running"@&; _DOCKER_GATE_PENDING=1@
+SED
+try "vnext_docker_gate_overload_no_arm" "transient OVERLOAD notice never arms" "$CLI" "$DOCKER_GATE_BATS"
+
+# 8. BANNER LEADING BLANK. Revert the gate's gap-aware leading blank to an
+#    unconditional `echo ""`: the undersized end-to-end doubles the blank above the
+#    amber banner, so the "exactly one blank" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@\[\[ "\${_ONSTART_GAP_OPEN:-0}" == "1" \]\] || echo ""@echo ""@
+SED
+try "vnext_docker_gate_banner_leading_blank" "one blank line above the banner in the undersized" "$CLI" "$DOCKER_GATE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

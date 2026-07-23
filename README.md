@@ -347,12 +347,16 @@ run `cleat rm && cleat`.
 #### Capabilities
 | Command | Description |
 |---|---|
-| `cleat config` | Interactive capability picker (keyboard TUI) |
-| `cleat config --list` | List capabilities and their status |
+| `cleat config` | Open the `.cleat` editor: a keyboard TUI for capabilities + resources |
+| `cleat config --list` | List capabilities and resources (memory, cpus) and their status |
 | `cleat config --enable <cap>` | Enable a capability (e.g. `git`, `ssh`, `env`) |
 | `cleat config --disable <cap>` | Disable a capability |
+| `cleat config --memory <val>` | Set the box memory ceiling (`default` clears it) |
+| `cleat config --cpus <val>` | Set the box CPU limit (`all` clears it) |
 | `cleat config --project --enable <cap>` | Project-level config (saved to `.cleat`) |
 | `cleat config <box> --enable <cap>` | Per-box config (saved to `.cleat.<box>`, replaces `.cleat` for that box) |
+
+The editor also has a **generate** row (global scope): it stamps your current caps + resources into `./.cleat` so a per-project config never has to be hand-written. It preserves an existing `[setup]` section and does not auto-trust (the file goes through the normal trust prompt on the next run).
 
 #### Workspace trust
 | Command | Description |
@@ -462,7 +466,7 @@ named sandbox for the project (default: `main`). See **Boxes** above.
 Containers run with these protections by default:
 
 - `--pids-limit 4096` -- prevents fork bombs from affecting the host
-- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 4-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Override with a `[resources]` section (`memory = 4g`, optionally `cpus = 2`) in `~/.config/cleat/config` or `<project>/.cleat`. Repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing. If a session is ever OOM-killed (often a test runner spawning one worker per host core), Cleat says so and how to fix it: raise `memory`, cap workers (`jest --maxWorkers=2`), or set `cpus`
+- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 4-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Set it with `cleat config` (the arrow-key editor has a Resources group) or `cleat config --memory 4g --cpus 2`, or hand-write a `[resources]` section in `~/.config/cleat/config` or `<project>/.cleat`. Repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing. If a session is ever OOM-killed (often a test runner spawning one worker per host core), Cleat says so and how to fix it: raise `memory`, cap workers (`jest --maxWorkers=2`), or set `cpus`
 - `--init` -- a real PID 1 reaps orphaned processes, so long sessions can't wedge on zombie buildup and `cleat stop` is instant
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
 - Node.js bookworm-slim base image with minimal attack surface

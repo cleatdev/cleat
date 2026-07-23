@@ -1272,7 +1272,12 @@ _write_caps_to_file() {
   local preserved=""
   if [[ -f "$file" ]]; then
     local in_caps=false
-    while IFS= read -r line; do
+    # `|| [[ -n "$line" ]]` so a project .cleat whose LAST section is hand-written
+    # and ends WITHOUT a trailing newline (e.g. a final `[setup]` line) is not
+    # silently dropped from `preserved`: without the guard `read` returns non-zero
+    # at EOF and the last line is lost, corrupting a section this writer must keep
+    # byte-for-byte. Matches _read_section_from_file / _write_kits_to_file / _write_resources_to_file.
+    while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%$'\r'}"
       if [[ "$line" == "[caps]" ]]; then
         in_caps=true
@@ -1300,6 +1305,62 @@ _write_caps_to_file() {
       for cap in "${caps[@]}"; do
         echo "$cap"
       done
+    fi
+  } > "$file"
+}
+
+# Write [resources] memory/cpus to a config file, preserving everything OUTSIDE
+# [resources] (same shape as _write_caps_to_file / _write_kits_to_file). An empty
+# value, or the picker sentinels "default"/"all", OMITS that key; when BOTH keys
+# are unset no [resources] section is written at all, so an untouched config stays
+# clean. Never touches [caps], [setup], or [kits]. The block uses explicit ifs
+# (never `[[ ]] && echo`): a false test as the block's last list would make the
+# `{ ...; } > file` compound return 1 and kill a strict-mode caller on the
+# both-unset path (the exact bug the kits writer's comment records).
+_write_resources_to_file() {
+  local file="$1" memory="$2" cpus="$3"
+  mkdir -p "$(dirname "$file")"
+
+  # Sentinel -> empty (callers translate too; this is belt and suspenders so a
+  # literal "default"/"all" can never leak into the file and get warned+ignored
+  # by resolve_box_memory on every subsequent run).
+  case "$memory" in default|all) memory="" ;; esac
+  case "$cpus" in default|all) cpus="" ;; esac
+
+  local preserved="" in_res=false line
+  if [[ -f "$file" ]]; then
+    # `|| [[ -n "$line" ]]` and the `\r` strip mirror the caps/kits writers: keep a
+    # no-trailing-newline final section, and match a CRLF `[resources]\r` header so
+    # the old section is REPLACED (not duplicated into two [resources] blocks).
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      if [[ "$line" == "[resources]" ]]; then
+        in_res=true
+        continue
+      fi
+      if $in_res; then
+        if [[ "$line" == "["*"]" ]]; then
+          in_res=false
+          preserved+="$line"$'\n'
+        fi
+        continue
+      fi
+      preserved+="$line"$'\n'
+    done < "$file"
+  fi
+
+  {
+    if [[ -n "$preserved" ]]; then
+      printf '%s' "$preserved"
+    fi
+    if [[ -n "$memory" || -n "$cpus" ]]; then
+      echo "[resources]"
+      if [[ -n "$memory" ]]; then
+        echo "memory = $memory"
+      fi
+      if [[ -n "$cpus" ]]; then
+        echo "cpus = $cpus"
+      fi
     fi
   } > "$file"
 }
@@ -7468,18 +7529,97 @@ ENVEOF
   success "Created ${DIM}${env_file}${RESET} (add to .gitignore)"
 }
 
-# ── TUI config picker ──────────────────────────────────────────────────────
+# ── .cleat editor (capabilities + resources) ───────────────────────────────
+#
+# `cleat config` opens ONE flat list that edits both [caps] (SPACE toggles) and
+# [resources] memory/cpus (←/→ cycles a preset ring). In GLOBAL scope a final
+# "generate" row also stamps the selections into this project's ./.cleat, so the
+# per-project config never has to be hand-written. It follows the `cleat kit`
+# editor's shape (arrow-key TUI + a text fallback for non-TTY).
 
+# Preset rings for the resource rows. Index 0 is the "unset" sentinel (default /
+# all) so a previously-set value can be CLEARED by cycling back to it. 2g is
+# deliberately absent from the memory ring: the VM-derived default floors at 4g,
+# so offering 2g would read as a DOWNGRADE of "default". A hand-set custom value
+# (e.g. 16g, 1.5) that is not a ring stop stays reachable (see _config_cycle_value).
+_CONFIG_MEM_CHOICES=(default 4g 6g 8g)
+_CONFIG_CPU_CHOICES=(all 1 2 4 8)
+
+# Cycle a resource value through its ring. $1 = next|prev, $2 = current value,
+# $3 = custom pin (a hand-set value not in the ring; pass "" when none), $4.. =
+# ring choices. Mirrors _kit_next_model/_kit_prev_model but wraps with modulo and
+# folds the custom pin in ONCE (deduped against the choices so a preset value
+# passed as custom does not double-append). ALWAYS ends on `echo`, never a bare
+# test/arithmetic, so a strict-mode `$(...)` caller is never killed.
+_config_cycle_value() {
+  local dir="$1" current="$2" custom="$3"
+  shift 3
+  local ring=("$@")
+  if [[ -n "$custom" ]]; then
+    local _dup=false _c
+    for _c in "$@"; do [[ "$_c" == "$custom" ]] && _dup=true; done
+    $_dup || ring+=("$custom")
+  fi
+  local m=${#ring[@]} i
+  for ((i = 0; i < m; i++)); do
+    if [[ "${ring[$i]}" == "$current" ]]; then
+      if [[ "$dir" == "prev" ]]; then
+        echo "${ring[$(((i - 1 + m) % m))]}"
+      else
+        echo "${ring[$(((i + 1) % m))]}"
+      fi
+      return 0
+    fi
+  done
+  # current is not on the ring (e.g. a value cleared out from under us): land on
+  # the first stop so a keypress always moves somewhere sane.
+  echo "${ring[0]}"
+}
+
+# Map a cursor position to the row it addresses. Echoes cap:<name> | mem | cpus |
+# gen. The nav order is: caps 0..N-1, then memory, then cpus, then (global scope
+# only) the generate row. This is the ONLY place that turns a cursor into a
+# KNOWN_CAPS index, so no key handler ever indexes KNOWN_CAPS with a cursor that
+# might land on a resource/generate row (that read is a set -u crash in the real
+# binary, not a silent no-op).
+_config_row_kind() {
+  local cur="$1" ncaps=${#KNOWN_CAPS[@]}
+  if (( cur < ncaps )); then
+    echo "cap:${KNOWN_CAPS[$cur]}"
+  elif (( cur == ncaps )); then
+    echo "mem"
+  elif (( cur == ncaps + 1 )); then
+    echo "cpus"
+  else
+    echo "gen"
+  fi
+}
+
+# Draw the whole editor block: a "Capabilities" group, the cap rows, a blank, a
+# "Resources" group, the memory + cpus rows, and (when show_gen=1) a blank plus
+# the generate row. It always emits the SAME number of physical lines for a given
+# scope (deterministic), which is what lets the TUI's cursor-up/down math be a
+# single scope-derived constant. Every row is one physical line; keep labels short
+# so an 80-column terminal never wraps a row (a wrap desyncs the redraw). New
+# params are read with `${n:-}` defaults so both the 2-arg draw tests and the real
+# strict-mode binary are safe.
 _config_picker_draw() {
   local cursor="$1"
   local toggled="$2"
-  local cap_count=${#KNOWN_CAPS[@]}
-  local i=0
-  while [[ $i -lt $cap_count ]]; do
-    local cap="${KNOWN_CAPS[$i]}"
-    local marker="${DIM}·${RESET}"
+  local mem="${3:-default}"
+  local cpus="${4:-all}"
+  local show_gen="${5:-0}"
+  local gen_on="${6:-0}"
+  local ncaps=${#KNOWN_CAPS[@]}
+  local i=0 cap marker
+
+  printf '\033[2K'
+  echo -e "  ${DIM}Capabilities${RESET} ${DIM}(space toggles host access)${RESET}"
+  while [[ $i -lt $ncaps ]]; do
+    cap="${KNOWN_CAPS[$i]}"
+    marker="${DIM}·${RESET}"
     case ",${toggled}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
-    printf '\033[2K' # clear line
+    printf '\033[2K'
     if [[ $i -eq $cursor ]]; then
       echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}${cap}${RESET}  $(_cap_description "$cap")"
     else
@@ -7487,186 +7627,402 @@ _config_picker_draw() {
     fi
     i=$((i + 1))
   done
+
+  printf '\033[2K'; echo ""
+  printf '\033[2K'
+  echo -e "  ${DIM}Resources${RESET} ${DIM}(←/→ changes the value)${RESET}"
+  printf '\033[2K'
+  if [[ $cursor -eq $ncaps ]]; then
+    echo -e "  ${CYAN}▸${RESET} memory  ${BOLD}‹ ${mem} ›${RESET}  ${DIM}(per-box RAM ceiling)${RESET}"
+  else
+    echo -e "    memory  ${mem}  ${DIM}(per-box RAM ceiling)${RESET}"
+  fi
+  printf '\033[2K'
+  if [[ $cursor -eq $((ncaps + 1)) ]]; then
+    echo -e "  ${CYAN}▸${RESET} cpus    ${BOLD}‹ ${cpus} ›${RESET}  ${DIM}(core limit; all = no cap)${RESET}"
+  else
+    echo -e "    cpus    ${cpus}  ${DIM}(core limit; all = no cap)${RESET}"
+  fi
+
+  if [[ "$show_gen" == "1" ]]; then
+    printf '\033[2K'; echo ""
+    marker="${DIM}·${RESET}"
+    [[ "$gen_on" == "1" ]] && marker="${GREEN}✔${RESET}"
+    printf '\033[2K'
+    if [[ $cursor -eq $((ncaps + 2)) ]]; then
+      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}Also write these to this project's .cleat${RESET}"
+    else
+      echo -e "    [${marker}] ${DIM}Also write these to this project's .cleat${RESET}"
+    fi
+  fi
+}
+
+# Read the scope file's memory into a (display-value, custom-pin) pair. Empty
+# becomes the sentinel; a value not on the ring becomes the reachable custom pin.
+# Printed as "<display>\t<custom>" for the caller to split. `|| true` because a
+# strict-mode caller assigns this bare and a file read must never abort the editor.
+_config_load_resource() {
+  local file="$1" key="$2" unset_label="$3"
+  local v; v="$(_read_resource_from_file "$file" "$key" || true)"
+  local choices
+  if [[ "$key" == "memory" ]]; then choices=" ${_CONFIG_MEM_CHOICES[*]} "; else choices=" ${_CONFIG_CPU_CHOICES[*]} "; fi
+  if [[ -z "$v" ]]; then
+    printf '%s\t%s\n' "$unset_label" ""
+  else
+    case "$choices" in
+      *" $v "*) printf '%s\t%s\n' "$v" "" ;;
+      *)        printf '%s\t%s\n' "$v" "$v" ;;
+    esac
+  fi
+}
+
+# Persist the editor state to the scope file (caps + resources, both section
+# preserving), then, in global scope with the generate row on, offer to stamp a
+# project ./.cleat. project is resolved ONCE by cmd_config and threaded through so
+# the scope label and any write target can never diverge.
+_config_editor_save() {
+  local config_file="$1" scope="$2" project="$3" toggled="$4" mem="$5" cpus="$6" show_gen="$7" gen_on="$8"
+
+  local final_caps=() cap
+  for cap in "${KNOWN_CAPS[@]}"; do
+    case ",${toggled}," in *,"$cap",*) final_caps+=("$cap") ;; esac
+  done
+  local mem_w="$mem" cpu_w="$cpus"
+  case "$mem_w" in default|all) mem_w="" ;; esac
+  case "$cpu_w" in default|all) cpu_w="" ;; esac
+
+  _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
+  _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"
+  success "Saved to ${config_file}"
+
+  case ",${toggled}," in
+    *,env,*)
+      if [[ -n "$project" && ! -f "${project}/.cleat.env" ]]; then
+        echo ""
+        local yn=""
+        _ask_yn yn "Create .cleat.env in ${project}? [Y/n] "
+        if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+          _scaffold_cleat_env "$project"
+        fi
+      fi
+      ;;
+  esac
+
+  if [[ "$show_gen" == "1" && "$gen_on" == "1" ]]; then
+    _config_generate_project "$project" "$mem_w" "$cpu_w" "${final_caps[@]+"${final_caps[@]}"}"
+  fi
 }
 
 _config_picker_tui() {
   local config_file="$1"
   local scope="$2"
+  local project="${3:-}"
 
   echo ""
-  echo -e "  ${BOLD}Cleat Capabilities${RESET}"
+  echo -e "  ${BOLD}Cleat config${RESET} ${DIM}(capabilities + resources)${RESET}"
   echo ""
   local scope_label
   if [[ "$scope" == "project" ]]; then
-    scope_label="project ($(pwd)/.cleat)"
+    scope_label="project (${config_file})"
   else
-    scope_label="global (~/.config/cleat/config)"
+    scope_label="global (${config_file})"
   fi
   echo -e "  ${DIM}Scope: ${scope_label}${RESET}"
-  echo ""
 
-  local toggled=""
-  local cap
+  local toggled="" cap
   while IFS= read -r cap; do
     [[ -n "$cap" ]] && toggled="${toggled:+${toggled},}${cap}"
   done < <(_read_caps_from_file "$config_file")
 
-  local cursor=0
-  local cap_count=${#KNOWN_CAPS[@]}
+  local mem mem_custom cpus cpu_custom _pair
+  _pair="$(_config_load_resource "$config_file" memory default)"
+  mem="${_pair%%$'\t'*}"; mem_custom="${_pair#*$'\t'}"
+  _pair="$(_config_load_resource "$config_file" cpus all)"
+  cpus="${_pair%%$'\t'*}"; cpu_custom="${_pair#*$'\t'}"
 
+  local show_gen=0 gen_on=0
+  [[ "$scope" == "global" && -n "$project" ]] && show_gen=1
+
+  local ncaps=${#KNOWN_CAPS[@]}
+  # nav_rows: the rows the cursor ranges over. draw_lines: the physical lines the
+  # block draws (incl. the two group headers and the blank separators). BOTH are
+  # scope-derived and computed ONCE so every reposition below uses one constant.
+  local nav_rows=$((ncaps + 2)) draw_lines=$((ncaps + 5))
+  if [[ "$show_gen" == "1" ]]; then
+    nav_rows=$((nav_rows + 1))
+    draw_lines=$((draw_lines + 2))
+  fi
+
+  if [[ "$show_gen" == "1" ]]; then
+    echo -e "  ${DIM}The last row writes ./.cleat so every clone runs in the same cage.${RESET}"
+  fi
+  echo ""
+
+  local cursor=0
   tput civis 2>/dev/null || true
 
-  _config_picker_draw "$cursor" "$toggled"
+  _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on"
   echo ""
-  echo -e "  ${DIM}↑/↓ navigate  ␣ toggle  ⏎ save  q cancel${RESET}"
-
-  # Move back above list for redraw
-  printf '\033[%dA' "$((cap_count + 2))"
+  echo -e "  ${DIM}↑/↓ move  space toggle  ←/→ change  ⏎ save  q cancel${RESET}"
+  printf '\033[%dA' "$((draw_lines + 2))"
 
   while true; do
-    local key
+    local key kind
     key="$(_read_keypress)"
+    kind="$(_config_row_kind "$cursor")"
 
     case "$key" in
-      UP)
-        [[ $cursor -gt 0 ]] && cursor=$((cursor - 1))
-        ;;
-      DOWN)
-        [[ $cursor -lt $((cap_count - 1)) ]] && cursor=$((cursor + 1))
-        ;;
+      UP)   [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
+      DOWN) [[ $cursor -lt $((nav_rows - 1)) ]] && cursor=$((cursor + 1)) ;;
       SPACE)
-        local current_cap="${KNOWN_CAPS[$cursor]}"
-        case ",${toggled}," in
-          *,"$current_cap",*)
-            local _new=""
-            local _c
-            for _c in $(echo "$toggled" | tr ',' ' '); do
-              [[ "$_c" == "$current_cap" ]] && continue
-              _new="${_new:+${_new},}${_c}"
-            done
-            toggled="$_new"
-            ;;
-          *)
-            toggled="${toggled:+${toggled},}${current_cap}"
-            ;;
-        esac
-        ;;
+        case "$kind" in
+          cap:*)
+            local current_cap="${kind#cap:}"
+            case ",${toggled}," in
+              *,"$current_cap",*)
+                local _new="" _c
+                for _c in $(echo "$toggled" | tr ',' ' '); do
+                  [[ "$_c" == "$current_cap" ]] && continue
+                  _new="${_new:+${_new},}${_c}"
+                done
+                toggled="$_new" ;;
+              *) toggled="${toggled:+${toggled},}${current_cap}" ;;
+            esac ;;
+          mem)  mem="$(_config_cycle_value next "$mem" "$mem_custom" "${_CONFIG_MEM_CHOICES[@]}")" ;;
+          cpus) cpus="$(_config_cycle_value next "$cpus" "$cpu_custom" "${_CONFIG_CPU_CHOICES[@]}")" ;;
+          gen)  [[ "$gen_on" == "1" ]] && gen_on=0 || gen_on=1 ;;
+        esac ;;
+      RIGHT)
+        case "$kind" in
+          mem)  mem="$(_config_cycle_value next "$mem" "$mem_custom" "${_CONFIG_MEM_CHOICES[@]}")" ;;
+          cpus) cpus="$(_config_cycle_value next "$cpus" "$cpu_custom" "${_CONFIG_CPU_CHOICES[@]}")" ;;
+        esac ;;
+      LEFT)
+        case "$kind" in
+          mem)  mem="$(_config_cycle_value prev "$mem" "$mem_custom" "${_CONFIG_MEM_CHOICES[@]}")" ;;
+          cpus) cpus="$(_config_cycle_value prev "$cpus" "$cpu_custom" "${_CONFIG_CPU_CHOICES[@]}")" ;;
+        esac ;;
       ENTER)
         tput cnorm 2>/dev/null || true
-        printf '\033[%dB' "$((cap_count + 2))"
+        printf '\033[%dB' "$((draw_lines + 2))"
         printf '\033[2K'
         echo ""
-
-        local final_caps=()
-        for cap in "${KNOWN_CAPS[@]}"; do
-          case ",${toggled}," in *,"$cap",*) final_caps+=("$cap") ;; esac
-        done
-        _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
-        success "Saved to ${config_file}"
-
-        case ",${toggled}," in
-          *,env,*)
-            if [[ ! -f "$(pwd)/.cleat.env" ]]; then
-              echo ""
-              local yn=""
-              _ask_yn yn "Create .cleat.env in current project? [Y/n] "
-              if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-                _scaffold_cleat_env "$(pwd)"
-              fi
-            fi
-            ;;
-        esac
-        return
-        ;;
+        _config_editor_save "$config_file" "$scope" "$project" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on"
+        return ;;
       QUIT|ESC)
         tput cnorm 2>/dev/null || true
-        printf '\033[%dB' "$((cap_count + 2))"
+        printf '\033[%dB' "$((draw_lines + 2))"
         printf '\033[2K'
         echo ""
         info "Cancelled."
-        return
-        ;;
+        return ;;
     esac
 
-    _config_picker_draw "$cursor" "$toggled"
-    printf '\033[%dA' "$cap_count"
+    _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on"
+    printf '\033[%dA' "$draw_lines"
   done
+}
+
+# Write a project ./.cleat from the editor's selections. Fixed args FIRST so the
+# variadic caps can be recovered in bash 3.2 (`shift 3; caps=("$@")`). When the
+# file is FRESH we lay down a short header comment first (readers skip `#` lines),
+# then the section-preserving caps + resources writers keep it as preamble. When
+# it already exists we never touch the header: the writers replace only [caps] and
+# [resources] and leave [setup] and any other section byte-for-byte.
+_generate_project_cleat() {
+  local project="$1" memory="$2" cpus="$3"
+  shift 3
+  local caps=("$@")
+  local file="${project}/.cleat"
+  local fresh=0
+  [[ -f "$file" ]] || fresh=1
+
+  if [[ $fresh -eq 1 ]]; then
+    mkdir -p "$project"
+    {
+      echo "# .cleat: Cleat project config. Commit it so every clone runs in the same cage."
+      echo "# Written by 'cleat config'. Edit freely or re-run the editor."
+      echo "# [caps] grant host access (off by default). [resources] cap the box."
+      echo "# Docs: https://cleat.sh/docs"
+      echo ""
+    } > "$file"
+  fi
+
+  _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+  _write_resources_to_file "$file" "$memory" "$cpus"
+}
+
+# Confirm and stamp the selections into ./.cleat (global-scope generate row). This
+# is an outward-facing write of a file the user is told to commit and share, so it
+# is gated behind an explicit default-DENY confirm that spells out exactly which
+# caps land in it (docker called out in amber: it hands over the host once trusted).
+# We never auto-trust and never offer `cleat trust` here: trust is a separate,
+# next-run ritual (and cmd_trust would also approve any pre-existing [setup]).
+_config_generate_project() {
+  local project="$1" memory="$2" cpus="$3"
+  shift 3
+  local caps=("$@")
+  local target="${project}/.cleat"
+
+  case "$project" in
+    ""|"/"|"$HOME")
+      warn "Not writing .cleat in ${project:-this location} ${DIM}(run cleat config from a project directory)${RESET}"
+      return 0 ;;
+  esac
+  if [[ ${#caps[@]} -eq 0 && -z "$memory" && -z "$cpus" ]]; then
+    info "Nothing to write to .cleat ${DIM}(no capabilities enabled and resources at default)${RESET}"
+    return 0
+  fi
+
+  echo ""
+  echo -e "  ${BOLD}Write ${target}${RESET}"
+  echo -e "  ${DIM}This file is committed and shared. Every clone runs in the same cage.${RESET}"
+  echo ""
+  if [[ ${#caps[@]} -gt 0 ]]; then
+    echo -e "  ${DIM}Capabilities (host access):${RESET}"
+    local c
+    for c in "${caps[@]}"; do
+      if [[ "$c" == "docker" ]]; then
+        echo -e "    ${AMBER}!${RESET} ${BOLD}docker${RESET} ${DIM}(mounts the host Docker socket: full host control once trusted)${RESET}"
+      else
+        echo -e "    ${GREEN}✔${RESET} ${c}"
+      fi
+    done
+  else
+    echo -e "  ${DIM}Capabilities: none${RESET}"
+  fi
+  local res=""
+  [[ -n "$memory" ]] && res="memory = ${memory}"
+  [[ -n "$cpus" ]] && res="${res:+${res}    }cpus = ${cpus}"
+  [[ -n "$res" ]] && echo -e "  ${DIM}Resources: ${res}${RESET}"
+  if [[ -f "$target" ]]; then
+    echo -e "  ${DIM}${target} exists: its [caps] and [resources] are replaced, other sections kept.${RESET}"
+  fi
+  echo ""
+  local yn=""
+  _ask_yn yn "Write this .cleat? ${DIM}[y/N]${RESET} "
+  if [[ "$yn" == [yY]* ]]; then
+    _generate_project_cleat "$project" "$memory" "$cpus" "${caps[@]+"${caps[@]}"}"
+    success "Wrote ${target}"
+    info "Its capabilities apply after you approve it on the next run ${DIM}(or cleat trust)${RESET}"
+  else
+    info "Skipped .cleat"
+  fi
+}
+
+# Trim leading/trailing whitespace then a single leading '=' then whitespace, so a
+# resource keyword accepts `memory 4g`, `memory=4g`, and `memory = 4g` (users mirror
+# the file, which writes `memory = 8g`). Echoes the bare value.
+_config_kw_value() {
+  local rest="$1"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  rest="${rest#=}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  rest="${rest%"${rest##*[![:space:]]}"}"
+  echo "$rest"
 }
 
 _config_picker_text() {
   local config_file="$1"
   local scope="$2"
+  local project="${3:-}"
 
   echo ""
-  echo -e "  ${BOLD}Cleat Capabilities${RESET}"
+  echo -e "  ${BOLD}Cleat config${RESET} ${DIM}(capabilities + resources)${RESET}"
   echo ""
   local scope_label
   if [[ "$scope" == "project" ]]; then
-    scope_label="project ($(pwd)/.cleat)"
+    scope_label="project (${config_file})"
   else
-    scope_label="global (~/.config/cleat/config)"
+    scope_label="global (${config_file})"
   fi
   echo -e "  ${DIM}Scope: ${scope_label}${RESET}"
   echo ""
 
-  local _active=""
-  local cap
+  local _active="" cap
   while IFS= read -r cap; do
     [[ -n "$cap" ]] && _active="${_active:+${_active},}${cap}"
   done < <(_read_caps_from_file "$config_file")
+
+  local mem cpus _pair
+  _pair="$(_config_load_resource "$config_file" memory default)"; mem="${_pair%%$'\t'*}"
+  _pair="$(_config_load_resource "$config_file" cpus all)"; cpus="${_pair%%$'\t'*}"
+
+  local show_gen=0 gen_on=0
+  [[ "$scope" == "global" && -n "$project" ]] && show_gen=1
 
   for cap in "${KNOWN_CAPS[@]}"; do
     local marker="${DIM}·${RESET}"
     case ",${_active}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
     echo -e "    [${marker}] ${BOLD}${cap}${RESET}     $(_cap_description "$cap")"
   done
+  echo ""
+  echo -e "  ${DIM}Resources: memory=${mem}  cpus=${cpus}${RESET}"
 
   echo ""
-  echo -e "  ${DIM}Toggle: type name to flip, \"done\" to save, \"q\" to cancel${RESET}"
+  echo -e "  ${DIM}Capabilities: type a name to flip. Resources: \"memory 4g\", \"cpus 2\"${RESET}"
+  if [[ "$show_gen" == "1" ]]; then
+    echo -e "  ${DIM}\"project\" writes ./.cleat too. \"done\" to save, \"q\" to cancel${RESET}"
+  else
+    echo -e "  ${DIM}\"done\" to save, \"q\" to cancel${RESET}"
+  fi
 
   while true; do
     echo -n "  > "
     local input
-    read -r input
+    read -r input || { echo ""; info "Cancelled."; return 0; }
     input="${input#"${input%%[![:space:]]*}"}"
     input="${input%"${input##*[![:space:]]}"}"
 
     case "$input" in
       done)
-        local final_caps=()
-        for cap in "${KNOWN_CAPS[@]}"; do
-          case ",${_active}," in *,"$cap",*) final_caps+=("$cap") ;; esac
-        done
-        _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
-        success "Saved to ${config_file}"
-
-        case ",${_active}," in
-          *,env,*)
-            if [[ ! -f "$(pwd)/.cleat.env" ]]; then
-              echo ""
-              local yn=""
-              _ask_yn yn "Create .cleat.env in current project? [Y/n] "
-              if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-                _scaffold_cleat_env "$(pwd)"
-              fi
-            fi
-            ;;
-        esac
+        _config_editor_save "$config_file" "$scope" "$project" "$_active" "$mem" "$cpus" "$show_gen" "$gen_on"
         return
         ;;
       q|quit)
         info "Cancelled."
         return
         ;;
+      memory|memory[!a-zA-Z0-9]*)
+        local _v; _v="$(_config_kw_value "${input#memory}")"
+        case "$_v" in
+          ""|default) mem="default"; success "memory set to default" ;;
+          *)
+            if _valid_memory_value "$_v"; then
+              mem="$_v"; success "memory set to ${_v}"
+            else
+              warn "Not a memory value: ${BOLD}${_v}${RESET} ${DIM}(use e.g. 4g, 4096m, or \"default\")${RESET}"
+            fi ;;
+        esac
+        ;;
+      cpus|cpus[!a-zA-Z0-9]*)
+        local _v; _v="$(_config_kw_value "${input#cpus}")"
+        case "$_v" in
+          ""|all) cpus="all"; success "cpus set to all (no cap)" ;;
+          *)
+            if _valid_cpus_value "$_v"; then
+              cpus="$_v"; success "cpus set to ${_v}"
+            else
+              warn "Not a cpus value: ${BOLD}${_v}${RESET} ${DIM}(use e.g. 2, 1.5, or \"all\")${RESET}"
+            fi ;;
+        esac
+        ;;
+      project|generate)
+        if [[ "$show_gen" == "1" ]]; then
+          [[ "$gen_on" == "1" ]] && gen_on=0 || gen_on=1
+          [[ "$gen_on" == "1" ]] && success "will also write ./.cleat" || info "will not write ./.cleat"
+        else
+          warn "\"project\" only applies to the global config ${DIM}(project scope already writes .cleat)${RESET}"
+        fi
+        ;;
       *)
-        local found=false
+        local found=false known
         for known in "${KNOWN_CAPS[@]}"; do
           if [[ "$known" == "$input" ]]; then
             found=true
             case ",${_active}," in
               *,"$input",*)
-                local _new_active=""
-                local _c
+                local _new_active="" _c
                 for _c in $(echo "$_active" | tr ',' ' '); do
                   [[ "$_c" == "$input" ]] && continue
                   _new_active="${_new_active:+${_new_active},}${_c}"
@@ -7695,6 +8051,9 @@ cmd_config() {
   local action=""
   local cap_name=""
   local box=""
+  # `__MISSING__` distinguishes "flag with no value token" (an error) from an
+  # explicit empty value (`--memory ""` / `--memory default`), which CLEARS the key.
+  local res_key="" res_val="__MISSING__"
 
   # Parse config subcommand flags
   while [[ $# -gt 0 ]]; do
@@ -7707,6 +8066,14 @@ cmd_config() {
       --disable)
         action="disable"
         if [[ $# -lt 2 ]]; then cap_name=""; shift; else cap_name="$2"; shift 2; fi
+        ;;
+      --memory)
+        action="resource"; res_key="memory"
+        if [[ $# -lt 2 ]]; then res_val="__MISSING__"; shift; else res_val="$2"; shift 2; fi
+        ;;
+      --cpus)
+        action="resource"; res_key="cpus"
+        if [[ $# -lt 2 ]]; then res_val="__MISSING__"; shift; else res_val="$2"; shift 2; fi
         ;;
       --list)     action="list"; shift ;;
       --*)
@@ -7730,11 +8097,14 @@ cmd_config() {
     esac
   done
 
+  # pwd resolved ONCE so the scope label, the config target, and any generated
+  # ./.cleat all agree (matches the historical `$(pwd)/.cleat` behavior).
+  local project; project="$(pwd)"
   local config_file
   if [[ -n "$box" && "$box" != "main" ]]; then
-    config_file="$(pwd)/.cleat.$box"
+    config_file="${project}/.cleat.$box"
   elif [[ "$scope" == "project" ]]; then
-    config_file="$(pwd)/.cleat"
+    config_file="${project}/.cleat"
   else
     config_file="$CLEAT_GLOBAL_CONFIG"
   fi
@@ -7752,7 +8122,7 @@ cmd_config() {
     done < <(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")
     # Also read project caps if available (box-aware: .cleat.<box> else .cleat)
     local _proj_caps_file
-    _proj_caps_file="$(_project_caps_file "$(pwd)" "${box:-main}")"
+    _proj_caps_file="$(_project_caps_file "$project" "${box:-main}")"
     if [[ -f "$_proj_caps_file" ]]; then
       while IFS= read -r cap; do
         [[ -n "$cap" ]] && case ",${_active_list}," in *,"$cap",*) ;; *) _active_list="${_active_list:+${_active_list},}${cap}" ;; esac
@@ -7765,8 +8135,49 @@ cmd_config() {
       echo -e "    [${marker}] ${BOLD}${cap}${RESET}  ${DIM}$(_cap_description "$cap")${RESET}"
     done
     echo ""
+    # Resources declared in THIS scope's file (empty reads as the effective default).
+    # `|| true` keeps a strict-mode caller safe on a bare command-substitution assign.
+    local _lm _lc
+    _lm="$(_read_resource_from_file "$config_file" memory || true)"
+    _lc="$(_read_resource_from_file "$config_file" cpus || true)"
+    echo -e "  ${BOLD}Resources${RESET}"
+    if [[ -n "$_lm" ]]; then echo -e "    memory  ${_lm}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
+    if [[ -n "$_lc" ]]; then echo -e "    cpus    ${_lc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
+    echo ""
     echo -e "  ${DIM}Config: ${config_file}${RESET}"
     echo ""
+    return
+  fi
+
+  # ── Direct mode: --memory / --cpus
+  if [[ "$action" == "resource" ]]; then
+    if [[ "$res_val" == "__MISSING__" ]]; then
+      error "Missing value. Usage: cleat config --${res_key} <value>"
+      echo -e "    ${DIM}Clear it with: cleat config --${res_key} default${RESET}"
+      exit 1
+    fi
+    # Sentinels and empty clear the key; anything else must validate.
+    local write_val="$res_val"
+    case "$res_val" in ""|default|all) write_val="" ;; esac
+    if [[ -n "$write_val" ]]; then
+      if [[ "$res_key" == "memory" ]] && ! _valid_memory_value "$write_val"; then
+        error "Invalid memory value: ${BOLD}${write_val}${RESET} ${DIM}(use e.g. 2g, 4096m)${RESET}"; exit 1
+      fi
+      if [[ "$res_key" == "cpus" ]] && ! _valid_cpus_value "$write_val"; then
+        error "Invalid cpus value: ${BOLD}${write_val}${RESET} ${DIM}(use e.g. 2, 1.5)${RESET}"; exit 1
+      fi
+    fi
+    # Preserve the OTHER key: read both, replace the one being set, write both.
+    local cur_mem cur_cpus
+    cur_mem="$(_read_resource_from_file "$config_file" memory || true)"
+    cur_cpus="$(_read_resource_from_file "$config_file" cpus || true)"
+    if [[ "$res_key" == "memory" ]]; then cur_mem="$write_val"; else cur_cpus="$write_val"; fi
+    _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus"
+    if [[ -n "$write_val" ]]; then
+      success "${res_key} set to ${write_val} ${DIM}(${config_file})${RESET}"
+    else
+      success "${res_key} cleared, using default ${DIM}(${config_file})${RESET}"
+    fi
     return
   fi
 
@@ -7809,7 +8220,7 @@ cmd_config() {
 
       # Scaffold .cleat.env when enabling env capability
       if [[ "$cap_name" == "env" ]]; then
-        _scaffold_cleat_env "$(pwd)"
+        _scaffold_cleat_env "$project"
       fi
     else
       # Disable: remove from list
@@ -7825,9 +8236,9 @@ cmd_config() {
 
   # ── Interactive mode (no flags)
   if [[ -t 0 ]] && [[ -t 1 ]]; then
-    _config_picker_tui "$config_file" "$scope"
+    _config_picker_tui "$config_file" "$scope" "$project"
   else
-    _config_picker_text "$config_file" "$scope"
+    _config_picker_text "$config_file" "$scope" "$project"
   fi
 }
 

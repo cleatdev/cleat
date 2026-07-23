@@ -2769,3 +2769,25 @@ EOF
   # safe here, unlike the ESC checks elsewhere which must stay scoped.
   refute_output --partial "$cr"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .cleat editor (config resources): _write_caps_to_file rewrites a project
+# .cleat in place, preserving every section it does not own. Its preserve loop
+# read `while IFS= read -r line`, which drops the FINAL line of a file that
+# ends WITHOUT a trailing newline (read returns non-zero at EOF and the last
+# line is lost). [setup] is exactly the section users hand-edit, and a hand
+# written .cleat commonly ends `script build.sh` with no final newline, so a
+# later caps write (e.g. the new generate-project flow, or cleat config
+# --project --enable) silently corrupted the last [setup] line. The `||
+# [[ -n "$line" ]]` guard keeps it, matching _read_section_from_file and the
+# resources/kits writers.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression: caps writer keeps a no-trailing-newline final [setup] line" {
+  printf '[caps]\nssh\n[setup]\nscript build.sh' > "$TEST_TEMP/cleat"   # NO trailing newline
+  _write_caps_to_file "$TEST_TEMP/cleat" git env
+  run cat "$TEST_TEMP/cleat"
+  assert_output --partial "script build.sh"
+  assert_output --partial "[setup]"
+  assert_output --partial "git"
+  assert_output --partial "env"
+}

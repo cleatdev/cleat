@@ -57,6 +57,7 @@ CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 PROVISION_BATS="$REPO_ROOT/test/unit/provision.bats"
 DOCKER_GATE_BATS="$REPO_ROOT/test/unit/docker_gate.bats"
+CONFIG_BATS="$REPO_ROOT/test/unit/config.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -3024,6 +3025,94 @@ cat > "$SED_TMP" << 'SED'
 s@\[\[ "\${_ONSTART_GAP_OPEN:-0}" == "1" \]\] || echo ""@echo ""@
 SED
 try "vnext_docker_gate_banner_leading_blank" "one blank line above the banner in the undersized" "$CLI" "$DOCKER_GATE_BATS"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .cleat EDITOR (cleat config: capabilities + resources). Eleven load-bearing
+# behaviors of the resources writer, the value-cycle ring, the direct-mode
+# --memory/--cpus flags, the text-picker resource grammar, and the generate
+# project-.cleat gate. Each mutation reintroduces a specific bug the review round
+# flagged and proves the guarding test catches it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. RESOURCES WRITER SECTION HEADER. Drop the `[resources]` header so the writer
+#    emits bare key lines: the "writes memory and cpus" test (asserts the header at
+#    line 0) must fail.
+cat > "$SED_TMP" << 'SED'
+s@      echo "\[resources\]"@      echo "# nope"@
+SED
+try "vnext_config_resources_writer_section" "write_resources: writes memory and cpus" "$CLI" "$CONFIG_BATS"
+
+# 2. CAPS WRITER NEWLINE GUARD. Revert the `|| [[ -n "$line" ]]` guard in
+#    _write_caps_to_file so a project .cleat whose last [setup] line lacks a
+#    trailing newline loses that line: the regression test must fail.
+cat > "$SED_TMP" << 'SED'
+/^_write_caps_to_file()/,/^}$/ s@read -r line || \[\[ -n "\$line" \]\]@read -r line@
+SED
+try "vnext_config_caps_writer_newline_guard" "caps writer keeps a no-trailing-newline" "$CLI" "$REGRESSIONS"
+
+# 3. RESOURCES WRITER NEWLINE GUARD. Same guard, in _write_resources_to_file: a
+#    no-trailing-newline final [setup] line must survive a resources write.
+cat > "$SED_TMP" << 'SED'
+/^_write_resources_to_file()/,/^}$/ s@read -r line || \[\[ -n "\$line" \]\]@read -r line@
+SED
+try "vnext_config_resources_writer_newline_guard" "final line with NO trailing newline survives" "$CLI" "$CONFIG_BATS"
+
+# 4. CYCLE NEXT. Neutralize the +1 step so "next" returns the current value: the
+#    "next advances through the memory ring" test (default -> 4g) must fail.
+cat > "$SED_TMP" << 'SED'
+s@\$(((i + 1) % m))@$(((i + 0) % m))@
+SED
+try "vnext_config_cycle_next" "cycle: next advances through the memory ring" "$CLI" "$CONFIG_BATS"
+
+# 5. CYCLE CUSTOM DEDUP. Always append the custom pin so a value equal to a ring
+#    stop double-appears: the "does not double-append" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@\$_dup || ring+=("\$custom")@ring+=("$custom")@
+SED
+try "vnext_config_cycle_custom_dedup" "does not double-append" "$CLI" "$CONFIG_BATS"
+
+# 6. ROW-KIND DISPATCH. Mislabel the memory row as a cap so a resource cursor would
+#    index KNOWN_CAPS: the row_kind mapping test must fail.
+cat > "$SED_TMP" << 'SED'
+s@    echo "mem"@    echo "cap:git"@
+SED
+try "vnext_config_row_kind" "row_kind: caps map to" "$CLI" "$CONFIG_BATS"
+
+# 7. DIRECT-MODE RESOURCE KEY. Route --memory into the cpus key so the memory value
+#    never lands: the "config --memory: sets the global memory limit" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@then cur_mem="\$write_val"; else cur_cpus="\$write_val"@then cur_cpus="$write_val"; else cur_cpus="$write_val"@
+SED
+try "vnext_config_memory_direct_write" "config --memory: sets the global memory limit" "$CLI" "$CONFIG_BATS"
+
+# 8. --LIST RESOURCES BLOCK. Rename the Resources header so --list stops printing it:
+#    the "shows the Resources block with configured values" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@\${BOLD}Resources\${RESET}"@${BOLD}Zzz${RESET}"@
+SED
+try "vnext_config_list_shows_resources" "shows the Resources block with configured values" "$CLI" "$CONFIG_BATS"
+
+# 9. TEXT-PICKER RESOURCE PARSE. Make the memory keyword a no-op on the stored value
+#    (keep the confirmation): the "memory keyword with a space sets the value" test,
+#    which reads the value back, must fail.
+cat > "$SED_TMP" << 'SED'
+s@mem="\$_v"@mem="$mem"@
+SED
+try "vnext_config_text_resource_parse" "memory keyword with a space sets the value" "$CLI" "$CONFIG_BATS"
+
+# 10. GENERATE NO-OP GUARD. Break the "nothing selected" short-circuit so an empty
+#     selection would still prompt/write: the no-op test must fail.
+cat > "$SED_TMP" << 'SED'
+s|\${#caps\[@\]} -eq 0|${#caps[@]} -eq 9|
+SED
+try "vnext_config_generate_noop_guard" "nothing selected is a no-op" "$CLI" "$CONFIG_BATS"
+
+# 11. GENERATE $HOME REFUSAL. Drop $HOME from the refusal list so `cleat config` run
+#     from $HOME would drop a stray ./.cleat: the "refuses to write in" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@""|"/"|"\$HOME")@""|"/")@
+SED
+try "vnext_config_generate_refuse_home" "refuses to write in" "$CLI" "$CONFIG_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

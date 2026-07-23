@@ -239,6 +239,45 @@ cleat_bin_timeout() {
   assert_output --partial "docker"
 }
 
+@test "smoke: cleat config --list prints the Resources block cleanly" {
+  run cleat_bin config --list
+  assert_success
+  assert_output --partial "Resources"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat config --memory persists to config file" {
+  run cleat_bin config --memory 4g
+  assert_success
+  grep -q "^memory = 4g$" "$CLEAT_CONFIG_DIR/config" || {
+    echo "memory not persisted"
+    cat "$CLEAT_CONFIG_DIR/config"
+    return 1
+  }
+}
+
+@test "smoke: cleat config --cpus then --memory keeps both keys" {
+  cleat_bin config --cpus 2 >/dev/null
+  run cleat_bin config --memory 6g
+  assert_success
+  grep -q "^cpus = 2$" "$CLEAT_CONFIG_DIR/config" || { echo "cpus lost"; cat "$CLEAT_CONFIG_DIR/config"; return 1; }
+  grep -q "^memory = 6g$" "$CLEAT_CONFIG_DIR/config" || { echo "memory missing"; cat "$CLEAT_CONFIG_DIR/config"; return 1; }
+}
+
+@test "smoke: cleat config --memory with a bad value exits 1" {
+  run cleat_bin config --memory lots
+  assert_failure
+  assert_output --partial "Invalid memory value"
+}
+
+@test "smoke: cleat config with no flags and closed stdin exits, never hangs" {
+  # Drives the interactive editor with no TTY (text fallback) and EOF stdin: it
+  # must fail open and return, not spin on 'Unknown capability' forever.
+  run cleat_bin_timeout 10 config < /dev/null
+  assert_success
+  assert_output --partial "Cancelled"
+}
+
 @test "smoke: cleat trust --list shows no projects initially" {
   run cleat_bin trust --list
   assert_success

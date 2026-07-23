@@ -451,3 +451,336 @@ EOF
   result="$(printf '\033' | _read_keypress)"
   [[ "$result" == "ESC" ]] || { echo "got: $result"; return 1; }
 }
+
+# ── _write_resources_to_file ───────────────────────────────────────────────
+
+@test "write_resources: writes memory and cpus" {
+  _write_resources_to_file "$TEST_TEMP/config" 4g 2
+  run cat "$TEST_TEMP/config"
+  assert_line --index 0 "[resources]"
+  assert_output --partial "memory = 4g"
+  assert_output --partial "cpus = 2"
+}
+
+@test "write_resources: omits an unset key" {
+  _write_resources_to_file "$TEST_TEMP/config" 8g ""
+  run cat "$TEST_TEMP/config"
+  assert_output --partial "memory = 8g"
+  refute_output --partial "cpus ="
+}
+
+@test "write_resources: both unset writes no [resources] section" {
+  : > "$TEST_TEMP/config"
+  _write_resources_to_file "$TEST_TEMP/config" "" ""
+  run cat "$TEST_TEMP/config"
+  refute_output --partial "[resources]"
+}
+
+@test "write_resources: sentinels default/all clear their keys" {
+  _write_resources_to_file "$TEST_TEMP/config" default all
+  run cat "$TEST_TEMP/config"
+  refute_output --partial "[resources]"
+  refute_output --partial "default"
+  refute_output --partial "all"
+}
+
+@test "write_resources: preserves [caps] and [setup], replaces only [resources]" {
+  printf '[caps]\ngit\n\n[setup]\nscript boot.sh\n\n[resources]\nmemory = 2g\n' > "$TEST_TEMP/config"
+  _write_resources_to_file "$TEST_TEMP/config" 6g ""
+  run cat "$TEST_TEMP/config"
+  assert_output --partial "[caps]"
+  assert_output --partial "git"
+  assert_output --partial "[setup]"
+  assert_output --partial "script boot.sh"
+  assert_output --partial "memory = 6g"
+  refute_output --partial "memory = 2g"
+}
+
+@test "write_resources: a CRLF [resources] header is replaced, not duplicated" {
+  printf '[resources]\r\nmemory = 2g\r\n' > "$TEST_TEMP/config"
+  _write_resources_to_file "$TEST_TEMP/config" 8g 4
+  run grep -c '^\[resources\]$' "$TEST_TEMP/config"
+  assert_output "1"
+}
+
+@test "write_resources: a [setup] final line with NO trailing newline survives" {
+  # The pre-fix caps writer dropped a no-trailing-newline last line; the resources
+  # writer must never corrupt a hand-edited [setup] the same way.
+  printf '[setup]\nscript build.sh' > "$TEST_TEMP/config"   # NO trailing newline
+  _write_resources_to_file "$TEST_TEMP/config" 4g ""
+  run cat "$TEST_TEMP/config"
+  assert_output --partial "script build.sh"
+  assert_output --partial "memory = 4g"
+}
+
+# ── _config_cycle_value ────────────────────────────────────────────────────
+
+@test "cycle: next advances through the memory ring" {
+  run _config_cycle_value next default "" "${_CONFIG_MEM_CHOICES[@]}"
+  assert_output "4g"
+}
+
+@test "cycle: next wraps from the last stop back to the sentinel" {
+  run _config_cycle_value next 8g "" "${_CONFIG_MEM_CHOICES[@]}"
+  assert_output "default"
+}
+
+@test "cycle: prev wraps from the sentinel to the last stop" {
+  run _config_cycle_value prev default "" "${_CONFIG_MEM_CHOICES[@]}"
+  assert_output "8g"
+}
+
+@test "cycle: a hand-set custom value stays reachable after the last stop" {
+  run _config_cycle_value next 8g 16g "${_CONFIG_MEM_CHOICES[@]}"
+  assert_output "16g"
+}
+
+@test "cycle: a custom value equal to a ring stop does not double-append" {
+  # custom=4g is already a preset, so cycling off 8g must land on the sentinel,
+  # not on a duplicate 4g stop.
+  run _config_cycle_value next 8g 4g "${_CONFIG_MEM_CHOICES[@]}"
+  assert_output "default"
+}
+
+@test "cycle: an off-ring current lands on the first stop" {
+  run _config_cycle_value next 99g "" "${_CONFIG_MEM_CHOICES[@]}"
+  assert_output "default"
+}
+
+# ── _config_row_kind ───────────────────────────────────────────────────────
+
+@test "row_kind: caps map to cap:<name>, then mem, then cpus, then gen" {
+  run _config_row_kind 0; assert_output "cap:git"
+  run _config_row_kind 5; assert_output "cap:docker"
+  run _config_row_kind 6; assert_output "mem"
+  run _config_row_kind 7; assert_output "cpus"
+  run _config_row_kind 8; assert_output "gen"
+}
+
+# ── draw: resource + generate rows ─────────────────────────────────────────
+
+@test "config draw: renders the Resources group with memory and cpus values" {
+  run _config_picker_draw 0 "" 4g 2 0 0
+  assert_output --partial "Resources"
+  assert_output --partial "memory"
+  assert_output --partial "4g"
+  assert_output --partial "cpus"
+}
+
+@test "config draw: shows chevrons on the cursored resource row" {
+  run _config_picker_draw 6 "" 4g all 0 0
+  assert_output --partial "‹ 4g ›"
+}
+
+@test "config draw: the generate row appears only when show_gen=1" {
+  run _config_picker_draw 0 "" default all 1 0
+  assert_output --partial "this project's .cleat"
+  run _config_picker_draw 0 "" default all 0 0
+  refute_output --partial "this project's .cleat"
+}
+
+# ── cmd_config --memory / --cpus (direct mode) ─────────────────────────────
+
+@test "config --memory: sets the global memory limit" {
+  run cmd_config --memory 4g
+  assert_success
+  run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory
+  assert_output "4g"
+}
+
+@test "config --cpus: sets the global cpus limit and preserves memory" {
+  cmd_config --memory 4g
+  run cmd_config --cpus 2
+  assert_success
+  run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory
+  assert_output "4g"
+  run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" cpus
+  assert_output "2"
+}
+
+@test "config --memory default: clears the key" {
+  cmd_config --memory 4g
+  run cmd_config --memory default
+  assert_success
+  run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory
+  assert_output ""
+}
+
+@test "config --memory: rejects an invalid value" {
+  run cmd_config --memory lots
+  assert_failure
+  assert_output --partial "Invalid memory value"
+}
+
+@test "config --cpus: rejects a zero value" {
+  run cmd_config --cpus 0
+  assert_failure
+  assert_output --partial "Invalid cpus value"
+}
+
+@test "config --memory: a missing value is an error, not a silent clear" {
+  run cmd_config --memory
+  assert_failure
+  assert_output --partial "Missing value"
+}
+
+@test "config --project --memory: writes to .cleat and preserves [caps]" {
+  cd "$TEST_TEMP"
+  cmd_config --project --enable git
+  run cmd_config --project --memory 8g
+  assert_success
+  run cat "$TEST_TEMP/.cleat"
+  assert_output --partial "[caps]"
+  assert_output --partial "git"
+  assert_output --partial "memory = 8g"
+}
+
+@test "config <box> --memory: writes to the box file" {
+  cd "$TEST_TEMP"
+  run cmd_config dev --memory 4g
+  assert_success
+  run _read_resource_from_file "$TEST_TEMP/.cleat.dev" memory
+  assert_output "4g"
+}
+
+# ── cmd_config --list: resources ───────────────────────────────────────────
+
+@test "config --list: shows the Resources block with configured values" {
+  printf '[resources]\nmemory = 6g\ncpus = 2\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_config --list
+  assert_success
+  assert_output --partial "Resources"
+  assert_output --partial "6g"
+  assert_output --partial "2"
+}
+
+@test "config --list: shows default markers when resources are unset" {
+  run cmd_config --list
+  assert_success
+  assert_output --partial "Resources"
+  assert_output --partial "default"
+  assert_output --partial "all"
+}
+
+# ── text picker: resources + generate + EOF ────────────────────────────────
+
+@test "config text: memory keyword with a space sets the value" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "" <<< $'memory 6g\ndone'
+  assert_success
+  assert_output --partial "memory set to 6g"
+  run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory
+  assert_output "6g"
+}
+
+@test "config text: memory keyword tolerates spaces around = (mirrors the file)" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "" <<< $'memory = 4g\ndone'
+  assert_success
+  run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory
+  assert_output "4g"
+}
+
+@test "config text: cpus keyword sets the value" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "" <<< $'cpus 2\ndone'
+  assert_success
+  run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" cpus
+  assert_output "2"
+}
+
+@test "config text: a bad resource value warns specifically, not 'Unknown capability'" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "" <<< $'memory lots\nq'
+  assert_success
+  assert_output --partial "Not a memory value"
+  refute_output --partial "Unknown capability"
+}
+
+@test "config text: a genuinely unknown word still warns Unknown capability" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "" <<< $'wobble\nq'
+  assert_success
+  assert_output --partial "Unknown capability"
+}
+
+@test "config text: EOF cancels cleanly instead of looping" {
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "" < /dev/null
+  assert_success
+  assert_output --partial "Cancelled"
+}
+
+@test "config text: project keyword generates ./.cleat when confirmed" {
+  cd "$TEST_TEMP"
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "$TEST_TEMP" <<< $'git\nproject\ndone\ny'
+  assert_success
+  assert_output --partial "Wrote"
+  run _read_caps_from_file "$TEST_TEMP/.cleat"
+  assert_output "git"
+}
+
+@test "config text: project keyword is inert in project scope" {
+  run _config_picker_text "$TEST_TEMP/.cleat" "project" "$TEST_TEMP" <<< $'project\nq'
+  assert_success
+  assert_output --partial "only applies to the global config"
+}
+
+# ── _generate_project_cleat ────────────────────────────────────────────────
+
+@test "generate: a fresh .cleat gets the friendly header" {
+  local d="$TEST_TEMP/fresh"
+  _generate_project_cleat "$d" 4g 2 git
+  run cat "$d/.cleat"
+  assert_output --partial "Cleat project config"
+  assert_output --partial "[caps]"
+  assert_output --partial "git"
+  assert_output --partial "memory = 4g"
+}
+
+@test "generate: an existing .cleat keeps [setup] byte-for-byte, no header added" {
+  local d="$TEST_TEMP/existing"
+  mkdir -p "$d"
+  # A [setup] line containing a bracket token must not be mistaken for a section.
+  printf '[setup]\nscript [ -f flag ] && ./boot.sh\n' > "$d/.cleat"
+  _generate_project_cleat "$d" 8g "" docker
+  run cat "$d/.cleat"
+  assert_output --partial 'script [ -f flag ] && ./boot.sh'
+  assert_output --partial "docker"
+  assert_output --partial "memory = 8g"
+  refute_output --partial "Cleat project config"
+}
+
+# ── _config_generate_project (confirm gate) ────────────────────────────────
+
+@test "generate confirm: nothing selected is a no-op, writes no file" {
+  local d="$TEST_TEMP/nada"
+  mkdir -p "$d"
+  run _config_generate_project "$d" "" ""
+  assert_success
+  assert_output --partial "Nothing to write"
+  [[ ! -f "$d/.cleat" ]]
+}
+
+@test "generate confirm: refuses to write in \$HOME" {
+  run _config_generate_project "$HOME" 4g "" git
+  assert_success
+  assert_output --partial "Not writing .cleat"
+  [[ ! -f "$HOME/.cleat" ]]
+}
+
+@test "generate confirm: docker is called out and a declined write leaves no file" {
+  local d="$TEST_TEMP/decline"
+  mkdir -p "$d"
+  run _config_generate_project "$d" 4g "" git docker <<< "n"
+  assert_success
+  assert_output --partial "full host control once trusted"
+  assert_output --partial "Skipped"
+  [[ ! -f "$d/.cleat" ]]
+}
+
+@test "generate confirm: an approved write lands the caps and resources" {
+  local d="$TEST_TEMP/approve"
+  mkdir -p "$d"
+  run _config_generate_project "$d" 4g 2 git <<< "y"
+  assert_success
+  assert_output --partial "Wrote"
+  run _read_caps_from_file "$d/.cleat"
+  assert_output "git"
+  run _read_resource_from_file "$d/.cleat" memory
+  assert_output "4g"
+}

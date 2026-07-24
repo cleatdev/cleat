@@ -288,6 +288,34 @@ cleat_bin_timeout() {
   grep -q "^memory = 6g$" "$CLEAT_CONFIG_DIR/config" || { echo "memory missing"; cat "$CLEAT_CONFIG_DIR/config"; return 1; }
 }
 
+# A memory value above the old fixed 8g ceiling now reaches the VM-relative
+# warning path (docker info reads, awk comparisons, the arithmetic tiers). Those
+# are exactly the pipelines that abort a strict-mode binary on a no-match, so the
+# real subprocess has to walk them.
+@test "smoke: cleat config --memory above the project cap exits cleanly" {
+  run cleat_bin config --memory 24g
+  assert_success
+  refute_output --partial "unbound variable"
+  grep -q "^memory = 24g$" "$CLEAT_CONFIG_DIR/config" || {
+    echo "memory not persisted"; cat "$CLEAT_CONFIG_DIR/config"; return 1; }
+}
+
+@test "smoke: cleat config --project --memory above the cap warns and still writes" {
+  cd "$TEST_TEMP"
+  run cleat_bin config --project --memory 32g
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "caps memory at"
+}
+
+@test "smoke: cleat config --cpus above the core count exits cleanly" {
+  run cleat_bin config --cpus 512
+  assert_success
+  refute_output --partial "unbound variable"
+  grep -q "^cpus = 512$" "$CLEAT_CONFIG_DIR/config" || {
+    echo "cpus not persisted"; cat "$CLEAT_CONFIG_DIR/config"; return 1; }
+}
+
 @test "smoke: cleat config --memory with a bad value exits 1" {
   run cleat_bin config --memory lots
   assert_failure

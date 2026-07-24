@@ -86,6 +86,40 @@ _stub_storage_docker() {
   assert_output --partial "On disk"
 }
 
+# The closing two lines are ONE paragraph: where the rest of the disk went, then
+# how to get space back. They must share the 2-space prose indent and sit on
+# consecutive lines. Elsewhere (advisory, gate, ENOSPC) the same lever keeps the
+# 4-space notice indent, so the shared helper has to take the indent, not pick one.
+@test "storage: the closing lever lines up with the prose above it, no blank between" {
+  _daemon_up() { return 0; }
+  _storage_fill() { echo "31457280 62914560 50"; }
+  _stub_storage_docker
+  run cmd_storage
+  assert_success
+  local plain prev_i i=0 found=0
+  while IFS= read -r plain; do
+    plain="$(printf '%s' "$plain" | sed $'s/\033\\[[0-9;]*m//g')"
+    case "$plain" in
+      "  Other projects hold the rest"*) prev_i=$i ;;
+      "  Docker Desktop: reclaim with"*)
+        [[ -n "${prev_i:-}" && $i -eq $((prev_i + 1)) ]] || {
+          echo "lever at line $i, prose at line ${prev_i:-none}: want consecutive"; return 1; }
+        found=1 ;;
+    esac
+    i=$((i + 1))
+  done <<< "$output"
+  [[ $found -eq 1 ]] || { echo "lever line not found at a 2-space indent"; return 1; }
+}
+
+@test "storage: the shared lever keeps its 4-space indent in notice blocks" {
+  local plain
+  plain="$(_disk_lever_short desktop | sed $'s/\033\\[[0-9;]*m//g')"
+  case "$plain" in
+    "    Docker Desktop: reclaim with"*) : ;;
+    *) echo "want a 4-space default indent, got: [$plain]"; return 1 ;;
+  esac
+}
+
 @test "storage: engine footer follows the kind (Colima names its resize command)" {
   _daemon_up() { return 0; }
   _disk_help_kind() { echo colima; }

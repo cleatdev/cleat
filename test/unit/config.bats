@@ -547,6 +547,176 @@ EOF
   assert_output "default"
 }
 
+# ── machine-sized resource rings ───────────────────────────────────────────
+# The picker must offer what THIS Docker can honour: never more cores than the
+# daemon reports (dockerd errors above NCPU), never less memory headroom than
+# the VM actually has (the fixed 8g ceiling hid 24 GB VMs).
+
+@test "mem ring: global scope climbs in real stops to the VM size" {
+  _docker_vm_memory() { echo $(( 24 * 1073741824 )); }
+  _docker_vm_configured_gb() { echo 24; }
+  run _config_mem_choices global
+  assert_success
+  assert_output "default 4g 6g 8g 12g 16g 24g"
+}
+
+@test "mem ring: the last stop is the VM size even off the ladder" {
+  _docker_vm_memory() { echo $(( 10 * 1073741824 )); }
+  _docker_vm_configured_gb() { echo 10; }
+  run _config_mem_choices global
+  assert_success
+  assert_output "default 4g 6g 8g 10g"
+}
+
+@test "mem ring: project scope stops at the runtime clamp" {
+  _docker_vm_memory() { echo $(( 64 * 1073741824 )); }
+  _docker_vm_configured_gb() { echo 64; }
+  run _config_mem_choices project
+  assert_success
+  assert_output "default 4g 6g 8g"
+}
+
+# The clamp the ring stops at and the clamp resolve_box_memory applies are two
+# separate constants in the source. If they drift, the picker offers a project
+# value the box silently will not get. This is the cross-check.
+@test "config: project ring stops at the runtime clamp" {
+  local last cfg
+  _docker_vm_memory() { echo $(( 64 * 1073741824 )); }
+  _docker_vm_configured_gb() { echo 64; }
+  last="$(_config_mem_choices project)"
+  last="${last##* }"
+  cfg="$TEST_TEMP/proj/.cleat"
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[resources]\nmemory = %s\n' "$last" > "$cfg"
+  run resolve_box_memory "$TEST_TEMP/proj" main
+  assert_success
+  assert_output "$last"
+}
+
+@test "mem ring: an unsizeable VM falls back to the static ring" {
+  _docker_vm_memory() { echo ""; }
+  _docker_vm_configured_gb() { echo ""; }
+  run _config_mem_choices global
+  assert_success
+  assert_output "default 4g 6g 8g"
+}
+
+@test "cpu ring: built from the daemon's real core count" {
+  _daemon_ncpu() { echo 24; }
+  run _config_cpu_choices
+  assert_success
+  assert_output "all 1 2 4 8 16 24"
+}
+
+@test "cpu ring: never offers more cores than the machine has" {
+  _daemon_ncpu() { echo 4; }
+  run _config_cpu_choices
+  assert_success
+  assert_output "all 1 2 4"
+}
+
+@test "cpu ring: a single-core daemon still gets a usable ring" {
+  _daemon_ncpu() { echo 1; }
+  run _config_cpu_choices
+  assert_success
+  assert_output "all 1"
+}
+
+@test "cpu ring: an unknown core count falls back to the static ring" {
+  _daemon_ncpu() { echo ""; }
+  run _config_cpu_choices
+  assert_success
+  assert_output "all 1 2 4 8"
+}
+
+# ── graduated memory warnings ──────────────────────────────────────────────
+# Escalating, because a ceiling reads as free until a box grows into it. The
+# note is ALWAYS two lines so the picker's redraw math stays constant.
+
+@test "mem note: silent at or below the project cap" {
+  run _config_mem_note 8g 24
+  assert_success
+  assert_output ""
+}
+
+@test "mem note: a mild note above the cap but well under the VM" {
+  run _config_mem_note 12g 64
+  assert_success
+  assert_output --partial "not a reservation"
+  refute_output --partial "warning:"
+}
+
+@test "mem note: escalates past half the VM" {
+  run _config_mem_note 16g 24
+  assert_success
+  assert_output --partial "over half the 24 GB Docker VM"
+  refute_output --partial "warning:"
+}
+
+@test "mem note: the top tier warns at the whole VM" {
+  run _config_mem_note 24g 24
+  assert_success
+  assert_output --partial "warning:"
+  assert_output --partial "the whole Docker VM"
+}
+
+@test "mem note: always exactly two lines at every tier" {
+  local v
+  for v in default 8g 12g 16g 24g 48g; do
+    n="$(_config_mem_note "$v" 24 | wc -l | tr -d ' ')"
+    [[ "$n" -eq 2 ]] || { echo "$v produced $n lines, want 2"; return 1; }
+  done
+}
+
+@test "mem note: an unknown VM size still notes above the cap" {
+  run _config_mem_note 16g ""
+  assert_success
+  assert_output --partial "not a reservation"
+}
+
+# On a Docker Desktop VM left at its 8 GB default, 8g is BOTH the ring's top
+# stop and the whole VM. The picker note and the save-time block must agree:
+# with the 8 GB floor checked first the picker said nothing and then ENTER
+# printed the full amber paragraph.
+@test "mem note: the whole-VM tier fires even at the project cap on a small VM" {
+  run _config_mem_note 8g 8
+  assert_success
+  assert_output --partial "warning:"
+  assert_output --partial "the whole Docker VM"
+}
+
+@test "mem note: picker note and save warning agree on a small VM" {
+  local note_fires block_fires
+  note_fires=0; block_fires=0
+  _config_mem_note 8g 8 | grep -q 'warning:' && note_fires=1
+  [[ -n "$(_config_mem_warn_block 8g 8)" ]] && block_fires=1
+  [[ "$note_fires" -eq "$block_fires" ]] || {
+    echo "disagreement: note=$note_fires block=$block_fires"; return 1; }
+  # and both stay silent one step below the whole VM
+  note_fires=0; block_fires=0
+  _config_mem_note 4g 8 | grep -q 'warning:' && note_fires=1
+  [[ -n "$(_config_mem_warn_block 4g 8)" ]] && block_fires=1
+  [[ "$note_fires" -eq 0 && "$block_fires" -eq 0 ]] || {
+    echo "should both be silent: note=$note_fires block=$block_fires"; return 1; }
+}
+
+# The derived default on a small VM is 4g. That is not a choice the user made,
+# so it must not nag: the two milder tiers stay behind the 8 GB floor.
+@test "mem note: a 4g default on a 6 GB VM stays quiet" {
+  run _config_mem_note 4g 6
+  assert_success
+  assert_output ""
+}
+
+@test "mem warn block: the full reason only at the whole-VM tier" {
+  run _config_mem_warn_block 16g 24
+  assert_success
+  assert_output ""
+  run _config_mem_warn_block 24g 24
+  assert_success
+  assert_output --partial "OOM killer"
+}
+
 # ── _config_row_kind ───────────────────────────────────────────────────────
 
 @test "row_kind: caps map to cap:<name>, then mem, then cpus, then gen" {
@@ -670,6 +840,24 @@ EOF
   assert_output --partial "memory set to 6g"
   run _read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory
   assert_output "6g"
+}
+
+# Text mode types a size rather than cycling a ring, so it can name anything.
+# It must carry the VM size into the save path or a piped whole-VM ceiling is
+# written in total silence (the TUI and direct mode both warn).
+@test "config text: a whole-VM ceiling still prints the warning off a terminal" {
+  _docker_vm_memory() { echo $(( 24 * 1073741824 )); }
+  _docker_vm_configured_gb() { echo 24; }
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" "global" "" <<< $'memory 24g\ndone'
+  assert_success
+  assert_output --partial "entire Docker VM"
+  assert_output --partial "OOM killer"
+}
+
+@test "config text: project scope states the 8 GB cap" {
+  run _config_picker_text "$TEST_TEMP/.cleat" "project" "$TEST_TEMP" <<< "q"
+  assert_success
+  assert_output --partial "caps memory at 8 GB"
 }
 
 @test "config text: memory keyword tolerates spaces around = (mirrors the file)" {
@@ -831,20 +1019,47 @@ EOF
 }
 
 # ── draw redraw invariant (line count = the tui's draw_lines formula) ───────
-# The TUI's cursor-up math uses draw_lines = ncaps+5 (+2 with the generate row).
+# The TUI's cursor-up math uses draw_lines = ncaps+7 (+2 with the generate row).
 # It MUST equal the physical lines _config_picker_draw emits, or every keypress
-# desyncs the redraw. These pin the draw side of that invariant.
+# desyncs the redraw. These pin the draw side of that invariant. The +7 (was +5)
+# is the always-two-line memory note area added with the VM-sized memory ring.
 
-@test "config draw: emits exactly ncaps+5 lines in project scope" {
+@test "config draw: emits exactly ncaps+7 lines in project scope" {
   local n
   n="$(_config_picker_draw 0 "" default all 0 0 | wc -l | tr -d ' ')"
-  [[ "$n" -eq $(( ${#KNOWN_CAPS[@]} + 5 )) ]] || { echo "got $n, want $(( ${#KNOWN_CAPS[@]} + 5 ))"; return 1; }
+  [[ "$n" -eq $(( ${#KNOWN_CAPS[@]} + 7 )) ]] || { echo "got $n, want $(( ${#KNOWN_CAPS[@]} + 7 ))"; return 1; }
 }
 
-@test "config draw: emits exactly ncaps+7 lines with the generate row (global scope)" {
+@test "config draw: emits exactly ncaps+9 lines with the generate row (global scope)" {
   local n
   n="$(_config_picker_draw 0 "" default all 1 0 | wc -l | tr -d ' ')"
-  [[ "$n" -eq $(( ${#KNOWN_CAPS[@]} + 7 )) ]] || { echo "got $n, want $(( ${#KNOWN_CAPS[@]} + 7 ))"; return 1; }
+  [[ "$n" -eq $(( ${#KNOWN_CAPS[@]} + 9 )) ]] || { echo "got $n, want $(( ${#KNOWN_CAPS[@]} + 9 ))"; return 1; }
+}
+
+# The note area is RESERVED, not conditional: the count must not move when the
+# memory value crosses a warning tier, or the redraw desyncs exactly when the
+# user is arrowing through the big values. This is the invariant that makes the
+# two constants above safe.
+@test "config draw: line count is identical at every memory warning tier" {
+  local base warned danger
+  base="$(_config_picker_draw 0 "" default all 0 0 24 | wc -l | tr -d ' ')"
+  warned="$(_config_picker_draw 0 "" 16g all 0 0 24 | wc -l | tr -d ' ')"
+  danger="$(_config_picker_draw 0 "" 24g all 0 0 24 | wc -l | tr -d ' ')"
+  [[ "$base" -eq "$warned" && "$base" -eq "$danger" ]] || {
+    echo "line counts drifted: default=$base 16g=$warned 24g=$danger"; return 1; }
+}
+
+@test "config draw: renders the top-tier memory warning inline" {
+  run _config_picker_draw 0 "" 24g all 0 0 24
+  assert_success
+  assert_output --partial "the whole Docker VM"
+}
+
+@test "config draw: no memory note at or below the project cap" {
+  run _config_picker_draw 0 "" 8g all 0 0 24
+  assert_success
+  refute_output --partial "note:"
+  refute_output --partial "warning:"
 }
 
 # ── env scaffolding via the editor save path ───────────────────────────────

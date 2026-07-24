@@ -3352,6 +3352,87 @@ s@ && "\$reclaimed" != "0B"@@
 SED
 try "vnext_prune_cache_zero" "0B reclaimed reports no reclaimable cache" "$CLI" "$PRUNE_BATS"
 
+# STORAGE CLOSING-LEVER INDENT. cmd_storage passes a 2-space indent so the lever
+# lines up with the prose line above it. Drop the argument (back to the 4-space
+# notice default) and the "lines up with the prose above it" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@_disk_lever_short "\$kind" "  "@_disk_lever_short "$kind"@
+SED
+try "vnext_storage_lever_indent" "lines up with the prose above it" "$CLI" "$STORAGE_BATS"
+
+# LEVER INDENT DEFAULT. The shared lever must still default to the 4-space notice
+# indent for the advisory/gate/ENOSPC callers. Force the default to 2 spaces and
+# the "keeps its 4-space indent" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@local i="\${2:-    }"@local i="${2:-  }"@
+SED
+try "vnext_lever_indent_default" "keeps its 4-space indent" "$CLI" "$STORAGE_BATS"
+
+# CPU RING FROM THE DAEMON. The picker must never offer more cores than the
+# daemon reports. Ignore the real core count and fall back to the static ring:
+# the "never offers more cores than the machine has" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@  ncpu="\$(_daemon_ncpu)"@  ncpu=""@
+SED
+try "vnext_config_cpu_ring_detect" "never offers more cores than the machine has" "$CLI" "$CONFIG_BATS"
+
+# CPU RING ENDS ON THE CORE COUNT. Drop the exact-core-count final stop so a
+# 24-core machine tops out at 16: the "built from the daemon's real core count"
+# test must fail.
+cat > "$SED_TMP" << 'SED'
+s@  printf '%s %s' "\$out" "\$ncpu"@  printf '%s' "$out"@
+SED
+try "vnext_config_cpu_ring_last_stop" "built from the daemon" "$CLI" "$CONFIG_BATS"
+
+# MEMORY RING CLIMBS TO THE VM. Force global scope down the project path so the
+# ring stops at 8g on a 24 GB VM (the old fixed ceiling): the "climbs in real
+# stops to the VM size" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ "\$scope" == "project" \]\]; then@  if [[ "$scope" != "" ]]; then@
+SED
+try "vnext_config_mem_ring_vm" "climbs in real stops to the VM size" "$CLI" "$CONFIG_BATS"
+
+# PROJECT RING RESPECTS THE RUNTIME CLAMP. Let project scope climb like global.
+# The picker would then offer a value resolve_box_memory silently cuts: the
+# "project scope stops at the runtime clamp" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ "\$scope" == "project" \]\]; then@  if [[ "$scope" == "nope" ]]; then@
+SED
+try "vnext_config_mem_ring_project_cap" "project scope stops at the runtime clamp" "$CLI" "$CONFIG_BATS"
+
+# MEMORY WARNING TIERS. Collapse the whole-VM tier into the milder half-VM one so
+# a ceiling equal to the entire VM no longer warns: the "top tier warns at the
+# whole VM" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@&& (( gb >= vm_gb )); then@\&\& (( gb >= vm_gb * 99 )); then@
+SED
+try "vnext_config_mem_note_top_tier" "top tier warns at the whole VM" "$CLI" "$CONFIG_BATS"
+
+# MEMORY NOTE IS TWO LINES ALWAYS. Drop the reserved padding so a value below the
+# first tier emits nothing and the picker's redraw math desyncs: the "always
+# exactly two lines" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@case "\$v" in ""|default) printf '\\n\\n'; return 0 ;; esac@case "$v" in ""|default) return 0 ;; esac@
+SED
+try "vnext_config_mem_note_two_lines" "always exactly two lines" "$CLI" "$CONFIG_BATS"
+
+# WHOLE-VM TIER VS THE 8 GB FLOOR. The whole-VM note must be tested BEFORE the
+# project-cap floor, or an 8 GB Docker VM (the Desktop default) makes 8g the
+# whole VM with a silent picker and a loud save. Put the floor back in front and
+# the "whole-VM tier fires even at the project cap" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ "\$vm_gb" =~ \^\[0-9\]+\$ \]\] && (( vm_gb >= 1 )) && (( gb >= vm_gb )); then@  if [[ "$vm_gb" =~ ^[0-9]+$ ]] \&\& (( vm_gb >= 1 )) \&\& (( gb >= vm_gb )) \&\& (( gb > _PROJECT_MEM_CAP_GB )); then@
+SED
+try "vnext_config_mem_note_whole_vm_floor" "whole-VM tier fires even at the project cap" "$CLI" "$CONFIG_BATS"
+
+# TEXT-MODE VM SIZE. The non-TTY picker must thread the VM size into the save
+# path. Drop it and a piped whole-VM ceiling saves in silence: the "whole-VM
+# ceiling still prints the warning off a terminal" test must fail.
+cat > "$SED_TMP" << 'SED'
+s@  vm_gb="\$(_config_vm_gb)"@  vm_gb=""@
+SED
+try "vnext_config_text_vm_gb" "whole-VM ceiling still prints the warning off a terminal" "$CLI" "$CONFIG_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

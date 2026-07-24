@@ -7684,22 +7684,25 @@ _disk_subject() {
 }
 
 # One concise, engine-correct lever line (DIM/BOLD formatted), reused by the
-# advisory, the gate banner, and the ENOSPC backstop. Every branch stays honest
-# about how THIS backend returns host space.
+# advisory, the gate banner, the ENOSPC backstop and `cleat storage`. Every
+# branch stays honest about how THIS backend returns host space. $2 is the left
+# indent, defaulting to the 4 spaces the notice blocks use. `cleat storage`
+# passes 2 so the lever lines up with the prose line above it in that block.
 _disk_lever_short() {
+  local i="${2:-    }"
   case "$1" in
     desktop)
-      echo -e "    ${DIM}Docker Desktop: reclaim with ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}, or raise the disk-size slider in ${RESET}${BOLD}Settings → Resources → Advanced${RESET}${DIM}.${RESET}" ;;
+      echo -e "${i}${DIM}Docker Desktop: reclaim with ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}, or raise the disk-size slider in ${RESET}${BOLD}Settings → Resources → Advanced${RESET}${DIM}.${RESET}" ;;
     orbstack)
-      echo -e "    ${DIM}OrbStack has no size slider. Free the Mac or run ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}. OrbStack usually returns the space. A restart reclaims it if not.${RESET}" ;;
+      echo -e "${i}${DIM}OrbStack has no size slider. Free the Mac or run ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}. OrbStack usually returns the space. A restart reclaims it if not.${RESET}" ;;
     colima)
-      echo -e "    ${DIM}Colima: grow the VM disk with ${RESET}${BOLD}colima start --disk <N>${RESET}${DIM} then restart (add ${RESET}${BOLD}-p <profile>${RESET}${DIM} for a named profile), or reclaim with ${RESET}${BOLD}colima ssh -- sudo fstrim -a${RESET}${DIM}.${RESET}" ;;
+      echo -e "${i}${DIM}Colima: grow the VM disk with ${RESET}${BOLD}colima start --disk <N>${RESET}${DIM} then restart (add ${RESET}${BOLD}-p <profile>${RESET}${DIM} for a named profile), or reclaim with ${RESET}${BOLD}colima ssh -- sudo fstrim -a${RESET}${DIM}.${RESET}" ;;
     wsl)
-      echo -e "    ${DIM}WSL: free space, then shrink the distro disk with ${RESET}${BOLD}wsl --manage ${WSL_DISTRO_NAME:-<distro>} --set-sparse true${RESET}${DIM} (reclaims on a later WSL shutdown).${RESET}" ;;
+      echo -e "${i}${DIM}WSL: free space, then shrink the distro disk with ${RESET}${BOLD}wsl --manage ${WSL_DISTRO_NAME:-<distro>} --set-sparse true${RESET}${DIM} (reclaims on a later WSL shutdown).${RESET}" ;;
     linux-host)
-      echo -e "    ${DIM}Linux: ${RESET}${BOLD}cleat prune --cache${RESET}${DIM} frees the host disk immediately, or grow the partition holding ${RESET}${BOLD}$(_docker_root_dir)${RESET}${DIM}.${RESET}" ;;
+      echo -e "${i}${DIM}Linux: ${RESET}${BOLD}cleat prune --cache${RESET}${DIM} frees the host disk immediately, or grow the partition holding ${RESET}${BOLD}$(_docker_root_dir)${RESET}${DIM}.${RESET}" ;;
     *)
-      echo -e "    ${DIM}Free space with ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}. Inspect with ${RESET}${BOLD}docker system df${RESET}${DIM}.${RESET}" ;;
+      echo -e "${i}${DIM}Free space with ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}. Inspect with ${RESET}${BOLD}docker system df${RESET}${DIM}.${RESET}" ;;
   esac
 }
 
@@ -8048,8 +8051,10 @@ cmd_storage() {
   echo -e "    ${DIM}$(_fmt_gb "$cache_rb")${RESET}   ${DIM}shared build cache${RESET}     ${BOLD}cleat prune --cache${RESET} ${DIM}(all projects)${RESET}"
   echo ""
   echo -e "  ${DIM}Other projects hold the rest. Cleat never deletes them. See ${RESET}${BOLD}docker system df${RESET}${DIM}.${RESET}"
-  echo ""
-  _disk_lever_short "$kind"
+  # Same 2-space indent as the line above and no blank between them: these two
+  # are one closing paragraph (where the rest went, then how to get space back),
+  # not the indented tail of a notice block.
+  _disk_lever_short "$kind" "  "
   echo ""
 }
 
@@ -8129,8 +8134,146 @@ ENVEOF
 # deliberately absent from the memory ring: the VM-derived default floors at 4g,
 # so offering 2g would read as a DOWNGRADE of "default". A hand-set custom value
 # (e.g. 16g, 1.5) that is not a ring stop stays reachable (see _config_cycle_value).
+#
+# These two are the STATIC FALLBACK rings, used verbatim when the machine cannot
+# be sized. The live editor builds its rings from the real machine instead (see
+# _config_mem_choices / _config_cpu_choices) so it never offers a value this
+# Docker cannot honour. It also stops hiding headroom this Docker really has.
 _CONFIG_MEM_CHOICES=(default 4g 6g 8g)
 _CONFIG_CPU_CHOICES=(all 1 2 4 8)
+
+# The ceiling resolve_box_memory clamps a PROJECT-supplied value to. A .cleat
+# ships with the repo, so an untrusted project must not be able to re-introduce
+# VM-wide overcommit. Kept in whole GB for the ring and the notes. This MUST stay
+# in sync with the 8589934592 byte comparisons in resolve_box_memory and
+# _configured_box_memory; `config: project ring stops at the runtime clamp`
+# in config.bats fails if the two ever drift.
+_PROJECT_MEM_CAP_GB=8
+
+# The Docker VM's memory in whole GB, empty when it cannot be sized. The single
+# seam the memory ring AND its warnings both read, so the top of the ring and
+# the "that is your whole VM" warning can never disagree (the same
+# one-helper-for-display-and-threshold rule _docker_vm_display_gb exists for).
+_config_vm_gb() {
+  local b g
+  b="$(_docker_vm_memory)"
+  [[ "$b" =~ ^[0-9]+$ ]] && (( b > 0 )) || return 0
+  g="$(_docker_vm_display_gb "$b")"
+  if [[ "$g" =~ ^[0-9]+$ ]] && (( g > 0 )); then
+    printf '%s' "$g"
+  fi
+  return 0
+}
+
+# The memory ring for a scope, space separated. GLOBAL scope climbs in real
+# stops up to the Docker VM's own size: someone who runs one box at a time may
+# legitimately want all of it. Capping the picker at 8g hid headroom on a
+# 24 GB VM. PROJECT scope stops at the runtime clamp, so the picker can never
+# offer a repo-shipped value the box would silently not get. Unknown VM size
+# falls back to the static ring (never invent headroom we cannot verify).
+_config_mem_choices() {
+  local scope="${1:-global}" vm_gb g out
+  out="${_CONFIG_MEM_CHOICES[*]}"
+  if [[ "$scope" == "project" ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  vm_gb="$(_config_vm_gb)"
+  if ! [[ "$vm_gb" =~ ^[0-9]+$ ]] || (( vm_gb <= _PROJECT_MEM_CAP_GB )); then
+    printf '%s' "$out"
+    return 0
+  fi
+  for g in 12 16 24 32 48 64 96 128 192 256; do
+    (( g < vm_gb )) || break
+    out="$out ${g}g"
+  done
+  printf '%s %sg' "$out" "$vm_gb"
+}
+
+# The cpu ring, space separated, built from the daemon's REAL core count. A
+# --cpus above NCPU is a dockerd error, so a ring stop the machine cannot honour
+# is a trap. Equally, a fixed ring ending at 8 hid 16 cores on a big machine.
+# The ring always ends on the exact core count (a hard cap at every core, which
+# is not the same as `all`: `all` writes no --cpus at all). Unknown core count
+# falls back to the static ring.
+_config_cpu_choices() {
+  local ncpu n out
+  ncpu="$(_daemon_ncpu)"
+  if ! [[ "$ncpu" =~ ^[0-9]+$ ]] || (( ncpu < 1 )); then
+    printf '%s' "${_CONFIG_CPU_CHOICES[*]}"
+    return 0
+  fi
+  out="all"
+  for n in 1 2 4 8 16 32 64 128; do
+    (( n < ncpu )) || break
+    out="$out $n"
+  done
+  printf '%s %s' "$out" "$ncpu"
+}
+
+# The graduated note for a chosen memory ceiling. Emits EXACTLY two lines (both
+# empty below the first tier) so the picker's redraw math stays a constant: a
+# note that wrapped or changed height would desync every cursor-up in the TUI.
+# Keep each line under ~74 visible columns for the same reason.
+#
+# Three tiers, because more RAM reads as free until it is not. A cgroup limit is
+# a ceiling, not a reservation, so a big number is harmless right up until a box
+# actually grows into it. The tiers are relative to the VM, the only number that
+# decides whether one box can starve the daemon. The top tier is the honest
+# one. $1 = the value, $2 = the VM size in GB (empty when unknown).
+_config_mem_note() {
+  local v="$1" vm_gb="${2:-}" gb
+  case "$v" in ""|default) printf '\n\n'; return 0 ;; esac
+  if ! _valid_memory_value "$v"; then printf '\n\n'; return 0; fi
+  gb=$(( $(_mem_to_bytes "$v") / 1073741824 ))
+
+  # The whole-VM tier is tested BEFORE the 8 GB floor, because it must agree
+  # with _config_mem_warn_block, which has no floor. A Docker Desktop VM left at
+  # its 8 GB default makes 8g BOTH the ring's top stop and the entire VM: with
+  # the floor first the picker said nothing and then ENTER printed the full amber
+  # block. The floor still guards the two milder tiers, so a 4g ceiling on a
+  # small VM stays quiet (it is the derived default there, not a choice).
+  if [[ "$vm_gb" =~ ^[0-9]+$ ]] && (( vm_gb >= 1 )) && (( gb >= vm_gb )); then
+    printf 'warning: %s GB is the whole Docker VM. A box that grows into it\n' "$gb"
+    printf '         starves the daemon, so Linux OOM-kills inside the VM.\n'
+    return 0
+  fi
+  if (( gb <= _PROJECT_MEM_CAP_GB )); then printf '\n\n'; return 0; fi
+
+  if ! [[ "$vm_gb" =~ ^[0-9]+$ ]] || (( vm_gb < 1 )); then
+    printf 'note: above %s GB. A ceiling is not a reservation, so this only\n' "$_PROJECT_MEM_CAP_GB"
+    printf '      bites when a box really grows into it.\n'
+    return 0
+  fi
+  if (( gb * 2 >= vm_gb )); then
+    printf 'note: over half the %s GB Docker VM. Two boxes at this ceiling can\n' "$vm_gb"
+    printf '      oversubscribe it, so run one at a time.\n'
+    return 0
+  fi
+  printf 'note: above %s GB of the %s GB VM. A ceiling is not a reservation,\n' "$_PROJECT_MEM_CAP_GB" "$vm_gb"
+  printf '      so this only bites when a box really grows into it.\n'
+}
+
+# The full paragraph behind the top tier, printed once on SAVE (and by the
+# direct-mode setter) rather than in the picker, where two lines is all the
+# redraw can afford. This is the "why is that dangerous" the short note cannot
+# hold. Prints nothing below the top tier.
+_config_mem_warn_block() {
+  local v="$1" vm_gb="${2:-}" gb
+  case "$v" in ""|default) return 0 ;; esac
+  _valid_memory_value "$v" || return 0
+  [[ "$vm_gb" =~ ^[0-9]+$ ]] && (( vm_gb > 0 )) || return 0
+  gb=$(( $(_mem_to_bytes "$v") / 1073741824 ))
+  (( gb >= vm_gb )) || return 0
+  echo ""
+  warn "A ${gb} GB ceiling is the entire Docker VM."
+  echo -e "    ${DIM}Docker gives the box a ceiling, not a reservation, so this is fine${RESET}"
+  echo -e "    ${DIM}until an agent really uses it. When one does, nothing is left for${RESET}"
+  echo -e "    ${DIM}the daemon or the VM's own kernel. The Linux OOM killer inside${RESET}"
+  echo -e "    ${DIM}the VM then starts killing processes. That can take out a working${RESET}"
+  echo -e "    ${DIM}agent mid-write or wedge Docker until you restart it. Leave the VM${RESET}"
+  echo -e "    ${DIM}a couple of GB of headroom. Run one box at a time at this size.${RESET}"
+}
 
 # Cycle a resource value through its ring. $1 = next|prev, $2 = current value,
 # $3 = custom pin (a hand-set value not in the ring; pass "" when none), $4.. =
@@ -8197,6 +8340,7 @@ _config_picker_draw() {
   local cpus="${4:-all}"
   local show_gen="${5:-0}"
   local gen_on="${6:-0}"
+  local vm_gb="${7:-}"
   local ncaps=${#KNOWN_CAPS[@]}
   local i=0 cap marker
 
@@ -8242,6 +8386,26 @@ _config_picker_draw() {
       echo -e "    [${marker}] ${DIM}Also write these to this project's .cleat${RESET}"
     fi
   fi
+
+  # The memory note area: ALWAYS exactly two lines, blank below the first tier.
+  # Reserved rather than conditional because the TUI repositions by a constant
+  # number of lines, so a note that appeared and vanished would desync the whole
+  # redraw. Amber at the top tier, dim below it.
+  local note_line note_i=0
+  while IFS= read -r note_line; do
+    note_i=$((note_i + 1))
+    [[ $note_i -le 2 ]] || break
+    printf '\033[2K'
+    case "$note_line" in
+      warning:*) echo -e "  ${AMBER}${note_line}${RESET}" ;;
+      "")        echo "" ;;
+      *)         echo -e "  ${DIM}${note_line}${RESET}" ;;
+    esac
+  done < <(_config_mem_note "$mem" "$vm_gb")
+  while [[ $note_i -lt 2 ]]; do
+    note_i=$((note_i + 1))
+    printf '\033[2K'; echo ""
+  done
 }
 
 # Read the scope file's memory into a (display-value, custom-pin) pair. Empty
@@ -8249,10 +8413,15 @@ _config_picker_draw() {
 # Printed as "<display>\t<custom>" for the caller to split. `|| true` because a
 # strict-mode caller assigns this bare and a file read must never abort the editor.
 _config_load_resource() {
-  local file="$1" key="$2" unset_label="$3"
+  local file="$1" key="$2" unset_label="$3" ring="${4:-}"
   local v; v="$(_read_resource_from_file "$file" "$key" || true)"
   local choices
-  if [[ "$key" == "memory" ]]; then choices=" ${_CONFIG_MEM_CHOICES[*]} "; else choices=" ${_CONFIG_CPU_CHOICES[*]} "; fi
+  # $4 is the live ring when the caller built one from this machine. Without it
+  # we fall back to the static ring, which keeps every direct 3-arg caller (and
+  # the 3-arg tests) reading exactly as before.
+  if [[ -n "$ring" ]]; then
+    choices=" $ring "
+  elif [[ "$key" == "memory" ]]; then choices=" ${_CONFIG_MEM_CHOICES[*]} "; else choices=" ${_CONFIG_CPU_CHOICES[*]} "; fi
   if [[ -z "$v" ]]; then
     printf '%s\t%s\n' "$unset_label" ""
   else
@@ -8268,7 +8437,7 @@ _config_load_resource() {
 # project ./.cleat. project is resolved ONCE by cmd_config and threaded through so
 # the scope label and any write target can never diverge.
 _config_editor_save() {
-  local config_file="$1" scope="$2" project="$3" toggled="$4" mem="$5" cpus="$6" show_gen="$7" gen_on="$8"
+  local config_file="$1" scope="$2" project="$3" toggled="$4" mem="$5" cpus="$6" show_gen="$7" gen_on="$8" vm_gb="${9:-}"
 
   local final_caps=() cap
   for cap in "${KNOWN_CAPS[@]}"; do
@@ -8281,6 +8450,9 @@ _config_editor_save() {
   _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
   _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"
   success "Saved to ${config_file}"
+  # The two-line picker note is a nudge. This is the full reason, printed once,
+  # only when the ceiling reaches the whole VM.
+  _config_mem_warn_block "$mem_w" "$vm_gb"
 
   case ",${toggled}," in
     *,env,*)
@@ -8316,15 +8488,30 @@ _config_picker_tui() {
   fi
   echo -e "  ${DIM}Scope: ${scope_label}${RESET}"
 
+  # Rings are built ONCE from the real machine (VM memory, daemon core count) and
+  # threaded through every cycle below, so the picker offers exactly what this
+  # Docker can honour. Both fall back to the static rings when the machine cannot
+  # be sized, so a down daemon degrades to the old behaviour instead of an error.
+  local mem_ring cpu_ring vm_gb
+  mem_ring="$(_config_mem_choices "$scope")"
+  cpu_ring="$(_config_cpu_choices)"
+  vm_gb="$(_config_vm_gb)"
+
+  # Project scope stops at the runtime clamp, so say why rather than let the ring
+  # look arbitrarily short next to a global editor that climbs to the VM size.
+  if [[ "$scope" == "project" ]]; then
+    echo -e "  ${DIM}A project .cleat caps memory at ${_PROJECT_MEM_CAP_GB} GB. Raise it in the global config.${RESET}"
+  fi
+
   local toggled="" cap
   while IFS= read -r cap; do
     [[ -n "$cap" ]] && toggled="${toggled:+${toggled},}${cap}"
   done < <(_read_caps_from_file "$config_file")
 
   local mem mem_custom cpus cpu_custom _pair
-  _pair="$(_config_load_resource "$config_file" memory default)"
+  _pair="$(_config_load_resource "$config_file" memory default "$mem_ring")"
   mem="${_pair%%$'\t'*}"; mem_custom="${_pair#*$'\t'}"
-  _pair="$(_config_load_resource "$config_file" cpus all)"
+  _pair="$(_config_load_resource "$config_file" cpus all "$cpu_ring")"
   cpus="${_pair%%$'\t'*}"; cpu_custom="${_pair#*$'\t'}"
 
   local show_gen=0 gen_on=0
@@ -8332,9 +8519,10 @@ _config_picker_tui() {
 
   local ncaps=${#KNOWN_CAPS[@]}
   # nav_rows: the rows the cursor ranges over. draw_lines: the physical lines the
-  # block draws (incl. the two group headers and the blank separators). BOTH are
-  # scope-derived and computed ONCE so every reposition below uses one constant.
-  local nav_rows=$((ncaps + 2)) draw_lines=$((ncaps + 5))
+  # block draws (incl. the two group headers, the blank separators and the
+  # always-two-line memory note area). BOTH are scope-derived and computed ONCE
+  # so every reposition below uses one constant.
+  local nav_rows=$((ncaps + 2)) draw_lines=$((ncaps + 7))
   if [[ "$show_gen" == "1" ]]; then
     nav_rows=$((nav_rows + 1))
     draw_lines=$((draw_lines + 2))
@@ -8348,7 +8536,7 @@ _config_picker_tui() {
   local cursor=0
   tput civis 2>/dev/null || true
 
-  _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on"
+  _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
   echo ""
   echo -e "  ${DIM}↑/↓ move  space toggle  ←/→ change  ⏎ save  q cancel${RESET}"
   printf '\033[%dA' "$((draw_lines + 2))"
@@ -8375,26 +8563,26 @@ _config_picker_tui() {
                 toggled="$_new" ;;
               *) toggled="${toggled:+${toggled},}${current_cap}" ;;
             esac ;;
-          mem)  mem="$(_config_cycle_value next "$mem" "$mem_custom" "${_CONFIG_MEM_CHOICES[@]}")" ;;
-          cpus) cpus="$(_config_cycle_value next "$cpus" "$cpu_custom" "${_CONFIG_CPU_CHOICES[@]}")" ;;
+          mem)  mem="$(_config_cycle_value next "$mem" "$mem_custom" $mem_ring)" ;;
+          cpus) cpus="$(_config_cycle_value next "$cpus" "$cpu_custom" $cpu_ring)" ;;
           gen)  [[ "$gen_on" == "1" ]] && gen_on=0 || gen_on=1 ;;
         esac ;;
       RIGHT)
         case "$kind" in
-          mem)  mem="$(_config_cycle_value next "$mem" "$mem_custom" "${_CONFIG_MEM_CHOICES[@]}")" ;;
-          cpus) cpus="$(_config_cycle_value next "$cpus" "$cpu_custom" "${_CONFIG_CPU_CHOICES[@]}")" ;;
+          mem)  mem="$(_config_cycle_value next "$mem" "$mem_custom" $mem_ring)" ;;
+          cpus) cpus="$(_config_cycle_value next "$cpus" "$cpu_custom" $cpu_ring)" ;;
         esac ;;
       LEFT)
         case "$kind" in
-          mem)  mem="$(_config_cycle_value prev "$mem" "$mem_custom" "${_CONFIG_MEM_CHOICES[@]}")" ;;
-          cpus) cpus="$(_config_cycle_value prev "$cpus" "$cpu_custom" "${_CONFIG_CPU_CHOICES[@]}")" ;;
+          mem)  mem="$(_config_cycle_value prev "$mem" "$mem_custom" $mem_ring)" ;;
+          cpus) cpus="$(_config_cycle_value prev "$cpus" "$cpu_custom" $cpu_ring)" ;;
         esac ;;
       ENTER)
         tput cnorm 2>/dev/null || true
         printf '\033[%dB' "$((draw_lines + 2))"
         printf '\033[2K'
         echo ""
-        _config_editor_save "$config_file" "$scope" "$project" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on"
+        _config_editor_save "$config_file" "$scope" "$project" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
         return ;;
       QUIT|ESC)
         tput cnorm 2>/dev/null || true
@@ -8405,7 +8593,7 @@ _config_picker_tui() {
         return ;;
     esac
 
-    _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on"
+    _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
     printf '\033[%dA' "$draw_lines"
   done
 }
@@ -8461,6 +8649,16 @@ _config_generate_project() {
     return 0
   fi
 
+  # The global editor's memory ring climbs to the VM size, but resolve_box_memory
+  # clamps a PROJECT value back down, so writing the bigger number into .cleat
+  # would promise a ceiling the box never gets. Clamp here and say so, rather
+  # than stamp a figure the runtime quietly overrides.
+  local mem_clamped=0
+  if [[ -n "$memory" ]] && _valid_memory_value "$memory" && (( $(_mem_to_bytes "$memory") > 8589934592 )); then
+    memory="${_PROJECT_MEM_CAP_GB}g"
+    mem_clamped=1
+  fi
+
   echo ""
   echo -e "  ${BOLD}Write ${target}${RESET}"
   echo -e "  ${DIM}This file is committed and shared. Every clone runs in the same cage.${RESET}"
@@ -8482,6 +8680,9 @@ _config_generate_project() {
   [[ -n "$memory" ]] && res="memory = ${memory}"
   [[ -n "$cpus" ]] && res="${res:+${res}    }cpus = ${cpus}"
   [[ -n "$res" ]] && echo -e "  ${DIM}Resources: ${res}${RESET}"
+  if [[ $mem_clamped -eq 1 ]]; then
+    echo -e "  ${DIM}Memory written as ${_PROJECT_MEM_CAP_GB}g: a project .cleat is capped there. Your global setting keeps its larger value.${RESET}"
+  fi
   if [[ -f "$target" ]]; then
     echo -e "  ${DIM}${target} exists: its [caps] and [resources] are replaced, other sections kept.${RESET}"
   fi
@@ -8531,12 +8732,19 @@ _config_picker_text() {
     [[ -n "$cap" ]] && _active="${_active:+${_active},}${cap}"
   done < <(_read_caps_from_file "$config_file")
 
-  local mem cpus _pair
+  local mem cpus _pair vm_gb
   _pair="$(_config_load_resource "$config_file" memory default)"; mem="${_pair%%$'\t'*}"
   _pair="$(_config_load_resource "$config_file" cpus all)"; cpus="${_pair%%$'\t'*}"
+  # Text mode types a value instead of cycling a ring, so it can name any size
+  # at all. It therefore needs the VM size just as much as the TUI does, or a
+  # piped `memory 64g` saves a whole-VM ceiling in silence.
+  vm_gb="$(_config_vm_gb)"
 
   local show_gen=0 gen_on=0
   [[ "$scope" == "global" && -n "$project" ]] && show_gen=1
+  if [[ "$scope" == "project" ]]; then
+    echo -e "  ${DIM}A project .cleat caps memory at ${_PROJECT_MEM_CAP_GB} GB. Raise it in the global config.${RESET}"
+  fi
 
   for cap in "${KNOWN_CAPS[@]}"; do
     local marker="${DIM}·${RESET}"
@@ -8563,7 +8771,7 @@ _config_picker_text() {
 
     case "$input" in
       done)
-        _config_editor_save "$config_file" "$scope" "$project" "$_active" "$mem" "$cpus" "$show_gen" "$gen_on"
+        _config_editor_save "$config_file" "$scope" "$project" "$_active" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
         return
         ;;
       q|quit)
@@ -8764,6 +8972,25 @@ cmd_config() {
       success "${res_key} set to ${write_val} ${DIM}(${config_file})${RESET}"
     else
       success "${res_key} cleared, using default ${DIM}(${config_file})${RESET}"
+    fi
+    # Direct mode skips the picker, so the same truths are printed here: a
+    # project value above the clamp, a ceiling that reaches the whole VM, or a
+    # core count this daemon would reject.
+    if [[ -n "$write_val" && "$res_key" == "memory" ]]; then
+      if [[ "$scope" == "project" ]] && (( $(_mem_to_bytes "$write_val") > 8589934592 )); then
+        warn "A project .cleat caps memory at ${_PROJECT_MEM_CAP_GB} GB. The box will run at ${_PROJECT_MEM_CAP_GB}g."
+        echo -e "    ${DIM}Set a larger ceiling in the global config instead: ${RESET}${BOLD}cleat config --memory ${write_val}${RESET}"
+      else
+        _config_mem_warn_block "$write_val" "$(_config_vm_gb)"
+      fi
+    fi
+    if [[ -n "$write_val" && "$res_key" == "cpus" ]]; then
+      local _ncpu; _ncpu="$(_daemon_ncpu)"
+      if [[ "$_ncpu" =~ ^[0-9]+$ ]] && (( _ncpu > 0 )) && \
+         awk -v v="$write_val" -v n="$_ncpu" 'BEGIN { exit !(v > n) }'; then
+        warn "This Docker reports ${_ncpu} cores. Docker rejects a --cpus above that."
+        echo -e "    ${DIM}The box will run at ${_ncpu} cores from a project .cleat, or fail to start from the global config.${RESET}"
+      fi
     fi
     return
   fi

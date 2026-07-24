@@ -577,6 +577,9 @@ teardown() { _common_teardown; }
 
   run cmd_rm "$TEST_TEMP/project"
   assert_success
+  assert_output --partial "Sessions preserved"
+  # The teachable disk note: the box layer is freed but the image + cache remain.
+  assert_output --partial "cleat storage"
   run docker_calls
   assert_output --partial "docker stop $cname"
   assert_output --partial "docker rm $cname"

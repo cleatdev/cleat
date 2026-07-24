@@ -1238,3 +1238,68 @@ teardown() { _common_teardown; }
   run _running_memory_limits_sum
   assert_output "0"
 }
+
+# ── prune --cache (shared, global build cache) ───────────────────────────────
+
+@test "prune --cache: clears the shared build cache after a yes" {
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" 'y'; }
+  run cmd_prune --cache
+  assert_success
+  assert_output --partial "shared"
+  run grep "^docker builder prune -f" "$DOCKER_CALLS"
+  assert_success
+}
+
+@test "prune --cache: default No leaves the cache untouched" {
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" 'n'; }
+  run cmd_prune --cache
+  assert_success
+  assert_output --partial "Left the build cache in place"
+  run grep "builder prune" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "prune (bare) never touches the build cache" {
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  run cmd_prune
+  assert_success
+  run grep "builder prune" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "prune --cache --yes bypasses the confirm" {
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  _ask_yn() { printf -v "$1" 'n'; }   # would be No, but --yes skips the prompt
+  run cmd_prune --cache --yes
+  assert_success
+  run grep "^docker builder prune -f" "$DOCKER_CALLS"
+  assert_success
+}
+
+@test "prune --cache: non-interactive without --yes discloses and skips" {
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  _is_interactive() { return 1; }
+  run cmd_prune --cache
+  assert_success
+  assert_output --partial "shared"
+  assert_output --partial "--yes"
+  run grep "builder prune" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "prune --cache: 0B reclaimed reports no reclaimable cache, not a 0B success" {
+  docker() { echo "Total reclaimed space: 0B"; }
+  run _prune_build_cache 1   # assume_yes=1 skips the confirm
+  assert_success
+  assert_output --partial "No reclaimable build cache"
+  refute_output --partial "Reclaimed 0B"
+}

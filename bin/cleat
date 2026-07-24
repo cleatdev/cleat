@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.2.5"
+VERSION="1.3.0"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="1.2.5"
+RELEASE_HIGHLIGHT_VERSION="1.3.0"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -6102,6 +6102,9 @@ cmd_run() {
   spin_stop "$run_rc" "Container started" "Container failed to start"
   if [[ $run_rc -ne 0 ]]; then
     [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
+    # A full store is a common opaque bring-up failure. The disk gate cannot read
+    # fill when the box will not start, so this ENOSPC backstop covers it.
+    _maybe_explain_enospc "$_docker_err"
     rm -f "$_docker_err"
     # Clean up any partial container state so the next attempt starts fresh
     docker rm -f "$cname" > /dev/null 2>&1 || true
@@ -6226,6 +6229,7 @@ cmd_start() {
 
   success "Claude launched"
   _print_summary_block "$cname" "$project"
+  _maybe_gate_on_disk_fill "$cname"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions
 }
@@ -6354,6 +6358,7 @@ cmd_resume() {
 
   success "Session resumed"
   _print_summary_block "$cname" "$project"
+  _maybe_gate_on_disk_fill "$cname"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions --continue
 }
@@ -6391,6 +6396,7 @@ cmd_rm() {
     rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
     success "Removed ${BOLD}${cname}${RESET}."
     echo -e "    ${DIM}Sessions preserved. Run ${BOLD}cleat resume${RESET}${DIM} to pick up where you left off.${RESET}"
+    echo -e "    ${DIM}The box's disk layer is freed. Its image and build cache stay in the shared Docker disk: ${RESET}${BOLD}cleat storage${RESET}${DIM} shows what is left.${RESET}"
   else
     info "No container to remove."
   fi
@@ -6574,6 +6580,7 @@ cmd_claude() {
 
   success "Claude launched"
   _print_summary_block "$cname" "$project"
+  _maybe_gate_on_disk_fill "$cname"
   echo ""
   exec_claude "$cname" --dangerously-skip-permissions
 }
@@ -6858,6 +6865,43 @@ cmd_status() {
 # session holding /tmp state. Other projects' images and caches are never
 # touched. This is the safe middle ground between `clean` and `nuke`.
 
+# ── Shared docker human-size parser ──────────────────────────────────────────
+# docker prints sizes as human strings ("36.34GB", "67.95MB", "512kB", "2.5TB",
+# "0B"), and `docker system df` appends a " (NN%)" reclaimable suffix. ONE
+# hardened converter backs every size/reclaimable number the CLI reports (cleat
+# storage, the disk advisory, prune --cache reclaimed bytes, the image-bloat sum
+# in _cleat_prunable_stats), so a parse bug can never make the advisory and the
+# command that acts on it disagree.
+#
+# h2b(s) -> BYTES (a double; callers format once). Strips a trailing " (NN%)"
+# suffix FIRST. Requires a digit immediately before the unit so a bare "kB"/"TB"
+# parses to 0 (never a unit-only value). Units B/kB/KB/MB/GB/TB/PB as 1024-steps
+# to match the CLI's existing GiB math. Two load-bearing portability guards:
+# LC_ALL=C (BSD awk honors LC_NUMERIC, so a comma locale would truncate "36.34"
+# to 36) and printf "%.0f" NOT "%d" (mawk's %d clamps at 2^31-1, so any size
+# >= 2GB would silently collapse; %.0f is a double, exact past PB).
+_SIZE_AWK='
+function h2b(s,   u, n, m) {
+  sub(/[ \t]*\([0-9]+%\)[ \t]*$/, "", s)
+  if (match(s, /[0-9][0-9.]*(B|kB|KB|MB|GB|TB|PB)/) == 0) return 0
+  s = substr(s, RSTART, RLENGTH)
+  u = s; sub(/^[0-9.]+/, "", u)
+  n = s + 0
+  if      (u == "B")               m = 1
+  else if (u == "kB" || u == "KB") m = 1024
+  else if (u == "MB")              m = 1048576
+  else if (u == "GB")              m = 1073741824
+  else if (u == "TB")              m = 1099511627776
+  else if (u == "PB")              m = 1125899906842624
+  else                             m = 0
+  return n * m
+}'
+
+# Convert ONE docker human-size token to integer bytes. Empty/garbage -> 0.
+_human_size_to_bytes() {
+  LC_ALL=C awk -v s="${1:-}" "$_SIZE_AWK"'BEGIN { printf "%.0f", h2b(s) }'
+}
+
 # Seams for cmd_prune/_cleat_prunable_stats (overridable in tests: the docker
 # stub serves one canned `images` response for every query shape).
 _dangling_cleat_images() {
@@ -6930,16 +6974,50 @@ _cleat_prunable_stats() {
       _image_referenced_by_container "$tag" "$referenced" && continue
       printf '%s\n' "${line#*	}"
     done < <(_prebuilt_image_tags)
-  } | awk '
-    /GB$/ { sub(/GB$/,"");  mb += $0 * 1024;           n++; next }
-    /MB$/ { sub(/MB$/,"");  mb += $0;                  n++; next }
-    /B$/  { sub(/B$/,"");   mb += $0 / 1048576;        n++; next }
-    { n++ }
-    END { printf "%d\t%d", n, mb }
+  } | LC_ALL=C awk "$_SIZE_AWK"'
+    { n++; b += h2b($0) }
+    END { printf "%d\t%.0f", n, int(b / 1048576) }
   '
 }
 
+# Reclaim GLOBAL, regenerable Docker build cache (reclaimable-only, never -a).
+# Build cache is content-addressed and shared across ALL Docker projects, so it
+# cannot be scoped to cleat: the typed --cache flag plus this loud default-No
+# confirm are the consent. --yes bypasses the prompt (still prints the
+# disclosure). Non-interactive without --yes prints the disclosure and skips.
+_prune_build_cache() {
+  local assume_yes="${1:-0}"
+  echo ""
+  warn "${BOLD}cleat prune --cache${RESET} clears the ${BOLD}shared${RESET} Docker build cache used by ${BOLD}all${RESET} Docker projects."
+  echo -e "    ${DIM}It is regenerable. Your next build re-creates what it needs.${RESET}"
+  if (( ! assume_yes )); then
+    if ! _is_interactive; then
+      echo -e "    ${DIM}Re-run with ${RESET}${BOLD}--yes${RESET}${DIM} to clear it non-interactively.${RESET}"
+      return 0
+    fi
+    local yn=""
+    _ask_yn yn "Clear the shared build cache? [y/N] "
+    [[ "$yn" == [yY]* ]] || { info "Left the build cache in place."; return 0; }
+  fi
+  local out reclaimed
+  out="$(docker builder prune -f 2>/dev/null || true)"
+  reclaimed="$(printf '%s\n' "$out" | grep -Eo '[0-9][0-9.]*[kKMGTP]?B' | tail -1 || true)"
+  if [[ -n "$reclaimed" && "$reclaimed" != "0B" ]]; then
+    success "Cleared build cache. Reclaimed ${BOLD}${reclaimed}${RESET}."
+  else
+    info "No reclaimable build cache."
+  fi
+}
+
 cmd_prune() {
+  local want_cache=0 assume_yes=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --cache|--build-cache) want_cache=1 ;;
+      --yes|-y)              assume_yes=1 ;;
+    esac
+  done
+
   local removed=0 failed=0
 
   # Superseded prebuilt version tags (everything but the current version's).
@@ -6975,6 +7053,10 @@ cmd_prune() {
   if (( failed > 0 )); then
     echo -e "    ${DIM}${failed} kept (still referenced by a container).${RESET}"
   fi
+
+  if (( want_cache )); then
+    _prune_build_cache "$assume_yes"
+  fi
 }
 
 # ── On-start Docker pressure check ──────────────────────────────────────────
@@ -6989,6 +7071,26 @@ cmd_prune() {
 #      VM is shared, and a neighboring compose stack squeezes cleat boxes
 #      just the same.
 _PRESSURE_BLOAT_MB_THRESHOLD=5120
+
+# Two-tier disk-fill thresholds, keyed on the shared Docker storage's Use% as a
+# box sees it via `df` (cap-relative: a 60 GB Docker Desktop VM and a 1.8 TB one
+# trip at the same fullness, never at an absolute GB, because df inside a box
+# reports the ONE shared disk). Each tier also requires a low absolute-free
+# floor, so a 95%-full 1.8 TB disk that still has 90 GB free never fires: the
+# free floor can only ever REMOVE a trigger, never add one. An 80% hard block
+# would fire on healthy large disks (80% of 1.8 TB = 360 GB free) and cross the
+# never-cripple line, so the gate sits at 95 and 85 is a read-only nudge.
+# Tunable in one line each.
+_DISK_ADVISORY_PCT=85      # >= this AND free < advisory floor: read-only advisory
+_DISK_ADVISORY_FREE_GB=25
+_DISK_GATE_PCT=95          # >= this AND free < gate floor: advisory PLUS a keypress hold
+_DISK_GATE_FREE_GB=10
+# Advisory is daily-throttled with its OWN stamp (the memory check already
+# stamps PRESSURE_CHECK_FILE this run, so sharing it would suppress one of them).
+# The hard gate is never throttled: it reads fresh every interactive start and
+# holds whenever the critical predicate is true, like the undersized-VM advisory.
+DISK_CHECK_FILE="$REPO_DIR/.disk_check"
+DISK_CHECK_INTERVAL=86400
 
 # Count zombie processes inside a running box by reading /proc directly (the
 # image ships no `ps`). The comm field in /proc/N/stat may contain spaces, so
@@ -7071,6 +7173,12 @@ _print_docker_vm_fix() {
   local host_bytes="${1:-}" rec_gb="${2:-$_PRESSURE_TARGET_VM_GB}" max_note=""
   if [[ "$host_bytes" =~ ^[0-9]+$ ]] && (( host_bytes > 0 )); then
     max_note="${DIM}   (max ≈ $(( host_bytes * 3 / 4 / 1073741824 )) GB)${RESET}"
+  fi
+  # Docker Desktop's WSL2 backend takes memory/swap from .wslconfig, not the
+  # Resources slider (which that backend removes). Name the real knob there.
+  if _is_wsl; then
+    echo -e "    ${DIM}•${RESET} ${DIM}In ${RESET}${BOLD}.wslconfig${RESET}${DIM} (your Windows user folder) under ${RESET}${BOLD}[wsl2]${RESET}${DIM} set ${RESET}${BOLD}memory=${rec_gb}GB${RESET}${DIM} and ${RESET}${BOLD}swap=2GB${RESET}${DIM}, then run ${RESET}${BOLD}wsl --shutdown${RESET}${max_note}"
+    return 0
   fi
   echo -e "    ${DIM}•${RESET} ${BOLD}Settings → Resources → Advanced${RESET}${DIM}: set ${RESET}${BOLD}Memory limit ${rec_gb} GB${RESET}${DIM} and ${RESET}${BOLD}Swap ≥ 2 GB${RESET}${DIM}, then Apply & restart${RESET}${max_note}"
   echo -e "    ${DIM}•${RESET} ${DIM}Faster I/O: ${RESET}${BOLD}Settings → General → Virtual Machine Options${RESET}${DIM} → ${RESET}${BOLD}VirtioFS${RESET}"
@@ -7462,6 +7570,10 @@ _maybe_announce_docker_ready() {
 # silent on every healthy start.
 _maybe_gate_on_docker_config() {
   [[ "${_DOCKER_GATE_PENDING:-0}" == "1" ]] || return 0
+  # WSL2 memory is elastic (the VM reclaims RAM back to Windows), so a hard hold
+  # on an "undersized" WSL VM is more likely a false alarm than a real block. The
+  # advisory above already printed (now .wslconfig-correct); skip only the hold.
+  _is_wsl && return 0
   _is_interactive || return 0
   [[ "${CLEAT_NO_DOCKER_GATE:-}" == "1" ]] && return 0
 
@@ -7494,6 +7606,216 @@ _maybe_gate_on_docker_config() {
   local _ack=""
   read -r _ack || true
   echo ""
+  return 0
+}
+
+# ── Disk-fill advisory + gate (cross-OS) ─────────────────────────────────────
+# The MECHANISM is engine-agnostic: `df` runs inside the box (always Linux) and
+# reads the shared docker storage. Only the guidance COPY branches per backend.
+
+# True when the active docker endpoint is REMOTE (ssh:// or tcp:// to a non-local
+# host), where we cannot advise on a local host disk. Local iff empty, a unix
+# socket, or a Windows named pipe. Seam.
+_docker_endpoint_is_remote() {
+  local ep; ep="$(_docker_context_endpoint)"
+  case "$ep" in
+    ""|unix://*|npipe://*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# The daemon's data-root (native /var/lib/docker, rootless ~/.local/share/docker,
+# etc.), resolved live so the copy names the real path. Falls back to the common
+# default. Seam.
+_docker_root_dir() {
+  local d
+  d="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+  [[ -n "$d" ]] && printf '%s' "$d" || printf '/var/lib/docker'
+}
+
+# Read the shared Docker storage fill from inside a RUNNING box: prints
+# "<use_pct> <avail_kb>" or nothing on any failure. `df -kP /` reports the
+# container overlay's backing store, which IS the shared docker storage on every
+# engine (the VM disk on VM engines, the host data-root on native Linux).
+# `/workspace` would report the HOST disk (a different number) so we use `/`.
+# `-kP` forces 1024-byte POSIX blocks and one data row. Fail-soft: a stopped or
+# unreadable box, or a down daemon, yields empty output. Seam (test override).
+_read_container_disk_use() {
+  local cname="$1"
+  [[ -n "$cname" ]] || return 0
+  docker exec "$cname" df -kP / 2>/dev/null \
+    | awk '$NF=="/" { p=$5; gsub(/%/,"",p); print p" "$4 }' || true
+}
+
+# The disk-help LEVER branch for the current backend (daemon is UP when this
+# runs): desktop | orbstack | colima | wsl | linux-host | generic.
+# _is_docker_desktop (a docker info read) wins first so an OrbStack daemon on a
+# Mac that also has Docker Desktop installed never inherits the Desktop slider.
+# WSL in-distro is its OWN kind (its vhdx grows and does not auto-shrink, unlike
+# native Linux where deletes free space immediately). A remote endpoint has no
+# local host to advise on -> generic. Seam.
+_disk_help_kind() {
+  # WSL first: an in-distro or Docker-Desktop-WSL2 store is a vhdx compacted via
+  # `wsl`, never a Desktop disk slider, so a WSL2 + Docker Desktop host must NOT
+  # inherit the desktop lever (it would name a slider that backend has removed).
+  _is_wsl && { echo wsl; return 0; }
+  _is_docker_desktop 2>/dev/null && { echo desktop; return 0; }
+  if _is_macos; then
+    case "$(_autostart_pick 2>/dev/null)" in
+      orbstack)        echo orbstack ;;
+      colima|colima:*) echo colima ;;
+      *)               echo generic ;;
+    esac
+    return 0
+  fi
+  _docker_endpoint_is_remote && { echo generic; return 0; }
+  echo linux-host
+}
+
+# The banner subject phrase for a kind ("<phrase> is 96% full"). Neutral about
+# auto-shrink (that differs per engine and lives in the lever).
+_disk_subject() {
+  case "$1" in
+    wsl)        printf 'The WSL distro disk' ;;
+    linux-host) printf 'The host disk' ;;
+    generic)    printf "Docker's disk" ;;
+    *)          printf 'The Docker VM disk' ;;
+  esac
+}
+
+# One concise, engine-correct lever line (DIM/BOLD formatted), reused by the
+# advisory, the gate banner, and the ENOSPC backstop. Every branch stays honest
+# about how THIS backend returns host space.
+_disk_lever_short() {
+  case "$1" in
+    desktop)
+      echo -e "    ${DIM}Docker Desktop: reclaim with ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}, or raise the disk-size slider in ${RESET}${BOLD}Settings → Resources → Advanced${RESET}${DIM}.${RESET}" ;;
+    orbstack)
+      echo -e "    ${DIM}OrbStack has no size slider. Free the Mac or run ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}. OrbStack usually returns the space. A restart reclaims it if not.${RESET}" ;;
+    colima)
+      echo -e "    ${DIM}Colima: grow the VM disk with ${RESET}${BOLD}colima start --disk <N>${RESET}${DIM} then restart (add ${RESET}${BOLD}-p <profile>${RESET}${DIM} for a named profile), or reclaim with ${RESET}${BOLD}colima ssh -- sudo fstrim -a${RESET}${DIM}.${RESET}" ;;
+    wsl)
+      echo -e "    ${DIM}WSL: free space, then shrink the distro disk with ${RESET}${BOLD}wsl --manage ${WSL_DISTRO_NAME:-<distro>} --set-sparse true${RESET}${DIM} (reclaims on a later WSL shutdown).${RESET}" ;;
+    linux-host)
+      echo -e "    ${DIM}Linux: ${RESET}${BOLD}cleat prune --cache${RESET}${DIM} frees the host disk immediately, or grow the partition holding ${RESET}${BOLD}$(_docker_root_dir)${RESET}${DIM}.${RESET}" ;;
+    *)
+      echo -e "    ${DIM}Free space with ${RESET}${BOLD}cleat prune --cache${RESET}${DIM}. Inspect with ${RESET}${BOLD}docker system df${RESET}${DIM}.${RESET}" ;;
+  esac
+}
+
+# ENOSPC backstop: when a docker bring-up error is an out-of-space error, name
+# the full store and print the engine-correct lever. The disk gate cannot read
+# fill when the box will not start, so this covers the "too full to bring up"
+# case. Callable and testable in isolation. Fail-soft: no file or no match is
+# silent, always returns 0. Arg: $1 = the captured docker stderr file.
+_maybe_explain_enospc() {
+  local errfile="$1"
+  [[ -s "$errfile" ]] || return 0
+  grep -qiE 'no space left|ENOSPC' "$errfile" 2>/dev/null || return 0
+  local dk; dk="$(_disk_help_kind)"
+  echo ""
+  warn "$(_disk_subject "$dk") is full, so the box could not start."
+  _disk_lever_short "$dk"
+}
+
+# Post-bring-up disk-fill check (called from cmd_start/cmd_resume/cmd_claude
+# right after _print_summary_block, before exec_claude). Reads the shared Docker
+# storage Use%+free from inside the just-started box and, in two tiers, prints a
+# read-only advisory (>= _DISK_ADVISORY_PCT AND low free) or a full-width amber
+# banner that HOLDS the launch on one keypress (>= _DISK_GATE_PCT AND lower
+# free). Cap-relative Use%, so a 60 GB and a 1.8 TB disk trip at the same
+# fullness. Fail-soft: off a TTY, on an unreadable fill, or a down daemon it
+# stays silent. Always returns 0 (runs bare under set -euo pipefail).
+_maybe_gate_on_disk_fill() {
+  local cname="$1"
+  _is_tty || return 0
+  [[ -n "$cname" ]] || return 0
+
+  local read_out pct avail_kb free_gb
+  read_out="$(_read_container_disk_use "$cname")"
+  pct="${read_out%% *}"
+  avail_kb="${read_out##* }"
+  [[ "$pct" =~ ^[0-9]+$ && "$avail_kb" =~ ^[0-9]+$ ]] || return 0
+  free_gb=$(( avail_kb / 1048576 ))
+
+  # Advisory predicate: high fill AND genuinely low free. The free floor removes
+  # the 95%-of-1.8-TB = 90-GB-free false positive (it can only ever REMOVE a
+  # trigger). Below the band: silence.
+  (( pct >= _DISK_ADVISORY_PCT && free_gb < _DISK_ADVISORY_FREE_GB )) || return 0
+
+  local gate=false
+  (( pct >= _DISK_GATE_PCT && free_gb < _DISK_GATE_FREE_GB )) && gate=true
+
+  local kind subject
+  kind="$(_disk_help_kind)"
+  subject="$(_disk_subject "$kind")"
+
+  # Cleat's OWN reclaimable images only (label-scoped, container-pinned excluded).
+  # Honest by construction: never includes build cache or volumes (shared).
+  local stats mb reclaim_gb=0
+  stats="$(_cleat_prunable_stats)"
+  mb="${stats##*	}"
+  [[ "$mb" =~ ^[0-9]+$ ]] && reclaim_gb=$(( (mb + 512) / 1024 ))
+
+  if ! $gate; then
+    # ADVISORY band: read-only, daily-throttled with its OWN stamp (the memory
+    # check already stamped PRESSURE_CHECK_FILE this run).
+    local now last=0
+    now="$(date +%s)"
+    if [[ -f "$DISK_CHECK_FILE" ]]; then
+      last="$(head -1 "$DISK_CHECK_FILE" 2>/dev/null || echo 0)"
+      [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    fi
+    (( now - last < DISK_CHECK_INTERVAL )) && return 0
+    echo "$now" > "$DISK_CHECK_FILE" 2>/dev/null || true
+
+    echo ""
+    warn "${subject} is ${BOLD}${pct}% full${RESET} ${DIM}(${free_gb} GB free)${RESET}. Every Cleat box shares it."
+    if (( reclaim_gb >= 1 )); then
+      echo -e "    ${DIM}Cleat can reclaim ~${reclaim_gb} GB of stale images: ${RESET}${BOLD}cleat prune${RESET}"
+    fi
+    echo -e "    ${DIM}What is using the disk: ${RESET}${BOLD}cleat storage${RESET}"
+    _disk_lever_short "$kind"
+    return 0
+  fi
+
+  # HARD band: full-width amber banner + one-keypress hold. The banner IS the
+  # escalated advisory (same substance plus the keypress), never printed on top
+  # of the compact advisory.
+  local rule
+  if _has_unicode; then
+    rule="────────────────────────────────────────────────"
+  else
+    rule="================================================"
+  fi
+  echo ""
+  echo -e "  ${AMBER}${BOLD}${rule}${RESET}"
+  echo -e "  ${AMBER}${BOLD}  Docker's disk is almost full${RESET}"
+  echo -e "  ${AMBER}${BOLD}${rule}${RESET}"
+  echo ""
+  echo -e "  ${AMBER}!${RESET} ${BOLD}${subject} is ${pct}% full (${free_gb} GB free).${RESET} Writes across every Cleat box are about to fail."
+  echo -e "    ${DIM}Every box shares this one disk, so one full disk stops them all.${RESET}"
+  echo ""
+  if (( reclaim_gb >= 1 )); then
+    echo -e "    ${DIM}Cleat can reclaim ~${reclaim_gb} GB of stale images: ${RESET}${BOLD}cleat prune${RESET}"
+  else
+    echo -e "    ${DIM}Cleat's own images are not the bulk here. Most of the space is other projects or build cache.${RESET}"
+  fi
+  echo -e "    ${DIM}What is using the disk: ${RESET}${BOLD}cleat storage${RESET}"
+  _disk_lever_short "$kind"
+  echo ""
+
+  # The hold: interactive-only and escapable, mirroring the config gate. The box
+  # is ALREADY running here (we just read its df), so Ctrl-C does NOT stop it:
+  # the copy says so truthfully instead of the config gate's "Ctrl-C to stop".
+  if _is_interactive && [[ "${CLEAT_NO_DISK_GATE:-}" != "1" ]]; then
+    echo -e "    ${DIM}To skip this stop from now on: ${RESET}${BOLD}CLEAT_NO_DISK_GATE=1${RESET}${DIM}.${RESET}"
+    echo -e "    ${DIM}Ctrl-C stops here but leaves the box running. Free disk, then run cleat again.${RESET}"
+    echo ""
+    echo -en "  ${BLUE}▸${RESET} Press ${BOLD}Enter${RESET} to continue into the session, or ${BOLD}Ctrl-C${RESET} to stop "
+    local _ack=""
+    read -r _ack || true
+  fi
   return 0
 }
 
@@ -7540,7 +7862,8 @@ cmd_clean() {
 
 cmd_nuke() {
   echo ""
-  warn "This will remove ${BOLD}ALL${RESET} Cleat containers, images, and volumes."
+  warn "This will remove ${BOLD}ALL${RESET} Cleat containers and images."
+  echo -e "  ${DIM}It also clears the shared Docker build cache used by all projects (regenerable).${RESET}"
   echo -e "  ${DIM}Your project files and ~/.claude auth are safe (they live on the host).${RESET}"
   echo ""
   read -rp "  Type 'nuke' to confirm: " confirm
@@ -7587,19 +7910,146 @@ cmd_nuke() {
     rm -rf "$CLEAT_KITS_DIR" 2>/dev/null || true
   fi
 
-  local dangling
-  dangling=$(docker images -f "dangling=true" -q 2>/dev/null)
-  if [[ -n "$dangling" ]]; then
-    info "Pruning dangling images..."
-    docker image prune -f > /dev/null 2>&1
+  # Dangling cleat builds only (label-scoped): other projects' dangling images
+  # are not ours to delete. Same _dangling_cleat_images seam cmd_prune uses.
+  local _did id
+  _did="$(_dangling_cleat_images)"
+  if [[ -n "$_did" ]]; then
+    info "Pruning dangling cleat images..."
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      docker rmi "$id" > /dev/null 2>&1 || true
+    done <<< "$_did"
   fi
 
-  info "Pruning build cache..."
+  info "Pruning build cache ${DIM}(shared across all Docker projects)${RESET}..."
   docker builder prune -f > /dev/null 2>&1 || true
 
   echo ""
-  success "Nuked. Everything Cleat-related is gone from Docker."
+  success "Nuked. All Cleat containers and images are gone from Docker."
   echo -e "  ${DIM}Run ${BOLD}cleat start${RESET}${DIM} to rebuild from scratch.${RESET}"
+  echo ""
+}
+
+# Format a byte count as GB for display ("12.3 GB", or "36 GB" when >= 10).
+_fmt_gb() {
+  LC_ALL=C awk -v b="${1:-0}" 'BEGIN { g = b / 1073741824; printf (g >= 10 ? "%.0f GB" : "%.1f GB"), g }'
+}
+
+# Fill of the shared docker store as "used_kb total_kb pct", read from a running
+# cleat box first, else a one-shot on cleat's OWN image (never a foreign
+# container: reading into another project's box crosses the boundary cleat
+# defends). Empty when neither is available. Seam (test override).
+_storage_fill() {
+  local cname
+  cname="$(_running_cleat_boxes 2>/dev/null | head -1)"
+  if [[ -n "$cname" ]]; then
+    docker exec "$cname" df -kP / 2>/dev/null \
+      | awk '$NF=="/" { p=$5; gsub(/%/,"",p); print $3" "$2" "p }' || true
+    return 0
+  fi
+  if image_exists 2>/dev/null; then
+    docker run --rm --entrypoint df "$IMAGE_NAME" -kP / 2>/dev/null \
+      | awk '$NF=="/" { p=$5; gsub(/%/,"",p); print $3" "$2" "p }' || true
+  fi
+}
+
+# `cleat storage`: a read-only, cross-OS breakdown of the shared Docker store.
+# Honest attribution: cleat IMAGES + BOXES are label-scoped (attributable);
+# build cache and volumes are shared/other-project (never called "cleat's").
+# Never mutates: docker system df is on-demand here, never on the start path.
+cmd_storage() {
+  if ! _daemon_up; then
+    error "Docker is not running."
+    echo -e "  ${DIM}Start it, then run ${RESET}${BOLD}cleat storage${RESET}${DIM} again.${RESET}"
+    return 1
+  fi
+
+  local kind; kind="$(_disk_help_kind)"
+
+  echo ""
+  echo -e "  ${BOLD}Docker storage${RESET}   ${DIM}one shared store, used by every container on this host${RESET}"
+  echo ""
+
+  # Fill bar (the cap-relative number the field incident proved matters).
+  local fill used_kb total_kb pct
+  fill="$(_storage_fill)"
+  if [[ -n "$fill" ]]; then
+    used_kb="${fill%% *}"
+    total_kb="$(printf '%s' "$fill" | awk '{print $2}')"
+    pct="${fill##* }"
+    [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
+    [[ "$used_kb" =~ ^[0-9]+$ ]] || used_kb=0
+    [[ "$total_kb" =~ ^[0-9]+$ ]] || total_kb=0
+    local barw=28 filled empty gl gd bar="" bar2="" i=0 tier
+    filled=$(( pct * barw / 100 ))
+    (( filled > barw )) && filled=barw
+    (( filled < 0 )) && filled=0
+    empty=$(( barw - filled ))
+    if _has_unicode; then gl="█"; gd="░"; else gl="#"; gd="-"; fi
+    while (( i < filled )); do bar="${bar}${gl}"; i=$(( i + 1 )); done
+    i=0
+    while (( i < empty )); do bar2="${bar2}${gd}"; i=$(( i + 1 )); done
+    if   (( pct >= _DISK_GATE_PCT ));     then tier="$RED"
+    elif (( pct >= _DISK_ADVISORY_PCT )); then tier="$AMBER"
+    else tier="$GREEN"; fi
+    echo -e "  ${BLUE}▸${RESET} ${BOLD}Disk${RESET}   ${tier}${bar}${RESET}${DIM}${bar2}${RESET}   ${BOLD}$(_fmt_gb $(( used_kb * 1024 )))${RESET} ${DIM}/ $(_fmt_gb $(( total_kb * 1024 )))${RESET}   ${BOLD}${pct}% full${RESET}"
+  else
+    echo -e "  ${BLUE}▸${RESET} ${BOLD}Disk${RESET}   ${DIM}(start a box to read live fill: ${RESET}${BOLD}cleat start${RESET}${DIM})${RESET}"
+  fi
+  echo ""
+
+  # Authoritative per-type totals from docker system df (on-demand, never on
+  # start). Value-only fields, so the " (NN%)" reclaimable suffix stays parseable.
+  local t s r
+  local img_b=0 img_rb=0 con_b=0 con_rb=0 vol_b=0 vol_rb=0 cache_b=0 cache_rb=0
+  while IFS="$(printf '\t')" read -r t s r; do
+    case "$t" in
+      Images)          img_b="$(_human_size_to_bytes "$s")";   img_rb="$(_human_size_to_bytes "$r")" ;;
+      Containers)      con_b="$(_human_size_to_bytes "$s")";   con_rb="$(_human_size_to_bytes "$r")" ;;
+      "Local Volumes") vol_b="$(_human_size_to_bytes "$s")";   vol_rb="$(_human_size_to_bytes "$r")" ;;
+      "Build Cache")   cache_b="$(_human_size_to_bytes "$s")"; cache_rb="$(_human_size_to_bytes "$r")" ;;
+    esac
+  done < <(docker system df --format "{{.Type}}$(printf '\t'){{.Size}}$(printf '\t'){{.Reclaimable}}" 2>/dev/null)
+
+  echo -e "  ${BOLD}On disk${RESET} ${DIM}(all projects)${RESET}"
+  printf "    %-20s %9s   %11s\n" "" "size" "reclaimable"
+  printf "    %-20s %9s   %11s\n" "Images"     "$(_fmt_gb "$img_b")"   "$(_fmt_gb "$img_rb")"
+  printf "    %-20s %9s   %11s\n" "Containers" "$(_fmt_gb "$con_b")"   "$(_fmt_gb "$con_rb")"
+  printf "    %-20s %9s   %11s\n" "Volumes"    "$(_fmt_gb "$vol_b")"   "$(_fmt_gb "$vol_rb")"
+  printf "    %-20s %9s   %11s\n" "Build cache (shared)" "$(_fmt_gb "$cache_b")" "$(_fmt_gb "$cache_rb")"
+  echo ""
+
+  # Cleat's attributable share: COUNTS (a byte sum of {{.Size}} would double-count
+  # shared base layers, so we show counts plus the accurate reclaimable figure).
+  local cleat_img_n=0 cleat_box_n=0 id seen=" "
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    case "$seen" in *" $id "*) continue ;; esac
+    seen="$seen$id "
+    cleat_img_n=$(( cleat_img_n + 1 ))
+  done < <(docker images --filter label=sh.cleat.version --format '{{.ID}}' 2>/dev/null)
+  local nm
+  while IFS= read -r nm; do
+    [[ -n "$nm" ]] && cleat_box_n=$(( cleat_box_n + 1 ))
+  done < <(docker ps -a --filter label=sh.cleat.version --format '{{.Names}}' 2>/dev/null)
+
+  # Cleat's reclaimable images (accurate, label-scoped, container-pinned excluded).
+  local stats mb cleat_reclaim_b=0
+  stats="$(_cleat_prunable_stats)"
+  mb="${stats##*	}"
+  [[ "$mb" =~ ^[0-9]+$ ]] && cleat_reclaim_b=$(( mb * 1048576 ))
+
+  echo -e "  ${BOLD}Cleat's share${RESET}"
+  printf "    %-20s %2s image%s, %s box%s\n" "" "$cleat_img_n" "$( (( cleat_img_n != 1 )) && printf s )" "$cleat_box_n" "$( (( cleat_box_n != 1 )) && printf es )"
+  echo ""
+  echo -e "  ${BOLD}Cleat can reclaim${RESET}"
+  echo -e "    ${GREEN}$(_fmt_gb "$cleat_reclaim_b")${RESET}   ${DIM}stale cleat images${RESET}      ${BOLD}cleat prune${RESET}"
+  echo -e "    ${DIM}$(_fmt_gb "$cache_rb")${RESET}   ${DIM}shared build cache${RESET}     ${BOLD}cleat prune --cache${RESET} ${DIM}(all projects)${RESET}"
+  echo ""
+  echo -e "  ${DIM}Other projects hold the rest. Cleat never deletes them. See ${RESET}${BOLD}docker system df${RESET}${DIM}.${RESET}"
+  echo ""
+  _disk_lever_short "$kind"
   echo ""
 }
 
@@ -9483,15 +9933,16 @@ cmd_help() {
   echo -e "    ${GREEN}stop${RESET}    ${DIM}[box]${RESET}      Stop container (keeps it for resume)"
   echo -e "    ${GREEN}rm${RESET}      ${DIM}[box]${RESET}      Stop + remove container permanently"
   echo -e "    ${GREEN}stop-all${RESET}           Stop all Cleat containers"
-  echo -e "    ${GREEN}prune${RESET}              Remove stale cleat images ${DIM}(old builds, superseded pulls; boxes untouched)${RESET}"
+  echo -e "    ${GREEN}prune${RESET} ${DIM}[--cache]${RESET}    Remove stale cleat images ${DIM}(--cache clears the shared build cache too)${RESET}"
   echo -e "    ${GREEN}clean${RESET}              Stop everything + remove image"
-  echo -e "    ${RED}nuke${RESET}               Remove ALL containers, images, and build cache"
+  echo -e "    ${RED}nuke${RESET}               Remove ALL Cleat containers + images + shared build cache"
   echo ""
   echo -e "  ${BOLD}CAPABILITIES${RESET}"
-  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET}        Interactive wizard ${DIM}(no box = global; box = .cleat.<box>)${RESET}"
-  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --list       List effective capabilities"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET}        .cleat editor: capabilities + resources ${DIM}(no box = global; box = .cleat.<box>)${RESET}"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --list       List capabilities and resources (memory, cpus)"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --enable ${DIM}<cap>${RESET}   Enable a capability"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --disable ${DIM}<cap>${RESET}  Disable a capability"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --memory ${DIM}<size>${RESET}${DIM} / ${RESET}--cpus ${DIM}<n>${RESET}  Set a resource limit directly"
   echo -e "    ${GREEN}setup${RESET} ${DIM}[box]${RESET}         Run this project's [setup] provisioning now"
   echo -e "    ${GREEN}setup${RESET} ${DIM}[box]${RESET} --show  Preview the payload, trust & marker state"
   echo ""
@@ -9511,6 +9962,7 @@ cmd_help() {
   echo -e "  ${BOLD}INFO${RESET}"
   echo -e "    ${GREEN}status${RESET}             Show this project's boxes, auth & caps"
   echo -e "    ${GREEN}ps${RESET}                 List all Cleat containers (running & stopped)"
+  echo -e "    ${GREEN}storage${RESET}            Show Docker disk usage ${DIM}(cleat vs shared vs other projects)${RESET}"
   echo -e "    ${GREEN}describe${RESET} ${DIM}[box] [text]${RESET}  Show or set a box's description"
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
@@ -9670,6 +10122,7 @@ main() {
     claude)    _set_box "$@"; cmd_claude ;;
     logs)      _set_box "$@"; cmd_logs ;;
     ps)        cmd_ps "$@" ;;
+    storage)   cmd_storage "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;

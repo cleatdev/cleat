@@ -44,6 +44,33 @@ teardown() { _common_teardown; }
   assert_output --partial "Enter"
 }
 
+@test "gate: WSL2 downgrades the hold (elastic VM memory, advisory printed above)" {
+  # WSL2 memory is elastic, so a hard hold on an "undersized" WSL VM is a likely
+  # false alarm. The .wslconfig-correct advisory already printed; skip only the hold.
+  _is_interactive() { return 0; }
+  _is_wsl() { return 0; }
+  _DOCKER_GATE_PENDING=1
+  _DOCKER_GATE_SUMMARY="Docker VM memory is 8 GB (aim for 16 GB)."
+  run _maybe_gate_on_docker_config <<< ""
+  assert_success
+  refute_output --partial "Docker is not tuned for Cleat"
+}
+
+@test "vm fix: WSL names .wslconfig, not the Docker Desktop slider" {
+  _is_wsl() { return 0; }
+  run _print_docker_vm_fix 17179869184 16
+  assert_output --partial ".wslconfig"
+  assert_output --partial "wsl --shutdown"
+  refute_output --partial "Settings"
+}
+
+@test "vm fix: non-WSL names the Docker Desktop Settings slider" {
+  _is_wsl() { return 1; }
+  run _print_docker_vm_fix 17179869184 16
+  assert_output --partial "Settings"
+  refute_output --partial ".wslconfig"
+}
+
 @test "gate: NON-interactive never blocks even when armed (the walk-away pillar)" {
   # This is the load-bearing guarantee: cron / a pipe / CI must sail straight
   # through, so the gate keys off _is_interactive (stdin AND stdout a terminal),

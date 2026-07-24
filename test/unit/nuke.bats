@@ -52,3 +52,19 @@ _run_nuke_with_input() {
   assert_output --partial "safe"
   assert_output --partial "cleat start"
 }
+
+@test "nuke: no global 'docker image prune'; build cache still cleared" {
+  mock_docker_ps_a "cleat-foo-abc12345"
+  mock_docker_images "cleat"
+  _run_nuke_with_input "nuke"
+  assert_success
+  run docker_calls
+  refute_output --partial "docker image prune"
+  assert_output --partial "docker builder prune -f"
+}
+
+@test "nuke: confirm discloses the shared build cache and drops the false volumes claim" {
+  _run_nuke_with_input "no"
+  refute_output --partial "and volumes"
+  assert_output --partial "shared Docker build cache"
+}

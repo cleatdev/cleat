@@ -188,6 +188,30 @@ cleat_bin_timeout() {
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat storage with no boxes exits cleanly" {
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf '' > "$DOCKER_MOCK_DIR/images_output"
+  run cleat_bin storage
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Docker storage"
+}
+
+@test "smoke: cleat storage exits with a friendly error when the daemon is down" {
+  export DOCKER_EXIT_CODE=1
+  run cleat_bin storage
+  refute_output --partial "unbound variable"
+  assert_output --partial "not running"
+}
+
+@test "smoke: cleat prune --cache --yes runs non-interactively without crashing" {
+  printf '' > "$DOCKER_MOCK_DIR/images_output"
+  run cleat_bin prune --cache --yes
+  assert_success
+  refute_output --partial "unbound variable"
+}
+
 # ── config ──────────────────────────────────────────────────────────────────
 
 @test "smoke: cleat config --list exits cleanly on fresh config" {

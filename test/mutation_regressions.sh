@@ -58,6 +58,10 @@ HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 PROVISION_BATS="$REPO_ROOT/test/unit/provision.bats"
 DOCKER_GATE_BATS="$REPO_ROOT/test/unit/docker_gate.bats"
 CONFIG_BATS="$REPO_ROOT/test/unit/config.bats"
+NUKE_BATS="$REPO_ROOT/test/unit/nuke.bats"
+HUMAN_SIZE_BATS="$REPO_ROOT/test/unit/human_size.bats"
+DISK_GATE_BATS="$REPO_ROOT/test/unit/disk_gate.bats"
+STORAGE_BATS="$REPO_ROOT/test/unit/storage.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -3217,6 +3221,136 @@ cat > "$SED_TMP" << 'SED'
 /^_image_id_of()/,/^}$/ s@{{.Id}}@{{.Size}}@
 SED
 try "vnext_prune_image_id_field" "_image_id_of resolves a ref via" "$CLI" "$PRUNE_BATS"
+
+# SHARED SIZE PARSER. Every reclaimable number flows through h2b(). Break the GB
+# multiplier and "36.34GB" no longer resolves to its byte count: the parser
+# fixture fails. (The %.0f and LC_ALL=C guards are platform-specific and are
+# covered by dedicated skip-guarded tests, not this both-legs mutation set.)
+cat > "$SED_TMP" << 'SED'
+s@m = 1073741824@m = 1@
+SED
+try "vnext_size_parser_gb_multiplier" "bare GB" "$CLI" "$HUMAN_SIZE_BATS"
+
+# DISK GATE THRESHOLD. Push the hard-gate percent out of reach and a 96%-full
+# disk no longer holds the launch (it falls back to the advisory), so the
+# "fires the amber banner" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_DISK_GATE_PCT=95@_DISK_GATE_PCT=200@
+SED
+try "vnext_disk_gate_pct" "fires the amber banner" "$CLI" "$DISK_GATE_BATS"
+
+# DISK ADVISORY THRESHOLD. Push the advisory percent out of reach and the 88%
+# band goes silent, so the "fires in the 85-94 band" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_DISK_ADVISORY_PCT=85@_DISK_ADVISORY_PCT=200@
+SED
+try "vnext_disk_advisory_pct" "fires in the 85-94 band" "$CLI" "$DISK_GATE_BATS"
+
+# DISK LOW-FREE FLOOR. Raise the advisory free floor to infinity and a high pct
+# with lots of free space fires anyway: the "low-free floor suppresses" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_DISK_ADVISORY_FREE_GB=25@_DISK_ADVISORY_FREE_GB=100000@
+SED
+try "vnext_disk_advisory_free_floor" "the low-free floor suppresses a high pct with lots free" "$CLI" "$DISK_GATE_BATS"
+
+# WSL IS A THIRD DISK CATEGORY. Disable the WSL carve-out and an in-distro WSL
+# engine falls into the native-Linux branch, so the "WSL in-distro is its own
+# kind" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_is_wsl && { echo wsl@false \&\& { echo wsl@
+SED
+try "vnext_disk_kind_wsl" "WSL in-distro is its own kind" "$CLI" "$DISK_GATE_BATS"
+
+# PRUNE --CACHE RECLAIM. Drop the build-cache reclaim call and --cache no longer
+# runs `docker builder prune`, so the "clears the shared build cache" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_prune_build_cache "\$assume_yes"@:@
+SED
+try "vnext_prune_cache_call" "clears the shared build cache after a yes" "$CLI" "$PRUNE_BATS"
+
+# PRUNE --CACHE DEFAULT-NO. Neutralize the No branch and a declined prompt prunes
+# anyway (the global default-yes trap this design forbids), so the "default No
+# leaves the cache untouched" test fails.
+cat > "$SED_TMP" << 'SED'
+s@info "Left the build cache in place."; return 0@:@
+SED
+try "vnext_prune_cache_default_no" "default No leaves the cache untouched" "$CLI" "$PRUNE_BATS"
+
+# NUKE BUILD CACHE. Remove nuke's build-cache sweep and the "build cache still
+# cleared" test fails (the narrowed dangling-image loop stays, but the shared
+# cache is no longer reclaimed).
+cat > "$SED_TMP" << 'SED'
+s@docker builder prune -f > /dev/null 2>&1 || true@:@
+SED
+try "vnext_nuke_build_cache" "build cache still cleared" "$CLI" "$NUKE_BATS"
+
+# STORAGE IMAGE DEDUP. Stop accumulating the seen-id set and a multi-tagged image
+# is counted per tag, so the "counts cleat images deduped by id" test fails.
+cat > "$SED_TMP" << 'SED'
+s@seen="\$seen\$id "@:@
+SED
+try "vnext_storage_dedup" "counts cleat images deduped by id" "$CLI" "$STORAGE_BATS"
+
+# STORAGE FILL PARSE. The real _storage_fill awk (used=$3 total=$2 pct=$5) is seam-
+# overridden in most tests; the real-seam test pins it. Swap the used/total fields
+# and the "real seam parses" test fails.
+cat > "$SED_TMP" << 'SED'
+s@print \$3" "\$2" "p@print \$2" "\$3" "p@
+SED
+try "vnext_storage_fill_fields" "storage fill: real seam parses" "$CLI" "$STORAGE_BATS"
+
+# ENOSPC BACKSTOP. Break the out-of-space match and a full-store bring-up failure
+# gets no friendly guidance: the "explains a full-store bring-up failure" test fails.
+cat > "$SED_TMP" << 'SED'
+s@no space left|ENOSPC@NEVER_MATCH_SENTINEL@
+SED
+try "vnext_enospc_backstop" "explains a full-store bring-up failure" "$CLI" "$DISK_GATE_BATS"
+
+# DISK READ AVAIL FIELD. _read_container_disk_use must emit avail ($4), not used
+# ($3), or the free-GB gate math is wrong. The "parses Use% and avail" test fails.
+cat > "$SED_TMP" << 'SED'
+s@print p" "\$4@print p" "\$3@
+SED
+try "vnext_disk_read_avail_field" "parses Use% and avail from the root row" "$CLI" "$DISK_GATE_BATS"
+
+# DISK GATE FREE FLOOR. Raise the gate free floor out of reach and a 96%-full disk
+# with 20 GB free (safe) holds the launch: the "advisory-only, not a hold" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_DISK_GATE_FREE_GB=10@_DISK_GATE_FREE_GB=100000@
+SED
+try "vnext_disk_gate_free_floor" "96% with 20 GB free is advisory-only, not a hold" "$CLI" "$DISK_GATE_BATS"
+
+# WSL DISK KIND ORDER. WSL must be classified BEFORE Docker Desktop (its store is a
+# vhdx, not a Desktop slider). Drop the return so WSL+DD falls through to desktop:
+# the "WSL wins even under Docker Desktop" test fails.
+cat > "$SED_TMP" << 'SED'
+s@_is_wsl && { echo wsl; return 0; }@_is_wsl \&\& { echo wsl; }@
+SED
+try "vnext_disk_kind_wsl_order" "WSL wins even under Docker Desktop" "$CLI" "$DISK_GATE_BATS"
+
+# WSL MEMORY-GATE DOWNGRADE. WSL2 memory is elastic, so the config gate must NOT
+# hold there. Delete the downgrade and the WSL launch holds: the "WSL2 downgrades
+# the hold" test fails.
+cat > "$SED_TMP" << 'SED'
+/_is_wsl && return 0/d
+SED
+try "vnext_wsl_gate_downgrade" "WSL2 downgrades the hold" "$CLI" "$DOCKER_GATE_BATS"
+
+# WSL VM-FIX COPY. On WSL the memory fix is .wslconfig, not the Settings slider.
+# Disable the WSL branch (scoped to the function) and it prints the wrong slider:
+# the "wslconfig, not" test fails.
+cat > "$SED_TMP" << 'SED'
+/^_print_docker_vm_fix()/,/^}$/ s@if _is_wsl; then@if false; then@
+SED
+try "vnext_wsl_vm_fix_copy" "wslconfig, not" "$CLI" "$DOCKER_GATE_BATS"
+
+# PRUNE --CACHE 0B. A 0B reclaim must report "No reclaimable build cache", not a
+# "Reclaimed 0B" success. Drop the 0B guard and the "reports no reclaimable cache"
+# test fails.
+cat > "$SED_TMP" << 'SED'
+s@ && "\$reclaimed" != "0B"@@
+SED
+try "vnext_prune_cache_zero" "0B reclaimed reports no reclaimable cache" "$CLI" "$PRUNE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

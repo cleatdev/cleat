@@ -342,7 +342,10 @@ run `cleat rm && cleat`.
 | `cleat rebuild` | Force rebuild the image from scratch |
 | `cleat upgrade-claude [stable\|latest\|VERSION]` | Update the bundled Claude Code in place (default `latest`). Offers to recreate the current container |
 | `cleat clean` | Stop everything and remove the image |
-| `cleat nuke` | Remove **all** containers, images and build cache |
+| `cleat prune` | Remove stale cleat images (boxes and other projects untouched) |
+| `cleat prune --cache` | Also clear the shared Docker build cache (regenerable, all projects). Typed flag + default-No confirm |
+| `cleat storage` | Read-only Docker disk breakdown: fill bar, cleat vs shared vs other projects |
+| `cleat nuke` | Remove **all** Cleat containers and images, plus the shared build cache |
 
 #### Capabilities
 | Command | Description |
@@ -476,6 +479,8 @@ Images are published multi-arch (amd64 + arm64): Apple Silicon runs natively, ne
 Closing a terminal ends the session but leaves the box running, still reserving its memory ceiling. On every interactive start, Cleat stops other idle boxes that are safe to stop (detached, no agent running, idle past a 30-minute grace) and tells you what it freed. A box working unattended (terminal left open, agent still running) is never touched. Disable with `CLEAT_NO_IDLE_SWEEP=1`. Tune the grace with `CLEAT_IDLE_GRACE_MINS`.
 
 If your Docker VM memory is set too low, or swap is left at the default, Cleat **holds the launch** on a prominent amber banner and waits for you to press Enter, instead of letting the warning scroll past unread into Claude's TUI. It fires only on a genuine config problem (never the transient overload notice) and only on a real interactive terminal, so cron, pipes and CI never block. Press Enter to launch anyway, Ctrl-C to go fix Docker, or set `CLEAT_NO_DOCKER_GATE=1` to keep the advisory but skip the hold.
+
+Disk is watched the same way. Every box shares one Docker store, so a box that reads 100% full is really the whole store filling up. When it crosses about 85% full with little free space Cleat drops a one-line advisory naming what you can reclaim (`cleat storage` shows the full breakdown, `cleat prune --cache` clears the shared build cache). When it crosses 95% with under 10 GB free it **holds the launch** like the memory gate, with `CLEAT_NO_DISK_GATE=1` to skip the hold. The trigger is the fill percentage, so a 60 GB disk and a 1.8 TB one trip at the same fullness. The fix guidance is written for your engine (Docker Desktop, OrbStack, Colima, native Linux or WSL). If a store is too full for a box to start at all, Cleat catches the out-of-space error and prints the same guidance.
 
 ---
 

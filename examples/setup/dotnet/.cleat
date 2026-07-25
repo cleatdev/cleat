@@ -21,12 +21,22 @@ if [ "$(dpkg --print-architecture)" = "amd64" ]; then
   sudo apt-get update
   sudo apt-get install -y dotnet-sdk-8.0
 else
+  # dotnet-install.sh only unpacks the SDK, it never resolves dependencies, and
+  # the slim base ships no ICU (verified). Without libicu the runtime FailFasts
+  # at startup with exit 134 ("Couldn't find a valid ICU package"), so the
+  # example's own `dotnet --info` would die. The amd64 branch above needs no
+  # such line: apt pulls libicu in as a dotnet-sdk-8.0 dependency.
+  sudo apt-get update
+  sudo apt-get install -y libicu72
   curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
   bash /tmp/dotnet-install.sh --channel 8.0 --install-dir "$HOME/.dotnet"
   rm /tmp/dotnet-install.sh
-  if ! grep -q '.dotnet' "$HOME/.bashrc" 2>/dev/null; then
-    echo 'export PATH="$HOME/.dotnet:$PATH"' >> "$HOME/.bashrc"
-  fi
+  # Expose it by symlinking into ~/.local/bin rather than appending to
+  # ~/.bashrc. The session already runs with ~/.local/bin first on PATH, and a
+  # non-interactive payload never sources an rc file anyway, so the symlink is
+  # both simpler and what actually takes effect. It is also re-runnable: `ln -sf`
+  # replaces an existing link instead of appending a duplicate PATH line.
+  ln -sf "$HOME/.dotnet/dotnet" "$HOME/.local/bin/dotnet"
   export PATH="$HOME/.dotnet:$PATH"
 fi
 dotnet --info

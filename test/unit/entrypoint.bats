@@ -64,6 +64,45 @@ _run_entrypoint() {
   assert_output --partial "/home/coder/.cache"
 }
 
+@test "entrypoint: chowns the shell rc files so a setup payload can put a tool on PATH" {
+  _run_entrypoint
+  assert_success
+  run cat "$CHOWN_LOG"
+  # The rc files come from useradd's skel owned by the build UID (1000) and are
+  # not host-mounted, so before this every host whose UID is not 1000 (i.e.
+  # every macOS host) got EACCES appending to them. Every provisioning tool that
+  # puts itself on PATH does exactly that: rustup amends ~/.profile, the dotnet
+  # install script appends to ~/.bashrc. A [setup] payload runs `bash -e`, so
+  # that EACCES aborted the whole payload. Reproduced in Docker on a 501:20 host.
+  assert_output --partial "/home/coder/.bashrc"
+  assert_output --partial "/home/coder/.profile"
+}
+
+@test "entrypoint: chowns ~/.config so a tool can create its config dir" {
+  _run_entrypoint
+  assert_success
+  run cat "$CHOWN_LOG"
+  # Built as 1000 (the Dockerfile mkdirs .config/gh), not host-mounted at this
+  # level, so `mkdir ~/.config/<tool>` was EACCES after the remap.
+  assert_output --partial "/home/coder/.config"
+}
+
+@test "entrypoint: chowns ~/.config NON-recursively so the gh mount keeps host ownership" {
+  _run_entrypoint
+  assert_success
+  # The gh capability bind-mounts the host's ~/.config/gh over the subdirectory.
+  # A recursive chown would rewrite the ownership of the user's REAL host files,
+  # so the .config chown must never gain -R. Chowning the parent alone is what
+  # lets the runtime user create new entries alongside the mount. This is the
+  # assertion a future "tidy the chowns into one -R" refactor must trip over.
+  local line
+  line="$(grep -- '/home/coder/.config' "$CHOWN_LOG" | head -1)"
+  [[ -n "$line" ]] || { echo "no chown recorded for /home/coder/.config"; return 1; }
+  case "$line" in
+    *-R*) echo "chown of ~/.config is recursive, which rewrites the host's ~/.config/gh: $line"; return 1 ;;
+  esac
+}
+
 @test "entrypoint: clears stale clipboard runtime files before dropping to coder" {
   # v0.13.1: a hard-killed prior session can leave a foreign-owned clip socket in
   # the sticky /tmp (it survives docker stop/start). As root, the entrypoint must

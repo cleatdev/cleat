@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.3.0"
+VERSION="1.3.1"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="1.3.0"
+RELEASE_HIGHLIGHT_VERSION="1.3.1"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -45,7 +45,11 @@ REPO_URL="https://github.com/cleatdev/cleat"
 #   2  base image pinned by digest (reproducible base; see docker/Dockerfile)
 #   3  ENV BROWSER=open shim, so Claude Code 2.1.191+ opens login URLs through
 #      the bridge instead of dropping to the code-paste flow
-_IMAGE_SPEC_VERSION=3
+#   4  entrypoint chowns the shell rc files and ~/.config after the UID remap,
+#      so a [setup] payload can put a toolchain on PATH. Without it every host
+#      whose UID is not 1000 (i.e. every macOS host) hit EACCES on ~/.bashrc,
+#      ~/.profile and mkdir ~/.config/*, which aborts the payload under bash -e
+_IMAGE_SPEC_VERSION=4
 # Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
 # existed, so they carry no spec label): their content is inferred from the
 # version they were built at. v0.16.3 was the LAST docker/ content change before

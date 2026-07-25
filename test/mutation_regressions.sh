@@ -1012,6 +1012,34 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.15.1_entrypoint_cache_chown" "chowns ~/.cache" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
 
+# vnext: the entrypoint must chown the shell rc files after the UID remap, or a
+# [setup] payload that appends to ~/.bashrc or ~/.profile (rustup, the dotnet
+# install script) dies with EACCES under `bash -e` on every non-1000 host.
+# Drop .bashrc from the chown list: the "shell rc files" test must fail.
+# Delete the line outright (a rename to .bashrc-nope would still satisfy a
+# --partial match on the prefix, and the real bug was an ABSENT chown anyway).
+# The remaining continuations stay syntactically valid.
+cat > "$SED_TMP" << 'SED'
+/^  \/home\/coder\/\.bashrc \\$/d
+SED
+try "vnext_entrypoint_rc_chown" "shell rc files" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# vnext: ~/.config must be chowned too, or `mkdir ~/.config/<tool>` is EACCES.
+# Drop just the operand, leaving `... .bash_logout \` + `2>/dev/null || true`,
+# which is still a valid command.
+cat > "$SED_TMP" << 'SED'
+s@^  /home/coder/\.config 2>/dev/null@  2>/dev/null@
+SED
+try "vnext_entrypoint_config_chown" "create its config dir" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# vnext: that .config chown must stay NON-recursive. The gh cap bind-mounts the
+# host's ~/.config/gh over the subdirectory, so a -R rewrites the ownership of
+# the user's real host files. Make it recursive: the non-recursive test fails.
+cat > "$SED_TMP" << 'SED'
+s@^chown "\$HOST_UID:\$HOST_GID" \\$@chown -R "$HOST_UID:$HOST_GID" \\@
+SED
+try "vnext_entrypoint_config_not_recursive" "NON-recursively" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
 # vnext: boxes must be created with --init (tini as PID 1) or `su` leaves
 # zombies unreaped until the pids cap wedges the box. Drop the flag: the
 # regression test asserting the recorded docker run contains --init fails.

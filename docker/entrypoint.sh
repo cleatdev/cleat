@@ -50,6 +50,28 @@ chown -R "$HOST_UID:$HOST_GID" /home/coder/.local 2>/dev/null || true
 # in-container `claude update`. Chown it so staging can write.
 chown -R "$HOST_UID:$HOST_GID" /home/coder/.cache 2>/dev/null || true
 
+# The shell rc files (from useradd's skel) and ~/.config are created at build
+# time owned by the build UID and are NOT host-mounted, so after the remap the
+# runtime user cannot write them. Every provisioning tool that puts itself on
+# PATH trips over exactly this: rustup amends ~/.profile, uv and the dotnet
+# install script append to ~/.bashrc, and anything writing ~/.config/<tool>
+# needs to create a directory inside ~/.config. Under a `[setup]` payload
+# (which runs `bash -e`) that EACCES is a hard abort, so provisioning fails on
+# any host whose UID is not the image's 1000, which is every macOS host.
+# Reproduced on a 501:20 host: append to ~/.bashrc and mkdir ~/.config/fish
+# both fail, while creating a NEW directory in ~ succeeds (the home dir itself
+# is chowned above).
+#
+# .config is chowned NON-recursively on purpose. The gh capability bind-mounts
+# the host's ~/.config/gh over the subdirectory, and recursing would rewrite
+# the ownership of the user's real host files. Chowning the parent is all that
+# is needed: it lets the runtime user create new entries alongside the mount.
+chown "$HOST_UID:$HOST_GID" \
+  /home/coder/.bashrc \
+  /home/coder/.profile \
+  /home/coder/.bash_logout \
+  /home/coder/.config 2>/dev/null || true
+
 # Docker capability: when /var/run/docker.sock is mounted (docker cap active),
 # the socket is group-owned by the host's docker GID (typically 999 on Linux).
 # The coder user's GID has been remapped to HOST_GID, which generally isn't

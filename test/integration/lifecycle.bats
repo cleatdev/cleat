@@ -223,6 +223,8 @@ EOF
   echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"
   mkdir -p "$HOME/.claude/agents"
   echo "mine" > "$HOME/.claude/agents/my-agent.md"
+  mkdir -p "$HOME/.claude/skills/my-skill"
+  echo "MY OWN SKILL" > "$HOME/.claude/skills/my-skill/SKILL.md"
 
   # Enable the kit (piped confirm), then create the box.
   run bash -c "echo y | '$CLI' kit plan-big-execute-small"
@@ -242,14 +244,27 @@ EOF
   assert_output --partial "my-agent.md"
   assert_output --partial "kit-worker.md"
 
-  # All three instruction-surface masks are read-only from inside the cage,
-  # even as root: memory, subagents, AND slash commands.
+  # Every instruction-surface mask is read-only from inside the cage, even as
+  # root: memory, subagents, slash commands, skills AND plugins. skills is the
+  # one that shipped writable (found 2026-07-25 by exactly this probe run by
+  # hand: touch ~/.claude/skills/.probe succeeded while the commands probe
+  # returned "Read-only file system"). It matters most because Claude Code
+  # auto-loads whatever sits there and can invoke it with no user action.
   run docker exec "$cname" sh -c 'echo pwned >> /home/coder/.claude/CLAUDE.md'
   assert_failure
   run docker exec "$cname" sh -c 'echo pwned > /home/coder/.claude/agents/evil.md'
   assert_failure
   run docker exec "$cname" sh -c 'echo pwned > /home/coder/.claude/commands/evil.md'
   assert_failure
+  run docker exec "$cname" sh -c 'mkdir -p /home/coder/.claude/skills/evil'
+  assert_failure
+  run docker exec "$cname" sh -c 'echo pwned > /home/coder/.claude/plugins/evil.json'
+  assert_failure
+
+  # ...and the box can still READ the user's own skills through the seed copy.
+  run docker exec "$cname" cat /home/coder/.claude/skills/my-skill/SKILL.md
+  assert_output --partial "MY OWN SKILL"
+
 
   # The host is untouched: no kit content in the real ~/.claude.
   run cat "$HOME/.claude/CLAUDE.md"

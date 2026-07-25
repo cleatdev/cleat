@@ -74,8 +74,10 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 # event spool. Persistent (deliberately NOT under /tmp) so macOS file rotation
 # and reboots can't delete a container's bind-mount sources out from under it and
 # force a recreate (which would discard the container's writable layer, e.g. an
-# ad-hoc `az` install). One dir per container, NOT mounted into the container:
-#   $CLEAT_RUN_DIR/<cname>/{settings,clip,hooks}
+# ad-hoc `az` install). One dir per container:
+#   $CLEAT_RUN_DIR/<cname>/{settings,clip,hooks,kit}
+# settings and hooks are host-side state. clip and the kit masks ARE mounted in
+# (kit/* read-only).
 CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 # Host-side per-box descriptions, keyed by container name. NOT Docker labels:
@@ -2168,6 +2170,11 @@ KIT_EOF
 # their next natural recreate, or explicitly via `cleat kit` which offers the
 # rebuild. Unreadable inspect degrades to "no mounts", the safe answer for
 # both callers (skip the regen / route the enable through the rebuild offer).
+# DELIBERATELY keyed on CLAUDE.md alone, never on the full mask set: a box
+# created before a LATER mask (skills, plugins) still has a live overlay that
+# must keep tracking the user's content. Tightening this to "has every mask"
+# would freeze those boxes' CLAUDE.md/agents/commands at whatever they last
+# held. The missing-mask signal is _maybe_note_missing_kit_masks, not this.
 _container_has_kit_mounts() {
   local dests
   dests="$(docker inspect "$1" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)" || return 1
@@ -2175,8 +2182,8 @@ _container_has_kit_mounts() {
 }
 
 # Boxes created before the read-only ~/.claude masks existed (or before the
-# third, commands, mask landed) keep those host-level surfaces writable until
-# recreated: bind mounts are baked at create, and the config fingerprint
+# skills and plugins masks landed) keep those host-level surfaces writable
+# until recreated: bind mounts are baked at create, and the config fingerprint
 # deliberately excludes mounts. Say so on every start until fixed, the same
 # always-on treatment as the undersized-VM advisory: a silent protection gap
 # is worse than a repeated note. Unreadable inspect stays silent, matching
@@ -2186,7 +2193,9 @@ _maybe_note_missing_kit_masks() {
   container_exists "$cname" || return 0
   local dests d
   dests="$(docker inspect "$cname" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)" || return 0
-  for d in /home/coder/.claude/CLAUDE.md /home/coder/.claude/agents /home/coder/.claude/commands; do
+  for d in /home/coder/.claude/CLAUDE.md /home/coder/.claude/agents \
+           /home/coder/.claude/commands /home/coder/.claude/skills \
+           /home/coder/.claude/plugins; do
     if ! printf '%s\n' "$dests" | grep -qx "$d"; then
       info "This box predates the read-only ~/.claude masks. Recreate to enable them: ${BOLD}cleat rm && cleat${RESET}"
       return 0
@@ -2195,22 +2204,38 @@ _maybe_note_missing_kit_masks() {
 }
 
 # VirtioFS rejects nested mounts whose target is missing inside the parent
-# bind source; ensure all three mask targets exist on the host (inert for
-# native claude: an empty CLAUDE.md / empty agents / empty commands dir is
-# nothing to it). A broken symlink at any target would make the touch/mkdir
-# fail with a raw trace under strict mode; refuse it with a clear remedy
-# instead. We never delete a user's symlink, even a dangling one: it may
-# point into a dotfiles repo that is simply not checked out yet.
+# bind source; ensure every mask target exists on the host (inert for native
+# claude: an empty CLAUDE.md and empty agents/commands/skills/plugins dirs are
+# nothing to it). Modern Docker Desktop auto-creates a missing DIRECTORY
+# target, but as root, which would leave an unwritable dir in the user's home
+# on rootful Linux; creating them here keeps them owned by the user.
+# A broken symlink at any target, or a regular file where a directory belongs,
+# would make the touch/mkdir fail with a raw trace under strict mode (and if it
+# reached Docker, an opaque rc=125 "not a directory" OCI error); refuse both
+# with a clear remedy instead. We never delete a user's symlink, even a
+# dangling one: it may point into a dotfiles repo not checked out yet.
 _ensure_kit_mask_targets() {
   local _t
-  for _t in "${HOME}/.claude/CLAUDE.md" "${HOME}/.claude/agents" "${HOME}/.claude/commands"; do
+  for _t in "${HOME}/.claude/CLAUDE.md" "${HOME}/.claude/agents" \
+            "${HOME}/.claude/commands" "${HOME}/.claude/skills" \
+            "${HOME}/.claude/plugins"; do
     if [[ -L "$_t" && ! -e "$_t" ]]; then
       error "${_t/#${HOME}/~} is a broken symlink. Fix or remove it, then rerun."
       return 1
     fi
   done
+  # The four dir targets must not be regular files. CLAUDE.md is excluded: it
+  # is the one target that is supposed to be a file.
+  for _t in "${HOME}/.claude/agents" "${HOME}/.claude/commands" \
+            "${HOME}/.claude/skills" "${HOME}/.claude/plugins"; do
+    if [[ -e "$_t" && ! -d "$_t" ]]; then
+      error "${_t/#${HOME}/~} is not a directory. Move or remove it, then rerun."
+      return 1
+    fi
+  done
   touch "${HOME}/.claude/CLAUDE.md"
-  mkdir -p "${HOME}/.claude/agents" "${HOME}/.claude/commands"
+  mkdir -p "${HOME}/.claude/agents" "${HOME}/.claude/commands" \
+           "${HOME}/.claude/skills" "${HOME}/.claude/plugins"
 }
 
 # (Re)generate the kit overlay content for a box: the three surfaces masked
@@ -2233,11 +2258,15 @@ _generate_kit_overlay() {
   fi
 
   # Self-heal wrong types from manual tampering: a directory where the file
-  # goes (or vice versa) would fail the writes below under strict mode.
+  # goes (or vice versa) would fail the writes below under strict mode. -L is
+  # in the dir checks on purpose: a SYMLINK at an overlay dir path is not
+  # caught by -f, and the clear loop below would then delete files in the
+  # link's target directory instead of in the overlay.
   [[ -d "$kit_dir/CLAUDE.md" ]] && rm -rf "$kit_dir/CLAUDE.md"
-  [[ -f "$kit_dir/agents" ]] && rm -f "$kit_dir/agents"
-  [[ -f "$kit_dir/commands" ]] && rm -f "$kit_dir/commands"
-  mkdir -p "$kit_dir/agents" "$kit_dir/commands"
+  [[ -L "$kit_dir/agents" || -f "$kit_dir/agents" ]] && rm -f "$kit_dir/agents"
+  [[ -L "$kit_dir/commands" || -f "$kit_dir/commands" ]] && rm -f "$kit_dir/commands"
+  [[ -L "$kit_dir/skills" || -f "$kit_dir/skills" ]] && rm -f "$kit_dir/skills"
+  mkdir -p "$kit_dir/agents" "$kit_dir/commands" "$kit_dir/skills"
 
   # Rewrite IN PLACE (truncate the file, clear inside the dir; never rm the
   # sources themselves): all are bind-mounted, and a running container keeps
@@ -2254,6 +2283,16 @@ _generate_kit_overlay() {
   for _f in "$kit_dir/commands"/* "$kit_dir/commands"/.[!.]*; do
     [[ -e "$_f" || -L "$_f" ]] || continue
     rm -rf "$_f"
+  done
+  # skills/: same both-globs shape as commands (skill bundles carry dotfiles,
+  # and a hidden skill dir is a real shape). The rm is made NON-FATAL here and
+  # the copy below normalizes modes: a skill dir can arrive from unzip, a git
+  # archive or a marketplace install at 0500, which copies through as 0500 and
+  # makes the NEXT regen's rm die EPERM. Under strict mode that raw
+  # "Permission denied" would take the whole `cleat start` down.
+  for _f in "$kit_dir/skills"/* "$kit_dir/skills"/.[!.]*; do
+    [[ -e "$_f" || -L "$_f" ]] || continue
+    rm -rf "$_f" 2>/dev/null || true
   done
 
   # CLAUDE.md: the user's real global memory first, byte-for-byte.
@@ -2305,6 +2344,36 @@ _generate_kit_overlay() {
   # swallow-and-continue matches the agents copy above.
   if [[ -d "${HOME}/.claude/commands" ]]; then
     cp -RL "${HOME}/.claude/commands/." "$kit_dir/commands/" 2>/dev/null || true
+  fi
+
+  # skills/: a read-only PASS-THROUGH of the user's own skills. Same purpose
+  # as commands above, one degree stronger: ~/.claude/skills is an AUTO-LOAD
+  # plugin source (Claude Code registers what it finds there as
+  # <name>@skills-dir), so a planted skill needs no user action at all to be
+  # discovered and invoked, and a skill root can carry hooks/, bin/ and
+  # .mcp.json, not only a SKILL.md. Copied entry by entry ON PURPOSE, and the
+  # recursive step drops -L: the TOP-LEVEL entry is still dereferenced
+  # (dotfile-repo users symlink a whole skill dir, and a copied link would be
+  # dead inside the box) while a symlink NESTED inside a skill is copied as a
+  # symlink. A blanket cp -RL would dereference `myskill/keys -> ~/.ssh` and
+  # materialize real host secrets inside the cage, the one thing the cage
+  # exists to prevent. A nested link that points outside simply dangles in the
+  # box.
+  if [[ -d "${HOME}/.claude/skills" ]]; then
+    local _sk _skb
+    for _sk in "${HOME}/.claude/skills"/* "${HOME}/.claude/skills"/.[!.]*; do
+      [[ -e "$_sk" ]] || continue
+      _skb="${_sk##*/}"
+      if [[ -d "$_sk" ]]; then
+        mkdir -p "$kit_dir/skills/$_skb"
+        cp -R "$_sk/." "$kit_dir/skills/$_skb/" 2>/dev/null || true
+      else
+        cp "$_sk" "$kit_dir/skills/$_skb" 2>/dev/null || true
+      fi
+    done
+    # Normalize modes so the overlay is always owner-removable (see the clear
+    # loop above). X, not x: only dirs and already-executable files get +x.
+    chmod -R u+rwX "$kit_dir/skills" 2>/dev/null || true
   fi
 
   [[ -n "$kit" ]] || return 0
@@ -5910,17 +5979,27 @@ cmd_run() {
   [[ -f "${HOME}/.claude/settings.json" ]] || echo '{}' > "${HOME}/.claude/settings.json"
 
   # ── Kit overlay (concept/34) ──────────────────────────────────────────────
-  # Three read-only masks over the base ~/.claude mount replace what the box
-  # sees at ~/.claude/CLAUDE.md, ~/.claude/agents, and ~/.claude/commands with
-  # host-generated content (the user's own content + the enabled kit for
-  # CLAUDE.md/agents, or a plain pass-through copy). Mounted on EVERY box so
-  # enabling, switching, or disabling a kit later is a content regeneration,
-  # never a recreate. :ro so the caged agent cannot rewrite its own
-  # instructions, and (the hardening property) can no longer write ANY of the
-  # three host-user-level instruction surfaces through the base mount that
-  # native host claude would obey: memory, subagents, and slash commands. The
-  # box still READS the user's real content (pass-through copy). Project-level
-  # /workspace/.claude/* is unaffected (still writable in the repo).
+  # Read-only masks over the base ~/.claude mount replace what the box sees at
+  # ~/.claude/CLAUDE.md, agents, commands and skills with host-generated
+  # content (the user's own content + the enabled kit for CLAUDE.md/agents, or
+  # a plain pass-through copy). Mounted on EVERY box so enabling, switching, or
+  # disabling a kit later is a content regeneration, never a recreate. :ro so
+  # the caged agent cannot rewrite its own instructions, and (the hardening
+  # property) can no longer write ANY of the host-user-level instruction
+  # surfaces through the base mount that native host claude would obey: memory,
+  # subagents, slash commands, skills and plugins. skills is the sharpest of
+  # them: Claude Code auto-loads whatever sits there as a <name>@skills-dir
+  # plugin, with no user action. plugins is self-masked (the host path over
+  # itself, no copy) because it is a live runtime tree, 9 MB with a git
+  # checkout in it. Read-only at its NORMAL path is deliberate: measured
+  # 2026-07-25, claude reads marketplaces and installed plugins fine from a
+  # read-only plugins dir, but redirecting the root with
+  # CLAUDE_CODE_PLUGIN_CACHE_DIR made it report "No marketplaces configured"
+  # and "No plugins installed", so the redirect was dropped. Installing a NEW
+  # plugin inside a box fails EROFS by design; install on the host.
+  # The box still READS the user's real content
+  # (pass-through copy). Project-level /workspace/.claude/* is unaffected
+  # (still writable in the repo).
   _generate_kit_overlay "$cname"
   # Mask targets must exist on the host before the nested mounts (VirtioFS);
   # dies with a clear remedy on a broken symlink. See _ensure_kit_mask_targets.
@@ -5935,6 +6014,8 @@ cmd_run() {
     -v "$CLEAT_RUN_DIR/${cname}/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/agents:/home/coder/.claude/agents:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/commands:/home/coder/.claude/commands:ro"
+    -v "$CLEAT_RUN_DIR/${cname}/kit/skills:/home/coder/.claude/skills:ro"
+    -v "${HOME}/.claude/plugins:/home/coder/.claude/plugins:ro"
     -v "$clip_dir":/tmp/cleat-clip
   )
 

@@ -2377,16 +2377,18 @@ cat > "$SED_TMP" << 'SED'
 s|/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro|/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md|
 s|/kit/agents:/home/coder/.claude/agents:ro|/kit/agents:/home/coder/.claude/agents|
 s|/kit/commands:/home/coder/.claude/commands:ro|/kit/commands:/home/coder/.claude/commands|
+s|/kit/skills:/home/coder/.claude/skills:ro|/kit/skills:/home/coder/.claude/skills|
+s|:/home/coder/.claude/plugins:ro|:/home/coder/.claude/plugins|
 SED
-try "kits_ro_masks" "cmd_run mounts all three kit masks read-only" "$CLI" "$KITS_BATS"
+try "kits_ro_masks" "cmd_run mounts every kit mask read-only" "$CLI" "$KITS_BATS"
 
 # KIT COMMANDS MASK MOUNT: the third :ro mask (slash commands) must be present,
 # or a caged agent can plant a host-user-level command native claude runs.
-# Drop the commands mount entirely: the three-masks test loses it.
+# Drop the commands mount entirely: the mask-mount test loses it.
 cat > "$SED_TMP" << 'SED'
 /-v "\$CLEAT_RUN_DIR\/\${cname}\/kit\/commands:\/home\/coder\/\.claude\/commands:ro"/d
 SED
-try "kits_commands_mask_mount" "cmd_run mounts all three kit masks read-only" "$CLI" "$KITS_BATS"
+try "kits_commands_mask_mount" "cmd_run mounts every kit mask read-only" "$CLI" "$KITS_BATS"
 
 # KIT COMMANDS PASS-THROUGH: the box must still READ the user's own slash
 # commands (the mask seeds a copy). Break the copy: the pass-through test no
@@ -2395,6 +2397,69 @@ cat > "$SED_TMP" << 'SED'
 s|cp -RL "${HOME}/.claude/commands/." "$kit_dir/commands/" 2>/dev/null \|\| true|true|
 SED
 try "kits_commands_passthrough" "pass-through-copies the user's slash commands" "$CLI" "$KITS_BATS"
+
+# KIT SKILLS MASK MOUNT: ~/.claude/skills is an AUTO-LOAD plugin source, so a
+# planted skill runs with no user action at all (strictly worse than a slash
+# command, which needs the user to type it). Drop the mount: the mask test
+# loses it.
+cat > "$SED_TMP" << 'SED'
+/-v "\$CLEAT_RUN_DIR\/\${cname}\/kit\/skills:\/home\/coder\/\.claude\/skills:ro"/d
+SED
+try "kits_skills_mask_mount" "cmd_run mounts every kit mask read-only" "$CLI" "$KITS_BATS"
+
+# KIT PLUGINS MASK MOUNT: an enabled plugin's payload and the marketplace git
+# checkout are both host-executed. Drop the self-mask: the mask test loses it.
+cat > "$SED_TMP" << 'SED'
+/-v "\${HOME}\/\.claude\/plugins:\/home\/coder\/\.claude\/plugins:ro"/d
+SED
+try "kits_plugins_mask_mount" "cmd_run mounts every kit mask read-only" "$CLI" "$KITS_BATS"
+
+# KIT SKILLS PASS-THROUGH: the box must still READ the user's own skills.
+# Neutralize the recursive copy: the pass-through test finds nothing.
+cat > "$SED_TMP" << 'SED'
+s|cp -R "$_sk/." "$kit_dir/skills/$_skb/" 2>/dev/null \|\| true|true|
+SED
+try "kits_skills_passthrough" "pass-through-copies the user's skills" "$CLI" "$KITS_BATS"
+
+# KIT SKILLS NESTED SYMLINK: the recursive copy must NOT dereference. Restore
+# -L: a skill symlinking ~/.ssh materializes real key bytes into the overlay
+# the cage reads, and the no-deref test finds them.
+cat > "$SED_TMP" << 'SED'
+s|cp -R "$_sk/." "$kit_dir/skills/$_skb/"|cp -RL "$_sk/." "$kit_dir/skills/$_skb/"|
+SED
+try "kits_skills_no_deref_nested" "symlink inside a skill is not dereferenced" "$CLI" "$KITS_BATS"
+
+# KIT SKILLS MODE NORMALIZE: a 0500 skill dir copies through at 0500 and the
+# NEXT regen's rm dies EPERM, aborting the start under strict mode. Drop the
+# chmod: the read-only-skill regen test fails.
+cat > "$SED_TMP" << 'SED'
+/chmod -R u+rwX "\$kit_dir\/skills"/d
+SED
+try "kits_skills_readonly_regen" "read-only dir inside a skill does not abort" "$CLI" "$KITS_BATS"
+
+# KIT SKILLS OVERLAY SELF-HEAL: a SYMLINK at the overlay skills path is not
+# caught by -f, and the clear loop would then delete files in the link's TARGET
+# directory. Drop the -L half: the replaced-not-followed test fails.
+cat > "$SED_TMP" << 'SED'
+s|\[\[ -L "$kit_dir/skills" \|\| -f "$kit_dir/skills" \]\]|[[ -f "$kit_dir/skills" ]]|
+SED
+try "kits_skills_overlay_symlink_heal" "symlink at the skills overlay path itself is replaced" "$CLI" "$KITS_BATS"
+
+# KIT SKILLS MASK TARGET: VirtioFS rejects a nested mount whose target is
+# missing inside the parent bind source. Drop skills from the mkdir: the
+# pre-create test fails.
+cat > "$SED_TMP" << 'SED'
+s|"${HOME}/.claude/skills" "${HOME}/.claude/plugins"$|"${HOME}/.claude/agents"|
+SED
+try "kits_skills_mask_target_precreate" "generates the overlay and pre-creates the host targets" "$CLI" "$KITS_BATS"
+
+# KIT SKILLS RECREATE NOTE: a box created before the skills mask keeps the host
+# surface writable and must be told. Drop skills from the advisory list: the
+# missing-skills-mask note test fails.
+cat > "$SED_TMP" << 'SED'
+s|/home/coder/.claude/commands /home/coder/.claude/skills \\|/home/coder/.claude/commands \\|
+SED
+try "kits_skills_recreate_note" "box missing the skills mask gets the recreate note" "$CLI" "$KITS_BATS"
 
 # KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
 # content, first and byte-for-byte. Drop the user-content copy (truncate

@@ -309,17 +309,24 @@ marked, after a `Cleat box notes` section every box carries with the
 clipboard-bridge rules. Its content stays off the host: kits live in generated
 mask files mounted into the box, nothing kit-related lands in your `~/.claude`
 and native `claude` never sees them. (Creating a box does seed inert placeholders there
-when missing, an empty `CLAUDE.md` and empty `agents`/`commands` dirs: mount
-targets, not content.) Different boxes can run different kits on the same
-repo. Kits contain instructions and subagents only, no hooks and no settings.
+when missing, an empty `CLAUDE.md` and empty `agents`/`commands`/`skills`/`plugins`
+dirs: mount targets, not content.) Different boxes can run different kits on the
+same repo. Kits contain instructions and subagents only, no hooks and no settings.
 Whatever they steer the agent to do happens inside the cage. As a
-hardening side effect, your three user-level instruction surfaces
-(`~/.claude/CLAUDE.md`, `agents` and `commands`) are mounted read-only in
-every box: the agent reads them but can't plant a host-user-level command or
-agent that your host `claude` would later obey. Author those at project level
-(`.claude/agents/`, `.claude/commands/`) instead. The read-only copies
+hardening side effect, your five user-level instruction surfaces
+(`~/.claude/CLAUDE.md`, `agents`, `commands`, `skills` and `plugins`) are
+mounted read-only in every box: the agent reads them but can't plant a
+host-user-level command, agent or skill that your host `claude` would later
+obey. `skills` matters most, because Claude Code loads whatever it finds there
+on its own and can invoke it without you typing anything. Author those at
+project level (`.claude/agents/`, `.claude/commands/`, `.claude/skills/`)
+instead. Plugins you already have stay readable and usable in a box, but installing a
+new one from inside a box fails, because that directory is read-only. Install
+plugins on the host and every box sees them. The read-only copies
 dereference symlinks (a dotfile-repo `commands` dir shows up as real files in
-the box), a broken symlink at one of the three paths stops box create with a
+the box) while a symlink nested inside a skill is kept as a link, so a skill
+pointing at `~/.ssh` cannot pull real key bytes into the box. A broken
+symlink at one of the mask paths stops box create with a
 clear fix-or-remove error (your symlink is never deleted) and a box created
 before these masks existed prints a recreate note on every start until you
 run `cleat rm && cleat`.

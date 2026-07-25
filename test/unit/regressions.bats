@@ -2855,3 +2855,29 @@ EOF
   run grep -q "WATCHER_FD2_SENTINEL" "$TEST_TEMP/caller-stderr"
   assert_failure
 }
+
+@test "regression: a caged agent cannot write the host ~/.claude/skills" {
+  # Live probe on the maintainer's machine, 2026-07-25: inside a box,
+  # `touch ~/.claude/commands/.probe` and `touch ~/.claude/agents/.probe` both
+  # returned "Read-only file system" while `touch ~/.claude/skills/.probe`
+  # SUCCEEDED. ~/.claude is bind-mounted read-write and only three surfaces
+  # were masked, so the caged agent could plant a skill in the HOST's
+  # ~/.claude/skills. That is worse than a planted slash command: a skill is an
+  # auto-load plugin source, discovered and model-invoked with no user action.
+  # The fix masks skills (and plugins) :ro over the base mount, seeded with a
+  # pass-through copy so the box still READS the user's own skills.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project" "$HOME/.claude/skills/my-tool"
+  echo "the skill" > "$HOME/.claude/skills/my-tool/SKILL.md"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # the mask is mounted, and it is read-only
+  run assert_docker_run_has "$cname" "/kit/skills:/home/coder/.claude/skills:ro"
+  assert_success
+  # ...and the box still reads the user's real skill through the seed copy
+  run cat "$CLEAT_RUN_DIR/$cname/kit/skills/my-tool/SKILL.md"
+  assert_output "the skill"
+}

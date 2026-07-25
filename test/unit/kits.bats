@@ -400,7 +400,7 @@ EOF
 
 # ── cmd_run: mask mounts ─────────────────────────────────────────────────────
 
-@test "kit: cmd_run mounts all three kit masks read-only" {
+@test "kit: cmd_run mounts every kit mask read-only" {
   mock_docker_images "cleat"
   run cmd_run "$TEST_TEMP/project"
   assert_success
@@ -409,6 +409,10 @@ EOF
   run assert_docker_run_has "$CNAME" "/kit/agents:/home/coder/.claude/agents:ro"
   assert_success
   run assert_docker_run_has "$CNAME" "/kit/commands:/home/coder/.claude/commands:ro"
+  assert_success
+  run assert_docker_run_has "$CNAME" "/kit/skills:/home/coder/.claude/skills:ro"
+  assert_success
+  run assert_docker_run_has "$CNAME" ":/home/coder/.claude/plugins:ro"
   assert_success
 }
 
@@ -439,10 +443,13 @@ EOF
   [ -f "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md" ]
   [ -d "$CLEAT_RUN_DIR/$CNAME/kit/agents" ]
   [ -d "$CLEAT_RUN_DIR/$CNAME/kit/commands" ]
+  [ -d "$CLEAT_RUN_DIR/$CNAME/kit/skills" ]
   # VirtioFS nested-mount prerequisite: targets exist in the base mount source
   [ -f "$HOME/.claude/CLAUDE.md" ]
   [ -d "$HOME/.claude/agents" ]
   [ -d "$HOME/.claude/commands" ]
+  [ -d "$HOME/.claude/skills" ]
+  [ -d "$HOME/.claude/plugins" ]
 }
 
 @test "kit: overlay pass-through-copies the user's slash commands (read-only mask seed)" {
@@ -473,6 +480,144 @@ EOF
   _generate_kit_overlay "$CNAME"
   [ ! -f "$CLEAT_RUN_DIR/$CNAME/kit/commands/gone.md" ]
 }
+
+# ── skills overlay (concept/34 Follow-up 12) ─────────────────────────────────
+
+@test "kit: skills overlay pass-through-copies the user's skills" {
+  mkdir -p "$HOME/.claude/skills/my-tool/references"
+  echo "the skill" > "$HOME/.claude/skills/my-tool/SKILL.md"
+  echo "deep ref" > "$HOME/.claude/skills/my-tool/references/deep.md"
+  _generate_kit_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/skills/my-tool/SKILL.md"
+  assert_output "the skill"
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/skills/my-tool/references/deep.md"
+  assert_output "deep ref"
+}
+
+@test "kit: skills overlay is an empty dir when the user has no skills" {
+  rm -rf "$HOME/.claude/skills"
+  _generate_kit_overlay "$CNAME"
+  [ -d "$CLEAT_RUN_DIR/$CNAME/kit/skills" ]
+  run bash -c "ls -A \"$CLEAT_RUN_DIR/$CNAME/kit/skills\""
+  assert_output ""
+}
+
+@test "kit: skills regen drops a skill the user deleted" {
+  mkdir -p "$HOME/.claude/skills/gone-tool"
+  echo "x" > "$HOME/.claude/skills/gone-tool/SKILL.md"
+  _generate_kit_overlay "$CNAME"
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/skills/gone-tool/SKILL.md" ]
+  rm -rf "$HOME/.claude/skills/gone-tool"
+  _generate_kit_overlay "$CNAME"
+  [ ! -e "$CLEAT_RUN_DIR/$CNAME/kit/skills/gone-tool" ]
+}
+
+@test "kit: skills pass-through dereferences a symlinked skill dir" {
+  # dotfile-repo users symlink a whole skill dir; a copied link would point at
+  # a host path that does not exist inside the box
+  mkdir -p "$HOME/dotfiles/linked-tool" "$HOME/.claude/skills"
+  echo "from dotfiles" > "$HOME/dotfiles/linked-tool/SKILL.md"
+  ln -s "$HOME/dotfiles/linked-tool" "$HOME/.claude/skills/linked-tool"
+  _generate_kit_overlay "$CNAME"
+  [ ! -L "$CLEAT_RUN_DIR/$CNAME/kit/skills/linked-tool" ]
+  run cat "$CLEAT_RUN_DIR/$CNAME/kit/skills/linked-tool/SKILL.md"
+  assert_output "from dotfiles"
+}
+
+@test "kit: a symlink inside a skill is not dereferenced into the overlay" {
+  # SECURITY. A blanket cp -RL would follow `myskill/keys -> ~/.ssh` and
+  # materialize real host key bytes into the overlay the cage reads, which is
+  # exactly what "Your keys never enter the cage" forbids.
+  mkdir -p "$HOME/secretstore" "$HOME/.claude/skills/my-tool"
+  echo "PRIVATE-KEY-MATERIAL" > "$HOME/secretstore/id_rsa"
+  echo "s" > "$HOME/.claude/skills/my-tool/SKILL.md"
+  ln -s "$HOME/secretstore" "$HOME/.claude/skills/my-tool/keys"
+  _generate_kit_overlay "$CNAME"
+  run bash -c "grep -rl PRIVATE-KEY-MATERIAL \"$CLEAT_RUN_DIR/$CNAME/kit/skills\" 2>/dev/null || true"
+  assert_output ""
+}
+
+@test "kit: a dangling symlink in the skills overlay is cleared on regen" {
+  mkdir -p "$CLEAT_RUN_DIR/$CNAME/kit/skills"
+  ln -s "$TEST_TEMP/gone-target" "$CLEAT_RUN_DIR/$CNAME/kit/skills/stale"
+  _generate_kit_overlay "$CNAME"
+  [ ! -L "$CLEAT_RUN_DIR/$CNAME/kit/skills/stale" ]
+  [ ! -e "$CLEAT_RUN_DIR/$CNAME/kit/skills/stale" ]
+}
+
+@test "kit: a read-only dir inside a skill does not abort the overlay regen" {
+  # A skill can carry a 0500 subdirectory (unzip, git archive, marketplace
+  # install). The top-level skill dir is safe because the overlay creates it
+  # with mkdir, but `cp -R` recreates NESTED dirs with the source mode, so a
+  # nested 0500 dir lands read-only in the overlay and the NEXT regen's
+  # rm -rf dies EPERM. Under set -euo pipefail that kills the whole start.
+  # Only the SECOND regeneration exposes it, so a single-regen test misses it.
+  mkdir -p "$HOME/.claude/skills/my-tool/locked"
+  echo "s" > "$HOME/.claude/skills/my-tool/SKILL.md"
+  echo "inner" > "$HOME/.claude/skills/my-tool/locked/data.txt"
+  chmod 500 "$HOME/.claude/skills/my-tool/locked"
+  run _generate_kit_overlay "$CNAME"
+  assert_success
+  # the nested dir must be owner-writable in the overlay, or the next regen dies
+  run bash -c "test -w \"$CLEAT_RUN_DIR/$CNAME/kit/skills/my-tool/locked\""
+  assert_success
+  chmod 700 "$HOME/.claude/skills/my-tool/locked"
+  rm -rf "$HOME/.claude/skills/my-tool"
+  run _generate_kit_overlay "$CNAME"
+  assert_success
+  run bash -c "ls -A \"$CLEAT_RUN_DIR/$CNAME/kit/skills\""
+  assert_output ""
+}
+
+@test "kit: skills overlay copies dotfiles and hidden skill dirs" {
+  mkdir -p "$HOME/.claude/skills/.hidden-skill"
+  echo "hidden" > "$HOME/.claude/skills/.hidden-skill/SKILL.md"
+  echo "" > "$HOME/.claude/skills/.gitkeep"
+  _generate_kit_overlay "$CNAME"
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/skills/.hidden-skill/SKILL.md" ]
+  [ -e "$CLEAT_RUN_DIR/$CNAME/kit/skills/.gitkeep" ]
+}
+
+@test "kit: hostile skill names survive the copy and the clear" {
+  mkdir -p "$HOME/.claude/skills/with space" "$HOME/.claude/skills/quo'te" \
+           "$HOME/.claude/skills/uni-café-日本" "$HOME/.claude/skills/glob star"
+  for d in "with space" "quo'te" "uni-café-日本" "glob star"; do
+    echo "x" > "$HOME/.claude/skills/$d/SKILL.md"
+  done
+  _generate_kit_overlay "$CNAME"
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/skills/with space/SKILL.md" ]
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/skills/quo'te/SKILL.md" ]
+  [ -f "$CLEAT_RUN_DIR/$CNAME/kit/skills/uni-café-日本/SKILL.md" ]
+  rm -rf "$HOME/.claude/skills"
+  _generate_kit_overlay "$CNAME"
+  run bash -c "ls -A \"$CLEAT_RUN_DIR/$CNAME/kit/skills\""
+  assert_output ""
+}
+
+@test "kit: a symlink at the skills overlay path itself is replaced, not followed" {
+  # Without the -L half of the self-heal, the clear loop would delete files in
+  # the link's TARGET directory instead of in the overlay.
+  mkdir -p "$TEST_TEMP/victim" "$CLEAT_RUN_DIR/$CNAME/kit"
+  echo "important" > "$TEST_TEMP/victim/important.txt"
+  rm -rf "$CLEAT_RUN_DIR/$CNAME/kit/skills"
+  ln -s "$TEST_TEMP/victim" "$CLEAT_RUN_DIR/$CNAME/kit/skills"
+  _generate_kit_overlay "$CNAME"
+  [ ! -L "$CLEAT_RUN_DIR/$CNAME/kit/skills" ]
+  [ -f "$TEST_TEMP/victim/important.txt" ]
+}
+
+@test "kit: the skills mask is USER-level only; project skills stay writable via /workspace" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude/skills/proj-tool"
+  echo "project skill" > "$TEST_TEMP/project/.claude/skills/proj-tool/SKILL.md"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$CNAME" "$TEST_TEMP/project:/workspace"
+  assert_success
+  run assert_docker_run_lacks "$CNAME" "/workspace/.claude/skills"
+  assert_success
+}
+
 
 @test "kit: commands pass-through dereferences symlinked commands" {
   # Dotfile-repo users symlink their commands; a copied symlink would point
@@ -592,7 +737,10 @@ EOF
 
 @test "kit: a box missing the commands mask gets the recreate note" {
   container_exists() { return 0; }
-  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents'
+  # Every OTHER mask is present, so this test isolates the commands entry. If
+  # skills and plugins were also absent here, dropping commands from the
+  # checked list would still fire the note and the mutation would go MISSED.
+  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/skills\n/home/coder/.claude/plugins'
   run _maybe_note_missing_kit_masks "$CNAME"
   assert_success
   assert_output --partial "predates the read-only ~/.claude masks"
@@ -601,10 +749,26 @@ EOF
 
 @test "kit: a fully masked box gets no recreate note" {
   container_exists() { return 0; }
-  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands'
+  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/skills\n/home/coder/.claude/plugins'
   run _maybe_note_missing_kit_masks "$CNAME"
   assert_success
   refute_output --partial "predates"
+}
+
+@test "kit: a box missing the skills mask gets the recreate note" {
+  container_exists() { return 0; }
+  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/plugins'
+  run _maybe_note_missing_kit_masks "$CNAME"
+  assert_success
+  assert_output --partial "predates the read-only ~/.claude masks"
+}
+
+@test "kit: a box missing the plugins mask gets the recreate note" {
+  container_exists() { return 0; }
+  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/skills'
+  run _maybe_note_missing_kit_masks "$CNAME"
+  assert_success
+  assert_output --partial "predates the read-only ~/.claude masks"
 }
 
 @test "kit: no container, no recreate note" {
@@ -650,6 +814,29 @@ EOF
   assert_success
   [ -f "$HOME/.claude/CLAUDE.md" ]
   [ -d "$HOME/.claude/agents" ]
+  [ -d "$HOME/.claude/skills" ]
+  [ -d "$HOME/.claude/plugins" ]
+}
+
+@test "kit: create refuses a broken symlink at ~/.claude/skills with a clear remedy" {
+  mkdir -p "$HOME/.claude"
+  rm -rf "$HOME/.claude/skills"
+  ln -s "$HOME/no-such-target" "$HOME/.claude/skills"
+  run _ensure_kit_mask_targets
+  assert_failure
+  assert_output --partial "broken symlink"
+  # never delete a user's symlink: it may point into a dotfiles repo that is
+  # simply not checked out yet
+  [ -L "$HOME/.claude/skills" ]
+}
+
+@test "kit: create refuses a regular file at ~/.claude/skills with a clear remedy" {
+  mkdir -p "$HOME/.claude"
+  rm -rf "$HOME/.claude/skills"
+  touch "$HOME/.claude/skills"
+  run _ensure_kit_mask_targets
+  assert_failure
+  assert_output --partial "is not a directory"
 }
 
 # ── cmd_kit: command surface ─────────────────────────────────────────────────

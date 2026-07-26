@@ -1255,3 +1255,20 @@ EOF
   assert_output --partial "Run this project's [setup] provisioning now"
   refute_output --partial "unbound variable"
 }
+
+@test "smoke: --fork is accepted and does not crash the real binary" {
+  # Strict-mode coverage for the flag path: _FORK_REQUESTED is read in cmd_run
+  # under set -euo pipefail, and an unbound-variable slip there would only show
+  # up as a subprocess failure, never in a sourced test.
+  run cleat_bin --fork --help
+  assert_success
+  assert_output --partial "cleat"
+}
+
+@test "smoke: --fork on a directory under the forks dir refuses cleanly" {
+  run cleat_bin run --fork nonexistent-box-name-that-is-fine
+  # Either it refuses for a real reason or it fails on docker being stubbed
+  # out, but it must never emit a bash trace or an unbound-variable error.
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+}

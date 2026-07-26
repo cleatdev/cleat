@@ -84,6 +84,11 @@ CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 # labels are immutable, so editing one would force a recreate that wipes the
 # writable layer (e.g. an `az login`). See concept/20-boxes.md.
 CLEAT_BOXES_DIR="$CLEAT_CONFIG_DIR/boxes"
+# Forked workspaces: one directory per fork box, a full copy of the project.
+# Under $CLEAT_CONFIG_DIR so it is inside Docker's shared scope on macOS and
+# normally on the same volume as the project, which is what lets APFS clone
+# blocks copy-on-write instead of duplicating them.
+CLEAT_FORKS_DIR="$CLEAT_CONFIG_DIR/forks"
 
 # Host-side per-box kit selection, keyed by container name: one file per box
 # holding the enabled kit's name. Same rationale as CLEAT_BOXES_DIR (not a
@@ -124,6 +129,7 @@ _RESOLVED_PROJECT=""
 # Default "main" = the legacy suffix-less container. Set by the dispatch via
 # _set_box for box-aware verbs; stays "main" for everything else.
 _BOX="main"
+_FORK_REQUESTED=false   # set by --fork; only read when a box is CREATED
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 _CLI_TRUST_PROJECT=0
@@ -2484,6 +2490,184 @@ _generate_home_overlay() {
     esac
   done
   : "$session_key"
+}
+
+# ── Forked workspaces (concept/31) ──────────────────────────────────────────
+#
+# A fork is not a new kind of thing: it is a BOX whose /workspace is its own
+# copy of the project instead of the live tree. Everything else about the box
+# (container name, session key, trust rows, caps, kits, description) still keys
+# off the real project path, so nothing else in the CLI learns a new concept.
+#
+# A COPY, deliberately, not a git clone. A clone drags in the whole submodule /
+# untracked-sibling / unpushed-SHA / git-identity problem class, and cannot
+# serve a project with no git at all (the PoC A/B case). A copy just has the
+# user's files: uncommitted work, untracked repos, gitignored build output.
+# On APFS `cp -c` clones blocks copy-on-write, measured at 0.005s for 50 MB on
+# the maintainer's machine, so "copy everything" is nearly free AND saves the
+# caged agent an `npm install`.
+_fork_dir() { printf '%s\n' "$CLEAT_FORKS_DIR/$1"; }
+
+# Whether a box is a fork is recorded SEPARATELY from the copy itself, in the
+# same per-box host state dir as the description. The copy's existence looks
+# like a sufficient marker and is not: if the copy is deleted, a bind source
+# vanishes, cmd_start recreates the box, and a marker-free cmd_run would
+# silently re-mount the LIVE tree and print success. A box the user believes is
+# caged to a disposable copy would then be editing the real repo. The marker
+# makes that case REFUSE instead.
+_fork_marker_file() { echo "$CLEAT_BOXES_DIR/$1.fork"; }
+_box_is_fork()      { [[ -f "$(_fork_marker_file "$1")" ]]; }
+_fork_mark()        { mkdir -p "$CLEAT_BOXES_DIR"; : > "$(_fork_marker_file "$1")"; }
+_fork_unmark()      { rm -f "$(_fork_marker_file "$1")"; }
+
+# Every value for a REPEATED key in a section, one per line. The existing
+# _read_section_from_file returns the first match only, which is right for
+# `memory = 8g` and wrong for `exclude = node_modules` repeated N times.
+_read_section_all_from_file() {
+  local file="$1" section="$2" key="$3"
+  [[ -f "$file" ]] || return 0
+  local in_section=false line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == "["*"]" ]]; then
+      [[ "$line" == "[$section]" ]] && in_section=true || in_section=false
+      continue
+    fi
+    $in_section || continue
+    [[ "$line" == *"="* ]] || continue
+    k="${line%%=*}"; v="${line#*=}"
+    k="${k%"${k##*[![:space:]]}"}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    [[ "$k" == "$key" && -n "$v" ]] && printf '%s\n' "$v"
+  done < "$file"
+}
+
+# cp flags, probed ONCE from the cp BINARY and never from `uname -s`. A macOS
+# host with Homebrew coreutils on PATH has GNU cp under the plain name, and GNU
+# cp rejects -c outright ("invalid option -- 'c'", exit 1, nothing copied), so
+# an OS-keyed branch hard-fails the fork for exactly that profile. No pipeline
+# in the probe: `cp --version | head -1` can hand cp a SIGPIPE, and pipefail
+# then reports the pipeline failed even when the match succeeded.
+_FORK_CP_PROBED=""
+_FORK_CP_FLAGS=""
+_fork_cp_flags() {
+  if [[ -n "$_FORK_CP_PROBED" ]]; then printf '%s' "$_FORK_CP_FLAGS"; return 0; fi
+  _FORK_CP_PROBED=1
+  local _v _h _p
+  _v="$(cp --version 2>/dev/null || true)"
+  case "$_v" in
+    *"GNU coreutils"*)
+      _h="$(cp --help 2>/dev/null || true)"
+      # --reflink=auto degrades silently to a byte copy on a non-CoW
+      # filesystem. Never =always, which fails instead. -d keeps hardlinks
+      # inside the tree shared, so a pnpm store does not multiply.
+      case "$_h" in
+        *--reflink*) _FORK_CP_FLAGS="-R -d --reflink=auto" ;;
+        *)           _FORK_CP_FLAGS="-R -d" ;;
+      esac
+      ;;
+    *)
+      # BSD. -c clones each regular file and falls back internally on EXDEV or
+      # ENOTSUP without changing the exit status, so no CoW retry is needed.
+      # Probe acceptance of the flag rather than assuming it.
+      _FORK_CP_FLAGS="-R"
+      _p="$CLEAT_FORKS_DIR/.cpprobe.$$"
+      rm -rf "$_p" 2>/dev/null || true
+      if mkdir -p "$_p/s" "$_p/d" 2>/dev/null && : > "$_p/s/f" 2>/dev/null \
+         && cp -Rc "$_p/s/." "$_p/d/" 2>/dev/null; then
+        _FORK_CP_FLAGS="-Rc"
+      fi
+      rm -rf "$_p" 2>/dev/null || true
+      ;;
+  esac
+  printf '%s' "$_FORK_CP_FLAGS"
+}
+
+# Recursive copy of a project tree into a fork workspace.
+#
+# Load-bearing, each measured:
+#   * The source form is "$src/." into a freshly created "$dst/". `cp -R "$src"
+#     "$dst"` looks equivalent and is not: when the PROJECT ROOT is itself a
+#     symlink it copies the LINK, so the fork becomes an alias for the live
+#     tree and the whole feature voids in silence. It also nests to
+#     $dst/$(basename $src) whenever $dst survives, which a root-owned leftover
+#     from the box's passwordless sudo can cause.
+#   * Flags come from _fork_cp_flags, which probes the binary. See there.
+#   * Plain -R copies symlinks AS symlinks on both BSD and GNU. That is the
+#     security property: a project containing `sub/keys -> ~/.ssh` must NOT
+#     have real key bytes materialised into the cage. Never add -L or -H.
+#
+# Copies into a temp dir inside CLEAT_FORKS_DIR and renames, so an interrupted
+# copy never presents a half tree as a workspace, and takes a mkdir lock so two
+# concurrent --fork runs cannot both rm -rf and copy into the same target.
+_fork_copy_tree() {
+  local src="$1" dst="$2" lock rc=0
+  mkdir -p "$CLEAT_FORKS_DIR" || return 1
+  # Never rm -rf outside the forks dir, whatever the caller passes.
+  case "$dst" in
+    "$CLEAT_FORKS_DIR"/?*) : ;;
+    *) error "Refusing to write a fork outside ${CLEAT_FORKS_DIR/#${HOME}/~}"; return 1 ;;
+  esac
+  [[ -d "$src" ]] || { error "Fork source is not a directory: $src"; return 1; }
+  lock="$CLEAT_FORKS_DIR/.lock.$(basename "$dst")"
+  if ! mkdir "$lock" 2>/dev/null; then
+    error "Another cleat is already copying this workspace."
+    echo -e "    ${DIM}If nothing else is running, remove ${BOLD}${lock/#${HOME}/~}${RESET}${DIM} and retry.${RESET}"
+    return 1
+  fi
+  _fork_copy_tree_locked "$src" "$dst" || rc=$?
+  rmdir "$lock" 2>/dev/null || true
+  return "$rc"
+}
+
+_fork_copy_tree_locked() {
+  local src="$1" dst="$2" tmp cpflags rc=0
+  tmp="$CLEAT_FORKS_DIR/.tmp.$$"
+  rm -rf "$tmp" || return 1
+  mkdir -p "$tmp" || return 1
+  cpflags="$(_fork_cp_flags)"
+  # shellcheck disable=SC2086
+  cp $cpflags "$src/." "$tmp/" || rc=$?
+  if [[ $rc -ne 0 ]]; then rm -rf "$tmp"; return "$rc"; fi
+  rm -rf "$dst" || { rm -rf "$tmp"; return 1; }
+  mv "$tmp" "$dst" || { rm -rf "$tmp"; return 1; }
+  return 0
+}
+
+# Prune configured excludes AFTER the copy. cp has no --exclude, and rsync
+# would lose clonefile on macOS, so copy-everything-then-prune keeps one code
+# path and keeps CoW. Paths are refused if absolute or containing '..': an
+# exclude must never be able to delete outside the fork.
+_fork_prune_excludes() {
+  local dst="$1" project="$2" e _root _parent _target
+  _root="$(cd -P "$dst" 2>/dev/null && pwd -P)" || return 0
+  while IFS= read -r e; do
+    [[ -n "$e" ]] || continue
+    # Cheap syntactic refusals first.
+    case "$e" in
+      /*|*..*) warn "Ignoring unsafe [fork] exclude: $e"; continue ;;
+    esac
+    # Then the one that actually matters. `rm -rf` follows every INTERMEDIATE
+    # symlink component, and the copy deliberately preserves symlinks, so an
+    # exclude that is neither absolute nor traversing can still reach outside
+    # the fork: a project containing `docs -> ~/Documents` plus
+    # `exclude = docs/thesis.txt` would delete the real host file. Resolve the
+    # PHYSICAL parent and require it to sit inside the fork. cd -P plus pwd -P
+    # is the portable resolver here: macOS has no realpath in the base system.
+    _target="$dst/$e"
+    _parent="$(cd -P "$(dirname "$_target")" 2>/dev/null && pwd -P)" || continue
+    case "$_parent" in
+      "$_root"|"$_root"/*) ;;
+      *) warn "Ignoring [fork] exclude that resolves outside the fork: $e"; continue ;;
+    esac
+    # The leaf itself must not be a symlink either: removing it is fine, but
+    # only the link, never through it.
+    rm -rf "$_parent/$(basename "$_target")"
+  done < <(_read_section_all_from_file "$project/.cleat" fork exclude)
 }
 
 # ── Workspace trust ─────────────────────────────────────────────────────────
@@ -6081,8 +6265,44 @@ cmd_run() {
   _generate_home_overlay "$cname" "$project" "$project_session_key"
   local home_overlay="$CLEAT_RUN_DIR/${cname}/home"
 
+  # ── Forked workspace ──────────────────────────────────────────────────────
+  # A fork box mounts its own COPY at /workspace. $project stays the real path
+  # everywhere else, so naming, trust, caps and kits are untouched.
+  local _workspace="$project"
+  local _fork_path=""
+  if [[ "${_FORK_REQUESTED:-false}" == true ]] && ! _box_is_fork "$cname"; then
+    _fork_path="$(_fork_dir "$cname")"
+    # Refuse to fork a directory that already lives under the forks dir: a fork
+    # of a fork nests copies without bound.
+    case "$project/" in
+      "$CLEAT_FORKS_DIR"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
+    esac
+    info "Copying workspace..."
+    if ! _fork_copy_tree "$project" "$_fork_path"; then
+      rm -rf "$_fork_path"
+      error "Could not copy the workspace. The fork was not created."
+      echo -e "    ${DIM}An unreadable file in the project will do this. Fix it, or exclude it with a [fork] exclude line in .cleat.${RESET}"
+      exit 1
+    fi
+    _fork_prune_excludes "$_fork_path" "$project"
+    _fork_mark "$cname"
+  fi
+  if _box_is_fork "$cname"; then
+    _fork_path="$(_fork_dir "$cname")"
+    # The marker says this box is a fork. If the copy is gone we must NOT fall
+    # back to the live tree: that is the silent re-bind this marker exists to
+    # prevent. Refuse and tell the user how to resolve it.
+    if [[ ! -d "$_fork_path" ]]; then
+      error "This box is a fork but its workspace copy is missing."
+      echo -e "    ${DIM}Expected: ${_fork_path/#${HOME}/~}${RESET}"
+      echo -e "    ${DIM}Recreate it with ${BOLD}cleat rm ${_BOX} && cleat run ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
+      exit 1
+    fi
+    _workspace="$_fork_path"
+  fi
+
   local mount_args=(
-    -v "$project":/workspace
+    -v "$_workspace":/workspace
     -v "${HOME}/.claude:/home/coder/.claude"
     -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
     -v "$home_overlay/projects:/home/coder/.claude/projects:ro"
@@ -6116,9 +6336,12 @@ cmd_run() {
   # Without an overlay, project .claude/settings*.json files are visible via the
   # workspace bind mount and Claude Code would try to run host commands (like
   # osascript) inside the container where they don't exist.
-  if [[ -d "$project/.claude" ]]; then
+  # Guard on the WORKSPACE, not the project: for a fork box the nested mount
+  # target lives inside the copy, and a copy without .claude would fail the
+  # mount on macOS VirtioFS with an opaque "create mountpoint" error.
+  if [[ -d "$_workspace/.claude" ]]; then
     local pf
-    for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+    for pf in "$_workspace/.claude/settings.json" "$_workspace/.claude/settings.local.json"; do
       [[ -f "$pf" ]] || continue
       local _base _overlay_name
       _base="$(basename "$pf")"
@@ -6196,8 +6419,11 @@ cmd_run() {
   local docker_args=()
   if cap_is_active docker; then
     mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
-    mount_args+=(-v "$project:$project")
-    docker_args+=(--workdir "$project" -e "CLEAT_HOST_PROJECT=$project")
+    # A fork box must expose its COPY at the host path, never the live tree:
+    # mounting $project here would hand a fork box the real working directory
+    # read-write and point its workdir at it, cancelling the isolation.
+    mount_args+=(-v "$_workspace:$_workspace")
+    docker_args+=(--workdir "$_workspace" -e "CLEAT_HOST_PROJECT=$_workspace")
     # Session-dir unification: with the docker cap, workdir is the host path
     # (not /workspace), so Claude Code encodes its session directory from
     # that path ('/Users/marcin/proj' → 'projects/-Users-marcin-proj/')
@@ -6574,6 +6800,20 @@ cmd_rm() {
   # only ever describe'd or kitted.
   _box_desc_remove "$cname"
   _box_kit_remove "$cname"
+  # A fork's workspace copy is NOT removed here, deliberately. It can hold the
+  # only copy of hours of work, and for a project with no git at all there is
+  # no cheap "is anything unlanded" check to gate a delete on. Silently
+  # destroying it is the exact data loss Cleat exists to prevent. So `cleat rm`
+  # frees the container and leaves the workspace, keeping the marker so a later
+  # `cleat run <box>` picks the same fork back up.
+  if _box_is_fork "$cname"; then
+    local _fp
+    _fp="$(_fork_dir "$cname")"
+    if [[ -d "$_fp" ]]; then
+      info "Fork workspace kept: ${BOLD}${_fp/#${HOME}/~}${RESET}"
+      echo -e "    ${DIM}Re-running this box reuses it. Remove it yourself when you are done.${RESET}"
+    fi
+  fi
 }
 
 cmd_shell() {
@@ -6842,6 +7082,10 @@ cmd_stop_all() {
     for _bf in "$CLEAT_BOXES_DIR"/*; do
       [[ -f "$_bf" ]] || continue
       _bcn="$(basename "$_bf")"
+      # Per-box state files may carry a suffix (<cname>.fork). Strip it, or the
+      # basename never matches a container, the file is pruned, and a fork box
+      # silently reverts to mounting the LIVE tree on its next run.
+      _bcn="${_bcn%.fork}"
       if ! container_exists "$_bcn"; then rm -f "$_bf" 2>/dev/null || true; fi
     done
   fi
@@ -6984,7 +7228,10 @@ cmd_status() {
     _running="${_rest%%|*}"
     _src="${_rest#*|}"
     if [[ -z "$_b" || "$_b" == "<no value>" ]]; then _b="main"; fi
-    [[ "$_src" == "$project" ]] || continue
+    # A fork box mounts its own COPY at /workspace, so its mount source is the
+    # forks path, not the project path. Match that too, or every fork box
+    # silently vanishes from Boxes while still showing up in `cleat ps`.
+    [[ "$_src" == "$project" || "$_src" == "$(_fork_dir "$_n")" ]] || continue
     [[ "$_b" == "main" ]] && continue
     # A candidate from `docker ps -a` always exists, so running/stopped is the
     # only distinction: pass the inspect's State.Running and skip re-probing.
@@ -8007,6 +8254,10 @@ cmd_clean() {
     for _bf in "$CLEAT_BOXES_DIR"/*; do
       [[ -f "$_bf" ]] || continue
       _bcn="$(basename "$_bf")"
+      # Per-box state files may carry a suffix (<cname>.fork). Strip it, or the
+      # basename never matches a container, the file is pruned, and a fork box
+      # silently reverts to mounting the LIVE tree on its next run.
+      _bcn="${_bcn%.fork}"
       if ! container_exists "$_bcn"; then rm -f "$_bf" 2>/dev/null || true; fi
     done
   fi
@@ -10405,6 +10656,11 @@ parse_global_flags() {
       --trust-setup)
         _CLI_TRUST_SETUP=1
         shift
+        ;;
+      --fork)
+        _FORK_REQUESTED=true
+        shift
+        continue
         ;;
       --cap)
         if [[ -z "${2:-}" ]]; then

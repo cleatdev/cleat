@@ -64,6 +64,24 @@ jobs:
         run: |
           rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
+
+  # ── Mutation harness, its OWN job on purpose ────────────────────────────────
+  # It used to run as a second step inside test-linux. The suite alone reached
+  # 18m18s against that job's 20-minute cap, so every test added to the suite
+  # pushed CI toward timing out before it could catch anything. Splitting also
+  # runs the two in parallel, which cuts total wall clock rather than adding to
+  # it. The harness must never run concurrently with another copy of itself: it
+  # mutates bin/cleat in place and restores from a backup on exit.
+  mutation-linux:
+    name: mutation (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Bash version
+        run: bash --version
       - name: Mutation test the regression registry
         run: |
           rc=0; ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
@@ -129,6 +147,46 @@ jobs:
         run: |
           rc=0; /bin/bash ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/mutation.log"; exit "$rc"
+
+      # ── The Homebrew-coreutils macOS profile ────────────────────────────────
+      # Plenty of macOS developers put GNU coreutils ahead of the system tools
+      # (`brew install coreutils` plus gnubin on PATH). That host is Darwin but
+      # has GNU cp, which rejects -c with "invalid option". Any code that picks
+      # tool flags from `uname -s` breaks for exactly that profile, which is why
+      # the fork copy probes the cp BINARY instead. Nothing else in CI covers
+      # this combination: the ubuntu legs are GNU-on-Linux and the macOS legs
+      # are BSD-on-Darwin, so GNU-on-Darwin only exists here.
+      - name: Fork copy under GNU coreutils on macOS
+        run: |
+          brew install coreutils >/dev/null 2>&1 || true
+          GNUBIN="$(brew --prefix)/opt/coreutils/libexec/gnubin"
+          if [ ! -d "$GNUBIN" ]; then echo "gnubin not present, skipping"; exit 0; fi
+          export PATH="$GNUBIN:$PATH"
+          echo "cp is now: $(command -v cp)"
+          cp --version | head -1
+          rc=0; /bin/bash ./test/bats/bin/bats test/unit/fork.bats > "$RUNNER_TEMP/fork-gnu.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/fork-gnu.log"; exit "$rc"
+
+  # ── macOS Intel ─────────────────────────────────────────────────────────────
+  # macos-15 is Apple Silicon. Cleat's documented host matrix includes Intel
+  # Macs, and nothing else exercises them: the arch differences that have cost
+  # releases before were base-image ones (an arm64 box needed libicu72 that
+  # amd64 already had). Suite only, no mutation harness: the harness is covered
+  # on two runners already and this leg is about arch, not about test depth.
+  test-macos-intel:
+    name: test (macos intel, bash 3.2)
+    runs-on: macos-13
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Bash version and arch
+        run: /bin/bash --version | head -1; uname -m
+      - name: Run full BATS suite via /bin/bash
+        run: |
+          rc=0; /bin/bash ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/suite.log"; exit "$rc"
 
   # ── Integration tests against real Docker (Linux only, runners have it) ──
   test-integration:

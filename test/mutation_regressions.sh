@@ -209,7 +209,7 @@ try "v0.5.1_hook_replace" "hook overlay replaces command with forwarder"
 # v0.6.0 + v0.6.5: both guards must hold. Break BOTH the -d dir check and
 # the -f file skip so the overlay is mounted even when neither exists.
 cat > "$SED_TMP" << 'SED'
-s|if \[\[ -d "\$project/.claude" \]\]; then|if true; then|
+s|if \[\[ -d "\$_workspace/.claude" \]\]; then|if true; then|
 /\[\[ -f "\$pf" \]\] || continue/d
 SED
 try "v0.6.0_claude_guard" "skip project overlay when .claude/ missing"
@@ -394,7 +394,7 @@ try "v0.10.0_docker_cap_socket_mount" "docker cap mounts host socket"
 # $(pwd) inside Cleat resolves to a host-valid path. Remove the identity
 # mount; the path-remapping guard should fail.
 cat > "$SED_TMP" << 'SED'
-/mount_args+=(-v "\$project:\$project")/d
+/mount_args+=(-v "\$_workspace:\$_workspace")/d
 SED
 try "v0.10.0_docker_cap_identity_mount" "docker cap mounts project at host path with workdir"
 
@@ -828,7 +828,7 @@ try "boxes_rm_removes_desc_unconditional" "removes the description even when no 
 # project (guards the cross-project hash-substring collision). Drop the check;
 # a sibling project's container would then surface as a phantom box.
 cat > "$SED_TMP" << 'SED'
-/\[\[ "\$_src" == "\$project" \]\] || continue/d
+/\[\[ "\$_src" == "\$project" || "\$_src" == "\$(_fork_dir "\$_n")" \]\] || continue/d
 SED
 try "boxes_status_mount_source_guard" "ignores a container whose /workspace mount is a different project" "$CLI" "$BOXES_BATS"
 
@@ -2510,6 +2510,81 @@ cat > "$SED_TMP" << 'SED'
 s|-v "$home_overlay/projects:/home/coder/.claude/projects:ro"|-v "${HOME}/.claude/projects:/home/coder/.claude/projects"|
 SED
 try "containment_no_cross_project_read" "cannot read another project" "$CLI" "$REGRESSIONS"
+
+FORK_BATS="$REPO_ROOT/test/unit/fork.bats"
+
+# FORK SYMLINK DEREF: the copy must NOT follow symlinks. Add -L and a project
+# containing keys -> ~/.ssh materialises real key bytes into the cage's copy.
+cat > "$SED_TMP" << 'SED'
+s@_FORK_CP_FLAGS="-R -d --reflink=auto"@_FORK_CP_FLAGS="-RL --reflink=auto"@
+s@_FORK_CP_FLAGS="-R -d"@_FORK_CP_FLAGS="-RL"@
+s@_FORK_CP_FLAGS="-Rc"@_FORK_CP_FLAGS="-RLc"@
+SED
+try "fork_no_symlink_deref" "symlink inside the project is copied as a symlink" "$CLI" "$FORK_BATS"
+
+# FORK WORKSPACE SWAP: the whole feature is this one mount. Point it back at
+# the live tree and the fork box edits the real repo.
+cat > "$SED_TMP" << 'SED'
+s|    -v "$_workspace":/workspace|    -v "$project":/workspace|
+SED
+try "fork_workspace_mount" "cmd_run mounts the copy at workspace" "$CLI" "$FORK_BATS"
+
+# FORK DOCKER CAP: with the docker cap the box also gets the workspace at its
+# host path. Restore $project there and a fork box gets the REAL tree back.
+cat > "$SED_TMP" << 'SED'
+s|    mount_args+=(-v "$_workspace:$_workspace")|    mount_args+=(-v "$project:$project")|
+SED
+try "fork_docker_cap_real_tree" "docker cap exposes the copy" "$CLI" "$FORK_BATS"
+
+# FORK MISSING COPY: a fork box whose copy vanished must REFUSE. Fall back to
+# the live tree instead and the box silently edits the real repo, with a
+# success message. Drop the refusal.
+cat > "$SED_TMP" << 'SED'
+s@if \[\[ ! -d "$_fork_path" \]\]; then@if false; then@
+SED
+try "fork_missing_copy_refuses" "copy is missing refuses" "$CLI" "$FORK_BATS"
+
+# FORK EXCLUDE SAFETY: an absolute or traversing exclude must be refused, or a
+# .cleat in a cloned repo can delete outside the fork.
+cat > "$SED_TMP" << 'SED'
+s@warn "Ignoring unsafe \[fork\] exclude: $e"; continue@:@
+SED
+try "fork_exclude_path_safety" "traversing exclude is refused" "$CLI" "$FORK_BATS"
+
+# FORK EXCLUDE PRUNE: excludes must actually be removed from the copy.
+cat > "$SED_TMP" << 'SED'
+s@    rm -rf "$_parent/$(basename "$_target")"@    :@
+SED
+try "fork_exclude_prune" "configured excludes are pruned" "$CLI" "$FORK_BATS"
+
+# FORK STATUS DISCOVERY: a fork box mounts the forks path, so status must match
+# it too or every fork box vanishes from Boxes.
+cat > "$SED_TMP" << 'SED'
+s@ || "$_src" == "$(_fork_dir "$_n")"@@
+SED
+try "fork_status_discovery" "a fork box is listed by cleat status" "$CLI" "$FORK_BATS"
+
+# FORK SOURCE FORM: "$src/." into a created dst is the only form that survives
+# a PROJECT ROOT that is itself a symlink. `cp ... "$src" "$dst"` copies the
+# LINK, so the fork becomes an alias for the live tree and the feature voids.
+cat > "$SED_TMP" << 'SED'
+s@cp $cpflags "$src/." "$tmp/"@cp $cpflags "$src" "$tmp"@
+SED
+try "fork_source_form_symlink_root" "symlinked project root produces a real copy" "$CLI" "$FORK_BATS"
+
+# FORK DEST GUARD: the copy must never rm -rf outside the forks dir, whatever
+# the caller passes.
+cat > "$SED_TMP" << 'SED'
+s@    \*) error "Refusing to write a fork outside@    ignoreme) error "Refusing to write a fork outside@
+SED
+try "fork_dest_outside_guard" "refuses a destination outside the forks dir" "$CLI" "$FORK_BATS"
+
+# FORK COPY LOCK: two concurrent --fork runs must not both rm -rf and copy into
+# the same destination.
+cat > "$SED_TMP" << 'SED'
+s@  if ! mkdir "$lock" 2>/dev/null; then@  if false; then@
+SED
+try "fork_copy_lock" "second concurrent copy is refused" "$CLI" "$FORK_BATS"
 
 # KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
 # content, first and byte-for-byte. Drop the user-content copy (truncate

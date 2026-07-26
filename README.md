@@ -281,6 +281,29 @@ not your Claude login.
 
 ### Kits: curated Claude pre-configurations, per box
 
+### Forked workspaces
+
+A box normally shares your live project directory. `--fork` gives it its own
+copy, so an agent can work without touching your tree.
+
+```bash
+cleat run feat-a --fork    # its own copy of the project
+cleat run feat-b --fork    # another one, independent
+```
+
+Run it a few times and you have several agents on the same project, each in its
+own container on its own copy, with nothing shared between them. The flag is
+only needed when the box is created.
+
+It is a copy rather than a git clone, so submodules, untracked sibling repos,
+uncommitted work and `node_modules` all come along, and a project with no git
+works the same way. On macOS the copy is copy-on-write, so it is close to
+instant and costs almost no disk until something changes. Exclude what you do
+not want with `[fork] exclude = node_modules` in `.cleat`.
+
+`cleat rm <box>` frees the container and keeps the copy, since it may hold the
+only version of the work.
+
 A **kit** is a curated Claude Code setup (a CLAUDE.md policy plus custom
 subagents) that you enable for one box with one command. The flagship kit,
 `plan-big-execute-small`, adapts the coordinator pattern from

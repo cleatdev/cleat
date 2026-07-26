@@ -2236,6 +2236,14 @@ _ensure_kit_mask_targets() {
   touch "${HOME}/.claude/CLAUDE.md"
   mkdir -p "${HOME}/.claude/agents" "${HOME}/.claude/commands" \
            "${HOME}/.claude/skills" "${HOME}/.claude/plugins"
+  # Containment targets. Same VirtioFS rule: the nested mount's target must
+  # exist inside the parent bind source. These are only mountpoints, and the
+  # host content behind them is never mounted into the box.
+  local _p
+  for _p in $_CLAUDE_PRIVATE_DIRS; do
+    [[ -L "${HOME}/.claude/$_p" && ! -e "${HOME}/.claude/$_p" ]] && continue
+    mkdir -p "${HOME}/.claude/$_p" 2>/dev/null || true
+  done
 }
 
 # (Re)generate the kit overlay content for a box: the three surfaces masked
@@ -2414,6 +2422,68 @@ _generate_kit_overlay() {
     cp "$_f" "$kit_dir/agents/$_base"
   done
   rm -rf "$stage"
+}
+
+# ── ~/.claude containment (concept/34 Follow-up 13) ─────────────────────────
+#
+# The base ~/.claude bind is read-write and carries auth, so everything not
+# explicitly handled passes through to the HOST. That leaked far more than
+# instructions. Measured on the maintainer's machine 2026-07-25: projects/ held
+# 976 MB across 24 directories, one per project ever run under Claude Code, and
+# file-history/ held 185 MB of versioned file snapshots with content from at
+# least four unrelated projects. A caged agent could read all of it.
+#
+# Two different shapes are needed, and the distinction is the whole design:
+#
+#   * A :ro self-mask (what plugins uses) blocks WRITES but not READS. Measured:
+#     with the host projects/ masked over itself :ro, a sibling project's
+#     transcript was still fully readable. So :ro is useless against disclosure.
+#   * A GENERATED replacement blocks both, because the host content is simply
+#     never mounted. That is what these dirs get.
+#
+# Per-box private dirs: the box gets its own empty, writable copy. Nothing to
+# read from other projects, nothing that outlives `cleat rm`. These hold
+# cross-project data with no reason to be shared into a cage.
+_CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots sessions tasks jobs"
+
+# Build the per-box replacement content for the containment mounts. Same
+# regeneration rail as the kit overlay (create/start/resume), so adding a
+# session key is never a container recreate. Cheap: these are empty dirs, not
+# copies, so there is no per-start IO proportional to the host's 1.1 GB.
+_generate_home_overlay() {
+  local cname="$1" project="$2" session_key="$3"
+  local home_dir="$CLEAT_RUN_DIR/${cname}/home"
+  local _d
+
+  for _d in $_CLAUDE_PRIVATE_DIRS; do
+    # Self-heal a wrong type (file or symlink where the dir goes), matching
+    # _generate_kit_overlay. A symlink here would make the box write through
+    # to whatever it points at.
+    [[ -L "$home_dir/$_d" || -f "$home_dir/$_d" ]] && rm -f "$home_dir/$_d"
+    mkdir -p "$home_dir/$_d"
+  done
+
+  # projects/: a generated parent holding ONLY this project's session keys as
+  # empty mountpoints. Masked :ro so the agent cannot create a sibling key, with
+  # the real session dir mounted read-write INSIDE it so --continue and --resume
+  # keep working. Both keys are always created: '-workspace' is the normal CWD
+  # encoding, and the host-path key is what Claude Code derives when the docker
+  # cap moves the workdir (see the docker cap block). Creating the second
+  # unconditionally costs an empty dir and keeps this independent of cap order.
+  [[ -L "$home_dir/projects" || -f "$home_dir/projects" ]] && rm -f "$home_dir/projects"
+  mkdir -p "$home_dir/projects/-workspace"
+  mkdir -p "$home_dir/projects/${project//\//-}"
+  # Drop stale keys from a previous project path so the box never sees a
+  # mountpoint it no longer owns.
+  local _k
+  for _k in "$home_dir/projects"/*; do
+    [[ -d "$_k" ]] || continue
+    case "${_k##*/}" in
+      -workspace|"${project//\//-}") ;;
+      *) rmdir "$_k" 2>/dev/null || true ;;
+    esac
+  done
+  : "$session_key"
 }
 
 # ── Workspace trust ─────────────────────────────────────────────────────────
@@ -6005,10 +6075,17 @@ cmd_run() {
   # dies with a clear remedy on a broken symlink. See _ensure_kit_mask_targets.
   _ensure_kit_mask_targets
 
+  # Per-box replacements for the cross-project surfaces. See
+  # _generate_home_overlay: a :ro self-mask would block writes but not reads,
+  # so these are generated empties, never the host content.
+  _generate_home_overlay "$cname" "$project" "$project_session_key"
+  local home_overlay="$CLEAT_RUN_DIR/${cname}/home"
+
   local mount_args=(
     -v "$project":/workspace
     -v "${HOME}/.claude:/home/coder/.claude"
     -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
+    -v "$home_overlay/projects:/home/coder/.claude/projects:ro"
     -v "${project_session_dir}:/home/coder/.claude/projects/-workspace"
     -v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"
     -v "$CLEAT_RUN_DIR/${cname}/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro"
@@ -6018,6 +6095,13 @@ cmd_run() {
     -v "${HOME}/.claude/plugins:/home/coder/.claude/plugins:ro"
     -v "$clip_dir":/tmp/cleat-clip
   )
+
+  # Per-box private dirs, read-write so Claude Code can use them normally, but
+  # backed by this box's own empty directory instead of the shared host one.
+  local _pd
+  for _pd in $_CLAUDE_PRIVATE_DIRS; do
+    mount_args+=(-v "$home_overlay/$_pd:/home/coder/.claude/$_pd")
+  done
 
   # ── hooks capability: shared directory for event forwarding to host bridge
   if cap_is_active hooks; then

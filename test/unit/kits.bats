@@ -1360,3 +1360,82 @@ ssh"
   run cmd_nuke <<< "nuke"
   [ ! -d "$CLEAT_KITS_DIR" ]
 }
+
+# ── ~/.claude containment (concept/34 Follow-up 13) ──────────────────────────
+
+@test "containment: cmd_run masks the projects dir with a generated parent" {
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # the generated parent is mounted read-only, so the agent cannot create a
+  # sibling project key
+  run assert_docker_run_has "$CNAME" "$CNAME/home/projects:/home/coder/.claude/projects:ro"
+  assert_success
+  # and the HOST projects dir is never mounted at that path
+  run assert_docker_run_lacks "$CNAME" "$HOME/.claude/projects:/home/coder/.claude/projects"
+  assert_success
+}
+
+@test "containment: this box's own session dir stays writable inside the masked parent" {
+  # --continue and --resume depend on it. A read-only parent with a writable
+  # child is a verified Docker shape, so the mask must not cost the session.
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$CNAME" ":/home/coder/.claude/projects/-workspace"
+  assert_success
+  run assert_docker_run_lacks "$CNAME" ":/home/coder/.claude/projects/-workspace:ro"
+  assert_success
+}
+
+@test "containment: cross-project dirs are backed by this box, not the host" {
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local d
+  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs; do
+    run assert_docker_run_has "$CNAME" "$CNAME/home/$d:/home/coder/.claude/$d"
+    assert_success
+    run assert_docker_run_lacks "$CNAME" "$HOME/.claude/$d:/home/coder/.claude/$d"
+    assert_success
+  done
+}
+
+@test "containment: the generated projects parent holds only this project's keys" {
+  # Seed a sibling project on the host WITH content. Without it the isolated
+  # test HOME has nothing to leak, so a mutation that seeds the overlay from
+  # the host would copy nothing and go MISSED. The file also matters: the
+  # prune loop uses rmdir, which cannot remove a non-empty leaked directory.
+  mkdir -p "$HOME/.claude/projects/-Users-someone-other-project"
+  echo "SECRET" > "$HOME/.claude/projects/-Users-someone-other-project/t.jsonl"
+  _generate_home_overlay "$CNAME" "/Users/someone/myproj" "key-abc"
+  run bash -c "ls -A \"$CLEAT_RUN_DIR/$CNAME/home/projects\" | sort | tr '\n' ' '"
+  assert_output "-Users-someone-myproj -workspace "
+}
+
+@test "containment: regen prunes a session key the box no longer owns" {
+  _generate_home_overlay "$CNAME" "/Users/someone/myproj" "key-abc"
+  mkdir -p "$CLEAT_RUN_DIR/$CNAME/home/projects/-Users-someone-OTHER"
+  _generate_home_overlay "$CNAME" "/Users/someone/myproj" "key-abc"
+  [ ! -e "$CLEAT_RUN_DIR/$CNAME/home/projects/-Users-someone-OTHER" ]
+}
+
+@test "containment: host mask targets are pre-created for virtiofs" {
+  local d
+  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs; do
+    rm -rf "$HOME/.claude/$d"
+  done
+  run _ensure_kit_mask_targets
+  assert_success
+  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs; do
+    [ -d "$HOME/.claude/$d" ] || { echo "missing host target: $d"; return 1; }
+  done
+}
+
+@test "containment: a wrong-type overlay entry is self-healed, not written through" {
+  mkdir -p "$CLEAT_RUN_DIR/$CNAME/home"
+  ln -s "$TEST_TEMP" "$CLEAT_RUN_DIR/$CNAME/home/file-history"
+  _generate_home_overlay "$CNAME" "/Users/someone/myproj" "key-abc"
+  [ ! -L "$CLEAT_RUN_DIR/$CNAME/home/file-history" ]
+  [ -d "$CLEAT_RUN_DIR/$CNAME/home/file-history" ]
+}

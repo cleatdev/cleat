@@ -2461,6 +2461,56 @@ s|/home/coder/.claude/commands /home/coder/.claude/skills \\|/home/coder/.claude
 SED
 try "kits_skills_recreate_note" "box missing the skills mask gets the recreate note" "$CLI" "$KITS_BATS"
 
+# CONTAINMENT PROJECTS MASK: without the generated parent, the HOST's
+# ~/.claude/projects passes through the base rw mount and every other project's
+# transcript is readable. Drop the mount: the mask test loses it.
+cat > "$SED_TMP" << 'SED'
+/-v "\$home_overlay\/projects:\/home\/coder\/\.claude\/projects:ro"/d
+SED
+try "containment_projects_mask" "cmd_run masks the projects dir with a generated parent" "$CLI" "$KITS_BATS"
+
+# CONTAINMENT PRIVATE DIRS: file-history alone held 185 MB of other projects'
+# file snapshots. Empty the registry: the per-box backing test finds no mounts.
+cat > "$SED_TMP" << 'SED'
+s|^_CLAUDE_PRIVATE_DIRS=.*|_CLAUDE_PRIVATE_DIRS=""|
+SED
+try "containment_private_dirs" "cross-project dirs are backed by this box" "$CLI" "$KITS_BATS"
+
+# CONTAINMENT KEY SCOPE: the generated parent must hold ONLY this project's
+# keys. Seed it from the host's projects dir instead: the scope test sees more.
+cat > "$SED_TMP" << 'SED'
+s|  mkdir -p "$home_dir/projects/-workspace"|  mkdir -p "$home_dir/projects/-workspace"; cp -R "${HOME}/.claude/projects/." "$home_dir/projects/" 2>/dev/null \|\| true|
+SED
+try "containment_key_scope" "generated projects parent holds only this project" "$CLI" "$KITS_BATS"
+
+# CONTAINMENT STALE KEY PRUNE: a key from a previous project path must not
+# linger as a mountpoint the box no longer owns. Drop the prune loop's rmdir.
+cat > "$SED_TMP" << 'SED'
+s|      \*) rmdir "$_k" 2>/dev/null \|\| true ;;|      *) : ;;|
+SED
+try "containment_stale_key_prune" "regen prunes a session key the box no longer owns" "$CLI" "$KITS_BATS"
+
+# CONTAINMENT VIRTIOFS TARGETS: a nested mount whose target is missing inside
+# the parent bind source fails on macOS. Drop the pre-create loop.
+cat > "$SED_TMP" << 'SED'
+/    mkdir -p "\${HOME}\/\.claude\/\$_p" 2>\/dev\/null || true/d
+SED
+try "containment_virtiofs_targets" "host mask targets are pre-created for virtiofs" "$CLI" "$KITS_BATS"
+
+# CONTAINMENT SELF HEAL: a symlink where an overlay dir belongs would make the
+# box write through to the link's target. Drop the -L half of the self-heal.
+cat > "$SED_TMP" << 'SED'
+s|\[\[ -L "$home_dir/$_d" \|\| -f "$home_dir/$_d" \]\]|[[ -f "$home_dir/$_d" ]]|
+SED
+try "containment_overlay_self_heal" "wrong-type overlay entry is self-healed" "$CLI" "$KITS_BATS"
+
+# CONTAINMENT REGRESSION: the transcripts of every other project must not be
+# reachable. Restore the host projects mount: the regression test fails.
+cat > "$SED_TMP" << 'SED'
+s|-v "$home_overlay/projects:/home/coder/.claude/projects:ro"|-v "${HOME}/.claude/projects:/home/coder/.claude/projects"|
+SED
+try "containment_no_cross_project_read" "cannot read another project" "$CLI" "$REGRESSIONS"
+
 # KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
 # content, first and byte-for-byte. Drop the user-content copy (truncate
 # instead): the merge test no longer sees the user's line at the top.

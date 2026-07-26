@@ -2881,3 +2881,32 @@ EOF
   run cat "$CLEAT_RUN_DIR/$cname/kit/skills/my-tool/SKILL.md"
   assert_output "the skill"
 }
+
+@test "regression: a caged agent cannot read another project's Claude transcripts" {
+  # Measured on the maintainer's machine 2026-07-25: ~/.claude/projects held
+  # 976 MB across 24 directories, one per project ever run under Claude Code,
+  # all readable and writable from inside any box, plus 185 MB of versioned
+  # file snapshots in file-history/ carrying content from unrelated projects.
+  # A :ro self-mask does NOT fix this: measured, it blocks writes while leaving
+  # a sibling transcript fully readable. The fix mounts a GENERATED parent
+  # holding only this project's keys, so the host content is never mounted.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  mkdir -p "$HOME/.claude/projects/-Users-someone-other-secret-project"
+  echo "OTHER PROJECT SECRET" > "$HOME/.claude/projects/-Users-someone-other-secret-project/t.jsonl"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # the host projects dir is never mounted onto the container path
+  run assert_docker_run_lacks "$cname" "$HOME/.claude/projects:/home/coder/.claude/projects"
+  assert_success
+  # a generated parent is mounted there instead, read-only
+  run assert_docker_run_has "$cname" "$cname/home/projects:/home/coder/.claude/projects:ro"
+  assert_success
+  # and it contains only this project's keys, so the sibling is not present
+  run bash -c "ls -A \"$CLEAT_RUN_DIR/$cname/home/projects\""
+  refute_output --partial "other-secret-project"
+}

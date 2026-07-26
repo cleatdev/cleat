@@ -322,7 +322,14 @@ on its own and can invoke it without you typing anything. Author those at
 project level (`.claude/agents/`, `.claude/commands/`, `.claude/skills/`)
 instead. Plugins you already have stay readable and usable in a box, but installing a
 new one from inside a box fails, because that directory is read-only. Install
-plugins on the host and every box sees them. The read-only copies
+plugins on the host and every box sees them. Other projects stay invisible: `~/.claude/projects` holds a full transcript of
+every project you have ever run Claude Code on, so a box gets a generated
+directory containing only its own project's sessions. Its own session stays
+writable, so `--continue` and `--resume` work normally. `file-history`,
+`paste-cache`, `uploads`, `backups`, `shell-snapshots`, `sessions`, `tasks` and
+`jobs` each become an empty per-box directory. What a box can still reach is
+the project you mounted plus your Claude login, which it needs to authenticate.
+The read-only copies
 dereference symlinks (a dotfile-repo `commands` dir shows up as real files in
 the box) while a symlink nested inside a skill is kept as a link, so a skill
 pointing at `~/.ssh` cannot pull real key bytes into the box. A broken

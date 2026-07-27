@@ -282,3 +282,34 @@ teardown() { _common_teardown; }
   # this box has GNU coreutils, so it must NOT have chosen the BSD clone flag
   refute_output --partial "-Rc"
 }
+
+@test "fork: an explicit fork flag recreates a copy that went missing" {
+  # The marker is written once the copy lands, so a first run whose container
+  # creation then failed left a marked box with no copy. Refusing there made
+  # the state unrecoverable. An explicit --fork must heal it.
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  rm -rf "$CLEAT_FORKS_DIR/$CNAME"
+  [ -f "$CLEAT_BOXES_DIR/$CNAME.fork" ]
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Copying workspace"
+  [ -d "$CLEAT_FORKS_DIR/$CNAME" ]
+}
+
+@test "fork: without the flag a missing copy still refuses, never re-binds" {
+  # The other half: resume and start must NOT silently heal, because a fork box
+  # quietly re-attaching to the live tree is the failure this guards.
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  rm -rf "$CLEAT_FORKS_DIR/$CNAME"
+  _FORK_REQUESTED=false
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "workspace copy is missing"
+}

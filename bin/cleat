@@ -6270,7 +6270,14 @@ cmd_run() {
   # everywhere else, so naming, trust, caps and kits are untouched.
   local _workspace="$project"
   local _fork_path=""
-  if [[ "${_FORK_REQUESTED:-false}" == true ]] && ! _box_is_fork "$cname"; then
+  # An explicit --fork ALWAYS ensures a copy exists. Guarding only on "is this
+  # already a fork" made an interrupted or failed first run unrecoverable: the
+  # marker is written once the copy lands, so a `docker run` that then failed
+  # left a marked box with no container, and the next `--fork` refused instead
+  # of healing. Refusing is right when the user did NOT ask for a fork (that is
+  # the silent re-bind guard below); it is wrong when they typed the flag.
+  if [[ "${_FORK_REQUESTED:-false}" == true ]] \
+     && { ! _box_is_fork "$cname" || [[ ! -d "$(_fork_dir "$cname")" ]]; }; then
     _fork_path="$(_fork_dir "$cname")"
     # Refuse to fork a directory that already lives under the forks dir: a fork
     # of a fork nests copies without bound.
@@ -6295,7 +6302,7 @@ cmd_run() {
     if [[ ! -d "$_fork_path" ]]; then
       error "This box is a fork but its workspace copy is missing."
       echo -e "    ${DIM}Expected: ${_fork_path/#${HOME}/~}${RESET}"
-      echo -e "    ${DIM}Recreate it with ${BOLD}cleat rm ${_BOX} && cleat run ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
+      echo -e "    ${DIM}Recreate it with ${BOLD}cleat run ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
       exit 1
     fi
     _workspace="$_fork_path"

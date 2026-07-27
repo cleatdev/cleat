@@ -287,8 +287,8 @@ A box normally shares your live project directory. `--fork` gives it its own
 copy, so an agent can work without touching your tree.
 
 ```bash
-cleat run feat-a --fork    # its own copy of the project
-cleat run feat-b --fork    # another one, independent
+cleat start feat-a --fork    # its own copy of the project
+cleat start feat-b --fork    # another one, independent
 ```
 
 Run it a few times and you have several agents on the same project, each in its

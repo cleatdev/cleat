@@ -6158,6 +6158,56 @@ cmd_run() {
   resolve_caps "$project"
   resolve_env_args "$project"
 
+  # ── Forked workspace ──────────────────────────────────────────────────────
+  # A fork box mounts its own COPY at /workspace. $project stays the real path
+  # everywhere else, so naming, trust, caps and kits are untouched.
+  local _workspace="$project"
+  local _fork_path=""
+  # An explicit --fork ALWAYS ensures a copy exists. Guarding only on "is this
+  # already a fork" made an interrupted or failed first run unrecoverable: the
+  # marker is written once the copy lands, so a `docker run` that then failed
+  # left a marked box with no container, and the next `--fork` refused instead
+  # of healing. Refusing is right when the user did NOT ask for a fork (that is
+  # the silent re-bind guard below); it is wrong when they typed the flag.
+  if [[ "${_FORK_REQUESTED:-false}" == true ]] \
+     && { ! _box_is_fork "$cname" || [[ ! -d "$(_fork_dir "$cname")" ]]; }; then
+    _fork_path="$(_fork_dir "$cname")"
+    # Refuse to fork a directory that already lives under the forks dir: a fork
+    # of a fork nests copies without bound.
+    case "$project/" in
+      "$CLEAT_FORKS_DIR"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
+    esac
+    # Its own spinner phase: the copy can take a moment on a filesystem
+    # without copy-on-write, and printing into an already-running spinner
+    # leaves a frozen glyph and two messages on one line.
+    local _copy_rc=0
+    spin "Copying workspace..."
+    _fork_copy_tree "$project" "$_fork_path" || _copy_rc=$?
+    spin_stop "$_copy_rc" "Workspace copied" "Workspace copy failed"
+    if [[ $_copy_rc -ne 0 ]]; then
+      rm -rf "$_fork_path"
+      error "Could not copy the workspace. The fork was not created."
+      echo -e "    ${DIM}An unreadable file in the project will do this. Fix it, or exclude it with a [fork] exclude line in .cleat.${RESET}"
+      exit 1
+    fi
+    _fork_prune_excludes "$_fork_path" "$project"
+    _fork_mark "$cname"
+  fi
+  if _box_is_fork "$cname"; then
+    _fork_path="$(_fork_dir "$cname")"
+    # The marker says this box is a fork. If the copy is gone we must NOT fall
+    # back to the live tree: that is the silent re-bind this marker exists to
+    # prevent. Refuse and tell the user how to resolve it.
+    if [[ ! -d "$_fork_path" ]]; then
+      error "This box is a fork but its workspace copy is missing."
+      echo -e "    ${DIM}Expected: ${_fork_path/#${HOME}/~}${RESET}"
+      echo -e "    ${DIM}Recreate it with ${BOLD}cleat start ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
+      exit 1
+    fi
+    _workspace="$_fork_path"
+  fi
+
+
   spin "Starting container..."
 
   # Clipboard bridge
@@ -6264,49 +6314,6 @@ cmd_run() {
   # so these are generated empties, never the host content.
   _generate_home_overlay "$cname" "$project" "$project_session_key"
   local home_overlay="$CLEAT_RUN_DIR/${cname}/home"
-
-  # ── Forked workspace ──────────────────────────────────────────────────────
-  # A fork box mounts its own COPY at /workspace. $project stays the real path
-  # everywhere else, so naming, trust, caps and kits are untouched.
-  local _workspace="$project"
-  local _fork_path=""
-  # An explicit --fork ALWAYS ensures a copy exists. Guarding only on "is this
-  # already a fork" made an interrupted or failed first run unrecoverable: the
-  # marker is written once the copy lands, so a `docker run` that then failed
-  # left a marked box with no container, and the next `--fork` refused instead
-  # of healing. Refusing is right when the user did NOT ask for a fork (that is
-  # the silent re-bind guard below); it is wrong when they typed the flag.
-  if [[ "${_FORK_REQUESTED:-false}" == true ]] \
-     && { ! _box_is_fork "$cname" || [[ ! -d "$(_fork_dir "$cname")" ]]; }; then
-    _fork_path="$(_fork_dir "$cname")"
-    # Refuse to fork a directory that already lives under the forks dir: a fork
-    # of a fork nests copies without bound.
-    case "$project/" in
-      "$CLEAT_FORKS_DIR"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
-    esac
-    info "Copying workspace..."
-    if ! _fork_copy_tree "$project" "$_fork_path"; then
-      rm -rf "$_fork_path"
-      error "Could not copy the workspace. The fork was not created."
-      echo -e "    ${DIM}An unreadable file in the project will do this. Fix it, or exclude it with a [fork] exclude line in .cleat.${RESET}"
-      exit 1
-    fi
-    _fork_prune_excludes "$_fork_path" "$project"
-    _fork_mark "$cname"
-  fi
-  if _box_is_fork "$cname"; then
-    _fork_path="$(_fork_dir "$cname")"
-    # The marker says this box is a fork. If the copy is gone we must NOT fall
-    # back to the live tree: that is the silent re-bind this marker exists to
-    # prevent. Refuse and tell the user how to resolve it.
-    if [[ ! -d "$_fork_path" ]]; then
-      error "This box is a fork but its workspace copy is missing."
-      echo -e "    ${DIM}Expected: ${_fork_path/#${HOME}/~}${RESET}"
-      echo -e "    ${DIM}Recreate it with ${BOLD}cleat run ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
-      exit 1
-    fi
-    _workspace="$_fork_path"
-  fi
 
   local mount_args=(
     -v "$_workspace":/workspace

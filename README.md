@@ -301,6 +301,11 @@ works the same way. On macOS the copy is copy-on-write, so it is close to
 instant and costs almost no disk until something changes. Exclude what you do
 not want with `[fork] exclude = node_modules` in `.cleat`.
 
+The launch summary names the copy and how old it is, so a stale fork is never
+silent. Move the fork root with `[fork] dir` in your global config
+(`~/.config/cleat/config`) if your projects live on another volume: copy-on-write
+only works within a volume.
+
 `cleat rm <box>` frees the container and keeps the copy, since it may hold the
 only version of the work.
 

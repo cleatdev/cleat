@@ -2586,6 +2586,31 @@ s@  if ! mkdir "$lock" 2>/dev/null; then@  if false; then@
 SED
 try "fork_copy_lock" "second concurrent copy is refused" "$CLI" "$FORK_BATS"
 
+# FORK PREFLIGHT ON RESUME: cmd_resume only re-checks bind sources when the
+# container is STOPPED, so a RUNNING fork box whose copy was deleted reached
+# exec_claude and reported success on an empty workspace. Drop the preflight
+# call from cmd_resume: the running-box refusal test fails.
+cat > "$SED_TMP" << 'SED'
+/^  _fork_preflight "\$cname"$/d
+SED
+try "fork_preflight_first_verb" "resume refuses when the copy is gone even if the box is running" "$CLI" "$FORK_BATS"
+
+# FORK PREFLIGHT REFUSAL: with the marker set and the copy gone, and no --fork,
+# the only safe answer is to refuse. Turn the refusal into a pass and a fork box
+# silently comes up on whatever Docker leaves at the mount point.
+cat > "$SED_TMP" << 'SED'
+s@  error "This box is a fork but its workspace copy is missing."@  return 0@
+SED
+try "fork_preflight_refuses" "resume refuses when the copy is gone even if the box is running" "$CLI" "$FORK_BATS"
+
+# FORK PREFLIGHT HEAL: an explicit --fork must rebuild rather than refuse. The
+# mount is baked at create, so healing requires dropping the container.
+cat > "$SED_TMP" << 'SED'
+s@    docker rm -f "$cname" > /dev/null 2>&1 || true@    :@
+s@    info "Fork workspace is missing, recreating it"@    error "no heal"; exit 1@
+SED
+try "fork_preflight_heals" "explicit fork flag heals a running box" "$CLI" "$FORK_BATS"
+
 # KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
 # content, first and byte-for-byte. Drop the user-content copy (truncate
 # instead): the merge test no longer sees the user's line at the top.

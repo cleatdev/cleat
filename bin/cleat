@@ -2520,6 +2520,34 @@ _box_is_fork()      { [[ -f "$(_fork_marker_file "$1")" ]]; }
 _fork_mark()        { mkdir -p "$CLEAT_BOXES_DIR"; : > "$(_fork_marker_file "$1")"; }
 _fork_unmark()      { rm -f "$(_fork_marker_file "$1")"; }
 
+# Every session verb must check this, not just cmd_run. The fork copy is a
+# HOST-side invariant: whether the container happens to be running says nothing
+# about whether its workspace still exists. cmd_resume only re-checks bind
+# sources when the container is stopped, so a running fork box whose copy was
+# deleted sailed straight through to exec_claude and came up on an empty (or
+# Docker-recreated) /workspace with a success message. That is the silent
+# re-bind this marker exists to prevent, reached by a different door.
+#
+# With an explicit --fork we heal instead of refusing: drop the container so the
+# normal create path rebuilds both the copy and the mount, which is baked in at
+# create and cannot be repointed on a running container.
+_fork_preflight() {
+  local cname="$1"
+  _box_is_fork "$cname" || return 0
+  local _fp
+  _fp="$(_fork_dir "$cname")"
+  [[ -d "$_fp" ]] && return 0
+  if [[ "${_FORK_REQUESTED:-false}" == true ]]; then
+    info "Fork workspace is missing, recreating it"
+    docker rm -f "$cname" > /dev/null 2>&1 || true
+    return 0
+  fi
+  error "This box is a fork but its workspace copy is missing."
+  echo -e "    ${DIM}Expected: ${_fp/#${HOME}/~}${RESET}"
+  echo -e "    ${DIM}Recreate it with ${BOLD}cleat start ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
+  exit 1
+}
+
 # Every value for a REPEATED key in a section, one per line. The existing
 # _read_section_from_file returns the first match only, which is right for
 # `memory = 8g` and wrong for `exclude = node_modules` repeated N times.
@@ -6539,6 +6567,7 @@ cmd_start() {
   _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project" "$box")"
+  _fork_preflight "$cname"
 
   # Resolve caps early for startup output and drift detection
   resolve_caps "$project"
@@ -6650,6 +6679,7 @@ cmd_resume() {
   _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project" "$box")"
+  _fork_preflight "$cname"
 
   # Resolve caps for startup output and drift detection
   resolve_caps "$project"
@@ -6836,6 +6866,7 @@ cmd_shell() {
   box="${_BOX:-main}"
   local cname
   cname="$(container_name_for "$project" "$box")"
+  _fork_preflight "$cname"
 
   require_running "$cname"
   _wait_for_coder_remap "$cname"
@@ -6889,6 +6920,7 @@ cmd_login() {
   box="${_BOX:-main}"
   local cname
   cname="$(container_name_for "$project" "$box")"
+  _fork_preflight "$cname"
 
   require_running "$cname"
   _wait_for_coder_remap "$cname"

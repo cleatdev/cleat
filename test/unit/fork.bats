@@ -313,3 +313,62 @@ teardown() { _common_teardown; }
   assert_failure
   assert_output --partial "workspace copy is missing"
 }
+
+# ── the guard must hold on every session verb, not just cmd_run ─────────────
+# Found on a real macOS run: cmd_resume only re-checks bind sources when the
+# container is STOPPED, so a RUNNING fork box whose copy had been deleted went
+# straight to exec_claude and reported success on an empty workspace.
+
+@test "fork: resume refuses when the copy is gone even if the box is running" {
+  mkdir -p "$CLEAT_BOXES_DIR"; : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  is_running() { return 0; }
+  container_exists() { return 0; }
+  _FORK_REQUESTED=false
+  run cmd_resume "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "workspace copy is missing"
+}
+
+@test "fork: start refuses when the copy is gone even if the box is running" {
+  mkdir -p "$CLEAT_BOXES_DIR"; : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  is_running() { return 0; }
+  container_exists() { return 0; }
+  _FORK_REQUESTED=false
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "workspace copy is missing"
+}
+
+@test "fork: shell refuses when the copy is gone even if the box is running" {
+  mkdir -p "$CLEAT_BOXES_DIR"; : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  is_running() { return 0; }
+  container_exists() { return 0; }
+  _FORK_REQUESTED=false
+  run cmd_shell "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "workspace copy is missing"
+}
+
+@test "fork: an explicit fork flag heals a running box by recreating it" {
+  # The mount is baked at create and cannot be repointed on a live container,
+  # so healing has to drop the container and let the create path rebuild both.
+  mkdir -p "$CLEAT_BOXES_DIR"; : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  _FORK_REQUESTED=true
+  run _fork_preflight "$CNAME"
+  assert_success
+  assert_output --partial "recreating it"
+}
+
+@test "fork: a healthy fork box passes preflight silently" {
+  mkdir -p "$CLEAT_BOXES_DIR" "$CLEAT_FORKS_DIR/$CNAME"
+  : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  run _fork_preflight "$CNAME"
+  assert_success
+  assert_output ""
+}
+
+@test "fork: a plain box is unaffected by preflight" {
+  run _fork_preflight "$CNAME"
+  assert_success
+  assert_output ""
+}

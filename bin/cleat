@@ -2506,7 +2506,55 @@ _generate_home_overlay() {
 # On APFS `cp -c` clones blocks copy-on-write, measured at 0.005s for 50 MB on
 # the maintainer's machine, so "copy everything" is nearly free AND saves the
 # caged agent an `npm install`.
-_fork_dir() { printf '%s\n' "$CLEAT_FORKS_DIR/$1"; }
+# Where fork copies live. Overridable with `[fork] dir` in the GLOBAL config
+# (~/.config/cleat/config), and DELIBERATELY not from a project's .cleat: that
+# file arrives with cloned repos and this value is a path Cleat creates and
+# later removes under. The global config is written by the user, so it needs no
+# trust gate.
+#
+# The default sits under $CLEAT_CONFIG_DIR next to run/, boxes/ and kits/. Two
+# reasons someone would move it. XDG says variable data belongs in
+# $XDG_DATA_HOME rather than a config dir, which is a fair reading. And
+# copy-on-write only works WITHIN a volume, so a project on an external drive
+# gets a full byte copy unless the fork root is on that drive too.
+_fork_root() {
+  local d
+  d="$(_read_section_from_file "$CLEAT_GLOBAL_CONFIG" fork dir 2>/dev/null || true)"
+  if [[ -n "$d" ]]; then
+    case "$d" in
+      "~"/*) d="${HOME}/${d#"~/"}" ;;
+    esac
+    # Absolute only. A relative fork root would resolve against whatever
+    # directory the user happened to run cleat from.
+    case "$d" in
+      /?*) printf '%s\n' "${d%/}"; return 0 ;;
+      *) warn "Ignoring [fork] dir, not an absolute path: $d" ;;
+    esac
+  fi
+  printf '%s\n' "$CLEAT_FORKS_DIR"
+}
+
+_fork_dir() { printf '%s\n' "$(_fork_root)/$1"; }
+
+# How long ago the copy was taken. The fork directory's own mtime is the
+# timestamp, so there is no extra state to write or keep in sync.
+_fork_age_human() {
+  local dir="$1" now mt delta
+  [[ -d "$dir" ]] || return 0
+  mt="$(_path_mtime "$dir")"
+  [[ "$mt" =~ ^[0-9]+$ ]] && [[ "$mt" -gt 0 ]] || return 0
+  now="$(date +%s 2>/dev/null || echo 0)"
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+  delta=$(( now - mt ))
+  # A copy taken this second, or a clock that moved backwards, is "just now"
+  # rather than nothing at all: an empty age would silently drop the whole line.
+  (( delta < 0 )) && delta=0
+  if   (( delta < 90 ));    then printf 'just now'
+  elif (( delta < 5400 ));  then printf '%dm ago' $(( delta / 60 ))
+  elif (( delta < 172800 ));then printf '%dh ago' $(( delta / 3600 ))
+  else                           printf '%dd ago' $(( delta / 86400 ))
+  fi
+}
 
 # Whether a box is a fork is recorded SEPARATELY from the copy itself, in the
 # same per-box host state dir as the description. The copy's existence looks
@@ -2603,7 +2651,7 @@ _fork_cp_flags() {
       # ENOTSUP without changing the exit status, so no CoW retry is needed.
       # Probe acceptance of the flag rather than assuming it.
       _FORK_CP_FLAGS="-R"
-      _p="$CLEAT_FORKS_DIR/.cpprobe.$$"
+      _p="$(_fork_root)/.cpprobe.$$"
       rm -rf "$_p" 2>/dev/null || true
       if mkdir -p "$_p/s" "$_p/d" 2>/dev/null && : > "$_p/s/f" 2>/dev/null \
          && cp -Rc "$_p/s/." "$_p/d/" 2>/dev/null; then
@@ -2634,14 +2682,15 @@ _fork_cp_flags() {
 # concurrent --fork runs cannot both rm -rf and copy into the same target.
 _fork_copy_tree() {
   local src="$1" dst="$2" lock rc=0
-  mkdir -p "$CLEAT_FORKS_DIR" || return 1
-  # Never rm -rf outside the forks dir, whatever the caller passes.
+  local root; root="$(_fork_root)"
+  mkdir -p "$root" || return 1
+  # Never rm -rf outside the fork root, whatever the caller passes.
   case "$dst" in
-    "$CLEAT_FORKS_DIR"/?*) : ;;
-    *) error "Refusing to write a fork outside ${CLEAT_FORKS_DIR/#${HOME}/~}"; return 1 ;;
+    "$root"/?*) : ;;
+    *) error "Refusing to write a fork outside ${root/#${HOME}/~}"; return 1 ;;
   esac
   [[ -d "$src" ]] || { error "Fork source is not a directory: $src"; return 1; }
-  lock="$CLEAT_FORKS_DIR/.lock.$(basename "$dst")"
+  lock="$root/.lock.$(basename "$dst")"
   if ! mkdir "$lock" 2>/dev/null; then
     error "Another cleat is already copying this workspace."
     echo -e "    ${DIM}If nothing else is running, remove ${BOLD}${lock/#${HOME}/~}${RESET}${DIM} and retry.${RESET}"
@@ -2653,8 +2702,9 @@ _fork_copy_tree() {
 }
 
 _fork_copy_tree_locked() {
-  local src="$1" dst="$2" tmp cpflags rc=0
-  tmp="$CLEAT_FORKS_DIR/.tmp.$$"
+  local src="$1" dst="$2" tmp cpflags rc=0 root
+  root="$(_fork_root)"
+  tmp="$root/.tmp.$$"
   rm -rf "$tmp" || return 1
   mkdir -p "$tmp" || return 1
   cpflags="$(_fork_cp_flags)"
@@ -4164,6 +4214,20 @@ _print_summary_block() {
       echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
     fi
   fi
+    # A fork box works on a COPY, so printing only "Project: ~/foo" would be
+    # actively misleading: edits there do not touch that path. Show where the
+    # copy lives (landing the work needs the path) and how old it is, because a
+    # fork drifts from the project it was taken from and nothing else says so.
+    if _box_is_fork "$cname"; then
+      local _fp _age
+      _fp="$(_fork_dir "$cname")"
+      _age="$(_fork_age_human "$_fp")"
+      if [[ -n "$_age" ]]; then
+        echo -e "  ${DIM}Fork:${RESET}       ${_fp/#$HOME/~} ${DIM}(copied ${_age})${RESET}"
+      else
+        echo -e "  ${DIM}Fork:${RESET}       ${_fp/#$HOME/~}"
+      fi
+    fi
   # A box's personality must never be invisible: show the enabled kit. The
   # selection file is hand-editable, so print its content as DATA (%s), never
   # through echo -e (same convention as cmd_describe).
@@ -6203,7 +6267,7 @@ cmd_run() {
     # Refuse to fork a directory that already lives under the forks dir: a fork
     # of a fork nests copies without bound.
     case "$project/" in
-      "$CLEAT_FORKS_DIR"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
+      "$(_fork_root)"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
     esac
     # Its own spinner phase: the copy can take a moment on a filesystem
     # without copy-on-write, and printing into an already-running spinner

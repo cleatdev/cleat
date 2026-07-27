@@ -372,3 +372,76 @@ teardown() { _common_teardown; }
   assert_success
   assert_output ""
 }
+
+# ── fork root override and the age signal ───────────────────────────────────
+
+@test "fork: the root defaults to the cleat config dir" {
+  run _fork_root
+  assert_output "$CLEAT_FORKS_DIR"
+}
+
+@test "fork: a global config fork dir moves the root" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$TEST_TEMP/elsewhere"
+  printf '[fork]\ndir = %s\n' "$TEST_TEMP/elsewhere" > "$CLEAT_GLOBAL_CONFIG"
+  run _fork_root
+  assert_output "$TEST_TEMP/elsewhere"
+  run bash -c "source_cli 2>/dev/null; true"   # no-op, keeps shellcheck quiet
+}
+
+@test "fork: a relative fork dir is refused and falls back to the default" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[fork]\ndir = ../nope\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _fork_root
+  assert_output --partial "$CLEAT_FORKS_DIR"
+}
+
+@test "fork: a project cleat file cannot move the fork root" {
+  # .cleat arrives with cloned repos and this value is a path cleat creates and
+  # removes under, so it is deliberately global-config only.
+  printf '[fork]\ndir = %s/evil\n' "$TEST_TEMP" > "$TEST_TEMP/project/.cleat"
+  run _fork_root
+  assert_output "$CLEAT_FORKS_DIR"
+}
+
+@test "fork: the copy honours the configured root" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$TEST_TEMP/elsewhere"
+  printf '[fork]\ndir = %s\n' "$TEST_TEMP/elsewhere" > "$CLEAT_GLOBAL_CONFIG"
+  _fork_copy_tree "$TEST_TEMP/project" "$TEST_TEMP/elsewhere/box1"
+  [ -f "$TEST_TEMP/elsewhere/box1/src/app.js" ]
+}
+
+@test "fork: the copy still refuses a destination outside the configured root" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$TEST_TEMP/elsewhere"
+  printf '[fork]\ndir = %s\n' "$TEST_TEMP/elsewhere" > "$CLEAT_GLOBAL_CONFIG"
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box1"
+  assert_failure
+  assert_output --partial "Refusing to write a fork outside"
+}
+
+@test "fork: a fresh copy reads as just now, never as nothing" {
+  mkdir -p "$TEST_TEMP/freshcopy"
+  run _fork_age_human "$TEST_TEMP/freshcopy"
+  assert_output "just now"
+}
+
+@test "fork: an older copy reports its age in hours" {
+  mkdir -p "$TEST_TEMP/oldcopy"
+  touch -t "$(date -d '3 hours ago' +%Y%m%d%H%M 2>/dev/null || date -v-3H +%Y%m%d%H%M)" "$TEST_TEMP/oldcopy"
+  run _fork_age_human "$TEST_TEMP/oldcopy"
+  assert_output "3h ago"
+}
+
+@test "fork: the summary names the copy and its age for a fork box" {
+  mkdir -p "$CLEAT_BOXES_DIR" "$CLEAT_FORKS_DIR/$CNAME"
+  : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  run _print_summary_block "$CNAME" "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Fork:"
+  assert_output --partial "copied"
+}
+
+@test "fork: the summary has no fork line for a plain box" {
+  run _print_summary_block "$CNAME" "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Fork:"
+}

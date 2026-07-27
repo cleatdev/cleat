@@ -2611,6 +2611,34 @@ s@    info "Fork workspace is missing, recreating it"@    error "no heal"; exit 
 SED
 try "fork_preflight_heals" "explicit fork flag heals a running box" "$CLI" "$FORK_BATS"
 
+# FORK ROOT OVERRIDE: a project on another volume gets a full byte copy unless
+# the fork root moves with it, because copy-on-write only works within a volume.
+cat > "$SED_TMP" << 'SED'
+s@  d="$(_read_section_from_file "$CLEAT_GLOBAL_CONFIG" fork dir 2>/dev/null || true)"@  d=""@
+SED
+try "fork_root_override" "global config fork dir moves the root" "$CLI" "$FORK_BATS"
+
+# FORK ROOT ABSOLUTE ONLY: a relative fork root would resolve against whatever
+# directory cleat happened to be run from.
+cat > "$SED_TMP" << 'SED'
+s@      /?\*) printf '%s\\n' "${d%/}"; return 0 ;;@      *) printf '%s\\n' "${d%/}"; return 0 ;;@
+SED
+try "fork_root_absolute_only" "relative fork dir is refused" "$CLI" "$FORK_BATS"
+
+# FORK AGE FLOOR: a copy taken this second must read "just now", not empty. An
+# empty age silently drops the whole Fork line from the summary.
+cat > "$SED_TMP" << 'SED'
+s@  (( delta < 0 )) \&\& delta=0@  (( delta < 1 )) \&\& return 0@
+SED
+try "fork_age_floor" "fresh copy reads as just now" "$CLI" "$FORK_BATS"
+
+# FORK SUMMARY LINE: a fork box shows Project: <the real path>, which is where
+# edits do NOT go. Without the Fork line the output is actively misleading.
+cat > "$SED_TMP" << 'SED'
+/^    if _box_is_fork "\$cname"; then$/,/^    fi$/d
+SED
+try "fork_summary_line" "summary names the copy and its age" "$CLI" "$FORK_BATS"
+
 # KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
 # content, first and byte-for-byte. Drop the user-content copy (truncate
 # instead): the merge test no longer sees the user's line at the top.

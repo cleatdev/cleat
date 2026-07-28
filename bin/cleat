@@ -6260,6 +6260,15 @@ cmd_run() {
   local cname
   cname="$(container_name_for "$project" "$box")"
 
+  # Before anything can remove a container. cmd_start and cmd_resume preflight
+  # ahead of calling here, but `cleat run <box> --fork` reaches this directly,
+  # and the container_exists branch below does a plain `docker rm`. So --fork
+  # aimed at an existing PLAIN box used to silently destroy that box's writable
+  # layer and rebuild it on a copy, which is worse than the silent no-op the
+  # preflight was written to stop. Running it here refuses instead, and puts
+  # `run` and `start` on the same answer.
+  _fork_preflight "$cname" recreate
+
   if is_running "$cname"; then
     warn "Container ${BOLD}${cname}${RESET} already running for this project."
     return

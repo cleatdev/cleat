@@ -2570,6 +2570,23 @@ s@_FORK_CP_FLAGS="-Rc"@_FORK_CP_FLAGS="-R"@
 SED
 try "fork_cp_bsd_clone" "cp flags from a BSD binary" "$CLI" "$FORK_BATS"
 
+# FORK CP CLONE PROBE: the BSD arm must PROBE for -c, not assume it. FreeBSD cp
+# has no -c at all and macOS predating clonefile rejects it, so assuming it
+# fails every fork there. Short-circuit the probe so -c is assumed: the
+# no-clonefile arm gets -Rc instead of -R, and its probe log stays empty.
+cat > "$SED_TMP" << 'SED'
+s@if mkdir -p "$_p/s"@if true || mkdir -p "$_p/s"@
+SED
+try "fork_cp_clone_probed_not_assumed" "cp flags from a BSD binary" "$CLI" "$FORK_BATS"
+
+# FORK CP PROBE CLEANUP: the probe writes a scratch tree under the fork root.
+# Drop the cleanup and every cleat invocation on a BSD host leaves a .cpprobe
+# directory behind, filling the fork root.
+cat > "$SED_TMP" << 'SED'
+s@  rm -rf "$_p" 2>/dev/null || true@  :@
+SED
+try "fork_cp_probe_cleanup" "clone probe leaves nothing behind" "$CLI" "$FORK_BATS"
+
 # FORK WORKSPACE SWAP: the whole feature is this one mount. Point it back at
 # the live tree and the fork box edits the real repo.
 cat > "$SED_TMP" << 'SED'
@@ -2586,11 +2603,30 @@ try "fork_docker_cap_real_tree" "docker cap exposes the copy" "$CLI" "$FORK_BATS
 
 # FORK MISSING COPY: a fork box whose copy vanished must REFUSE. Fall back to
 # the live tree instead and the box silently edits the real repo, with a
-# success message. Drop the refusal.
+# success message.
+#
+# This property has TWO layers, so the mutation removes both. The preflight runs
+# first (and now runs in cmd_run too, so `cleat run --fork` cannot destroy a
+# plain box), and the check inside cmd_run is the backstop for a copy that
+# vanishes between the preflight and the moment the mount is built. Dropping
+# only one used to leave the other standing, which reported MISSED and would
+# have read as a broken test rather than as defence in depth.
 cat > "$SED_TMP" << 'SED'
+/^  _fork_preflight "$cname" recreate$/d
 s@if \[\[ ! -d "$_fork_path" \]\]; then@if false; then@
 SED
 try "fork_missing_copy_refuses" "copy is missing refuses" "$CLI" "$FORK_BATS"
+
+# FORK RUN PREFLIGHT: `cleat run <box> --fork` reaches cmd_run without the
+# preflight cmd_start does first, and cmd_run's container_exists branch is a
+# plain `docker rm`. Without the preflight here the flag DESTROYS an existing
+# plain box's writable layer and rebuilds it on a copy. Delete only the cmd_run
+# call (the first of the three, by line order) and that test goes red while the
+# start and resume paths stay intact.
+cat > "$SED_TMP" << 'SED'
+0,/^  _fork_preflight "$cname" recreate$/{/^  _fork_preflight "$cname" recreate$/d;}
+SED
+try "fork_run_preflight" "run refuses the flag on an existing plain box" "$CLI" "$FORK_BATS"
 
 # FORK EXCLUDE SAFETY: an absolute or traversing exclude must be refused, or a
 # .cleat in a cloned repo can delete outside the fork.

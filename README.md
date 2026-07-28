@@ -305,7 +305,7 @@ remedy. Forking a fork, or pointing the fork root inside the project so the copy
 would contain itself, is refused too.
 
 It is a copy rather than a git clone, so submodules, untracked sibling repos,
-uncommitted work and `node_modules` all come along, and a project with no git
+uncommitted work and `node_modules` all come along. A project with no git
 works the same way. Symlinks are copied as symlinks and never followed, so a
 project holding `sub/keys -> ~/.ssh` does not put real key bytes in the cage. On
 macOS the copy is copy-on-write, so it is close to instant and costs almost no
@@ -318,7 +318,7 @@ The launch summary names the copy and how old it is, so a stale fork is never
 silent:
 
 ```
-  Fork:       ~/.config/cleat/forks/myproj-feat-a  (copied 3h ago)
+  Fork:       ~/.config/cleat/forks/cleat-myproj-2f96c884-feat-a  (copied 3h ago)
 ```
 
 Move the fork root with `[fork] dir` in your **global** config
@@ -337,7 +337,7 @@ Worth knowing before you rely on it:
   have work you did in the live tree since.
 - Without copy-on-write (Linux without reflink support, or a fork root on a
   different volume) the copy is real duplicated disk.
-- `cleat storage` does not see fork copies. It measures the Docker store, and
+- `cleat storage` does not see fork copies. It measures the Docker store, while
   the copies live on your filesystem.
 - Landing the work is yours. Cleat copies out, it does not merge back.
 
@@ -389,7 +389,7 @@ writable, so `--continue` and `--resume` work normally. `file-history`,
 `paste-cache`, `uploads`, `backups`, `shell-snapshots`, `sessions`, `tasks`,
 `jobs` and `hooks` each become an empty per-box directory. `hooks` is the one
 that matters most. It is also why these are generated empties rather than
-read-only views: the `hooks` capability runs your hook commands on the **host**,
+read-only views. The `hooks` capability runs your hook commands on the **host**
 and the usual way to write one names a script under `~/.claude/hooks/`, so a box
 able to write there could rewrite what your host runs. What a box can still
 reach is the project you mounted plus your Claude login, which it needs to
@@ -834,6 +834,8 @@ When the `hooks` capability is enabled, your Claude Code hooks run on the host, 
 - `~/.claude/settings.json` (global)
 - `.claude/settings.json` (project, committed)
 - `.claude/settings.local.json` (project, local)
+
+**This capability is the one place where the box's activity deliberately runs a command outside the cage.** That is the feature and it is your call, but enable it knowing the shape. The command runs on your host, as you, uncontained. The agent is what generates the events that trigger it. Two consequences worth reading twice. A hook command that names a path in the repo (`$CLAUDE_PROJECT_DIR/.claude/hooks/format.sh`, `npm run hook`, `make lint`) resolves inside `/workspace`, which the agent edits as ordinary work. The two project settings files above are read from your working tree, so hooks the agent writes there are hooks your host will run. Point a hook you care about at a script outside the project. Treat the set of hooks you have enabled as the set of things the box can ask your host to do, at a time of its choosing.
 
 ```bash
 cleat config --enable hooks    # enable persistently

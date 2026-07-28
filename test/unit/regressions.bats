@@ -1149,6 +1149,28 @@ EOF
   assert_failure
 }
 
+@test "regression style: README contains no em dashes" {
+  # The guards above covered the code and the shipped scripts but not the one
+  # file most strangers actually read. Nothing checked it, and prose is exactly
+  # where the glyph creeps back in.
+  run grep -n "—" "$PROJECT_ROOT/README.md"
+  assert_failure
+}
+
+@test "regression style: README has no serial or clause-joining comma before and" {
+  # The other banned AI tell in outward prose (root CLAUDE.md): lists read
+  # "a, b and c" and a clause join gets split into two sentences. Four of these
+  # shipped into README and the docs page in one session precisely because
+  # nothing checked. The wrapped form matters: a comma ending one line with
+  # "and" starting the next is the same construct and a plain grep misses it.
+  run awk 'BEGIN{rc=1}
+           /, and/ {print FILENAME":"FNR": "$0; rc=0}
+           NR>1 && prev ~ /,$/ && $0 ~ /^[[:space:]]*and / {print FILENAME":"FNR-1" (wrapped): "prev; rc=0}
+           {prev=$0}
+           END{exit rc}' "$PROJECT_ROOT/README.md"
+  assert_failure
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # v0.9.2: installer spin_stop printed literal \033 escape sequences and
 # left trailing chars from longer spinner lines (e.g. "Pinned to v0.9.1est

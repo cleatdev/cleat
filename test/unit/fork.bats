@@ -304,7 +304,12 @@ case "$1" in
       *)           echo "usage: cp [-R [-H | -L | -P]] source target" >&2; exit 64 ;;
     esac ;;
 esac
-# the BSD clone probe is `cp -Rc <src>/. <dst>/`
+# the BSD clone probe is `cp -Rc <src>/. <dst>/`. Record it when asked, so a
+# test can assert the probe actually ran rather than inferring it from a flag
+# string the function would also produce without probing.
+case " $* " in
+  *" -Rc "*) [ -n "${FORK_CP_PROBE_LOG:-}" ] && echo "probe $*" >> "$FORK_CP_PROBE_LOG" ;;
+esac
 case "$kind" in
   bsd-noclone) case " $* " in *" -Rc "*) exit 1 ;; esac ;;
 esac
@@ -345,10 +350,27 @@ SHIM
 @test "fork: cp flags from a BSD binary without clonefile" {
   # BSD cp that rejects -c: fall back to a plain recursive copy rather than
   # failing every fork.
+  #
+  # "-R" alone is a weak assertion, because it is also the value the function
+  # sets BEFORE it probes. So this asserts the probe RAN: the probe writes a
+  # .cpprobe.$$ tree under the fork root and removes it, which a shim can
+  # record. Without that, the test passes just as well against a function that
+  # never probes at all, and the one property it exists to guard is the probe.
   _fake_cp bsd-noclone
-  run _fork_cp_flags
+  FORK_CP_PROBE_LOG="$TEST_TEMP/cpprobe.log" run _fork_cp_flags
   assert_success
   assert_output "-R"
+  [ -s "$TEST_TEMP/cpprobe.log" ] || { echo "the clone probe never ran"; return 1; }
+}
+
+@test "fork: the BSD clone probe leaves nothing behind" {
+  # The probe creates a scratch tree under the fork root. It must clean up, or
+  # a fork root fills with .cpprobe.NNN dirs, one per cleat invocation.
+  _fake_cp bsd
+  run _fork_cp_flags
+  assert_success
+  run bash -c "ls -A \"$CLEAT_FORKS_DIR\" 2>/dev/null | grep -c cpprobe || true"
+  assert_output "0"
 }
 
 @test "fork: cp flags are probed from the real binary not from the OS name" {
@@ -563,6 +585,24 @@ SHIM
   run cmd_clean
   assert_success
   [ -f "$CLEAT_BOXES_DIR/$CNAME.fork" ]
+}
+
+@test "fork: run refuses the flag on an existing plain box instead of destroying it" {
+  # cmd_run is reached directly by `cleat run <box> --fork`, without the
+  # preflight cmd_start does first, and its container_exists branch is a plain
+  # `docker rm`. So the flag used to silently destroy an existing plain box's
+  # writable layer and rebuild it on a copy, which is worse than the no-op the
+  # preflight was written to stop. run and start must give the same answer.
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"          # a plain box exists
+  assert_success
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _FORK_REQUESTED=true
+  _BOX=main
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "already exists and is not a fork"
 }
 
 @test "fork: the flag on an existing plain box refuses instead of doing nothing" {

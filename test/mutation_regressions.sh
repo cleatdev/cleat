@@ -2591,7 +2591,7 @@ try "fork_copy_lock" "second concurrent copy is refused" "$CLI" "$FORK_BATS"
 # exec_claude and reported success on an empty workspace. Drop the preflight
 # call from cmd_resume: the running-box refusal test fails.
 cat > "$SED_TMP" << 'SED'
-/^  _fork_preflight "\$cname"$/d
+/^  _fork_preflight "\$cname"/d
 SED
 try "fork_preflight_first_verb" "resume refuses when the copy is gone even if the box is running" "$CLI" "$FORK_BATS"
 
@@ -2638,6 +2638,45 @@ cat > "$SED_TMP" << 'SED'
 /^    if _box_is_fork "\$cname"; then$/,/^    fi$/d
 SED
 try "fork_summary_line" "summary names the copy and its age" "$CLI" "$FORK_BATS"
+
+# FORK MARKER SURVIVES PRUNING: cleat rm <box> removes the container and KEEPS
+# the copy, so the marker legitimately outlives its container. Prune it and the
+# next run re-binds the LIVE tree, then --fork deletes the retained copy.
+cat > "$SED_TMP" << 'SED'
+s@      case "$_bf" in \*.fork) continue ;; esac@      _bcn="${_bcn%.fork}"@
+SED
+try "fork_marker_survives_prune" "stop-all keeps a fork marker whose container is already gone" "$CLI" "$FORK_BATS"
+
+# FORK ROOT WARN TO STDERR: warn writes to stdout and every _fork_root caller is
+# a command substitution, so without >&2 the warning TEXT becomes the fork root
+# and is handed to mkdir, cp, rm -rf and mv as a relative path.
+cat > "$SED_TMP" << 'SED'
+s@      \*) warn "Ignoring \[fork\] dir, not an absolute path: $d" >&2 ;;@      *) warn "Ignoring [fork] dir, not an absolute path: $d" ;;@
+SED
+try "fork_root_warn_stderr" "relative fork dir is refused and falls back" "$CLI" "$FORK_BATS"
+
+# FORK FLAG ON A PLAIN BOX: --fork on an existing non-fork box did nothing at
+# all, so a user who forgot the flag and re-ran with it kept the live tree.
+cat > "$SED_TMP" << 'SED'
+s@    if \[\[ "${_FORK_REQUESTED:-false}" == true \]\] \&\& container_exists "$cname"; then@    if false; then@
+SED
+try "fork_flag_on_plain_box" "flag on an existing plain box refuses" "$CLI" "$FORK_BATS"
+
+# FORK HEAL SCOPE: healing drops the container so the create path rebuilds it.
+# shell and claude have no create path, so healing there destroys a live box.
+cat > "$SED_TMP" << 'SED'
+s@ \&\& "$can_recreate" == "recreate" \]\]; then@ ]]; then@
+SED
+try "fork_heal_scope" "shell never force-removes a box while healing" "$CLI" "$FORK_BATS"
+
+# FORK EXCLUDE ROOT: `exclude = .` resolves to the fork root itself. rm refuses
+# it on its own, so the arm is belt-and-braces for deletion; what it actually
+# buys is a named reason instead of a raw rm error, and skipping a doomed rm.
+# The mutation therefore targets the message, which is the real contribution.
+cat > "$SED_TMP" << 'SED'
+s@names the workspace root@names something else entirely@
+SED
+try "fork_exclude_root" "exclude naming the workspace root is refused" "$CLI" "$FORK_BATS"
 
 # KIT USER-FIRST MERGE: the merged CLAUDE.md must carry the user's own global
 # content, first and byte-for-byte. Drop the user-content copy (truncate

@@ -2528,7 +2528,11 @@ _fork_root() {
     # directory the user happened to run cleat from.
     case "$d" in
       /?*) printf '%s\n' "${d%/}"; return 0 ;;
-      *) warn "Ignoring [fork] dir, not an absolute path: $d" ;;
+      # >&2 is load-bearing: warn writes to stdout and every caller of
+      # _fork_root is a command substitution, so without it the warning TEXT
+      # becomes the fork root and is then handed to mkdir, cp, rm -rf and mv
+      # as a relative path.
+      *) warn "Ignoring [fork] dir, not an absolute path: $d" >&2 ;;
     esac
   fi
   printf '%s\n' "$CLEAT_FORKS_DIR"
@@ -2580,12 +2584,27 @@ _fork_unmark()      { rm -f "$(_fork_marker_file "$1")"; }
 # normal create path rebuilds both the copy and the mount, which is baked in at
 # create and cannot be repointed on a running container.
 _fork_preflight() {
-  local cname="$1"
-  _box_is_fork "$cname" || return 0
+  local cname="$1" can_recreate="${2:-}"
+  if ! _box_is_fork "$cname"; then
+    # --fork on a box that already exists as a plain box did nothing at all:
+    # the create block only runs when there is no container, so the flag was
+    # silently ignored and the LIVE tree stayed mounted. The only signal was an
+    # absent Fork line. Refuse loudly instead, and name the way out.
+    if [[ "${_FORK_REQUESTED:-false}" == true ]] && container_exists "$cname"; then
+      error "Box ${BOLD}${_BOX}${RESET} already exists and is not a fork."
+      echo -e "    ${DIM}A box's workspace is fixed when it is created. Remove it first: ${BOLD}cleat rm ${_BOX}${RESET}${DIM}, then ${BOLD}cleat start ${_BOX} --fork${RESET}${DIM}.${RESET}"
+      exit 1
+    fi
+    return 0
+  fi
   local _fp
   _fp="$(_fork_dir "$cname")"
   [[ -d "$_fp" ]] && return 0
-  if [[ "${_FORK_REQUESTED:-false}" == true ]]; then
+  # Healing drops the container so the create path rebuilds copy and mount
+  # together. Only verbs that HAVE a create path may do that: from shell or
+  # claude it would destroy a live box with nothing to rebuild it, so those
+  # fall through to the refusal below.
+  if [[ "${_FORK_REQUESTED:-false}" == true && "$can_recreate" == "recreate" ]]; then
     info "Fork workspace is missing, recreating it"
     docker rm -f "$cname" > /dev/null 2>&1 || true
     return 0
@@ -2728,6 +2747,10 @@ _fork_prune_excludes() {
     # Cheap syntactic refusals first.
     case "$e" in
       /*|*..*) warn "Ignoring unsafe [fork] exclude: $e"; continue ;;
+      # `.` resolves to the fork root itself. It passes the physical-parent
+      # check below, and `rm -rf "$dir/."` is refused by rm with a non-zero
+      # status, which under set -e would abort the whole run after the copy.
+      .|./|"") warn "Ignoring [fork] exclude that names the workspace root: $e"; continue ;;
     esac
     # Then the one that actually matters. `rm -rf` follows every INTERMEDIATE
     # symlink component, and the copy deliberately preserves symlinks, so an
@@ -2744,7 +2767,11 @@ _fork_prune_excludes() {
     esac
     # The leaf itself must not be a symlink either: removing it is fine, but
     # only the link, never through it.
-    rm -rf "$_parent/$(basename "$_target")"
+    # Non-fatal: an exclude that cannot be removed (a root-owned path the
+    # box's own passwordless sudo created, for instance) must not take down a
+    # copy that already succeeded.
+    rm -rf "$_parent/$(basename "$_target")" 2>/dev/null \
+      || warn "Could not prune [fork] exclude: $e"
   done < <(_read_section_all_from_file "$project/.cleat" fork exclude)
 }
 
@@ -6264,10 +6291,25 @@ cmd_run() {
   if [[ "${_FORK_REQUESTED:-false}" == true ]] \
      && { ! _box_is_fork "$cname" || [[ ! -d "$(_fork_dir "$cname")" ]]; }; then
     _fork_path="$(_fork_dir "$cname")"
-    # Refuse to fork a directory that already lives under the forks dir: a fork
+    # Refuse to fork a directory that already lives under the fork root: a fork
     # of a fork nests copies without bound.
+    local _froot _pp
+    _froot="$(_fork_root)"
     case "$project/" in
-      "$(_fork_root)"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
+      "$_froot"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
+    esac
+    # And the mirror case: a fork root INSIDE the project, which someone will
+    # reach for wanting the copy near the code. The copy would then contain the
+    # fork root and recurse. GNU cp happens to catch this ("cannot copy a
+    # directory into itself") but BSD cp is a different implementation and the
+    # failure mode if it does not is a disk-filling loop, so refuse explicitly
+    # rather than relying on the tool. Compared physically so a symlinked
+    # project path cannot slip past.
+    _pp="$(cd -P "$project" 2>/dev/null && pwd -P)" || _pp="$project"
+    case "$_froot/" in
+      "$_pp"/*) error "Fork root is inside the project: ${_froot/#${HOME}/~}"
+                echo -e "    ${DIM}The copy would contain itself. Point ${BOLD}[fork] dir${RESET}${DIM} outside the project.${RESET}"
+                exit 1 ;;
     esac
     # Its own spinner phase: the copy can take a moment on a filesystem
     # without copy-on-write, and printing into an already-running spinner
@@ -6631,7 +6673,7 @@ cmd_start() {
   _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project" "$box")"
-  _fork_preflight "$cname"
+  _fork_preflight "$cname" recreate
 
   # Resolve caps early for startup output and drift detection
   resolve_caps "$project"
@@ -6743,7 +6785,7 @@ cmd_resume() {
   _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project" "$box")"
-  _fork_preflight "$cname"
+  _fork_preflight "$cname" recreate
 
   # Resolve caps for startup output and drift detection
   resolve_caps "$project"
@@ -7053,6 +7095,7 @@ cmd_claude() {
   local cname
   cname="$(container_name_for "$project" "$box")"
 
+  _fork_preflight "$cname"
   require_running "$cname"
   _RESOLVED_PROJECT="$project"
   resolve_caps "$project"
@@ -7192,10 +7235,13 @@ cmd_stop_all() {
     for _bf in "$CLEAT_BOXES_DIR"/*; do
       [[ -f "$_bf" ]] || continue
       _bcn="$(basename "$_bf")"
-      # Per-box state files may carry a suffix (<cname>.fork). Strip it, or the
-      # basename never matches a container, the file is pruned, and a fork box
-      # silently reverts to mounting the LIVE tree on its next run.
-      _bcn="${_bcn%.fork}"
+      # NEVER prune a fork marker. Stripping the suffix was not enough: `cleat
+      # rm <box>` deliberately removes the container and KEEPS the copy, so the
+      # marker legitimately outlives the container. Pruning it there re-binds
+      # the next run to the LIVE tree, and a later --fork then rm -rf's the copy
+      # that `cleat rm` promised to keep. This is the one per-box state file
+      # whose whole purpose is to outlive its container.
+      case "$_bf" in *.fork) continue ;; esac
       if ! container_exists "$_bcn"; then rm -f "$_bf" 2>/dev/null || true; fi
     done
   fi
@@ -8364,10 +8410,13 @@ cmd_clean() {
     for _bf in "$CLEAT_BOXES_DIR"/*; do
       [[ -f "$_bf" ]] || continue
       _bcn="$(basename "$_bf")"
-      # Per-box state files may carry a suffix (<cname>.fork). Strip it, or the
-      # basename never matches a container, the file is pruned, and a fork box
-      # silently reverts to mounting the LIVE tree on its next run.
-      _bcn="${_bcn%.fork}"
+      # NEVER prune a fork marker. Stripping the suffix was not enough: `cleat
+      # rm <box>` deliberately removes the container and KEEPS the copy, so the
+      # marker legitimately outlives the container. Pruning it there re-binds
+      # the next run to the LIVE tree, and a later --fork then rm -rf's the copy
+      # that `cleat rm` promised to keep. This is the one per-box state file
+      # whose whole purpose is to outlive its container.
+      case "$_bf" in *.fork) continue ;; esac
       if ! container_exists "$_bcn"; then rm -f "$_bf" 2>/dev/null || true; fi
     done
   fi

@@ -354,7 +354,7 @@ teardown() { _common_teardown; }
   # so healing has to drop the container and let the create path rebuild both.
   mkdir -p "$CLEAT_BOXES_DIR"; : > "$CLEAT_BOXES_DIR/$CNAME.fork"
   _FORK_REQUESTED=true
-  run _fork_preflight "$CNAME"
+  run _fork_preflight "$CNAME" recreate
   assert_success
   assert_output --partial "recreating it"
 }
@@ -391,8 +391,15 @@ teardown() { _common_teardown; }
 @test "fork: a relative fork dir is refused and falls back to the default" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[fork]\ndir = ../nope\n' > "$CLEAT_GLOBAL_CONFIG"
+  # Assert on the CAPTURED VALUE, not on `run` output: bats merges stderr into
+  # $output, so a --partial check there passed even while the warning was
+  # polluting the value itself. Every real caller uses a command substitution.
+  local root
+  root="$(_fork_root 2>/dev/null)"
+  [ "$root" = "$CLEAT_FORKS_DIR" ] || { echo "got: [$root]"; return 1; }
+  # and the warning is still emitted, just on stderr
   run _fork_root
-  assert_output --partial "$CLEAT_FORKS_DIR"
+  assert_output --partial "not an absolute path"
 }
 
 @test "fork: a project cleat file cannot move the fork root" {
@@ -444,4 +451,73 @@ teardown() { _common_teardown; }
   run _print_summary_block "$CNAME" "$TEST_TEMP/project"
   assert_success
   refute_output --partial "Fork:"
+}
+
+# ── audit follow-ups ────────────────────────────────────────────────────────
+
+@test "fork: stop-all keeps a fork marker whose container is already gone" {
+  # cleat rm <box> deliberately removes the container and KEEPS the copy, so
+  # the marker legitimately outlives its container. Pruning it there re-binds
+  # the next run to the live tree.
+  mkdir -p "$CLEAT_BOXES_DIR"
+  : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  printf '%s\n' "$CNAME" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$CNAME" > "$DOCKER_MOCK_DIR/ps_a_output"
+  container_exists() { return 1; }
+  run cmd_stop_all
+  assert_success
+  [ -f "$CLEAT_BOXES_DIR/$CNAME.fork" ]
+}
+
+@test "fork: clean keeps a fork marker whose container is already gone" {
+  mkdir -p "$CLEAT_BOXES_DIR"
+  : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  container_exists() { return 1; }
+  run cmd_clean
+  assert_success
+  [ -f "$CLEAT_BOXES_DIR/$CNAME.fork" ]
+}
+
+@test "fork: the flag on an existing plain box refuses instead of doing nothing" {
+  # The create block only runs when there is no container, so --fork on an
+  # existing plain box was silently ignored and the live tree stayed mounted.
+  container_exists() { return 0; }
+  _FORK_REQUESTED=true
+  run _fork_preflight "$CNAME" recreate
+  assert_failure
+  assert_output --partial "already exists and is not a fork"
+}
+
+@test "fork: shell never force-removes a box while healing" {
+  # Healing drops the container so the create path rebuilds it. shell and
+  # claude have no create path, so healing there destroys a live box with
+  # nothing to rebuild it.
+  mkdir -p "$CLEAT_BOXES_DIR"; : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  _FORK_REQUESTED=true
+  run _fork_preflight "$CNAME"
+  assert_failure
+  assert_output --partial "workspace copy is missing"
+  run grep -c "rm -f $CNAME" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "fork: an exclude naming the workspace root is refused, not fatal" {
+  # `.` passes the physical-parent check and rm refuses it non-zero, which
+  # under strict mode aborted the run after a successful copy.
+  printf '[fork]\nexclude = .\n' > "$TEST_TEMP/project/.cleat"
+  _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/testbox"
+  run _fork_prune_excludes "$CLEAT_FORKS_DIR/testbox" "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "names the workspace root"
+  [ -f "$CLEAT_FORKS_DIR/testbox/src/app.js" ]
+}
+
+@test "fork: a fork root inside the project is refused" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[fork]\ndir = %s/inner\n' "$TEST_TEMP/project" > "$CLEAT_GLOBAL_CONFIG"
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Fork root is inside the project"
 }

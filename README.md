@@ -96,6 +96,8 @@ Cleat gives you the best of both worlds:
 - **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq and socat
 - **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`) and host Docker daemon for testing dockerized apps (`--cap docker`). All disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
+- **Forked workspaces** -- `--fork` gives a box its own copy of the project, so several agents can work in parallel without touching your tree
+- **Contained Claude home** -- a box sees only its own project's Claude history. The instruction surfaces your host `claude` obeys are read-only inside the cage
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
@@ -257,8 +259,9 @@ cleat ps
 
 ### Boxes: multiple sandboxes per project
 
-A **box** is a named, isolated container scoped to the current directory. Every
-box mounts the **same** live files, but each has its own capabilities, writable
+A **box** is a named, isolated container scoped to the current directory. By
+default every box mounts the **same** live files (a fork box is the exception,
+see below), but each has its own capabilities, writable
 layer and Claude session, so a locked-down `dev` box can run beside a
 cloud-capable `az` box over the same repo. The agent in `dev` can't reach the
 Docker socket or cloud token that `az` holds.
@@ -292,22 +295,51 @@ cleat start feat-b --fork    # another one, independent
 ```
 
 Run it a few times and you have several agents on the same project, each in its
-own container on its own copy, with nothing shared between them. The flag is
-only needed when the box is created.
+own container working on its own files. They still share what every box shares:
+your Claude login and the host `~/.claude/plugins`.
+
+A box's workspace is fixed when the container is created, so the flag only does
+something at create time. Passing `--fork` to a box that already exists as a
+plain box is refused rather than silently ignored, with `cleat rm <box>` as the
+remedy. Forking a fork, or pointing the fork root inside the project so the copy
+would contain itself, is refused too.
 
 It is a copy rather than a git clone, so submodules, untracked sibling repos,
 uncommitted work and `node_modules` all come along, and a project with no git
-works the same way. On macOS the copy is copy-on-write, so it is close to
-instant and costs almost no disk until something changes. Exclude what you do
-not want with `[fork] exclude = node_modules` in `.cleat`.
+works the same way. Symlinks are copied as symlinks and never followed, so a
+project holding `sub/keys -> ~/.ssh` does not put real key bytes in the cage. On
+macOS the copy is copy-on-write, so it is close to instant and costs almost no
+disk until something changes. Exclude what you do not want with
+`[fork] exclude = node_modules` in `.cleat`. An exclude that is an absolute
+path, contains `..`, names the workspace root, or resolves outside the copy
+through a symlink is refused with a warning instead of being deleted.
 
 The launch summary names the copy and how old it is, so a stale fork is never
-silent. Move the fork root with `[fork] dir` in your global config
+silent:
+
+```
+  Fork:       ~/.config/cleat/forks/myproj-feat-a  (copied 3h ago)
+```
+
+Move the fork root with `[fork] dir` in your **global** config
 (`~/.config/cleat/config`) if your projects live on another volume: copy-on-write
-only works within a volume.
+only works within a volume. It is read from the global config only and must be
+an absolute path. A `[fork] dir` in a project's `.cleat` is ignored on purpose,
+because `.cleat` arrives with a cloned repo and this value is a path Cleat
+creates and deletes under.
 
 `cleat rm <box>` frees the container and keeps the copy, since it may hold the
 only version of the work.
+
+Worth knowing before you rely on it:
+
+- The copy is a **point-in-time snapshot**. A fork taken an hour ago does not
+  have work you did in the live tree since.
+- Without copy-on-write (Linux without reflink support, or a fork root on a
+  different volume) the copy is real duplicated disk.
+- `cleat storage` does not see fork copies. It measures the Docker store, and
+  the copies live on your filesystem.
+- Landing the work is yours. Cleat copies out, it does not merge back.
 
 A **kit** is a curated Claude Code setup (a CLAUDE.md policy plus custom
 subagents) that you enable for one box with one command. The flagship kit,
@@ -354,9 +386,14 @@ plugins on the host and every box sees them. Other projects stay invisible: `~/.
 every project you have ever run Claude Code on, so a box gets a generated
 directory containing only its own project's sessions. Its own session stays
 writable, so `--continue` and `--resume` work normally. `file-history`,
-`paste-cache`, `uploads`, `backups`, `shell-snapshots`, `sessions`, `tasks` and
-`jobs` each become an empty per-box directory. What a box can still reach is
-the project you mounted plus your Claude login, which it needs to authenticate.
+`paste-cache`, `uploads`, `backups`, `shell-snapshots`, `sessions`, `tasks`,
+`jobs` and `hooks` each become an empty per-box directory. `hooks` is the one
+that matters most. It is also why these are generated empties rather than
+read-only views: the `hooks` capability runs your hook commands on the **host**,
+and the usual way to write one names a script under `~/.claude/hooks/`, so a box
+able to write there could rewrite what your host runs. What a box can still
+reach is the project you mounted plus your Claude login, which it needs to
+authenticate.
 The read-only copies
 dereference symlinks (a dotfile-repo `commands` dir shows up as real files in
 the box) while a symlink nested inside a skill is kept as a link, so a skill
@@ -436,6 +473,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `--trust-project` | Auto-approve the current project's `.cleat` caps without prompting |
 | `--trust-setup` | Auto-approve the current project's `[setup]` provisioning without prompting |
 | `--desc <text>` | Set the box's description at start (host-side, never recreates) |
+| `--fork` | Give the box its own copy of the project instead of the live tree (create time only) |
 
 #### Interact
 | Command | Description |
@@ -751,9 +789,10 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
 ### Config files
 
 ```
-~/.config/cleat/config    ← global capabilities
+~/.config/cleat/config    ← global capabilities, [resources], [kits], [fork] dir
 ~/.config/cleat/env       ← global env vars
-<project>/.cleat          ← project-level capabilities (extends global)
+~/.config/cleat/forks/    ← fork workspace copies (default root, moved by [fork] dir)
+<project>/.cleat          ← project-level capabilities (extends global), [setup], [fork] exclude
 <project>/.cleat.env      ← project-level env vars
 ```
 

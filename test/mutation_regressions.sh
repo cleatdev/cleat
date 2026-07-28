@@ -2511,6 +2511,24 @@ s|-v "$home_overlay/projects:/home/coder/.claude/projects:ro"|-v "${HOME}/.claud
 SED
 try "containment_no_cross_project_read" "cannot read another project" "$CLI" "$REGRESSIONS"
 
+# CONTAINMENT HOOKS: ~/.claude/hooks is the one containment entry whose leak is
+# host EXECUTION, not just disclosure: the hooks capability runs the user's hook
+# commands on the host, and those commands conventionally name a script under
+# that dir. Drop it from the private list and the host dir rides the read-write
+# base mount again, so a caged agent can overwrite the script the host runs.
+cat > "$SED_TMP" << 'SED'
+s@ sessions tasks jobs hooks"@ sessions tasks jobs"@
+SED
+try "containment_host_hooks_dir" "cannot plant a host hook script" "$CLI" "$REGRESSIONS"
+
+# HOOK BRIDGE JQ INJECTION: the forwarded event name is agent-controlled. Put it
+# back into the jq PROGRAM instead of passing it as --arg data, and a crafted
+# event name synthesizes its own hook entry, giving the box bash -c on the host.
+cat > "$SED_TMP" << 'SED'
+s@^.*--arg ev.*$@    hook_entries="$(jq -c ".hooks.\\"$event_name\\" // [] | .[]" "$settings" 2>/dev/null)" || continue@
+SED
+try "hook_bridge_event_name_is_data" "cannot inject a jq program" "$CLI" "$REGRESSIONS"
+
 FORK_BATS="$REPO_ROOT/test/unit/fork.bats"
 
 # FORK SYMLINK DEREF: the copy must NOT follow symlinks. Add -L and a project
@@ -2521,6 +2539,36 @@ s@_FORK_CP_FLAGS="-R -d"@_FORK_CP_FLAGS="-RL"@
 s@_FORK_CP_FLAGS="-Rc"@_FORK_CP_FLAGS="-RLc"@
 SED
 try "fork_no_symlink_deref" "symlink inside the project is copied as a symlink" "$CLI" "$FORK_BATS"
+
+# FORK CP ARM SELECTION: the flags must come from the cp BINARY, never from the
+# OS. Break the GNU case label and a GNU host falls down the BSD arm, which is
+# exactly the Homebrew-coreutils-on-macOS breakage the probe exists to prevent.
+cat > "$SED_TMP" << 'SED'
+s@"GNU coreutils"@"NEVER MATCHES THIS"@
+SED
+try "fork_cp_arm_selection" "cp flags from a" "$CLI" "$FORK_BATS"
+
+# FORK CP HARDLINKS: -d keeps hardlinks inside the tree shared, so a pnpm store
+# is not multiplied by every fork. Dropping it is silent: copies still work.
+cat > "$SED_TMP" << 'SED'
+s@_FORK_CP_FLAGS="-R -d --reflink=auto"@_FORK_CP_FLAGS="-R --reflink=auto"@
+s@_FORK_CP_FLAGS="-R -d"@_FORK_CP_FLAGS="-R"@
+SED
+try "fork_cp_gnu_hardlinks" "cp flags from a GNU binary" "$CLI" "$FORK_BATS"
+
+# FORK CP REFLINK: --reflink=auto is why forking a large repo is usable at all.
+# Dropping it degrades to a full byte copy with every test still passing.
+cat > "$SED_TMP" << 'SED'
+s@_FORK_CP_FLAGS="-R -d --reflink=auto"@_FORK_CP_FLAGS="-R -d"@
+SED
+try "fork_cp_gnu_reflink" "cp flags from a GNU binary" "$CLI" "$FORK_BATS"
+
+# FORK CP CLONEFILE: the BSD half of the same property. -c is what makes a fork
+# on APFS near-instant and near-free.
+cat > "$SED_TMP" << 'SED'
+s@_FORK_CP_FLAGS="-Rc"@_FORK_CP_FLAGS="-R"@
+SED
+try "fork_cp_bsd_clone" "cp flags from a BSD binary" "$CLI" "$FORK_BATS"
 
 # FORK WORKSPACE SWAP: the whole feature is this one mount. Point it back at
 # the live tree and the fork box edits the real repo.

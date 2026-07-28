@@ -1393,7 +1393,7 @@ ssh"
   run cmd_run "$TEST_TEMP/project"
   assert_success
   local d
-  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs; do
+  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs hooks; do
     run assert_docker_run_has "$CNAME" "$CNAME/home/$d:/home/coder/.claude/$d"
     assert_success
     run assert_docker_run_lacks "$CNAME" "$HOME/.claude/$d:/home/coder/.claude/$d"
@@ -1422,12 +1422,12 @@ ssh"
 
 @test "containment: host mask targets are pre-created for virtiofs" {
   local d
-  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs; do
+  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs hooks; do
     rm -rf "$HOME/.claude/$d"
   done
   run _ensure_kit_mask_targets
   assert_success
-  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs; do
+  for d in file-history paste-cache uploads backups shell-snapshots sessions tasks jobs hooks; do
     [ -d "$HOME/.claude/$d" ] || { echo "missing host target: $d"; return 1; }
   done
 }

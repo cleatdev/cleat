@@ -270,17 +270,104 @@ teardown() { _common_teardown; }
   assert_output --partial "already copying this workspace"
 }
 
-@test "fork: cp flags are probed from the binary, not from the OS name" {
-  # A macOS host with Homebrew coreutils on PATH has GNU cp under the plain
-  # name, and GNU cp rejects -c. An OS-keyed branch breaks the fork there.
+# ── cp flag selection ───────────────────────────────────────────────────────
+#
+# _fork_cp_flags must key off the cp BINARY, never off `uname`: a macOS host
+# with Homebrew coreutils on PATH has GNU cp under the plain name, and GNU cp
+# rejects -c.
+#
+# Asserting that against the runner's own cp only ever exercises the one arm
+# that runner happens to have, which left three holes: the GNU `-d` and
+# `--reflink=auto` flags and the BSD `-Rc` clone flag could each be deleted
+# with the whole suite green, and a regression to OS-keyed dispatch had no
+# assertion behind it anywhere. Standing a fake cp in front of the real one
+# asserts every arm on every leg, Linux included.
+#
+# `kind` is baked into the shim rather than read from the environment so the
+# shim keeps working through `run`, which re-executes it in a subshell.
+_fake_cp() {
+  mkdir -p "$TEST_TEMP/fakebin"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "kind=\"$1\""
+    cat <<'SHIM'
+case "$1" in
+  --version)
+    case "$kind" in
+      gnu*) echo "cp (GNU coreutils) 9.1"; exit 0 ;;
+      *)    echo "cp: illegal option -- -" >&2; exit 64 ;;
+    esac ;;
+  --help)
+    case "$kind" in
+      gnu-reflink) echo "      --reflink[=WHEN]  control clone/CoW copies"; exit 0 ;;
+      gnu*)        echo "      --preserve[=ATTR_LIST]  preserve attributes"; exit 0 ;;
+      *)           echo "usage: cp [-R [-H | -L | -P]] source target" >&2; exit 64 ;;
+    esac ;;
+esac
+# the BSD clone probe is `cp -Rc <src>/. <dst>/`
+case "$kind" in
+  bsd-noclone) case " $* " in *" -Rc "*) exit 1 ;; esac ;;
+esac
+exit 0
+SHIM
+  } > "$TEST_TEMP/fakebin/cp"
+  chmod +x "$TEST_TEMP/fakebin/cp"
+  PATH="$TEST_TEMP/fakebin:$PATH"
+  # The probe memoises into a source-time global. Clearing it keeps a second
+  # probe in one process from silently replaying the first one's answer.
+  _FORK_CP_PROBED=""
+  _FORK_CP_FLAGS=""
+}
+
+@test "fork: cp flags from a GNU binary with reflink" {
+  _fake_cp gnu-reflink
   run _fork_cp_flags
   assert_success
-  case "$output" in
-    *-R*) ;;
-    *) echo "expected a -R form, got: $output"; return 1 ;;
-  esac
-  # this box has GNU coreutils, so it must NOT have chosen the BSD clone flag
-  refute_output --partial "-Rc"
+  assert_output "-R -d --reflink=auto"
+}
+
+@test "fork: cp flags from a GNU binary without reflink" {
+  # An older GNU cp: no --reflink in --help, so asking for it would abort the
+  # copy rather than degrade to a byte copy.
+  _fake_cp gnu-noreflink
+  run _fork_cp_flags
+  assert_success
+  assert_output "-R -d"
+}
+
+@test "fork: cp flags from a BSD binary with clonefile" {
+  _fake_cp bsd
+  run _fork_cp_flags
+  assert_success
+  assert_output "-Rc"
+}
+
+@test "fork: cp flags from a BSD binary without clonefile" {
+  # BSD cp that rejects -c: fall back to a plain recursive copy rather than
+  # failing every fork.
+  _fake_cp bsd-noclone
+  run _fork_cp_flags
+  assert_success
+  assert_output "-R"
+}
+
+@test "fork: cp flags are probed from the real binary not from the OS name" {
+  # The same invariant against whatever cp this leg actually ships, so a shim
+  # that drifts from real cp behaviour cannot hide a break.
+  run _fork_cp_flags
+  assert_success
+  if cp --version 2>/dev/null | grep -q "GNU coreutils"; then
+    # GNU cp rejects -c, so choosing the clone flag here breaks every copy.
+    refute_output --partial "-Rc"
+    assert_output --partial "-R -d"
+  else
+    # BSD: -Rc where clonefile works, plain -R where it does not. Asserting
+    # -Rc unconditionally would go red on a BSD host without clonefile.
+    case "$output" in
+      "-Rc"|"-R") ;;
+      *) echo "unexpected BSD flags: $output"; return 1 ;;
+    esac
+  fi
 }
 
 @test "fork: an explicit fork flag recreates a copy that went missing" {

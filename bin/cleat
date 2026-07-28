@@ -2450,7 +2450,19 @@ _generate_kit_overlay() {
 # Per-box private dirs: the box gets its own empty, writable copy. Nothing to
 # read from other projects, nothing that outlives `cleat rm`. These hold
 # cross-project data with no reason to be shared into a cage.
-_CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots sessions tasks jobs"
+#
+# hooks/ is in this list for a stronger reason than the rest, and it is the one
+# entry that must never be downgraded to a :ro mask. The hooks CAPABILITY runs
+# the user's hook commands on the HOST (see _execute_host_hooks). A hook command
+# that names a script under ~/.claude/hooks/ therefore turns any write into that
+# directory into host execution: a caged agent drops a file, triggers any tool
+# event, and the bridge runs it outside the box as the user. :ro would stop that
+# write, but an empty per-box dir stops it AND keeps the user's hook scripts
+# (internal URLs, tokens, company automation) out of the cage. Nothing is lost:
+# the box never reads these. With the cap ON every command in the box's settings
+# overlay is rewritten to the forwarder, and with it OFF hooks are deleted
+# outright, so no in-box code path resolves a path under ~/.claude/hooks.
+_CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots sessions tasks jobs hooks"
 
 # Build the per-box replacement content for the containment mounts. Same
 # regeneration rail as the kit overlay (create/start/resume), so adding a
@@ -5015,10 +5027,23 @@ _execute_host_hooks() {
   tool_name="$(echo "$event_json" | jq -r '.tool_name // empty' 2>/dev/null)" || true
 
   # Process hooks from all settings files (global + project)
+  #
+  # $event_name arrives from the container: it is a field of a line the box
+  # appended to the forwarding spool, which is bind-mounted read-write when the
+  # cap is on. It is DATA, so it goes in through --arg and is indexed with
+  # .hooks[$ev]. It must never be pasted into the jq program text. The old form
+  # built `.hooks."$event_name" // [] | .[]` by interpolation, so an event name
+  # carrying a double quote rewrote the program: `X" // [{"hooks":[{"type":
+  # "command","command":"..."}]}] // "` returned an attacker-authored hook entry
+  # no matter what the user's settings said, and the loop below then ran that
+  # command on the HOST. Enabling the cap is a decision to run YOUR hooks on
+  # your machine; it is not a decision to let the box choose the command.
+  # --arg is also plain more correct: the dot form mis-parses a legitimate event
+  # name containing a dot or a dash.
   local settings
   for settings in "${settings_files[@]}"; do
     local hook_entries
-    hook_entries="$(jq -c ".hooks.\"$event_name\" // [] | .[]" "$settings" 2>/dev/null)" || continue
+    hook_entries="$(jq -c --arg ev "$event_name" '.hooks[$ev] // [] | .[]' "$settings" 2>/dev/null)" || continue
     [[ -n "$hook_entries" ]] || continue
 
     while IFS= read -r entry; do

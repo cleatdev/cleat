@@ -2910,3 +2910,71 @@ EOF
   run bash -c "ls -A \"$CLEAT_RUN_DIR/$cname/home/projects\""
   refute_output --partial "other-secret-project"
 }
+
+@test "regression: a caged agent cannot plant a host hook script" {
+  # ~/.claude/hooks was the last instruction-shaped surface riding the
+  # read-write ~/.claude mount unmasked, and it is the one with the worst
+  # consequence. The hooks capability executes the user's hook commands ON THE
+  # HOST (_execute_host_hooks), and the documented way to write one names a
+  # script under ~/.claude/hooks/. So a caged agent could overwrite that script,
+  # trigger any tool event, and have the bridge run its content outside the box
+  # as the user. Masking it :ro would stop the write but still hand the cage the
+  # user's hook scripts to read; the box provably never needs them, because with
+  # the cap ON every in-box hook command is rewritten to the forwarder and with
+  # it OFF hooks are deleted, so the dir becomes a per-box empty instead.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project" "$HOME/.claude/hooks"
+  echo "echo HOST HOOK CONTENT" > "$HOME/.claude/hooks/notify.sh"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  # the host hooks dir is never mounted onto the container path
+  run assert_docker_run_lacks "$cname" "$HOME/.claude/hooks:/home/coder/.claude/hooks"
+  assert_success
+  # this box's own generated dir is mounted there instead
+  run assert_docker_run_has "$cname" "$cname/home/hooks:/home/coder/.claude/hooks"
+  assert_success
+  # and the user's real hook script is not inside it
+  run bash -c "ls -A \"$CLEAT_RUN_DIR/$cname/home/hooks\""
+  refute_output --partial "notify.sh"
+}
+
+@test "regression: a forwarded event cannot inject a jq program into the host bridge" {
+  # The host bridge selected hook entries with the event name pasted into the
+  # jq PROGRAM: jq -c ".hooks.\"$event_name\" // [] | .[]". event_name comes
+  # from a line the container appended to the forwarding spool, which the hooks
+  # capability bind-mounts read-write into the box. An event name carrying a
+  # double quote therefore rewrote the program and returned an attacker-authored
+  # hook entry regardless of the user's settings, and _execute_host_hooks then
+  # ran that command on the HOST. Enabling the cap is consent to run YOUR hooks
+  # on your machine, not consent to let the box choose the command.
+  local settings="$TEST_TEMP/settings.json"
+  jq -n --arg c "touch $TEST_TEMP/USER_HOOK_RAN" \
+    '{hooks:{PreToolUse:[{hooks:[{type:"command",command:$c}]}]}}' > "$settings"
+  local evil='X" // [{"hooks":[{"type":"command","command":"touch '"$TEST_TEMP"'/PWNED"}]}] // "'
+
+  # the selection must treat the name as DATA and match nothing
+  run jq -c --arg ev "$evil" '.hooks[$ev] // [] | .[]' "$settings"
+  assert_success
+  assert_output ""
+
+  # end to end: a forged event naming the injected program runs no host command
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$TEST_TEMP/project"
+  local event
+  event="$(jq -cn --arg ev "$evil" '{hook_event_name:$ev}')"
+  run _execute_host_hooks "$event" "$settings"
+  assert_success
+  [ ! -e "$TEST_TEMP/PWNED" ] || { echo "host command executed from a forged event"; return 1; }
+
+  # ...while a legitimate event still reaches the user's own hook. This half is
+  # the positive control: without it, deleting the selection entirely would
+  # pass the assertion above.
+  event="$(jq -cn '{hook_event_name:"PreToolUse"}')"
+  run _execute_host_hooks "$event" "$settings"
+  assert_success
+  [ -e "$TEST_TEMP/USER_HOOK_RAN" ] || { echo "the user's own hook did not run"; return 1; }
+}

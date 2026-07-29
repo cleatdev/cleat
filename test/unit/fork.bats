@@ -153,6 +153,48 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+@test "fork: the session key follows the copy, not the live project" {
+  # Shipped broken, found on a real host run 2026-07-29. Under the docker cap
+  # the container cd's into the workspace HOST path, so Claude Code derives its
+  # session key from the fork copy. Both the generated mountpoint and the
+  # session mount were keyed off the live PROJECT, so the box looked for a key
+  # that did not exist, and the projects parent is :ro so it could not create
+  # one. Sessions and memory silently did not persist for a fork box.
+  mock_docker_images "cleat"
+  printf '[capabilities]\ndocker\n' > "$TEST_TEMP/project/.cleat"
+  _trust_lookup() { echo "trusted"; }
+  cap_is_active() { [[ "$1" == "docker" ]]; }
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  local fork_key="${CLEAT_FORKS_DIR//\//-}-$CNAME"
+  # the generated parent holds a mountpoint for the COPY's key
+  [ -d "$CLEAT_RUN_DIR/$CNAME/home/projects/$fork_key" ] \
+    || { echo "missing fork session key: $fork_key"; \
+         ls -A "$CLEAT_RUN_DIR/$CNAME/home/projects"; return 1; }
+  # ...and the writable session dir is mounted at that key, not the project's
+  run assert_docker_run_has "$CNAME" "/home/coder/.claude/projects/$fork_key"
+  assert_success
+  run assert_docker_run_lacks "$CNAME" "/home/coder/.claude/projects/${TEST_TEMP//\//-}-project"
+  assert_success
+}
+
+@test "fork: a plain box still keys its session off the project path" {
+  # The same code path must not move for a non-fork box: workspace == project.
+  mock_docker_images "cleat"
+  printf '[capabilities]\ndocker\n' > "$TEST_TEMP/project/.cleat"
+  _trust_lookup() { echo "trusted"; }
+  cap_is_active() { [[ "$1" == "docker" ]]; }
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local proj_key="${TEST_TEMP//\//-}-project"
+  [ -d "$CLEAT_RUN_DIR/$CNAME/home/projects/$proj_key" ] \
+    || { echo "missing project session key: $proj_key"; return 1; }
+  run assert_docker_run_has "$CNAME" "/home/coder/.claude/projects/$proj_key"
+  assert_success
+}
+
 # ── the ways a fork could silently re-attach ────────────────────────────────
 
 @test "fork: a fork box whose copy is missing refuses instead of using the live tree" {
@@ -392,6 +434,25 @@ SHIM
   fi
 }
 
+@test "fork: the heal notice prints once even though two verbs preflight" {
+  # cmd_start preflights and then calls cmd_run, which preflights too so that
+  # `cleat run <box> --fork` cannot reach its plain `docker rm`. A real host run
+  # showed the heal line twice because both calls ran the body. Asserted in ONE
+  # shell on purpose: `run` is a subshell, so a test that calls cmd_run twice
+  # through `run` cannot see the per-process guard at all.
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  rm -rf "$CLEAT_FORKS_DIR/$CNAME"
+  _FORK_PREFLIGHT_DONE=""
+  local out
+  out="$( { _fork_preflight "$CNAME" recreate; _fork_preflight "$CNAME" recreate; } 2>&1 )"
+  local n
+  n="$(printf '%s\n' "$out" | grep -c "recreating it" || true)"
+  [ "$n" = "1" ] || { echo "expected 1 heal notice, got $n:"; printf '%s\n' "$out"; return 1; }
+}
+
 @test "fork: an explicit fork flag recreates a copy that went missing" {
   # The marker is written once the copy lands, so a first run whose container
   # creation then failed left a marked box with no copy. Refusing there made
@@ -556,6 +617,46 @@ SHIM
   assert_output --partial "copied"
 }
 
+@test "fork: the summary does not claim the project is mounted for a fork box" {
+  # Shipped wrong, seen on a real host run: with the docker cap the Project line
+  # read "~/proj (same path, sandboxed)" directly above a Fork line naming a
+  # different directory. False twice over. The box has the COPY mounted, and the
+  # path it is mounted at is the copy's own.
+  mkdir -p "$CLEAT_FORKS_DIR/$CNAME"
+  _fork_mark "$CNAME"
+  cap_is_active() { [[ "$1" == "docker" ]]; }
+  run _print_summary_block "$CNAME" "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "not mounted"
+  # the PROJECT line specifically must not claim the mount
+  local projline
+  projline="$(printf '%s\n' "$output" | grep -- "Project:" | head -1)"
+  case "$projline" in
+    *"same path, sandboxed"*) echo "Project line still claims the mount: $projline"; return 1 ;;
+  esac
+  # the Fork line now carries the mount instead
+  local forkline
+  forkline="$(printf '%s\n' "$output" | grep -- "Fork:" | head -1)"
+  case "$forkline" in
+    *"same path, sandboxed"*) ;;
+    *) echo "Fork line does not say where the copy is mounted: $forkline"; return 1 ;;
+  esac
+}
+
+@test "fork: without the docker cap the fork line points at workspace" {
+  mkdir -p "$CLEAT_FORKS_DIR/$CNAME"
+  _fork_mark "$CNAME"
+  cap_is_active() { return 1; }
+  run _print_summary_block "$CNAME" "$TEST_TEMP/project"
+  assert_success
+  local forkline
+  forkline="$(printf '%s\n' "$output" | grep -- "Fork:" | head -1)"
+  case "$forkline" in
+    *"/workspace"*) ;;
+    *) echo "Fork line does not name /workspace: $forkline"; return 1 ;;
+  esac
+}
+
 @test "fork: the summary has no fork line for a plain box" {
   run _print_summary_block "$CNAME" "$TEST_TEMP/project"
   assert_success
@@ -647,4 +748,191 @@ SHIM
   run cmd_run "$TEST_TEMP/project"
   assert_failure
   assert_output --partial "Fork root is inside the project"
+}
+
+# ── cleat fork: managing the copies ─────────────────────────────────────────
+#
+# Before this verb the copies were write-only state: created by --fork, kept on
+# purpose by cleat rm, and after that reachable only by knowing the layout of
+# $CLEAT_FORKS_DIR. There was also no way to get a FRESH copy at all, which is
+# what a real host run hit: cleat rm keeps the copy, so start --fork reused it
+# and a newly added `[fork] exclude` could never take effect.
+
+@test "fork verb: says so plainly when there are no copies" {
+  run cmd_fork
+  assert_success
+  assert_output --partial "No fork workspaces"
+}
+
+@test "fork verb: lists a copy with its size and its box state" {
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  container_exists() { return 0; }
+  run cmd_fork
+  assert_success
+  # Assert on THIS copy's row, not on the whole output: the legend at the bottom
+  # always mentions "no box" while explaining what the marker means.
+  local row
+  row="$(printf '%s\n' "$output" | grep -- "$CNAME" | head -1)"
+  case "$row" in
+    *"box exists"*) ;;
+    *) echo "row did not read as having a box: $row"; return 1 ;;
+  esac
+  case "$row" in
+    *"no box"*) echo "row wrongly read as an orphan: $row"; return 1 ;;
+  esac
+  # and the size column is populated
+  case "$row" in
+    *KB*|*MB*|*GB*) ;;
+    *) echo "row has no size: $row"; return 1 ;;
+  esac
+}
+
+@test "fork verb: a copy whose container is gone reads as an orphan" {
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-gone-11112222-main"
+  container_exists() { return 1; }
+  run cmd_fork
+  assert_success
+  assert_output --partial "cleat-gone-11112222-main"
+  assert_output --partial "no box"
+}
+
+@test "fork verb: the total is labelled apparent, never reclaimable" {
+  # A copy-on-write copy shares blocks with the project, and du is not
+  # clone-aware, so the number over-reports what deleting would free. Printing
+  # it as reclaimable disk would be the same class of overclaim the docs ban.
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-x-11112222-main"
+  container_exists() { return 1; }
+  run cmd_fork
+  assert_success
+  assert_output --partial "apparent"
+}
+
+@test "fork verb: path prints the bare path and nothing else on stdout" {
+  # This exists so `cd "$(cleat fork path feat-a)"` works, so a diagnostic on
+  # stdout would be cd'd into.
+  mkdir -p "$CLEAT_FORKS_DIR/$CNAME"
+  run cmd_fork path main
+  assert_success
+  assert_output "$CLEAT_FORKS_DIR/$CNAME"
+}
+
+@test "fork verb: path fails with an empty stdout when there is no copy" {
+  local out rc=0
+  out="$(cmd_fork path main 2>/dev/null)" || rc=$?
+  [ "$rc" != "0" ] || { echo "expected a non-zero exit"; return 1; }
+  [ -z "$out" ] || { echo "expected empty stdout, got: $out"; return 1; }
+}
+
+@test "fork verb: rm refuses while the box still exists" {
+  # The container has the copy bind-mounted at /workspace. Deleting it under a
+  # live box hands the agent a half tree with no warning.
+  mkdir -p "$CLEAT_FORKS_DIR/$CNAME"
+  container_exists() { return 0; }
+  run cmd_fork rm main
+  assert_failure
+  assert_output --partial "still exists"
+  [ -d "$CLEAT_FORKS_DIR/$CNAME" ]
+}
+
+@test "fork verb: rm keeps the copy when the confirmation is declined" {
+  mkdir -p "$CLEAT_FORKS_DIR/$CNAME"
+  echo "work" > "$CLEAT_FORKS_DIR/$CNAME/uncommitted.txt"
+  container_exists() { return 1; }
+  run cmd_fork rm main <<< "n"
+  assert_success
+  assert_output --partial "Kept"
+  [ -f "$CLEAT_FORKS_DIR/$CNAME/uncommitted.txt" ]
+}
+
+@test "fork verb: rm deletes the copy and drops the fork marker when confirmed" {
+  mkdir -p "$CLEAT_FORKS_DIR/$CNAME"
+  _fork_mark "$CNAME"
+  [ -f "$(_fork_marker_file "$CNAME")" ]
+  container_exists() { return 1; }
+  run cmd_fork rm main <<< "y"
+  assert_success
+  [ ! -e "$CLEAT_FORKS_DIR/$CNAME" ]
+  [ ! -e "$(_fork_marker_file "$CNAME")" ]
+}
+
+@test "fork verb: prune deletes orphans and keeps copies that still have a box" {
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main"
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-live-33334444-main"
+  container_exists() { [[ "$1" == "cleat-live-33334444-main" ]]; }
+  run cmd_fork prune --yes
+  assert_success
+  [ ! -e "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main" ]
+  [ -d "$CLEAT_FORKS_DIR/cleat-live-33334444-main" ]
+}
+
+@test "fork verb: prune keeps everything when the confirmation is declined" {
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main"
+  container_exists() { return 1; }
+  run cmd_fork prune <<< "n"
+  assert_success
+  assert_output --partial "Kept"
+  [ -d "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main" ]
+}
+
+@test "fork verb: refresh re-copies and finally applies a changed exclude" {
+  # THE host bug: cleat rm keeps the copy, so start --fork reused a stale one
+  # and a newly added [fork] exclude never took effect. There was no way to
+  # force a fresh copy short of deleting the directory by hand.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/node_modules/pkg"
+  echo "dep" > "$TEST_TEMP/project/node_modules/pkg/i.js"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -d "$CLEAT_FORKS_DIR/$CNAME/node_modules" ]
+
+  # now the user adds the exclude and refreshes
+  printf '[fork]\nexclude = node_modules\n' > "$TEST_TEMP/project/.cleat"
+  container_exists() { return 1; }
+  run cmd_fork refresh main <<< "y"
+  assert_success
+  [ ! -e "$CLEAT_FORKS_DIR/$CNAME/node_modules" ]
+  [ -f "$CLEAT_FORKS_DIR/$CNAME/src/app.js" ]
+}
+
+@test "fork verb: refresh refuses while the box still exists" {
+  mkdir -p "$CLEAT_FORKS_DIR/$CNAME"
+  echo "agent work" > "$CLEAT_FORKS_DIR/$CNAME/wip.txt"
+  container_exists() { return 0; }
+  run cmd_fork refresh main
+  assert_failure
+  assert_output --partial "still exists"
+  [ -f "$CLEAT_FORKS_DIR/$CNAME/wip.txt" ]
+}
+
+@test "fork verb: an unknown subcommand errors instead of guessing a box name" {
+  # `cleat fork feat-a` must not be read as either "show me feat-a's copy" or
+  # "run subcommand feat-a". Guessing is how a delete lands on the wrong thing.
+  run cmd_fork feat-a
+  assert_failure
+  assert_output --partial "Unknown subcommand"
+  assert_output --partial "start feat-a --fork"
+}
+
+@test "fork verb: the tree delete refuses a target outside the fork root" {
+  mkdir -p "$TEST_TEMP/victim"
+  echo "important" > "$TEST_TEMP/victim/keep.txt"
+  run _fork_rm_tree "$TEST_TEMP/victim"
+  assert_failure
+  assert_output --partial "Refusing to delete outside"
+  [ -f "$TEST_TEMP/victim/keep.txt" ]
+}
+
+@test "fork verb: the tree delete refuses a symlinked copy" {
+  # rm -rf on a symlinked copy would follow it out of the fork root.
+  mkdir -p "$TEST_TEMP/realdir" "$CLEAT_FORKS_DIR"
+  echo "important" > "$TEST_TEMP/realdir/keep.txt"
+  ln -s "$TEST_TEMP/realdir" "$CLEAT_FORKS_DIR/sneaky"
+  run _fork_rm_tree "$CLEAT_FORKS_DIR/sneaky"
+  assert_failure
+  assert_output --partial "symlink"
+  [ -f "$TEST_TEMP/realdir/keep.txt" ]
 }

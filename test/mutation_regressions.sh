@@ -2628,6 +2628,87 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "fork_run_preflight" "run refuses the flag on an existing plain box" "$CLI" "$FORK_BATS"
 
+# FORK SESSION KEY: under the docker cap the container cd's into the workspace
+# HOST path, so Claude Code derives its session key from the fork COPY. Key the
+# generated mountpoint off the live project instead and the box looks for a key
+# that does not exist, under a :ro parent it cannot create: sessions and memory
+# silently stop persisting. Shipped broken, found on a real host run.
+cat > "$SED_TMP" << 'SED'
+s@_generate_home_overlay "$cname" "$_workspace"@_generate_home_overlay "$cname" "$project"@
+SED
+try "fork_session_key_mountpoint" "session key follows the copy" "$CLI" "$FORK_BATS"
+
+# FORK SESSION MOUNT: the other half. The writable session dir must be mounted
+# at the same workspace-derived key, or the mountpoint exists and stays empty.
+cat > "$SED_TMP" << 'SED'
+s@local _host_project_key="${_workspace@local _host_project_key="${project@
+SED
+try "fork_session_key_mount" "session key follows the copy" "$CLI" "$FORK_BATS"
+
+# FORK CONFIG SECTION: [fork] must be a KNOWN section. Drop it from the project
+# allow-list and every launch of a project using `exclude = node_modules` warns
+# that its own config section is unknown and ignored.
+cat > "$SED_TMP" << 'SED'
+s@caps|resources|setup|fork) continue@caps|resources|setup) continue@
+SED
+try "fork_section_is_known" "fork. is known in a project" "$CLI" "$REPO_ROOT/test/unit/provision.bats"
+
+# FORK HEAL NOTICE ONCE: cmd_start and cmd_run both preflight. Drop the
+# once-per-process guard and the heal line prints twice, as it did on the host.
+cat > "$SED_TMP" << 'SED'
+/^  \[\[ -n "$_FORK_PREFLIGHT_DONE" \]\] && return 0$/d
+SED
+try "fork_preflight_once" "heal notice prints once" "$CLI" "$FORK_BATS"
+
+# FORK RM TREE CONTAINMENT: _fork_rm_tree is an `rm -rf` on a path built from a
+# container name and a user-configurable root. Make the containment check always
+# pass and it will delete whatever it is handed. Scoped with a line range so the
+# identical guard in _fork_copy_tree keeps its own mutation.
+cat > "$SED_TMP" << 'SED'
+2600,2620s@case "$target" in@case "$root/x" in@
+SED
+try "fork_rm_tree_containment" "refuses a target outside the fork root" "$CLI" "$FORK_BATS"
+
+# FORK RM TREE SYMLINK: rm -rf on a symlinked copy follows it out of the fork
+# root, so the containment check above passes while real host files die.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ -L "$target" \]\]; then@  if false; then@
+SED
+try "fork_rm_tree_symlink" "refuses a symlinked copy" "$CLI" "$FORK_BATS"
+
+# FORK RM LIVE BOX: rm and refresh must refuse while the container exists. It
+# has the copy bind-mounted at /workspace, so replacing or deleting it hands the
+# agent a half tree mid-session with no warning.
+cat > "$SED_TMP" << 'SED'
+s@      if container_exists "$cname"; then@      if false; then@
+SED
+try "fork_rm_refuses_live_box" "refuses while the box still exists" "$CLI" "$FORK_BATS"
+
+# FORK PRUNE SELECTIVITY: prune must skip copies whose container still exists.
+# Neuter the skip and it deletes the workspace of a live box.
+cat > "$SED_TMP" << 'SED'
+s@        container_exists "$cname" && continue@        false && continue@
+SED
+try "fork_prune_keeps_live" "keeps copies that still have a box" "$CLI" "$FORK_BATS"
+
+# FORK SUMMARY PROJECT LINE: a fork box must not be printed as though the live
+# project were mounted. Drop the fork branch and it falls back to the docker-cap
+# line, which is what shipped: "Project: ~/proj (same path, sandboxed)" directly
+# above a Fork line naming a different directory.
+cat > "$SED_TMP" << 'SED'
+s@      echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}(not mounted, this box works on a copy)${RESET}"@      :@
+SED
+try "fork_summary_project_not_mounted" "does not claim the project is mounted" "$CLI" "$FORK_BATS"
+
+# FORK SUMMARY MOUNT TARGET: with the Project line no longer carrying the mount,
+# the Fork line must. Neuter the branch and the summary never says where the
+# copy is mounted at all.
+cat > "$SED_TMP" << 'SED'
+s@        _where="${DIM}(same path, sandboxed)${RESET}"@        _where=""@
+s@        _where="${DIM}→${RESET} /workspace"@        _where=""@
+SED
+try "fork_summary_mount_target" "fork line points at workspace" "$CLI" "$FORK_BATS"
+
 # FORK EXCLUDE SAFETY: an absolute or traversing exclude must be refused, or a
 # .cleat in a cloned repo can delete outside the fork.
 cat > "$SED_TMP" << 'SED'

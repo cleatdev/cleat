@@ -130,6 +130,7 @@ _RESOLVED_PROJECT=""
 # _set_box for box-aware verbs; stays "main" for everything else.
 _BOX="main"
 _FORK_REQUESTED=false   # set by --fork; only read when a box is CREATED
+_FORK_PREFLIGHT_DONE="" # one preflight per process: start/resume run it, then cmd_run
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
 _CLI_TRUST_PROJECT=0
@@ -2469,7 +2470,15 @@ _CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots s
 # session key is never a container recreate. Cheap: these are empty dirs, not
 # copies, so there is no per-start IO proportional to the host's 1.1 GB.
 _generate_home_overlay() {
-  local cname="$1" project="$2" session_key="$3"
+  # $2 is the WORKSPACE, not the project. For a plain box they are the same path.
+  # For a fork box the workspace is the copy, and the copy is what the container
+  # cd's into under the docker cap, so the copy is what Claude Code encodes its
+  # session key from. Passing the project here shipped broken: a fork box with
+  # the docker cap got a mountpoint named after the live project while Claude
+  # looked for one named after the copy, found nothing, and could not create it
+  # because this parent is mounted :ro. Sessions and memory silently did not
+  # persist. Found on a real host run 2026-07-29.
+  local cname="$1" workspace="$2" session_key="$3"
   local home_dir="$CLEAT_RUN_DIR/${cname}/home"
   local _d
 
@@ -2490,14 +2499,14 @@ _generate_home_overlay() {
   # unconditionally costs an empty dir and keeps this independent of cap order.
   [[ -L "$home_dir/projects" || -f "$home_dir/projects" ]] && rm -f "$home_dir/projects"
   mkdir -p "$home_dir/projects/-workspace"
-  mkdir -p "$home_dir/projects/${project//\//-}"
-  # Drop stale keys from a previous project path so the box never sees a
+  mkdir -p "$home_dir/projects/${workspace//\//-}"
+  # Drop stale keys from a previous workspace path so the box never sees a
   # mountpoint it no longer owns.
   local _k
   for _k in "$home_dir/projects"/*; do
     [[ -d "$_k" ]] || continue
     case "${_k##*/}" in
-      -workspace|"${project//\//-}") ;;
+      -workspace|"${workspace//\//-}") ;;
       *) rmdir "$_k" 2>/dev/null || true ;;
     esac
   done
@@ -2584,6 +2593,28 @@ _box_is_fork()      { [[ -f "$(_fork_marker_file "$1")" ]]; }
 _fork_mark()        { mkdir -p "$CLEAT_BOXES_DIR"; : > "$(_fork_marker_file "$1")"; }
 _fork_unmark()      { rm -f "$(_fork_marker_file "$1")"; }
 
+# Delete a fork copy. Every caller passes a path it derived from _fork_dir, but
+# this is an `rm -rf` on a path built from a container name and a configurable
+# root, so it re-checks containment itself rather than trusting the caller. Same
+# guard as _fork_copy_tree, and for the same reason: `[fork] dir` is user input
+# and _fork_root once returned a warning STRING when it was relative.
+_fork_rm_tree() {
+  local target="$1" root
+  root="$(_fork_root)"
+  case "$target" in
+    "$root"/?*) : ;;
+    *) error "Refusing to delete outside ${root/#${HOME}/~}: $target"; return 1 ;;
+  esac
+  # A symlinked copy would make rm -rf follow it out of the root.
+  if [[ -L "$target" ]]; then
+    error "Fork workspace is a symlink, refusing to delete: ${target/#${HOME}/~}"
+    return 1
+  fi
+  [[ -d "$target" ]] || return 0
+  rm -rf "$target" || { error "Could not delete ${target/#${HOME}/~}"; return 1; }
+  return 0
+}
+
 # Every session verb must check this, not just cmd_run. The fork copy is a
 # HOST-side invariant: whether the container happens to be running says nothing
 # about whether its workspace still exists. cmd_resume only re-checks bind
@@ -2597,6 +2628,13 @@ _fork_unmark()      { rm -f "$(_fork_marker_file "$1")"; }
 # create and cannot be repointed on a running container.
 _fork_preflight() {
   local cname="$1" can_recreate="${2:-}"
+  # cmd_start and cmd_resume preflight, then call cmd_run, which preflights too so
+  # that `cleat run <box> --fork` cannot reach the plain `docker rm` below without
+  # being refused. Running the body twice is harmless but not silent: the heal
+  # path printed "Fork workspace is missing, recreating it" once per call, which
+  # a real host run showed as a duplicated line. Once per process is enough.
+  [[ -n "$_FORK_PREFLIGHT_DONE" ]] && return 0
+  _FORK_PREFLIGHT_DONE=1
   if ! _box_is_fork "$cname"; then
     # --fork on a box that already exists as a plain box did nothing at all:
     # the create block only runs when there is no container, so the flag was
@@ -3288,14 +3326,14 @@ _warn_unknown_cleat_sections() {
     case "$scope" in
       project)
         case "$name" in
-          caps|resources|setup) continue ;;
+          caps|resources|setup|fork) continue ;;
           kits)
             warn "Section [kits] in .cleat is ignored ${DIM}(kit models are read from the global config only)${RESET}"
             continue ;;
         esac ;;
       global)
         case "$name" in
-          caps|resources|kits) continue ;;
+          caps|resources|kits|fork) continue ;;
           setup)
             warn "Section [setup] in the global config is ignored ${DIM}([setup] is project-only, in .cleat)${RESET}"
             continue ;;
@@ -4247,7 +4285,16 @@ _print_summary_block() {
     # its own path so $(pwd) and `docker run -v $(pwd)` resolve on the host
     # daemon; see the docker-cap mount block). Without it, the project lives at
     # /workspace. Show the truth for each case.
-    if cap_is_active docker; then
+    #
+    # A fork box is a third case and it used to fall into the first one, which
+    # read "Project: ~/proj (same path, sandboxed)". That is false twice over:
+    # the box has the COPY mounted, not ~/proj, and the path it is mounted at is
+    # the copy's own path. A real host run showed exactly that line above a Fork
+    # line naming a different directory. Say "not mounted" and let the Fork line
+    # below say what is.
+    if _box_is_fork "$cname"; then
+      echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}(not mounted, this box works on a copy)${RESET}"
+    elif cap_is_active docker; then
       echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}(same path, sandboxed)${RESET}"
     else
       echo -e "  ${DIM}Project:${RESET}    ${display_path} ${DIM}→${RESET} /workspace"
@@ -4258,13 +4305,20 @@ _print_summary_block() {
     # copy lives (landing the work needs the path) and how old it is, because a
     # fork drifts from the project it was taken from and nothing else says so.
     if _box_is_fork "$cname"; then
-      local _fp _age
+      local _fp _age _where
       _fp="$(_fork_dir "$cname")"
       _age="$(_fork_age_human "$_fp")"
-      if [[ -n "$_age" ]]; then
-        echo -e "  ${DIM}Fork:${RESET}       ${_fp/#$HOME/~} ${DIM}(copied ${_age})${RESET}"
+      # Now that the Project line says "not mounted", this line has to carry the
+      # mount, in the same shape the Project line uses for a plain box.
+      if cap_is_active docker; then
+        _where="${DIM}(same path, sandboxed)${RESET}"
       else
-        echo -e "  ${DIM}Fork:${RESET}       ${_fp/#$HOME/~}"
+        _where="${DIM}→${RESET} /workspace"
+      fi
+      if [[ -n "$_age" ]]; then
+        echo -e "  ${DIM}Fork:${RESET}       ${_fp/#$HOME/~} ${_where} ${DIM}(copied ${_age})${RESET}"
+      else
+        echo -e "  ${DIM}Fork:${RESET}       ${_fp/#$HOME/~} ${_where}"
       fi
     fi
   # A box's personality must never be invisible: show the enabled kit. The
@@ -6480,7 +6534,7 @@ cmd_run() {
   # Per-box replacements for the cross-project surfaces. See
   # _generate_home_overlay: a :ro self-mask would block writes but not reads,
   # so these are generated empties, never the host content.
-  _generate_home_overlay "$cname" "$project" "$project_session_key"
+  _generate_home_overlay "$cname" "$_workspace" "$project_session_key"
   local home_overlay="$CLEAT_RUN_DIR/${cname}/home"
 
   local mount_args=(
@@ -6613,7 +6667,10 @@ cmd_run() {
     # per-project session dir at the host-path-derived location too, so
     # sessions land in the same place regardless of which cap was active
     # when they were created. Slashes become dashes to match Claude's key.
-    local _host_project_key="${project//\//-}"
+    # Keyed off the WORKSPACE, not the project: for a fork box the container
+    # cd's into the copy, so the copy is the path Claude Code encodes. Using
+    # $project here mounted the session dir under a key the box never looks at.
+    local _host_project_key="${_workspace//\//-}"
     mkdir -p "${HOME}/.claude/projects/${_host_project_key}"
     mount_args+=(-v "${project_session_dir}:/home/coder/.claude/projects/${_host_project_key}")
   fi
@@ -9928,6 +9985,233 @@ cmd_describe() {
   fi
 }
 
+# ── `cleat fork`: manage the workspace copies ───────────────────────────────
+#
+# The copies were write-only state before this: created by `--fork`, deliberately
+# KEPT by `cleat rm` because a copy may hold the only version of hours of agent
+# work, and after that reachable only by knowing that they live under
+# $CLEAT_FORKS_DIR named after the container. There was no way to see how much
+# disk they held, and no way to get a FRESH copy at all: `cleat rm` keeps the
+# copy, so re-running the box reuses it and a changed `[fork] exclude` could
+# never take effect. A real host run hit exactly that (2026-07-29).
+#
+# `fork` is a VERB here while `--fork` stays a FLAG on start/run. They do not
+# collide because the flag is parsed globally and this verb owns its own
+# positionals. The subcommand names are RESERVED: `cleat fork feat-a` is an
+# error, not a guess, because guessing between "show me box feat-a's copy" and
+# "run subcommand feat-a" is how a delete lands on the wrong thing.
+
+# Apparent size of a directory in KB. `du -sk` is the one form BSD and GNU
+# agree on (-h differs, --block-size is GNU-only, and BSD needs -k to escape
+# 512-byte blocks). NOT clone-aware: on APFS a copy-on-write fork shares blocks
+# with the project, so this over-reports what deleting it would actually free.
+# Callers must label it as apparent size, never as reclaimable disk.
+_fork_size_kb() {
+  local d="$1" out
+  [[ -d "$d" ]] || { printf '%s' 0; return 0; }
+  out="$(du -sk "$d" 2>/dev/null | tail -1)" || out=""
+  # macOS wc/du pad their output, so take the first field rather than a cut.
+  set -- $out
+  case "${1:-}" in
+    ''|*[!0-9]*) printf '%s' 0 ;;
+    *)           printf '%s' "$1" ;;
+  esac
+}
+
+_fork_fmt_kb() {
+  local kb="$1"
+  if   [[ "$kb" -ge 1048576 ]]; then printf '%s GB' "$(( (kb + 524288) / 1048576 ))"
+  elif [[ "$kb" -ge 1024 ]];    then printf '%s MB' "$(( (kb + 512) / 1024 ))"
+  else                               printf '%s KB' "$kb"
+  fi
+}
+
+# Every copy under the fork root, one absolute path per line, sorted. Guarded
+# for a missing root and for a non-glob match (nullglob is not set anywhere in
+# this script, so an unmatched glob arrives as a literal).
+_fork_all_dirs() {
+  local root d
+  root="$(_fork_root)"
+  [[ -d "$root" ]] || return 0
+  for d in "$root"/*; do
+    [[ -d "$d" ]] || continue
+    printf '%s\n' "$d"
+  done
+}
+
+_fork_print_list() {
+  local root dirs total_kb=0 n=0 d cname kb age state
+  root="$(_fork_root)"
+  dirs="$(_fork_all_dirs)"
+  if [[ -z "$dirs" ]]; then
+    info "No fork workspaces."
+    echo -e "    ${DIM}Create one with ${BOLD}cleat start <box> --fork${RESET}${DIM}.${RESET}"
+    return 0
+  fi
+  echo -e "  ${BOLD}Fork workspaces${RESET} ${DIM}in ${root/#${HOME}/~}${RESET}"
+  echo
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    cname="${d##*/}"
+    kb="$(_fork_size_kb "$d")"
+    total_kb=$(( total_kb + kb ))
+    n=$(( n + 1 ))
+    age="$(_fork_age_human "$d")"
+    if container_exists "$cname"; then
+      state="${DIM}box exists${RESET}"
+    else
+      state="${AMBER}no box${RESET}"
+    fi
+    printf '    %-46s %8s  %-10s %b\n' \
+      "$cname" "$(_fork_fmt_kb "$kb")" "${age:-just now}" "$state"
+  done <<< "$dirs"
+  echo
+  echo -e "    ${DIM}$n $( [[ $n -eq 1 ]] && echo copy || echo copies ), $(_fork_fmt_kb "$total_kb") apparent.${RESET}"
+  echo -e "    ${DIM}Apparent, not reclaimable: a copy-on-write copy shares blocks with the project until something changes.${RESET}"
+  echo -e "    ${DIM}Rows marked ${RESET}${AMBER}no box${RESET}${DIM} have no container left. ${BOLD}cleat fork prune${RESET}${DIM} clears those.${RESET}"
+}
+
+cmd_fork() {
+  case "${1:-}" in
+    --help|-h)
+      echo "Usage: cleat fork                      List every workspace copy, with size and age"
+      echo "       cleat fork list                 Same, for scripts"
+      echo "       cleat fork path [box]           Print this box's copy path"
+      echo "       cleat fork rm [box]             Delete this box's copy and its fork marker"
+      echo "       cleat fork prune                Delete copies whose container is gone"
+      echo "       cleat fork refresh [box]        Re-copy from the live project"
+      echo ""
+      echo "Create a fork with: cleat start <box> --fork"
+      return 0 ;;
+  esac
+
+  local sub="${1:-}"
+  if [[ -z "$sub" || "$sub" == "list" ]]; then
+    _fork_print_list
+    return 0
+  fi
+  shift
+
+  case "$sub" in
+    path|rm|refresh)
+      local project box cname _fp
+      project="$(resolve_project "")"
+      box="${1:-${_BOX:-main}}"
+      cname="$(container_name_for "$project" "$box")"
+      _fp="$(_fork_dir "$cname")"
+
+      if [[ "$sub" == "path" ]]; then
+        # Bare path on stdout, nothing else: this exists so that
+        # `cd "$(cleat fork path feat-a)"` works. Missing copy is a non-zero
+        # exit with the message on stderr, so a subshell gets an empty string
+        # rather than a diagnostic it would then cd into.
+        if [[ ! -d "$_fp" ]]; then
+          error "No fork workspace for box ${BOLD}${box}${RESET}." >&2
+          return 1
+        fi
+        printf '%s\n' "$_fp"
+        return 0
+      fi
+
+      if [[ ! -d "$_fp" ]]; then
+        error "No fork workspace for box ${BOLD}${box}${RESET}."
+        echo -e "    ${DIM}Expected: ${_fp/#${HOME}/~}${RESET}"
+        return 1
+      fi
+      # Both remaining verbs replace or delete the copy, and the container has
+      # it bind-mounted at /workspace. Pulling it out from under a live box
+      # gives the agent a half tree with no warning, so refuse instead.
+      if container_exists "$cname"; then
+        error "Box ${BOLD}${box}${RESET} still exists."
+        echo -e "    ${DIM}Its container has this copy mounted. Remove the box first: ${BOLD}cleat rm ${box}${RESET}${DIM}.${RESET}"
+        return 1
+      fi
+
+      local _kb _ans
+      _kb="$(_fork_size_kb "$_fp")"
+      if [[ "$sub" == "rm" ]]; then
+        warn "This deletes ${BOLD}${_fp/#${HOME}/~}${RESET} ${DIM}($(_fork_fmt_kb "$_kb") apparent)${RESET}"
+        echo -e "    ${DIM}Anything the agent did in that copy and did not commit or push is gone.${RESET}"
+        _ask_yn _ans "Delete it? [y/N] "
+        case "$_ans" in
+          y|Y|yes|YES) ;;
+          *) info "Kept."; return 0 ;;
+        esac
+        _fork_rm_tree "$_fp" || return 1
+        _fork_unmark "$cname"
+        success "Fork workspace deleted."
+        echo -e "    ${DIM}Box ${BOLD}${box}${RESET}${DIM} is no longer a fork. ${BOLD}cleat start ${box} --fork${RESET}${DIM} makes a new copy.${RESET}"
+        return 0
+      fi
+
+      # refresh
+      warn "This replaces ${BOLD}${_fp/#${HOME}/~}${RESET} with a fresh copy of ${BOLD}${project/#${HOME}/~}${RESET}"
+      echo -e "    ${DIM}Anything the agent did in the current copy and did not commit or push is gone.${RESET}"
+      _ask_yn _ans "Replace it? [y/N] "
+      case "$_ans" in
+        y|Y|yes|YES) ;;
+        *) info "Kept."; return 0 ;;
+      esac
+      local _rc=0
+      spin "Copying workspace..."
+      _fork_copy_tree "$project" "$_fp" || _rc=$?
+      spin_stop "$_rc" "Workspace copied" "Workspace copy failed"
+      [[ "$_rc" -eq 0 ]] || return 1
+      _fork_prune_excludes "$_fp" "$project"
+      _fork_mark "$cname"
+      echo -e "    ${DIM}Next ${BOLD}cleat start ${box} --fork${RESET}${DIM} uses it.${RESET}"
+      return 0 ;;
+
+    prune)
+      local assume_yes=0 a
+      for a in "$@"; do case "$a" in --yes|-y) assume_yes=1 ;; esac; done
+      local dirs d cname orphans="" count=0 kb total=0
+      dirs="$(_fork_all_dirs)"
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        cname="${d##*/}"
+        container_exists "$cname" && continue
+        kb="$(_fork_size_kb "$d")"
+        total=$(( total + kb ))
+        count=$(( count + 1 ))
+        orphans="${orphans}${d}"$'\n'
+      done <<< "$dirs"
+      if [[ "$count" -eq 0 ]]; then
+        info "Nothing to prune. Every fork workspace still has a box."
+        return 0
+      fi
+      warn "$count fork $( [[ $count -eq 1 ]] && echo workspace || echo workspaces ) with no container, $(_fork_fmt_kb "$total") apparent:"
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        echo -e "    ${DIM}${d/#${HOME}/~}${RESET}"
+      done <<< "$orphans"
+      echo -e "    ${DIM}A copy outlives its box on purpose: it may hold the only version of the work.${RESET}"
+      if [[ "$assume_yes" -ne 1 ]]; then
+        local _ans2
+        _ask_yn _ans2 "Delete all of them? [y/N] "
+        case "$_ans2" in
+          y|Y|yes|YES) ;;
+          *) info "Kept."; return 0 ;;
+        esac
+      fi
+      local removed=0
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        if _fork_rm_tree "$d"; then
+          _fork_unmark "${d##*/}"
+          removed=$(( removed + 1 ))
+        fi
+      done <<< "$orphans"
+      success "Removed $removed fork $( [[ $removed -eq 1 ]] && echo workspace || echo workspaces )."
+      return 0 ;;
+
+    *)
+      error "Unknown subcommand ${BOLD}${sub}${RESET} for ${BOLD}cleat fork${RESET}."
+      echo -e "    ${DIM}Try ${BOLD}cleat fork --help${RESET}${DIM}. To create a fork: ${BOLD}cleat start ${sub} --fork${RESET}${DIM}.${RESET}"
+      exit 1 ;;
+  esac
+}
+
 # `cleat kit`: enable/disable/inspect curated Claude pre-configurations per
 # box. Two positionals (`kit <name> [box]`), so like `describe` it parses
 # inside cmd_kit and never routes through _set_box (which rejects a second
@@ -10793,6 +11077,13 @@ cmd_help() {
   echo -e "    ${GREEN}kit${RESET} ${DIM}off [box]${RESET}      Disable ${DIM}(back to your own config)${RESET}"
   echo -e "    ${GREEN}kit${RESET} ${DIM}show <name>${RESET}    Print everything a kit injects"
   echo ""
+  echo -e "  ${BOLD}FORKS${RESET} ${DIM}(a box on its own copy of the project: ${BOLD}start <box> --fork${RESET}${DIM})${RESET}"
+  echo -e "    ${GREEN}fork${RESET}               List every workspace copy ${DIM}(size, age, whether its box is left)${RESET}"
+  echo -e "    ${GREEN}fork${RESET} ${DIM}path [box]${RESET}     Print a copy's path ${DIM}(cd \"\$(cleat fork path feat-a)\")${RESET}"
+  echo -e "    ${GREEN}fork${RESET} ${DIM}rm [box]${RESET}       Delete a copy and drop the fork marker"
+  echo -e "    ${GREEN}fork${RESET} ${DIM}prune${RESET}          Delete copies whose container is gone"
+  echo -e "    ${GREEN}fork${RESET} ${DIM}refresh [box]${RESET}  Re-copy from the live project ${DIM}(after changing [fork] exclude)${RESET}"
+  echo ""
   echo -e "  ${BOLD}INTERACT${RESET}"
   echo -e "    ${GREEN}claude${RESET}  ${DIM}[box]${RESET}      Attach Claude Code (--dangerously-skip-permissions)"
   echo -e "    ${GREEN}shell${RESET}   ${DIM}[box]${RESET}      Open bash in the container"
@@ -10972,6 +11263,7 @@ main() {
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;
     kit)       cmd_kit "$@" ;;
+    fork)      cmd_fork "$@" ;;
     setup)     cmd_setup "$@" ;;
     trust)     cmd_trust "$@" ;;
     untrust)   cmd_untrust "$@" ;;

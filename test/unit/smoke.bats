@@ -1272,3 +1272,56 @@ EOF
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
 }
+
+@test "smoke: cleat fork with no copies exits 0" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork
+  assert_success
+  assert_output --partial "No fork workspaces"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork list survives strict mode with a copy present" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  mkdir -p "$CLEAT_CONFIG_DIR/forks/cleat-smoke-11112222-main"
+  run cleat_bin fork list
+  assert_success
+  assert_output --partial "cleat-smoke-11112222-main"
+  assert_output --partial "apparent"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork prune with nothing to do exits 0" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork prune
+  assert_success
+  assert_output --partial "Nothing to prune"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork path with no copy exits 1 and prints nothing on stdout" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork path main
+  assert_failure
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork rejects an unknown subcommand with exit 1" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork definitely-not-a-subcommand
+  assert_failure
+  assert_output --partial "Unknown subcommand"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork --help exits 0" {
+  run cleat_bin fork --help
+  assert_success
+  assert_output --partial "cleat fork prune"
+  refute_output --partial "unbound variable"
+}

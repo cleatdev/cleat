@@ -979,6 +979,26 @@ _th_record_setup() {
   refute_output --partial "Unknown section [setup]"
 }
 
+@test "warn_unknown_sections: [fork] is known in a project .cleat and in the global config" {
+  # Shipped broken: [fork] was in neither allow-list, so a project using
+  # `exclude = node_modules` was told its section was unknown and ignored on
+  # every single launch. Reported from a real host run 2026-07-29. [fork] is
+  # valid in both scopes: `exclude` is project-only, `dir` is global-only, and
+  # the section name itself is legitimate in each.
+  printf '[fork]\nexclude = node_modules\n' > "$PROJECT/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  run resolve_caps "$PROJECT"
+  refute_output --partial "Unknown section [fork]"
+  refute_output --partial "is ignored"
+}
+
+@test "warn_unknown_sections: [fork] in the global config is silent" {
+  printf '[fork]\ndir = /Volumes/fast/forks\n' > "$CLEAT_GLOBAL_CONFIG"
+  run resolve_caps "$PROJECT"
+  refute_output --partial "Unknown section"
+  refute_output --partial "is ignored"
+}
+
 @test "warn_unknown_sections: [kits] in a project .cleat gets the global-only hint" {
   printf '[kits]\nworker = sonnet\n' > "$PROJECT/.cleat"
   export CLEAT_TRUST_PROJECT=1

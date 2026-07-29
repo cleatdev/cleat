@@ -329,7 +329,9 @@ because `.cleat` arrives with a cloned repo and this value is a path Cleat
 creates and deletes under.
 
 `cleat rm <box>` frees the container and keeps the copy, since it may hold the
-only version of the work.
+only version of the work. Because it is kept, starting the box again with
+`--fork` **reuses** that copy rather than taking a fresh one, so a change to
+`[fork] exclude` does not apply until you refresh it.
 
 Worth knowing before you rely on it:
 
@@ -340,6 +342,32 @@ Worth knowing before you rely on it:
 - `cleat storage` does not see fork copies. It measures the Docker store, while
   the copies live on your filesystem.
 - Landing the work is yours. Cleat copies out, it does not merge back.
+
+The copies outlive their boxes on purpose, so they get their own verb. `fork` is
+a verb here while `--fork` stays a flag on `start` and `run`.
+
+```bash
+cleat fork                   # every copy: apparent size, age, is its box still there
+cleat fork path feat-a       # bare path, so cd "$(cleat fork path feat-a)" works
+cleat fork rm feat-a         # delete one copy and drop the box's fork marker
+cleat fork prune             # delete every copy whose container is gone
+cleat fork refresh feat-a    # replace a copy with a fresh one from the project
+```
+
+```
+  Fork workspaces in ~/.config/cleat/forks
+
+    cleat-demo-ab8ed4e5-feat-a                     412 MB  3h ago     box exists
+    cleat-demo-ab8ed4e5-feat-b                      12 MB  2d ago     no box
+
+    2 copies, 424 MB apparent.
+```
+
+Size is **apparent, not reclaimable**: `du` is not copy-on-write aware, so a
+fresh copy reports its full size while sharing nearly every block with the
+project. `rm` and `refresh` refuse while the box exists, because its container
+has the copy mounted at `/workspace`. Both confirm, defaulting to no. Both say
+plainly that uncommitted agent work in the copy will be lost.
 
 A **kit** is a curated Claude Code setup (a CLAUDE.md policy plus custom
 subagents) that you enable for one box with one command. The flagship kit,
@@ -474,6 +502,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `--trust-setup` | Auto-approve the current project's `[setup]` provisioning without prompting |
 | `--desc <text>` | Set the box's description at start (host-side, never recreates) |
 | `--fork` | Give the box its own copy of the project instead of the live tree (create time only) |
+| `fork [sub]` | Manage the workspace copies: `list`, `path`, `rm`, `prune`, `refresh` |
 
 #### Interact
 | Command | Description |

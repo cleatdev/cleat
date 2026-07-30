@@ -347,6 +347,8 @@ The copies outlive their boxes on purpose, so they get their own verb. `fork` is
 a verb here while `--fork` stays a flag on `start` and `run`.
 
 ```bash
+cleat fork start feat-a      # create a fork box and launch Claude (= start feat-a --fork)
+cleat fork run feat-a        # create it without launching Claude
 cleat fork                   # every copy: apparent size, age, is its box still there
 cleat fork path feat-a       # bare path, so cd "$(cleat fork path feat-a)" works
 cleat fork rm feat-a         # delete one copy and drop the box's fork marker
@@ -502,7 +504,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `--trust-setup` | Auto-approve the current project's `[setup]` provisioning without prompting |
 | `--desc <text>` | Set the box's description at start (host-side, never recreates) |
 | `--fork` | Give the box its own copy of the project instead of the live tree (create time only) |
-| `fork [sub]` | Manage the workspace copies: `list`, `path`, `rm`, `prune`, `refresh` |
+| `fork [sub]` | Fork a box (`start`, `run`) or manage the copies (`list`, `path`, `rm`, `prune`, `refresh`) |
 
 #### Interact
 | Command | Description |

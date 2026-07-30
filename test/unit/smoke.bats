@@ -1325,3 +1325,41 @@ EOF
   assert_output --partial "cleat fork prune"
   refute_output --partial "unbound variable"
 }
+
+@test "smoke: cleat fork run creates a fork box under strict mode" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork run
+  assert_success
+  assert_output --partial "Workspace copied"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork run rejects an invalid box name with exit 1" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork run "Bad Name"
+  assert_failure
+  assert_output --partial "Invalid box name"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork run rejects a stray second positional with exit 1" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork run feat-a extra
+  assert_failure
+  assert_output --partial "Unexpected argument"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat fork run then cleat fork list shows the copy" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork run feat-a
+  assert_success
+  run cleat_bin fork list
+  assert_success
+  assert_output --partial "feat-a"
+  refute_output --partial "unbound variable"
+}

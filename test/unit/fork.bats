@@ -914,7 +914,8 @@ SHIM
   run cmd_fork feat-a
   assert_failure
   assert_output --partial "Unknown subcommand"
-  assert_output --partial "start feat-a --fork"
+  # ...and the hint names the verb that WOULD fork that box
+  assert_output --partial "cleat fork start feat-a"
 }
 
 @test "fork verb: the tree delete refuses a target outside the fork root" {
@@ -935,4 +936,114 @@ SHIM
   assert_failure
   assert_output --partial "symlink"
   [ -f "$TEST_TEMP/realdir/keep.txt" ]
+}
+
+# ── cleat fork run / fork start ─────────────────────────────────────────────
+#
+# Discoverable aliases for `--fork` from the noun people reach for. Both exist
+# on purpose: `run` is create-only, so shipping only `fork run` would hand
+# someone a box and drop them back at their shell when they meant to work in it.
+# These tests assert EQUIVALENCE, not just that the commands do something.
+
+@test "fork run: mounts the copy at workspace, exactly like run --fork" {
+  mock_docker_images "cleat"
+  run cmd_fork run
+  assert_success
+  run assert_docker_run_has "$CNAME" "$CLEAT_FORKS_DIR/$CNAME:/workspace"
+  assert_success
+  run assert_docker_run_lacks "$CNAME" "$TEST_TEMP/project:/workspace"
+  assert_success
+}
+
+@test "fork run: records the fork marker so the box stays forked" {
+  mock_docker_images "cleat"
+  run cmd_fork run
+  assert_success
+  run _box_is_fork "$CNAME"
+  assert_success
+}
+
+@test "fork run: produces the same docker run line as run --fork" {
+  # The point of the alias is that it is not a lookalike. Capture the recorded
+  # docker command for each route and compare them.
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local via_flag
+  via_flag="$(grep -F -- "--name $CNAME" "$DOCKER_CALLS" | tail -1)"
+
+  # reset: same box, same project, via the new verb
+  docker rm "$CNAME" >/dev/null 2>&1 || true
+  : > "$DOCKER_CALLS"
+  rm -rf "$CLEAT_RUN_DIR/$CNAME"
+  container_exists() { return 1; }
+  _FORK_REQUESTED=false
+  _FORK_PREFLIGHT_DONE=""
+  run cmd_fork run
+  assert_success
+  local via_verb
+  via_verb="$(grep -F -- "--name $CNAME" "$DOCKER_CALLS" | tail -1)"
+
+  [ -n "$via_flag" ] || { echo "no docker run recorded for the flag route"; return 1; }
+  [ "$via_flag" = "$via_verb" ] || {
+    echo "routes differ:"; echo "  flag: $via_flag"; echo "  verb: $via_verb"; return 1; }
+}
+
+@test "fork run: a named box lands on that box, not on main" {
+  mock_docker_images "cleat"
+  local named
+  named="$(container_name_for "$TEST_TEMP/project" "feat-a")"
+  run cmd_fork run feat-a
+  assert_success
+  run assert_docker_run_has "$named" "$CLEAT_FORKS_DIR/$named:/workspace"
+  assert_success
+}
+
+@test "fork start: launches Claude rather than only creating the box" {
+  # The whole reason both verbs exist. `run` is create-only; `start` must reach
+  # the session launch. cmd_start is stubbed out to a marker so this stays a
+  # unit test rather than a real session.
+  mock_docker_images "cleat"
+  cmd_start() { echo "CMD_START REACHED"; }
+  run cmd_fork start feat-a
+  assert_success
+  assert_output --partial "CMD_START REACHED"
+}
+
+@test "fork start: sets the fork request before handing off" {
+  # If the flag were not set, cmd_start would build a plain box in silence.
+  local seen=""
+  cmd_start() { seen="$_FORK_REQUESTED"; }
+  cmd_fork start feat-a
+  [ "$seen" = "true" ] || { echo "expected _FORK_REQUESTED=true, got: [$seen]"; return 1; }
+}
+
+@test "fork run: routes through _set_box so the box name is validated" {
+  cmd_run() { echo "SHOULD NOT REACH"; }
+  run cmd_fork run "Not A Valid Box"
+  assert_failure
+  assert_output --partial "Invalid box name"
+  refute_output --partial "SHOULD NOT REACH"
+}
+
+@test "fork run: refuses a stray second positional like every box-aware verb" {
+  cmd_run() { echo "SHOULD NOT REACH"; }
+  run cmd_fork run feat-a extra
+  assert_failure
+  assert_output --partial "Unexpected argument"
+  refute_output --partial "SHOULD NOT REACH"
+}
+
+@test "fork start: an existing plain box is refused, not converted" {
+  # Same preflight as start --fork. Without it this alias would be a second
+  # route to the destructive docker rm that preflight exists to stop.
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"     # a plain box exists
+  assert_success
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  run cmd_fork run
+  assert_failure
+  assert_output --partial "already exists and is not a fork"
 }

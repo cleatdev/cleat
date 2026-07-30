@@ -2709,6 +2709,31 @@ s@        _where="${DIM}→${RESET} /workspace"@        _where=""@
 SED
 try "fork_summary_mount_target" "fork line points at workspace" "$CLI" "$FORK_BATS"
 
+# FORK RUN SETS THE REQUEST: `cleat fork run` is only a real alias for
+# `run --fork` if it sets the flag. Drop it and the verb quietly builds a PLAIN
+# box on the live tree, which is the worst possible failure for this feature:
+# the user asked for isolation by name and did not get it.
+cat > "$SED_TMP" << 'SED'
+/^      _FORK_REQUESTED=true$/d
+SED
+try "fork_run_sets_request" "mounts the copy at workspace, exactly like" "$CLI" "$FORK_BATS"
+
+# FORK START LAUNCHES CLAUDE: `run` is create-only, so routing `fork start` to
+# cmd_run hands the user a box and drops them at their shell. That confusion is
+# exactly why both verbs exist.
+cat > "$SED_TMP" << 'SED'
+s@      if \[\[ "$sub" == "start" \]\]; then@      if false; then@
+SED
+try "fork_start_launches" "launches Claude rather than only creating" "$CLI" "$FORK_BATS"
+
+# FORK RUN VALIDATES THE BOX: routing through _set_box is what gives this verb
+# the same name validation and stray-argument refusal as every other box-aware
+# verb. Hand-parsing it would let `cleat fork run "Bad Name"` through.
+cat > "$SED_TMP" << 'SED'
+/^      _set_box "$@"$/d
+SED
+try "fork_run_validates_box" "routes through _set_box" "$CLI" "$FORK_BATS"
+
 # FORK EXCLUDE SAFETY: an absolute or traversing exclude must be refused, or a
 # .cleat in a cloned repo can delete outside the fork.
 cat > "$SED_TMP" << 'SED'

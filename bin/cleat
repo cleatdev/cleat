@@ -10074,14 +10074,16 @@ _fork_print_list() {
 cmd_fork() {
   case "${1:-}" in
     --help|-h)
-      echo "Usage: cleat fork                      List every workspace copy, with size and age"
+      echo "Usage: cleat fork start [box]          Create a fork box and launch Claude in it"
+      echo "       cleat fork run [box]            Create it without launching Claude"
+      echo "       cleat fork                      List every workspace copy, with size and age"
       echo "       cleat fork list                 Same, for scripts"
       echo "       cleat fork path [box]           Print this box's copy path"
       echo "       cleat fork rm [box]             Delete this box's copy and its fork marker"
       echo "       cleat fork prune                Delete copies whose container is gone"
       echo "       cleat fork refresh [box]        Re-copy from the live project"
       echo ""
-      echo "Create a fork with: cleat start <box> --fork"
+      echo "cleat fork start <box> is the same as cleat start <box> --fork."
       return 0 ;;
   esac
 
@@ -10093,6 +10095,26 @@ cmd_fork() {
   shift
 
   case "$sub" in
+    start|run)
+      # `cleat fork start <box>` == `cleat start <box> --fork`, discoverable from
+      # the noun people actually reach for. BOTH verbs exist on purpose: `run` is
+      # create-only, so shipping only `fork run` would hand someone a box and
+      # drop them back at their shell when they meant to work in it. That exact
+      # confusion showed up in a host test run.
+      #
+      # Routed through _set_box rather than parsing the box here, so the name
+      # validation and the stray-argument refusal are the same code every other
+      # box-aware verb uses. Global flags (--cap, --env, --memory) were already
+      # parsed before dispatch, so they compose with this unchanged.
+      _set_box "$@"
+      _FORK_REQUESTED=true
+      if [[ "$sub" == "start" ]]; then
+        cmd_start
+      else
+        cmd_run
+      fi
+      return $? ;;
+
     path|rm|refresh)
       local project box cname _fp
       project="$(resolve_project "")"
@@ -10207,7 +10229,7 @@ cmd_fork() {
 
     *)
       error "Unknown subcommand ${BOLD}${sub}${RESET} for ${BOLD}cleat fork${RESET}."
-      echo -e "    ${DIM}Try ${BOLD}cleat fork --help${RESET}${DIM}. To create a fork: ${BOLD}cleat start ${sub} --fork${RESET}${DIM}.${RESET}"
+      echo -e "    ${DIM}Try ${BOLD}cleat fork --help${RESET}${DIM}. To fork a box named ${BOLD}${sub}${RESET}${DIM}: ${BOLD}cleat fork start ${sub}${RESET}${DIM}.${RESET}"
       exit 1 ;;
   esac
 }
@@ -11077,7 +11099,9 @@ cmd_help() {
   echo -e "    ${GREEN}kit${RESET} ${DIM}off [box]${RESET}      Disable ${DIM}(back to your own config)${RESET}"
   echo -e "    ${GREEN}kit${RESET} ${DIM}show <name>${RESET}    Print everything a kit injects"
   echo ""
-  echo -e "  ${BOLD}FORKS${RESET} ${DIM}(a box on its own copy of the project: ${BOLD}start <box> --fork${RESET}${DIM})${RESET}"
+  echo -e "  ${BOLD}FORKS${RESET} ${DIM}(a box on its own copy of the project, so it cannot touch your tree)${RESET}"
+  echo -e "    ${GREEN}fork${RESET} ${DIM}start [box]${RESET}    Create a fork box and launch Claude ${DIM}(= ${BOLD}start <box> --fork${RESET}${DIM})${RESET}"
+  echo -e "    ${GREEN}fork${RESET} ${DIM}run [box]${RESET}      Create it without launching Claude"
   echo -e "    ${GREEN}fork${RESET}               List every workspace copy ${DIM}(size, age, whether its box is left)${RESET}"
   echo -e "    ${GREEN}fork${RESET} ${DIM}path [box]${RESET}     Print a copy's path ${DIM}(cd \"\$(cleat fork path feat-a)\")${RESET}"
   echo -e "    ${GREEN}fork${RESET} ${DIM}rm [box]${RESET}       Delete a copy and drop the fork marker"

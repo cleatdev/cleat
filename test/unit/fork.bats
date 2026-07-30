@@ -168,7 +168,8 @@ teardown() { _common_teardown; }
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  local fork_key="${CLEAT_FORKS_DIR//\//-}-$CNAME"
+  local fork_key
+  fork_key="$(_claude_session_key "$CLEAT_FORKS_DIR/$CNAME")"
   # the generated parent holds a mountpoint for the COPY's key
   [ -d "$CLEAT_RUN_DIR/$CNAME/home/projects/$fork_key" ] \
     || { echo "missing fork session key: $fork_key"; \
@@ -176,8 +177,37 @@ teardown() { _common_teardown; }
   # ...and the writable session dir is mounted at that key, not the project's
   run assert_docker_run_has "$CNAME" "/home/coder/.claude/projects/$fork_key"
   assert_success
-  run assert_docker_run_lacks "$CNAME" "/home/coder/.claude/projects/${TEST_TEMP//\//-}-project"
+  run assert_docker_run_lacks "$CNAME" "/home/coder/.claude/projects/$(_claude_session_key "$TEST_TEMP/project")"
   assert_success
+}
+
+@test "fork: the session key replaces dots as well as slashes" {
+  # The half my first fix missed. Claude Code encodes BOTH / and . as a dash:
+  # measured on a live box, the workspace
+  #   /Users/marcin/.config/cleat/forks/cleat-demo-ab8ed4e5-feat-a
+  # became  -Users-marcin--config-cleat-forks-...  with a DOUBLE dash for "/.".
+  # Slash-only matched for a dotless project path, so this hid, but the DEFAULT
+  # fork root is ~/.config/cleat/forks, so every fork box under the docker cap
+  # missed its session dir.
+  run _claude_session_key "/Users/marcin/.config/cleat/forks/cleat-demo-ab8ed4e5-feat-a"
+  assert_success
+  assert_output "-Users-marcin--config-cleat-forks-cleat-demo-ab8ed4e5-feat-a"
+}
+
+@test "fork: a dotted fork root still gets a session mountpoint the box can find" {
+  # End to end for the same bug, through the real generator.
+  CLEAT_FORKS_DIR="$TEST_TEMP/.config/cleat/forks"
+  local ws="$CLEAT_FORKS_DIR/$CNAME"
+  mkdir -p "$ws"
+  _generate_home_overlay "$CNAME" "$ws" "key-abc"
+  local want
+  want="$(_claude_session_key "$ws")"
+  case "$want" in
+    *".."*|*"."*) echo "key still contains a dot: $want"; return 1 ;;
+  esac
+  [ -d "$CLEAT_RUN_DIR/$CNAME/home/projects/$want" ] \
+    || { echo "missing mountpoint for $want"; \
+         ls -A "$CLEAT_RUN_DIR/$CNAME/home/projects"; return 1; }
 }
 
 @test "fork: a plain box still keys its session off the project path" {
@@ -188,7 +218,8 @@ teardown() { _common_teardown; }
   cap_is_active() { [[ "$1" == "docker" ]]; }
   run cmd_run "$TEST_TEMP/project"
   assert_success
-  local proj_key="${TEST_TEMP//\//-}-project"
+  local proj_key
+  proj_key="$(_claude_session_key "$TEST_TEMP/project")"
   [ -d "$CLEAT_RUN_DIR/$CNAME/home/projects/$proj_key" ] \
     || { echo "missing project session key: $proj_key"; return 1; }
   run assert_docker_run_has "$CNAME" "/home/coder/.claude/projects/$proj_key"

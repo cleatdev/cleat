@@ -2641,9 +2641,19 @@ try "fork_session_key_mountpoint" "session key follows the copy" "$CLI" "$FORK_B
 # FORK SESSION MOUNT: the other half. The writable session dir must be mounted
 # at the same workspace-derived key, or the mountpoint exists and stays empty.
 cat > "$SED_TMP" << 'SED'
-s@local _host_project_key="${_workspace@local _host_project_key="${project@
+s@_host_project_key="$(_claude_session_key "$_workspace")"@_host_project_key="$(_claude_session_key "$project")"@
 SED
 try "fork_session_key_mount" "session key follows the copy" "$CLI" "$FORK_BATS"
+
+# FORK SESSION KEY DOTS: Claude Code encodes BOTH / and . as a dash. Replacing
+# only slashes matched for a dotless project path, so this hid, but the DEFAULT
+# fork root is ~/.config/cleat/forks: drop the dot half and every fork box under
+# the docker cap looks for a session dir that was never created, under a :ro
+# parent it cannot create one in. Silent loss of sessions and memory.
+cat > "$SED_TMP" << 'SED'
+s@  printf '%s' "${_k//\./-}"@  printf '%s' "$_k"@
+SED
+try "fork_session_key_dots" "replaces dots as well as slashes" "$CLI" "$FORK_BATS"
 
 # FORK CONFIG SECTION: [fork] must be a KNOWN section. Drop it from the project
 # allow-list and every launch of a project using `exclude = node_modules` warns
@@ -2664,8 +2674,13 @@ try "fork_preflight_once" "heal notice prints once" "$CLI" "$FORK_BATS"
 # container name and a user-configurable root. Make the containment check always
 # pass and it will delete whatever it is handed. Scoped with a line range so the
 # identical guard in _fork_copy_tree keeps its own mutation.
+# Anchored on the error string, NOT on a line range: the first version of this
+# entry used `2600,2620s@...@`, and inserting a helper 100 lines above silently
+# moved _fork_rm_tree out of that window, so the sed became a no-op and the
+# entry reported SKIPPED instead of failing loudly. Content anchors survive
+# refactors; line ranges do not.
 cat > "$SED_TMP" << 'SED'
-2600,2620s@case "$target" in@case "$root/x" in@
+s@    \*) error "Refusing to delete outside@    ZZ) error "Refusing to delete outside@
 SED
 try "fork_rm_tree_containment" "refuses a target outside the fork root" "$CLI" "$FORK_BATS"
 

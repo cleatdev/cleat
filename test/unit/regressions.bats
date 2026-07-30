@@ -1567,10 +1567,27 @@ EOF
   run cmd_run "$TEST_TEMP/project"
   assert_success
 
-  # Host-path key is the project path with slashes replaced by dashes.
-  local host_key="${TEST_TEMP//\//-}-project"
+  # Host-path key is the project path as Claude Code encodes it: every '/' AND
+  # every '.' becomes a dash.
+  #
+  # This assertion originally hardcoded slash-only replacement, and it passed
+  # because the code did the same thing. Both were wrong. Measured against a
+  # live box on 2026-07-29, Claude reported its own session path for a workspace
+  # under /Users/marcin/.config/... as -Users-marcin--config-..., a DOUBLE dash
+  # where "/." appeared. So the docker cap's session unification silently missed
+  # for every project path containing a dot, which this test's own mktemp dir
+  # (/tmp/tmp.XXXX) is an example of. Now shares one encoder with the overlay
+  # generator, so the two cannot drift apart again.
+  local host_key
+  host_key="$(_claude_session_key "$TEST_TEMP/project")"
   run assert_docker_run_has "$cname" ":/home/coder/.claude/projects/${host_key}"
   assert_success
+  # and the encoding is really the dotted one, not slash-only
+  case "$TEST_TEMP" in
+    *.*) case "$host_key" in
+           *.*) echo "key kept a dot: $host_key"; return 1 ;;
+         esac ;;
+  esac
 
   rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
 }

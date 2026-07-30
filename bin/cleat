@@ -2469,6 +2469,25 @@ _CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots s
 # regeneration rail as the kit overlay (create/start/resume), so adding a
 # session key is never a container recreate. Cheap: these are empty dirs, not
 # copies, so there is no per-start IO proportional to the host's 1.1 GB.
+# Claude Code's encoding of a working directory into its ~/.claude/projects/<key>
+# directory name: every '/' AND every '.' becomes a dash.
+#
+# Measured against a live box on 2026-07-29. With the workspace at
+#   /Users/marcin/.config/cleat/forks/cleat-demo-ab8ed4e5-feat-a
+# Claude reported its own session path as
+#   ~/.claude/projects/-Users-marcin--config-cleat-forks-cleat-demo-ab8ed4e5-feat-a
+# Note the DOUBLE dash where '/.' appeared. Replacing only slashes matched for a
+# project path with no dot in it, which is why this went unnoticed for so long,
+# but the default fork root is ~/.config/cleat/forks, so every fork box under the
+# docker cap looked for a session dir that was never created. Any project path
+# containing a dot had the same problem.
+#
+# Two steps because bash 3.2 has no nested parameter expansion.
+_claude_session_key() {
+  local _k="${1//\//-}"
+  printf '%s' "${_k//./-}"
+}
+
 _generate_home_overlay() {
   # $2 is the WORKSPACE, not the project. For a plain box they are the same path.
   # For a fork box the workspace is the copy, and the copy is what the container
@@ -2498,15 +2517,17 @@ _generate_home_overlay() {
   # cap moves the workdir (see the docker cap block). Creating the second
   # unconditionally costs an empty dir and keeps this independent of cap order.
   [[ -L "$home_dir/projects" || -f "$home_dir/projects" ]] && rm -f "$home_dir/projects"
+  local _wskey
+  _wskey="$(_claude_session_key "$workspace")"
   mkdir -p "$home_dir/projects/-workspace"
-  mkdir -p "$home_dir/projects/${workspace//\//-}"
+  mkdir -p "$home_dir/projects/$_wskey"
   # Drop stale keys from a previous workspace path so the box never sees a
   # mountpoint it no longer owns.
   local _k
   for _k in "$home_dir/projects"/*; do
     [[ -d "$_k" ]] || continue
     case "${_k##*/}" in
-      -workspace|"${workspace//\//-}") ;;
+      -workspace|"$_wskey") ;;
       *) rmdir "$_k" 2>/dev/null || true ;;
     esac
   done
@@ -6670,7 +6691,8 @@ cmd_run() {
     # Keyed off the WORKSPACE, not the project: for a fork box the container
     # cd's into the copy, so the copy is the path Claude Code encodes. Using
     # $project here mounted the session dir under a key the box never looks at.
-    local _host_project_key="${_workspace//\//-}"
+    local _host_project_key
+    _host_project_key="$(_claude_session_key "$_workspace")"
     mkdir -p "${HOME}/.claude/projects/${_host_project_key}"
     mount_args+=(-v "${project_session_dir}:/home/coder/.claude/projects/${_host_project_key}")
   fi

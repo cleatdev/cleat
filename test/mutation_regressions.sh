@@ -2749,6 +2749,35 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "fork_run_validates_box" "routes through _set_box" "$CLI" "$FORK_BATS"
 
+SMOKE_BATS="$REPO_ROOT/test/unit/smoke.bats"
+
+# CURSOR ESCAPES OFF A PIPE: `tput cnorm` writes to STDOUT whether or not stdout
+# is a terminal. Ungate it and every command ends with a cursor-restore sequence
+# on stdout, which is invisible to a human and fatal to
+# `cd "$(cleat fork path feat-a)"`. Found on a host run 2026-07-31.
+cat > "$SED_TMP" << 'SED'
+s@_cursor_show() { _is_tty @_cursor_show() { true @
+SED
+try "cursor_escapes_off_a_pipe" "no cursor escapes reach stdout" "$CLI" "$SMOKE_BATS"
+
+# HEAL NOTICE NEEDS SOMETHING TO HEAL: a fork marker outlives its box, so a
+# leftover one made a brand-new `cleat fork start` open with "Fork workspace is
+# missing, recreating it" when it was a first create. Ungate it and that returns.
+# Anchored on a unique comment line rather than an absolute range, because a
+# numeric range silently stops matching when anything above it moves.
+cat > "$SED_TMP" << 'SED'
+/path makes the copy anyway, so say nothing and let "Workspace copied"/,+4s@if container_exists "$cname"; then@if true; then@
+SED
+try "fork_heal_notice_needs_a_box" "first create does not announce a heal" "$CLI" "$FORK_BATS"
+
+# STALE MARKER SWEEP REACHABLE: the sweep must be counted BEFORE the early
+# return, because "no orphan copies" is exactly the state stale markers live in.
+# Restore the copies-only early return and the sweep becomes dead code.
+cat > "$SED_TMP" << 'SED'
+s@      if \[\[ "$count" -eq 0 && "$stale" -eq 0 \]\]; then@      if [[ "$count" -eq 0 ]]; then@
+SED
+try "fork_prune_stale_markers" "clears a stale marker" "$CLI" "$FORK_BATS"
+
 # FORK EXCLUDE SAFETY: an absolute or traversing exclude must be refused, or a
 # .cleat in a cloned repo can delete outside the fork.
 cat > "$SED_TMP" << 'SED'

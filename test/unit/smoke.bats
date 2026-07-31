@@ -1363,3 +1363,37 @@ EOF
   assert_output --partial "feat-a"
   refute_output --partial "unbound variable"
 }
+
+@test "smoke: cleat fork path output is capturable, no trailing escapes" {
+  # THE bug this subcommand exists to avoid, and it only shows through a real
+  # subprocess. `tput cnorm` writes its escape to STDOUT whether or not stdout
+  # is a terminal, so every command ended with a cursor-restore sequence.
+  # Invisible to a human, fatal to `cd "$(cleat fork path feat-a)"`: the
+  # captured value was the path, a newline, then \033[?12l\033[?25h, and cd
+  # failed with "no such file or directory". Host run, 2026-07-31.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork run
+  assert_success
+  local out
+  out="$(cleat_bin fork path 2>/dev/null)"
+  case "$out" in
+    *$'\033'*) echo "escape on stdout:"; printf '%s' "$out" | od -c | tail -4; return 1 ;;
+  esac
+  [ -d "$out" ] || { echo "captured value is not a directory: [$out]"; return 1; }
+  ( cd "$out" ) || { echo "cd into the captured path failed"; return 1; }
+}
+
+@test "smoke: no cursor escapes reach stdout when it is not a terminal" {
+  # Same defect, wider surface: any scriptable output would have been corrupted.
+  # Narrowed to the CURSOR sequences on purpose; colour codes on stdout are a
+  # separate question and are not what broke command substitution.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  local out
+  out="$(cleat_bin fork list 2>/dev/null)"
+  case "$out" in
+    *$'\033'"[?25h"*|*$'\033'"[?12l"*|*$'\033'"[?25l"*)
+      echo "cursor escape on stdout:"; printf '%s' "$out" | od -c | tail -4; return 1 ;;
+  esac
+}

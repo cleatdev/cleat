@@ -477,6 +477,8 @@ SHIM
   assert_success
   rm -rf "$CLEAT_FORKS_DIR/$CNAME"
   _FORK_PREFLIGHT_DONE=""
+  # The notice only fires when there is a container to drop, so give it one.
+  container_exists() { return 0; }
   local out
   out="$( { _fork_preflight "$CNAME" recreate; _fork_preflight "$CNAME" recreate; } 2>&1 )"
   local n
@@ -554,6 +556,7 @@ SHIM
   # The mount is baked at create and cannot be repointed on a live container,
   # so healing has to drop the container and let the create path rebuild both.
   mkdir -p "$CLEAT_BOXES_DIR"; : > "$CLEAT_BOXES_DIR/$CNAME.fork"
+  container_exists() { return 0; }   # there IS a box to heal
   _FORK_REQUESTED=true
   run _fork_preflight "$CNAME" recreate
   assert_success
@@ -1077,4 +1080,81 @@ SHIM
   run cmd_fork run
   assert_failure
   assert_output --partial "already exists and is not a fork"
+}
+
+# ── found by a host run, 2026-07-31 ─────────────────────────────────────────
+
+@test "fork: a first create does not announce a heal for a leftover marker" {
+  # A marker outlives its box on purpose, so one from a box removed long ago
+  # (or from an rm -rf of the forks dir) made a brand-new `cleat fork start`
+  # open with "Fork workspace is missing, recreating it" when nothing was
+  # missing and nothing was being recreated.
+  mock_docker_images "cleat"
+  _fork_mark "$CNAME"                    # marker, but no copy and no container
+  container_exists() { return 1; }
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "recreating it"
+  assert_output --partial "Workspace copied"
+}
+
+@test "fork: a real heal still announces itself when there is a box to heal" {
+  # The other side: gating the notice must not silence the case it exists for.
+  mock_docker_images "cleat"
+  _fork_mark "$CNAME"
+  container_exists() { return 0; }
+  _FORK_REQUESTED=true
+  run _fork_preflight "$CNAME" recreate
+  assert_success
+  assert_output --partial "recreating it"
+}
+
+@test "fork: a missing copy still refuses without the flag, container or not" {
+  # The refusal is deliberately NOT gated on the container existing: refusing to
+  # silently re-bind the live tree matters either way.
+  _fork_mark "$CNAME"
+  container_exists() { return 1; }
+  _FORK_REQUESTED=false
+  run _fork_preflight "$CNAME" recreate
+  assert_failure
+  assert_output --partial "workspace copy is missing"
+}
+
+@test "fork verb: prune clears a stale marker that has no copy and no box" {
+  # Stale markers accumulated invisibly and were not inert: the next box of that
+  # name became a fork with a missing copy, so cleat start refused.
+  _fork_mark "cleat-gone-11112222-main"
+  container_exists() { return 1; }
+  run cmd_fork prune --yes
+  assert_success
+  assert_output --partial "stale fork marker"
+  [ ! -e "$(_fork_marker_file "cleat-gone-11112222-main")" ]
+}
+
+@test "fork verb: prune keeps a marker whose copy still exists" {
+  # That is the normal kept-copy state, not garbage.
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-keep-11112222-main"
+  _fork_mark "cleat-keep-11112222-main"
+  container_exists() { return 1; }
+  run cmd_fork prune <<< "n"
+  assert_success
+  [ -f "$(_fork_marker_file "cleat-keep-11112222-main")" ]
+}
+
+@test "fork verb: prune keeps a marker whose box still exists" {
+  _fork_mark "cleat-live-33334444-main"
+  container_exists() { return 0; }
+  run cmd_fork prune --yes
+  assert_success
+  [ -f "$(_fork_marker_file "cleat-live-33334444-main")" ]
+}
+
+@test "fork verb: marker-only prune does not claim to have removed copies" {
+  _fork_mark "cleat-gone-11112222-main"
+  container_exists() { return 1; }
+  run cmd_fork prune --yes
+  assert_success
+  refute_output --partial "Removed 1 fork workspace"
+  assert_output --partial "No copies to remove"
 }

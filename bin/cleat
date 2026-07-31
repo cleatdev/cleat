@@ -221,6 +221,15 @@ _SPIN_PID=""
 
 _is_tty() { [[ -t 1 ]]; }
 
+# Cursor visibility. Guarded on _is_tty because `tput` writes its escapes to
+# STDOUT regardless of whether stdout is a terminal. Unguarded, every command
+# ended with a cursor-restore sequence on stdout, which is invisible noise for a
+# human but corrupts any output meant to be captured: `cd "$(cleat fork path
+# feat-a)"` got the path plus a newline plus \033[?12l\033[?25h and failed with
+# "no such file or directory". Found on a host run 2026-07-31.
+_cursor_hide() { _is_tty && { command -v tput &>/dev/null && tput civis 2>/dev/null; }; return 0; }
+_cursor_show() { _is_tty && { command -v tput &>/dev/null && tput cnorm 2>/dev/null; }; return 0; }
+
 # Stricter than _is_tty (which checks stdout alone): BOTH stdin and stdout must be
 # a real terminal. Used only by the one place Cleat deliberately BLOCKS for a
 # keypress (_maybe_gate_on_docker_config): a launch with no human to answer
@@ -288,7 +297,7 @@ spin() {
   else
     frames=('-' '\' '|' '/')
   fi
-  command -v tput &>/dev/null && tput civis 2>/dev/null
+  _cursor_hide
   local _spin_parent=$$
   (
     trap 'exit 0' TERM INT
@@ -302,7 +311,7 @@ spin() {
     # restore the cursor instead of overwriting the shell prompt every 80 ms
     # with the cursor left hidden. The old spinner was un-disownable spam.
     printf "\r\033[K"
-    { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+    _cursor_show
   ) &
   _SPIN_PID=$!
   # NOT disowned: spin_stop's `wait` must synchronize with the loop's exit so
@@ -316,7 +325,7 @@ spin_stop() {
     kill "$_SPIN_PID" 2>/dev/null || true
     wait "$_SPIN_PID" 2>/dev/null || true
     _SPIN_PID=""
-    { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+    _cursor_show
   fi
   if ! _is_tty; then
     [[ "$code" -eq 0 ]] && success "$ok_msg" || error "$fail_msg"
@@ -335,7 +344,7 @@ _cleanup_spin() {
     wait "$_SPIN_PID" 2>/dev/null || true
     _SPIN_PID=""
   fi
-  { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+  _cursor_show
 }
 
 # Restore the host terminal after an interactive `docker exec`. The docker CLI
@@ -1091,7 +1100,7 @@ _ensure_daemon() {
   else
     frames=('-' '\' '|' '/')
   fi
-  { command -v tput &>/dev/null && tput civis 2>/dev/null; } || true
+  _cursor_hide
   local poll_noun
   poll_noun="$(_autostart_poll_noun "$kind")"
   local start now elapsed=0 i=0
@@ -1100,7 +1109,7 @@ _ensure_daemon() {
     now="$(date +%s)"
     elapsed=$(( now - start ))
     if (( elapsed >= deadline )); then
-      { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+      _cursor_show
       printf "\r\033[K"
       error "Docker did not come up in ${deadline}s. Open it manually, then retry."
       exit 1
@@ -1109,7 +1118,7 @@ _ensure_daemon() {
     i=$(( (i + 1) % ${#frames[@]} ))
     sleep 0.5
   done
-  { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+  _cursor_show
   printf "\r\033[K"
   success "Docker ready"
   return 0
@@ -2676,8 +2685,20 @@ _fork_preflight() {
   # claude it would destroy a live box with nothing to rebuild it, so those
   # fall through to the refusal below.
   if [[ "${_FORK_REQUESTED:-false}" == true && "$can_recreate" == "recreate" ]]; then
-    info "Fork workspace is missing, recreating it"
-    docker rm -f "$cname" > /dev/null 2>&1 || true
+    # Only announce a HEAL when there is something to heal. A fork marker
+    # outlives both its container and its copy (cleat rm keeps the marker so
+    # re-running the box reuses the copy), so a marker left over from a box
+    # removed long ago made a brand-new `cleat fork start feat-b` open with
+    # "Fork workspace is missing, recreating it" when nothing was missing and
+    # nothing was being recreated: it was a first create. Reported from a host
+    # run 2026-07-31. With no container there is nothing to drop and the create
+    # path makes the copy anyway, so say nothing and let "Workspace copied"
+    # speak. The refusal below is deliberately NOT gated this way: refusing to
+    # silently re-bind the live tree matters whether or not a container exists.
+    if container_exists "$cname"; then
+      info "Fork workspace is missing, recreating it"
+      docker rm -f "$cname" > /dev/null 2>&1 || true
+    fi
     return 0
   fi
   error "This box is a fork but its workspace copy is missing."
@@ -6061,7 +6082,7 @@ _do_pull() {
     frames=('-' '\' '|' '/')
   fi
 
-  { command -v tput &>/dev/null && tput civis 2>/dev/null; } || true
+  _cursor_hide
 
   local i=0 total=0 complete=0 status
   while kill -0 "$pull_pid" 2>/dev/null; do
@@ -6084,7 +6105,7 @@ _do_pull() {
 
   wait "$pull_pid"
   rc=$?
-  { command -v tput &>/dev/null && tput cnorm 2>/dev/null; } || true
+  _cursor_show
 
   if [[ $rc -ne 0 ]]; then
     printf "\r\033[K  ${AMBER}!${RESET} Prebuilt image unavailable for v%s, building locally\n" \
@@ -9226,7 +9247,7 @@ _config_picker_tui() {
   echo ""
 
   local cursor=0
-  tput civis 2>/dev/null || true
+  _cursor_hide
 
   _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
   echo ""
@@ -9270,14 +9291,14 @@ _config_picker_tui() {
           cpus) cpus="$(_config_cycle_value prev "$cpus" "$cpu_custom" $cpu_ring)" ;;
         esac ;;
       ENTER)
-        tput cnorm 2>/dev/null || true
+        _cursor_show
         printf '\033[%dB' "$((draw_lines + 2))"
         printf '\033[2K'
         echo ""
         _config_editor_save "$config_file" "$scope" "$project" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
         return ;;
       QUIT|ESC)
-        tput cnorm 2>/dev/null || true
+        _cursor_show
         printf '\033[%dB' "$((draw_lines + 2))"
         printf '\033[2K'
         echo ""
@@ -10220,8 +10241,39 @@ cmd_fork() {
         count=$(( count + 1 ))
         orphans="${orphans}${d}"$'\n'
       done <<< "$dirs"
-      if [[ "$count" -eq 0 ]]; then
+      # Stale markers: a fork marker whose copy AND container are both already
+      # gone. A marker outlives its box on purpose (cleat rm keeps it so
+      # re-running reuses the copy), but nothing ever cleaned one whose copy was
+      # deleted by hand, and a stale one is NOT inert: it makes the next box of
+      # that name a fork with a missing copy, so `cleat start` refuses. Reported
+      # from a host run 2026-07-31, where markers from earlier runs survived an
+      # `rm -rf` of the forks directory. Counted BEFORE the early return below,
+      # because "no orphan copies" is exactly the state stale markers live in.
+      local _mk _mc stale=0 stale_list=""
+      if [[ -d "$CLEAT_BOXES_DIR" ]]; then
+        for _mk in "$CLEAT_BOXES_DIR"/*.fork; do
+          [[ -f "$_mk" ]] || continue
+          _mc="${_mk##*/}"; _mc="${_mc%.fork}"
+          [[ -d "$(_fork_dir "$_mc")" ]] && continue
+          container_exists "$_mc" && continue
+          stale=$(( stale + 1 ))
+          stale_list="${stale_list}${_mk}"$'\n'
+        done
+      fi
+      if [[ "$count" -eq 0 && "$stale" -eq 0 ]]; then
         info "Nothing to prune. Every fork workspace still has a box."
+        return 0
+      fi
+      if [[ "$count" -eq 0 ]]; then
+        # Markers only. Nothing is at risk here, so no confirmation: there is no
+        # copy and no container, just a leftover flag that would misroute the
+        # next box of that name.
+        while IFS= read -r _mk; do
+          [[ -n "$_mk" ]] || continue
+          rm -f "$_mk"
+        done <<< "$stale_list"
+        success "Cleared $stale stale fork $( [[ $stale -eq 1 ]] && echo marker || echo markers )."
+        echo -e "    ${DIM}No copies to remove. A marker with no copy and no box would have made the next box of that name refuse to start.${RESET}"
         return 0
       fi
       warn "$count fork $( [[ $count -eq 1 ]] && echo workspace || echo workspaces ) with no container, $(_fork_fmt_kb "$total") apparent:"
@@ -10246,7 +10298,12 @@ cmd_fork() {
           removed=$(( removed + 1 ))
         fi
       done <<< "$orphans"
+      while IFS= read -r _mk; do
+        [[ -n "$_mk" ]] || continue
+        rm -f "$_mk"
+      done <<< "$stale_list"
       success "Removed $removed fork $( [[ $removed -eq 1 ]] && echo workspace || echo workspaces )."
+      [[ "$stale" -gt 0 ]] && echo -e "    ${DIM}Also cleared $stale stale fork $( [[ $stale -eq 1 ]] && echo marker || echo markers ) with no copy and no box.${RESET}"
       return 0 ;;
 
     *)
@@ -10688,7 +10745,7 @@ _kit_models_tui() {
   echo ""
 
   local cursor=0
-  tput civis 2>/dev/null || true
+  _cursor_hide
   _kit_models_draw "$cursor" "$worker" "$scout"
   echo ""
   echo -e "  ${DIM}↑/↓ navigate  ←/→ change model  ⏎ enable kit  q cancel${RESET}"
@@ -10715,7 +10772,7 @@ _kit_models_tui() {
         fi
         ;;
       ENTER)
-        tput cnorm 2>/dev/null || true
+        _cursor_show
         printf '\033[%dB' 4
         printf '\033[2K'
         echo ""
@@ -10724,7 +10781,7 @@ _kit_models_tui() {
         return 0
         ;;
       QUIT|ESC)
-        tput cnorm 2>/dev/null || true
+        _cursor_show
         printf '\033[%dB' 4
         printf '\033[2K'
         echo ""
@@ -10755,7 +10812,7 @@ _kit_picker_tui() {
   # The redraw block is the rows plus the detail pane (and its separator).
   local block=$(( rows + 1 + _KIT_PANE_LINES ))
   local cursor=0
-  tput civis 2>/dev/null || true
+  _cursor_hide
   _kit_picker_draw "$cursor" "$selected"
   echo ""
   echo -e "  ${DIM}↑/↓ navigate  ⏎/→ select  q cancel${RESET}"
@@ -10768,7 +10825,7 @@ _kit_picker_tui() {
       UP)   [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
       DOWN) [[ $cursor -lt $((rows - 1)) ]] && cursor=$((cursor + 1)) ;;
       ENTER|RIGHT)
-        tput cnorm 2>/dev/null || true
+        _cursor_show
         printf '\033[%dB' "$((block + 2))"
         printf '\033[2K'
         if [[ $cursor -eq $((rows - 1)) ]]; then
@@ -10782,7 +10839,7 @@ _kit_picker_tui() {
         return 0
         ;;
       QUIT|ESC)
-        tput cnorm 2>/dev/null || true
+        _cursor_show
         printf '\033[%dB' "$((block + 2))"
         printf '\033[2K'
         echo ""

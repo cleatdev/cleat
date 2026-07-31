@@ -352,7 +352,7 @@ cleat fork run feat-a        # create it without launching Claude
 cleat fork                   # every copy: apparent size, age, is its box still there
 cleat fork path feat-a       # bare path, so cd "$(cleat fork path feat-a)" works
 cleat fork rm feat-a         # delete one copy and drop the box's fork marker
-cleat fork prune             # delete every copy whose container is gone
+cleat fork prune             # delete copies whose container is gone, plus any stale marker
 cleat fork refresh feat-a    # replace a copy with a fresh one from the project
 ```
 

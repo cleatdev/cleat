@@ -151,3 +151,23 @@ teardown() { _common_teardown; }
   assert_output --partial "--env"
   assert_output --partial "--env-file"
 }
+
+@test "env flag: a bare --env with an invalid variable name is refused up front" {
+  # ${!KEY} on a non-identifier is a hard bash error, so `--env MY-VAR` died
+  # with a raw "invalid variable name" trace under strict mode, and only AFTER
+  # the image had been pulled or built. Refuse on the flag instead.
+  run parse_global_flags --env "MY-VAR" run
+  assert_failure
+  assert_output --partial "Invalid environment variable name"
+}
+
+@test "env flag: KEY=VALUE is not name-checked, only a bare inherit key is" {
+  # The value side is data and may contain anything.
+  run parse_global_flags --env "MY-VAR=hello" run
+  assert_success
+}
+
+@test "env flag: an ordinary inherit key still parses" {
+  run parse_global_flags --env GH_TOKEN run
+  assert_success
+}

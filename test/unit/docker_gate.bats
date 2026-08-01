@@ -279,3 +279,31 @@ teardown() { _common_teardown; }
   run grep -qF "Docker VM memory is 8 GB (aim for 16 GB)." "$TEST_TEMP/e2e.txt"  # the reason
   assert_success
 }
+
+@test "docker settings: a leftover Desktop settings file is ignored when Desktop is not the engine" {
+  # The file is picked by PATH, and that path survives uninstalling Docker
+  # Desktop, so a host that moved to OrbStack or Colima had a dead config read
+  # as the live engine's: wrong memory in the advisory, and a swap value that
+  # could raise the blocking config gate over a setting the running engine does
+  # not even have.
+  local base="$TEST_TEMP/ddsettings"
+  mkdir -p "$base"
+  printf '{"MemoryMiB": 2048, "SwapMiB": 1024}\n' > "$base/settings.json"
+  _DD_SETTINGS_DIR="$base"
+
+  _is_docker_desktop() { return 1; }        # OrbStack / Colima / Linux
+  run _docker_desktop_settings_file
+  assert_success
+  assert_output ""
+}
+
+@test "docker settings: the file is still read when Desktop IS the engine" {
+  local base="$TEST_TEMP/ddsettings2"
+  mkdir -p "$base"
+  printf '{"MemoryMiB": 2048, "SwapMiB": 1024}\n' > "$base/settings.json"
+  _DD_SETTINGS_DIR="$base"
+  _is_docker_desktop() { return 0; }
+  run _docker_desktop_settings_file
+  assert_success
+  assert_output "$base/settings.json"
+}

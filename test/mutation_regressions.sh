@@ -1240,7 +1240,7 @@ try "vnext_prune_repo_scope" "queries docker with the cleat ownership filters" "
 # vnext: main()'s session-launching verbs must reach the pressure check.
 # Delete the call site: the marker test fails.
 cat > "$SED_TMP" << 'SED'
-/^      _maybe_check_docker_pressure$/d
+/^    _maybe_check_docker_pressure$/d
 SED
 try "vnext_pressure_main_callsite" "session-launching commands consult the pressure check" "$CLI" "$PRUNE_BATS"
 
@@ -1300,7 +1300,8 @@ try "vnext_ps_restart_hint" "box gets the Docker-restarted resume hint" "$CLI" "
 # vnext: zero-spelling memory values must be rejected ("00g" → --memory 0 is
 # UNLIMITED in docker, a project-clamp bypass). Accept zero: the 00g test fails.
 cat > "$SED_TMP" << 'SED'
-s|(( 10#\$n > 0 ))|(( 10#$n >= 0 ))|
+s@(( 10#\$n > 0 )) || return 1@(( 10#$n >= 0 )) || return 1@
+s@  (( _b >= 6291456 ))@  true@
 SED
 try "vnext_memory_zero_guard" "zero-spellings like 00g are rejected" "$CLI" "$RESOURCES_BATS"
 
@@ -1858,7 +1859,7 @@ try "vnext_ready_adequacy_gate" "silent when the VM is undersized" "$CLI" "$PRUN
 # vnext: main()'s session-launching verbs must reach the readiness confirmation.
 # Delete the call: the announce-on-start test fails.
 cat > "$SED_TMP" << 'SED'
-/^      _maybe_announce_docker_ready$/d
+/^    _maybe_announce_docker_ready$/d
 SED
 try "vnext_ready_main_callsite" "session-launching commands announce docker readiness" "$CLI" "$PRUNE_BATS"
 
@@ -2394,7 +2395,8 @@ try "kits_commands_mask_mount" "cmd_run mounts every kit mask read-only" "$CLI" 
 # commands (the mask seeds a copy). Break the copy: the pass-through test no
 # longer finds the user's command in the overlay.
 cat > "$SED_TMP" << 'SED'
-s|cp -RL "${HOME}/.claude/commands/." "$kit_dir/commands/" 2>/dev/null \|\| true|true|
+s|        cp -R "$_cm/." "$kit_dir/commands/$_cmb/" 2>/dev/null \|\| true|        true|
+s|        cp "$_cm" "$kit_dir/commands/$_cmb" 2>/dev/null \|\| true|        true|
 SED
 try "kits_commands_passthrough" "pass-through-copies the user's slash commands" "$CLI" "$KITS_BATS"
 
@@ -2651,7 +2653,7 @@ try "fork_session_key_mount" "session key follows the copy" "$CLI" "$FORK_BATS"
 # the docker cap looks for a session dir that was never created, under a :ro
 # parent it cannot create one in. Silent loss of sessions and memory.
 cat > "$SED_TMP" << 'SED'
-s@  printf '%s' "${_k//\./-}"@  printf '%s' "$_k"@
+s@LC_ALL=C sed 's/\[^A-Za-z0-9\]/-/g'@LC_ALL=C sed 's|/|-|g'@
 SED
 try "fork_session_key_dots" "replaces dots as well as slashes" "$CLI" "$FORK_BATS"
 
@@ -2681,6 +2683,7 @@ try "fork_preflight_once" "heal notice prints once" "$CLI" "$FORK_BATS"
 # refactors; line ranges do not.
 cat > "$SED_TMP" << 'SED'
 s@    \*) error "Refusing to delete outside@    ZZ) error "Refusing to delete outside@
+s@  if ! _fork_path_under_root "$target"; then@  if false; then@
 SED
 try "fork_rm_tree_containment" "refuses a target outside the fork root" "$CLI" "$FORK_BATS"
 
@@ -2810,6 +2813,7 @@ try "fork_source_form_symlink_root" "symlinked project root produces a real copy
 # the caller passes.
 cat > "$SED_TMP" << 'SED'
 s@    \*) error "Refusing to write a fork outside@    ignoreme) error "Refusing to write a fork outside@
+s@  if ! _fork_path_under_root "$dst"; then@  if false; then@
 SED
 try "fork_dest_outside_guard" "refuses a destination outside the forks dir" "$CLI" "$FORK_BATS"
 
@@ -3052,7 +3056,7 @@ try "kits_collision_by_name" "user agent with the SAME NAME" "$CLI" "$KITS_BATS"
 # trailing test that is false when both models are default, reproducing the
 # original silent-death return code.
 cat > "$SED_TMP" << 'SED'
-/^_write_kits_to_file()/,/^}$/ s|\} > "\$file"|} > "$file"; [[ "$worker" != "$_KIT_DEFAULT_MODEL" ]]|
+/^_write_kits_to_file()/,/^}$/ s|  \} > "\$file.cleat-tmp.\$\$" && mv -f "\$file.cleat-tmp.\$\$" "\$file" |  } > "$file"; [[ "$worker" != "$_KIT_DEFAULT_MODEL" ]] |
 SED
 try "kits_writer_strict_return" "DEFAULT models survives" "$CLI" "$SMOKE_BATS"
 
@@ -3060,7 +3064,7 @@ try "kits_writer_strict_return" "DEFAULT models survives" "$CLI" "$SMOKE_BATS"
 # commands; a copied symlink dangles inside the box. Revert -RL to -R: the
 # deref test finds a symlink in the overlay and fails.
 cat > "$SED_TMP" << 'SED'
-s|cp -RL |cp -R |
+s|        cp "$_cm" "$kit_dir/commands/$_cmb" 2>/dev/null|        cp -P "$_cm" "$kit_dir/commands/$_cmb" 2>/dev/null|
 SED
 try "kits_commands_deref" "dereferences symlinked commands" "$CLI" "$KITS_BATS"
 
@@ -3976,6 +3980,251 @@ cat > "$SED_TMP" << 'SED'
 s@  vm_gb="\$(_config_vm_gb)"@  vm_gb=""@
 SED
 try "vnext_config_text_vm_gb" "whole-VM ceiling still prints the warning off a terminal" "$CLI" "$CONFIG_BATS"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-07-31 hardening pass
+# ─────────────────────────────────────────────────────────────────────────────
+
+# FORK PRUNE DAEMON GATE: container_exists is a false negative against a
+# stopped daemon, so without this gate prune reads every live box as an orphan
+# and deletes every workspace copy on the machine. The worst defect the fork
+# feature has had. Remove the gate and the refusal test must fail.
+cat > "$SED_TMP" << 'SED'
+s@      if ! _daemon_up; then@      if false; then@
+SED
+try "fork_prune_daemon_gate" "prune refuses to delete anything when the daemon" "$CLI" "$FORK_BATS"
+
+# FORK PHYSICAL CONTAINMENT: the textual "$root"/?* test passes for a path whose
+# '..' components resolve anywhere on the host. Disable the physical resolver
+# and `cleat fork rm` deletes outside the fork root again.
+cat > "$SED_TMP" << 'SED'
+s@^_fork_path_under_root() {@_fork_path_under_root() { return 0;@
+SED
+try "fork_physical_containment" "tree delete refuses a path that only textually" "$CLI" "$FORK_BATS"
+
+# FORK COPY PHYSICAL CONTAINMENT: same guard on the write side, which rm -rf's
+# its destination before moving the staged copy into place.
+cat > "$SED_TMP" << 'SED'
+s@  if ! _fork_path_under_root "$dst"; then@  if false; then@
+SED
+try "fork_copy_physical_containment" "tree copy refuses a destination that only" "$CLI" "$FORK_BATS"
+
+# FORK VERB BOX VALIDATION: path/rm/refresh must route the positional through
+# _set_box like every other box-aware verb. Read it raw and an unvalidated name
+# flows into container_name_for, _fork_dir and then rm -rf.
+cat > "$SED_TMP" << 'SED'
+/^      # Routed through _set_box, exactly like start|run above/,/^      _set_box "\$@"$/{
+  /^      _set_box "\$@"$/d
+}
+SED
+try "fork_verb_box_validation" "rm refuses a box name that walks out of the fork" "$CLI" "$FORK_BATS"
+
+# FORK SIZE PIPEFAIL: du prints a valid total AND exits non-zero when it cannot
+# descend. Move the `|| true` back outside the pipeline and one unreadable
+# directory makes a real copy report 0 KB under the CLI's pipefail.
+cat > "$SED_TMP" << 'SED'
+s@  out="$( { du -sk "$d" 2>/dev/null || true; } | tail -1 )" || out=""@  out="$(du -sk "$d" 2>/dev/null | tail -1)" || out=""@
+SED
+try "fork_size_pipefail" "unreadable subdirectory does not make a copy report" "$CLI" "$FORK_BATS"
+
+# FORK MARKER DEAD END: `cleat fork rm` must clear a marker whose copy is gone.
+# Without it both documented exits are closed and the box is unstartable.
+cat > "$SED_TMP" << 'SED'
+s@        if \[\[ "$sub" == "rm" \]\] && _box_is_fork "$cname"; then@        if false; then@
+SED
+try "fork_rm_clears_stale_marker" "rm drops a fork marker whose copy is already" "$CLI" "$FORK_BATS"
+
+# FORK INTERRUPTED COPY: the staging tree is a dotfile, so nothing listed or
+# reclaimed it. Skip the sweep and the leak returns.
+cat > "$SED_TMP" << 'SED'
+s@        kill -0 "$_pid" 2>/dev/null && continue@        continue@
+SED
+try "fork_partial_copy_sweep" "prune reclaims an interrupted copy" "$CLI" "$FORK_BATS"
+
+# SESSION KEY FULL ENCODING: Claude Code encodes every non-alphanumeric as a
+# dash (measured against 2.1.220). Narrow it back to / and . and every
+# snake_case project silently loses its sessions under the docker cap.
+cat > "$SED_TMP" << 'SED'
+s@LC_ALL=C sed 's/\[^A-Za-z0-9\]/-/g'@LC_ALL=C sed 's|[/.]|-|g'@
+SED
+try "session_key_all_nonalnum" "session key replaces EVERY non-alphanumeric" "$CLI" "$FORK_BATS"
+
+# CONFIG WRITER HEADER PARITY: every reader trims the header before matching.
+# Match it untrimmed in the writer and an indented section is duplicated rather
+# than replaced, leaving a disabled capability active.
+cat > "$SED_TMP" << 'SED'
+s@      if \[\[ "$_h" == "\[caps\]" \]\]; then@      if [[ "$line" == "[caps]" ]]; then@
+SED
+try "caps_writer_header_trim" "an indented .caps. header is replaced" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@      if \[\[ "$_h" == "\[resources\]" \]\]; then@      if [[ "$line" == "[resources]" ]]; then@
+SED
+try "resources_writer_header_trim" "an indented .resources. header is replaced" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@      if \[\[ "$_h" == "\[kits\]" \]\]; then@      if [[ "$line" == "[kits]" ]]; then@
+SED
+try "kits_writer_header_trim" "an indented .kits. header is replaced" "$CLI" "$KITS_BATS"
+
+# CONFIG READER READABILITY: an unreadable .cleat reached the redirect and
+# killed every command in the project with a raw bash error.
+cat > "$SED_TMP" << 'SED'
+s@^  \[\[ -r "$file" \]\] || return 0$@  [[ -f "$file" ]] || return 0@
+SED
+try "config_reader_unreadable" "an unreadable file yields nothing instead of crashing the CLI" "$CLI" "$CONFIG_BATS"
+
+# ENV NAME VALIDATION: a bare --env NAME is expanded with ${!NAME}, a hard bash
+# error on a non-identifier, and it fired only after the image was built.
+cat > "$SED_TMP" << 'SED'
+s@        if \[\[ "$2" != \*=\* \]\] && ! \[\[ "$2" =~ \^\[A-Za-z_\]\[A-Za-z0-9_\]\*\$ \]\]; then@        if false; then@
+SED
+try "env_bare_key_validation" "invalid variable name is refused up front" "$CLI" "$REPO_ROOT/test/unit/argument_parsing.bats"
+
+# FORK SESSION PREFLIGHTS: `cleat fork start|run` is documented as the same
+# command as `cleat start <box> --fork`, so it must get the same preflights.
+cat > "$SED_TMP" << 'SED'
+s#        start|run) _do_preflight=1; _preflight_args=("\${@:2}") ;;#        start|run) : ;;#
+SED
+try "fork_verb_session_preflight" "fork run reaches the session preflights" "$CLI" "$FORK_BATS"
+
+
+# NUKE KEEPS FORK MARKERS: nuke wipes the boxes dir, which holds the .fork
+# markers, but deliberately keeps the workspace copies. Drop the re-mark and a
+# surviving copy comes back unmarked, so the next --fork rm -rf's it.
+cat > "$SED_TMP" << 'SED'
+s@      _fork_mark "$_nc"@      :@
+SED
+try "nuke_keeps_fork_markers" "fork marker whose copy survives is kept" "$CLI" "$REPO_ROOT/test/unit/nuke.bats"
+
+# FORK ROOT OWNERSHIP: the fork root is user-settable, so only cleat-named
+# directories are workspace copies. Drop the filter and prune deletes anything
+# one level under a hand-set [fork] dir.
+cat > "$SED_TMP" << 'SED'
+s@      cleat-?\*) : ;;@      *) : ;;@
+SED
+try "fork_root_ownership_filter" "prune ignores a directory that is not a cleat" "$CLI" "$FORK_BATS"
+
+# ── 2026-07-31 hardening pass, batch 2 ──────────────────────────────────────
+
+# HOOK WINDOW BOUND: the spool read must be bounded to the size already
+# sampled, or bytes written during the read are replayed and their hook runs a
+# SECOND time (a deploy, a commit, a notification: a real side effect).
+cat > "$SED_TMP" << 'SED'
+s@  \[\[ "$size" -gt "$offset" \]\] || return 1@  [[ "$size" -gt "$offset" ]] || return 1; size=$(( size + 999 ))@
+SED
+try "hook_window_bounded" "read window is bounded to the size already sampled" "$CLI" "$HOOKS_BATS"
+
+# HOOK WINDOW REWIND: a truncated spool must rewind, or the bridge silently
+# stops running the user's hooks for the rest of the session.
+cat > "$SED_TMP" << 'SED'
+s@  \[\[ "$size" -lt "$offset" \]\] && offset=0@  :@
+SED
+try "hook_window_rewind" "truncated spool rewinds instead of killing" "$CLI" "$HOOKS_BATS"
+
+# HOOK CONCURRENCY BOUND: the spool line count is chosen by the caged side, so
+# an unbounded subshell per line turns it into a host process count.
+cat > "$SED_TMP" << 'SED'
+s@^_HOOK_BRIDGE_MAX_CONCURRENT=8$@_HOOK_BRIDGE_MAX_CONCURRENT=0@
+SED
+try "hook_concurrency_bound" "concurrency is bounded so a spool flood" "$CLI" "$HOOKS_BATS"
+
+# TRUST HASH BEFORE PROMPT: hashing after the answer records a .cleat the user
+# never saw, so an agent can rewrite it while the prompt is on screen.
+cat > "$SED_TMP" << 'SED'
+/# Hash BEFORE the prompt, from the same read that produced the caps we are/,/^    hash="\$(_hash_cleat_caps "\$caps_file")"$/{
+  /^    hash="\$(_hash_cleat_caps "\$caps_file")"$/d
+}
+SED
+try "trust_hash_before_prompt" "recorded hash is the one the user was shown" "$CLI" "$TRUST_BATS"
+
+# KIT COMMANDS SYMLINK: -L dereferences at every depth, materializing real host
+# secret bytes inside the cage.
+cat > "$SED_TMP" << 'SED'
+s@        cp -R "$_cm/." "$kit_dir/commands/$_cmb/" 2>/dev/null || true@        cp -RL "$_cm/." "$kit_dir/commands/$_cmb/" 2>/dev/null || true@
+SED
+try "kit_commands_no_deref" "nested in a command dir is copied as a link" "$CLI" "$KITS_BATS"
+
+# DESKTOP SETTINGS ENGINE GATE: the settings path survives uninstalling Docker
+# Desktop, so without this a dead config describes the live engine.
+cat > "$SED_TMP" << 'SED'
+s@  _is_docker_desktop || return 0@  :@
+SED
+try "desktop_settings_engine_gate" "leftover Desktop settings file is ignored" "$CLI" "$REPO_ROOT/test/unit/docker_gate.bats"
+
+# ATOMIC CONFIG WRITE: truncate-then-write destroys the preserved [setup] block
+# if anything fails part way.
+cat > "$SED_TMP" << 'SED'
+s@  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {@  } > "$file" || {@
+SED
+try "config_write_atomic" "replaced by rename, never truncated in place" "$CLI" "$CONFIG_BATS"
+
+# SHELL ATTACH MARKER: without it the idle sweep stops a box the user is
+# sitting in, because a shell runs bash and so does a detached box.
+cat > "$SED_TMP" << 'SED'
+s@    _box_has_attached_session "$name" && continue@    :@
+SED
+try "sweep_respects_attached_shell" "attached box survives a real sweep pass" "$CLI" "$REPO_ROOT/test/unit/idle_sweep.bats"
+
+# STALE ATTACH MARKER: a marker from a killed session must not pin the box.
+cat > "$SED_TMP" << 'SED'
+s@      rm -f "$m" 2>/dev/null || true@      :@
+SED
+try "sweep_stale_marker_cleaned" "marker from a dead session does not pin" "$CLI" "$REPO_ROOT/test/unit/idle_sweep.bats"
+
+# PERSISTED CLAUDE.JSON HEAL: the host file had a corruption guard, the project
+# copy had none, so a truncated one broke the box on every later start.
+cat > "$SED_TMP" << 'SED'
+s@    if \[\[ -f "$proj_src" && -s "$proj_src" \]\] && ! _looks_like_json_object "$proj_src"; then@    if false; then@
+SED
+try "claude_json_persisted_heal" "corrupt PERSISTED project copy is backed up" "$CLI" "$REPO_ROOT/test/unit/claude_json.bats"
+
+# TRUST PATH ESCAPES: awk -v processes escapes in the VALUE, so a path with a
+# backslash never matched its own trust record.
+cat > "$SED_TMP" << 'SED'
+s@  CLEAT_AWK_P="$project" CLEAT_AWK_B="$box" awk -F'\\t' '@  awk -F'\\t' -v p="$project" -v b="$box" '@
+SED
+try "trust_path_backslash" "path containing a backslash escape still matches" "$CLI" "$TRUST_BATS"
+
+# SETUP SCRIPT TAB: a tab after the directive fell through and was executed as
+# a shell command instead of being read as a script.
+cat > "$SED_TMP" << 'SED'
+s@      "script "\*|"script	"\*)@      "script "*)@
+SED
+try "setup_script_tab_directive" "tab after the script directive is still a script" "$CLI" "$REPO_ROOT/test/unit/provision.bats"
+
+# MEMORY FLOOR: dockerd refuses under 6 MB, so a forgotten suffix aborted
+# docker run instead of failing validation.
+cat > "$SED_TMP" << 'SED'
+s@  (( _b >= 6291456 ))@  true@
+SED
+try "memory_dockerd_floor" "below dockerd.s 6 MB floor is rejected" "$CLI" "$REPO_ROOT/test/unit/resources.bats"
+
+# NUKE STDIN: read with no fallback dies under set -e at EOF.
+cat > "$SED_TMP" << 'SED'
+s@  read -rp "  Type 'nuke' to confirm: " confirm || confirm=""@  read -rp "  Type '"'"'nuke'"'"' to confirm: " confirm@
+SED
+try "nuke_stdin_fallback" "closed stdin aborts instead of dying" "$CLI" "$REPO_ROOT/test/unit/nuke.bats"
+
+# STATUS BOX POSITIONAL: forwarded into cmd_status's PROJECT slot, so
+# `cleat status feat-a` reported a phantom project.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ -n "$_arg" && ! -d "$_arg" \]\]; then@  if false; then@
+SED
+try "status_box_positional" "box positional is a BOX, not a phantom project" "$CLI" "$REPO_ROOT/test/unit/docker_commands.bats"
+
+# CONFIG BOM: an editor's BOM voided the first section in silence.
+cat > "$SED_TMP" << 'SED'
+s@    line="${line#$'\\xef\\xbb\\xbf'}"   # UTF-8 BOM, silently voided the first section@    :@
+SED
+try "config_bom_strip" "UTF-8 BOM does not void the first section" "$CLI" "$CONFIG_BATS"
+
+# BOX-AWARE FORK EXCLUDES: a named box's caps came from .cleat.<box> while its
+# [fork] excludes were read from .cleat.
+cat > "$SED_TMP" << 'SED'
+s@  _exfile="$(_project_caps_file "$project" "$box")"@  _exfile="$project/.cleat"@
+SED
+try "fork_excludes_box_aware" "excludes come from its own .cleat" "$CLI" "$FORK_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

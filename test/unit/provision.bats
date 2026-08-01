@@ -1431,3 +1431,16 @@ _th_record_setup() {
     [[ -n "$(_read_setup_from_file "${d}.cleat")" ]] || { echo "no [setup] in ${d}.cleat"; return 1; }
   done
 }
+
+@test "setup: a tab after the script directive is still a script, not a command" {
+  # `"script "*` matched only a SPACE. `script<TAB>provision.sh` fell through
+  # to the default arm and was handed to the shell as a command line, so the
+  # trust preview and the payload both showed it as an arbitrary command while
+  # the user had written a script directive.
+  printf '[setup]\nscript\tprovision.sh\n' > "$TEST_TEMP/project/.cleat"
+  printf '#!/bin/sh\necho hi\n' > "$TEST_TEMP/project/provision.sh"
+  run _build_setup_payload "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "echo hi"
+  refute_output --partial "script	provision.sh"
+}

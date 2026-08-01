@@ -1439,3 +1439,53 @@ ssh"
   [ ! -L "$CLEAT_RUN_DIR/$CNAME/home/file-history" ]
   [ -d "$CLEAT_RUN_DIR/$CNAME/home/file-history" ]
 }
+
+@test "write_kits: an indented [kits] header is replaced, not duplicated" {
+  # Same writer/reader header-matching parity bug as [caps] and [resources]:
+  # readers trim, this writer did not, so an indented header produced a second
+  # [kits] section and the stale first one won every read.
+  printf ' [kits]\nworker_model = haiku\n' > "$CLEAT_GLOBAL_CONFIG"
+  _write_kits_to_file "$CLEAT_GLOBAL_CONFIG" opus sonnet
+  [ "$(grep -c '\[kits\]' "$CLEAT_GLOBAL_CONFIG")" -eq 1 ] \
+    || { echo "duplicate [kits]:"; cat "$CLEAT_GLOBAL_CONFIG"; return 1; }
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits worker_model
+  assert_success
+  assert_output "opus"
+}
+
+@test "kit overlay: a symlink nested in a command dir is copied as a link, never followed" {
+  # SECURITY, the same property _fork_copy_tree protects for the workspace
+  # ("never add -L or -H"). The commands pass-through used a blanket `cp -RL`,
+  # which dereferences at every depth, so `mycommands/keys -> ~/.ssh` copied
+  # real host secret BYTES into the overlay. A copied symlink instead points at
+  # a host path that does not exist inside the box, so it simply dangles there.
+  mkdir -p "$TEST_TEMP/secretstore"
+  echo "PRIVATE-KEY-MATERIAL" > "$TEST_TEMP/secretstore/id_rsa"
+  mkdir -p "$HOME/.claude/commands/deploy"
+  echo "# a command" > "$HOME/.claude/commands/deploy/go.md"
+  ln -s "$TEST_TEMP/secretstore" "$HOME/.claude/commands/deploy/keys"
+
+  _generate_kit_overlay "testbox"
+  local out="$CLEAT_RUN_DIR/testbox/kit/commands"
+  [ -f "$out/deploy/go.md" ] || { echo "the real command did not copy"; return 1; }
+  [ -L "$out/deploy/keys" ] || { echo "nested link was dereferenced into the overlay"; return 1; }
+  [ ! -f "$out/deploy/keys/id_rsa" ] || true
+  # the decisive check: no real key bytes anywhere under the overlay
+  run grep -rl "PRIVATE-KEY-MATERIAL" "$out"
+  assert_failure
+}
+
+@test "kit overlay: a top-level symlinked command is still followed, for dotfile repos" {
+  # The compatibility half: people symlink their whole commands dir or single
+  # command files out of a dotfiles repo, and a copied link would be dead
+  # inside the box.
+  mkdir -p "$TEST_TEMP/dotfiles"
+  echo "# from dotfiles" > "$TEST_TEMP/dotfiles/review.md"
+  mkdir -p "$HOME/.claude/commands"
+  ln -s "$TEST_TEMP/dotfiles/review.md" "$HOME/.claude/commands/review.md"
+
+  _generate_kit_overlay "testbox2"
+  run cat "$CLEAT_RUN_DIR/testbox2/kit/commands/review.md"
+  assert_success
+  assert_output --partial "from dotfiles"
+}

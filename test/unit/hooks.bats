@@ -1625,3 +1625,67 @@ EOF
   [ "$dead" = 1 ] || { echo "bridge outlived its dead parent"; return 1; }
   [ ! -f "$TEST_TEMP/hook_ran" ] || { echo "orphan bridge executed a hook"; return 1; }
 }
+
+# ── bridge robustness, 2026-07-31 ───────────────────────────────────────────
+#
+# None of these change WHETHER or WHICH hooks run. Enabling the capability is
+# the user's decision to run their own hooks on their own machine and that is
+# untouched. These are bugs inside that decision.
+
+@test "hook bridge: concurrency is bounded so a spool flood cannot fork-bomb the host" {
+  # The spool is bind-mounted read-write into the box, so the caged side
+  # chooses the line count. One unbounded background subshell per line turned
+  # that into a host process count.
+  [ -n "$_HOOK_BRIDGE_MAX_CONCURRENT" ]
+  [ "$_HOOK_BRIDGE_MAX_CONCURRENT" -gt 0 ]
+  [ "$_HOOK_BRIDGE_MAX_CONCURRENT" -le 32 ]
+
+  # with the ceiling already occupied, a new spawn waits rather than piling on
+  _HOOK_BRIDGE_MAX_CONCURRENT=2
+  _HOOK_BRIDGE_CHILDREN=()
+  sleep 5 & _HOOK_BRIDGE_CHILDREN+=("$!")
+  local held1=$!
+  sleep 5 & _HOOK_BRIDGE_CHILDREN+=("$!")
+  local held2=$!
+  run _hook_bridge_live_count
+  assert_output "2"
+  kill "$held1" "$held2" 2>/dev/null || true
+}
+
+@test "hook bridge: the live count ignores children that already exited" {
+  _HOOK_BRIDGE_CHILDREN=()
+  true & _HOOK_BRIDGE_CHILDREN+=("$!")
+  wait "$!" 2>/dev/null || true
+  run _hook_bridge_live_count
+  assert_output "0"
+}
+
+@test "hook bridge: a truncated spool rewinds instead of killing the bridge" {
+  # byte_offset only ever grew, so once the box truncated events.jsonl the
+  # "is there more" test could never be true again and the user's hooks
+  # silently stopped running for the rest of the session.
+  run _hook_bridge_window 500 120
+  assert_success
+  assert_output "1 120"
+}
+
+@test "hook bridge: the read window is bounded to the size already sampled" {
+  # tail read to the LIVE eof, which the box can push past the sampled size
+  # mid-read. byte_offset was then set to the older size, so everything written
+  # during the read was replayed and its hook ran twice.
+  run _hook_bridge_window 100 150
+  assert_success
+  assert_output "101 50"
+}
+
+@test "hook bridge: nothing new means no read at all" {
+  run _hook_bridge_window 100 100
+  assert_failure
+  assert_output ""
+}
+
+@test "hook bridge: a fresh spool is read from its first byte" {
+  run _hook_bridge_window 0 42
+  assert_success
+  assert_output "1 42"
+}

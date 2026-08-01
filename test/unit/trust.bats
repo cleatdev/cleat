@@ -526,3 +526,61 @@ EOF
   assert_output --partial "${amber}docker"
   refute_output --partial "${amber}git"
 }
+
+@test "trust: the recorded hash is the one the user was shown, not a later rewrite" {
+  # The hash was computed AFTER the y/n came back, so a .cleat rewritten while
+  # the user read the prompt was recorded as approved at its NEW hash. The user
+  # approved one set of capabilities and the store remembered another, with no
+  # re-prompt next run. The writer can be the sandboxed agent itself.
+  local proj="$TEST_TEMP/project"
+  mkdir -p "$proj"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  local shown_hash
+  shown_hash="$(_hash_cleat_caps "$proj/.cleat")"
+
+  unset CLEAT_TRUST_PROJECT
+  _is_tty() { return 0; }
+  # the file is rewritten to ask for far more, DURING the prompt
+  _trust_prompt() { printf '[caps]\ndocker\nssh\nnetwork\n' > "$proj/.cleat"; return 0; }
+
+  run _resolve_project_trust "$proj" ""
+  assert_success
+  run _trust_lookup "$proj" main
+  assert_output "$shown_hash"
+}
+
+@test "trust: a genuinely unchanged .cleat still records its own hash" {
+  local proj="$TEST_TEMP/project2"
+  mkdir -p "$proj"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  unset CLEAT_TRUST_PROJECT
+  _is_tty() { return 0; }
+  _trust_prompt() { return 0; }
+  run _resolve_project_trust "$proj" ""
+  assert_success
+  run _trust_lookup "$proj" main
+  assert_output "$(_hash_cleat_caps "$proj/.cleat")"
+}
+
+@test "trust: a project path containing a backslash escape still matches its record" {
+  # awk -v processes escape sequences in the VALUE, so a path containing \t or
+  # \n was compared against a mangled string and the record never matched:
+  # the project was re-prompted on every single run, or silently treated as
+  # untrusted in a non-interactive one.
+  local proj="$TEST_TEMP/we\\tird"
+  mkdir -p "$proj"
+  _trust_record "$proj" "deadbeef" main ""
+  run _trust_lookup "$proj" main
+  assert_success
+  assert_output "deadbeef"
+}
+
+@test "trust: an ordinary path is unaffected by the ENVIRON change" {
+  local proj="$TEST_TEMP/plain"
+  mkdir -p "$proj"
+  _trust_record "$proj" "cafe1234" main ""
+  run _trust_lookup "$proj" main
+  assert_output "cafe1234"
+  run _trust_list
+  assert_output --partial "$proj"
+}

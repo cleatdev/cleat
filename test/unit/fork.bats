@@ -1158,3 +1158,340 @@ SHIM
   refute_output --partial "Removed 1 fork workspace"
   assert_output --partial "No copies to remove"
 }
+
+# ── box-name containment for the fork verb ──────────────────────────────────
+#
+# `cleat fork path|rm|refresh <box>` read the box positional directly instead
+# of routing it through _set_box, so unlike every other box-aware verb the name
+# was never validated. container_name_for appends it to the container name
+# verbatim, _fork_dir appends THAT to the fork root, and the containment guards
+# in _fork_rm_tree and _fork_copy_tree were textual (`case "$target" in
+# "$root"/?*`), which a '..' component satisfies while resolving anywhere on
+# the host. `cleat fork rm 'x/../../../Documents'` deleted ~/Documents.
+# Found 2026-07-31. Two independent fixes, one test each: validate the name,
+# and resolve containment physically the way _fork_prune_excludes already does.
+
+@test "fork verb: rm refuses a box name that walks out of the fork root" {
+  mkdir -p "$TEST_TEMP/victim"
+  echo "important" > "$TEST_TEMP/victim/keep.txt"
+  mkdir -p "$CLEAT_FORKS_DIR/$(container_name_for "$TEST_TEMP/project" x)"
+  container_exists() { return 1; }
+  run cmd_fork rm 'x/../../../victim' <<< "y"
+  assert_failure
+  assert_output --partial "Invalid box name"
+  [ -f "$TEST_TEMP/victim/keep.txt" ]
+}
+
+@test "fork verb: refresh refuses a box name that walks out of the fork root" {
+  mkdir -p "$TEST_TEMP/victim"
+  echo "important" > "$TEST_TEMP/victim/keep.txt"
+  mkdir -p "$CLEAT_FORKS_DIR/$(container_name_for "$TEST_TEMP/project" x)"
+  container_exists() { return 1; }
+  run cmd_fork refresh 'x/../../../victim' <<< "y"
+  assert_failure
+  assert_output --partial "Invalid box name"
+  [ -f "$TEST_TEMP/victim/keep.txt" ]
+  # and the project was not written over the victim either
+  [ ! -e "$TEST_TEMP/victim/src" ]
+}
+
+@test "fork verb: path refuses an invalid box name instead of printing a path" {
+  run cmd_fork path 'Bad Name'
+  assert_failure
+  assert_output --partial "Invalid box name"
+}
+
+@test "fork verb: rm refuses a stray second positional like every box-aware verb" {
+  run cmd_fork rm main extra
+  assert_failure
+  assert_output --partial "Unexpected argument"
+}
+
+@test "fork verb: the tree delete refuses a path that only textually starts with the root" {
+  # Defence in depth for the above: even handed a crafted path directly, the
+  # delete must resolve containment physically. A fork copy is always exactly
+  # one level under the fork root.
+  mkdir -p "$TEST_TEMP/victim" "$CLEAT_FORKS_DIR/copy"
+  echo "important" > "$TEST_TEMP/victim/keep.txt"
+  run _fork_rm_tree "$CLEAT_FORKS_DIR/copy/../../../victim"
+  assert_failure
+  assert_output --partial "Refusing to delete outside"
+  [ -f "$TEST_TEMP/victim/keep.txt" ]
+}
+
+@test "fork verb: the tree copy refuses a destination that only textually starts with the root" {
+  # _fork_copy_tree rm -rf's its destination before moving the copy into place,
+  # so the same textual guard let refresh both delete AND overwrite a host dir.
+  mkdir -p "$TEST_TEMP/victim" "$CLEAT_FORKS_DIR/copy"
+  echo "important" > "$TEST_TEMP/victim/keep.txt"
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/copy/../../../victim"
+  assert_failure
+  assert_output --partial "Refusing to write a fork outside"
+  [ -f "$TEST_TEMP/victim/keep.txt" ]
+  [ ! -e "$TEST_TEMP/victim/src" ]
+}
+
+@test "fork verb: a normal one-level copy path is still accepted by both guards" {
+  # The containment hardening must not refuse the only shape that is real.
+  mkdir -p "$CLEAT_FORKS_DIR"
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/$CNAME"
+  assert_success
+  [ -f "$CLEAT_FORKS_DIR/$CNAME/src/app.js" ]
+  run _fork_rm_tree "$CLEAT_FORKS_DIR/$CNAME"
+  assert_success
+  [ ! -e "$CLEAT_FORKS_DIR/$CNAME" ]
+}
+
+# ── the daemon-down false negative ──────────────────────────────────────────
+#
+# container_exists is `docker ps -a | grep -q`, which returns FALSE when the
+# daemon is merely stopped. cmd_status already guards on this ("the old line
+# lied after every reboot"); the fork verb, written later, did not. So
+# `cleat fork prune` read every live box as an orphan and deleted every
+# workspace copy on the machine, uncommitted agent work included, on a laptop
+# that had simply not started Docker yet. With --yes it did it without asking.
+# Found 2026-07-31. This is the worst defect the fork feature has had.
+
+@test "fork verb: prune refuses to delete anything when the daemon is unreachable" {
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-a-11112222-main" "$CLEAT_FORKS_DIR/cleat-b-33334444-main"
+  echo "uncommitted work" > "$CLEAT_FORKS_DIR/cleat-a-11112222-main/WIP.txt"
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }   # what a down daemon actually reports
+  run cmd_fork prune --yes
+  assert_failure
+  assert_output --partial "Docker is not running"
+  [ -f "$CLEAT_FORKS_DIR/cleat-a-11112222-main/WIP.txt" ]
+  [ -d "$CLEAT_FORKS_DIR/cleat-b-33334444-main" ]
+}
+
+@test "fork verb: prune still works normally when the daemon is up" {
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main"
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  run cmd_fork prune --yes
+  assert_success
+  [ ! -e "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main" ]
+}
+
+@test "fork verb: list does not call every box orphaned when the daemon is down" {
+  # The list is read-only so it still prints, but it must not label a live box
+  # "no box" and must not point the user at prune, which would be the delete.
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-a-11112222-main"
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  run cmd_fork
+  assert_success
+  refute_output --partial "no box"
+  assert_output --partial "Docker is not running"
+}
+
+@test "fork: an unreadable subdirectory does not make a copy report 0 KB" {
+  [ "$(id -u)" -ne 0 ] || skip "root descends into any directory, so du never fails"
+  # du prints a valid total AND exits non-zero when it cannot descend into one
+  # subdir. Under the CLI's `set -o pipefail` the pipeline's failure discarded
+  # that total, so `cleat fork list`, `fork rm` and `fork prune` all reported
+  # "0 KB apparent" for a real multi-gigabyte copy.
+  set -o pipefail
+  local d="$CLEAT_FORKS_DIR/cleat-size-11112222-main"
+  mkdir -p "$d/data" "$d/locked/inner"
+  dd if=/dev/zero of="$d/data/blob" bs=1024 count=512 2>/dev/null
+  chmod 000 "$d/locked"
+  local kb; kb="$(_fork_size_kb "$d")"
+  chmod 755 "$d/locked"
+  [ "$kb" -gt 100 ] || { echo "expected a real size, got ${kb} KB"; return 1; }
+}
+
+@test "fork: the session key replaces EVERY non-alphanumeric, not only / and ." {
+  # The other half the dot fix still missed. Claude Code encodes every
+  # character outside [A-Za-z0-9] as a dash, dashes themselves excepted.
+  # Measured against the bundled Claude Code 2.1.220 on 2026-07-31 by running
+  # it in a directory literally named  a_b c+d@e#f%g(h)i,j=k~l  and reading the
+  # key it created: every one of those characters came back as a single dash.
+  # Underscore is the one that matters in practice: my_app, foo_bar and
+  # snake_case repo names are everywhere, and each of them got a session
+  # mountpoint at a key Claude Code never looks at. Under the docker cap that
+  # parent is :ro, so Claude could not create the right one either and
+  # sessions plus memory silently did not persist. Same failure the dot bug
+  # caused, reached by a commoner path.
+  run _claude_session_key "/home/u/my_app"
+  assert_success
+  assert_output "-home-u-my-app"
+
+  run _claude_session_key "/w/a_b c+d@e#f%g(h)i,j=k~l"
+  assert_success
+  assert_output "-w-a-b-c-d-e-f-g-h-i-j-k-l"
+}
+
+@test "fork: the session key leaves an already-safe path byte-identical" {
+  # The compatibility half: widening the encoder must not re-key the paths
+  # that were already correct, or every existing user loses their history.
+  run _claude_session_key "/Users/marcin/Workspaces/cleat"
+  assert_output "-Users-marcin-Workspaces-cleat"
+  run _claude_session_key "/Users/marcin/.config/cleat/forks/cleat-demo-ab8ed4e5-feat-a"
+  assert_output "-Users-marcin--config-cleat-forks-cleat-demo-ab8ed4e5-feat-a"
+}
+
+@test "fork verb: rm drops a fork marker whose copy is already gone" {
+  # The dead end. A marker outlives its copy on purpose, but a marker with NO
+  # copy makes every later `cleat start <box>` refuse. The refusal said "drop
+  # the fork with cleat rm <box>", and cleat rm deliberately KEEPS the marker,
+  # while cleat fork rm bailed on the missing directory. Both documented exits
+  # were closed and the box was unstartable with no way out in the message.
+  _fork_mark "$CNAME"
+  [ ! -d "$CLEAT_FORKS_DIR/$CNAME" ]
+  container_exists() { return 1; }
+  run cmd_fork rm main
+  assert_success
+  assert_output --partial "marker cleared"
+  [ ! -e "$(_fork_marker_file "$CNAME")" ]
+}
+
+@test "fork verb: rm still refuses when there is neither a copy nor a marker" {
+  # Not a fork at all: saying "cleared" would be a lie.
+  container_exists() { return 1; }
+  run cmd_fork rm main
+  assert_failure
+  assert_output --partial "No fork workspace"
+}
+
+@test "fork: the missing-copy refusal names a command that actually works" {
+  # It used to name `cleat rm <box>`, which keeps the marker by design.
+  _fork_mark "$CNAME"
+  container_exists() { return 1; }
+  _FORK_REQUESTED=false
+  run _fork_preflight "$CNAME" recreate
+  assert_failure
+  assert_output --partial "cleat fork rm"
+  refute_output --partial "drop the fork with cleat rm"
+}
+
+@test "fork verb: prune reclaims an interrupted copy's staging tree" {
+  # _fork_copy_tree_locked stages into $root/.tmp.<pid> and renames. A copy
+  # killed part way strands that tree, and _fork_all_dirs globs "$root"/* which
+  # skips dotfiles, so it was invisible to fork list, uncounted by prune and
+  # never reclaimed: a silent disk leak the size of the project.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  mkdir -p "$CLEAT_FORKS_DIR/.tmp.999999/src"
+  echo "half a copy" > "$CLEAT_FORKS_DIR/.tmp.999999/src/app.js"
+  run cmd_fork prune --yes
+  assert_success
+  assert_output --partial "interrupted"
+  [ ! -e "$CLEAT_FORKS_DIR/.tmp.999999" ]
+}
+
+@test "fork verb: prune leaves a staging tree whose copy is still running" {
+  # A concurrent cleat must never have its half-written copy deleted.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  mkdir -p "$CLEAT_FORKS_DIR/.tmp.$$/src"
+  run cmd_fork prune --yes
+  assert_success
+  [ -d "$CLEAT_FORKS_DIR/.tmp.$$" ]
+  rm -rf "$CLEAT_FORKS_DIR/.tmp.$$"
+}
+
+@test "fork verb: a staging tree is not listed as a workspace copy" {
+  _daemon_up() { return 0; }
+  mkdir -p "$CLEAT_FORKS_DIR/.tmp.999999"
+  container_exists() { return 1; }
+  run cmd_fork
+  assert_success
+  refute_output --partial ".tmp."
+}
+
+# ── fork start/run are session launches ─────────────────────────────────────
+
+@test "fork verb: fork run reaches the session preflights, like start --fork" {
+  # main() dispatched `fork` outside the block that runs the CLI-update check,
+  # Docker autostart, idle sweep, pressure check and config gate, so
+  # `cleat fork start` was NOT the same command as `cleat start --fork` even
+  # though both its own help and cleat help say it is. With the daemon down it
+  # skipped the autostart every other launch verb gets.
+  _ensure_daemon() { echo "PREFLIGHT-RAN"; }
+  _maybe_prompt_cli_update() { :; }
+  _maybe_sweep_idle_boxes() { echo "SWEEP-ARG:[$*]"; }
+  _maybe_check_docker_pressure() { :; }
+  _maybe_show_release_highlight() { :; }
+  _maybe_announce_docker_ready() { :; }
+  _maybe_gate_on_docker_config() { :; }
+  cmd_fork() { :; }
+  run main fork run feat-a
+  assert_success
+  assert_output --partial "PREFLIGHT-RAN"
+  # and the subcommand is stripped before the sweep, which uses $1 as the box
+  # to SKIP: passing "start" would have let it stop the box being launched.
+  assert_output --partial "SWEEP-ARG:[feat-a]"
+}
+
+@test "fork verb: fork start reaches the session preflights too" {
+  _ensure_daemon() { echo "PREFLIGHT-RAN"; }
+  _maybe_prompt_cli_update() { :; }
+  _maybe_sweep_idle_boxes() { :; }
+  _maybe_check_docker_pressure() { :; }
+  _maybe_show_release_highlight() { :; }
+  _maybe_announce_docker_ready() { :; }
+  _maybe_gate_on_docker_config() { :; }
+  cmd_fork() { :; }
+  run main fork start feat-a
+  assert_success
+  assert_output --partial "PREFLIGHT-RAN"
+}
+
+@test "fork verb: a read-only fork subcommand never boots the daemon" {
+  # The other half of the same dispatch rule: stop/status/nuke and the
+  # read-only fork subcommands must never start a VM.
+  _ensure_daemon() { echo "PREFLIGHT-RAN"; }
+  cmd_fork() { :; }
+  run main fork path feat-a
+  assert_success
+  refute_output --partial "PREFLIGHT-RAN"
+}
+
+@test "fork verb: bare cleat fork never boots the daemon" {
+  _ensure_daemon() { echo "PREFLIGHT-RAN"; }
+  cmd_fork() { :; }
+  run main fork
+  assert_success
+  refute_output --partial "PREFLIGHT-RAN"
+}
+
+@test "fork verb: prune ignores a directory that is not a cleat workspace copy" {
+  # The fork root is user-settable via [fork] dir, so prune must not assume it
+  # owns everything one level under it. It used to delete ANY directory there,
+  # which is severe if someone points [fork] dir at a path holding anything
+  # else. Every real copy is named by container_name_for, so it starts cleat-.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  mkdir -p "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main"
+  mkdir -p "$CLEAT_FORKS_DIR/my-important-notes"
+  echo "not cleat's" > "$CLEAT_FORKS_DIR/my-important-notes/keep.txt"
+  run cmd_fork prune --yes
+  assert_success
+  [ ! -e "$CLEAT_FORKS_DIR/cleat-orphan-11112222-main" ]
+  [ -f "$CLEAT_FORKS_DIR/my-important-notes/keep.txt" ]
+}
+
+@test "fork verb: list ignores a directory that is not a workspace copy" {
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  mkdir -p "$CLEAT_FORKS_DIR/my-important-notes"
+  run cmd_fork
+  assert_success
+  refute_output --partial "my-important-notes"
+}
+
+@test "fork: a named box's [fork] excludes come from its own .cleat.<box>" {
+  # The excludes were read from $project/.cleat unconditionally, so a named box
+  # using .cleat.<box> had its caps honoured from that file and its excludes
+  # read from a different one.
+  mkdir -p "$TEST_TEMP/project/node_modules/pkg"
+  echo dep > "$TEST_TEMP/project/node_modules/pkg/i.js"
+  printf '[fork]\nexclude = node_modules\n' > "$TEST_TEMP/project/.cleat.feat"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/project/.cleat"
+  local dst="$CLEAT_FORKS_DIR/boxcopy"
+  _fork_copy_tree "$TEST_TEMP/project" "$dst"
+  _fork_prune_excludes "$dst" "$TEST_TEMP/project" feat
+  [ ! -e "$dst/node_modules" ] || { echo "the box's own exclude was ignored"; return 1; }
+  [ -f "$dst/src/app.js" ]
+}

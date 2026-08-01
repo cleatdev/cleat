@@ -908,6 +908,11 @@ teardown() { _common_teardown; }
 # swap advisory never fires on a guess.
 
 @test "swap: reads SwapMiB from settings-store.json (newer Docker Desktop)" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
   printf '{ "Cpus": 4, "MemoryMiB": 16384, "SwapMiB": 1024 }\n' > "$dir/settings-store.json"
   _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
@@ -915,6 +920,11 @@ teardown() { _common_teardown; }
 }
 
 @test "swap: reads lowercase swapMiB from settings.json (older Docker Desktop)" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
   printf '{ "cpus": 4, "memoryMiB": 16384, "swapMiB": 2048 }\n' > "$dir/settings.json"
   _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
@@ -922,6 +932,11 @@ teardown() { _common_teardown; }
 }
 
 @test "swap: prefers settings-store.json over the older settings.json" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
   printf '{ "SwapMiB": 4096 }\n' > "$dir/settings-store.json"
   printf '{ "swapMiB": 512 }\n' > "$dir/settings.json"
@@ -950,6 +965,11 @@ teardown() { _common_teardown; }
 }
 
 @test "swap: a leading-zero value is read as base-10, not octal" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   # "08"/"09" pass the digit guard but are invalid octal: $(( 08 * … )) would abort
   # under set -e and leak an error. 10# forces decimal: "08" → 8 MiB, never a crash.
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
@@ -960,6 +980,11 @@ teardown() { _common_teardown; }
 }
 
 @test "swap: a zero-padded value is decimal, not silently misread as octal" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
   printf '{ "SwapMiB": 0001024 }\n' > "$dir/settings-store.json"
   _DD_SETTINGS_DIR="$dir" run _docker_vm_swap_bytes
@@ -1087,6 +1112,11 @@ teardown() { _common_teardown; }
 # swap. Display AND thresholds share _docker_vm_display_gb so they never contradict.
 
 @test "vm display: reads MemoryMiB from settings-store.json (24576 -> 24)" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
   printf '{ "Cpus": 8, "MemoryMiB": 24576, "SwapMiB": 2048 }\n' > "$dir/settings-store.json"
   _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
@@ -1094,6 +1124,11 @@ teardown() { _common_teardown; }
 }
 
 @test "vm display: reads lowercase memoryMiB from settings.json (16384 -> 16)" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
   printf '{ "cpus": 4, "memoryMiB": 16384, "swapMiB": 1024 }\n' > "$dir/settings.json"
   _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
@@ -1116,6 +1151,11 @@ teardown() { _common_teardown; }
 }
 
 @test "vm display: a leading-zero MemoryMiB is read base-10, not octal" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   local dir="$TEST_TEMP/dd"; mkdir -p "$dir"
   printf '{ "MemoryMiB": 024576 }\n' > "$dir/settings-store.json"
   _DD_SETTINGS_DIR="$dir" run _docker_vm_configured_gb
@@ -1123,6 +1163,11 @@ teardown() { _common_teardown; }
 }
 
 @test "vm display: a non-1024-aligned MemoryMiB rounds to nearest (7936 -> 8), not truncates" {
+  # These assert the PARSING of Docker Desktop's settings file, so they state
+  # the premise the parser now requires: Desktop is the running engine. The
+  # resolver ignores a leftover settings file on a host that has moved to
+  # OrbStack or Colima, which is a different behaviour with its own tests.
+  _is_docker_desktop() { return 0; }
   # The slider normally steps in whole GB (MiB a multiple of 1024), but a hand-edited
   # or non-standard value must round like the MemTotal fallback, not truncate. 7936
   # MiB = 7.75 GiB: truncation reads 7 (which would false-trip the 8 GB advisory

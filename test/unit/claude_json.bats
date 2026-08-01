@@ -435,3 +435,31 @@ teardown() { _common_teardown; }
   run jq 'has("oauthAccount")' "$OUT"
   assert_output "false"
 }
+
+@test "claude.json: a corrupt PERSISTED project copy is backed up and rebuilt" {
+  # The host file had a corruption guard; the persisted project copy had none.
+  # A truncated project file was fed to jq, the whole merge failed, and the box
+  # came up unable to read it. Nothing healed it, so every later start
+  # reproduced the same broken box with no message naming the cause.
+  command -v jq >/dev/null 2>&1 || skip "needs jq"
+  printf '{"userID":"u1","oauthAccount":{"emailAddress":"a@b.c"}}\n' > "$HOME/.claude.json"
+  local proj="$TEST_TEMP/proj.json" out="$TEST_TEMP/out.json"
+  printf '{"projects": {"/workspace": {"allowed' > "$proj"     # truncated mid-write
+  run _build_project_claude_json "$out" "$proj"
+  assert_success
+  assert_output --partial "corrupt"
+  [ -f "${proj}.bak" ]
+  run _looks_like_json_object "$out"
+  assert_success
+}
+
+@test "claude.json: a healthy persisted project copy is left alone" {
+  command -v jq >/dev/null 2>&1 || skip "needs jq"
+  printf '{"userID":"u1"}\n' > "$HOME/.claude.json"
+  local proj="$TEST_TEMP/proj2.json" out="$TEST_TEMP/out2.json"
+  printf '{"projects":{"/workspace":{"allowedTools":[]}}}\n' > "$proj"
+  run _build_project_claude_json "$out" "$proj"
+  assert_success
+  refute_output --partial "corrupt"
+  [ ! -e "${proj}.bak" ]
+}

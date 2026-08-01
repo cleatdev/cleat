@@ -872,3 +872,27 @@ EOF
   run test -L "$target/cleat"
   assert_failure
 }
+
+@test "status: a box positional is a BOX, not a phantom project" {
+  # The dispatch forwarded the positional into cmd_status's project slot, so
+  # `cleat status feat-a` resolved a project literally named "feat-a" and
+  # printed a confident, entirely phantom project line.
+  cd "$TEST_TEMP"
+  local here="$PWD"
+  run main status feat-a
+  assert_success
+  # Checked on the Project LINE with colours stripped: the raw output carries
+  # ANSI resets between the label and the value, so a --partial on the rendered
+  # string silently never matches and the test cannot fail.
+  local line
+  line="$(printf '%s\n' "$output" | sed 's/\x1b\[[0-9;]*m//g' | grep 'Project:' | head -1)"
+  [[ "$line" == *"$here"* ]] \
+    || { echo "status reported a phantom project: $line"; return 1; }
+}
+
+@test "status: an invalid box positional is refused, not treated as a path" {
+  cd "$TEST_TEMP"
+  run main status "Bad Name"
+  assert_failure
+  assert_output --partial "Invalid box name"
+}

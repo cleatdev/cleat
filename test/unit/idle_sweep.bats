@@ -234,3 +234,58 @@ teardown() { _common_teardown; }
   run _maybe_sweep_idle_boxes 'bad name!'
   refute_output --partial "SWEEP RAN"
 }
+
+@test "sweep: a box with an open cleat shell is never stopped" {
+  # A shell session runs bash, and _box_has_live_agent deliberately does not
+  # count bash as live because a DETACHED box runs bash too. cmd_shell also
+  # never stamped the run dir, so the sweep measured idleness from the last
+  # CLAUDE session and stopped the container out from under someone sitting at
+  # its prompt.
+  mkdir -p "$CLEAT_RUN_DIR/cleat-a-11112222-main"
+  : > "$CLEAT_RUN_DIR/cleat-a-11112222-main/.attached.$$"
+  run _box_has_attached_session "cleat-a-11112222-main"
+  assert_success
+}
+
+@test "sweep: a marker from a dead session does not pin the box forever" {
+  # Otherwise a crashed or killed shell would make the box permanently
+  # unsweepable, which is the opposite failure.
+  mkdir -p "$CLEAT_RUN_DIR/cleat-b-33334444-main"
+  : > "$CLEAT_RUN_DIR/cleat-b-33334444-main/.attached.999999"
+  run _box_has_attached_session "cleat-b-33334444-main"
+  assert_failure
+  [ ! -e "$CLEAT_RUN_DIR/cleat-b-33334444-main/.attached.999999" ] \
+    || { echo "stale marker was not cleaned up"; return 1; }
+}
+
+@test "sweep: a box with no attach marker is still sweepable" {
+  mkdir -p "$CLEAT_RUN_DIR/cleat-c-55556666-main"
+  run _box_has_attached_session "cleat-c-55556666-main"
+  assert_failure
+}
+
+@test "sweep: an attached box survives a real sweep pass" {
+  # Asserted on the DOCKER CALL, not on the summary line: the sweep reports a
+  # count, never the names, so output alone cannot tell whether this box was
+  # stopped.
+  mkdir -p "$CLEAT_RUN_DIR/cleat-att-11112222-main"
+  : > "$CLEAT_RUN_DIR/cleat-att-11112222-main/.attached.$$"
+  touch -t 200001010000 "$CLEAT_RUN_DIR/cleat-att-11112222-main" 2>/dev/null || true
+  _running_cleat_boxes() { echo "cleat-att-11112222-main"; }
+  _box_has_live_agent() { return 1; }
+  _sweep_idle_boxes "" 1
+  run grep -c "^docker stop .*cleat-att-11112222-main" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "sweep: an UNattached idle box is still stopped" {
+  # The other half. Without it the test above would pass even if the sweep
+  # had been disabled entirely.
+  mkdir -p "$CLEAT_RUN_DIR/cleat-idle-11112222-main"
+  touch -t 200001010000 "$CLEAT_RUN_DIR/cleat-idle-11112222-main" 2>/dev/null || true
+  _running_cleat_boxes() { echo "cleat-idle-11112222-main"; }
+  _box_has_live_agent() { return 1; }
+  _sweep_idle_boxes "" 1
+  run grep -c "^docker stop .*cleat-idle-11112222-main" "$DOCKER_CALLS"
+  refute_output "0"
+}

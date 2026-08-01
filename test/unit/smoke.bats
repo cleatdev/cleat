@@ -1100,6 +1100,10 @@ EOF
 set -euo pipefail
 source "$CLI"
 _is_tty() { return 0; }
+# Docker Desktop is the premise of the whole scrape: the settings file is only
+# read when Desktop is the running engine, so a host that moved to OrbStack or
+# Colima is not described by a file it left behind.
+_is_docker_desktop() { return 0; }
 _docker_vm_memory() { echo 17179869184; }     # 16 GiB VM (memory is fine)
 _host_total_memory() { echo 34359738368; }    # 32 GiB host
 dd="\$(mktemp -d)"
@@ -1396,4 +1400,29 @@ EOF
     *$'\033'"[?25h"*|*$'\033'"[?12l"*|*$'\033'"[?25l"*)
       echo "cursor escape on stdout:"; printf '%s' "$out" | od -c | tail -4; return 1 ;;
   esac
+}
+
+@test "smoke: cleat fork run gets the session preflights, like start --fork" {
+  # `cleat fork start|run` was dispatched without the preflight block that
+  # every other session verb gets, so with the daemon down it skipped Docker
+  # autostart and died on a raw daemon error while `cleat start --fork` from
+  # the same shell brought Docker up. The two are documented as the same
+  # command. Asserted through the real binary because it is a main() dispatch
+  # question, not a cmd_fork one.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork run feat-a
+  assert_success
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: a read-only fork subcommand still never boots the daemon" {
+  # The other half: stop/status/nuke and the read-only fork verbs must not
+  # start a VM. If `fork path` ever runs _ensure_daemon, this catches it.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  run cleat_bin fork path feat-a
+  assert_failure
+  refute_output --partial "Starting Docker"
+  refute_output --partial "unbound variable"
 }

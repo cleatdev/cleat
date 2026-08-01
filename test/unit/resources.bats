@@ -490,3 +490,17 @@ teardown() { _common_teardown; }
   run bash -c "grep 'NODE_OPTIONS' '$DOCKER_CALLS'"
   assert_failure
 }
+
+@test "memory: a value below dockerd's 6 MB floor is rejected at validation" {
+  # dockerd refuses anything under 6 MB ("Minimum memory limit allowed is
+  # 6MB"), so a forgotten suffix like `memory = 4` sailed through validation
+  # and aborted `docker run` with a daemon error instead of being caught here.
+  run _valid_memory_value "4m"
+  assert_failure
+  run _valid_memory_value "1024"
+  assert_failure
+  run _valid_memory_value "6m"
+  assert_success
+  run _valid_memory_value "8g"
+  assert_success
+}

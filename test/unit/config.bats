@@ -1079,3 +1079,151 @@ EOF
   run cat "$TEST_TEMP/.cleat.env"
   assert_output "FOO=bar"
 }
+
+# ── writer/reader header-matching parity ────────────────────────────────────
+#
+# Every READER (_read_caps_from_file, _read_setup_from_file,
+# _read_section_from_file, _read_section_all_from_file,
+# _warn_unknown_cleat_sections) trims leading and trailing whitespace before
+# comparing a section header. Every WRITER matched the header untrimmed, so a
+# header an editor had indented was a section to the reader and ordinary
+# preserved text to the writer. The writer then appended a SECOND section of
+# the same name. For [caps] that is a live capability the user was told had
+# been disabled; for [resources] the stale first section wins, because
+# _read_section_from_file returns on its first match. Found 2026-07-31.
+
+@test "write_caps: an indented [caps] header is replaced, not duplicated" {
+  printf ' [caps]\ndocker\nssh\n' > "$TEST_TEMP/config"
+  _write_caps_to_file "$TEST_TEMP/config" ssh
+  [ "$(grep -c '\[caps\]' "$TEST_TEMP/config")" -eq 1 ] \
+    || { echo "duplicate [caps] sections:"; cat "$TEST_TEMP/config"; return 1; }
+  run _read_caps_from_file "$TEST_TEMP/config"
+  assert_success
+  refute_output --partial "docker"
+  assert_output --partial "ssh"
+}
+
+@test "write_caps: a tab-indented [caps] header is replaced, not duplicated" {
+  printf '\t[caps]\ndocker\n' > "$TEST_TEMP/config"
+  _write_caps_to_file "$TEST_TEMP/config" ssh
+  [ "$(grep -c '\[caps\]' "$TEST_TEMP/config")" -eq 1 ]
+  run _read_caps_from_file "$TEST_TEMP/config"
+  refute_output --partial "docker"
+}
+
+@test "write_caps: a [caps] header with trailing space is replaced, not duplicated" {
+  printf '[caps] \ndocker\n' > "$TEST_TEMP/config"
+  _write_caps_to_file "$TEST_TEMP/config" ssh
+  [ "$(grep -c '\[caps\]' "$TEST_TEMP/config")" -eq 1 ]
+  run _read_caps_from_file "$TEST_TEMP/config"
+  refute_output --partial "docker"
+}
+
+@test "write_resources: an indented [resources] header is replaced, not duplicated" {
+  # _read_section_from_file returns on its FIRST match, so a surviving stale
+  # section silently beats the value the user just set.
+  printf ' [resources]\nmemory = 2g\n' > "$TEST_TEMP/config"
+  _write_resources_to_file "$TEST_TEMP/config" 8g ""
+  [ "$(grep -c '\[resources\]' "$TEST_TEMP/config")" -eq 1 ] \
+    || { echo "duplicate [resources]:"; cat "$TEST_TEMP/config"; return 1; }
+  run _read_resource_from_file "$TEST_TEMP/config" memory
+  assert_success
+  assert_output "8g"
+}
+
+@test "write_caps: an indented header for a DIFFERENT section still ends the caps block" {
+  # The closing half of the same comparison: an indented [setup] must terminate
+  # the old [caps] block, or the writer swallows [setup] into the section it is
+  # replacing and deletes the user's provisioning.
+  printf '[caps]\ndocker\n  [setup]\nsudo apt-get update\n' > "$TEST_TEMP/config"
+  _write_caps_to_file "$TEST_TEMP/config" ssh
+  run cat "$TEST_TEMP/config"
+  assert_output --partial "[setup]"
+  assert_output --partial "sudo apt-get update"
+  run _read_setup_from_file "$TEST_TEMP/config"
+  assert_output --partial "sudo apt-get update"
+}
+
+@test "read_caps: an unreadable file yields nothing instead of crashing the CLI" {
+  [ "$(id -u)" -ne 0 ] || skip "root reads anything, the mode bits do not apply"
+  # The guard was [[ -f ]], so a .cleat the user cannot read reached the
+  # redirect and bash aborted with a raw "Permission denied" under strict mode.
+  # Every command in that project died, cleat status included, so there was no
+  # way to even diagnose it. Fail closed and quiet: fewer caps, not a crash.
+  printf '[caps]\ndocker\n' > "$TEST_TEMP/unreadable"
+  chmod 000 "$TEST_TEMP/unreadable"
+  run _read_caps_from_file "$TEST_TEMP/unreadable"
+  chmod 644 "$TEST_TEMP/unreadable"
+  assert_success
+  assert_output ""
+}
+
+@test "read_section: an unreadable file yields nothing instead of crashing" {
+  [ "$(id -u)" -ne 0 ] || skip "root reads anything, the mode bits do not apply"
+  printf '[resources]\nmemory = 8g\n' > "$TEST_TEMP/unreadable2"
+  chmod 000 "$TEST_TEMP/unreadable2"
+  run _read_section_from_file "$TEST_TEMP/unreadable2" resources memory
+  chmod 644 "$TEST_TEMP/unreadable2"
+  assert_success
+  assert_output ""
+}
+
+@test "read_caps: a UTF-8 BOM does not void the first section" {
+  # An editor that writes a BOM made the opening "[caps]" read as
+  # $'\xef\xbb\xbf[caps]', which matches neither the header test nor any known
+  # section name, so the section was silently ignored and the unknown-section
+  # warner stayed quiet about it too.
+  printf '\xef\xbb\xbf[caps]\ndocker\n' > "$TEST_TEMP/bom"
+  run _read_caps_from_file "$TEST_TEMP/bom"
+  assert_success
+  assert_output "docker"
+}
+
+@test "read_section: a UTF-8 BOM does not void the first section" {
+  printf '\xef\xbb\xbf[resources]\nmemory = 8g\n' > "$TEST_TEMP/bom2"
+  run _read_section_from_file "$TEST_TEMP/bom2" resources memory
+  assert_success
+  assert_output "8g"
+}
+
+@test "unknown sections: a BOM'd first header is not reported as unknown" {
+  printf '\xef\xbb\xbf[caps]\ndocker\n' > "$TEST_TEMP/bom3"
+  run _warn_unknown_cleat_sections "$TEST_TEMP/bom3" project
+  assert_success
+  refute_output --partial "Unknown section"
+}
+
+@test "write_caps: the file is replaced by rename, never truncated in place" {
+  # The writers opened the real file with > , so the moment the redirect ran
+  # the old content was gone. A crash or a full disk between that and the last
+  # line destroyed the preserved [setup] block and every comment, and the file
+  # the user was left with was a truncated .cleat, not the old one.
+  printf '[caps]\ngit\n[setup]\nsudo apt-get update\n' > "$TEST_TEMP/config"
+  local before_inode; before_inode="$(ls -i "$TEST_TEMP/config" | awk '{print $1}')"
+  _write_caps_to_file "$TEST_TEMP/config" ssh
+  local after_inode; after_inode="$(ls -i "$TEST_TEMP/config" | awk '{print $1}')"
+  [ "$before_inode" != "$after_inode" ] \
+    || { echo "same inode: the file was written in place, not renamed over"; return 1; }
+  run cat "$TEST_TEMP/config"
+  assert_output --partial "sudo apt-get update"
+}
+
+@test "write_caps: no temp file is left behind" {
+  printf '[caps]\ngit\n' > "$TEST_TEMP/config"
+  _write_caps_to_file "$TEST_TEMP/config" ssh
+  run bash -c 'ls "'"$TEST_TEMP"'"/*cleat-tmp* 2>/dev/null'
+  assert_failure
+}
+
+@test "write_resources: an unwritable directory reports an error instead of destroying the file" {
+  [ "$(id -u)" -ne 0 ] || skip "root writes anywhere"
+  mkdir -p "$TEST_TEMP/ro"
+  printf '[caps]\ngit\n[setup]\nmake bootstrap\n' > "$TEST_TEMP/ro/.cleat"
+  chmod 500 "$TEST_TEMP/ro"
+  run _write_resources_to_file "$TEST_TEMP/ro/.cleat" 8g ""
+  chmod 700 "$TEST_TEMP/ro"
+  assert_failure
+  # and the original survived intact rather than being truncated
+  run cat "$TEST_TEMP/ro/.cleat"
+  assert_output --partial "make bootstrap"
+}

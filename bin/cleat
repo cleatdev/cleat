@@ -1232,7 +1232,7 @@ _host_connectivity_args() {
 # Config format: [caps] section header, then one cap name per line.
 _read_caps_from_file() {
   local file="$1"
-  [[ -f "$file" ]] || return 0
+  [[ -r "$file" ]] || return 0
   local in_caps=false
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (common in
   # hand-edited .cleat/config files, e.g. `printf '[caps]\nenv'`) is still read;
@@ -1241,6 +1241,7 @@ _read_caps_from_file() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip carriage return (CRLF from Windows editors)
     line="${line%$'\r'}"
+    line="${line#$'\xef\xbb\xbf'}"   # UTF-8 BOM, silently voided the first section
     # Strip leading/trailing whitespace
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
@@ -1265,10 +1266,11 @@ _read_caps_from_file() {
 # use `test`, and _warn_unknown_cleat_sections surfaces the mistake).
 _read_setup_from_file() {
   local file="$1"
-  [[ -f "$file" ]] || return 0
+  [[ -r "$file" ]] || return 0
   local in_setup=false
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
+    line="${line#$'\xef\xbb\xbf'}"   # UTF-8 BOM, silently voided the first section
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
@@ -1293,7 +1295,7 @@ _write_caps_to_file() {
   # If file exists, preserve everything outside [caps] section
   local preserved=""
   if [[ -f "$file" ]]; then
-    local in_caps=false
+    local in_caps=false _h
     # `|| [[ -n "$line" ]]` so a project .cleat whose LAST section is hand-written
     # and ends WITHOUT a trailing newline (e.g. a final `[setup]` line) is not
     # silently dropped from `preserved`: without the guard `read` returns non-zero
@@ -1301,13 +1303,23 @@ _write_caps_to_file() {
     # byte-for-byte. Matches _read_section_from_file / _write_kits_to_file / _write_resources_to_file.
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%$'\r'}"
-      if [[ "$line" == "[caps]" ]]; then
+      # Match the header the way every READER does: trimmed. Comparing the raw
+      # line meant an indented `  [caps]` was a section to _read_caps_from_file
+      # and ordinary preserved text to this writer, which then appended a
+      # SECOND [caps] block. The reader reads both, so `cleat config --disable
+      # docker` reported success while docker stayed ACTIVE, and an indented
+      # [setup] between the two blocks was swallowed and deleted outright.
+      # Found 2026-07-31. The preserved text keeps the original line, not the
+      # trimmed one: other sections keep the user's own formatting.
+      _h="${line#"${line%%[![:space:]]*}"}"
+      _h="${_h%"${_h##*[![:space:]]}"}"
+      if [[ "$_h" == "[caps]" ]]; then
         in_caps=true
         continue
       fi
       if $in_caps; then
         # Skip lines in old [caps] section until next section or EOF
-        if [[ "$line" == "["*"]" ]]; then
+        if [[ "$_h" == "["*"]" ]]; then
           in_caps=false
           preserved+="$line"$'\n'
         fi
@@ -1328,7 +1340,11 @@ _write_caps_to_file() {
         echo "$cap"
       done
     fi
-  } > "$file"
+  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
+    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
+    error "Could not write ${file/#${HOME}/~}"
+    return 1
+  }
 }
 
 # Write [resources] memory/cpus to a config file, preserving everything OUTSIDE
@@ -1356,12 +1372,18 @@ _write_resources_to_file() {
     # the old section is REPLACED (not duplicated into two [resources] blocks).
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%$'\r'}"
-      if [[ "$line" == "[resources]" ]]; then
+      # Trimmed header match, same parity fix as _write_caps_to_file. Here the
+      # stale duplicate WINS every read, because _read_section_from_file
+      # returns on its first match, so a memory the user had just raised
+      # silently kept the old value.
+      _h="${line#"${line%%[![:space:]]*}"}"
+      _h="${_h%"${_h##*[![:space:]]}"}"
+      if [[ "$_h" == "[resources]" ]]; then
         in_res=true
         continue
       fi
       if $in_res; then
-        if [[ "$line" == "["*"]" ]]; then
+        if [[ "$_h" == "["*"]" ]]; then
           in_res=false
           preserved+="$line"$'\n'
         fi
@@ -1384,7 +1406,11 @@ _write_resources_to_file() {
         echo "cpus = $cpus"
       fi
     fi
-  } > "$file"
+  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
+    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
+    error "Could not write ${file/#${HOME}/~}"
+    return 1
+  }
 }
 
 # Resolve which project cap file applies to a box (see concept/20-boxes.md):
@@ -1419,8 +1445,12 @@ _build_setup_payload() {
   local line
   while IFS= read -r line; do
     case "$line" in
-      "script "*)
-        local path="${line#script }"
+      # Any whitespace after the directive, not just a space. A tab fell
+      # through to the default arm and was handed to the shell as a command
+      # line, so a `script<TAB>provision.sh` line ran as an arbitrary command
+      # while the user had written (and the trust prompt showed) a script.
+      "script "*|"script	"*)
+        local path="${line#script}"
         # Trim surrounding whitespace, then one leading "./".
         path="${path#"${path%%[![:space:]]*}"}"
         path="${path%"${path##*[![:space:]]}"}"
@@ -1500,7 +1530,7 @@ _project_env_file() {
 # comment- and whitespace-tolerant. Prints the value, or nothing when absent.
 _read_section_from_file() {
   local file="$1" section="$2" key="$3"
-  [[ -f "$file" ]] || return 0
+  [[ -r "$file" ]] || return 0
   local in_section=false line k v
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (a hand-edited
   # `.cleat` ending in `memory = 8g`) is still read; without it `read` returns
@@ -1508,6 +1538,7 @@ _read_section_from_file() {
   # to the default. Matches _read_caps_from_file and _parse_env_file.
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
+    line="${line#$'\xef\xbb\xbf'}"   # UTF-8 BOM, silently voided the first section
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
@@ -1551,7 +1582,15 @@ _valid_memory_value() {
   # Force base-10: a leading zero ("08g") is otherwise an octal parse error in
   # bash arithmetic, and all-zero spellings ("0", "00g") mean --memory 0,
   # which docker treats as UNLIMITED, a clamp bypass rather than a limit.
-  (( 10#$n > 0 ))
+  (( 10#$n > 0 )) || return 1
+  # dockerd refuses anything under 6 MB ("Minimum memory limit allowed is
+  # 6MB"). Without a floor here a forgotten suffix (`memory = 4`, meaning 4
+  # BYTES) passed validation and then aborted `docker run` with a daemon error
+  # the user had no way to trace back to their config line.
+  local _b
+  _b="$(_mem_to_bytes "$1")"
+  [[ "$_b" =~ ^[0-9]+$ ]] || return 0
+  (( _b >= 6291456 ))
 }
 
 # Convert a validated memory value to bytes (for clamping comparisons).
@@ -1601,6 +1640,14 @@ _vm_gb_rounded() {
 # settings-store.json (PascalCase keys); older writes settings.json (camelCase).
 # Try the newer one first. The base dir is overridable for tests.
 _docker_desktop_settings_file() {
+  # Only when Docker Desktop is the ACTIVE engine. The file is picked by path,
+  # and that path survives uninstalling Desktop, so on a host that used to run
+  # it and now runs OrbStack or Colima this returned a DEAD config. Every
+  # reader below then described a VM that is not the one running the boxes:
+  # wrong memory in the advisory, and a swap value that could raise the
+  # blocking config gate over a setting the live engine does not even have.
+  # _is_docker_desktop asks the daemon, so it follows the context.
+  _is_docker_desktop || return 0
   local base="${_DD_SETTINGS_DIR:-$HOME/Library/Group Containers/group.com.docker}"
   local f
   for f in "$base/settings-store.json" "$base/settings.json"; do
@@ -2362,12 +2409,28 @@ _generate_kit_overlay() {
   # that native host claude would run on invocation, closing the third
   # instruction surface after CLAUDE.md and agents. Project-level
   # /workspace/.claude/commands is unaffected (still writable in the repo).
-  # -L dereferences: dotfile-repo users symlink their commands, and a copied
-  # symlink would point at a host path that does not exist inside the box. A
-  # dangling source link makes cp error on that entry and continue; the
-  # swallow-and-continue matches the agents copy above.
+  # Copied entry by entry, exactly like skills below and for the same reason.
+  # The blanket `cp -RL` this used to be dereferenced EVERY link at every
+  # depth, so `mycommands/keys -> ~/.ssh` materialized real host secrets inside
+  # the cage. That is the one thing the cage exists to prevent, and
+  # _fork_copy_tree guards the identical property for the workspace ("never add
+  # -L or -H"). The TOP-LEVEL entry is still dereferenced, because dotfile-repo
+  # users symlink their whole commands dir or individual command files and a
+  # copied link would be dead inside the box. A link NESTED inside a command
+  # directory is copied AS a link and simply dangles there.
   if [[ -d "${HOME}/.claude/commands" ]]; then
-    cp -RL "${HOME}/.claude/commands/." "$kit_dir/commands/" 2>/dev/null || true
+    local _cm _cmb
+    for _cm in "${HOME}/.claude/commands"/* "${HOME}/.claude/commands"/.[!.]*; do
+      [[ -e "$_cm" ]] || continue
+      _cmb="${_cm##*/}"
+      if [[ -d "$_cm" ]]; then
+        mkdir -p "$kit_dir/commands/$_cmb"
+        cp -R "$_cm/." "$kit_dir/commands/$_cmb/" 2>/dev/null || true
+      else
+        cp "$_cm" "$kit_dir/commands/$_cmb" 2>/dev/null || true
+      fi
+    done
+    chmod -R u+rwX "$kit_dir/commands" 2>/dev/null || true
   fi
 
   # skills/: a read-only PASS-THROUGH of the user's own skills. Same purpose
@@ -2491,10 +2554,23 @@ _CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots s
 # docker cap looked for a session dir that was never created. Any project path
 # containing a dot had the same problem.
 #
-# Two steps because bash 3.2 has no nested parameter expansion.
+# Re-measured against the bundled Claude Code 2.1.220 on 2026-07-31 by running
+# it in a directory named  a_b c+d@e#f%g(h)i,j=k~l  and reading the key it
+# created:  a-b-c-d-e-f-g-h-i-j-k-l. So the rule is not "slash and dot" but
+# EVERY character outside [A-Za-z0-9], dashes excepted. Handling only / and .
+# left underscore broken, and snake_case project names (my_app, foo_bar) are
+# everywhere: each one got its session mountpoint at a key Claude Code never
+# reads, and under the docker cap the parent is :ro so it could not create the
+# right one either. Sessions and memory silently did not persist, exactly as
+# the dot bug did, by a commoner route.
+#
+# LC_ALL=C pins the ranges to ASCII: under a UTF-8 collation an A-Z range can
+# match outside the letters you meant. sed rather than ${var//[!A-Za-z0-9]/-}
+# for the same reason, and it matches how container_name_for already sanitizes.
+# A path made only of [A-Za-z0-9/.-] encodes byte-identically to the old form,
+# so no existing user is re-keyed.
 _claude_session_key() {
-  local _k="${1//\//-}"
-  printf '%s' "${_k//./-}"
+  printf '%s' "$(printf '%s' "$1" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')"
 }
 
 _generate_home_overlay() {
@@ -2641,8 +2717,37 @@ _fork_rm_tree() {
     return 1
   fi
   [[ -d "$target" ]] || return 0
+  # The textual test above is necessary and NOT sufficient: it passes for any
+  # string that starts with the root, including one whose '..' components
+  # resolve elsewhere entirely. Resolve physically before deleting.
+  if ! _fork_path_under_root "$target"; then
+    error "Refusing to delete outside ${root/#${HOME}/~}: $target"
+    return 1
+  fi
   rm -rf "$target" || { error "Could not delete ${target/#${HOME}/~}"; return 1; }
   return 0
+}
+
+# Physical containment for a path this file is about to delete or overwrite.
+#
+# The `case "$target" in "$root"/?*` tests were the only guard, and they are
+# purely textual: "$root/box/../../../Documents" matches the pattern and
+# resolves to a real host directory. `cleat fork rm` and `cleat fork refresh`
+# reached that path because their box positional was never validated (see
+# cmd_fork), and rm -rf'd ~/Documents. Found 2026-07-31.
+#
+# A fork copy is always EXACTLY one level under the fork root, so resolve the
+# parent physically and require it to BE the root. That is stricter than a
+# prefix test and immune to '..'. cd -P plus pwd -P is the portable resolver
+# here: macOS has no realpath in the base system. Same technique
+# _fork_prune_excludes already uses against the same class of escape.
+_fork_path_under_root() {
+  local target="$1" base root_p parent_p
+  base="${target##*/}"
+  case "$base" in ''|.|..) return 1 ;; esac
+  root_p="$(cd -P "$(_fork_root)" 2>/dev/null && pwd -P)" || return 1
+  parent_p="$(cd -P "$(dirname "$target")" 2>/dev/null && pwd -P)" || return 1
+  [[ "$parent_p" == "$root_p" ]]
 }
 
 # Every session verb must check this, not just cmd_run. The fork copy is a
@@ -2703,7 +2808,7 @@ _fork_preflight() {
   fi
   error "This box is a fork but its workspace copy is missing."
   echo -e "    ${DIM}Expected: ${_fp/#${HOME}/~}${RESET}"
-  echo -e "    ${DIM}Recreate it with ${BOLD}cleat start ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
+  echo -e "    ${DIM}Recreate it with ${BOLD}cleat start ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat fork rm ${_BOX}${RESET}${DIM}.${RESET}"
   exit 1
 }
 
@@ -2712,10 +2817,11 @@ _fork_preflight() {
 # `memory = 8g` and wrong for `exclude = node_modules` repeated N times.
 _read_section_all_from_file() {
   local file="$1" section="$2" key="$3"
-  [[ -f "$file" ]] || return 0
+  [[ -r "$file" ]] || return 0
   local in_section=false line k v
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
+    line="${line#$'\xef\xbb\xbf'}"   # UTF-8 BOM, silently voided the first section
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
@@ -2795,11 +2901,18 @@ _fork_copy_tree() {
   local src="$1" dst="$2" lock rc=0
   local root; root="$(_fork_root)"
   mkdir -p "$root" || return 1
-  # Never rm -rf outside the fork root, whatever the caller passes.
+  # Never rm -rf outside the fork root, whatever the caller passes. Textual
+  # first, then physical: this function rm -rf's $dst before moving the copy
+  # into place, so a '..' that only LOOKS contained deleted a host directory
+  # and then replaced it with the project. See _fork_path_under_root.
   case "$dst" in
     "$root"/?*) : ;;
     *) error "Refusing to write a fork outside ${root/#${HOME}/~}"; return 1 ;;
   esac
+  if ! _fork_path_under_root "$dst"; then
+    error "Refusing to write a fork outside ${root/#${HOME}/~}"
+    return 1
+  fi
   [[ -d "$src" ]] || { error "Fork source is not a directory: $src"; return 1; }
   lock="$root/.lock.$(basename "$dst")"
   if ! mkdir "$lock" 2>/dev/null; then
@@ -2831,8 +2944,13 @@ _fork_copy_tree_locked() {
 # would lose clonefile on macOS, so copy-everything-then-prune keeps one code
 # path and keeps CoW. Paths are refused if absolute or containing '..': an
 # exclude must never be able to delete outside the fork.
+# $3 is the BOX. The excludes were read from $project/.cleat unconditionally,
+# so a named box using .cleat.<box> had its caps honoured from that file and
+# its [fork] excludes read from a different one. _project_caps_file is the same
+# resolver every other per-box setting goes through.
 _fork_prune_excludes() {
-  local dst="$1" project="$2" e _root _parent _target
+  local dst="$1" project="$2" box="${3:-main}" e _root _parent _target _exfile
+  _exfile="$(_project_caps_file "$project" "$box")"
   _root="$(cd -P "$dst" 2>/dev/null && pwd -P)" || return 0
   while IFS= read -r e; do
     [[ -n "$e" ]] || continue
@@ -2864,7 +2982,7 @@ _fork_prune_excludes() {
     # copy that already succeeded.
     rm -rf "$_parent/$(basename "$_target")" 2>/dev/null \
       || warn "Could not prune [fork] exclude: $e"
-  done < <(_read_section_all_from_file "$project/.cleat" fork exclude)
+  done < <(_read_section_all_from_file "$_exfile" fork exclude)
 }
 
 # ── Workspace trust ─────────────────────────────────────────────────────────
@@ -2913,7 +3031,8 @@ _setup_payload_hash() {
 _trust_lookup() {
   local project="$1" box="${2:-main}"
   [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
-  awk -F'\t' -v p="$project" -v b="$box" '
+  CLEAT_AWK_P="$project" CLEAT_AWK_B="$box" awk -F'\t' '
+    BEGIN { p = ENVIRON["CLEAT_AWK_P"]; b = ENVIRON["CLEAT_AWK_B"] }
     /^#/ { next }
     $1 != p { next }
     NF >= 3 { if ($2 == b) { print $3; exit } ; next }
@@ -2928,7 +3047,8 @@ _trust_lookup() {
 _trust_lookup_setup() {
   local project="$1" box="${2:-main}"
   [[ -f "$CLEAT_TRUST_FILE" ]] || return 0
-  awk -F'\t' -v p="$project" -v b="$box" '
+  CLEAT_AWK_P="$project" CLEAT_AWK_B="$box" awk -F'\t' '
+    BEGIN { p = ENVIRON["CLEAT_AWK_P"]; b = ENVIRON["CLEAT_AWK_B"] }
     /^#/ { next }
     $1 != p { next }
     NF >= 4 { if ($2 == b) { print $4; exit } }
@@ -2965,8 +3085,9 @@ _trust_record() {
     echo "# <absolute-project-path><TAB><box><TAB><hash-of-canonical-caps>"
     echo "# Legacy two-column rows (<path><TAB><hash>) are read as the 'main' box."
     if [[ -f "$CLEAT_TRUST_FILE" ]]; then
-      awk -F'\t' -v p="$project" -v b="$box" '
-        /^#/ { next }
+      CLEAT_AWK_P="$project" CLEAT_AWK_B="$box" awk -F'\t' '
+        BEGIN { p = ENVIRON["CLEAT_AWK_P"]; b = ENVIRON["CLEAT_AWK_B"] }
+    /^#/ { next }
         NF < 2 { next }
         {
           if ($1 == p) {
@@ -2997,8 +3118,9 @@ _trust_remove() {
     echo "# Cleat project trust file (one entry per line)"
     echo "# <absolute-project-path><TAB><box><TAB><hash-of-canonical-caps>"
     echo "# Legacy two-column rows (<path><TAB><hash>) are read as the 'main' box."
-    awk -F'\t' -v p="$project" -v b="$box" '
-      /^#/ { next }
+    CLEAT_AWK_P="$project" CLEAT_AWK_B="$box" awk -F'\t' '
+      BEGIN { p = ENVIRON["CLEAT_AWK_P"]; b = ENVIRON["CLEAT_AWK_B"] }
+    /^#/ { next }
       NF < 2 { next }
       {
         if ($1 == p) {
@@ -3199,9 +3321,17 @@ _resolve_project_trust() {
     local -a req_caps=()
     local c
     while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$caps_file")
+    # Hash BEFORE the prompt, from the same read that produced the caps we are
+    # about to display. It used to be computed after the answer came back, so a
+    # .cleat rewritten while the user was reading the prompt got recorded as
+    # approved at its NEW hash: the user approved one set of capabilities and
+    # the trust store remembered a different set, with no re-prompt on the next
+    # run. The window is however long someone takes to read a security prompt,
+    # which is exactly the window that matters, and the writer can be the
+    # sandboxed agent itself.
+    local hash
+    hash="$(_hash_cleat_caps "$caps_file")"
     if _trust_prompt "$project" "${req_caps[@]}"; then
-      local hash
-      hash="$(_hash_cleat_caps "$caps_file")"
       # Preserve any existing [setup] trust (col4): see the opt-in branch
       # above, same reasoning.
       _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
@@ -3347,7 +3477,7 @@ _WARNED_SECTIONS_FILES=""
 # as "wrong file" rather than "ignored".
 _warn_unknown_cleat_sections() {
   local file="$1" scope="$2"
-  [[ -f "$file" ]] || return 0
+  [[ -r "$file" ]] || return 0
   case "$_WARNED_SECTIONS_FILES" in
     *"|$file|"*) return 0 ;;
   esac
@@ -3358,6 +3488,7 @@ _warn_unknown_cleat_sections() {
   local line name
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
+    line="${line#$'\xef\xbb\xbf'}"   # UTF-8 BOM, silently voided the first section
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
@@ -3460,10 +3591,11 @@ cap_is_active() {
 # Bare KEY entries are resolved from the host environment.
 _parse_env_file() {
   local file="$1"
-  [[ -f "$file" ]] || return 0
+  [[ -r "$file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip carriage return (CRLF from Windows editors)
     line="${line%$'\r'}"
+    line="${line#$'\xef\xbb\xbf'}"   # UTF-8 BOM, silently voided the first section
     # Strip leading/trailing whitespace
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
@@ -3898,7 +4030,20 @@ _build_project_claude_json() {
     local tmp="${out}.tmp.$$"
     local hf pf sf sib
     if [[ -n "$host_src" && -f "$host_src" && -s "$host_src" ]]; then hf="$host_src"; else hf=/dev/null; fi
-    if [[ -f "$proj_src" && -s "$proj_src" ]]; then pf="$proj_src"; else pf=/dev/null; fi
+    # The PERSISTED project copy gets the same corruption guard as the host
+    # file above. It had none, so a project file truncated by a full disk or a
+    # killed write was fed to jq, jq failed on the whole merge, and the box
+    # came up with a file it could not read. Nothing healed it, so every later
+    # start reproduced it: the box was stuck on the login screen with no
+    # message naming the cause. Backing it up and treating it as absent lets
+    # the merge rebuild from the host file and the sibling identity.
+    if [[ -f "$proj_src" && -s "$proj_src" ]] && ! _looks_like_json_object "$proj_src"; then
+      cp "$proj_src" "${proj_src}.bak" 2>/dev/null || true
+      warn "This project's stored ${BOLD}.claude.json${RESET} was corrupt, backed up alongside it."
+      echo -e "    ${DIM}Rebuilding it from the host file. Session history for this project may be reset.${RESET}"
+      proj_src=""
+    fi
+    if [[ -n "$proj_src" && -f "$proj_src" && -s "$proj_src" ]]; then pf="$proj_src"; else pf=/dev/null; fi
     # Identity gained inside another box (its mounted per-project file is the
     # only place an in-box login lands) fills identity keys that BOTH the host
     # file and this project's own copy lack. Without it, a login done in box A
@@ -5005,6 +5150,10 @@ _browser_watcher() {
 # the container; this bridge reads those events and runs the real commands.
 _HOOK_BRIDGE_PID=""
 _HOOK_BRIDGE_CHILDREN=()
+# Ceiling on hooks executing at once. The spool is written by the CAGED side,
+# so its line count is attacker-influenced; this is what stops it becoming a
+# host process count. Every event still runs, just not all in one instant.
+_HOOK_BRIDGE_MAX_CONCURRENT=8
 
 _has_host_hooks() {
   local f
@@ -5055,20 +5204,43 @@ _hook_bridge_watcher() {
     file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
     file_size=$((file_size + 0))
 
-    if [[ $file_size -gt $byte_offset ]]; then
+    local _win _start _count
+    if _win="$(_hook_bridge_window "$byte_offset" "$file_size")"; then
+      read -r _start _count <<< "$_win"
       # Reap finished children
       _hook_bridge_reap
 
-      # Read new lines since last offset
       while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         _execute_host_hook_bg "$line" "${settings_files[@]}"
-      done < <(tail -c +"$((byte_offset + 1))" "$hooks_file" 2>/dev/null)
+      done < <(tail -c +"$_start" "$hooks_file" 2>/dev/null | head -c "$_count")
 
       byte_offset=$file_size
     fi
     sleep 0.5
   done
+}
+
+# The next read window over the spool, as "<start-byte> <count>", or non-zero
+# when there is nothing new. Split out of the watcher loop because that loop is
+# an infinite poll and this arithmetic is where both of its bugs lived.
+#
+#   * COUNT IS BOUNDED to the size already sampled. The old code ran `tail -c
+#     +N` with no bound, so it read to the LIVE end of file, which the box can
+#     push past the sampled size while the read is in flight. byte_offset was
+#     then set to the older, smaller size, so every byte written during the read
+#     came back on the next pass and its hook RAN A SECOND TIME. A hook is
+#     arbitrary user automation (a deploy, a notification, a commit), so a
+#     duplicate is a real side effect, not a cosmetic double read.
+#   * A SHRINKING SPOOL REWINDS. The offset only ever grew, so once the box
+#     truncated or replaced events.jsonl the "is there more" test could never be
+#     true again and the bridge silently stopped running the user's hooks for
+#     the rest of the session, with nothing on screen to say so.
+_hook_bridge_window() {
+  local offset="$1" size="$2"
+  [[ "$size" -lt "$offset" ]] && offset=0
+  [[ "$size" -gt "$offset" ]] || return 1
+  printf '%s %s' "$(( offset + 1 ))" "$(( size - offset ))"
 }
 
 # Reap finished child processes from the tracking array
@@ -5089,7 +5261,13 @@ _hook_bridge_reap() {
 # We kill them directly: no wait needed since they're in our own process tree.
 _hook_bridge_cleanup() {
   for pid in "${_HOOK_BRIDGE_CHILDREN[@]+"${_HOOK_BRIDGE_CHILDREN[@]}"}"; do
-    kill "$pid" 2>/dev/null || true
+    # The GROUP first: _execute_host_hook_bg starts each hook under `set -m`,
+    # so the subshell leads its own process group and the real work (timeout,
+    # bash -c, whatever the hook spawns) is inside it. Signalling only the
+    # tracked PID hit the subshell and left the actual hook process running
+    # past the end of the session. Fall back to the bare PID for any child
+    # started before job control, or if the group is already gone.
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
   done
   # Brief pause to let children exit, then reap
   sleep 0.1 2>/dev/null || true
@@ -5105,8 +5283,47 @@ _execute_host_hook_bg() {
   shift
   local settings_files=("$@")
 
+  # Bounded concurrency. The spool is bind-mounted read-write into the box, so
+  # the number of lines is chosen by the CAGED side: one background subshell
+  # per line, unbounded, meant a box appending N lines forked N host processes
+  # at once. Host fork exhaustion has already corrupted this project's TUI once,
+  # and it is the one failure a sandbox must not import from the thing it is
+  # sandboxing.
+  #
+  # This does NOT change whether or which hooks run. Enabling the capability is
+  # the user's decision to run THEIR hooks on their machine, and every spooled
+  # event still gets its hooks, in order. It only stops them all starting in
+  # the same instant. Blocking here also applies backpressure to the read loop,
+  # which is the point: the spool is a queue, not a fan-out.
+  local _waited=0
+  while [[ "$(_hook_bridge_live_count)" -ge "$_HOOK_BRIDGE_MAX_CONCURRENT" ]]; do
+    _hook_bridge_reap
+    [[ "$(_hook_bridge_live_count)" -lt "$_HOOK_BRIDGE_MAX_CONCURRENT" ]] && break
+    sleep 0.1
+    _waited=$(( _waited + 1 ))
+    # Never wedge the bridge on a hook that ignores its own timeout. 600 x 0.1s
+    # is well past the 30s `timeout` each hook already carries.
+    [[ $_waited -ge 600 ]] && break
+  done
+
+  # Job control so each hook lands in its OWN process group. Without it the
+  # tracked PID is the subshell and the actual `timeout`/`bash -c` is a
+  # grandchild, so _hook_bridge_cleanup signalled a shell that was already
+  # waiting and left the real hook process running after the session ended.
+  set -m 2>/dev/null || true
   ( _execute_host_hooks "$event_json" "${settings_files[@]}" ) &
   _HOOK_BRIDGE_CHILDREN+=("$!")
+  set +m 2>/dev/null || true
+}
+
+# How many tracked children are still alive. Counting is separate from reaping
+# because the bound above has to ask repeatedly while it waits.
+_hook_bridge_live_count() {
+  local pid n=0
+  for pid in "${_HOOK_BRIDGE_CHILDREN[@]+"${_HOOK_BRIDGE_CHILDREN[@]}"}"; do
+    kill -0 "$pid" 2>/dev/null && n=$(( n + 1 ))
+  done
+  printf '%s' "$n"
 }
 
 _execute_host_hooks() {
@@ -6451,10 +6668,13 @@ cmd_run() {
     if [[ $_copy_rc -ne 0 ]]; then
       rm -rf "$_fork_path"
       error "Could not copy the workspace. The fork was not created."
-      echo -e "    ${DIM}An unreadable file in the project will do this. Fix it, or exclude it with a [fork] exclude line in .cleat.${RESET}"
+      # NOT "exclude it with a [fork] exclude line": excludes are pruned AFTER
+      # the copy, so they cannot prevent a copy that fails. Pointing at them
+      # sent the user to a setting that could never fix what they were seeing.
+      echo -e "    ${DIM}Usually an unreadable file in the project, or no space left. Check permissions and free space, then retry.${RESET}"
       exit 1
     fi
-    _fork_prune_excludes "$_fork_path" "$project"
+    _fork_prune_excludes "$_fork_path" "$project" "$box"
     _fork_mark "$cname"
   fi
   if _box_is_fork "$cname"; then
@@ -6465,7 +6685,7 @@ cmd_run() {
     if [[ ! -d "$_fork_path" ]]; then
       error "This box is a fork but its workspace copy is missing."
       echo -e "    ${DIM}Expected: ${_fork_path/#${HOME}/~}${RESET}"
-      echo -e "    ${DIM}Recreate it with ${BOLD}cleat start ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat rm ${_BOX}${RESET}${DIM}.${RESET}"
+      echo -e "    ${DIM}Recreate it with ${BOLD}cleat start ${_BOX} --fork${RESET}${DIM}, or drop the fork with ${BOLD}cleat fork rm ${_BOX}${RESET}${DIM}.${RESET}"
       exit 1
     fi
     _workspace="$_fork_path"
@@ -7139,10 +7359,28 @@ cmd_shell() {
   fi
 
   info "Container ${BOLD}${cname}${RESET}"
+  # Claim the box for the idle sweep. A shell session runs bash, which
+  # _box_has_live_agent deliberately does NOT count as live (a detached box
+  # runs bash too), and cmd_shell never stamped the run dir, so the sweep
+  # measured idleness from the last CLAUDE session and stopped the container
+  # out from under someone sitting at its prompt. Re-stamping alone would not
+  # fix it either: the mtime freezes at attach, so a long shell ages out of the
+  # grace window anyway. The marker carries this process's PID so a crashed
+  # session cannot claim the box forever.
+  mkdir -p "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+  touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+  local _attach_marker="$CLEAT_RUN_DIR/${cname}/.attached.$$"
+  : > "$_attach_marker" 2>/dev/null || true
+  # shellcheck disable=SC2064
+  trap "rm -f '$_attach_marker' 2>/dev/null || true" EXIT INT TERM HUP
+
   local shell_rc=0
   docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
     runuser -u coder -- bash || shell_rc=$?
+
+  rm -f "$_attach_marker" 2>/dev/null || true
+  touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
 
   if [ -n "$_shell_bw_pid" ]; then
     kill "$_shell_bw_pid" 2>/dev/null || true
@@ -7383,8 +7621,22 @@ cmd_stop_all() {
 }
 
 cmd_status() {
-  local project box
-  project="$(resolve_project "${1:-}")"
+  local project box _arg="${1:-}"
+  # The positional is a PROJECT PATH when it names a real directory (the form
+  # the smoke tests and scripts use) and a BOX otherwise. resolve_project
+  # returns a non-directory unchanged, so without this split `cleat status
+  # feat-a` printed a confident, entirely phantom project literally called
+  # "feat-a": right-looking output about something that does not exist.
+  if [[ -n "$_arg" && ! -d "$_arg" ]]; then
+    if ! _validate_box_name "$_arg"; then
+      error "Invalid box name: ${BOLD}${_arg}${RESET}"
+      echo -e "    ${DIM}Box names: lowercase letters, digits, '-' or '_'; max 31 chars. Pass a directory to inspect another project.${RESET}"
+      exit 1
+    fi
+    _BOX="$_arg"
+    _arg=""
+  fi
+  project="$(resolve_project "$_arg")"
   box="${_BOX:-main}"
   local cname
   cname="$(container_name_for "$project" "$box")"
@@ -7899,6 +8151,25 @@ _print_docker_vm_fix() {
 # alone (the "leave it running, walk away" promise). `docker top` reads the
 # process list from the daemon (the image ships no `ps`), so no exec is needed.
 # Fails SAFE: any error, or output we can't read, is treated as "live" → skip.
+# True when a host-side session has this box open (today: `cleat shell`, which
+# the in-container process list cannot distinguish from a detached box). Each
+# marker is named for the claiming PID, so one left by a killed session is
+# ignored and swept away rather than pinning the box forever.
+_box_has_attached_session() {
+  local m pid found=1
+  for m in "$CLEAT_RUN_DIR/$1"/.attached.*; do
+    [[ -f "$m" ]] || continue
+    pid="${m##*/.attached.}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if kill -0 "$pid" 2>/dev/null; then
+      found=0
+    else
+      rm -f "$m" 2>/dev/null || true
+    fi
+  done
+  return $found
+}
+
 _box_has_live_agent() {
   local top
   top="$(docker top "$1" 2>/dev/null)" || return 0     # unreadable → assume live (safe)
@@ -7930,6 +8201,11 @@ _sweep_idle_boxes() {
     age="$(_path_mtime "$CLEAT_RUN_DIR/$name")"
     [[ "$age" =~ ^[0-9]+$ ]] && (( age > 0 )) || continue
     (( now - age < grace_secs )) && continue
+    # An open `cleat shell` claims the box with a PID-stamped marker. Checked
+    # BEFORE the docker round-trip, and separately from the agent gate, because
+    # a shell runs bash and a DETACHED box runs bash too, so the process list
+    # cannot tell them apart. Host-side, so it costs nothing.
+    _box_has_attached_session "$name" && continue
     # Liveness gate: a claude/node process means the box is attached or working
     # unattended → never touch it. Fail-safe (an unreadable `docker top` = live).
     _box_has_live_agent "$name" && continue
@@ -8582,7 +8858,10 @@ cmd_nuke() {
   echo -e "  ${DIM}It also clears the shared Docker build cache used by all projects (regenerable).${RESET}"
   echo -e "  ${DIM}Your project files and ~/.claude auth are safe (they live on the host).${RESET}"
   echo ""
-  read -rp "  Type 'nuke' to confirm: " confirm
+  # `|| confirm=""` so a closed or non-terminal stdin is the SAFE answer. Without
+  # it read returns non-zero at EOF and strict mode killed the command mid-prompt.
+  local confirm=""
+  read -rp "  Type 'nuke' to confirm: " confirm || confirm=""
   if [[ "$confirm" != "nuke" ]]; then
     info "Aborted."
     return
@@ -8619,7 +8898,28 @@ cmd_nuke() {
   fi
 
   if [[ -d "$CLEAT_BOXES_DIR" ]]; then
+    # A fork marker whose COPY still exists has to survive this. nuke removes
+    # containers, images and build cache; it deliberately does NOT remove fork
+    # workspaces, because a copy can hold the only version of hours of agent
+    # work (the same reason cleat rm keeps it). But the marker lived in this
+    # directory, so wiping it left the copy orphaned AND unmarked, and the next
+    # `cleat start <box> --fork` then read the box as a brand-new fork,
+    # re-copied, and _fork_copy_tree_locked rm -rf'd the surviving copy first.
+    # Silent destruction of work by a command that never claimed to touch it.
+    local _nk _nc _nkeep=()
+    for _nk in "$CLEAT_BOXES_DIR"/*.fork; do
+      [[ -f "$_nk" ]] || continue
+      _nc="${_nk##*/}"; _nc="${_nc%.fork}"
+      [[ -d "$(_fork_dir "$_nc")" ]] && _nkeep+=("$_nc")
+    done
     rm -rf "$CLEAT_BOXES_DIR" 2>/dev/null || true
+    for _nc in "${_nkeep[@]+"${_nkeep[@]}"}"; do
+      _fork_mark "$_nc"
+    done
+    if [[ ${#_nkeep[@]} -gt 0 ]]; then
+      info "Kept ${#_nkeep[@]} fork workspace $( [[ ${#_nkeep[@]} -eq 1 ]] && echo copy || echo copies ) and their markers."
+      echo -e "    ${DIM}Copies can hold work that was never committed. Remove them with ${BOLD}cleat fork prune${RESET}${DIM}.${RESET}"
+    fi
   fi
 
   if [[ -d "$CLEAT_KITS_DIR" ]]; then
@@ -10052,7 +10352,12 @@ cmd_describe() {
 _fork_size_kb() {
   local d="$1" out
   [[ -d "$d" ]] || { printf '%s' 0; return 0; }
-  out="$(du -sk "$d" 2>/dev/null | tail -1)" || out=""
+  # `|| true` INSIDE the pipeline, never after it. du exits non-zero when it
+  # cannot descend into a subdirectory but STILL prints a valid grand total,
+  # and under the CLI's `set -o pipefail` that non-zero failed the whole
+  # substitution, so one unreadable directory made a real multi-gigabyte copy
+  # report "0 KB apparent" in fork list, fork rm and fork prune.
+  out="$( { du -sk "$d" 2>/dev/null || true; } | tail -1 )" || out=""
   # macOS wc/du pad their output, so take the first field rather than a cut.
   set -- $out
   case "${1:-}" in
@@ -10078,12 +10383,28 @@ _fork_all_dirs() {
   [[ -d "$root" ]] || return 0
   for d in "$root"/*; do
     [[ -d "$d" ]] || continue
+    # Only directories named like a cleat container. Every copy is named by
+    # container_name_for, which always emits "cleat-...", so this loses
+    # nothing real. Without it prune treated ANY directory one level under the
+    # fork root as an orphan copy and deleted it, which is harmless under the
+    # default root and severe under a hand-set `[fork] dir` pointing at a
+    # directory that holds anything else. The root is user-settable, so this
+    # list must not assume it owns everything under it.
+    case "${d##*/}" in
+      cleat-?*) : ;;
+      *) continue ;;
+    esac
     printf '%s\n' "$d"
   done
 }
 
 _fork_print_list() {
   local root dirs total_kb=0 n=0 d cname kb age state
+  # Read-only, so a down daemon still prints the list. What it must NOT do is
+  # label every row "no box" and then point at prune, which is the delete: the
+  # box probe is a false negative against a stopped daemon (see prune).
+  local _daemon=1
+  _daemon_up || _daemon=0
   root="$(_fork_root)"
   dirs="$(_fork_all_dirs)"
   if [[ -z "$dirs" ]]; then
@@ -10100,7 +10421,9 @@ _fork_print_list() {
     total_kb=$(( total_kb + kb ))
     n=$(( n + 1 ))
     age="$(_fork_age_human "$d")"
-    if container_exists "$cname"; then
+    if [[ "$_daemon" -eq 0 ]]; then
+      state="${DIM}box unknown${RESET}"
+    elif container_exists "$cname"; then
       state="${DIM}box exists${RESET}"
     else
       state="${AMBER}no box${RESET}"
@@ -10111,7 +10434,11 @@ _fork_print_list() {
   echo
   echo -e "    ${DIM}$n $( [[ $n -eq 1 ]] && echo copy || echo copies ), $(_fork_fmt_kb "$total_kb") apparent.${RESET}"
   echo -e "    ${DIM}Apparent, not reclaimable: a copy-on-write copy shares blocks with the project until something changes.${RESET}"
-  echo -e "    ${DIM}Rows marked ${RESET}${AMBER}no box${RESET}${DIM} have no container left. ${BOLD}cleat fork prune${RESET}${DIM} clears those.${RESET}"
+  if [[ "$_daemon" -eq 0 ]]; then
+    echo -e "    ${AMBER}Docker is not running${RESET}${DIM}, so whether a copy still has a box is unknown. Start it for the real state.${RESET}"
+  else
+    echo -e "    ${DIM}Rows marked ${RESET}${AMBER}no box${RESET}${DIM} have no container left. ${BOLD}cleat fork prune${RESET}${DIM} clears those.${RESET}"
+  fi
 }
 
 cmd_fork() {
@@ -10160,8 +10487,18 @@ cmd_fork() {
 
     path|rm|refresh)
       local project box cname _fp
+      # Routed through _set_box, exactly like start|run above and like every
+      # other box-aware verb. This branch used to read the positional directly,
+      # which made cmd_fork the ONLY box-aware verb in the CLI that never
+      # validated the name, and the only one that then rm -rf's a path built
+      # from it: container_name_for appends the name verbatim and _fork_dir
+      # appends that to the fork root, so `cleat fork rm 'x/../../../Documents'`
+      # walked the delete out of the fork root and took a real host directory
+      # with it. _set_box also restores the stray-argument refusal, which two
+      # destructive verbs were silently swallowing.
+      _set_box "$@"
+      box="$_BOX"
       project="$(resolve_project "")"
-      box="${1:-${_BOX:-main}}"
       cname="$(container_name_for "$project" "$box")"
       _fp="$(_fork_dir "$cname")"
 
@@ -10179,6 +10516,20 @@ cmd_fork() {
       fi
 
       if [[ ! -d "$_fp" ]]; then
+        # `rm` is also how you DROP a fork whose copy is already gone, and it
+        # had to become that because both documented exits were closed. The
+        # marker outlives the copy on purpose, but a marker with no copy makes
+        # every later `cleat start <box>` refuse; that refusal said "drop the
+        # fork with cleat rm <box>", which deliberately KEEPS the marker, and
+        # coming here instead hit this bare refusal because the directory was
+        # missing. The box was unstartable with no working way out in any
+        # message. Clearing the marker is exactly what the user asked for.
+        if [[ "$sub" == "rm" ]] && _box_is_fork "$cname"; then
+          _fork_unmark "$cname"
+          success "Fork marker cleared for box ${BOLD}${box}${RESET}."
+          echo -e "    ${DIM}Its workspace copy was already gone. ${BOLD}cleat start ${box}${RESET}${DIM} now works on the project itself again.${RESET}"
+          return 0
+        fi
         error "No fork workspace for box ${BOLD}${box}${RESET}."
         echo -e "    ${DIM}Expected: ${_fp/#${HOME}/~}${RESET}"
         return 1
@@ -10222,14 +10573,53 @@ cmd_fork() {
       _fork_copy_tree "$project" "$_fp" || _rc=$?
       spin_stop "$_rc" "Workspace copied" "Workspace copy failed"
       [[ "$_rc" -eq 0 ]] || return 1
-      _fork_prune_excludes "$_fp" "$project"
+      _fork_prune_excludes "$_fp" "$project" "$box"
       _fork_mark "$cname"
       echo -e "    ${DIM}Next ${BOLD}cleat start ${box} --fork${RESET}${DIM} uses it.${RESET}"
       return 0 ;;
 
     prune)
+      # container_exists is `docker ps -a | grep -q`, which is FALSE when the
+      # daemon is merely stopped, not only when the box is gone. cmd_status
+      # already guards on exactly this ("the old line lied after every
+      # reboot"); this verb, written later, did not, so on a laptop that had
+      # not started Docker yet every live box read as an orphan and prune
+      # deleted EVERY workspace copy on the machine, uncommitted agent work
+      # included, and with --yes it did so without asking. A delete must never
+      # run on a probe that cannot answer. Found 2026-07-31.
+      if ! _daemon_up; then
+        error "Docker is not running."
+        echo -e "    ${DIM}Every box would look gone, so this would delete every copy. Start Docker, then run ${BOLD}cleat fork prune${RESET}${DIM} again.${RESET}"
+        return 1
+      fi
       local assume_yes=0 a
       for a in "$@"; do case "$a" in --yes|-y) assume_yes=1 ;; esac; done
+
+      # Interrupted copies. _fork_copy_tree_locked stages into
+      # $root/.tmp.<pid> and renames, so a copy killed part way (Ctrl-C, OOM,
+      # a reboot) strands a partial tree that _fork_all_dirs cannot see: its
+      # glob skips dotfiles. It was invisible to `cleat fork`, uncounted by
+      # prune and never reclaimed, so a large project could leak its whole
+      # size on every interruption with nothing on screen to explain the disk.
+      # Only sweep one whose owning PID is gone, so a CONCURRENT copy is never
+      # pulled out from under itself; PID reuse can only make us skip a
+      # removal, never take a live one. No confirmation: a staging tree is
+      # incomplete by construction and was never a workspace.
+      local _root_dir _tmp _pid _partial=0 _partial_kb=0
+      _root_dir="$(_fork_root)"
+      for _tmp in "$_root_dir"/.tmp.*; do
+        [[ -d "$_tmp" ]] || continue
+        _pid="${_tmp##*/.tmp.}"
+        case "$_pid" in ''|*[!0-9]*) continue ;; esac
+        kill -0 "$_pid" 2>/dev/null && continue
+        _partial_kb=$(( _partial_kb + $(_fork_size_kb "$_tmp") ))
+        _fork_rm_tree "$_tmp" && _partial=$(( _partial + 1 ))
+      done
+      if [[ "$_partial" -gt 0 ]]; then
+        success "Removed $_partial interrupted $( [[ $_partial -eq 1 ]] && echo copy || echo copies ), $(_fork_fmt_kb "$_partial_kb")."
+        echo -e "    ${DIM}Staging trees left by a fork copy that was interrupted. Nothing listed them until now.${RESET}"
+      fi
+
       local dirs d cname orphans="" count=0 kb total=0
       dirs="$(_fork_all_dirs)"
       while IFS= read -r d; do
@@ -10261,6 +10651,7 @@ cmd_fork() {
         done
       fi
       if [[ "$count" -eq 0 && "$stale" -eq 0 ]]; then
+        [[ "$_partial" -gt 0 ]] && return 0
         info "Nothing to prune. Every fork workspace still has a box."
         return 0
       fi
@@ -10571,16 +10962,19 @@ _write_kits_to_file() {
   local file="$1" worker="$2" scout="$3"
   mkdir -p "$(dirname "$file")"
 
-  local preserved="" in_kits=false line
+  local preserved="" in_kits=false line _h
   if [[ -f "$file" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%$'\r'}"
-      if [[ "$line" == "[kits]" ]]; then
+      # Trimmed header match, same parity fix as _write_caps_to_file.
+      _h="${line#"${line%%[![:space:]]*}"}"
+      _h="${_h%"${_h##*[![:space:]]}"}"
+      if [[ "$_h" == "[kits]" ]]; then
         in_kits=true
         continue
       fi
       if $in_kits; then
-        if [[ "$line" == "["*"]" ]]; then
+        if [[ "$_h" == "["*"]" ]]; then
           in_kits=false
           preserved+="$line"$'\n'
         fi
@@ -10606,7 +11000,11 @@ _write_kits_to_file() {
         echo "scout_model = $scout"
       fi
     fi
-  } > "$file"
+  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
+    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
+    error "Could not write ${file/#${HOME}/~}"
+    return 1
+  }
 }
 
 # Next model in the picker cycle for a role. The cycle is _KIT_MODEL_CHOICES;
@@ -11272,6 +11670,19 @@ parse_global_flags() {
           error "Missing value after --env"
           exit 1
         fi
+        # A bare `--env KEY` is INHERIT, and resolve_env_args reads it with
+        # ${!KEY}. An indirect expansion on anything that is not a shell
+        # identifier is a hard bash error ("MY-VAR: invalid variable name"),
+        # which under strict mode killed the run with a raw trace and no
+        # remedy, AFTER the image had already been pulled or built. Validated
+        # here so it fails on the first line instead. KEY=VALUE is data and is
+        # deliberately not restricted: only the name we are about to expand is.
+        if [[ "$2" != *=* ]] && ! [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          error "Invalid environment variable name: ${BOLD}$2${RESET}"
+          echo -e "    ${DIM}A bare ${BOLD}--env NAME${RESET}${DIM} inherits from your shell, so NAME must be a valid variable name (letters, digits, underscore; not starting with a digit).${RESET}"
+          echo -e "    ${DIM}To pass a literal value instead, use ${BOLD}--env NAME=VALUE${RESET}${DIM}.${RESET}"
+          exit 1
+        fi
         _CLI_ENVS+=("$2")
         shift 2
         ;;
@@ -11328,23 +11739,40 @@ main() {
   # CONFIG error (undersized VM memory or default swap), _maybe_gate_on_docker_config
   # HOLDS the interactive launch on a keypress: the single deliberate block in the
   # startup path, so a misconfigured Docker can't "just blink" past unread.
+  # `cleat fork start|run` IS a session launch: its own help calls it the same
+  # command as `cleat start <box> --fork`, and it creates a box (and for start,
+  # attaches Claude). It was reaching none of the preflights below, so with the
+  # daemon stopped it skipped the autostart every other launch verb gets and
+  # died on a raw Docker error instead. Branching on the SUBCOMMAND, not the
+  # verb, is what keeps the promise in the second half of that comment: the
+  # read-only fork subcommands (bare list, path, prune, refresh) must still
+  # never boot a VM. The preflight args drop the subcommand so the idle sweep
+  # sees the box name and not the literal word "start", which would make it
+  # sweep the very box being launched.
+  local _do_preflight=0
+  local _preflight_args=("$@")
   case "$cmd" in
-    start|resume|r|run|claude|shell|sh)
-      _maybe_prompt_cli_update
-      # Docker autopilot (concept/29): a down daemon is started for the user
-      # (TTY-gated, bounded, remote-refusing) BEFORE the sweep/pressure/
-      # announce preflights, which all no-op against a down daemon. Session
-      # verbs only: stop/status/nuke must never boot a VM.
-      _ensure_daemon
-      _maybe_sweep_idle_boxes "$@"
-      _maybe_check_docker_pressure
-      _maybe_show_release_highlight
-      _maybe_announce_docker_ready
-      # Last: if any advisory above flagged a genuine Docker CONFIG error, hold the
-      # interactive launch on a keypress so it can't scroll by unread (concept/21).
-      _maybe_gate_on_docker_config
-      ;;
+    start|resume|r|run|claude|shell|sh) _do_preflight=1 ;;
+    fork)
+      case "${1:-}" in
+        start|run) _do_preflight=1; _preflight_args=("${@:2}") ;;
+      esac ;;
   esac
+  if [[ "$_do_preflight" -eq 1 ]]; then
+    _maybe_prompt_cli_update
+    # Docker autopilot (concept/29): a down daemon is started for the user
+    # (TTY-gated, bounded, remote-refusing) BEFORE the sweep/pressure/
+    # announce preflights, which all no-op against a down daemon. Session
+    # verbs only: stop/status/nuke must never boot a VM.
+    _ensure_daemon
+    _maybe_sweep_idle_boxes "${_preflight_args[@]+"${_preflight_args[@]}"}"
+    _maybe_check_docker_pressure
+    _maybe_show_release_highlight
+    _maybe_announce_docker_ready
+    # Last: if any advisory above flagged a genuine Docker CONFIG error, hold the
+    # interactive launch on a keypress so it can't scroll by unread (concept/21).
+    _maybe_gate_on_docker_config
+  fi
 
   case "$cmd" in
     start)     _set_box "$@"; cmd_start ;;

@@ -4226,6 +4226,13 @@ s@  _exfile="$(_project_caps_file "$project" "$box")"@  _exfile="$project/.cleat
 SED
 try "fork_excludes_box_aware" "excludes come from its own .cleat" "$CLI" "$FORK_BATS"
 
+# WRITER BOM HYGIENE: the readers strip a BOM, the writers did not, so a BOM'd
+# .cleat still duplicated its section on write and left a "disabled" cap active.
+cat > "$SED_TMP" << 'SED'
+s@      line="${line#$'\\xef\\xbb\\xbf'}"   # UTF-8 BOM, same hygiene as the readers@      :@
+SED
+try "writer_bom_strip" "BOM.d file is replaced, not duplicated" "$CLI" "$CONFIG_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -1489,3 +1489,11 @@ ssh"
   assert_success
   assert_output --partial "from dotfiles"
 }
+
+@test "write_kits: a BOM'd [kits] header is replaced, not duplicated" {
+  printf '\xef\xbb\xbf[kits]\nworker_model = haiku\n' > "$CLEAT_GLOBAL_CONFIG"
+  _write_kits_to_file "$CLEAT_GLOBAL_CONFIG" opus sonnet
+  [ "$(grep -c '\[kits\]' "$CLEAT_GLOBAL_CONFIG")" -eq 1 ]
+  run _read_section_from_file "$CLEAT_GLOBAL_CONFIG" kits worker_model
+  assert_output "opus"
+}

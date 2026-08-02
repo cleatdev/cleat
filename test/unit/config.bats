@@ -1227,3 +1227,26 @@ EOF
   run cat "$TEST_TEMP/ro/.cleat"
   assert_output --partial "make bootstrap"
 }
+
+@test "write_caps: a BOM'd file is replaced, not duplicated, so --disable really disables" {
+  # The 2026-07-31 pass added BOM stripping to the six READERS and missed the
+  # three WRITERS, so the duplicate-section bug survived through the write path:
+  # `cleat config --disable docker` on a BOM'd .cleat printed success, appended
+  # a second [caps] block, and left docker ACTIVE. Same class as the untrimmed
+  # header, reached by the other door.
+  printf '\xef\xbb\xbf[caps]\ndocker\nssh\n' > "$TEST_TEMP/config"
+  _write_caps_to_file "$TEST_TEMP/config" ssh
+  [ "$(grep -c '\[caps\]' "$TEST_TEMP/config")" -eq 1 ] \
+    || { echo "duplicate [caps]:"; cat -v "$TEST_TEMP/config"; return 1; }
+  run _read_caps_from_file "$TEST_TEMP/config"
+  refute_output --partial "docker"
+  assert_output --partial "ssh"
+}
+
+@test "write_resources: a BOM'd [resources] header is replaced, not duplicated" {
+  printf '\xef\xbb\xbf[resources]\nmemory = 2g\n' > "$TEST_TEMP/config"
+  _write_resources_to_file "$TEST_TEMP/config" 8g ""
+  [ "$(grep -c '\[resources\]' "$TEST_TEMP/config")" -eq 1 ]
+  run _read_resource_from_file "$TEST_TEMP/config" memory
+  assert_output "8g"
+}

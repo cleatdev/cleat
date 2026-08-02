@@ -1227,12 +1227,63 @@ _host_connectivity_args() {
   echo "${args[@]+"${args[@]}"}"
 }
 
+# ── Per-box sections ────────────────────────────────────────────────────────
+#
+# A project's .cleat can scope any section to one box:
+#
+#     [caps]                 # the project default, used by every box
+#     git
+#     [box.review.caps]      # box `review` DECLARES its own, replacing the above
+#     git
+#     [box.locked.caps]      # DECLARED and EMPTY: zero caps, a hard lockdown
+#
+# DECLARED replaces, it never merges. That is what keeps least privilege: a box
+# can still ask for FEWER capabilities than the project (concept/20). ABSENT
+# inherits the bare section. Present-but-empty is a real value, not absence,
+# which is the one thing the old per-box FILES could not express.
+#
+# Presence is a PREDICATE, never an exit status threaded through a command
+# substitution. `local out="$(f)"` reports local's status, not f's, so an
+# rc-based declared/absent contract silently reads "declared" every time. Six
+# call sites in this file already use that idiom.
+_cleat_section_present() {
+  local file="$1" want="[$2]" line
+  [[ -r "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#$'\xef\xbb\xbf'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ "$line" == "$want" ]] && return 0
+  done < "$file"
+  return 1
+}
+
+# The section name to read for (box, kind): the box's own when it declares one,
+# else the bare project section. LIST kinds only (caps, setup, fork); resources
+# resolves per KEY instead, see _read_resource_from_file.
+#
+# `main` is deliberately NOT special-cased. [box.main.caps] is honoured, which
+# costs nothing (a file with no box sections resolves byte-identically) and lets
+# a .cleat be written so the RESTRICTIVE section is the one an older Cleat reads.
+_scoped_section() {
+  local file="$1" box="${2:-}" kind="$3"
+  if [[ -n "$box" ]] && _cleat_section_present "$file" "box.${box}.${kind}"; then
+    printf 'box.%s.%s' "$box" "$kind"
+  else
+    printf '%s' "$kind"
+  fi
+}
+
 # ── Capabilities: config file reading ──────────────────────────────────────
 # Read capabilities from a config file. Returns newline-separated cap names.
 # Config format: [caps] section header, then one cap name per line.
+# $2 is the BOX: with one, a declared [box.<box>.caps] replaces [caps] entirely.
+# Callers that mean the global config (which has no boxes) pass nothing.
 _read_caps_from_file() {
-  local file="$1"
+  local file="$1" _box="${2:-}"
   [[ -r "$file" ]] || return 0
+  local _want; _want="[$(_scoped_section "$file" "$_box" caps)]"
   local in_caps=false
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (common in
   # hand-edited .cleat/config files, e.g. `printf '[caps]\nenv'`) is still read;
@@ -1249,7 +1300,7 @@ _read_caps_from_file() {
     [[ -z "$line" || "$line" == \#* ]] && continue
     # Section header
     if [[ "$line" == "["*"]" ]]; then
-      [[ "$line" == "[caps]" ]] && in_caps=true || in_caps=false
+      [[ "$line" == "$_want" ]] && in_caps=true || in_caps=false
       continue
     fi
     if $in_caps; then
@@ -1265,8 +1316,9 @@ _read_caps_from_file() {
 # off (INI hazard: a stray `[ -f x ]` test line reads as a header; docs say
 # use `test`, and _warn_unknown_cleat_sections surfaces the mistake).
 _read_setup_from_file() {
-  local file="$1"
+  local file="$1" _box="${2:-}"
   [[ -r "$file" ]] || return 0
+  local _want; _want="[$(_scoped_section "$file" "$_box" setup)]"
   local in_setup=false
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
@@ -1275,7 +1327,7 @@ _read_setup_from_file() {
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
     if [[ "$line" == "["*"]" ]]; then
-      [[ "$line" == "[setup]" ]] && in_setup=true || in_setup=false
+      [[ "$line" == "$_want" ]] && in_setup=true || in_setup=false
       continue
     fi
     if $in_setup; then
@@ -1289,6 +1341,9 @@ _write_caps_to_file() {
   local file="$1"
   shift
   local caps=("$@")
+  # $_WRITE_SECTION scopes the write to a per-box section. It is a global rather
+  # than a positional because the cap list is variadic. Empty = the bare [caps].
+  local _sec="${_WRITE_SECTION:-caps}"
 
   mkdir -p "$(dirname "$file")"
 
@@ -1314,7 +1369,7 @@ _write_caps_to_file() {
       # trimmed one: other sections keep the user's own formatting.
       _h="${line#"${line%%[![:space:]]*}"}"
       _h="${_h%"${_h##*[![:space:]]}"}"
-      if [[ "$_h" == "[caps]" ]]; then
+      if [[ "$_h" == "[$_sec]" ]]; then
         in_caps=true
         continue
       fi
@@ -1335,17 +1390,78 @@ _write_caps_to_file() {
     if [[ -n "$preserved" ]]; then
       printf '%s' "$preserved"
     fi
+    # A per-box section that has been DECLARED is never removed by emptying it.
+    # Omitting the header would mean "absent", which means INHERIT, so
+    # `cleat config locked --disable <last cap>` would silently escalate a
+    # zero-caps box to the project's full set. Empty is written as a bare header.
     if [[ ${#caps[@]} -gt 0 ]]; then
-      echo "[caps]"
+      echo "[$_sec]"
       for cap in "${caps[@]}"; do
         echo "$cap"
       done
+    elif [[ "$_sec" != "caps" && "${_WRITE_EMPTY_SECTION:-0}" == "1" ]]; then
+      echo "[$_sec]"
     fi
   } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
     rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
     error "Could not write ${file/#${HOME}/~}"
     return 1
   }
+}
+
+# Which section the editor writes for a box, resolved exactly the way the
+# readers resolve it. Without this shared rule `cleat config main` wrote [caps]
+# while _read_caps_from_file read an existing [box.main.caps], so the edit was a
+# silent no-op that also granted the caps project-wide.
+_config_section_for() {
+  local file="$1" box="${2:-}" kind="$3"
+  # No box at all: the bare project/global section.
+  [[ -n "$box" ]] || { printf '%s' "$kind"; return 0; }
+  # Already declared: write where the readers read, whatever the box is called.
+  if _cleat_section_present "$file" "box.${box}.${kind}"; then
+    printf 'box.%s.%s' "$box" "$kind"; return 0
+  fi
+  # Not declared yet. `main` IS the bare section, so it edits [caps]; any other
+  # box gets its own section created rather than editing the project default.
+  if [[ "$box" == "main" ]]; then
+    printf '%s' "$kind"
+  else
+    printf 'box.%s.%s' "$box" "$kind"
+  fi
+}
+
+# Write a cap set for a scope, with the two rules the adversarial review made
+# non-negotiable:
+#
+#   DELETE-ON-EQUAL. If the box's resulting set is exactly what it would inherit,
+#   drop the section so the box goes back to INHERITING. Without this a no-op
+#   edit (even a bare ENTER) silently pins the box to today's project caps
+#   forever, and no verb can undo it.
+#
+#   NEVER VANISH. Otherwise, always emit the header, empty included. An omitted
+#   section means "absent" means "inherit", so writing an empty set by omission
+#   would escalate a locked-down box to the project's full capability set.
+_config_write_caps_scoped() {
+  local file="$1" sec="$2" box="$3"; shift 3
+  local caps=("$@")
+  if [[ -z "$box" ]]; then
+    _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+    return
+  fi
+  local _mine _inherited
+  _mine="$(printf '%s\n' "${caps[@]+"${caps[@]}"}" | _canonical_caps)"
+  _inherited="$(_read_caps_from_file "$file" "" | _canonical_caps)"
+  # ONLY for a per-box section. For the bare [caps] the "inherited" set IS the
+  # set being written, so this fired on every no-op edit of the project config
+  # and deleted [caps] outright: a silent, total capability wipe.
+  # And never on an EMPTY set: a bare [box.B.caps] is an explicit lockdown, and
+  # dropping it would let the box inherit whatever the project gains later.
+  if [[ "$sec" == box.* && -n "$_mine" && "$_mine" == "$_inherited" ]]; then
+    _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=0 _write_caps_to_file "$file"
+    info "Box ${BOLD}${box}${RESET} now inherits the project capabilities."
+    return
+  fi
+  _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
 }
 
 # Write [resources] memory/cpus to a config file, preserving everything OUTSIDE
@@ -1358,6 +1474,7 @@ _write_caps_to_file() {
 # both-unset path (the exact bug the kits writer's comment records).
 _write_resources_to_file() {
   local file="$1" memory="$2" cpus="$3"
+  local _sec="${_WRITE_RES_SECTION:-resources}"
   mkdir -p "$(dirname "$file")"
 
   # Sentinel -> empty (callers translate too; this is belt and suspenders so a
@@ -1380,7 +1497,7 @@ _write_resources_to_file() {
       # silently kept the old value.
       _h="${line#"${line%%[![:space:]]*}"}"
       _h="${_h%"${_h##*[![:space:]]}"}"
-      if [[ "$_h" == "[resources]" ]]; then
+      if [[ "$_h" == "[$_sec]" ]]; then
         in_res=true
         continue
       fi
@@ -1400,7 +1517,7 @@ _write_resources_to_file() {
       printf '%s' "$preserved"
     fi
     if [[ -n "$memory" || -n "$cpus" ]]; then
-      echo "[resources]"
+      echo "[$_sec]"
       if [[ -n "$memory" ]]; then
         echo "memory = $memory"
       fi
@@ -1420,13 +1537,38 @@ _write_resources_to_file() {
 # default/"main" box always uses .cleat. REPLACE semantics: a box file fully
 # replaces .cleat (it does NOT inherit), which is what enables least privilege:
 # a box can declare FEWER caps than the project default.
+# The project config file. Always .cleat now: per-box config moved INTO it as
+# [box.<name>.<kind>] sections, so there is one file per project instead of one
+# per box (a week of forks used to leave nine committed dotfiles in the repo
+# root, and the ephemeral ones outlived their boxes).
+#
+# The old $project/.cleat.<box> files are NO LONGER READ. That is a deliberate
+# clean break, and it is announced rather than silent: a leftover file would
+# otherwise change a box's capabilities in either direction with nothing on
+# screen. Dropping the fallback also retires a shipped footgun for free, because
+# `.cleat.env` is the project ENV file and used to double as box `env`'s cap
+# file: `cleat config env --memory 4g` appended [resources] next to API_TOKEN=.
 _project_caps_file() {
+  local project="$1"
+  echo "$project/.cleat"
+}
+
+# Announce a leftover per-box file exactly once per run, per file.
+_WARNED_LEGACY_BOX_FILES=""
+_warn_legacy_box_file() {
+  # Separate lines on purpose: bash expands the whole `local` list against the
+  # PREVIOUS scope, so `local a="$1" b="$a/x"` builds b from an unset a.
   local project="$1" box="${2:-main}"
-  if [[ "$box" != "main" && -f "$project/.cleat.$box" ]]; then
-    echo "$project/.cleat.$box"
-  else
-    echo "$project/.cleat"
-  fi
+  # `env` is the project ENV sidecar (.cleat.env), never a per-box caps file.
+  # Warning on it told the user to move their secrets into the committed .cleat.
+  [[ "$box" != "env" ]] || return 0
+  local f="$project/.cleat.$box"
+  [[ -n "$box" && "$box" != "main" ]] || return 0
+  [[ -f "$f" ]] || return 0
+  case "$_WARNED_LEGACY_BOX_FILES" in *"|$f|"*) return 0 ;; esac
+  _WARNED_LEGACY_BOX_FILES="${_WARNED_LEGACY_BOX_FILES}|$f|"
+  warn "${BOLD}.cleat.${box}${RESET} is no longer read ${DIM}(per-box config moved into .cleat)${RESET}"
+  echo -e "    ${DIM}Move its sections into ${BOLD}.cleat${RESET}${DIM} as ${BOLD}[box.${box}.caps]${RESET}${DIM}, ${BOLD}[box.${box}.resources]${RESET}${DIM}, ${BOLD}[box.${box}.setup]${RESET}${DIM}. This box is using the project defaults until you do.${RESET}"
 }
 
 # Build the executable [setup] payload for (project, box): stdout is the
@@ -1441,7 +1583,7 @@ _project_caps_file() {
 _build_setup_payload() {
   local project="$1" box="${2:-main}"
   local caps_file
-  caps_file="$(_project_caps_file "$project" "$box")"
+  caps_file="$(_project_caps_file "$project")"
   [[ -f "$caps_file" ]] || return 0
 
   local line
@@ -1512,7 +1654,7 @@ _build_setup_payload() {
         printf '%s\n' "$line"
         ;;
     esac
-  done < <(_read_setup_from_file "$caps_file")
+  done < <(_read_setup_from_file "$caps_file" "$box")
 }
 
 # Same fallback shape for the env file: .cleat.<box>.env else .cleat.env, so
@@ -1562,8 +1704,17 @@ _read_section_from_file() {
 }
 
 # Back-compat wrapper: every existing [resources] call site keeps its shape.
+# Resources resolve per KEY, not per section: declaring [box.B.resources] with
+# only `memory` must not silently un-declare `cpus`. caps/setup/fork are LIST
+# sections and replace wholesale; this one is key/value and each key falls back
+# on its own. $3 is the box.
 _read_resource_from_file() {
-  _read_section_from_file "$1" resources "$2"
+  local _file="$1" _key="$2" _box="${3:-}" _v
+  if [[ -n "$_box" ]]; then
+    _v="$(_read_section_from_file "$_file" "box.${_box}.resources" "$_key")"
+    [[ -n "$_v" ]] && { printf '%s\n' "$_v"; return 0; }
+  fi
+  _read_section_from_file "$_file" resources "$_key"
 }
 
 # A docker memory value: positive integer with optional b/k/m/g suffix.
@@ -1795,7 +1946,7 @@ resolve_box_memory() {
   local project="$1" box="${2:-main}"
   local v
 
-  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" memory)"
+  v="$(_read_resource_from_file "$(_project_caps_file "$project")" memory "$box")"
   if [[ -n "$v" ]]; then
     if _valid_memory_value "$v"; then
       if (( $(_mem_to_bytes "$v") > 8589934592 )); then
@@ -1847,7 +1998,7 @@ resolve_box_cpus() {
   local project="$1" box="${2:-main}"
   local v ncpu
 
-  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" cpus)"
+  v="$(_read_resource_from_file "$(_project_caps_file "$project")" cpus "$box")"
   if [[ -n "$v" ]]; then
     if _valid_cpus_value "$v"; then
       ncpu="$(_daemon_ncpu)"
@@ -1888,7 +2039,7 @@ resolve_box_cpus() {
 # ignored so a typo can't change the fingerprint either.
 _configured_box_memory() {
   local project="$1" box="${2:-main}" v
-  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" memory)"
+  v="$(_read_resource_from_file "$(_project_caps_file "$project")" memory "$box")"
   if [[ -n "$v" ]] && _valid_memory_value "$v"; then
     # Mirror resolve_box_memory's project clamp so the fingerprint matches the
     # ceiling the container would actually get (deterministic, not VM-dependent).
@@ -1905,7 +2056,7 @@ _configured_box_memory() {
 
 _configured_box_cpus() {
   local project="$1" box="${2:-main}" v
-  v="$(_read_resource_from_file "$(_project_caps_file "$project" "$box")" cpus)"
+  v="$(_read_resource_from_file "$(_project_caps_file "$project")" cpus "$box")"
   if [[ -n "$v" ]] && _valid_cpus_value "$v"; then
     echo "$v"
     return 0
@@ -2952,7 +3103,7 @@ _fork_copy_tree_locked() {
 # resolver every other per-box setting goes through.
 _fork_prune_excludes() {
   local dst="$1" project="$2" box="${3:-main}" e _root _parent _target _exfile
-  _exfile="$(_project_caps_file "$project" "$box")"
+  _exfile="$(_project_caps_file "$project")"
   _root="$(cd -P "$dst" 2>/dev/null && pwd -P)" || return 0
   while IFS= read -r e; do
     [[ -n "$e" ]] || continue
@@ -2984,7 +3135,7 @@ _fork_prune_excludes() {
     # copy that already succeeded.
     rm -rf "$_parent/$(basename "$_target")" 2>/dev/null \
       || warn "Could not prune [fork] exclude: $e"
-  done < <(_read_section_all_from_file "$_exfile" fork exclude)
+  done < <(_read_section_all_from_file "$_exfile" "$(_scoped_section "$_exfile" "$box" fork)" exclude)
 }
 
 # ── Workspace trust ─────────────────────────────────────────────────────────
@@ -3011,10 +3162,10 @@ _canonical_caps() {
 # "  -" (the filename of stdin). Strip that so the stored trust hash is
 # purely hex, otherwise we write malformed tab-separated lines.
 _hash_cleat_caps() {
-  local path="$1"
+  local path="$1" box="${2?_hash_cleat_caps needs a box}"
   [[ -f "$path" ]] || return 0
   local caps
-  caps="$(_read_caps_from_file "$path" | _canonical_caps)"
+  caps="$(_read_caps_from_file "$path" "$box" | _canonical_caps)"
   [[ -z "$caps" ]] && return 0
   echo -n "$caps" | _md5 | awk '{print $1}'
 }
@@ -3154,10 +3305,10 @@ _is_project_trusted() {
   local project="$1"
   local box="${_BOX:-main}"
   local caps_file stored current
-  caps_file="$(_project_caps_file "$project" "$box")"
+  caps_file="$(_project_caps_file "$project")"
   stored="$(_trust_lookup "$project" "$box")"
   [[ -z "$stored" ]] && return 1
-  current="$(_hash_cleat_caps "$caps_file")"
+  current="$(_hash_cleat_caps "$caps_file" "$box")"
   [[ -z "$current" ]] && return 1
   [[ "$stored" == "$current" ]]
 }
@@ -3286,7 +3437,7 @@ _resolve_project_trust() {
   local mode="${2:-prompt}"
   local box="${_BOX:-main}"
   local caps_file
-  caps_file="$(_project_caps_file "$project" "$box")"
+  caps_file="$(_project_caps_file "$project")"
 
   # Cached decision for this session/project/box
   if [[ -n "$_TRUST_SESSION_DECISION" && "$_TRUST_SESSION_PROJECT" == "$project" && "$_TRUST_SESSION_BOX" == "$box" ]]; then
@@ -3304,7 +3455,7 @@ _resolve_project_trust() {
   # Explicit non-interactive opt-in
   if [[ "${CLEAT_TRUST_PROJECT:-}" == "1" || "${_CLI_TRUST_PROJECT:-0}" == "1" ]]; then
     local hash
-    hash="$(_hash_cleat_caps "$caps_file")"
+    hash="$(_hash_cleat_caps "$caps_file" "$box")"
     # Preserve any existing [setup] trust (col4): approving caps never
     # creates setup trust, and passing through an empty lookup is exactly
     # that (a no-op 4th arg keeps the row 3-column, see _trust_record).
@@ -3322,7 +3473,7 @@ _resolve_project_trust() {
   if _is_tty; then
     local -a req_caps=()
     local c
-    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$caps_file")
+    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$caps_file" "$box")
     # Hash BEFORE the prompt, from the same read that produced the caps we are
     # about to display. It used to be computed after the answer came back, so a
     # .cleat rewritten while the user was reading the prompt got recorded as
@@ -3332,7 +3483,7 @@ _resolve_project_trust() {
     # which is exactly the window that matters, and the writer can be the
     # sandboxed agent itself.
     local hash
-    hash="$(_hash_cleat_caps "$caps_file")"
+    hash="$(_hash_cleat_caps "$caps_file" "$box")"
     if _trust_prompt "$project" "${req_caps[@]}"; then
       # Preserve any existing [setup] trust (col4): see the opt-in branch
       # above, same reasoning.
@@ -3378,7 +3529,7 @@ _resolve_setup_trust() {
   [[ -n "$project" ]] || return 0
 
   local caps_file
-  caps_file="$(_project_caps_file "$project" "$box")"
+  caps_file="$(_project_caps_file "$project")"
   [[ -f "$caps_file" ]] || return 0
 
   local payload
@@ -3439,7 +3590,7 @@ _resolve_setup_trust() {
   # Interactive prompt
   if _is_tty; then
     local entry_count
-    entry_count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+    entry_count="$(_read_setup_from_file "$caps_file" "$box" | wc -l | tr -d ' ')"
     if _setup_trust_prompt "$project" "$payload" "$entry_count"; then
       _trust_record "$project" "$(_trust_lookup "$project" "$box")" "$box" "$hash" || true
       _SETUP_SESSION_DECISION="approved:$hash"
@@ -3485,7 +3636,7 @@ _warn_unknown_cleat_sections() {
   esac
   _WARNED_SECTIONS_FILES="${_WARNED_SECTIONS_FILES}|$file|"
 
-  local base seen=""
+  local base seen="" _bn _bk
   base="$(basename "$file")"
   local line name
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -3500,6 +3651,17 @@ _warn_unknown_cleat_sections() {
     seen="${seen:+$seen|}$name"
     case "$scope" in
       project)
+        # Per-box sections. The name AND the kind are both validated, so
+        # [box.feta-a.caps] (a typo'd box) and [box.review.capss] still warn:
+        # a silently accepted typo is a box running the wrong configuration.
+        case "$name" in
+          box.*.*)
+            _bn="${name#box.}"; _bk="${_bn##*.}"; _bn="${_bn%.*}"
+            case "$_bk" in
+              caps|resources|setup|fork)
+                if _validate_box_name "$_bn"; then continue; fi ;;
+            esac ;;
+        esac
         case "$name" in
           caps|resources|setup|fork) continue ;;
           kits)
@@ -3508,6 +3670,11 @@ _warn_unknown_cleat_sections() {
         esac ;;
       global)
         case "$name" in
+          # Box names are per PROJECT, so a global [box.feat-a.*] would apply to
+          # every project that happens to have a box called feat-a.
+          box.*)
+            warn "Section [$(_sanitize_repo_str "$name")] in the global config is ignored ${DIM}(per-box sections are project-only, in .cleat)${RESET}"
+            continue ;;
           caps|resources|kits|fork) continue ;;
           setup)
             warn "Section [setup] in the global config is ignored ${DIM}([setup] is project-only, in .cleat)${RESET}"
@@ -3527,6 +3694,13 @@ resolve_caps() {
   local box="${_BOX:-main}"
   ACTIVE_CAPS=()
 
+  # Every path that resolves capabilities passes through here, so this is where
+  # a leftover per-box file gets announced. Warning only from cmd_config meant
+  # `cleat start <box>` ran the box with the project defaults while a
+  # .cleat.<box> sat there declaring something else, in either direction, with
+  # nothing on screen.
+  [[ -n "$project" ]] && _warn_legacy_box_file "$project" "$box"
+
   # 1. Global config
   local global_caps
   global_caps="$(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")"
@@ -3541,11 +3715,11 @@ resolve_caps() {
   local project_caps=""
   if [[ -n "$project" ]]; then
     local caps_file
-    caps_file="$(_project_caps_file "$project" "$box")"
+    caps_file="$(_project_caps_file "$project")"
     [[ -f "$caps_file" ]] && _warn_unknown_cleat_sections "$caps_file" project || true
     if [[ -f "$caps_file" ]]; then
       local _raw_project_caps
-      _raw_project_caps="$(_read_caps_from_file "$caps_file")"
+      _raw_project_caps="$(_read_caps_from_file "$caps_file" "$box")"
       if [[ -n "$_raw_project_caps" ]]; then
         if _resolve_project_trust "$project" "$trust_mode"; then
           project_caps="$_raw_project_caps"
@@ -5526,8 +5700,8 @@ _maybe_run_setup() {
   _SETUP_ATTEMPTED="${_SETUP_ATTEMPTED}|$cname|"
 
   local caps_file count
-  caps_file="$(_project_caps_file "$project" "$box")"
-  count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+  caps_file="$(_project_caps_file "$project")"
+  count="$(_read_setup_from_file "$caps_file" "$box" | wc -l | tr -d ' ')"
   info "Running project setup ${DIM}(${count} command(s), [setup] in $(basename "$caps_file"))${RESET}"
 
   # Stage the payload into a file in the box, then run that file rather than
@@ -9428,8 +9602,16 @@ _config_picker_draw() {
 # Printed as "<display>\t<custom>" for the caller to split. `|| true` because a
 # strict-mode caller assigns this bare and a file read must never abort the editor.
 _config_load_resource() {
-  local file="$1" key="$2" unset_label="$3" ring="${4:-}"
-  local v; v="$(_read_resource_from_file "$file" "$key" || true)"
+  local file="$1" key="$2" unset_label="$3" ring="${4:-}" _lbox="${5:-}"
+  # $5 is the BOX. Its OWN declared value, never the inherited one: the picker
+  # writes back whatever it loaded, so loading the project's number would either
+  # freeze it into the box's section or silently clear the box's own ceiling.
+  local v
+  if [[ -n "$_lbox" ]]; then
+    v="$(_read_section_from_file "$file" "box.${_lbox}.resources" "$key" || true)"
+  else
+    v="$(_read_resource_from_file "$file" "$key" || true)"
+  fi
   local choices
   # $4 is the live ring when the caller built one from this machine. Without it
   # we fall back to the static ring, which keeps every direct 3-arg caller (and
@@ -9453,6 +9635,14 @@ _config_load_resource() {
 # the scope label and any write target can never diverge.
 _config_editor_save() {
   local config_file="$1" scope="$2" project="$3" toggled="$4" mem="$5" cpus="$6" show_gen="$7" gen_on="$8" vm_gb="${9:-}"
+  # $10 is the BOX. Without it the interactive picker wrote a box's edit into
+  # the project-wide [caps]/[resources], granting it to EVERY box, while the
+  # same edit through --enable/--disable correctly scoped. Two review passes
+  # caught it independently.
+  local _ebox="${10:-}"
+  local _esec_caps _esec_res
+  _esec_caps="$(_config_section_for "$config_file" "$_ebox" caps)"
+  _esec_res="$(_config_section_for "$config_file" "$_ebox" resources)"
 
   local final_caps=() cap
   for cap in "${KNOWN_CAPS[@]}"; do
@@ -9462,9 +9652,13 @@ _config_editor_save() {
   case "$mem_w" in default|all) mem_w="" ;; esac
   case "$cpu_w" in default|all) cpu_w="" ;; esac
 
-  _write_caps_to_file "$config_file" "${final_caps[@]+"${final_caps[@]}"}"
-  _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"
-  success "Saved to ${config_file}"
+  _config_write_caps_scoped "$config_file" "$_esec_caps" "$_ebox" "${final_caps[@]+"${final_caps[@]}"}"
+  _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"
+  if [[ -n "$_ebox" ]]; then
+    success "Saved to ${config_file} ${DIM}(box ${_ebox})${RESET}"
+  else
+    success "Saved to ${config_file}"
+  fi
   # The two-line picker note is a nudge. This is the full reason, printed once,
   # only when the ceiling reaches the whole VM.
   _config_mem_warn_block "$mem_w" "$vm_gb"
@@ -9521,12 +9715,12 @@ _config_picker_tui() {
   local toggled="" cap
   while IFS= read -r cap; do
     [[ -n "$cap" ]] && toggled="${toggled:+${toggled},}${cap}"
-  done < <(_read_caps_from_file "$config_file")
+  done < <(_read_caps_from_file "$config_file" "$_box_scope")
 
   local mem mem_custom cpus cpu_custom _pair
-  _pair="$(_config_load_resource "$config_file" memory default "$mem_ring")"
+  _pair="$(_config_load_resource "$config_file" memory default "$mem_ring" "$_box_scope")"
   mem="${_pair%%$'\t'*}"; mem_custom="${_pair#*$'\t'}"
-  _pair="$(_config_load_resource "$config_file" cpus all "$cpu_ring")"
+  _pair="$(_config_load_resource "$config_file" cpus all "$cpu_ring" "$_box_scope")"
   cpus="${_pair%%$'\t'*}"; cpu_custom="${_pair#*$'\t'}"
 
   local show_gen=0 gen_on=0
@@ -9597,7 +9791,7 @@ _config_picker_tui() {
         printf '\033[%dB' "$((draw_lines + 2))"
         printf '\033[2K'
         echo ""
-        _config_editor_save "$config_file" "$scope" "$project" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
+        _config_editor_save "$config_file" "$scope" "$project" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb" "$_box_scope"
         return ;;
       QUIT|ESC)
         _cursor_show
@@ -9745,10 +9939,10 @@ _config_picker_text() {
   local _active="" cap
   while IFS= read -r cap; do
     [[ -n "$cap" ]] && _active="${_active:+${_active},}${cap}"
-  done < <(_read_caps_from_file "$config_file")
+  done < <(_read_caps_from_file "$config_file" "$_box_scope")
 
   local mem cpus _pair vm_gb
-  _pair="$(_config_load_resource "$config_file" memory default)"; mem="${_pair%%$'\t'*}"
+  _pair="$(_config_load_resource "$config_file" memory default "" "$_box_scope")"; mem="${_pair%%$'\t'*}"
   _pair="$(_config_load_resource "$config_file" cpus all)"; cpus="${_pair%%$'\t'*}"
   # Text mode types a value instead of cycling a ring, so it can name any size
   # at all. It therefore needs the VM size just as much as the TUI does, or a
@@ -9786,7 +9980,7 @@ _config_picker_text() {
 
     case "$input" in
       done)
-        _config_editor_save "$config_file" "$scope" "$project" "$_active" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb"
+        _config_editor_save "$config_file" "$scope" "$project" "$_active" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb" "$_box_scope"
         return
         ;;
       q|quit)
@@ -9912,12 +10106,22 @@ cmd_config() {
   local project; project="$(pwd)"
   local config_file
   if [[ -n "$box" && "$box" != "main" ]]; then
-    config_file="${project}/.cleat.$box"
+    # One file per project. A named box edits its own SECTIONS inside .cleat
+    # rather than getting a whole separate file, which is what retired the
+    # strip-the-box footgun: writing [box.B.resources] cannot remove [caps] or
+    # [setup], because there is no whole-file replacement to trigger.
+    config_file="${project}/.cleat"
+    _warn_legacy_box_file "$project" "$box"
   elif [[ "$scope" == "project" ]]; then
     config_file="${project}/.cleat"
   else
     config_file="$CLEAT_GLOBAL_CONFIG"
   fi
+  # The sections this invocation writes. Empty box = the bare [caps]/[resources].
+  local _sec_caps _sec_res _box_scope=""
+  [[ -n "$box" ]] && _box_scope="$box"
+  _sec_caps="$(_config_section_for "$config_file" "$_box_scope" caps)"
+  _sec_res="$(_config_section_for "$config_file" "$_box_scope" resources)"
 
   # ── Direct mode: --list
   if [[ "$action" == "list" ]]; then
@@ -9932,11 +10136,11 @@ cmd_config() {
     done < <(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG")
     # Also read project caps if available (box-aware: .cleat.<box> else .cleat)
     local _proj_caps_file
-    _proj_caps_file="$(_project_caps_file "$project" "${box:-main}")"
+    _proj_caps_file="$(_project_caps_file "$project")"
     if [[ -f "$_proj_caps_file" ]]; then
       while IFS= read -r cap; do
         [[ -n "$cap" ]] && case ",${_active_list}," in *,"$cap",*) ;; *) _active_list="${_active_list:+${_active_list},}${cap}" ;; esac
-      done < <(_read_caps_from_file "$_proj_caps_file")
+      done < <(_read_caps_from_file "$_proj_caps_file" "${box:-main}")
     fi
 
     for cap in "${KNOWN_CAPS[@]}"; do
@@ -9948,8 +10152,8 @@ cmd_config() {
     # Resources declared in THIS scope's file (empty reads as the effective default).
     # `|| true` keeps a strict-mode caller safe on a bare command-substitution assign.
     local _lm _lc
-    _lm="$(_read_resource_from_file "$config_file" memory || true)"
-    _lc="$(_read_resource_from_file "$config_file" cpus || true)"
+    _lm="$(_read_resource_from_file "$config_file" memory "$_box_scope" || true)"
+    _lc="$(_read_resource_from_file "$config_file" cpus "$_box_scope" || true)"
     echo -e "  ${BOLD}Resources${RESET}"
     if [[ -n "$_lm" ]]; then echo -e "    memory  ${_lm}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
     if [[ -n "$_lc" ]]; then echo -e "    cpus    ${_lc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
@@ -9978,11 +10182,14 @@ cmd_config() {
       fi
     fi
     # Preserve the OTHER key: read both, replace the one being set, write both.
+    # Read the box's OWN declared values, never the inherited ones: pulling the
+    # project's memory into the box's section on a --cpus edit would silently
+    # freeze that box against future project changes.
     local cur_mem cur_cpus
-    cur_mem="$(_read_resource_from_file "$config_file" memory || true)"
-    cur_cpus="$(_read_resource_from_file "$config_file" cpus || true)"
+    cur_mem="$(_read_section_from_file "$config_file" "$_sec_res" memory || true)"
+    cur_cpus="$(_read_section_from_file "$config_file" "$_sec_res" cpus || true)"
     if [[ "$res_key" == "memory" ]]; then cur_mem="$write_val"; else cur_cpus="$write_val"; fi
-    _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus"
+    _WRITE_RES_SECTION="$_sec_res" _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus"
     if [[ -n "$write_val" ]]; then
       success "${res_key} set to ${write_val} ${DIM}(${config_file})${RESET}"
     else
@@ -10032,7 +10239,7 @@ cmd_config() {
     local current_caps=()
     while IFS= read -r cap; do
       [[ -n "$cap" ]] && current_caps+=("$cap")
-    done < <(_read_caps_from_file "$config_file")
+    done < <(_read_caps_from_file "$config_file" "$_box_scope")
 
     if [[ "$action" == "enable" ]]; then
       # Check if already enabled
@@ -10043,7 +10250,7 @@ cmd_config() {
       if ! $already; then
         current_caps+=("$cap_name")
       fi
-      _write_caps_to_file "$config_file" "${current_caps[@]}"
+      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${current_caps[@]}"
       success "${cap_name} enabled"
       echo -e "    ${DIM}$(_cap_description "$cap_name")${RESET}"
 
@@ -10057,7 +10264,7 @@ cmd_config() {
       for cap in "${current_caps[@]+"${current_caps[@]}"}"; do
         [[ "$cap" != "$cap_name" ]] && new_caps+=("$cap")
       done
-      _write_caps_to_file "$config_file" "${new_caps[@]+"${new_caps[@]}"}"
+      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${new_caps[@]+"${new_caps[@]}"}"
       success "${cap_name} disabled"
     fi
     return
@@ -10177,9 +10384,9 @@ cmd_trust() {
       local marker="${GREEN}●${RESET}"
       # Indicate if the box's cap file has changed since approval
       local _cf _stored _cur
-      _cf="$(_project_caps_file "$p" "$b")"
+      _cf="$(_project_caps_file "$p")"
       _stored="$(_trust_lookup "$p" "$b")"
-      _cur="$(_hash_cleat_caps "$_cf")"
+      _cur="$(_hash_cleat_caps "$_cf" "$b")"
       if [[ -f "$_cf" && -n "$_cur" && "$_stored" != "$_cur" ]]; then
         marker="${YELLOW}●${RESET}"
       fi
@@ -10204,7 +10411,7 @@ cmd_trust() {
   # same file resolve_caps would prompt for at `cleat run <box>`, so trusting
   # here records the byte-identical trust row (see _project_caps_file).
   local caps_file caps_base
-  caps_file="$(_project_caps_file "$project" "$box")"
+  caps_file="$(_project_caps_file "$project")"
   caps_base="$(basename "$caps_file")"
   if [[ ! -f "$caps_file" ]]; then
     error "No ${caps_base} file found in ${BOLD}${project}${RESET}"
@@ -10212,7 +10419,7 @@ cmd_trust() {
     exit 1
   fi
   local hash
-  hash="$(_hash_cleat_caps "$caps_file")"
+  hash="$(_hash_cleat_caps "$caps_file" "$box")"
   # An explicit `cleat trust` approves the whole file the user is looking
   # at: caps and [setup] both, separate consent classes (concept/16). A
   # caps-less file with a [setup] section is still approvable: setup trust
@@ -10231,7 +10438,7 @@ cmd_trust() {
   local setup_hash="" setup_count=""
   if [[ -n "$setup_payload" ]]; then
     setup_hash="$(_setup_payload_hash "$setup_payload")"
-    setup_count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+    setup_count="$(_read_setup_from_file "$caps_file" "$box" | wc -l | tr -d ' ')"
     _trust_record "$project" "$hash" "$box" "$setup_hash" || exit 1
   elif ! _trust_record "$project" "$hash" "$box"; then
     exit 1
@@ -10243,7 +10450,7 @@ cmd_trust() {
   fi
   if [[ -n "$hash" ]]; then
     local caps
-    caps="$(_read_caps_from_file "$caps_file" | _canonical_caps)"
+    caps="$(_read_caps_from_file "$caps_file" "$box" | _canonical_caps)"
     echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$caps")${RESET}"
   fi
   if [[ -n "$setup_payload" ]]; then
@@ -11404,7 +11611,7 @@ cmd_setup() {
   project="$(resolve_project "")"
   cname="$(container_name_for "$project" "$box")"
   _RESOLVED_PROJECT="$project"
-  caps_file="$(_project_caps_file "$project" "$box")"
+  caps_file="$(_project_caps_file "$project")"
 
   if [[ $show -eq 1 ]]; then
     # A pure inspection command: never prompts, never records trust.
@@ -11419,7 +11626,7 @@ cmd_setup() {
     # verb doesn't claim "no section" over a broken one. --show resolves in
     # readonly mode, which silences the builder, so rebuild loudly here to
     # surface the specific directive error the user needs.
-    if [[ -n "$(_read_setup_from_file "$caps_file")" ]]; then
+    if [[ -n "$(_read_setup_from_file "$caps_file" "$box")" ]]; then
       _build_setup_payload "$project" "$box" >/dev/null || true
       error "Project [setup] is invalid"
       exit 1
@@ -11452,7 +11659,7 @@ cmd_setup() {
     else
       marker_state="unknown (box not running)"
     fi
-    count="$(_read_setup_from_file "$caps_file" | wc -l | tr -d ' ')"
+    count="$(_read_setup_from_file "$caps_file" "$box" | wc -l | tr -d ' ')"
 
     echo ""
     echo -e "  ${BOLD}Source:${RESET}   ${caps_file}"

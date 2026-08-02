@@ -1481,14 +1481,13 @@ SHIM
   refute_output --partial "my-important-notes"
 }
 
-@test "fork: a named box's [fork] excludes come from its own .cleat.<box>" {
+@test "fork: a named box's [fork] excludes come from its own section" {
   # The excludes were read from $project/.cleat unconditionally, so a named box
   # using .cleat.<box> had its caps honoured from that file and its excludes
   # read from a different one.
   mkdir -p "$TEST_TEMP/project/node_modules/pkg"
   echo dep > "$TEST_TEMP/project/node_modules/pkg/i.js"
-  printf '[fork]\nexclude = node_modules\n' > "$TEST_TEMP/project/.cleat.feat"
-  printf '[caps]\ngit\n' > "$TEST_TEMP/project/.cleat"
+  printf '[caps]\ngit\n[box.feat.fork]\nexclude = node_modules\n' > "$TEST_TEMP/project/.cleat"
   local dst="$CLEAT_FORKS_DIR/boxcopy"
   _fork_copy_tree "$TEST_TEMP/project" "$dst"
   _fork_prune_excludes "$dst" "$TEST_TEMP/project" feat

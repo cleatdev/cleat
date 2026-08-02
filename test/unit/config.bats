@@ -805,12 +805,22 @@ EOF
   assert_output --partial "memory = 8g"
 }
 
-@test "config <box> --memory: writes to the box file" {
+@test "config <box> --memory: writes the box's section into .cleat, not a new file" {
+  # THE footgun this feature retires: the old path created a .cleat.dev holding
+  # only [resources], which then REPLACED .cleat and silently stripped that
+  # box's caps and [setup]. A section cannot strip anything.
   cd "$TEST_TEMP"
+  printf '[caps]\ngit\nssh\n[setup]\nmake bootstrap\n' > "$TEST_TEMP/.cleat"
   run cmd_config dev --memory 4g
   assert_success
-  run _read_resource_from_file "$TEST_TEMP/.cleat.dev" memory
+  [ ! -e "$TEST_TEMP/.cleat.dev" ] || { echo "a per-box file was created"; return 1; }
+  run _read_resource_from_file "$TEST_TEMP/.cleat" memory dev
   assert_output "4g"
+  # and the box kept everything it inherits
+  run _read_caps_from_file "$TEST_TEMP/.cleat" dev
+  assert_output --partial "git"
+  run _read_setup_from_file "$TEST_TEMP/.cleat" dev
+  assert_output --partial "make bootstrap"
 }
 
 # ── cmd_config --list: resources ───────────────────────────────────────────

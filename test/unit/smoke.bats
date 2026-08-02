@@ -366,7 +366,7 @@ cleat_bin_timeout() {
 @test "smoke: cleat trust <box> records a per-box trust row" {
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
-  printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat.web"
+  printf '[box.web.caps]\ndocker\n'   >> "$TEST_TEMP/proj/.cleat"
   cd "$TEST_TEMP/proj"
   run cleat_bin trust web
   assert_success
@@ -379,7 +379,7 @@ cleat_bin_timeout() {
 @test "smoke: cleat untrust <box> removes only that box, main survives" {
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
-  printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat.web"
+  printf '[box.web.caps]\ndocker\n'   >> "$TEST_TEMP/proj/.cleat"
   cd "$TEST_TEMP/proj"
   cleat_bin trust >/dev/null
   cleat_bin trust web >/dev/null

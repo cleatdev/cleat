@@ -1454,10 +1454,10 @@ EOF
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\nssh\n' > "$TEST_TEMP/proj/.cleat"
   local h1 h2
-  h1="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  h1="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat" "")"
   # Rewrite the file with comments and reordered caps. Same cap set.
   printf '# this is a comment\n[caps]\nssh\n# another comment\ngit\n' > "$TEST_TEMP/proj/.cleat"
-  h2="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  h2="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat" "")"
   [[ -n "$h1" && "$h1" == "$h2" ]] || {
     echo "REGRESSION: comment/order-only .cleat changes altered the trust hash"
     echo "h1=$h1 h2=$h2"
@@ -1482,7 +1482,7 @@ EOF
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\nssh\n' > "$TEST_TEMP/proj/.cleat"
   local h
-  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat" "")"
   [[ "$h" =~ ^[0-9a-f]+$ ]] || {
     echo "REGRESSION: trust hash contains non-hex chars: '$h'"
     return 1

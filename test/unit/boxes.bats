@@ -122,7 +122,7 @@ teardown() { _common_teardown; }
   # the project default (.cleat) grants it.
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\ndocker\n' > "$TEST_TEMP/project/.cleat"
-  printf '[caps]\ngit\n'         > "$TEST_TEMP/project/.cleat.dev"
+  printf '[box.dev.caps]\ngit\n'   >> "$TEST_TEMP/project/.cleat"
   _BOX="dev"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active git;    assert_success
@@ -132,7 +132,7 @@ teardown() { _common_teardown; }
 @test "box caps: a box file can REPLACE with MORE caps than .cleat" {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\n'         > "$TEST_TEMP/project/.cleat"
-  printf '[caps]\ngit\ndocker\n' > "$TEST_TEMP/project/.cleat.az"
+  printf '[box.az.caps]\ngit\ndocker\n'   >> "$TEST_TEMP/project/.cleat"
   _BOX="az"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active git;    assert_success
@@ -151,7 +151,7 @@ teardown() { _common_teardown; }
 @test "box caps: the main box always reads .cleat, ignoring any .cleat.<box>" {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\n'    > "$TEST_TEMP/project/.cleat"
-  printf '[caps]\ndocker\n' > "$TEST_TEMP/project/.cleat.az"
+  printf '[box.az.caps]\ndocker\n'   >> "$TEST_TEMP/project/.cleat"
   _BOX="main"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active git;    assert_success
@@ -162,7 +162,7 @@ teardown() { _common_teardown; }
   mkdir -p "$TEST_TEMP/project"
   CLEAT_GLOBAL_CONFIG="$TEST_TEMP/global-config"
   printf '[caps]\ngh\n'  > "$CLEAT_GLOBAL_CONFIG"
-  printf '[caps]\ngit\n' > "$TEST_TEMP/project/.cleat.dev"
+  printf '[box.dev.caps]\ngit\n'   >> "$TEST_TEMP/project/.cleat"
   _BOX="dev"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active git; assert_success   # from .cleat.dev
@@ -173,7 +173,7 @@ teardown() { _common_teardown; }
 
 @test "box env: .cleat.<box>.env is used and .cleat.env is NOT leaked to it" {
   mkdir -p "$TEST_TEMP/project"
-  printf '[caps]\nenv\n'    > "$TEST_TEMP/project/.cleat.az"
+  printf '[box.az.caps]\nenv\n'   >> "$TEST_TEMP/project/.cleat"
   printf 'AZ_TOKEN=secret\n' > "$TEST_TEMP/project/.cleat.az.env"
   printf 'DEV_ONLY=1\n'      > "$TEST_TEMP/project/.cleat.env"
   _BOX="az"
@@ -186,7 +186,7 @@ teardown() { _common_teardown; }
 
 @test "box env: falls back to .cleat.env when no .cleat.<box>.env exists" {
   mkdir -p "$TEST_TEMP/project"
-  printf '[caps]\nenv\n' > "$TEST_TEMP/project/.cleat.az"
+  printf '[box.az.caps]\nenv\n'   >> "$TEST_TEMP/project/.cleat"
   printf 'SHARED=yes\n'  > "$TEST_TEMP/project/.cleat.env"
   _BOX="az"
   resolve_caps "$TEST_TEMP/project"
@@ -200,18 +200,18 @@ teardown() { _common_teardown; }
 @test "box trust: .cleat.<box> and .cleat hash to different trust values" {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\n'    > "$TEST_TEMP/project/.cleat"
-  printf '[caps]\ndocker\n' > "$TEST_TEMP/project/.cleat.az"
+  printf '[box.az.caps]\ndocker\n'   >> "$TEST_TEMP/project/.cleat"
   local main_hash az_hash
-  main_hash="$(_hash_cleat_caps "$TEST_TEMP/project/.cleat")"
-  az_hash="$(_hash_cleat_caps "$TEST_TEMP/project/.cleat.az")"
+  main_hash="$(_hash_cleat_caps "$TEST_TEMP/project/.cleat" "")"
+  az_hash="$(_hash_cleat_caps "$TEST_TEMP/project/.cleat.az" "")"
   [[ -n "$main_hash" && "$main_hash" != "$az_hash" ]] || return 1
 }
 
 @test "box trust: trusting main does not trust the az box" {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\n'    > "$TEST_TEMP/project/.cleat"
-  printf '[caps]\ndocker\n' > "$TEST_TEMP/project/.cleat.az"
-  _trust_record "$TEST_TEMP/project" "$(_hash_cleat_caps "$TEST_TEMP/project/.cleat")" main
+  printf '[box.az.caps]\ndocker\n'   >> "$TEST_TEMP/project/.cleat"
+  _trust_record "$TEST_TEMP/project" "$(_hash_cleat_caps "$TEST_TEMP/project/.cleat" "")" main
   _BOX="main"; run _is_project_trusted "$TEST_TEMP/project"; assert_success
   _BOX="az";   run _is_project_trusted "$TEST_TEMP/project"; assert_failure
 }
@@ -219,7 +219,7 @@ teardown() { _common_teardown; }
 @test "box trust: a legacy two-column trust row is read as the main box" {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\n' > "$TEST_TEMP/project/.cleat"
-  local h; h="$(_hash_cleat_caps "$TEST_TEMP/project/.cleat")"
+  local h; h="$(_hash_cleat_caps "$TEST_TEMP/project/.cleat" "")"
   mkdir -p "$(dirname "$CLEAT_TRUST_FILE")"
   printf '%s\t%s\n' "$TEST_TEMP/project" "$h" > "$CLEAT_TRUST_FILE"
   _BOX="main"; run _is_project_trusted "$TEST_TEMP/project"; assert_success

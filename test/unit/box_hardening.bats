@@ -82,20 +82,20 @@ teardown() { _common_teardown; }
 
 # ── Per-box caps boundary: replace-with-nothing & non-cap content ───────────
 
-@test "harden: an empty .cleat.<box> REPLACES with nothing (no project caps)" {
+@test "harden: a DECLARED but empty caps section REPLACES with nothing" {
+  # The lockdown the per-box FILES could never express cleanly: a bare header
+  # is a real value (zero caps), not absence, so it does not fall back.
   mkdir -p "$TEST_TEMP/project"
-  printf '[caps]\ngit\ndocker\n' > "$TEST_TEMP/project/.cleat"
-  : > "$TEST_TEMP/project/.cleat.locked"     # exists but empty
+  printf '[caps]\ngit\ndocker\n[box.locked.caps]\n' > "$TEST_TEMP/project/.cleat"
   _BOX="locked"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active git;    assert_failure   # NOT inherited from .cleat
   run cap_is_active docker; assert_failure
 }
 
-@test "harden: a comment-only .cleat.<box> yields no caps" {
+@test "harden: a comment-only caps section yields no caps" {
   mkdir -p "$TEST_TEMP/project"
-  printf '[caps]\ndocker\n' > "$TEST_TEMP/project/.cleat"
-  printf '# nothing enabled here\n' > "$TEST_TEMP/project/.cleat.locked"
+  printf '[caps]\ndocker\n[box.locked.caps]\n# nothing enabled here\n' > "$TEST_TEMP/project/.cleat"
   _BOX="locked"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active docker; assert_failure
@@ -104,7 +104,7 @@ teardown() { _common_teardown; }
 @test "harden: an underscore box name resolves its own cap file" {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\n'    > "$TEST_TEMP/project/.cleat"
-  printf '[caps]\ndocker\n' > "$TEST_TEMP/project/.cleat.my_box"
+  printf '[box.my_box.caps]\ndocker\n'   >> "$TEST_TEMP/project/.cleat"
   _BOX="my_box"
   resolve_caps "$TEST_TEMP/project"
   run cap_is_active docker; assert_success
@@ -194,7 +194,7 @@ teardown() { _common_teardown; }
 @test "harden: env summary reflects the box's .cleat.<box>.env, not .cleat.env" {
   mkdir -p "$TEST_TEMP/project"
   CLEAT_GLOBAL_ENV="$TEST_TEMP/noenv"
-  printf '[caps]\nenv\n'        > "$TEST_TEMP/project/.cleat.az"
+  printf '[box.az.caps]\nenv\n'   >> "$TEST_TEMP/project/.cleat"
   printf 'AZ_ONE=1\nAZ_TWO=2\n' > "$TEST_TEMP/project/.cleat.az.env"
   printf 'X=9\n'                > "$TEST_TEMP/project/.cleat.env"
   _BOX="az"
@@ -208,7 +208,7 @@ teardown() { _common_teardown; }
 @test "harden: inline env summary is box-aware too" {
   mkdir -p "$TEST_TEMP/project"
   CLEAT_GLOBAL_ENV="$TEST_TEMP/noenv"
-  printf '[caps]\nenv\n' > "$TEST_TEMP/project/.cleat.az"
+  printf '[box.az.caps]\nenv\n'   >> "$TEST_TEMP/project/.cleat"
   printf 'AZ_ONE=1\n'    > "$TEST_TEMP/project/.cleat.az.env"
   _BOX="az"
   resolve_caps "$TEST_TEMP/project"

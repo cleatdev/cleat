@@ -150,6 +150,18 @@ run_mutation() {
     return 2
   fi
 
+  # A filter that matches NOTHING runs zero tests, and bats exits 0 for that, so
+  # the mutation reads as MISSED when in fact it was never tested. It has
+  # happened twice: a test gets renamed and its filter silently stops matching.
+  # Check the count against the PRISTINE source, before judging the mutation.
+  local _planned
+  _planned="$("$BATS" --count --filter "$test_filter" "$test_file" 2>/dev/null || echo 0)"
+  case "$_planned" in ''|*[!0-9]*) _planned=0 ;; esac
+  if [[ "$_planned" -eq 0 ]]; then
+    echo "${RED}✖ $name: NO MATCH${RESET} ${DIM}(filter '$test_filter' matches no test in ${test_file##*/})${RESET}"
+    return 1
+  fi
+
   # Run only the target test; expect it to FAIL
   if "$BATS" --filter "$test_filter" "$test_file" </dev/null >/dev/null 2>&1; then
     echo "${RED}✖ $name: MISSED${RESET} ${DIM}(test passed against mutated code)${RESET}"
@@ -423,7 +435,7 @@ try "v0.10.0_status_readonly_trust" "cmd_status never prompts for trust"
 # file hashing and the hash-stability guard should fail.
 cat > "$SED_TMP" << 'SED'
 /^_hash_cleat_caps\(\)/,/^}$/{
-  s|caps="\$(_read_caps_from_file "\$path" \| _canonical_caps)"|caps="$(cat "$path")"|
+  s|caps="\$(_read_caps_from_file "\$path" "\$box" \| _canonical_caps)"|caps="$(cat "$path")"|
 }
 SED
 try "v0.10.0_trust_hash_canonical" "trust hash is over canonical caps"
@@ -791,8 +803,8 @@ try "boxes_session_key_threads_box" "a named box gets its own session overlay di
 # .cleat.<box>; the dev box would then inherit .cleat's docker cap and the
 # replace-not-merge test must fail.
 cat > "$SED_TMP" << 'SED'
-/^_project_caps_file()/,/^}$/{
-  s|echo "\$project/.cleat.\$box"|echo "\$project/.cleat"|
+/^_scoped_section()/,/^}$/{
+  s|    printf 'box.%s.%s' "\$box" "\$kind"|    printf '%s' "\$kind"|
 }
 SED
 try "boxes_caps_file_replace_not_merge" "a box can have FEWER caps" "$CLI" "$BOXES_BATS"
@@ -3590,7 +3602,7 @@ try "vnext_docker_gate_banner_leading_blank" "one blank line above the banner in
 #    emits bare key lines: the "writes memory and cpus" test (asserts the header at
 #    line 0) must fail.
 cat > "$SED_TMP" << 'SED'
-s@      echo "\[resources\]"@      echo "# nope"@
+s@      echo "\[$_sec\]"@      echo "# nope"@
 SED
 try "vnext_config_resources_writer_section" "write_resources: writes memory and cpus" "$CLI" "$CONFIG_BATS"
 
@@ -4053,12 +4065,16 @@ try "session_key_all_nonalnum" "session key replaces EVERY non-alphanumeric" "$C
 # Match it untrimmed in the writer and an indented section is duplicated rather
 # than replaced, leaving a disabled capability active.
 cat > "$SED_TMP" << 'SED'
-s@      if \[\[ "$_h" == "\[caps\]" \]\]; then@      if [[ "$line" == "[caps]" ]]; then@
+/^_write_caps_to_file()/,/^}$/{
+  s@      if \[\[ "$_h" == "\[$_sec\]" \]\]; then@      if [[ "$line" == "[$_sec]" ]]; then@
+}
 SED
 try "caps_writer_header_trim" "an indented .caps. header is replaced" "$CLI" "$CONFIG_BATS"
 
 cat > "$SED_TMP" << 'SED'
-s@      if \[\[ "$_h" == "\[resources\]" \]\]; then@      if [[ "$line" == "[resources]" ]]; then@
+/^_write_resources_to_file()/,/^}$/{
+  s@      if \[\[ "$_h" == "\[$_sec\]" \]\]; then@      if [[ "$line" == "[$_sec]" ]]; then@
+}
 SED
 try "resources_writer_header_trim" "an indented .resources. header is replaced" "$CLI" "$CONFIG_BATS"
 
@@ -4132,8 +4148,8 @@ try "hook_concurrency_bound" "concurrency is bounded so a spool flood" "$CLI" "$
 # TRUST HASH BEFORE PROMPT: hashing after the answer records a .cleat the user
 # never saw, so an agent can rewrite it while the prompt is on screen.
 cat > "$SED_TMP" << 'SED'
-/# Hash BEFORE the prompt, from the same read that produced the caps we are/,/^    hash="\$(_hash_cleat_caps "\$caps_file")"$/{
-  /^    hash="\$(_hash_cleat_caps "\$caps_file")"$/d
+/# Hash BEFORE the prompt, from the same read that produced the caps we are/,/^    hash="\$(_hash_cleat_caps "\$caps_file" "\$box")"$/{
+  /^    hash="\$(_hash_cleat_caps "\$caps_file" "\$box")"$/d
 }
 SED
 try "trust_hash_before_prompt" "recorded hash is the one the user was shown" "$CLI" "$TRUST_BATS"
@@ -4222,9 +4238,9 @@ try "config_bom_strip" "UTF-8 BOM does not void the first section" "$CLI" "$CONF
 # BOX-AWARE FORK EXCLUDES: a named box's caps came from .cleat.<box> while its
 # [fork] excludes were read from .cleat.
 cat > "$SED_TMP" << 'SED'
-s@  _exfile="$(_project_caps_file "$project" "$box")"@  _exfile="$project/.cleat"@
+s@"$(_scoped_section "$_exfile" "$box" fork)" exclude@fork exclude@
 SED
-try "fork_excludes_box_aware" "excludes come from its own .cleat" "$CLI" "$FORK_BATS"
+try "fork_excludes_box_aware" "excludes come from its own" "$CLI" "$FORK_BATS"
 
 # WRITER BOM HYGIENE: the readers strip a BOM, the writers did not, so a BOM'd
 # .cleat still duplicated its section on write and left a "disabled" cap active.
@@ -4232,6 +4248,145 @@ cat > "$SED_TMP" << 'SED'
 s@      line="${line#$'\\xef\\xbb\\xbf'}"   # UTF-8 BOM, same hygiene as the readers@      :@
 SED
 try "writer_bom_strip" "BOM.d file is replaced, not duplicated" "$CLI" "$CONFIG_BATS"
+
+# ── per-box sections ────────────────────────────────────────────────────────
+PBS_BATS="$REPO_ROOT/test/unit/per_box_sections.bats"
+
+# DECLARED REPLACES: fall back to the bare section when the box declares one and
+# a locked-down box silently runs with the project's full capability set.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ -n "$box" \]\] && _cleat_section_present "$file" "box.${box}.${kind}"; then@  if false; then@
+SED
+try "pbs_declared_replaces" "declared caps section REPLACES" "$CLI" "$PBS_BATS"
+
+# EMPTY IS A VALUE: treat a declared-but-empty section as absent and the
+# lockdown box inherits everything instead of getting nothing.
+cat > "$SED_TMP" << 'SED'
+s@^    \[\[ "$line" == "$want" \]\] && return 0$@    [[ "$line" == "$want" ]] \&\& [[ "$(sed -n "/^\\[/,\$p" "$file" | sed -n 2p)" != "" ]] \&\& return 0@
+SED
+try "pbs_empty_is_a_value" "EMPTY caps section means zero caps" "$CLI" "$PBS_BATS"
+
+# RESOURCES ARE PER KEY: make the resource read section-level and declaring
+# memory silently un-declares the inherited cpus.
+cat > "$SED_TMP" << 'SED'
+s@    \[\[ -n "$_v" \]\] && { printf '%s\\n' "$_v"; return 0; }@    printf '%s\\n' "$_v"; return 0;@
+SED
+try "pbs_resources_per_key" "resources resolve per KEY" "$CLI" "$PBS_BATS"
+
+# HASH IS PER BOX: default the box and every box hashes as main, so editing one
+# box re-prompts all of them and cmd_trust reports a permanent false change.
+cat > "$SED_TMP" << 'SED'
+s@  local path="$1" box="${2?_hash_cleat_caps needs a box}"@  local path="$1" box="${2:-main}"@
+SED
+try "pbs_hash_requires_box" "caps hash refuses to guess a box" "$CLI" "$PBS_BATS"
+
+# MATERIALIZE: without it, enabling one cap on an inheriting box leaves the box
+# with ONLY that cap, the same silent strip the per-box files caused.
+cat > "$SED_TMP" << 'SED'
+s@    done < <(_read_caps_from_file "$config_file" "$_box_scope")@    done < <(_read_caps_from_file "$config_file" "")@
+SED
+try "pbs_editor_materializes" "adds to ITS set, not the project" "$CLI" "$PBS_BATS"
+
+# NEVER VANISH: an omitted section means absent means inherit, so an emptied
+# box section would escalate a locked box to the project's full cap set.
+cat > "$SED_TMP" << 'SED'
+s@    elif \[\[ "$_sec" != "caps" && "${_WRITE_EMPTY_SECTION:-0}" == "1" \]\]; then@    elif false; then@
+SED
+try "pbs_empty_section_kept" "keeps the header, never removes it" "$CLI" "$PBS_BATS"
+
+# DELETE ON EQUAL: without it a no-op edit silently pins the box to today's
+# project caps forever and no verb undoes it.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ "$sec" == box.\* && -n "$_mine" && "$_mine" == "$_inherited" \]\]; then@  if false; then@
+SED
+try "pbs_delete_on_equal" "restores inheritance" "$CLI" "$PBS_BATS"
+
+# EDITOR TARGETS .cleat: writing a per-box FILE is what stripped the box.
+cat > "$SED_TMP" << 'SED'
+s@    config_file="${project}/.cleat"\n    _warn_legacy_box_file@    config_file="${project}/.cleat.$box"\n    _warn_legacy_box_file@
+SED
+cat > "$SED_TMP" << 'SED'
+/^    _warn_legacy_box_file "\$project" "\$box"$/{x;s@^@@;x;}
+s@^    config_file="\${project}/.cleat"$@    config_file="${project}/.cleat.${box:-main}"@
+SED
+try "pbs_editor_one_file" "writes a section, never a new file" "$CLI" "$PBS_BATS"
+
+# LEGACY FILE ANNOUNCED: a leftover .cleat.<box> changes a box's capabilities in
+# either direction, so it must never be silent.
+cat > "$SED_TMP" << 'SED'
+s@  warn "${BOLD}.cleat.${box}${RESET} is no longer read@  true "@
+SED
+try "pbs_legacy_announced" "leftover .cleat..box. is announced" "$CLI" "$PBS_BATS"
+
+# WARNER KNOWS THE KINDS: accept any box.*.* and a typo'd kind is silently
+# accepted forever, which is a box running the wrong configuration.
+cat > "$SED_TMP" << 'SED'
+s@              caps|resources|setup|fork)@              caps|resources|setup|fork|capss)@
+SED
+try "pbs_warner_kind" "typo.d box name or kind still warns" "$CLI" "$PBS_BATS"
+
+# GLOBAL REFUSAL: box names are per project, so a global [box.x.*] would apply
+# to every project with a box of that name.
+cat > "$SED_TMP" << 'SED'
+s@          box.\*)@          boxZZ.*)@
+SED
+try "pbs_warner_global" "refused in the GLOBAL config" "$CLI" "$PBS_BATS"
+
+# PICKER SCOPING: the direct flags scoped and the interactive picker did not, so
+# a box edit made through the TUI granted the capability to EVERY box.
+cat > "$SED_TMP" << 'SED'
+s#  _config_write_caps_scoped "$config_file" "$_esec_caps" "$_ebox" #  _write_caps_to_file "$config_file" #
+SED
+try "pbs_picker_scoped" "picker scopes a box.s save" "$CLI" "$PBS_BATS"
+
+# PICKER RESOURCES: same, for the resources half.
+cat > "$SED_TMP" << 'SED'
+s@  _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"@  _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"@
+SED
+try "pbs_picker_resources_scoped" "picker scopes resources too" "$CLI" "$PBS_BATS"
+
+# EDITOR WRITES WHERE READERS READ: `cleat config main` wrote [caps] while the
+# readers honoured [box.main.caps], a silent no-op that also granted it widely.
+cat > "$SED_TMP" << 'SED'
+s@  if _cleat_section_present "$file" "box.${box}.${kind}"; then@  if false; then@
+SED
+try "pbs_editor_section_rule" "main-box edit writes where main actually reads" "$CLI" "$PBS_BATS"
+
+# LOCKDOWN SURVIVES: delete-on-equal must not fire on an EMPTY set, or the box
+# inherits whatever the project gains later.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ "$sec" == box.\* && -n "$_mine" && "$_mine" == "$_inherited" \]\]; then@  if [[ "$sec" == box.* \&\& "$_mine" == "$_inherited" ]]; then@
+SED
+try "pbs_lockdown_survives" "declared-empty lockdown survives an edit" "$CLI" "$PBS_BATS"
+
+# ENV SIDECAR: the legacy warning told the user to move their SECRETS file into
+# the committed .cleat.
+cat > "$SED_TMP" << 'SED'
+s@  \[\[ "$box" != "env" \]\] || return 0@  :@
+SED
+try "pbs_legacy_skips_env" "env sidecar is never mistaken" "$CLI" "$PBS_BATS"
+
+# LEGACY WARNED ON EVERY VERB: warning only from cmd_config meant a session verb
+# ran the box with different caps than the leftover file declared, silently.
+cat > "$SED_TMP" << 'SED'
+s@  \[\[ -n "$project" \]\] && _warn_legacy_box_file "$project" "$box"@  :@
+SED
+try "pbs_legacy_on_session_verb" "announced on a session verb" "$CLI" "$PBS_BATS"
+
+# NO-OP PROJECT EDIT: delete-on-equal is only meaningful for a per-box section.
+# On the bare [caps] the "inherited" set IS the set being written, so it fired
+# on every no-op project edit and wiped the section outright.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ "$sec" == box.\* && -n "$_mine" && "$_mine" == "$_inherited" \]\]; then@  if [[ -n "$_mine" \&\& "$_mine" == "$_inherited" ]]; then@
+SED
+try "pbs_noop_keeps_project_caps" "no-op edit of box main never deletes" "$CLI" "$PBS_BATS"
+
+# PICKER LOADS SCOPED: it writes back whatever it loaded, so loading the
+# project's number clears the box's own declared ceiling.
+cat > "$SED_TMP" << 'SED'
+s@    v="$(_read_section_from_file "$file" "box.${_lbox}.resources" "$key" || true)"@    v="$(_read_resource_from_file "$file" "$key" || true)"@
+SED
+try "pbs_picker_loads_scoped" "picker loads a box.s OWN declared resources" "$CLI" "$PBS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

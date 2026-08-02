@@ -83,7 +83,7 @@ teardown() { _common_teardown; }
 
 @test "resources: a box file replaces the project file (least-privilege shape)" {
   printf '[resources]\nmemory = 6g\n' > "$PROJECT/.cleat"
-  printf '[resources]\nmemory = 3g\n' > "$PROJECT/.cleat.dev"
+  printf '[box.dev.resources]\nmemory = 3g\n' >> "$PROJECT/.cleat"
   run resolve_box_memory "$PROJECT" "dev"
   assert_output "3g"
 }

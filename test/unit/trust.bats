@@ -81,8 +81,8 @@ _source_cli_silent() {
   printf '[caps]\ngit\nssh\n' > "$a"
   printf '[caps]\nssh\ngit\n' > "$b"
   local ha hb
-  ha="$(_hash_cleat_caps "$a")"
-  hb="$(_hash_cleat_caps "$b")"
+  ha="$(_hash_cleat_caps "$a" "")"
+  hb="$(_hash_cleat_caps "$b" "")"
   [[ -n "$ha" && "$ha" == "$hb" ]] || {
     echo "hashes differ: a='$ha' b='$hb'"
     return 1
@@ -94,10 +94,10 @@ _source_cli_silent() {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\nssh\n' > "$f"
   local h1
-  h1="$(_hash_cleat_caps "$f")"
+  h1="$(_hash_cleat_caps "$f" "")"
   printf '# I changed a comment\n[caps]\n# another comment\ngit\nssh\n' > "$f"
   local h2
-  h2="$(_hash_cleat_caps "$f")"
+  h2="$(_hash_cleat_caps "$f" "")"
   [[ "$h1" == "$h2" ]] || {
     echo "comment change altered the hash ($h1 vs $h2)"
     return 1
@@ -109,10 +109,10 @@ _source_cli_silent() {
   mkdir -p "$TEST_TEMP/project"
   printf '[caps]\ngit\n' > "$f"
   local h1
-  h1="$(_hash_cleat_caps "$f")"
+  h1="$(_hash_cleat_caps "$f" "")"
   printf '[caps]\ngit\ndocker\n' > "$f"
   local h2
-  h2="$(_hash_cleat_caps "$f")"
+  h2="$(_hash_cleat_caps "$f" "")"
   [[ "$h1" != "$h2" ]] || {
     echo "adding a cap didn't change hash"
     return 1
@@ -120,7 +120,7 @@ _source_cli_silent() {
 }
 
 @test "hash: missing file returns empty" {
-  run _hash_cleat_caps "$TEST_TEMP/nope/.cleat"
+  run _hash_cleat_caps "$TEST_TEMP/nope/.cleat" ""
   assert_success
   assert_output ""
 }
@@ -133,7 +133,7 @@ _source_cli_silent() {
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\nssh\n' > "$f"
   local h
-  h="$(_hash_cleat_caps "$f")"
+  h="$(_hash_cleat_caps "$f" "")"
   [[ "$h" =~ ^[0-9a-f]+$ ]] || {
     echo "hash contains non-hex characters: '$h'"
     return 1
@@ -149,7 +149,7 @@ _source_cli_silent() {
   local f="$TEST_TEMP/project/.cleat"
   mkdir -p "$TEST_TEMP/project"
   printf '# nothing here\n' > "$f"
-  run _hash_cleat_caps "$f"
+  run _hash_cleat_caps "$f" ""
   assert_success
   assert_output ""
 }
@@ -273,7 +273,7 @@ EOF
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\nssh\n' > "$TEST_TEMP/proj/.cleat"
   local h
-  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat" "")"
   _trust_record "$TEST_TEMP/proj" "$h"
   run _is_project_trusted "$TEST_TEMP/proj"
   assert_success
@@ -283,7 +283,7 @@ EOF
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"
   local h
-  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat" "")"
   _trust_record "$TEST_TEMP/proj" "$h"
   # Now add a cap the user hasn't approved.
   printf '[caps]\ngit\ndocker\n' > "$TEST_TEMP/proj/.cleat"
@@ -313,7 +313,7 @@ EOF
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ndocker\n' > "$TEST_TEMP/proj/.cleat"
   local h
-  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat")"
+  h="$(_hash_cleat_caps "$TEST_TEMP/proj/.cleat" "")"
   _trust_record "$TEST_TEMP/proj" "$h"
   resolve_caps "$TEST_TEMP/proj"
   cap_is_active docker
@@ -536,7 +536,7 @@ EOF
   mkdir -p "$proj"
   printf '[caps]\ngit\n' > "$proj/.cleat"
   local shown_hash
-  shown_hash="$(_hash_cleat_caps "$proj/.cleat")"
+  shown_hash="$(_hash_cleat_caps "$proj/.cleat" "")"
 
   unset CLEAT_TRUST_PROJECT
   _is_tty() { return 0; }
@@ -559,7 +559,7 @@ EOF
   run _resolve_project_trust "$proj" ""
   assert_success
   run _trust_lookup "$proj" main
-  assert_output "$(_hash_cleat_caps "$proj/.cleat")"
+  assert_output "$(_hash_cleat_caps "$proj/.cleat" "")"
 }
 
 @test "trust: a project path containing a backslash escape still matches its record" {

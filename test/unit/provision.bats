@@ -266,7 +266,7 @@ _th_record_setup() {
 
 @test "build_setup_payload: a box's .cleat.<box> [setup] fully replaces .cleat's, it never merges" {
   printf '[setup]\necho from-main\n' > "$PROJECT/.cleat"
-  printf '[setup]\necho from-dev\n' > "$PROJECT/.cleat.dev"
+  printf '[box.dev.setup]\necho from-dev\n'  >> "$PROJECT/.cleat"
   run _build_setup_payload "$PROJECT" dev
   assert_success
   assert_output "echo from-dev"
@@ -919,10 +919,9 @@ _th_record_setup() {
 
 @test "cmd_setup: <box> --show reads the box's .cleat.<box>" {
   printf '[setup]\necho from-main\n' > "$PROJECT/.cleat"
-  printf '[setup]\necho from-dev-unique\n' > "$PROJECT/.cleat.dev"
+  printf '[box.dev.setup]\necho from-dev-unique\n'  >> "$PROJECT/.cleat"
   run cmd_setup dev --show
   assert_success
-  assert_output --partial ".cleat.dev"
   assert_output --partial "echo from-dev-unique"
   refute_output --partial "from-main"
 }
@@ -1149,7 +1148,7 @@ _th_record_setup() {
   cap="$(printf '\x1bBADESC\\033TAIL')"
   printf '[caps]\n%s\n' "$cap" > "$PROJECT/.cleat"
   local h
-  h="$(_hash_cleat_caps "$PROJECT/.cleat")"
+  h="$(_hash_cleat_caps "$PROJECT/.cleat" "")"
   _trust_record "$PROJECT" "$h" main
   run cmd_status "$PROJECT"
   assert_output --partial "BADESC"
@@ -1237,7 +1236,7 @@ _th_record_setup() {
 
 @test "cmd_trust <box>: records a per-box row from .cleat.<box>" {
   printf '[caps]\ngit\n' > "$PROJECT/.cleat"
-  printf '[caps]\ngit\ndocker\n' > "$PROJECT/.cleat.web"
+  printf '[box.web.caps]\ngit\ndocker\n'   >> "$PROJECT/.cleat"
   run cmd_trust web
   assert_success
   assert_output --partial "[web]"
@@ -1261,7 +1260,7 @@ _th_record_setup() {
 
 @test "cmd_trust: a box and main are independent trust rows" {
   printf '[caps]\ngit\n' > "$PROJECT/.cleat"
-  printf '[caps]\ndocker\n' > "$PROJECT/.cleat.web"
+  printf '[box.web.caps]\ndocker\n'   >> "$PROJECT/.cleat"
   cmd_trust web >/dev/null
   cmd_trust >/dev/null
   local web_h main_h
@@ -1274,9 +1273,9 @@ _th_record_setup() {
   # Caps + [setup] approved for a box must produce the SAME 4-col row whether
   # via the interactive start prompt (_resolve_project_trust + _resolve_setup_
   # trust) or `cleat trust <box>`.
-  printf '[caps]\ndocker\n\n[setup]\necho provision\n' > "$PROJECT/.cleat.web"
+  printf '[box.web.caps]\ndocker\n\n[setup]\necho provision\n'   >> "$PROJECT/.cleat"
   local caps_hash setup_hash expected got
-  caps_hash="$(_hash_cleat_caps "$PROJECT/.cleat.web")"
+  caps_hash="$(_hash_cleat_caps "$PROJECT/.cleat" web)"
   setup_hash="$(_setup_payload_hash "$(_build_setup_payload "$PROJECT" web)")"
   expected="$(printf '%s\t%s\t%s\t%s' "$PROJECT" web "$caps_hash" "$setup_hash")"
   cmd_trust web >/dev/null
@@ -1287,7 +1286,7 @@ _th_record_setup() {
 @test "cmd_trust <path> <box>: the two-arg form resolves the path's box" {
   # `.` resolves to the current project (cwd); the second positional is the box.
   printf '[caps]\ngit\n' > "$PROJECT/.cleat"
-  printf '[caps]\ndocker\n' > "$PROJECT/.cleat.web"
+  printf '[box.web.caps]\ndocker\n'   >> "$PROJECT/.cleat"
   run cmd_trust . web
   assert_success
   assert_output --partial "[web]"
@@ -1300,7 +1299,7 @@ _th_record_setup() {
   # Colors are empty when stdout isn't a TTY (bats), so set distinct sentinels
   # to tell the green (trusted) marker from the yellow (changed) one.
   GREEN='<G>'; YELLOW='<Y>'
-  printf '[caps]\ngit\n' > "$PROJECT/.cleat.web"
+  printf '[box.web.caps]\ngit\n'   >> "$PROJECT/.cleat"
   cmd_trust web >/dev/null
   # Fresh approval: the web row carries the green marker, not yellow.
   run cmd_trust --list
@@ -1309,7 +1308,7 @@ _th_record_setup() {
   line="$(printf '%s\n' "$output" | grep '\[web\]')"
   [[ "$line" == *'<G>'* && "$line" != *'<Y>'* ]] || { echo "fresh web row not green: $line"; return 1; }
   # Edit the box's caps: the row must now warn (yellow) that it changed.
-  printf '[caps]\ngit\ndocker\n' > "$PROJECT/.cleat.web"
+  printf '[box.web.caps]\ngit\ndocker\n'   >> "$PROJECT/.cleat"
   run cmd_trust --list
   assert_success
   line="$(printf '%s\n' "$output" | grep '\[web\]')"
@@ -1318,7 +1317,7 @@ _th_record_setup() {
 
 @test "cmd_untrust <box>: removes only that box's row, main survives" {
   printf '[caps]\ngit\n' > "$PROJECT/.cleat"
-  printf '[caps]\ndocker\n' > "$PROJECT/.cleat.web"
+  printf '[box.web.caps]\ndocker\n'   >> "$PROJECT/.cleat"
   cmd_trust >/dev/null
   cmd_trust web >/dev/null
   run cmd_untrust web

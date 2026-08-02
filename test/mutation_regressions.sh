@@ -4388,6 +4388,35 @@ s@    v="$(_read_section_from_file "$file" "box.${_lbox}.resources" "$key" || tr
 SED
 try "pbs_picker_loads_scoped" "picker loads a box.s OWN declared resources" "$CLI" "$PBS_BATS"
 
+# TRUST SUBJECT: with one file per project the box name is the only thing
+# separating two consent decisions, so a bare "Project .cleat" is ambiguous.
+cat > "$SED_TMP" << 'SED'
+s@    printf '.cleat \[box.%s.%s\]' "$box" "$kind"@    printf '.cleat'@
+SED
+try "pbs_trust_names_section" "prompt names the box and the section" "$CLI" "$PBS_BATS"
+
+# PROJECT EDIT NO-OP: editing [caps] while main declares its own changes nothing
+# for main, and a bare success reads as if it did.
+cat > "$SED_TMP" << 'SED'
+s@    if _cleat_section_present "$file" "box.main.caps"; then@    if false; then@
+SED
+try "pbs_project_edit_warns" "warns when main declares its own" "$CLI" "$PBS_BATS"
+
+# COMPAT NOTE: an older Cleat reads a per-box REDUCTION as the permissive
+# project section, so the file itself should say which version understands it.
+cat > "$SED_TMP" << 'SED'
+s@  _config_note_sections_version "$file"@  :@
+SED
+try "pbs_compat_note" "first box section adds a compatibility note" "$CLI" "$PBS_BATS"
+
+# WRITER CHANNEL HYGIENE: _WRITE_SECTION and friends are function parameters
+# carried in globals. Read from the inherited environment, a stray value in the
+# user's shell silently redirects which section a config edit lands in.
+cat > "$SED_TMP" << 'SED'
+s@^_WRITE_SECTION=""$@_WRITE_SECTION="${_WRITE_SECTION:-}"@
+SED
+try "pbs_writer_channel_hygiene" "ambient _WRITE_SECTION cannot redirect" "$CLI" "$PBS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -440,3 +440,99 @@ teardown() { _common_teardown; }
   run _config_load_resource "$F" memory default "" ""
   assert_output --partial "2g"
 }
+
+# ── the three review leftovers ──────────────────────────────────────────────
+
+@test "trust: the prompt names the box and the section it resolved" {
+  # With per-box config in ONE file the box name is the only thing separating
+  # two different consent decisions, so "Project .cleat" alone is ambiguous.
+  printf '[caps]\ngit\n[box.ci.caps]\ndocker\n' > "$F"
+  run _trust_subject "$PROJECT" ci caps
+  assert_output "$(printf '.cleat [box.ci.caps]')"
+  run _trust_subject "$PROJECT" other caps
+  assert_output --partial "box other"
+  run _trust_subject "$PROJECT" main caps
+  assert_output ".cleat [caps]"
+}
+
+@test "trust: the caps prompt shows the resolved subject, not a bare .cleat" {
+  printf '[caps]\ngit\n[box.ci.caps]\ndocker\n' > "$F"
+  _BOX=ci
+  _is_tty() { return 0; }
+  _read_keypress() { printf 'n'; }
+  _ask_yn() { printf -v "$1" '%s' 'n'; }
+  run _trust_prompt "$PROJECT" docker
+  assert_output --partial "box.ci.caps"
+}
+
+@test "editor: editing the project default warns when main declares its own" {
+  # Otherwise the edit reports success and changes nothing for main.
+  cd "$PROJECT"
+  printf '[caps]\ngit\n[box.main.caps]\ngit\n' > "$F"
+  run _config_write_caps_scoped "$F" caps "" git ssh
+  assert_success
+  assert_output --partial "unaffected"
+}
+
+@test "editor: no such warning when main inherits normally" {
+  cd "$PROJECT"
+  printf '[caps]\ngit\n' > "$F"
+  run _config_write_caps_scoped "$F" caps "" git ssh
+  assert_success
+  refute_output --partial "unaffected"
+}
+
+@test "sections: the first box section adds a compatibility note to the file" {
+  # .cleat is committed and shared. An older Cleat cannot see [box.*] sections
+  # and falls back to [caps], so a per-box REDUCTION fails OPEN on a teammate's
+  # older CLI. Worth saying in the file, not only in the docs.
+  cd "$PROJECT"
+  printf '[caps]\ngit\n' > "$F"
+  cmd_config dev --enable docker >/dev/null
+  run head -2 "$F"
+  assert_output --partial "cleat >="
+  assert_output --partial "Older versions ignore them"
+}
+
+@test "sections: the compatibility note is written once, not on every edit" {
+  cd "$PROJECT"
+  printf '[caps]\ngit\n' > "$F"
+  cmd_config dev --enable docker >/dev/null
+  cmd_config dev --enable gh >/dev/null
+  cmd_config other --memory 4g >/dev/null
+  run grep -c '^# cleat >= ' "$F"
+  assert_output "1"
+}
+
+@test "sections: a file with no box sections gets no note" {
+  cd "$PROJECT"
+  printf '[caps]\ngit\n' > "$F"
+  cmd_config --project --enable ssh >/dev/null 2>&1 || true
+  run grep -c '^# cleat >= ' "$F"
+  assert_output "0"
+}
+
+@test "sections: the note is a comment, so it never changes what is resolved" {
+  cd "$PROJECT"
+  printf '[caps]\ngit\n' > "$F"
+  cmd_config dev --enable docker >/dev/null
+  run _read_caps_from_file "$F" ""
+  assert_output "git"
+  run _read_caps_from_file "$F" dev
+  assert_output --partial "docker"
+}
+
+@test "sections: an ambient _WRITE_SECTION cannot redirect a project write" {
+  # The scoped-writer channels are function parameters carried in globals. Read
+  # straight from the inherited environment, a stray value in the user's shell
+  # would silently send a project edit into some other section.
+  cd "$PROJECT"
+  printf '[caps]\ngit\n' > "$F"
+  run env _WRITE_SECTION="box.evil.caps" _WRITE_EMPTY_SECTION=1 \
+      "$PROJECT_ROOT/bin/cleat" config --project --enable ssh
+  assert_success
+  run _cleat_section_present "$F" "box.evil.caps"
+  assert_failure
+  run _read_caps_from_file "$F" ""
+  assert_output --partial "ssh"
+}

@@ -1430,6 +1430,25 @@ _config_section_for() {
   fi
 }
 
+# A one-line note at the top of a .cleat that has grown its first per-box
+# section. .cleat is COMMITTED and shared, and a Cleat older than this release
+# cannot see [box.*] sections: it falls back to [caps], so a per-box REDUCTION
+# reads as the permissive project set on a teammate's older CLI. That fails
+# OPEN, so it is worth saying in the file itself rather than only in the docs.
+_config_note_sections_version() {
+  local file="$1"
+  [[ -r "$file" ]] || return 0
+  grep -q '^# cleat >= ' "$file" 2>/dev/null && return 0
+  grep -q '^\[box\.' "$file" 2>/dev/null || return 0
+  local tmp="${file}.cleat-note.$$"
+  {
+    echo "# cleat >= ${VERSION} reads [box.<name>.<kind>] sections."
+    echo "# Older versions ignore them and apply [caps] to every box."
+    cat "$file"
+  } > "$tmp" && mv -f "$tmp" "$file" || rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
 # Write a cap set for a scope, with the two rules the adversarial review made
 # non-negotiable:
 #
@@ -1446,6 +1465,12 @@ _config_write_caps_scoped() {
   local caps=("$@")
   if [[ -z "$box" ]]; then
     _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+    # Editing the project default while box `main` DECLARES its own section
+    # changes nothing for main, and reporting a bare success reads as if it did.
+    if _cleat_section_present "$file" "box.main.caps"; then
+      warn "Box ${BOLD}main${RESET} declares ${BOLD}[box.main.caps]${RESET}, so it is unaffected by this edit."
+      echo -e "    ${DIM}Edit it with ${BOLD}cleat config main --enable <cap>${RESET}${DIM}, or delete that section to make main inherit again.${RESET}"
+    fi
     return
   fi
   local _mine _inherited
@@ -1462,6 +1487,7 @@ _config_write_caps_scoped() {
     return
   fi
   _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+  _config_note_sections_version "$file"
 }
 
 # Write [resources] memory/cpus to a config file, preserving everything OUTSIDE
@@ -3316,6 +3342,22 @@ _is_project_trusted() {
 # Show a trust prompt and read y/n. Returns 0 on approval.
 # $1 = project path; $2..$N = capability names being requested.
 # Must only be called when _is_tty is true.
+# How to describe the thing being approved. With per-box config in ONE file, the
+# box name is the only thing distinguishing two different consent decisions, so
+# a prompt that says only "Project .cleat" is ambiguous the moment a second box
+# declares anything. Names the section when the box declares its own.
+_trust_subject() {
+  local project="$1" box="${2:-main}" kind="$3" file
+  file="$(_project_caps_file "$project")"
+  if [[ -n "$box" ]] && _cleat_section_present "$file" "box.${box}.${kind}"; then
+    printf '.cleat [box.%s.%s]' "$box" "$kind"
+  elif [[ "$box" != "main" ]]; then
+    printf '.cleat [%s] (box %s)' "$kind" "$box"
+  else
+    printf '.cleat [%s]' "$kind"
+  fi
+}
+
 _trust_prompt() {
   local project="$1"; shift
   local caps=("$@")
@@ -3340,7 +3382,7 @@ _trust_prompt() {
   if [[ $is_reprompt -eq 1 ]]; then
     info "Project ${BOLD}.cleat${RESET} changed since you trusted it: it now grants ${_list} ${DIM}on your host${RESET}"
   else
-    info "Project ${BOLD}.cleat${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
+    info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" caps)${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
   fi
 
   # Default-DENY ([y/N]): only an explicit yes grants the caps. Empty / EOF / no
@@ -3367,9 +3409,9 @@ _setup_trust_prompt() {
   [[ -n "$(_trust_lookup_setup "$project" "${_BOX:-main}")" ]] && is_reprompt=1
 
   if [[ $is_reprompt -eq 1 ]]; then
-    info "Project ${BOLD}.cleat${RESET} setup changed since you approved it: it runs ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder${RESET}"
+    info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" setup)${RESET} setup changed since you approved it: it runs ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder${RESET}"
   else
-    info "Project ${BOLD}.cleat${RESET} wants to run ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder (full network access)${RESET}"
+    info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" setup)${RESET} wants to run ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder (full network access)${RESET}"
   fi
 
   # Preview: up to the first 15 payload lines, sanitized (repo-controlled
@@ -5330,6 +5372,13 @@ _HOOK_BRIDGE_CHILDREN=()
 # so its line count is attacker-influenced; this is what stops it becoming a
 # host process count. Every event still runs, just not all in one instant.
 _HOOK_BRIDGE_MAX_CONCURRENT=8
+
+# The scoped-writer channels. Declared here so an ambient value inherited from
+# the caller's ENVIRONMENT can never redirect which section a write lands in:
+# these are function parameters carried in globals, not user-facing knobs.
+_WRITE_SECTION=""
+_WRITE_RES_SECTION=""
+_WRITE_EMPTY_SECTION=0
 
 _has_host_hooks() {
   local f
@@ -9654,6 +9703,7 @@ _config_editor_save() {
 
   _config_write_caps_scoped "$config_file" "$_esec_caps" "$_ebox" "${final_caps[@]+"${final_caps[@]}"}"
   _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"
+  _config_note_sections_version "$config_file"
   if [[ -n "$_ebox" ]]; then
     success "Saved to ${config_file} ${DIM}(box ${_ebox})${RESET}"
   else
@@ -10190,6 +10240,7 @@ cmd_config() {
     cur_cpus="$(_read_section_from_file "$config_file" "$_sec_res" cpus || true)"
     if [[ "$res_key" == "memory" ]]; then cur_mem="$write_val"; else cur_cpus="$write_val"; fi
     _WRITE_RES_SECTION="$_sec_res" _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus"
+    _config_note_sections_version "$config_file"
     if [[ -n "$write_val" ]]; then
       success "${res_key} set to ${write_val} ${DIM}(${config_file})${RESET}"
     else

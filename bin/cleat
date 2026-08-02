@@ -9655,12 +9655,14 @@ _config_load_resource() {
   # $5 is the BOX. Its OWN declared value, never the inherited one: the picker
   # writes back whatever it loaded, so loading the project's number would either
   # freeze it into the box's section or silently clear the box's own ceiling.
-  local v
-  if [[ -n "$_lbox" ]]; then
-    v="$(_read_section_from_file "$file" "box.${_lbox}.resources" "$key" || true)"
-  else
-    v="$(_read_resource_from_file "$file" "$key" || true)"
-  fi
+  # Read from exactly the section the WRITER will target, via the one shared
+  # resolver. Reading "box.$_lbox.resources" unconditionally broke box `main`,
+  # whose writer targets the bare [resources]: the load found nothing, the
+  # picker showed "default", and saving wrote an empty section, DELETING the
+  # project's [resources]. Found by the portability review against a real pty.
+  local v _lsec
+  _lsec="$(_config_section_for "$file" "$_lbox" resources)"
+  v="$(_read_section_from_file "$file" "$_lsec" "$key" || true)"
   local choices
   # $4 is the live ring when the caller built one from this machine. Without it
   # we fall back to the static ring, which keeps every direct 3-arg caller (and
@@ -9993,7 +9995,7 @@ _config_picker_text() {
 
   local mem cpus _pair vm_gb
   _pair="$(_config_load_resource "$config_file" memory default "" "$_box_scope")"; mem="${_pair%%$'\t'*}"
-  _pair="$(_config_load_resource "$config_file" cpus all)"; cpus="${_pair%%$'\t'*}"
+  _pair="$(_config_load_resource "$config_file" cpus all "" "$_box_scope")"; cpus="${_pair%%$'\t'*}"
   # Text mode types a value instead of cycling a ring, so it can name any size
   # at all. It therefore needs the VM size just as much as the TUI does, or a
   # piped `memory 64g` saves a whole-VM ceiling in silence.
@@ -10201,14 +10203,30 @@ cmd_config() {
     echo ""
     # Resources declared in THIS scope's file (empty reads as the effective default).
     # `|| true` keeps a strict-mode caller safe on a bare command-substitution assign.
-    local _lm _lc
+    local _lm _lc _lmsrc="" _lcsrc="" _lcapsrc=""
     _lm="$(_read_resource_from_file "$config_file" memory "$_box_scope" || true)"
     _lc="$(_read_resource_from_file "$config_file" cpus "$_box_scope" || true)"
+    # Which of these the BOX declares and which it inherits. A box view that
+    # shows only values cannot be told apart from the project's own, and the
+    # difference decides whether a later project edit reaches this box.
+    if [[ -n "$_box_scope" ]]; then
+      _cleat_section_present "$config_file" "box.${_box_scope}.caps" \
+        && _lcapsrc=" ${DIM}(declared by ${_box_scope})${RESET}" \
+        || _lcapsrc=" ${DIM}(inherited from the project)${RESET}"
+      [[ -n "$(_read_section_from_file "$config_file" "box.${_box_scope}.resources" memory)" ]] \
+        && _lmsrc=" ${DIM}(declared)${RESET}" || _lmsrc=" ${DIM}(inherited)${RESET}"
+      [[ -n "$(_read_section_from_file "$config_file" "box.${_box_scope}.resources" cpus)" ]] \
+        && _lcsrc=" ${DIM}(declared)${RESET}" || _lcsrc=" ${DIM}(inherited)${RESET}"
+    fi
     echo -e "  ${BOLD}Resources${RESET}"
-    if [[ -n "$_lm" ]]; then echo -e "    memory  ${_lm}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
-    if [[ -n "$_lc" ]]; then echo -e "    cpus    ${_lc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
+    if [[ -n "$_lm" ]]; then echo -e "    memory  ${_lm}${_lmsrc}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
+    if [[ -n "$_lc" ]]; then echo -e "    cpus    ${_lc}${_lcsrc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
     echo ""
-    echo -e "  ${DIM}Config: ${config_file}${RESET}"
+    if [[ -n "$_box_scope" ]]; then
+      echo -e "  ${DIM}Config: ${config_file}${RESET}  ${BOLD}box ${_box_scope}${RESET}${_lcapsrc}"
+    else
+      echo -e "  ${DIM}Config: ${config_file}${RESET}"
+    fi
     echo ""
     return
   fi
@@ -11822,7 +11840,7 @@ cmd_help() {
   echo -e "    ${RED}nuke${RESET}               Remove ALL Cleat containers + images + shared build cache"
   echo ""
   echo -e "  ${BOLD}CAPABILITIES${RESET}"
-  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET}        .cleat editor: capabilities + resources ${DIM}(no box = global; box = .cleat.<box>)${RESET}"
+  echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET}        .cleat editor: capabilities + resources ${DIM}(no box = global; box = [box.<name>.*] in .cleat)${RESET}"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --list       List capabilities and resources (memory, cpus)"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --enable ${DIM}<cap>${RESET}   Enable a capability"
   echo -e "    ${GREEN}config${RESET} ${DIM}[box]${RESET} --disable ${DIM}<cap>${RESET}  Disable a capability"

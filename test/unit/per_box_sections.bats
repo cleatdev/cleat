@@ -536,3 +536,76 @@ teardown() { _common_teardown; }
   run _read_caps_from_file "$F" ""
   assert_output --partial "ssh"
 }
+
+@test "editor: --list marks each box value as declared or inherited" {
+  # A box view that shows only values cannot be told apart from the project's
+  # own, and the difference decides whether a later project edit reaches it.
+  cd "$PROJECT"
+  printf '[caps]\ngit\n[resources]\nmemory = 2g\ncpus = 2\n[box.heavy.caps]\ndocker\n[box.heavy.resources]\nmemory = 8g\n' > "$F"
+  run cmd_config heavy --list
+  assert_success
+  assert_output --partial "8g"
+  assert_output --partial "declared"
+  assert_output --partial "inherited"
+  assert_output --partial "box heavy"
+}
+
+@test "editor: --list on an inheriting box says so for capabilities" {
+  cd "$PROJECT"
+  printf '[caps]\ngit\n' > "$F"
+  run cmd_config other --list
+  assert_success
+  assert_output --partial "inherited from the project"
+}
+
+@test "editor: the project --list is unchanged, with no box annotations" {
+  cd "$PROJECT"
+  printf '[caps]\ngit\n[resources]\nmemory = 2g\n' > "$F"
+  run cmd_config --project --list
+  assert_success
+  refute_output --partial "declared"
+  refute_output --partial "box "
+}
+
+@test "editor: a no-op picker save on main never deletes the project [resources]" {
+  # _config_load_resource read "box.main.resources" unconditionally. That
+  # section does not exist, so the picker showed "default" and saving wrote an
+  # empty section, DELETING the project's [resources]. The load must use the
+  # same section the writer targets.
+  cd "$PROJECT"
+  printf '[caps]\ngit\n[resources]\nmemory = 2g\ncpus = 3\n' > "$F"
+  run _config_load_resource "$F" memory default "" main
+  assert_output --partial "2g"
+  _config_editor_save "$F" project "$PROJECT" "git" "2g" "3" 0 0 "" main >/dev/null
+  run _read_resource_from_file "$F" memory main
+  assert_output "2g"
+  run _read_resource_from_file "$F" cpus main
+  assert_output "3"
+}
+
+@test "editor: a no-op picker save with no box also keeps [resources]" {
+  cd "$PROJECT"
+  printf '[resources]\nmemory = 2g\ncpus = 3\n' > "$F"
+  run _config_load_resource "$F" cpus all "" ""
+  assert_output --partial "3"
+  _config_editor_save "$F" project "$PROJECT" "" "2g" "3" 0 0 "" "" >/dev/null
+  run _read_resource_from_file "$F" cpus ""
+  assert_output "3"
+}
+
+@test "editor: a real box still loads only what it declares" {
+  # Deliberate: the picker writes back what it displays, so an inheriting box
+  # must not materialize the project's value just by being opened.
+  cd "$PROJECT"
+  printf '[resources]\nmemory = 2g\n[box.heavy.resources]\nmemory = 8g\n' > "$F"
+  run _config_load_resource "$F" memory default "" heavy
+  assert_output --partial "8g"
+  run _config_load_resource "$F" memory default "" other
+  assert_output --partial "default"
+}
+
+@test "help: the config line no longer names the retired per-box file" {
+  run cmd_help
+  assert_success
+  refute_output --partial ".cleat.<box>"
+}

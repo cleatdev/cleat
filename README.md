@@ -277,10 +277,12 @@ cleat status                      # list this project's boxes
 The token after a verb is a box name (lowercase letters, digits, `-`, `_`),
 never a path. `cleat` always operates on the current directory. The default box
 is byte-identical to the pre-boxes container, so existing projects keep working
-unchanged. Per-box caps come from `.cleat.<box>` (replace, not merge: a box can
-have *fewer* caps than `.cleat`). One caveat: `~/.claude` (your Anthropic auth)
-is shared across boxes. A box isolates host capabilities and the writable layer,
-not your Claude login.
+unchanged. Per-box config lives in `[box.<name>.<kind>]` sections of the one
+project `.cleat`. A declared section replaces the project default rather than
+merging it, so a box can hold *fewer* caps than the project. See **Per-box
+capabilities** below. One caveat: `~/.claude` (your Anthropic auth) is shared
+across boxes. A box isolates host capabilities and the writable layer, not your
+Claude login.
 
 ### Kits: curated Claude pre-configurations, per box
 
@@ -310,7 +312,8 @@ works the same way. Symlinks are copied as symlinks and never followed, so a
 project holding `sub/keys -> ~/.ssh` does not put real key bytes in the cage. On
 macOS the copy is copy-on-write, so it is close to instant and costs almost no
 disk until something changes. Exclude what you do not want with
-`[fork] exclude = node_modules` in `.cleat`. An exclude that is an absolute
+`[fork] exclude = node_modules` in `.cleat` (`[box.<name>.fork]` to scope the
+excludes to one box). An exclude that is an absolute
 path, contains `..`, names the workspace root, or resolves outside the copy
 through a symlink is refused with a warning instead of being deleted.
 
@@ -466,9 +469,10 @@ run `cleat rm && cleat`.
 | `cleat config --memory <val>` | Set the box memory ceiling (`default` clears it) |
 | `cleat config --cpus <val>` | Set the box CPU limit (`all` clears it) |
 | `cleat config --project --enable <cap>` | Project-level config (saved to `.cleat`) |
-| `cleat config <box> --enable <cap>` | Per-box config (saved to `.cleat.<box>`, replaces `.cleat` for that box) |
+| `cleat config <box> --enable <cap>` | Per-box config (writes `[box.<box>.caps]` in `.cleat`, replacing the project set for that box) |
+| `cleat config <box> --list` | Per-box view: names the box and marks each value declared or inherited |
 
-The editor also has a **generate** row (global scope): it stamps your current caps + resources into `./.cleat` so a per-project config never has to be hand-written. It preserves an existing `[setup]` section and does not auto-trust (the file goes through the normal trust prompt on the next run).
+The editor also has a **generate** row (global scope): it stamps your current caps + resources into `./.cleat` so a per-project config never has to be hand-written. It preserves the rest of the file (an existing `[setup]`, any `[box.*]` sections) and does not auto-trust (the file goes through the normal trust prompt on the next run).
 
 #### Workspace trust
 | Command | Description |
@@ -580,7 +584,7 @@ named sandbox for the project (default: `main`). See **Boxes** above.
 Containers run with these protections by default:
 
 - `--pids-limit 4096` -- prevents fork bombs from affecting the host
-- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 4-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Set it with `cleat config` (the arrow-key editor has a Resources group) or `cleat config --memory 4g --cpus 2`, or hand-write a `[resources]` section in `~/.config/cleat/config` or `<project>/.cleat`. The editor's choices are built from your actual machine. Cpus come from the core count Docker reports. On a VM bigger than 8 GB the memory ring climbs in real stops to the VM's size, so a 24 GB VM can be asked for all 24 GB. Past 8 GB it annotates instead of blocking, with a note that gets blunter as the number climbs and the full reason at the whole-VM value (a box that grows into everything starves the daemon and the VM's own OOM killer starts firing). Repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing. If a session is ever OOM-killed (often a test runner spawning one worker per host core), Cleat says so and how to fix it: raise `memory`, cap workers (`jest --maxWorkers=2`), or set `cpus`
+- A per-box memory ceiling (a quarter of your Docker VM's memory, clamped to 4-8 GB) with swap disabled -- a runaway process OOMs inside its own box instead of swap-thrashing every session at once. Set it with `cleat config` (the arrow-key editor has a Resources group) or `cleat config --memory 4g --cpus 2`, or hand-write a `[resources]` section in `~/.config/cleat/config` or `<project>/.cleat` (`[box.<name>.resources]` to change one box). The editor's choices are built from your actual machine. Cpus come from the core count Docker reports. On a VM bigger than 8 GB the memory ring climbs in real stops to the VM's size, so a 24 GB VM can be asked for all 24 GB. Past 8 GB it annotates instead of blocking, with a note that gets blunter as the number climbs and the full reason at the whole-VM value (a box that grows into everything starves the daemon and the VM's own OOM killer starts firing). Repo-supplied values are capped (8g memory, your core count for cpus). CPU is unlimited unless you set it -- an idle core costs nothing. If a session is ever OOM-killed (often a test runner spawning one worker per host core), Cleat says so and how to fix it: raise `memory`, cap workers (`jest --maxWorkers=2`), or set `cpus`
 - `--init` -- a real PID 1 reaps orphaned processes, so long sessions can't wedge on zombie buildup and `cleat stop` is instant
 - Numeric UID/GID validation in the entrypoint to prevent injection attacks
 - Node.js bookworm-slim base image with minimal attack surface
@@ -627,6 +631,65 @@ cleat --cap ssh start
 
 > Cloud CLI caps (`az`, `aws`, `gcloud`) and the lazy-install framework that backed them shipped in v0.11.0 / v0.12.0 and were removed after v0.12.3. They bloated first-run time without earning their weight. Install the CLI on the host and pass credentials via the `env` cap.
 
+### Per-box capabilities
+
+Every box reads the same project `.cleat`. A box that needs something different
+declares its own section, which **replaces** the project default instead of
+merging with it. That is what lets a box hold *fewer* capabilities than the
+project:
+
+```ini
+[caps]
+git
+ssh
+
+# review declares its own, so it gets git and nothing else
+[box.review.caps]
+git
+
+# declared and empty: zero capabilities
+[box.locked.caps]
+
+# only memory is declared, so cpus stays inherited
+[box.heavy.resources]
+memory = 8g
+```
+
+Comments go on their own line. A `#` after a section header is read as part of
+the header name, not as a comment.
+
+`<kind>` is `caps`, `resources`, `setup` or `fork`. A section you don't declare
+is inherited from the bare one. Declared-but-empty is a real value, not absence,
+which is what keeps a locked-down box locked down when the project later gains a
+cap. `caps`, `setup` and `fork` replace wholesale. `resources` falls back key by
+key, so declaring `memory` for a box leaves its `cpus` inherited.
+
+`cleat config <box>` edits those sections for you. Enabling a cap on a box that
+inherits materializes the inherited set first, so `--enable gh` against a project
+`[caps]` of `git ssh` writes `git ssh gh`. Edit a box back to exactly what it
+would inherit and the section is dropped, restoring inheritance. Empty a declared
+section and it keeps its bare header. `cleat config <box> --list` names the box
+and marks every value declared or inherited, so you can see at a glance which
+project edits will still reach it.
+
+Per-box sections are project-only. The global config ignores them with a warning,
+because a box name belongs to one project. Resources from a project `.cleat` are
+still clamped (8 GB memory, your daemon's core count for cpus). Per-box sections
+are clamped the same way. Environment variables are the one thing that stays in
+sidecar files: `.cleat.<box>.env`, falling back to `.cleat.env`.
+
+> **Mixed-version teams.** `.cleat` is committed. A Cleat older than this
+> release cannot see `[box.*]` sections. It falls back to `[caps]`, so a per-box
+> *reduction* reads as the permissive project set on an older CLI. That fails
+> open. If a lockdown box has to hold across a team, either make `[caps]` itself
+> the restrictive set or make sure everyone is on a current Cleat. The first time
+> a per-box section appears, `cleat config` stamps a two-line comment at the top
+> of the file naming the minimum version that reads them.
+
+> Leftover `.cleat.<box>` files from before this release are **no longer read**.
+> A box with one starts on the project defaults and says so at launch, naming the
+> sections to move its config into.
+
 ### Display categories
 
 The post-launch summary and `cleat status` group active caps by behavior:
@@ -641,24 +704,23 @@ When only one category is active the line collapses to a single coloured row. Wi
 A project's `.cleat` file lives in the repo. Whoever controls the repo controls that file. Cleat won't silently apply a `.cleat`'s capabilities on first run. Instead, on first launch inside a project with a `.cleat`, you'll see:
 
 ```
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  This project's .cleat file requests capabilities                   │
-  │  that extend what the sandbox can access on your host.              │
-  │                                                                     │
-  │  Requested:                                                         │
-  │                                                                     │
-  │    docker  Host Docker socket (breaks sandbox) to test Docker apps  │
-  │    env     Load env vars from ~/.config/cleat/env and .cleat.env    │
-  │                                                                     │
-  │  Project: /Users/you/proj                                           │
-  └─────────────────────────────────────────────────────────────────────┘
+  ▸ Project .cleat [caps] requests host access: docker, env (beyond the sandbox)
+    Trust this project's .cleat? (applies its caps; approve once, undo with cleat untrust) [y/N]
+```
 
-  Trust this project's .cleat? [y/N]:
+The prompt names the exact section being approved, so a second box asking for
+something else is never mistaken for the project default:
+
+```
+  ▸ Project .cleat [box.ci.caps] requests host access: gh (beyond the sandbox)
 ```
 
 Say yes and the approval is stored at `~/.config/cleat/trust`. Next launch, nothing to see. Cleat silently applies the caps.
 
 Approval is keyed on the **canonical list of capabilities** declared in `.cleat`, not the raw file. Comment edits and cap reordering don't invalidate trust. Adding, removing, or changing a cap triggers a re-prompt with an "…has changed since you trusted it" framing.
+
+The hash is per box, so trust rows are keyed on (project, box). Editing one box's
+section re-prompts for that box only. Every other box keeps its approval.
 
 #### Scripting & CI
 
@@ -679,7 +741,7 @@ cleat trust                           # persist for this project, once (caps and
 ```bash
 cleat trust                  # trust the current dir's .cleat
 cleat trust ~/proj           # trust a specific project
-cleat trust web              # trust the current project's "web" box (.cleat.web)
+cleat trust web              # trust the current project's "web" box ([box.web.*])
 cleat trust --list           # show all trusted projects and boxes
 cleat untrust web            # untrust just the "web" box
 cleat untrust ~/proj         # remove a project's trust entry
@@ -726,7 +788,8 @@ Setup trust is separate from capability trust. `CLEAT_TRUST_SETUP=1` (or
 `--trust-setup`) approves it non-interactively, `cleat trust` approves both
 caps and setup together and editing `[setup]` re-prompts without ever
 recreating the container. Trust is per (project, box): `cleat trust <box>`
-approves that box's `.cleat.<box>`.
+approves what that box resolves to, a `[box.<name>.setup]` section when it
+declares one, otherwise the bare `[setup]`.
 
 A failed command prints its exit code and the box still opens. Fix `.cleat`
 or the box, then retry with `cleat setup`.
@@ -823,9 +886,15 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
 ~/.config/cleat/config    ← global capabilities, [resources], [kits], [fork] dir
 ~/.config/cleat/env       ← global env vars
 ~/.config/cleat/forks/    ← fork workspace copies (default root, moved by [fork] dir)
-<project>/.cleat          ← project-level capabilities (extends global), [setup], [fork] exclude
+<project>/.cleat          ← project capabilities (extends global), [resources], [setup],
+                            [fork] exclude, plus any [box.<name>.<kind>] overrides
 <project>/.cleat.env      ← project-level env vars
+<project>/.cleat.<box>.env ← per-box env vars (falls back to .cleat.env)
 ```
+
+One project, one `.cleat`. Boxes scope their caps, resources, setup and fork
+excludes into `[box.<name>.<kind>]` sections of that file. Env vars are the
+exception and keep their own sidecar.
 
 ---
 

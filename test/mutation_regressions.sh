@@ -4384,7 +4384,7 @@ try "pbs_noop_keeps_project_caps" "no-op edit of box main never deletes" "$CLI" 
 # PICKER LOADS SCOPED: it writes back whatever it loaded, so loading the
 # project's number clears the box's own declared ceiling.
 cat > "$SED_TMP" << 'SED'
-s@    v="$(_read_section_from_file "$file" "box.${_lbox}.resources" "$key" || true)"@    v="$(_read_resource_from_file "$file" "$key" || true)"@
+s@  v="$(_read_section_from_file "$file" "$_lsec" "$key" || true)"@  v="$(_read_resource_from_file "$file" "$key" || true)"@
 SED
 try "pbs_picker_loads_scoped" "picker loads a box.s OWN declared resources" "$CLI" "$PBS_BATS"
 
@@ -4416,6 +4416,29 @@ cat > "$SED_TMP" << 'SED'
 s@^_WRITE_SECTION=""$@_WRITE_SECTION="${_WRITE_SECTION:-}"@
 SED
 try "pbs_writer_channel_hygiene" "ambient _WRITE_SECTION cannot redirect" "$CLI" "$PBS_BATS"
+
+# LIST SHOWS THE SOURCE: a box view that prints only values is indistinguishable
+# from the project's own, and the difference decides whether a later project
+# edit reaches that box.
+cat > "$SED_TMP" << 'SED'
+s@    if \[\[ -n "$_box_scope" \]\]; then\n      _cleat_section_present@    if false; then\n      _cleat_section_present@
+SED
+cat > "$SED_TMP" << 'SED'
+s@ ${DIM}(declared)${RESET}@@g
+s@ ${DIM}(inherited)${RESET}@@g
+s@ ${DIM}(declared by ${_box_scope})${RESET}@@g
+s@ ${DIM}(inherited from the project)${RESET}@@g
+SED
+try "pbs_list_shows_source" "marks each box value as declared or inherited" "$CLI" "$PBS_BATS"
+
+# PICKER LOAD USES THE WRITER'S SECTION: reading box.<box>.resources
+# unconditionally broke box `main`, whose writer targets the bare [resources]:
+# the load found nothing, the picker showed "default", and a no-op save DELETED
+# the project's [resources].
+cat > "$SED_TMP" << 'SED'
+s@  _lsec="$(_config_section_for "$file" "$_lbox" resources)"@  _lsec="box.${_lbox}.resources"@
+SED
+try "pbs_picker_load_section" "no-op picker save on main never deletes" "$CLI" "$PBS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

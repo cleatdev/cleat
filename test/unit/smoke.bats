@@ -83,6 +83,24 @@ cleat_bin_timeout() {
     "$CLI" "$@"
 }
 
+# Run an ARBITRARY cleat binary (a copy of it, or a symlink to one) as a real
+# subprocess with the same isolated env cleat_bin uses. Lets a test exercise a
+# different INSTALL SHAPE, e.g. a Homebrew keg, where the path the binary is
+# reached through is the thing under test.
+# Signature: cleat_bin_at PATH [ARGS...]
+cleat_bin_at() {
+  local bin="$1"; shift
+  env \
+    PATH="$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE="${DOCKER_EXIT_CODE:-0}" \
+    DOCKER_STDERR="${DOCKER_STDERR:-}" \
+    "$bin" "$@"
+}
+
 # ── Help and version ────────────────────────────────────────────────────────
 
 @test "smoke: cleat --help exits 0 under strict mode" {
@@ -121,6 +139,33 @@ cleat_bin_timeout() {
   run cleat_bin version
   assert_success
   assert_output --partial "cleat"
+}
+
+# ── cleat update on a Homebrew install ──────────────────────────────────────
+
+@test "smoke: cleat update refuses on a real Homebrew keg layout" {
+  # Build the actual install shape a formula produces: the whole tree under
+  # libexec inside the keg, the receipt at the keg root, and bin/cleat a
+  # RELATIVE symlink into it. The binary is copied (not linked) because the
+  # physical file has to live in the Cellar for the detector to be exercised
+  # honestly. Then run it through the symlink, which is what a user's PATH
+  # hits and what BASH_SOURCE reports.
+  local keg="$TEST_TEMP/hb/Cellar/cleat/9.9.9"
+  mkdir -p "$keg/libexec/bin" "$TEST_TEMP/hb/bin"
+  cp "$CLI" "$keg/libexec/bin/cleat"
+  echo '{}' > "$keg/INSTALL_RECEIPT.json"
+  ln -s "../Cellar/cleat/9.9.9/libexec/bin/cleat" "$TEST_TEMP/hb/bin/cleat"
+
+  run cleat_bin_at "$TEST_TEMP/hb/bin/cleat" update
+  assert_failure
+  assert_output --partial "Installed via Homebrew"
+  assert_output --partial "brew upgrade cleatdev/tap/cleat"
+  # The generic no-git branch and its curl hint would wreck this install.
+  refute_output --partial "not a git installation"
+  refute_output --partial "install.sh"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+  refute_output --partial "syntax error"
 }
 
 # ── Release highlight (strict-mode body coverage) ────────────────────────────

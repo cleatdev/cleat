@@ -552,6 +552,66 @@ require_running() {
   fi
 }
 
+# Resolve a symlink chain down to the physical file, portably. BSD readlink
+# (macOS before 12.3) has no usable -f, so the chain is walked by hand: a
+# relative target resolves against the link's OWN directory, and the closing
+# `pwd -P` collapses both the `..` segments a Homebrew symlink is made of and
+# any symlinked parent directory. The hop cap means a symlink cycle can never
+# hang the CLI. A path that does not exist (or whose directory is unreadable)
+# comes back unchanged: callers only pattern-match the result.
+_resolve_physical_path() {
+  local p="${1:-}" target dir hops=0
+  while [[ -L "$p" && $hops -lt 40 ]]; do
+    target="$(readlink "$p" 2>/dev/null)" || break
+    [[ -n "$target" ]] || break
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  if [[ -e "$p" ]]; then
+    dir="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || dir=""
+    if [[ -n "$dir" ]]; then
+      # Trimming a trailing slash keeps a root-level file as /cleat, not //cleat.
+      printf '%s/%s\n' "${dir%/}" "$(basename "$p")"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$p"
+}
+
+# True when the cleat at $1 is a Homebrew keg install. The signal is where the
+# PHYSICAL file lives (a path segment named Cellar, or the keg's
+# INSTALL_RECEIPT.json a couple of levels above it), never the directory the
+# command was invoked through: /usr/local/bin is BOTH Homebrew's bin on an
+# Intel Mac and install.sh's symlink target, so the directory proves nothing.
+# Deliberately never shells out to `brew` and never reads $HOMEBREW_PREFIX:
+# both are absent unless the user ran `eval "$(brew shellenv)"`, which plenty
+# of Intel-Mac setups never did and a cron or non-login shell never has. The
+# path is a parameter so the caller decides what gets probed.
+_is_brew_managed() {
+  [[ -n "${1:-}" ]] || return 1
+  local phys dir hops=0
+  phys="$(_resolve_physical_path "$1")"
+  case "$phys" in
+    */Cellar/*) return 0 ;;
+  esac
+  # Second signal: the keg receipt at the keg root, which sits a short way
+  # above the binary (bin/ under libexec/ under the keg, so three levels).
+  # Bounded at 4: enough for that layout with one to spare, and short enough
+  # to stay near the install. Homebrew writes this file at a keg root and
+  # nowhere else, so a hit anywhere in that range means a keg.
+  dir="$(dirname "$phys")"
+  while [[ $hops -lt 4 ]]; do
+    [[ -f "$dir/INSTALL_RECEIPT.json" ]] && return 0
+    [[ "$dir" == "/" || "$dir" == "." ]] && break
+    dir="$(dirname "$dir")"
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
 # ── Host connectivity ────────────────────────────────────────────────────
 # Docker Desktop (macOS/Windows) provides host.docker.internal automatically.
 # On Linux with Docker Engine, we need --add-host for it.
@@ -11771,6 +11831,19 @@ cmd_version() {
 }
 
 cmd_update() {
+  # A Homebrew keg has no .git, so without this the generic branch below would
+  # tell a brew user to re-install with the curl script. That advice destroys
+  # their install: install.sh clones to ~/.cleat and symlinks over
+  # /usr/local/bin/cleat, which on an Intel Mac IS Homebrew's own bin, leaving
+  # a forked copy and a stale, formula-orphaned keg. Refuse instead, and hand
+  # the update back to brew. The image side needs nothing here: the next
+  # session start re-checks it against the new version.
+  if _is_brew_managed "${BASH_SOURCE[0]}"; then
+    error "Installed via Homebrew: cleat update does not manage this install."
+    echo -e "    ${DIM}Update with: brew upgrade cleatdev/tap/cleat${RESET}"
+    exit 1
+  fi
+
   info "Checking for updates..."
 
   if [[ ! -d "$REPO_DIR/.git" ]]; then

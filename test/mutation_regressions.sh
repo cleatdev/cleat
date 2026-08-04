@@ -62,6 +62,7 @@ NUKE_BATS="$REPO_ROOT/test/unit/nuke.bats"
 HUMAN_SIZE_BATS="$REPO_ROOT/test/unit/human_size.bats"
 DISK_GATE_BATS="$REPO_ROOT/test/unit/disk_gate.bats"
 STORAGE_BATS="$REPO_ROOT/test/unit/storage.bats"
+UPDATE_BATS="$REPO_ROOT/test/unit/update.bats"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -4439,6 +4440,24 @@ cat > "$SED_TMP" << 'SED'
 s@  _lsec="$(_config_section_for "$file" "$_lbox" resources)"@  _lsec="box.${_lbox}.resources"@
 SED
 try "pbs_picker_load_section" "no-op picker save on main never deletes" "$CLI" "$PBS_BATS"
+
+# BREW GUARD WIRED: unwired, a Homebrew install falls into the generic no-git
+# branch, whose curl re-install hint symlinks over Homebrew's own bin on an
+# Intel Mac and orphans the keg. Neutered rather than deleted: dropping the
+# `if` line alone leaves a dangling `fi` and the harness would skip it as a
+# syntax error instead of judging it.
+cat > "$SED_TMP" << 'SED'
+s@if _is_brew_managed.*then@if false; then@
+SED
+try "vnext_brew_guard_wired" "refuses to self-update a Homebrew install" "$CLI" "$UPDATE_BATS"
+
+# CELLAR PATTERN: the keg is recognised by the physical file living under a
+# Cellar path segment. Point that pattern at something no path ever contains
+# and every real brew install reads as a plain git checkout again.
+cat > "$SED_TMP" << 'SED'
+s@    \*/Cellar/\*) return 0 ;;@    */NeverAHomebrewCellar/*) return 0 ;;@
+SED
+try "vnext_brew_guard_cellar_pattern" "detects a keg through the bin symlink" "$CLI" "$UPDATE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -91,6 +91,22 @@ _assert_run_dir_is_safe() {
   case "$home_real/" in
     "$real"/*) echo "${RED}Refusing: the run directory contains your home directory${RESET}" >&2; exit 1 ;;
   esac
+
+  # OWN IT, do not merely accept it. _safe_rm is correct, but its whole premise
+  # is "this directory is ours", and nothing established that. Pointed at a
+  # directory you already use, the checks rm -rf fixed names inside it
+  # (projects/bom, projects/pbx-mem, canary, ...) and still printed all green.
+  # So: an existing NON-EMPTY directory must carry our marker or we refuse.
+  local marker="$real/.cleat-verify-runroot"
+  if [[ ! -f "$marker" ]]; then
+    if [[ -n "$(ls -A "$real" 2>/dev/null)" ]]; then
+      echo "${RED}Refusing: $real already has content and was not created by this script.${RESET}" >&2
+      echo "Point CLEAT_VERIFY_DIR at a new or empty directory. This script deletes" >&2
+      echo "fixed names inside its run dir, so it will not adopt one of yours." >&2
+      exit 1
+    fi
+    printf 'cleat verify run root. Safe to delete.\n' > "$marker"
+  fi
 }
 
 # Every delete goes through this. Physical resolution, then containment, so a
@@ -423,21 +439,31 @@ check_06_session_key() {
 
 check_03_nuke_keeps_forks() {
   _gate 03 "Scenario 3: nuke keeps fork copies and their markers" \
-    "cleat nuke removes EVERY cleat container and image on this host, which" \
-    "XDG_CONFIG_HOME does not isolate, so the script will not run it for you." \
+    "${RED}READ THIS BEFORE YOU RUN IT.${RESET} cleat nuke is HOST-WIDE. XDG_CONFIG_HOME" \
+    "does NOT isolate any of the destructive half. Running it will:" \
     "" \
-    "If you want this check, run it yourself against the isolated state:" \
-    "  export XDG_CONFIG_HOME=$XDG_CONFIG_HOME" \
-    "  cd $RUN_DIR/projects && mkdir -p nuketest && cd nuketest && git init -q" \
-    "  $CLI_BIN fork run feat" \
-    "  echo work > \"\$($CLI_BIN fork path feat)/WIP.txt\"" \
-    "  $CLI_BIN rm feat && $CLI_BIN nuke        # type: nuke" \
+    "  - docker rm -f EVERY container named cleat-*, on this whole machine," \
+    "    including their writable layers (anything installed in a box, an az" \
+    "    login, uncommitted work in a non-fork box)" \
+    "  - delete the cleat image" \
+    "  - run 'docker builder prune -f', which wipes the build cache SHARED with" \
+    "    every other Docker project you have, nothing to do with cleat" \
     "" \
-    "Expect a line saying it KEPT the copies, then confirm:" \
-    "  ls $XDG_CONFIG_HOME/cleat/boxes/*.fork      # marker survived" \
-    "  cat $XDG_CONFIG_HOME/cleat/forks/*feat/WIP.txt   # work survived" \
+    "See exactly what you would destroy first:" \
+    "  docker ps -a --filter name=^cleat-" \
     "" \
-    "Or skip it: this script's remaining checks do not depend on it."
+    "${DIM}Skipping this is the normal choice. No later check depends on it.${RESET}" \
+    "" \
+    "If you do want it, in a THROWAWAY shell (the export leaks otherwise):" \
+    "  ( export XDG_CONFIG_HOME=$XDG_CONFIG_HOME" \
+    "    cd $RUN_DIR/projects && mkdir -p nuketest && cd nuketest && git init -q" \
+    "    $CLI_BIN fork run feat" \
+    "    echo work > \"\$($CLI_BIN fork path feat)/WIP.txt\"" \
+    "    $CLI_BIN rm feat && $CLI_BIN nuke )      # type: nuke" \
+    "" \
+    "Then confirm the copies and markers SURVIVED the nuke:" \
+    "  ls $XDG_CONFIG_HOME/cleat/boxes/*.fork" \
+    "  cat $XDG_CONFIG_HOME/cleat/forks/*feat/WIP.txt"
 }
 
 # ── report ──────────────────────────────────────────────────────────────────

@@ -490,8 +490,12 @@ teardown() { _common_teardown; }
   printf '[caps]\ngit\n' > "$F"
   cmd_config dev --enable docker >/dev/null
   run head -2 "$F"
-  assert_output --partial "cleat >="
+  assert_output --partial "Per-box config"
   assert_output --partial "Older versions ignore them"
+  # No version number: VERSION is the release being RUN, which at first-write is
+  # still the last one that CANNOT read sections, so naming it said the opposite
+  # of the truth in a file the user commits.
+  refute_output --partial "cleat >="
 }
 
 @test "sections: the compatibility note is written once, not on every edit" {
@@ -500,7 +504,7 @@ teardown() { _common_teardown; }
   cmd_config dev --enable docker >/dev/null
   cmd_config dev --enable gh >/dev/null
   cmd_config other --memory 4g >/dev/null
-  run grep -c '^# cleat >= ' "$F"
+  run grep -c '^# Per-box config' "$F"
   assert_output "1"
 }
 
@@ -508,7 +512,7 @@ teardown() { _common_teardown; }
   cd "$PROJECT"
   printf '[caps]\ngit\n' > "$F"
   cmd_config --project --enable ssh >/dev/null 2>&1 || true
-  run grep -c '^# cleat >= ' "$F"
+  run grep -c '^# Per-box config' "$F"
   assert_output "0"
 }
 

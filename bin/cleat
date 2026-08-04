@@ -1438,11 +1438,15 @@ _config_section_for() {
 _config_note_sections_version() {
   local file="$1"
   [[ -r "$file" ]] || return 0
-  grep -q '^# cleat >= ' "$file" 2>/dev/null && return 0
+  grep -q '^# Per-box config' "$file" 2>/dev/null && return 0
   grep -q '^\[box\.' "$file" 2>/dev/null || return 0
   local tmp="${file}.cleat-note.$$"
   {
-    echo "# cleat >= ${VERSION} reads [box.<name>.<kind>] sections."
+    # No version number. VERSION is the release being RUN, and at the moment a
+    # file first grows a section that is still the last release that CANNOT read
+    # one, so naming it stated the exact opposite of the truth in a file the user
+    # then commits. The warning that matters does not need a number.
+    echo "# Per-box config: [box.<name>.<kind>] sections, read by newer Cleat."
     echo "# Older versions ignore them and apply [caps] to every box."
     cat "$file"
   } > "$tmp" && mv -f "$tmp" "$file" || rm -f "$tmp" 2>/dev/null || true

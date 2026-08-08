@@ -171,6 +171,10 @@ want_nofile(){ [[ ! -e "$2" ]] && ok "$1" "$3" || bad "$1" "$3" "file should not
 # exits 10. Re-run with --resume and it picks up after that step.
 _gate() {   # id  title  instructions...
   local id="$1" title="$2"; shift 2
+  # Already satisfied on an earlier run: fall through so the assertions AFTER
+  # the gate actually execute. Marking the CHECK done here meant --resume
+  # skipped the entire function and the thing you just set up was never tested.
+  _is_done "gate:$id" && return 0
   _manual=$((_manual+1))
   _record "$id" MANUAL "$title" ""
   echo ""
@@ -178,8 +182,8 @@ _gate() {   # id  title  instructions...
   local line
   for line in "$@"; do echo "      $line"; done
   echo ""
-  echo "      ${DIM}Then: $0 --resume${RESET}"
-  _mark_done "$id"
+  echo "      ${DIM}Then: cd $REPO_ROOT && ./cli/test/manual/verify.sh --resume${RESET}"
+  _mark_done "gate:$id"
   _write_report
   exit 10
 }
@@ -346,20 +350,38 @@ check_27_legacy_file_announced() {
 }
 
 check_28_trust_per_box() {
+  # Asserts the STORED HASHES directly rather than eyeballing `trust --list`
+  # output for "did it change". The old version compared two renderings and
+  # SKIPPED itself when they happened to look the same, which is a test that
+  # reports nothing rather than a test that fails.
   local p; p="$(new_project pbx-trust)"
   printf '[caps]\ngit\n[box.ci.caps]\ndocker\n' > "$p/.cleat"
-  local h_main h_ci h_main2
-  h_main="$(cd "$p" && CLEAT_VERIFY_HASH=1 "$CLI_BIN" config --project --list >/dev/null 2>&1; echo)"
-  # hashes are internal, so assert the OBSERVABLE property: editing one box's
-  # section must not disturb another box's stored trust decision.
-  ( cd "$p" && C trust ci >/dev/null 2>&1 ) || true
+  local tf="$XDG_CONFIG_HOME/cleat/trust"
   ( cd "$p" && C trust main >/dev/null 2>&1 ) || true
-  local before; before="$(cd "$p" && CO trust --list)"
+  ( cd "$p" && C trust ci   >/dev/null 2>&1 ) || true
+  local main_before ci_before main_after ci_after
+  main_before="$(awk -F'\t' -v p="$p" '$1==p && $2=="main" {print $3}' "$tf" 2>/dev/null)"
+  ci_before="$(  awk -F'\t' -v p="$p" '$1==p && $2=="ci"   {print $3}' "$tf" 2>/dev/null)"
+
+  [[ -n "$main_before" && -n "$ci_before" ]] \
+    && ok 28a "each box gets its own trust row" \
+    || bad 28a "each box gets its own trust row" "main=[$main_before] ci=[$ci_before] in $tf"
+  [[ "$main_before" != "$ci_before" ]] \
+    && ok 28b "a declaring box hashes differently from the project default" \
+    || bad 28b "a declaring box hashes differently from the project default" "both are [$main_before]"
+
+  # now change ONLY the ci section and re-approve both
   printf '[caps]\ngit\n[box.ci.caps]\ndocker\nssh\n' > "$p/.cleat"
-  local after; after="$(cd "$p" && CO trust --list)"
-  want_not 28a "$before" "PLACEHOLDER-NEVER" "trust --list runs"
-  [[ "$before" != "$after" ]] && ok 28b "editing one box's caps changes only that box's trust state" \
-    || skip 28b "editing one box's caps changes its trust state" "trust --list output did not change, inspect manually"
+  ( cd "$p" && C trust main >/dev/null 2>&1 ) || true
+  ( cd "$p" && C trust ci   >/dev/null 2>&1 ) || true
+  main_after="$(awk -F'\t' -v p="$p" '$1==p && $2=="main" {print $3}' "$tf" 2>/dev/null)"
+  ci_after="$(  awk -F'\t' -v p="$p" '$1==p && $2=="ci"   {print $3}' "$tf" 2>/dev/null)"
+  [[ "$main_after" == "$main_before" ]] \
+    && ok 28c "editing one box does NOT disturb another box's approval" \
+    || bad 28c "editing one box does NOT disturb another box's approval" "main moved $main_before -> $main_after"
+  [[ "$ci_after" != "$ci_before" ]] \
+    && ok 28d "and the edited box IS re-hashed" \
+    || bad 28d "and the edited box IS re-hashed" "ci stayed [$ci_before]"
 }
 
 check_30_global_refuses_and_typo_warns() {
@@ -407,7 +429,6 @@ check_02_fork_containment() {
   local canary="$RUN_DIR/canary"; mkdir -p "$canary"; echo precious > "$canary/thesis.txt"
   local forks="$XDG_CONFIG_HOME/cleat/forks"; mkdir -p "$forks"
   # a real-looking copy so the '..' walk has a first component that exists
-  local cname; cname="$(cd "$p" && C describe x 2>/dev/null | head -0; echo)"
   mkdir -p "$forks/cleat-fork-contain-deadbeef-x"
   out="$(cd "$p" && CO fork rm 'x/../../../../../canary')"; rc=$?
   want_eq 02a "$rc" "1" "a box name that walks out of the fork root is refused"
@@ -507,6 +528,18 @@ _write_report() {
 }
 
 _summary() {
+  # Counted from the results file, not from this process's counters: a resumed
+  # run starts them at zero, so the last leg reported "0 passed" for a session
+  # that had 42 greens in it.
+  # No `|| echo 0`: grep -c PRINTS 0 and EXITS 1 when it matches nothing, so the
+  # fallback appended a second zero and the count became "0\n0", which then blew
+  # up the arithmetic below. Count with awk, which has one exit status.
+  if [[ -s "$RESULTS" ]]; then
+    _pass="$(awk -F'\t' '$2=="PASS"{n++} END{print n+0}' "$RESULTS")"
+    _fail="$(awk -F'\t' '$2=="FAIL"{n++} END{print n+0}' "$RESULTS")"
+    _skip="$(awk -F'\t' '$2=="SKIP"{n++} END{print n+0}' "$RESULTS")"
+    _manual="$(awk -F'\t' '$2=="MANUAL"{n++} END{print n+0}' "$RESULTS")"
+  fi
   _write_report
   echo ""
   echo "  ${BOLD}${_pass} passed${RESET}  ${_fail} failed  ${_skip} skipped  ${_manual} waiting on you"

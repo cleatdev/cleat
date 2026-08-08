@@ -49,6 +49,7 @@ _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$_here/../../.." && pwd)"
 CLI_BIN="${CLEAT_VERIFY_BIN:-$REPO_ROOT/cli/bin/cleat}"
 RUN_DIR="${CLEAT_VERIFY_DIR:-${TMPDIR:-/tmp}/cleat-verify}"
+RUN_DIR="$(printf '%s' "$RUN_DIR" | sed 's|//*|/|g; s|/$||')"
 # The report lands inside the repo so it can be read from wherever you are
 # working, including an agent in a container with the repo bind-mounted.
 REPORT_DIR="$REPO_ROOT/.cleat-verify"
@@ -556,16 +557,34 @@ check_08_fork_dead_end() {
 check_14_fork_path_capturable() {
   # THE bug this subcommand exists to avoid: tput wrote its cursor-restore
   # escape to STDOUT, so `cd "$(cleat fork path feat)"` got the path, a newline
-  # and then [?12l[?25h, and cd failed.
+  # and then the escape, and cd failed.
   local p copy out; p="$(new_project forkpath)"
   copy="$(_fake_fork "$p" feat)"
+  # Guarded on a NON-EMPTY setup and a NON-EMPTY capture. Without that every
+  # assertion here degenerates to green when fork path prints nothing:
+  # want_eq "" "" matches, `case "" in *ESC*` cannot match, and bash `cd ""`
+  # silently returns 0. The check that guards `cd "$(cleat fork path feat)"`
+  # was reporting 3/3 while testing nothing at all.
+  if [[ -z "$copy" ]]; then
+    bad 14a "fork path prints the bare path and nothing else" "setup failed: no container name"
+    bad 14b "no terminal escapes reach stdout" "setup failed"
+    bad 14c "and the captured value is usable with cd" "setup failed"
+    return 0
+  fi
   out="$(cd "$p" && "$CLI_BIN" fork path feat 2>/dev/null)"
+  if [[ -z "$out" ]]; then
+    bad 14a "fork path prints the bare path and nothing else" "printed nothing at all"
+    bad 14b "no terminal escapes reach stdout" "nothing captured to check"
+    bad 14c "and the captured value is usable with cd" "nothing captured to cd into"
+    return 0
+  fi
   want_eq 14a "$out" "$copy" "fork path prints the bare path and nothing else"
   case "$out" in
     *$'\033'*) bad 14b "no terminal escapes reach stdout" "found an escape byte" ;;
     *)          ok  14b "no terminal escapes reach stdout" ;;
   esac
-  ( cd "$out" ) 2>/dev/null && ok 14c "and the captured value is usable with cd"     || bad 14c "and the captured value is usable with cd" "cd into [$out] failed"
+  ( cd "$out" ) 2>/dev/null && ok 14c "and the captured value is usable with cd" \
+    || bad 14c "and the captured value is usable with cd" "cd into [$out] failed"
 }
 
 check_17_interrupted_copies() {
@@ -605,14 +624,19 @@ check_21_older_cleat_fails_open() {
   # Cleat cannot see [box.*] sections, falls back to [caps], and therefore gives
   # a locked-down box MORE than intended. This check exists to prove that is
   # still true, so nobody assumes a reduction is safe on a mixed-version team.
+  # ALWAYS re-extract, and check what came out. Trusting the -x bit meant an
+  # executable already sitting at that path was run instead, and never
+  # refreshed: a planted script, or a truncated earlier extraction, would be
+  # executed forever. The shebang test closes the not-a-script case too.
   local old="$RUN_DIR/cleat-old"
-  if [[ ! -x "$old" ]]; then
-    ( cd "$REPO_ROOT/cli" && git show v1.3.1:bin/cleat ) > "$old" 2>/dev/null && chmod +x "$old"
-  fi
-  if [[ ! -s "$old" ]]; then
-    skip 21 "a per-box lockdown on an older Cleat fails OPEN" "could not extract v1.3.1 from git"
+  _safe_rm "$old"
+  ( cd "$REPO_ROOT/cli" && git show v1.3.1:bin/cleat ) > "$old" 2>/dev/null || true
+  if [[ ! -s "$old" ]] || ! head -1 "$old" | grep -q '^#!.*sh'; then
+    _safe_rm "$old"
+    skip 21 "a per-box lockdown on an older Cleat fails OPEN" "could not extract a usable v1.3.1 from git"
     return 0
   fi
+  chmod +x "$old"
   local p; p="$(new_project failopen)"
   printf '[caps]\ngit\ndocker\n[box.locked.caps]\n' > "$p/.cleat"
   local new_out old_out
@@ -650,8 +674,12 @@ check_15_idle_sweep_shell() {
     "  cd $RUN_DIR/projects && mkdir -p sweeptest && cd sweeptest && git init -q" \
     "  $CLI_BIN fork run feat && $CLI_BIN shell feat" \
     "" \
-    "Leave that shell OPEN. In another terminal, past the grace window, run" \
-    "\`$CLI_BIN start\` in a DIFFERENT project to trigger the sweep." \
+    "Leave that shell OPEN. In another terminal, past the grace window:" \
+    "  XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN start   # from ANOTHER project" \
+    "" \
+    "${AMBER}Keep the XDG prefix on that command.${RESET} The sweep enumerates with" \
+    "docker ps --filter label=sh.cleat.version, which is HOST-WIDE, so running it" \
+    "without the prefix can stop your REAL boxes instead of the test one." \
     "" \
     "The feat box must still be running when you come back to it. While attached:" \
     "  ls $XDG_CONFIG_HOME/cleat/run/*feat/.attached.*   # the claim marker" \

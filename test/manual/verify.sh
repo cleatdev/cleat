@@ -487,6 +487,212 @@ check_03_nuke_keeps_forks() {
     "  cat $XDG_CONFIG_HOME/cleat/forks/*feat/WIP.txt"
 }
 
+# Some checks need a live daemon (prune refuses without one, by design). Skip
+# cleanly rather than reporting a failure that is really an environment fact.
+_need_daemon() {   # id  title
+  _daemon_up && return 0
+  skip "$1" "$2" "needs a running Docker daemon"
+  return 1
+}
+
+# A fork copy and its marker, made directly. Lets the copy-shaped checks run
+# without creating a container, which is both faster and safer.
+_fake_fork() {   # project  box -> echoes the copy dir
+  local proj="$1" box="${2:-main}" cname copy
+  # ASK THE CLI for the container name rather than re-deriving it. An earlier
+  # version rebuilt container_name_for by hand (basename, tr, sed, md5) and
+  # skipped its 48-char truncation and trailing-dash strip, so a long project
+  # name would have silently pointed these checks at a directory the CLI does
+  # not use. `cleat status <box>` prints the real name and cannot drift.
+  cname="$(cd "$proj" && CO status "$box" 2>/dev/null | awk '/Container:/ {print $NF; exit}')"
+  if [[ -z "$cname" ]]; then
+    echo "${RED}could not resolve the container name for box $box${RESET}" >&2
+    return 1
+  fi
+  copy="$XDG_CONFIG_HOME/cleat/forks/$cname"
+  mkdir -p "$copy" "$XDG_CONFIG_HOME/cleat/boxes"
+  : > "$XDG_CONFIG_HOME/cleat/boxes/${cname}.fork"
+  printf '%s' "$copy"
+}
+
+check_04_prune_owns_only_its_own() {
+  _need_daemon 04 "fork prune only touches its own directories" || return 0
+  local forks="$XDG_CONFIG_HOME/cleat/forks"; mkdir -p "$forks"
+  mkdir -p "$forks/my-notes" "$forks/cleat-orphan-11112222-main"
+  echo keep > "$forks/my-notes/x.txt"
+  local p; p="$(new_project prune-own)"
+  ( cd "$p" && C fork prune --yes >/dev/null 2>&1 )
+  want_file  04a "$forks/my-notes/x.txt" "a directory that is not a cleat copy is left alone"
+  want_nofile 04b "$forks/cleat-orphan-11112222-main" "while a real orphan copy is reclaimed"
+  _safe_rm "$forks/my-notes"
+}
+
+check_07_status_box_positional() {
+  local p out; p="$(new_project statusbox)"
+  out="$(cd "$p" && CO status feat-a)"
+  want     07a "$out" "$p" "cleat status <box> reports THIS project, not a phantom one"
+  want_not 07b "$out" "Project:   feat-a" "and never a directory that does not exist"
+  local q; q="$(new_project statusbox2)"
+  out="$(cd "$p" && CO status "$q")"
+  want     07c "$out" "$q" "a real path still works as a project argument"
+  out="$(cd "$p" && CO status "Bad Name")"; local rc=$?
+  want     07d "$out" "Invalid box name" "and an invalid box name is refused"
+}
+
+check_08_fork_dead_end() {
+  # The fix, exercised without a container: a marker whose copy is gone must be
+  # droppable. Before it, cleat rm kept the marker and cleat fork rm bailed on
+  # the missing directory, so the box was unstartable with no way out.
+  local p copy out; p="$(new_project deadend)"
+  copy="$(_fake_fork "$p" feat)"
+  _safe_rm "$copy"                       # marker survives, copy is gone
+  out="$(cd "$p" && CO fork rm feat)"
+  want 08a "$out" "marker cleared" "cleat fork rm drops a marker whose copy is gone"
+  want_nofile 08b "$XDG_CONFIG_HOME/cleat/boxes/$(basename "$copy").fork" "and the marker is really removed"
+  out="$(cd "$p" && CO fork rm feat)"
+  want 08c "$out" "No fork workspace" "a second call correctly reports nothing to drop"
+}
+
+check_14_fork_path_capturable() {
+  # THE bug this subcommand exists to avoid: tput wrote its cursor-restore
+  # escape to STDOUT, so `cd "$(cleat fork path feat)"` got the path, a newline
+  # and then [?12l[?25h, and cd failed.
+  local p copy out; p="$(new_project forkpath)"
+  copy="$(_fake_fork "$p" feat)"
+  out="$(cd "$p" && "$CLI_BIN" fork path feat 2>/dev/null)"
+  want_eq 14a "$out" "$copy" "fork path prints the bare path and nothing else"
+  case "$out" in
+    *$'\033'*) bad 14b "no terminal escapes reach stdout" "found an escape byte" ;;
+    *)          ok  14b "no terminal escapes reach stdout" ;;
+  esac
+  ( cd "$out" ) 2>/dev/null && ok 14c "and the captured value is usable with cd"     || bad 14c "and the captured value is usable with cd" "cd into [$out] failed"
+}
+
+check_17_interrupted_copies() {
+  _need_daemon 17 "interrupted copies are reclaimed" || return 0
+  local forks="$XDG_CONFIG_HOME/cleat/forks"; mkdir -p "$forks/.tmp.999999/src"
+  echo half > "$forks/.tmp.999999/src/a"
+  local p out; p="$(new_project interrupted)"
+  out="$(cd "$p" && CO fork)"
+  want_not 17a "$out" ".tmp." "a staging tree is not listed as a workspace copy"
+  out="$(cd "$p" && CO fork prune --yes)"
+  want        17b "$out" "interrupted" "and prune reports reclaiming it"
+  want_nofile 17c "$forks/.tmp.999999" "and it is actually gone"
+}
+
+check_18_trust_hash_recorded() {
+  local p; p="$(new_project trusthash)"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  ( cd "$p" && C trust >/dev/null 2>&1 ) || true
+  local tf="$XDG_CONFIG_HOME/cleat/trust" before after
+  before="$(awk -F'\t' -v q="$p" '$1==q {print $3}' "$tf" 2>/dev/null | head -1)"
+  [[ -n "$before" ]] && ok 18a "approving a project records a caps hash" \
+    || bad 18a "approving a project records a caps hash" "no row for $p in $tf"
+  # a comment-only edit must NOT invalidate the approval
+  printf '[caps]\ngit\n# just a comment\n' > "$p/.cleat"
+  ( cd "$p" && C trust >/dev/null 2>&1 ) || true
+  after="$(awk -F'\t' -v q="$p" '$1==q {print $3}' "$tf" 2>/dev/null | head -1)"
+  want_eq 18b "$after" "$before" "a comment-only edit does not change the recorded hash"
+  # adding a capability MUST
+  printf '[caps]\ngit\nssh\n' > "$p/.cleat"
+  ( cd "$p" && C trust >/dev/null 2>&1 ) || true
+  after="$(awk -F'\t' -v q="$p" '$1==q {print $3}' "$tf" 2>/dev/null | head -1)"
+  [[ "$after" != "$before" ]] && ok 18c "but adding a capability does"     || bad 18c "but adding a capability does" "hash stayed [$before]"
+}
+
+check_21_older_cleat_fails_open() {
+  # The one compatibility fact worth seeing rather than being told. An older
+  # Cleat cannot see [box.*] sections, falls back to [caps], and therefore gives
+  # a locked-down box MORE than intended. This check exists to prove that is
+  # still true, so nobody assumes a reduction is safe on a mixed-version team.
+  local old="$RUN_DIR/cleat-old"
+  if [[ ! -x "$old" ]]; then
+    ( cd "$REPO_ROOT/cli" && git show v1.3.1:bin/cleat ) > "$old" 2>/dev/null && chmod +x "$old"
+  fi
+  if [[ ! -s "$old" ]]; then
+    skip 21 "a per-box lockdown on an older Cleat fails OPEN" "could not extract v1.3.1 from git"
+    return 0
+  fi
+  local p; p="$(new_project failopen)"
+  printf '[caps]\ngit\ndocker\n[box.locked.caps]\n' > "$p/.cleat"
+  local new_out old_out
+  new_out="$(cd "$p" && CO config locked --list)"
+  old_out="$(cd "$p" && "$old" config locked --list 2>&1 | _strip)"
+  want_not 21a "$new_out" "[✔] docker" "this Cleat honours the lockdown"
+  want     21b "$old_out" "[✔] docker" "an older Cleat gives the box the project caps instead"
+  ok 21c "so a per-box REDUCTION fails OPEN on an older CLI, as documented"
+}
+
+check_29_per_box_setup_and_fork() {
+  local p out; p="$(new_project pbx-setupfork)"
+  printf '[setup]\nmake bootstrap\n[box.ci.setup]\nnpm ci\n' > "$p/.cleat"
+  out="$(cd "$p" && CO setup ci --show)"
+  want     29a "$out" "npm ci" "a per-box [setup] is what the box would run"
+  want_not 29b "$out" "make bootstrap" "and it REPLACES the project setup"
+  out="$(cd "$p" && CO setup --show)"
+  want     29c "$out" "make bootstrap" "while the project keeps its own"
+
+  # [fork] excludes, through a real refresh so no container is needed
+  local q copy; q="$(new_project pbx-forkex)"
+  mkdir -p "$q/node_modules/pkg" "$q/target"; echo dep > "$q/node_modules/pkg/i.js"
+  printf '[fork]\nexclude = node_modules\n[box.ci.fork]\nexclude = target\n' > "$q/.cleat"
+  copy="$(_fake_fork "$q" ci)"
+  ( cd "$q" && printf 'y\n' | C fork refresh ci >/dev/null 2>&1 )
+  want_nofile 29d "$copy/target" "a per-box [fork] exclude is applied"
+  want_file   29e "$copy/node_modules/pkg/i.js" "and it REPLACES the project exclude"
+}
+
+check_15_idle_sweep_shell() {
+  _gate 15 "Scenario 15: the idle sweep leaves an open shell alone" \
+    "Needs a shell held open past the idle grace window, so a script cannot do it." \
+    "" \
+    "  export XDG_CONFIG_HOME=$XDG_CONFIG_HOME" \
+    "  cd $RUN_DIR/projects && mkdir -p sweeptest && cd sweeptest && git init -q" \
+    "  $CLI_BIN fork run feat && $CLI_BIN shell feat" \
+    "" \
+    "Leave that shell OPEN. In another terminal, past the grace window, run" \
+    "\`$CLI_BIN start\` in a DIFFERENT project to trigger the sweep." \
+    "" \
+    "The feat box must still be running when you come back to it. While attached:" \
+    "  ls $XDG_CONFIG_HOME/cleat/run/*feat/.attached.*   # the claim marker" \
+    "" \
+    "${DIM}Skipping is fine: a unit test covers the marker logic.${RESET}"
+}
+
+check_16_claude_commands_symlink() {
+  _gate 16 "Scenario 16: a symlink inside ~/.claude/commands" \
+    "This one is DELIBERATELY not automated. It has to plant a symlink in your" \
+    "REAL ~/.claude/commands, and this script's whole safety model is that it" \
+    "never writes there. So it is yours to run, or to skip." \
+    "" \
+    "  mkdir -p ~/.claude/commands/deploy" \
+    "  ln -s ~/.ssh ~/.claude/commands/deploy/keys" \
+    "  cd $RUN_DIR/projects && mkdir -p symtest && cd symtest && git init -q" \
+    "  XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN run" \
+    "" \
+    "Then the property that matters, that no real key BYTES were copied:" \
+    "  ls -l $XDG_CONFIG_HOME/cleat/run/*symtest*/kit/commands/deploy/   # keys must be a SYMLINK" \
+    "  grep -rl 'PRIVATE KEY' $XDG_CONFIG_HOME/cleat/run/*symtest*/kit/commands/ ; echo \"exit=\$?\"" \
+    "" \
+    "Clean up:  rm -rf ~/.claude/commands/deploy"
+}
+
+check_19_hooks() {
+  _gate 19 "Scenario 19: hooks, if you use them" \
+    "Only meaningful if you already have hooks in ~/.claude/settings.json, and" \
+    "it runs YOUR hook commands on the host, so it is not the script's to run." \
+    "" \
+    "  cd $RUN_DIR/projects && mkdir -p hooktest && cd hooktest && git init -q" \
+    "  XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN config --project --enable hooks" \
+    "  XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN start" \
+    "" \
+    "Work normally for a bit, then check each hook fired ONCE per event (an" \
+    "event appended while the bridge was reading used to run twice), and after" \
+    "exit that no hook process is left behind." \
+    "" \
+    "${DIM}Skipping is the normal choice unless you actually use hooks.${RESET}"
+}
+
 # ── report ──────────────────────────────────────────────────────────────────
 _write_report() {
   mkdir -p "$REPORT_DIR"
@@ -550,12 +756,19 @@ _summary() {
 }
 
 # ── driver ──────────────────────────────────────────────────────────────────
-CHECKS="02_fork_containment 05_disable_indented 09_unreadable_cleat 10_env_name
-        11_nuke_no_tty 12_memory_floor 13_bom 20_box_memory_writes_section
+# Ids line up one-to-one with MANUAL-TESTS-2026-07-31.md, so "did I test
+# everything" has one answer. Gates (the ones a script must not do for you) run
+# last so the automated body always completes first.
+CHECKS="02_fork_containment 04_prune_owns_only_its_own 05_disable_indented
+        07_status_box_positional 08_fork_dead_end 09_unreadable_cleat
+        10_env_name 11_nuke_no_tty 12_memory_floor 13_bom
+        14_fork_path_capturable 17_interrupted_copies 18_trust_hash_recorded
+        20_box_memory_writes_section 21_older_cleat_fails_open
         22_declared_empty 23_empty_keeps_header 24_declared_replaces
         25_resources_per_key 26_materialize_and_restore 27_legacy_file_announced
-        28_trust_per_box 30_global_refuses_and_typo_warns
-        01_prune_daemon_down 03_nuke_keeps_forks 06_session_key"
+        28_trust_per_box 29_per_box_setup_and_fork 30_global_refuses_and_typo_warns
+        01_prune_daemon_down 03_nuke_keeps_forks 06_session_key
+        15_idle_sweep_shell 16_claude_commands_symlink 19_hooks"
 
 RESUME=0; ONLY=""; NO_DOCKER=0
 while [[ $# -gt 0 ]]; do
@@ -568,7 +781,7 @@ while [[ $# -gt 0 ]]; do
     --report)    [[ -f "$REPORT" ]] && { echo "$REPORT"; cat "$REPORT"; } || echo "no report yet"; exit 0 ;;
     --list)      echo "checks (id  needs-you?):"
                  for c in $CHECKS; do
-                   case "$c" in 01_*|03_*|06_*) echo "  ${c%%_*}  YES" ;; *) echo "  ${c%%_*}  no" ;; esac
+                   case "$c" in 01_*|03_*|06_*|15_*|16_*|19_*) echo "  ${c%%_*}  YES" ;; *) echo "  ${c%%_*}  no" ;; esac
                  done; exit 0 ;;
     -h|--help)   sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "unknown option: $1" >&2; exit 1 ;;
@@ -587,7 +800,7 @@ for c in $CHECKS; do
   id="${c%%_*}"
   _want_check "$id" || continue
   case "$c" in
-    01_*|03_*|06_*) [[ "$NO_DOCKER" -eq 1 ]] && { skip "$id" "$c" "--no-docker"; continue; } ;;
+    01_*|03_*|06_*|15_*|16_*|19_*) [[ "$NO_DOCKER" -eq 1 ]] && { skip "$id" "$c" "--no-docker"; continue; } ;;
   esac
   "check_$c"
   _mark_done "$id"

@@ -13,6 +13,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 load "../setup"
 
+# Extract one function's REAL body from bin/cleat and define it here, undoing
+# setup's stub for the tests that mean to exercise the shipped implementation.
+_restore_real_app_bundle_present() {
+  eval "$(sed -n '/^_app_bundle_present() {/,/^}$/p' "$CLI")"
+}
+
 setup() {
   _common_setup
   use_docker_stub
@@ -158,13 +164,35 @@ teardown() { _common_teardown; }
 }
 
 @test "autostart: _app_bundle_present finds a ~/Applications (no-admin) install" {
-  # Restore the real two-path implementation (setup stubs it to false).
-  _app_bundle_present() { [[ -d "/Applications/$1.app" ]] || [[ -d "$HOME/Applications/$1.app" ]]; }
-  mkdir -p "$HOME/Applications/OrbStack.app"
+  # Restore the real implementation (setup stubs it to false) and redirect the
+  # SYSTEM path too. $HOME is sandboxed but /Applications is not, so the
+  # absent-app assertion below used to depend on the developer's machine not
+  # having Docker Desktop installed: green on Linux and CI, red on a real Mac.
+  # Re-source the REAL definition over setup's stub. Copying the body into the
+  # test here meant it asserted on its own copy, so a change to bin/cleat could
+  # not fail it: the mutation harness proved that by reverting the seam and
+  # watching this stay green.
+  _restore_real_app_bundle_present
+  _APP_DIR_SYSTEM="$TEST_TEMP/Applications"
+  mkdir -p "$_APP_DIR_SYSTEM" "$HOME/Applications/OrbStack.app"
   run _app_bundle_present OrbStack
   assert_success
   run _app_bundle_present Docker
   assert_failure
+}
+
+@test "autostart: _app_bundle_present finds a system /Applications install" {
+  _restore_real_app_bundle_present
+  _APP_DIR_SYSTEM="$TEST_TEMP/Applications"
+  mkdir -p "$_APP_DIR_SYSTEM/Docker.app"
+  run _app_bundle_present Docker
+  assert_success
+}
+
+@test "autostart: the system app path defaults to /Applications" {
+  # The seam must not change what production looks at.
+  run bash -c 'unset _APP_DIR_SYSTEM; printf "%s" "${_APP_DIR_SYSTEM:-/Applications}"'
+  assert_output "/Applications"
 }
 
 @test "autostart pick: macOS desktop-linux context means Docker Desktop" {

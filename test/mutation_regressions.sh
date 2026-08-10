@@ -4459,6 +4459,15 @@ s@    \*/Cellar/\*) return 0 ;;@    */NeverAHomebrewCellar/*) return 0 ;;@
 SED
 try "vnext_brew_guard_cellar_pattern" "detects a keg through the bin symlink" "$CLI" "$UPDATE_BATS"
 
+# APP BUNDLE TEST SEAM: $HOME is sandboxed in tests but /Applications is not, so
+# an absent-app assertion depended on the developer's machine not having the app
+# installed. Green on Linux and CI, red on a Mac with Docker Desktop. Hardcode
+# the system path again and the system-install test fails.
+cat > "$SED_TMP" << 'SED'
+s@  local _sys="${_APP_DIR_SYSTEM:-/Applications}"@  local _sys="/Applications"@
+SED
+try "autostart_app_dir_seam" "finds a system /Applications install" "$CLI" "$REPO_ROOT/test/unit/autostart.bats"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

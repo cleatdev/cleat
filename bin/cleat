@@ -718,8 +718,14 @@ _wsl_interop_ok() {
 # A macOS app bundle is installed, checking both the system and per-user
 # (no-admin install) Applications dirs. Overridable in tests (Linux CI has
 # no /Applications).
+# $HOME is sandboxed in tests but /Applications is NOT, so a test asserting an
+# app is absent silently depended on the developer's machine not having it
+# installed. It passed on Linux and on CI and failed on the one machine that
+# matters, a Mac with Docker Desktop. _APP_DIR_SYSTEM is a test seam only; it
+# defaults to the real path and production behaviour is unchanged.
 _app_bundle_present() {
-  [[ -d "/Applications/$1.app" ]] || [[ -d "$HOME/Applications/$1.app" ]]
+  local _sys="${_APP_DIR_SYSTEM:-/Applications}"
+  [[ -d "$_sys/$1.app" ]] || [[ -d "$HOME/Applications/$1.app" ]]
 }
 
 _colima_present() {

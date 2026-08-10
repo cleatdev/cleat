@@ -127,6 +127,36 @@ _safe_rm() {
   rm -rf "$target"
 }
 
+
+# Removing the run root itself. _safe_rm deliberately requires a target's parent
+# to be inside the run dir, which the run dir's own parent never is, so --clean
+# refused every time and then printed that it had succeeded. This validates the
+# root the same way the startup guard does, then requires OUR marker, so it can
+# only ever delete a directory this script created.
+_clean_run_dir() {
+  local real home_real
+  real="$(_phys "$RUN_DIR")" || real=""
+  home_real="$(_phys "$HOME")" || home_real="$HOME"
+  if [[ -z "$real" ]]; then
+    echo "nothing to clean at $RUN_DIR"
+    return 0
+  fi
+  case "$real" in
+    /|"$home_real") echo "${RED}Refusing to delete $real${RESET}" >&2; return 1 ;;
+    *"/.config/cleat"*|*"/.claude"*)
+      echo "${RED}Refusing to delete $real${RESET}" >&2; return 1 ;;
+  esac
+  case "$home_real/" in
+    "$real"/*) echo "${RED}Refusing: $real contains your home directory${RESET}" >&2; return 1 ;;
+  esac
+  if [[ ! -f "$real/.cleat-verify-runroot" ]]; then
+    echo "${RED}Refusing: $real has no run-root marker, so this script did not create it.${RESET}" >&2
+    return 1
+  fi
+  rm -rf "$real" && echo "removed $real" || { echo "${RED}Could not remove $real${RESET}" >&2; return 1; }
+  return 0
+}
+
 # ── the isolated world ──────────────────────────────────────────────────────
 _setup_world() {
   _assert_run_dir_is_safe
@@ -804,8 +834,15 @@ while [[ $# -gt 0 ]]; do
     --resume)    RESUME=1; shift ;;
     --only)      ONLY="${2:-}"; shift 2 ;;
     --no-docker) NO_DOCKER=1; shift ;;
-    --clean)     _assert_run_dir_is_safe; _safe_rm "$RUN_DIR"; rm -rf "$REPORT_DIR"
-                 echo "removed $RUN_DIR and $REPORT_DIR"; exit 0 ;;
+    --clean)     _clean_run_dir || true
+                 # fenced too: only ever the derived report dir, never a path
+                 # someone passed in.
+                 case "$REPORT_DIR" in
+                   */.cleat-verify) [[ -d "$REPORT_DIR" ]] && rm -rf "$REPORT_DIR" \
+                                      && echo "removed $REPORT_DIR" ;;
+                   *) echo "${RED}Refusing to delete $REPORT_DIR${RESET}" >&2 ;;
+                 esac
+                 exit 0 ;;
     --report)    [[ -f "$REPORT" ]] && { echo "$REPORT"; cat "$REPORT"; } || echo "no report yet"; exit 0 ;;
     --list)      echo "checks (id  needs-you?):"
                  for c in $CHECKS; do

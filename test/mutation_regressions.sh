@@ -4468,6 +4468,20 @@ s@  local _sys="${_APP_DIR_SYSTEM:-/Applications}"@  local _sys="/Applications"@
 SED
 try "autostart_app_dir_seam" "finds a system /Applications install" "$CLI" "$REPO_ROOT/test/unit/autostart.bats"
 
+# FORK GUARDS RESOLVE BOTH SIDES: comparing a physically-resolved project
+# against a LOGICAL fork root made both recursion guards no-ops wherever the
+# path crosses a symlink, which on macOS is everything under /tmp and
+# /var/folders. The copy then recursed into itself: a disk-filling loop.
+cat > "$SED_TMP" << 'SED'
+s@    _fr_phys="$(_phys_or_best "$_froot")"@    _fr_phys="$_froot"@
+SED
+try "fork_root_inside_symlinked" "a fork root inside the project is refused THROUGH" "$CLI" "$FORK_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@    _pp="$(_phys_or_best "$project")"@    _pp="$project"@
+SED
+try "fork_of_fork_symlinked" "forking a fork is refused THROUGH" "$CLI" "$FORK_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

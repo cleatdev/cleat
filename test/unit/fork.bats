@@ -1494,3 +1494,49 @@ SHIM
   [ ! -e "$dst/node_modules" ] || { echo "the box's own exclude was ignored"; return 1; }
   [ -f "$dst/src/app.js" ]
 }
+
+@test "fork: a fork root inside the project is refused THROUGH a symlinked path" {
+  # The guard compared a physically-resolved project against a LOGICAL fork
+  # root, so anywhere the path crosses a symlink it silently did not fire and
+  # the copy recursed into itself: a disk-filling loop. On macOS that is every
+  # path under /tmp and /var/folders, which is why it only ever failed there.
+  mkdir -p "$TEST_TEMP/real/project/src"
+  echo code > "$TEST_TEMP/real/project/src/app.js"
+  ln -s "$TEST_TEMP/real" "$TEST_TEMP/link"
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[fork]\ndir = %s/inner\n' "$TEST_TEMP/link/project" > "$CLEAT_GLOBAL_CONFIG"
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/real/project"
+  assert_failure
+  assert_output --partial "Fork root is inside the project"
+}
+
+@test "fork: forking a fork is refused THROUGH a symlinked path too" {
+  # The mirror guard, same defect: a project sitting inside the fork root,
+  # reached by a symlink, was not recognised as a fork of a fork.
+  mkdir -p "$TEST_TEMP/real/forks/someproj/src"
+  echo code > "$TEST_TEMP/real/forks/someproj/src/app.js"
+  ln -s "$TEST_TEMP/real" "$TEST_TEMP/link"
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[fork]\ndir = %s/forks\n' "$TEST_TEMP/link" > "$CLEAT_GLOBAL_CONFIG"
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  # Reached THROUGH the symlink on purpose: with an already-physical project
+  # path the guard matches either way, so the test would not notice the
+  # resolver being removed.
+  run cmd_run "$TEST_TEMP/link/forks/someproj"
+  assert_failure
+  assert_output --partial "Refusing to fork a fork"
+}
+
+@test "fork: a normal fork root outside the project is still accepted" {
+  # The guards must not start refusing the only layout that is correct.
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[fork]\ndir = %s/elsewhere\n' "$TEST_TEMP" > "$CLEAT_GLOBAL_CONFIG"
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -d "$TEST_TEMP/elsewhere" ]
+}

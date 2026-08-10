@@ -2882,6 +2882,25 @@ _generate_home_overlay() {
 # On APFS `cp -c` clones blocks copy-on-write, measured at 0.005s for 50 MB on
 # the maintainer's machine, so "copy everything" is nearly free AND saves the
 # caged agent an `npm install`.
+# Physical path for something that may not exist yet. cd -P only works on an
+# existing directory, and the fork root is created on demand, so resolve the
+# deepest ancestor that DOES exist and re-attach the rest. Used to compare a
+# fork root against a project path: comparing one side physically and the other
+# logically is how the recursion guard below silently stopped firing on macOS,
+# where /var/folders and /tmp are symlinks.
+_phys_or_best() {
+  local p="$1" rest="" base
+  [[ -n "$p" ]] || return 0
+  while [[ "$p" != "/" && -n "$p" && ! -d "$p" ]]; do
+    rest="/${p##*/}$rest"
+    p="${p%/*}"
+    [[ -z "$p" ]] && p="/"
+  done
+  base="$(cd -P "$p" 2>/dev/null && pwd -P)" || { printf '%s' "$1"; return 0; }
+  [[ "$base" == "/" ]] && base=""
+  printf '%s%s' "$base" "$rest"
+}
+
 # Where fork copies live. Overridable with `[fork] dir` in the GLOBAL config
 # (~/.config/cleat/config), and DELIBERATELY not from a project's .cleat: that
 # file arrives with cloned repos and this value is a path Cleat creates and
@@ -6935,10 +6954,15 @@ cmd_run() {
     _fork_path="$(_fork_dir "$cname")"
     # Refuse to fork a directory that already lives under the fork root: a fork
     # of a fork nests copies without bound.
-    local _froot _pp
+    # BOTH sides resolved the same way. Mixing a physical path with a logical
+    # one made these guards no-ops wherever the path crosses a symlink, which
+    # on macOS is everything under /tmp and /var/folders.
+    local _froot _pp _fr_phys
     _froot="$(_fork_root)"
-    case "$project/" in
-      "$_froot"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
+    _fr_phys="$(_phys_or_best "$_froot")"
+    _pp="$(_phys_or_best "$project")"
+    case "$_pp/" in
+      "$_fr_phys"/*) error "Refusing to fork a fork: ${project/#${HOME}/~}"; exit 1 ;;
     esac
     # And the mirror case: a fork root INSIDE the project, which someone will
     # reach for wanting the copy near the code. The copy would then contain the
@@ -6947,8 +6971,7 @@ cmd_run() {
     # failure mode if it does not is a disk-filling loop, so refuse explicitly
     # rather than relying on the tool. Compared physically so a symlinked
     # project path cannot slip past.
-    _pp="$(cd -P "$project" 2>/dev/null && pwd -P)" || _pp="$project"
-    case "$_froot/" in
+    case "$_fr_phys/" in
       "$_pp"/*) error "Fork root is inside the project: ${_froot/#${HOME}/~}"
                 echo -e "    ${DIM}The copy would contain itself. Point ${BOLD}[fork] dir${RESET}${DIM} outside the project.${RESET}"
                 exit 1 ;;

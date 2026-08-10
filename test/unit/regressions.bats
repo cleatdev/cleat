@@ -1127,6 +1127,49 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Test harness: the integration suite computes the container name it is about
+# to inspect. A wrong computation fails every downstream test with "No such
+# container", which reads like a broken CLI and is not. It happened: converting
+# away from `bash -c "... container_name_for '$INT_PROJECT'"` kept the inner
+# single quotes, and as a direct argument those stop the expansion. The literal
+# text got hashed, yielding `cleat--int-project-<hash>`, and seven integration
+# tests failed at once on macOS. The name now comes from one helper.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "harness: int_cname derives the name from the real project path" {
+  INT_PROJECT="$TEST_TEMP/probe-proj"
+  mkdir -p "$INT_PROJECT"
+  run int_cname
+  assert_success
+  # An unexpanded '$INT_PROJECT' produces `cleat--int-project-<hash>` instead.
+  assert_output --regexp '^cleat-probe-proj-[0-9a-f]{8}$'
+}
+
+@test "harness: int_cname threads a box name through" {
+  INT_PROJECT="$TEST_TEMP/probe-proj"
+  mkdir -p "$INT_PROJECT"
+  run int_cname az
+  assert_success
+  assert_output --regexp '^cleat-probe-proj-[0-9a-f]{8}-az$'
+}
+
+@test "harness: int_cname refuses a name carrying an unexpanded variable" {
+  INT_PROJECT="$TEST_TEMP/probe-proj"
+  mkdir -p "$INT_PROJECT"
+  cli_call() { printf 'cleat--int-project-$X\n'; }
+  run int_cname
+  assert_failure
+  assert_output --partial "bogus container name"
+}
+
+@test "harness: no cli_call argument is single-quoted" {
+  # `cli_call fn '$VAR'` passes the literal text. The outer double quotes that
+  # made that spelling correct under `bash -c` are gone, so it is now a bug.
+  run grep -rn "cli_call.*'[\$]" \
+    "$PROJECT_ROOT/test/integration" "$PROJECT_ROOT/test/setup.bash"
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Writing style: no em dashes anywhere. They read as AI-authored, so the project
 # bans them repo-wide (see root CLAUDE.md). Source-level guard on the shipped CLI
 # and its runtime scripts: an em dash in any of them fails the suite. Replace one

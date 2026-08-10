@@ -24,7 +24,12 @@ setup_file() {
   # Build the image once for all tests in this file
   local repo_root
   repo_root="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
-  docker build -q -t cleat -f "$repo_root/docker/Dockerfile" "$repo_root/docker/" >/dev/null 2>&1 || {
+  # See lifecycle.bats: keep the build output so a failed build is diagnosable
+  # instead of a silent skip. Declare before assigning (local masks the status).
+  local _build_log
+  _build_log="$(docker build -q -t cleat -f "$repo_root/docker/Dockerfile" "$repo_root/docker/" 2>&1)" || {
+    echo "# docker build failed, nothing below was tested:" >&3
+    echo "$_build_log" | sed 's/^/#   /' >&3
     skip "could not build cleat image"
   }
 }
@@ -56,7 +61,7 @@ EOF
   run "$CLI" run
   assert_success
 
-  INT_CNAME="$(cli_call container_name_for '$INT_PROJECT')"
+  INT_CNAME="$(int_cname)"
 
   # The provisioning command actually ran, as coder, inside the real box.
   run docker exec "$INT_CNAME" cat /tmp/provisioned.txt

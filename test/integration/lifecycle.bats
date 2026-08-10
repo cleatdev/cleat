@@ -21,7 +21,13 @@ setup_file() {
   # Build the image once for all tests in this file
   local repo_root
   repo_root="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
-  docker build -q -t cleat -f "$repo_root/docker/Dockerfile" "$repo_root/docker/" >/dev/null 2>&1 || {
+  # Keep the build output. Throwing it away is how a broken image becomes a run
+  # that skips all eight tests and still exits 0. Declare before assigning:
+  # `local x="$(cmd)"` reports local's status, never the command's.
+  local _build_log
+  _build_log="$(docker build -q -t cleat -f "$repo_root/docker/Dockerfile" "$repo_root/docker/" 2>&1)" || {
+    echo "# docker build failed, nothing below was tested:" >&3
+    echo "$_build_log" | sed 's/^/#   /' >&3
     skip "could not build cleat image"
   }
 }
@@ -41,7 +47,7 @@ teardown() {
   docker rm -f "$INT_CNAME" >/dev/null 2>&1 || true
   # Also remove the default cleat-named container if any
   local default_name
-  default_name="$(cli_call container_name_for '$INT_PROJECT' 2>/dev/null)"
+  default_name="$(int_cname 2>/dev/null)"
   [[ -n "$default_name" ]] && docker rm -f "$default_name" >/dev/null 2>&1 || true
   # Remove any box containers for this project (main cname is the prefix).
   if [[ -n "$default_name" ]]; then
@@ -107,7 +113,7 @@ EOF
 
   # Non-interactive shell: feed a command to cleat shell via stdin
   local cname
-  cname="$(cli_call container_name_for '$INT_PROJECT')"
+  cname="$(int_cname)"
   run docker exec "$cname" printenv DATABASE_URL
   assert_success
   assert_output "postgres://integration-test/db"
@@ -118,8 +124,8 @@ EOF
 @test "integration: two boxes are distinct containers sharing one /workspace; describe never recreates" {
   cd "$INT_PROJECT"
   local main_cname az_cname
-  main_cname="$(cli_call container_name_for '$INT_PROJECT' main)"
-  az_cname="$(cli_call container_name_for '$INT_PROJECT' az)"
+  main_cname="$(int_cname main)"
+  az_cname="$(int_cname az)"
 
   run "$CLI" run
   assert_success
@@ -160,7 +166,7 @@ EOF
   run "$CLI" --cap docker run
   assert_success
   local cname
-  cname="$(cli_call container_name_for '$INT_PROJECT')"
+  cname="$(int_cname)"
 
   # The entrypoint adds coder to the socket's owning group at container start so
   # coder can reach the mounted /var/run/docker.sock. Against a freshly started
@@ -174,7 +180,13 @@ EOF
     sleep 0.5
   done
   if [ -z "$ok" ]; then
-    echo "DIAG host-sock:  $(stat -c '%g %U:%G %a' /var/run/docker.sock 2>&1)"
+    # `stat -c` is GNU only. BSD stat (macOS) needs -f with different verbs, and
+    # a diagnostic that itself errors out just hides the failure it exists for.
+    if stat -c '%g' . >/dev/null 2>&1; then
+      echo "DIAG host-sock:  $(stat -c '%g %U:%G %a' /var/run/docker.sock 2>&1)"
+    else
+      echo "DIAG host-sock:  $(stat -f '%g %Su:%Sg %Lp' /var/run/docker.sock 2>&1)"
+    fi
     echo "DIAG in-sock:    $(docker exec "$cname" stat -c '%g %U:%G %a' /var/run/docker.sock 2>&1)"
     echo "DIAG coder-id:   $(docker exec "$cname" id coder 2>&1)"
     echo "DIAG runuser-id: $(docker exec "$cname" runuser -u coder -- id 2>&1)"
@@ -202,7 +214,7 @@ EOF
   run "$CLI" run
   assert_success
   local cname
-  cname="$(cli_call container_name_for '$INT_PROJECT')"
+  cname="$(int_cname)"
   run docker exec "$cname" node --version
   assert_success
   [[ "$output" == v24* ]] || { echo "expected Node 24, got: $output"; return 1; }
@@ -217,7 +229,7 @@ EOF
 @test "integration: kitted box sees the merged view read-only; host untouched; kit off lands live" {
   cd "$INT_PROJECT"
   local cname
-  cname="$(cli_call container_name_for '$INT_PROJECT')"
+  cname="$(int_cname)"
 
   # Host global memory + a personal agent that must survive the merge.
   echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"

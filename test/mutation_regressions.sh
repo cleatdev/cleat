@@ -63,6 +63,8 @@ HUMAN_SIZE_BATS="$REPO_ROOT/test/unit/human_size.bats"
 DISK_GATE_BATS="$REPO_ROOT/test/unit/disk_gate.bats"
 STORAGE_BATS="$REPO_ROOT/test/unit/storage.bats"
 UPDATE_BATS="$REPO_ROOT/test/unit/update.bats"
+INT_LIFECYCLE_BATS="$REPO_ROOT/test/integration/lifecycle.bats"
+SETUP_BASH="$REPO_ROOT/test/setup.bash"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
 ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
@@ -76,6 +78,8 @@ OPENBRIDGE_BACKUP="/tmp/cleat-regression-mutation-openbridge-backup-$$"
 CLIP_DAEMON_BACKUP="/tmp/cleat-regression-mutation-clipdaemon-backup-$$"
 CLIP_SHIM_BACKUP="/tmp/cleat-regression-mutation-clipshim-backup-$$"
 TEST_SH_BACKUP="/tmp/cleat-regression-mutation-testsh-backup-$$"
+INT_LIFECYCLE_BACKUP="/tmp/cleat-regression-mutation-intlifecycle-backup-$$"
+SETUP_BASH_BACKUP="/tmp/cleat-regression-mutation-setupbash-backup-$$"
 
 BOLD=$'\033[1m'
 RED=$'\033[0;31m'
@@ -92,8 +96,11 @@ cleanup() {
   [[ -f "$CLIP_DAEMON_BACKUP" ]] && cp "$CLIP_DAEMON_BACKUP" "$CLIP_DAEMON"
   [[ -f "$CLIP_SHIM_BACKUP" ]] && cp "$CLIP_SHIM_BACKUP" "$CLIP_SHIM"
   [[ -f "$TEST_SH_BACKUP" ]] && cp "$TEST_SH_BACKUP" "$TEST_SH"
+  [[ -f "$INT_LIFECYCLE_BACKUP" ]] && cp "$INT_LIFECYCLE_BACKUP" "$INT_LIFECYCLE_BATS"
+  [[ -f "$SETUP_BASH_BACKUP" ]] && cp "$SETUP_BASH_BACKUP" "$SETUP_BASH"
   rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP" \
-        "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$TEST_SH_BACKUP"
+        "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$TEST_SH_BACKUP" \
+        "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP"
 }
 trap cleanup EXIT INT TERM
 
@@ -104,6 +111,8 @@ cp "$OPENBRIDGE" "$OPENBRIDGE_BACKUP"
 cp "$CLIP_DAEMON" "$CLIP_DAEMON_BACKUP"
 cp "$CLIP_SHIM" "$CLIP_SHIM_BACKUP"
 cp "$TEST_SH" "$TEST_SH_BACKUP"
+cp "$INT_LIFECYCLE_BATS" "$INT_LIFECYCLE_BACKUP"
+cp "$SETUP_BASH" "$SETUP_BASH_BACKUP"
 filter="${1:-}"
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
@@ -123,6 +132,10 @@ run_mutation() {
     backup="$CLIP_SHIM_BACKUP"
   elif [[ "$target" == "$TEST_SH" ]]; then
     backup="$TEST_SH_BACKUP"
+  elif [[ "$target" == "$INT_LIFECYCLE_BATS" ]]; then
+    backup="$INT_LIFECYCLE_BACKUP"
+  elif [[ "$target" == "$SETUP_BASH" ]]; then
+    backup="$SETUP_BASH_BACKUP"
   else
     backup="$BACKUP"
   fi
@@ -145,11 +158,18 @@ run_mutation() {
     return 2
   fi
 
-  # Verify the mutated file still parses
-  if ! bash -n "$target" 2>/dev/null; then
-    echo "${YELLOW}~ $name: SKIPPED${RESET} ${DIM}(mutation caused syntax error)${RESET}"
-    return 2
-  fi
+  # Verify the mutated file still parses. A `.bats` file is not valid bash
+  # (`@test "x" { ... }` is bats syntax that bash rejects at the closing brace),
+  # so the check cannot apply there: bats parses those itself at run time.
+  case "$target" in
+    *.bats) : ;;
+    *)
+      if ! bash -n "$target" 2>/dev/null; then
+        echo "${YELLOW}~ $name: SKIPPED${RESET} ${DIM}(mutation caused syntax error)${RESET}"
+        return 2
+      fi
+      ;;
+  esac
 
   # A filter that matches NOTHING runs zero tests, and bats exits 0 for that, so
   # the mutation reads as MISSED when in fact it was never tested. It has
@@ -4483,6 +4503,39 @@ cat > "$SED_TMP" << 'SED'
 s@    _pp="$(_phys_or_best "$project")"@    _pp="$project"@
 SED
 try "fork_of_fork_symlinked" "forking a fork is refused THROUGH" "$CLI" "$FORK_BATS"
+
+# INTEGRATION NAME QUOTING: reintroduce the single-quoted path argument in a
+# real integration call site. The literal text gets hashed, so the computed
+# container name no longer matches the container cleat created, and every
+# assertion downstream fails with "No such container". The source guard must
+# see it without a Docker daemon anywhere in the loop.
+cat > "$SED_TMP" << 'SED'
+s@  cname="$(int_cname)"@  cname="$(cli_call container_name_for '$INT_PROJECT')"@
+SED
+try "int_cname_single_quoted_arg" "no cli_call argument is single-quoted" "$INT_LIFECYCLE_BATS" "$REGRESSIONS"
+
+# INT_CNAME BOGUS-NAME GATE: drop the sanity gate and a name that still holds an
+# unexpanded variable sails through to `docker exec`, where the error names a
+# missing container instead of the quoting bug that produced the name.
+cat > "$SED_TMP" << 'SED'
+s@    ''|\*'[$]'\*|\*\[\[:space:\]\]\*)@    __never_matches__)@
+SED
+try "int_cname_bogus_gate" "int_cname refuses a name carrying an unexpanded" "$SETUP_BASH" "$REGRESSIONS"
+
+# INT_CNAME EXPANSION: quote the helper's own argument and every integration
+# test inherits the bug the helper exists to prevent.
+cat > "$SED_TMP" << 'SED'
+s@    name="$(cli_call container_name_for "$INT_PROJECT")" || return 1@    name="$(cli_call container_name_for '"'"'$INT_PROJECT'"'"')" || return 1@
+SED
+try "int_cname_expands_path" "int_cname derives the name from the real project path" "$SETUP_BASH" "$REGRESSIONS"
+
+# INT_CNAME BOX THREADING: swallow the box argument and two boxes resolve to the
+# same container name, which quietly turns the two-box isolation test into a
+# test of one box against itself.
+cat > "$SED_TMP" << 'SED'
+s@    name="$(cli_call container_name_for "$INT_PROJECT" "$box")" || return 1@    name="$(cli_call container_name_for "$INT_PROJECT")" || return 1@
+SED
+try "int_cname_threads_box" "int_cname threads a box name through" "$SETUP_BASH" "$REGRESSIONS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

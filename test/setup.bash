@@ -177,6 +177,30 @@ cli_call() {
   return $rc
 }
 
+# The container name cleat will use for $INT_PROJECT (optional box as $1).
+#
+# Centralized on purpose. Every integration test needs this name. Spelling the
+# call out at each site is how one quoting slip (single quotes around the path
+# argument, so the literal text got hashed instead of the path) reached seven
+# sites at once. All seven then failed with a baffling "No such container".
+# One place to get right, plus a sanity gate: a name still carrying a `$` or a
+# space is a quoting bug rather than a container that vanished. Say so.
+int_cname() {
+  local box="${1:-}" name
+  if [[ -n "$box" ]]; then
+    name="$(cli_call container_name_for "$INT_PROJECT" "$box")" || return 1
+  else
+    name="$(cli_call container_name_for "$INT_PROJECT")" || return 1
+  fi
+  case "$name" in
+    ''|*'$'*|*[[:space:]]*)
+      echo "int_cname: bogus container name '$name' for project '$INT_PROJECT'" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$name"
+}
+
 # Source the CLI (without running main).
 #
 # The CLI runs under `set -euo pipefail` in production. In tests:

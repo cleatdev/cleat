@@ -2639,7 +2639,9 @@ try "fork_missing_copy_refuses" "copy is missing refuses" "$CLI" "$FORK_BATS"
 # call (the first of the three, by line order) and that test goes red while the
 # start and resume paths stay intact.
 cat > "$SED_TMP" << 'SED'
-0,/^  _fork_preflight "$cname" recreate$/{/^  _fork_preflight "$cname" recreate$/d;}
+/^cmd_run() {/,/^}$/{
+  /^  _fork_preflight "\$cname" recreate$/d
+}
 SED
 try "fork_run_preflight" "run refuses the flag on an existing plain box" "$CLI" "$FORK_BATS"
 
@@ -4464,7 +4466,7 @@ try "vnext_brew_guard_cellar_pattern" "detects a keg through the bin symlink" "$
 # installed. Green on Linux and CI, red on a Mac with Docker Desktop. Hardcode
 # the system path again and the system-install test fails.
 cat > "$SED_TMP" << 'SED'
-s@  local _sys="${_APP_DIR_SYSTEM:-/Applications}"@  local _sys="/Applications"@
+s@  local _sys="${_APP_DIR_SYSTEM:-/Applications}"@  local _sys="/nonexistent-Applications"@
 SED
 try "autostart_app_dir_seam" "finds a system /Applications install" "$CLI" "$REPO_ROOT/test/unit/autostart.bats"
 

@@ -183,9 +183,13 @@ teardown() { _common_teardown; }
 
 @test "autostart: _app_bundle_present finds a system /Applications install" {
   _restore_real_app_bundle_present
+  # A name no real /Applications has. Probing for Docker here made the
+  # assertion satisfiable by the developer's own machine, so hardcoding the
+  # system path (the regression this guards) still passed on a Mac with Docker
+  # Desktop installed.
   _APP_DIR_SYSTEM="$TEST_TEMP/Applications"
-  mkdir -p "$_APP_DIR_SYSTEM/Docker.app"
-  run _app_bundle_present Docker
+  mkdir -p "$_APP_DIR_SYSTEM/CleatVerifyProbe.app"
+  run _app_bundle_present CleatVerifyProbe
   assert_success
 }
 

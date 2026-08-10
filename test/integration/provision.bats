@@ -56,7 +56,7 @@ EOF
   run "$CLI" run
   assert_success
 
-  INT_CNAME="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+  INT_CNAME="$(cli_call container_name_for '$INT_PROJECT')"
 
   # The provisioning command actually ran, as coder, inside the real box.
   run docker exec "$INT_CNAME" cat /tmp/provisioned.txt

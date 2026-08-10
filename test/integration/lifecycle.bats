@@ -41,7 +41,7 @@ teardown() {
   docker rm -f "$INT_CNAME" >/dev/null 2>&1 || true
   # Also remove the default cleat-named container if any
   local default_name
-  default_name="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'" 2>/dev/null)"
+  default_name="$(cli_call container_name_for '$INT_PROJECT' 2>/dev/null)"
   [[ -n "$default_name" ]] && docker rm -f "$default_name" >/dev/null 2>&1 || true
   # Remove any box containers for this project (main cname is the prefix).
   if [[ -n "$default_name" ]]; then
@@ -107,7 +107,7 @@ EOF
 
   # Non-interactive shell: feed a command to cleat shell via stdin
   local cname
-  cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+  cname="$(cli_call container_name_for '$INT_PROJECT')"
   run docker exec "$cname" printenv DATABASE_URL
   assert_success
   assert_output "postgres://integration-test/db"
@@ -118,8 +118,8 @@ EOF
 @test "integration: two boxes are distinct containers sharing one /workspace; describe never recreates" {
   cd "$INT_PROJECT"
   local main_cname az_cname
-  main_cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT' main")"
-  az_cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT' az")"
+  main_cname="$(cli_call container_name_for '$INT_PROJECT' main)"
+  az_cname="$(cli_call container_name_for '$INT_PROJECT' az)"
 
   run "$CLI" run
   assert_success
@@ -160,7 +160,7 @@ EOF
   run "$CLI" --cap docker run
   assert_success
   local cname
-  cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+  cname="$(cli_call container_name_for '$INT_PROJECT')"
 
   # The entrypoint adds coder to the socket's owning group at container start so
   # coder can reach the mounted /var/run/docker.sock. Against a freshly started
@@ -188,7 +188,7 @@ EOF
 
   # The per-exec self-heal must be idempotent: re-running it on an already-OK
   # container keeps coder's access working (doesn't strip the group / break it).
-  bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); _heal_docker_sock '$cname'"
+  cli_call _heal_docker_sock "$cname"
   run docker exec "$cname" runuser -u coder -- docker version
   assert_success
 
@@ -202,7 +202,7 @@ EOF
   run "$CLI" run
   assert_success
   local cname
-  cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+  cname="$(cli_call container_name_for '$INT_PROJECT')"
   run docker exec "$cname" node --version
   assert_success
   [[ "$output" == v24* ]] || { echo "expected Node 24, got: $output"; return 1; }
@@ -217,7 +217,7 @@ EOF
 @test "integration: kitted box sees the merged view read-only; host untouched; kit off lands live" {
   cd "$INT_PROJECT"
   local cname
-  cname="$(bash -c "source <(sed 's/^set -euo pipefail/#/' '$CLI'); container_name_for '$INT_PROJECT'")"
+  cname="$(cli_call container_name_for '$INT_PROJECT')"
 
   # Host global memory + a personal agent that must survive the merge.
   echo "MY GLOBAL RULES" > "$HOME/.claude/CLAUDE.md"

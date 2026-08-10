@@ -147,7 +147,34 @@ _common_teardown() {
   # and hangs the file. Scoped to TEST_TEMP so nothing else is touched.
   pkill -f "inotifywait.*$TEST_TEMP" 2>/dev/null || true
   pkill -f "fswatch.*$TEST_TEMP" 2>/dev/null || true
-  rm -rf "$TEST_TEMP"
+  # Docker auto-creates a missing bind-mount TARGET as root, so an integration
+  # test can leave directories the host user cannot remove. On Linux CI the uid
+  # remap hides it; on macOS Docker Desktop it does not, and the failing rm made
+  # teardown return non-zero, which bats reports as the TEST failing. A leftover
+  # temp dir is not a test result, so never let it decide one.
+  rm -rf "$TEST_TEMP" 2>/dev/null
+  if [[ -d "$TEST_TEMP" ]]; then
+    chmod -R u+rwX "$TEST_TEMP" 2>/dev/null || true
+    rm -rf "$TEST_TEMP" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Call one CLI function in a subshell WITHOUT process substitution.
+#
+# The integration tests used `bash -c "source <(sed ... "$CLI"); somefunc"`.
+# That is fragile: on macOS every test using it failed with
+# "container_name_for: command not found", because the /dev/fd stream backing
+# the substitution is not reliably readable from the -c shell. A temp file is
+# boring and works everywhere.
+cli_call() {
+  local fn="$1"; shift
+  local tmp="${TEST_TEMP:-${TMPDIR:-/tmp}}/cli-call-$$-$RANDOM.sh"
+  sed 's/^set -euo pipefail$/# [stripped for cli_call]/' "$CLI" > "$tmp" || return 1
+  local rc=0
+  bash -c 'source "$1" || exit 1; shift; "$@"' _ "$tmp" "$fn" "$@" || rc=$?
+  rm -f "$tmp"
+  return $rc
 }
 
 # Source the CLI (without running main).

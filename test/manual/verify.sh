@@ -179,13 +179,18 @@ _clean_run_dir() {
   printf 'cleat verify run root. Safe to delete.\n' > "$real/.cleat-verify-runroot" 2>/dev/null || true
   echo "${RED}Could not fully remove $real${RESET}" >&2
   echo "" >&2
-  echo "Files in there are owned by root (Docker made them). Deleting those is" >&2
-  echo "yours to run, not this script's:" >&2
+  echo "What survived is root-owned: Docker's bind-mount targets for a box that" >&2
+  echo "still exists. Remove the box and they go with it. Reach for sudo only if" >&2
+  echo "something is still there afterwards." >&2
   echo "" >&2
+  echo "  docker ps -a --filter name=^cleat- --format '{{.Names}}'" >&2
+  echo "  docker rm -f <the box this run created>" >&2
+  echo "  $0 --clean" >&2
+  echo "" >&2
+  echo "Only if that leaves something behind:" >&2
   echo "  sudo rm -rf $real" >&2
   echo "" >&2
-  echo "The run dir is still marked as this script's, so --clean and a fresh run" >&2
-  echo "both keep working either way." >&2
+  echo "The marker is back either way, so the run dir never wedges." >&2
   return 1
 }
 

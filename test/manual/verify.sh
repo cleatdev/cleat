@@ -479,10 +479,17 @@ check_06_session_key() {
     "  XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN config --project --enable docker" \
     "  XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN start" \
     "" \
-    "  Say something memorable to Claude, then /exit and exit." \
+    "  Say something memorable to Claude, then type ${BOLD}/exit${RESET} once." \
+    "" \
+    "${AMBER}That is the only exit you type.${RESET} Claude is the box session here, so" \
+    "/exit ends it and puts you straight back on the HOST shell, still in" \
+    "my_app. Typing exit again closes your terminal." \
+    "" \
+    "From that same my_app directory, reopen the conversation:" \
     "  XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN resume" \
     "" \
-    "Claude must offer that conversation back. Then check the host key:" \
+    "Claude must offer that conversation back. Leave it with /exit again," \
+    "then check the host key:" \
     "  ls ~/.claude/projects/ | grep my" \
     "It must end -my-app with a DASH, not my_app." \
     "" \
@@ -859,6 +866,17 @@ _setup_world
 echo ""
 echo "  ${BOLD}cleat verify${RESET}  ${DIM}isolated state in $XDG_CONFIG_HOME/cleat${RESET}"
 echo "  ${DIM}your real ~/.config/cleat is not touched${RESET}"
+# Where am I? A gated run spans several invocations over as long as it takes to
+# do the manual bits, and without this the only way to know how far you got was
+# to remember. Derived from the gates in this file so it cannot drift.
+_GATES_TOTAL="$(grep -c '^[[:space:]]*_gate ' "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+case "$_GATES_TOTAL" in ''|*[!0-9]*) _GATES_TOTAL=6 ;; esac
+_GATES_DONE=0
+if [[ -f "$STATE" ]]; then
+  _GATES_DONE="$(grep -c '^gate:' "$STATE" 2>/dev/null || true)"
+  case "$_GATES_DONE" in ''|*[!0-9]*) _GATES_DONE=0 ;; esac
+fi
+echo "  ${DIM}manual gates: ${_GATES_DONE}/${_GATES_TOTAL} passed${RESET}"
 echo ""
 
 for c in $CHECKS; do

@@ -102,8 +102,12 @@ _assert_run_dir_is_safe() {
   if [[ ! -f "$marker" ]]; then
     if [[ -n "$(ls -A "$real" 2>/dev/null)" ]]; then
       echo "${RED}Refusing: $real already has content and was not created by this script.${RESET}" >&2
-      echo "Point CLEAT_VERIFY_DIR at a new or empty directory. This script deletes" >&2
-      echo "fixed names inside its run dir, so it will not adopt one of yours." >&2
+      echo "" >&2
+      echo "If an earlier --clean stopped on root-owned files, this is the way out:" >&2
+      echo "  sudo rm -rf $real" >&2
+      echo "" >&2
+      echo "Otherwise point CLEAT_VERIFY_DIR at a new or empty directory. This script" >&2
+      echo "deletes fixed names inside its run dir, so it will not adopt one of yours." >&2
       exit 1
     fi
     printf 'cleat verify run root. Safe to delete.\n' > "$marker"
@@ -153,8 +157,36 @@ _clean_run_dir() {
     echo "${RED}Refusing: $real has no run-root marker, so this script did not create it.${RESET}" >&2
     return 1
   fi
-  rm -rf "$real" && echo "removed $real" || { echo "${RED}Could not remove $real${RESET}" >&2; return 1; }
-  return 0
+  rm -rf "$real" 2>/dev/null
+  if [[ -e "$real" ]]; then
+    # Retry once for the merely-unwritable case (ours, odd permissions).
+    chmod -R u+rwX "$real" 2>/dev/null || true
+    rm -rf "$real" 2>/dev/null || true
+  fi
+  if [[ ! -e "$real" ]]; then
+    echo "removed $real"
+    return 0
+  fi
+  # Something survived, and it is almost always root-owned: Docker creates
+  # missing bind-mount targets as root, and the container writes into the
+  # session overlays as root before the entrypoint remaps. A non-root user
+  # cannot unlink those, and chmod cannot help with files it does not own.
+  #
+  # Re-plant the marker. `rm -rf` deletes it early in the walk, so a partial
+  # clean used to leave a non-empty directory with no marker, which the
+  # startup guard then refused forever. One failed clean became a dead end
+  # with no way out that the script itself would tell you about.
+  printf 'cleat verify run root. Safe to delete.\n' > "$real/.cleat-verify-runroot" 2>/dev/null || true
+  echo "${RED}Could not fully remove $real${RESET}" >&2
+  echo "" >&2
+  echo "Files in there are owned by root (Docker made them). Deleting those is" >&2
+  echo "yours to run, not this script's:" >&2
+  echo "" >&2
+  echo "  sudo rm -rf $real" >&2
+  echo "" >&2
+  echo "The run dir is still marked as this script's, so --clean and a fresh run" >&2
+  echo "both keep working either way." >&2
+  return 1
 }
 
 # ── the isolated world ──────────────────────────────────────────────────────
@@ -841,7 +873,8 @@ while [[ $# -gt 0 ]]; do
     --resume)    RESUME=1; shift ;;
     --only)      ONLY="${2:-}"; shift 2 ;;
     --no-docker) NO_DOCKER=1; shift ;;
-    --clean)     _clean_run_dir || true
+    --clean)     _clean_rc=0
+                 _clean_run_dir || _clean_rc=$?
                  # fenced too: only ever the derived report dir, never a path
                  # someone passed in.
                  case "$REPORT_DIR" in
@@ -849,7 +882,9 @@ while [[ $# -gt 0 ]]; do
                                       && echo "removed $REPORT_DIR" ;;
                    *) echo "${RED}Refusing to delete $REPORT_DIR${RESET}" >&2 ;;
                  esac
-                 exit 0 ;;
+                 # Propagate the failure. Exiting 0 here is how `--clean && run`
+                 # sailed on past a clean that had not cleaned anything.
+                 exit "$_clean_rc" ;;
     --report)    [[ -f "$REPORT" ]] && { echo "$REPORT"; cat "$REPORT"; } || echo "no report yet"; exit 0 ;;
     --list)      echo "checks (id  needs-you?):"
                  for c in $CHECKS; do

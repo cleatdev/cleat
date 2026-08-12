@@ -4529,6 +4529,27 @@ s@local claim="[$]claim_dir/@local claim="$clip_dir/@
 SED
 try "clip_claim_outside_mount" "the clipboard claim is renamed out of the box-visible dir" "$CLI" "$REGRESSIONS"
 
+# BROWSER BRIDGE SYMLINK READ-THROUGH: the same shape as the clipboard payload
+# path, in the consumer that `cat`s the claim. Drop the guard and a planted link
+# has the host read any file it names and hand the contents to the URL opener.
+# Removes the WHOLE defence, both the pre-check and the post-rename check.
+# Deleting either one alone leaves the other covering the property, so a
+# single-guard mutation reads as MISSED when the test is in fact fine. The
+# post-rename check defends a race and cannot be isolated in a test.
+cat > "$SED_TMP" << 'SED'
+/^  if \[ -L "[$]bridge_file" \]; then$/,/^  fi$/d
+/^  if \[ -L "[$]claim" \]; then$/,/^  fi$/d
+SED
+try "browser_symlink_read_through" "a symlinked browser-bridge file is never read through" "$CLI" "$REGRESSIONS"
+
+# BROWSER CLAIM DIR: ignore the caller's claim directory and the claim goes back
+# beside the bridge file, inside the box's bind mount, where it can be swapped
+# between the rename and the cat.
+cat > "$SED_TMP" << 'SED'
+s@  \[ -n "[$]claim_dir" \] || claim_dir="[$](dirname "[$]bridge_file")"@  claim_dir="$(dirname "$bridge_file")"@
+SED
+try "browser_claim_dir_honoured" "the browser claim honours a claim dir outside the mount" "$CLI" "$REGRESSIONS"
+
 # INTEGRATION NAME QUOTING: reintroduce the single-quoted path argument in a
 # real integration call site. The literal text gets hashed, so the computed
 # container name no longer matches the container cleat created, and every

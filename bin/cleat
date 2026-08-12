@@ -5270,9 +5270,27 @@ PYEOF
 # URL written in the same wall-clock second.
 _browser_claim_url() {
   local bridge_file="$1"
+  # Where the claim goes. The watcher passes a directory outside the box's bind
+  # mount, which is what stops the box swapping the claim between the rename and
+  # the read. Defaults beside the bridge file so direct callers are unchanged.
+  local claim_dir="${2:-}"
+  [ -n "$claim_dir" ] || claim_dir="$(dirname "$bridge_file")"
+  # Same shape as the clipboard payload path, same fix. A symlink is never a
+  # real claim: the box's open shim writes a regular file. `mv` moves the LINK
+  # without following it and the `cat` below DOES follow it, so a planted link
+  # would have the host read whatever file it names. Tested before [ -f ],
+  # which dereferences and so passes a link to any readable file.
+  if [ -L "$bridge_file" ]; then
+    rm -f "$bridge_file" 2>/dev/null || true
+    return 1
+  fi
   [ -f "$bridge_file" ] || return 1
-  local claim="${bridge_file}.opening.$$.${RANDOM}"
+  local claim="$claim_dir/.browser-open.opening.$$.${RANDOM}"
   mv "$bridge_file" "$claim" 2>/dev/null || return 1
+  if [ -L "$claim" ]; then
+    rm -f "$claim" 2>/dev/null || true
+    return 1
+  fi
   cat "$claim" 2>/dev/null || true
   rm -f "$claim" 2>/dev/null || true
   return 0
@@ -5412,9 +5430,17 @@ _browser_watcher() {
   # poll. The unconditional rm here swallowed it, stranding that login. Only a
   # file older than several polls is a true leftover. _path_mtime returns 0 on
   # failure, which reads as ancient and still gets swept, so this fails safe.
-  if [ -f "$bridge_file" ] && [ $(( $(date +%s) - $(_path_mtime "$bridge_file") )) -gt 5 ]; then
+  # A symlink here is dropped unaged, for the reason in _browser_claim_url, and
+  # before the [ -f ] that would dereference it.
+  if [ -L "$bridge_file" ]; then
+    rm -f "$bridge_file"
+  elif [ -f "$bridge_file" ] && [ $(( $(date +%s) - $(_path_mtime "$bridge_file") )) -gt 5 ]; then
     rm -f "$bridge_file"
   fi
+  # Claims land outside the bind mount, same sibling the clipboard bridge uses.
+  local _bw_claim_dir
+  _bw_claim_dir="$(dirname "$clip_dir")/clipclaim"
+  mkdir -p "$_bw_claim_dir" 2>/dev/null || _bw_claim_dir="$clip_dir"
   _browser_sweep_stale_markers "$clip_dir"
   while true; do
     # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
@@ -5433,7 +5459,7 @@ _browser_watcher() {
     # a heavy multi-agent run. Behavior is identical: _browser_claim_url also
     # returns 1 when the file is absent.
     local url=""
-    if [ -f "$bridge_file" ] && url="$(_browser_claim_url "$bridge_file")"; then
+    if { [ -f "$bridge_file" ] || [ -L "$bridge_file" ]; } && url="$(_browser_claim_url "$bridge_file" "$_bw_claim_dir")"; then
       if _browser_recently_opened "$clip_dir" "$url"; then
         url=""   # duplicate of a just-opened URL; drop it
       fi

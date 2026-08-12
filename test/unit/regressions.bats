@@ -2770,6 +2770,59 @@ SCRIPT
     echo "REGRESSION: the planted symlink was delivered to the host clipboard"; return 1; }
 }
 
+@test "regression: a symlinked browser-bridge file is never read through" {
+  # Same bug, same shared dir, different consumer: _browser_claim_url gated on
+  # [ -f ] (dereferences), moved the link with mv (does not), then `cat`ed the
+  # claim (does). So a box could name any host file and have the host read it.
+  echo "HOST-PRIVATE-KEY" > "$TEST_TEMP/secret"
+  ln -s "$TEST_TEMP/secret" "$TEST_TEMP/.browser-open"
+
+  run _browser_claim_url "$TEST_TEMP/.browser-open"
+  # Nothing claimed, and above all nothing from the target on stdout: that
+  # string is what would have been handed to the host's browser opener.
+  assert_failure
+  refute_output --partial "HOST-PRIVATE-KEY"
+  [ ! -L "$TEST_TEMP/.browser-open" ] || {
+    echo "REGRESSION: the planted symlink survived the claim"; return 1; }
+  run cat "$TEST_TEMP/secret"
+  assert_output "HOST-PRIVATE-KEY"
+}
+
+@test "regression: a real browser-bridge URL still claims after the symlink guard" {
+  # The guard must not cost the feature: a regular file still claims exactly
+  # once and is consumed, which is the property the bridge exists for.
+  printf '%s\n' "https://example.com/real" > "$TEST_TEMP/.browser-open"
+  run _browser_claim_url "$TEST_TEMP/.browser-open"
+  assert_success
+  assert_output "https://example.com/real"
+  [ ! -e "$TEST_TEMP/.browser-open" ] || {
+    echo "REGRESSION: the bridge file was not consumed"; return 1; }
+}
+
+@test "regression: the browser claim honours a claim dir outside the mount" {
+  # The watcher passes a directory the box cannot see, so the claim cannot be
+  # swapped between the rename and the cat. Without the second argument the old
+  # behaviour (claim beside the bridge file) is preserved for direct callers.
+  #
+  # Discriminating on an UNWRITABLE claim dir, because the claim file exists
+  # only between the mv and the rm and cannot be observed directly. Honouring
+  # the argument means the mv targets a dir that rejects it, so nothing is
+  # claimed. Ignoring it means claiming beside the bridge file, which succeeds.
+  # Asserting "no litter in outside/" instead was worthless: it is trivially
+  # true when the directory is never touched, so it passed under the mutation.
+  [ "$(id -u)" -ne 0 ] || skip "root ignores directory permissions"
+  mkdir -p "$TEST_TEMP/outside"
+  printf '%s\n' "https://example.com/x" > "$TEST_TEMP/.browser-open"
+  chmod a-w "$TEST_TEMP/outside"
+
+  run _browser_claim_url "$TEST_TEMP/.browser-open" "$TEST_TEMP/outside"
+  chmod u+w "$TEST_TEMP/outside"
+
+  assert_failure
+  [ -f "$TEST_TEMP/.browser-open" ] || {
+    echo "REGRESSION: claim_dir ignored, the URL was claimed from the wrong directory"; return 1; }
+}
+
 @test "regression: the clipboard claim is renamed out of the box-visible dir" {
   # The claim used to be created inside \$clip_dir, which the box has rw. A box
   # watching that directory could swap the claim for a symlink in the window

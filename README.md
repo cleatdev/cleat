@@ -457,6 +457,7 @@ run `cleat rm && cleat`.
 | `cleat prune` | Remove stale cleat images (boxes and other projects untouched) |
 | `cleat prune --cache` | Also clear the shared Docker build cache (regenerable, all projects). Typed flag + default-No confirm |
 | `cleat storage` | Read-only Docker disk breakdown: fill bar, cleat vs shared vs other projects |
+| `cleat paste [box]` | Hand the clipboard image to a box and print the path to paste at the prompt |
 | `cleat nuke` | Remove **all** Cleat containers and images, plus the shared build cache |
 
 #### Capabilities

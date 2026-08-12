@@ -250,6 +250,39 @@ cleat_bin_at() {
   assert_output --partial "not running"
 }
 
+# ── paste ───────────────────────────────────────────────────────────────────
+
+@test "smoke: cleat paste --help exits cleanly" {
+  run cleat_bin paste --help
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "cleat paste"
+}
+
+@test "smoke: cleat paste exits with a friendly error when the daemon is down" {
+  export DOCKER_EXIT_CODE=1
+  run cleat_bin paste
+  refute_output --partial "unbound variable"
+  assert_output --partial "not running"
+}
+
+@test "smoke: cleat paste with no box says so instead of crashing" {
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  run cleat_bin paste
+  assert_failure
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+}
+
+@test "smoke: cleat paste --file on a non-image exits without a strict-mode crash" {
+  printf 'not an image' > "$TEST_TEMP/x.png"
+  run cleat_bin paste --file "$TEST_TEMP/x.png"
+  assert_failure
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+}
+
 @test "smoke: cleat prune --cache --yes runs non-interactively without crashing" {
   printf '' > "$DOCKER_MOCK_DIR/images_output"
   run cleat_bin prune --cache --yes

@@ -4940,18 +4940,37 @@ _clipboard_watcher() {
   # "never replay old bytes into the clipboard" is this bridge's safe
   # direction. _path_mtime returns 0 on failure, which reads as ancient and
   # still gets swept, so unreadable files fail safe too.
+  #
+  # A SYMLINK here is never a real copy. The shim only ever renames a regular
+  # file into place, so a link is something the box planted, and it is dropped
+  # unread and unaged: see _do_copy for what reading one would do. It must be
+  # tested before the [ -f ] below, because -f follows the link and a link to a
+  # regular host file passes it.
   local leftover_age
-  if [ -f "$clip_dir/clipboard" ]; then
+  if [ -L "$clip_dir/clipboard" ]; then
+    rm -f "$clip_dir/clipboard" 2>/dev/null || true
+  elif [ -f "$clip_dir/clipboard" ]; then
     leftover_age=$(( $(date +%s) - $(_path_mtime "$clip_dir/clipboard") ))
     if [ "$leftover_age" -gt 5 ] || [ "$leftover_age" -lt 0 ]; then
       rm -f "$clip_dir/clipboard" 2>/dev/null || true
     fi
   fi
+  # Claims live OUTSIDE the bind mount. Only $clip_dir is shared with the box
+  # (docker run -v "$clip_dir":/tmp/cleat-clip), so a claim renamed up here is
+  # one the box cannot see, enumerate or swap, which is what closes the window
+  # between the rename and the read in _do_copy. A dedicated subdir rather than
+  # the run dir itself: the idle sweep measures staleness from the run dir's
+  # mtime, so churning claim files directly in it would re-stamp that clock on
+  # every copy and quietly hold the box out of the sweep.
+  local claim_dir
+  claim_dir="$(dirname "$clip_dir")/clipclaim"
+  mkdir -p "$claim_dir" 2>/dev/null || claim_dir="$clip_dir"
+
   # Claims stranded by a watcher killed between rename and delivery are the
   # same kind of leftover: same age gate. A live claim is milliseconds old
   # and never matches.
   local stale_claim
-  for stale_claim in "$clip_dir"/.claim.*; do
+  for stale_claim in "$claim_dir"/.claim.* "$clip_dir"/.claim.*; do
     [ -f "$stale_claim" ] || continue
     if [ $(( $(date +%s) - $(_path_mtime "$stale_claim") )) -gt 5 ]; then
       rm -f "$stale_claim" 2>/dev/null || true
@@ -4974,8 +4993,20 @@ _clipboard_watcher() {
   # crash.
   _do_copy() {
     kill -0 "$_cw_parent" 2>/dev/null || exit 0
-    local claim="$clip_dir/.claim.$$.${RANDOM}"
+    local claim="$claim_dir/.claim.$$.${RANDOM}"
+    # Rename FIRST, into a directory the box cannot reach. `mv` moves a symlink
+    # without following it, so a planted link arrives here intact rather than
+    # being resolved, and once it is out of the shared dir the box can no longer
+    # swap it for one.
     mv "$clip_dir/clipboard" "$claim" 2>/dev/null || return 0
+    # Now test what we actually got. The redirect below FOLLOWS a symlink, and
+    # it runs on the host: a link naming any file the host user can read would
+    # have this watcher pipe that file into the host clipboard. The shim never
+    # produces a link, so this is only ever hostile. Drop it unread.
+    if [ -L "$claim" ]; then
+      rm -f "$claim" 2>/dev/null || true
+      return 0
+    fi
     eval "$clip_cmd" < "$claim" 2>/dev/null || true
     rm -f "$claim" 2>/dev/null || true
   }
@@ -5000,7 +5031,9 @@ _clipboard_watcher() {
   # signal, and a pre-existing file can never masquerade as a fresh copy.
   while true; do
     kill -0 "$_cw_parent" 2>/dev/null || exit 0
-    if [ -f "$clip_dir/clipboard" ]; then
+    # -L as well as -f: a DANGLING symlink fails -f, so without this a planted
+    # link naming a nonexistent path would sit here untouched. _do_copy drops it.
+    if [ -L "$clip_dir/clipboard" ] || [ -f "$clip_dir/clipboard" ]; then
       _do_copy
     fi
     sleep 1
@@ -5927,8 +5960,11 @@ exec_claude() {
     fi
     _cleanup_spin
     rm -f "${_CLIP_DIR:?}/.clipboard."*
-    # Own claims only: another session's live claim in this shared dir must
-    # survive our exit (see _do_copy's claim-name note).
+    # Own claims only: another session's live claim must survive our exit (see
+    # _do_copy's claim-name note). Both locations: claims moved out of the bind
+    # mount into clipclaim/, and the legacy in-mount path for a watcher started
+    # by an older CLI that is still running against this box.
+    rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."*
     rm -f "${_CLIP_DIR:?}/.claim.$$."*
     rm -f "${_CLIP_DIR:?}/.browser-open"
     rm -f "$_CLIP_DIR/.watcher.$$"

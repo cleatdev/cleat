@@ -2703,6 +2703,100 @@ SCRIPT
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Clipboard bridge symlink read-through. The clip dir is a READ-WRITE bind
+# mount into the box, so the box can put a symlink where a payload belongs.
+# `mv` moved the link without following it, the `<` redirect that delivered it
+# DID follow it, and both presence gates used [ -f ], which dereferences. So a
+# box could name any file the host user can read and have the host's own
+# watcher pipe it into the host clipboard. Reproduced end to end on 2026-08-11.
+#
+# Three properties, one per test: a link is never read through, a link planted
+# before startup is swept unaged, and the claim is renamed OUT of the shared
+# directory so the box cannot swap it between the rename and the read.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression: a symlinked clipboard payload is never read through to the host" {
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir"
+  echo "HOST-PRIVATE-KEY" > "$TEST_TEMP/secret"
+
+  _clipboard_watcher "$clip_dir" "cat >> '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 0.3
+  # Exactly what the box can do today: plant the link, then rename it into
+  # place the way the shim delivers a real payload (which is what fires the
+  # watcher's moved_to).
+  ln -s "$TEST_TEMP/secret" "$TEST_TEMP/evil"
+  mv "$TEST_TEMP/evil" "$clip_dir/clipboard"
+  sleep 2
+  stop_watcher "$pid" "$clip_dir"
+
+  if [ -f "$TEST_TEMP/copied" ]; then
+    run cat "$TEST_TEMP/copied"
+    refute_output --partial "HOST-PRIVATE-KEY"
+  fi
+  [ ! -e "$clip_dir/clipboard" ] && [ ! -L "$clip_dir/clipboard" ] || {
+    echo "REGRESSION: the planted symlink survived instead of being dropped"; return 1; }
+  run cat "$TEST_TEMP/secret"
+  assert_output "HOST-PRIVATE-KEY"
+}
+
+@test "regression: a symlink planted before startup is swept, never delivered" {
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir" "$TEST_TEMP/bin"
+  echo "HOST-PRIVATE-KEY" > "$TEST_TEMP/secret"
+  # No age gate applies to a link. The shim only ever renames a regular file
+  # into place, so a link is hostile at any age, including zero seconds old.
+  ln -s "$TEST_TEMP/secret" "$clip_dir/clipboard"
+
+  # Force the EVENT-DRIVEN branch, which is the only one where this matters and
+  # the one real hosts take. A link planted BEFORE the watcher starts never
+  # fires moved_to, so _do_copy never runs and the startup sweep is the only
+  # thing that can remove it. Without this stub the polling fallback picks the
+  # link up on its first tick and _do_copy's own guard drops it, so the test
+  # passes whatever the sweep does. That is how this test first shipped, and
+  # the mutation harness caught it.
+  printf '#!/usr/bin/env bash\nsleep 30\nexit 1\n' > "$TEST_TEMP/bin/inotifywait"
+  chmod +x "$TEST_TEMP/bin/inotifywait"
+  PATH="$TEST_TEMP/bin:$PATH"
+
+  _clipboard_watcher "$clip_dir" "cat >> '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 1
+  stop_watcher "$pid" "$clip_dir"
+
+  [ ! -L "$clip_dir/clipboard" ] || {
+    echo "REGRESSION: startup sweep left a planted symlink in place"; return 1; }
+  [ ! -f "$TEST_TEMP/copied" ] || {
+    echo "REGRESSION: the planted symlink was delivered to the host clipboard"; return 1; }
+}
+
+@test "regression: the clipboard claim is renamed out of the box-visible dir" {
+  # The claim used to be created inside \$clip_dir, which the box has rw. A box
+  # watching that directory could swap the claim for a symlink in the window
+  # between the rename and the read. Renaming into a host-only sibling closes
+  # the window instead of racing it.
+  local clip_dir="$TEST_TEMP/clip"
+  mkdir -p "$clip_dir"
+
+  _clipboard_watcher "$clip_dir" \
+    "ls '$clip_dir'/.claim.* >> '$TEST_TEMP/in-mount' 2>/dev/null; ls '$TEST_TEMP'/clipclaim/.claim.* >> '$TEST_TEMP/out-of-mount' 2>/dev/null; cat > '$TEST_TEMP/copied'" \
+    >/dev/null 2>&1 &
+  local pid=$!
+  sleep 0.3
+  echo "payload" > "$TEST_TEMP/payload"
+  mv "$TEST_TEMP/payload" "$clip_dir/clipboard"
+  sleep 2
+  stop_watcher "$pid" "$clip_dir"
+
+  run cat "$TEST_TEMP/copied"
+  assert_output "payload"
+  [ -s "$TEST_TEMP/out-of-mount" ] || {
+    echo "REGRESSION: no claim existed outside the shared dir at delivery time"; return 1; }
+  [ ! -s "$TEST_TEMP/in-mount" ] || {
+    echo "REGRESSION: the claim is still created inside the bind-mounted dir"; return 1; }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # v1.2.5: on hosts with inotify-tools (or fswatch), _cleanup_session's plain
 # `kill` on the clipboard watcher never reached the blocking inotifywait
 # child: bash defers a subprocess's own TERM trap while it sits blocked in a

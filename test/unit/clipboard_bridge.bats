@@ -78,10 +78,15 @@ EOF
   # session exiting mid-delivery (the copy is silently lost). The claim must
   # live under .claim.* instead. The snoop clip command records the claim
   # path at the moment of delivery, while the claim file exists.
+  #
+  # The claim also moved OUT of the shared dir entirely (into a clipclaim/
+  # sibling) to close the symlink-swap window, so look for it there. The
+  # namespace property this test guards is unchanged: still .claim.*, still
+  # never .clipboard.*.
   local clip_dir="$TEST_TEMP/clip"
   mkdir -p "$clip_dir"
 
-  _clipboard_watcher "$clip_dir" "ls '$clip_dir'/.claim.* >> '$TEST_TEMP/claims-seen' 2>/dev/null; cat > '$TEST_TEMP/copied'" >/dev/null 2>&1 &
+  _clipboard_watcher "$clip_dir" "ls '$TEST_TEMP'/clipclaim/.claim.* >> '$TEST_TEMP/claims-seen' 2>/dev/null; cat > '$TEST_TEMP/copied'" >/dev/null 2>&1 &
   local pid=$!
   sleep 0.3
   echo "payload" > "$TEST_TEMP/payload"

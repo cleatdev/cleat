@@ -4504,6 +4504,31 @@ s@    _pp="$(_phys_or_best "$project")"@    _pp="$project"@
 SED
 try "fork_of_fork_symlinked" "forking a fork is refused THROUGH" "$CLI" "$FORK_BATS"
 
+# CLIPBOARD SYMLINK READ-THROUGH: the delivery redirect follows a symlink even
+# though the mv that precedes it does not. Drop the post-rename check and a box
+# can name any host file and have the host's own watcher pipe it into the host
+# clipboard.
+cat > "$SED_TMP" << 'SED'
+/^    if \[ -L "[$]claim" \]; then$/,/^    fi$/d
+SED
+try "clip_symlink_read_through" "a symlinked clipboard payload is never read through" "$CLI" "$REGRESSIONS"
+
+# CLIPBOARD SYMLINK STARTUP SWEEP: kill the -L branch and a planted link falls
+# through to the [ -f ] age gate, which dereferences. A fresh link is inside the
+# grace window, so it survives startup and waits to be delivered.
+cat > "$SED_TMP" << 'SED'
+s@  if \[ -L "[$]clip_dir/clipboard" \]; then@  if [ -L "/nonexistent-never-matches" ]; then@
+SED
+try "clip_symlink_startup_sweep" "a symlink planted before startup is swept" "$CLI" "$REGRESSIONS"
+
+# CLAIM INSIDE THE BIND MOUNT: put the claim back in the shared dir and the box
+# can swap it for a symlink in the window between the rename and the read, which
+# is the race the move out of the mount exists to remove.
+cat > "$SED_TMP" << 'SED'
+s@local claim="[$]claim_dir/@local claim="$clip_dir/@
+SED
+try "clip_claim_outside_mount" "the clipboard claim is renamed out of the box-visible dir" "$CLI" "$REGRESSIONS"
+
 # INTEGRATION NAME QUOTING: reintroduce the single-quoted path argument in a
 # real integration call site. The literal text gets hashed, so the computed
 # container name no longer matches the container cleat created, and every

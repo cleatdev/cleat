@@ -4561,13 +4561,55 @@ s@  docker cp "[$]done" "[$]cname:[$]_CLIPIMG_BOX_DIR/in.done" >/dev/null 2>&1@ 
 SED
 try "clipimg_serve_done_signal" "delivered as in.png then in.done" "$CLI" "$CLIPIMG_BATS"
 
-# WATCHER CONSUMES REQUEST: stop removing the request marker and the watcher
-# re-serves the same request every tick, and the shim never gets its liveness
-# signal that a watcher is alive.
+# WATCHER CONSUMES REQUEST: serve without the atomic mv-claim and the request is
+# never consumed, so the shim never gets its liveness signal and the watcher
+# re-serves every tick.
 cat > "$SED_TMP" << 'SED'
-s@      rm -f "[$]req" 2>/dev/null || true@      :@
+s@    if mv "[$]req" "[$]req.claimed" 2>/dev/null; then@    if [ -e "$req" ]; then@
 SED
 try "clipimg_watcher_consumes" "consumes the request marker and serves once" "$CLI" "$CLIPIMG_BATS"
+
+# LOCK TRAP: drop the shim's signal trap and a paste killed mid-flight strands
+# the lock DIRECTORY, wedging every later paste (the .host-ready latch class).
+cat > "$SED_TMP" << 'SED'
+/trap .rm -f "[$]REQ" 2>.dev.null; rmdir "[$]LOCK"/d
+SED
+try "clipimg_lock_trap" "a signal mid-paste releases the lock" "$CLI" "$CLIPIMG_BATS"
+
+# LOCK SWEEP: SIGKILL cannot be trapped, so the host watcher must sweep a stale
+# lock. Remove the sweep and a killed shim's lock wedges paste across sessions.
+cat > "$SED_TMP" << 'SED'
+s@      rmdir "[$]lock" 2>/dev/null || true@      :@
+SED
+try "clipimg_lock_sweep" "sweeps a stale lock a killed shim left" "$CLI" "$CLIPIMG_BATS"
+
+# LOCK SWEEP AGE GATE: sweep without the age gate and a LIVE lock is yanked from
+# a running paste.
+cat > "$SED_TMP" << 'SED'
+s@))" -gt 10 \]; then@))" -gt -100000 ]; then@
+SED
+try "clipimg_lock_sweep_age" "never sweeps a fresh" "$CLI" "$CLIPIMG_BATS"
+
+# BOUNDED READ: remove the kill and a slow host read runs unbounded, so a late
+# delivery is attached by the next paste as a stale wrong image.
+cat > "$SED_TMP" << 'SED'
+s@    if \[ "[$]_rn" -ge 16 \]; then kill "[$]_rpid" 2>/dev/null; break; fi@    :@
+SED
+try "clipimg_read_bounded" "a slow host read is bounded" "$CLI" "$CLIPIMG_BATS"
+
+# CLEAR AFTER LOCK: clear before taking the lock and a losing second press wipes
+# the winner's in-flight in.png.
+cat > "$SED_TMP" << 'SED'
+s@^mkdir "[$]LOCK" 2>/dev/null || exit 1@rm -f "$D/in.png" "$D/in.done" "$D/cache.png" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || exit 1@
+SED
+try "clipimg_clear_after_lock" "does not delete the winner" "$CLI" "$CLIPIMG_BATS"
+
+# ATOMIC CLAIM RESIDUE: leave the .claimed rename behind and the shared dir fills
+# with residue the sweeps do not match.
+cat > "$SED_TMP" << 'SED'
+s@      rm -f "[$]req.claimed" 2>/dev/null || true@      :@
+SED
+try "clipimg_claim_residue" "leaves no residue" "$CLI" "$CLIPIMG_BATS"
 
 # SHIM DROP PATH: land the shim anywhere but ahead of xclip on PATH and native
 # ctrl+v never reaches it.

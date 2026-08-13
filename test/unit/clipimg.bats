@@ -321,3 +321,103 @@ EOF
   assert_output --partial "cleat-shim v1"
   refute_output --regexp 'rm -f "?/home/coder/.local/bin/xclip"?$'
 }
+
+# ── the lock wedge (2.1): trap + host sweep ─────────────────────────────────
+
+@test "clipimg shim: a signal mid-paste releases the lock, the next paste works" {
+  # No fake host, so the check leg blocks in its poll loops holding the lock.
+  # Without the trap, a kill here strands the lock DIRECTORY and every later
+  # paste fails the mkdir forever. The wedge is the same class as .host-ready.
+  "$SHIM" -selection clipboard -t TARGETS -o >/dev/null 2>&1 &
+  local spid=$!
+  local i=0
+  while [ ! -e "$CLIPDIR/.image-lock" ] && [ "$i" -lt 60 ]; do sleep 0.05; i=$((i+1)); done
+  [ -e "$CLIPDIR/.image-lock" ] || { echo "shim never took the lock"; return 1; }
+  kill -TERM "$spid"
+  wait "$spid" 2>/dev/null || true
+  [ ! -e "$CLIPDIR/.image-lock" ] || { echo "TERM stranded the lock, paste is now wedged"; return 1; }
+  # Not wedged: a fresh paste still works.
+  _fake_host "AFTERKILL"
+  run "$SHIM" -selection clipboard -t TARGETS -o
+  assert_success
+  assert_output "image/png"
+}
+
+@test "clipimg watcher: sweeps a stale lock a killed shim left across sessions" {
+  # SIGKILL cannot be trapped, so a lock can outlive its shim and persist on the
+  # shared mount. The watcher must clear an aged one before the first paste.
+  mkdir "$CLIPDIR/.image-lock"
+  touch -t 202001010000 "$CLIPDIR/.image-lock"
+  _clipimg_watcher "$CLIPDIR" "abox" >/dev/null 2>&1 &
+  local wpid=$!
+  local i=0
+  while [ -d "$CLIPDIR/.image-lock" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ ! -d "$CLIPDIR/.image-lock" ] || { echo "stale lock not swept, paste stays wedged"; return 1; }
+}
+
+@test "clipimg watcher: never sweeps a fresh (live) lock" {
+  # A live shim holds the lock for up to ~4s. Sweeping a fresh one would yank it
+  # from a running paste. Only an aged lock is orphaned.
+  mkdir "$CLIPDIR/.image-lock"
+  _clipimg_watcher "$CLIPDIR" "abox" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 1
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ -d "$CLIPDIR/.image-lock" ] || { echo "swept a live lock"; return 1; }
+  rmdir "$CLIPDIR/.image-lock" 2>/dev/null || true
+}
+
+# ── bounded host read (2.2) ─────────────────────────────────────────────────
+
+@test "clipimg serve: a slow host read is bounded and answered as a miss" {
+  # An unbounded read can outlive the requesting shim's window, and its late
+  # delivery would then be attached by the NEXT paste as a stale wrong image.
+  _use_capturing_docker
+  _host_clip_read_image() { sleep 6; printf 'LATEBYTES' > "$1"; return 0; }
+  local start end
+  start="$(date +%s)"
+  _clipimg_serve "abox" "$TEST_TEMP/stage"
+  end="$(date +%s)"
+  # Bounded ~1.6s. Unbounded would wait the full 6s, so 4 separates them cleanly.
+  [ $((end - start)) -le 4 ] || { echo "serve took $((end-start))s, the read was not bounded"; return 1; }
+  # Killed mid-read means an empty (miss) delivery, never the late bytes.
+  [ ! -s "$TEST_TEMP/captured/in.png" ] || { echo "delivered late bytes instead of a miss"; return 1; }
+}
+
+# ── clear-after-lock (2.3) ──────────────────────────────────────────────────
+
+@test "clipimg shim: a press that loses the lock does not delete the winner's in.png" {
+  # Winner state: lock held, in.png delivered, in.done not yet. A losing second
+  # press must fail the mkdir lock and exit WITHOUT clearing the slot. With the
+  # clear above the lock (the old order), the loser wiped the winner's in.png.
+  mkdir "$CLIPDIR/.image-lock"
+  mkdir -p "$BOXDIR"
+  printf 'WINNER' > "$BOXDIR/in.png"
+  run "$SHIM" -selection clipboard -t TARGETS -o
+  assert_failure
+  run cat "$BOXDIR/in.png"
+  assert_output "WINNER"
+  rmdir "$CLIPDIR/.image-lock" 2>/dev/null || true
+}
+
+# ── atomic claim (2.4) ──────────────────────────────────────────────────────
+
+@test "clipimg watcher: claims the request by rename and leaves no residue" {
+  # The consume is an atomic mv, not test-then-rm, so two watchers on one box
+  # cannot both serve one request. This proves the claim path consumes the
+  # request and cleans up its .claimed rename.
+  _use_capturing_docker
+  _host_clip_read_image() { printf '\x89PNG\r\n\x1a\nB' > "$1"; return 0; }
+  : > "$CLIPDIR/.image-req"
+  _clipimg_watcher "$CLIPDIR" "abox" >/dev/null 2>&1 &
+  local wpid=$!
+  local i=0
+  while [ ! -e "$TEST_TEMP/captured/in.done" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i+1)); done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ ! -e "$CLIPDIR/.image-req" ]         || { echo "request not consumed"; return 1; }
+  [ ! -e "$CLIPDIR/.image-req.claimed" ] || { echo "claim residue left behind"; return 1; }
+}

@@ -5064,10 +5064,21 @@ esac
 # Check leg: ask the host, and always terminate. A shim that blocks forever
 # would hang the paste for the life of the session.
 mkdir -p "$D" 2>/dev/null
-rm -f "$D/in.png" "$D/in.done" "$D/cache.png" 2>/dev/null
 # Single flight. Two fast ctrl+v presses share one fixed temp path upstream, so
 # refusing the second is strictly better than racing it.
 mkdir "$LOCK" 2>/dev/null || exit 1
+# Release the lock on any catchable signal. Without this, a shim killed while it
+# holds the lock (session Ctrl+C or the terminal closing mid-paste) strands the
+# lock DIRECTORY on the shared mount, and since nothing box-side sweeps it every
+# later paste fails the mkdir above and silently attaches nothing. SIGKILL
+# cannot be trapped, so the host watcher sweeps a stale lock too; this covers the
+# common signals at no cost.
+trap 'rm -f "$REQ" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; exit 1' INT TERM HUP
+# Clear AFTER taking the lock, so a second press that loses the lock cannot
+# delete the winner's in-flight delivery on its way out. Only the holder wipes
+# the slot, and it still clears before writing the request, so a fully-landed
+# stale delivery from an earlier paste is never mistaken for this one.
+rm -f "$D/in.png" "$D/in.done" "$D/cache.png" 2>/dev/null
 : > "$REQ" 2>/dev/null || { rmdir "$LOCK" 2>/dev/null; exit 1; }
 
 # The host's first act is to rm the marker, so its disappearance is proof a
@@ -5090,6 +5101,9 @@ while [ ! -e "$D/in.done" ]; do
   sleep 0.05
 done
 rmdir "$LOCK" 2>/dev/null
+# Past the locked region: a late signal must not turn a nearly-complete paste
+# into a lock cleanup that exits 1.
+trap - INT TERM HUP
 
 # An empty in.png is the host's negative answer.
 [ -s "$D/in.png" ] || exit 1
@@ -5133,13 +5147,32 @@ _clipimg_remove_shim() {
 _clipimg_serve() {
   local cname="$1" stage_dir="$2"
   mkdir -p "$stage_dir" 2>/dev/null || return 0
-  local img="$stage_dir/serve.$$.png"
+  # Unique per serve. A reader killed by the bound below can leave an orphan
+  # child (osascript) that writes late, and a fixed name would let it scribble
+  # the NEXT serve's file. A unique name sends that stray write to a dead path.
+  local img="$stage_dir/serve.$$.${RANDOM}.png"
   rm -f "$img" 2>/dev/null || true
   : > "$img"
 
   # Image-only by construction: _host_clip_read_image has no text reader. On a
   # text or empty clipboard it fails and leaves the file empty.
-  _host_clip_read_image "$img" 2>/dev/null || true
+  #
+  # Bound the read. It shells out to osascript, which can block with no limit:
+  # the macOS 15.4+ pasteboard-privacy modal waits on a human click, a large
+  # TIFF plus a sips convert is slow, a WSL powershell is a cold start. If it
+  # overran the requesting shim's ~2.5s give-up window, the shim would report a
+  # miss while this serve was still in flight, and the late delivery would then
+  # be attached by the NEXT paste as a stale wrong image. macOS ships no
+  # timeout(1), so bound it with a background job and a kill. Worst case is a
+  # miss, which the gates below already produce, never a wrong image.
+  _host_clip_read_image "$img" >/dev/null 2>&1 &
+  local _rpid=$! _rn=0
+  while kill -0 "$_rpid" 2>/dev/null; do
+    _rn=$((_rn + 1))
+    if [ "$_rn" -ge 16 ]; then kill "$_rpid" 2>/dev/null; break; fi   # ~1.6s
+    sleep 0.1
+  done
+  wait "$_rpid" 2>/dev/null || true
 
   # Validate independently of the reader, the same two gates cleat paste uses.
   # Any failure collapses to an empty file, which the shim reads as a miss.
@@ -5173,16 +5206,33 @@ _clipimg_watcher() {
   trap 'exit 0' TERM INT HUP
   local _ciw_parent=$$
   local req="$clip_dir/.image-req"
+  local lock="$clip_dir/.image-lock"
   local stage_dir; stage_dir="$(dirname "$clip_dir")/clipimg-stage"
   while true; do
     # Orphan guards, same as the other watchers: the run dir vanishing (rm/nuke)
     # or the parent cleat dying (terminal closed, SIGKILL) stops the poll.
     [ -d "$clip_dir" ] || exit 0
     kill -0 "$_ciw_parent" 2>/dev/null || exit 0
-    if [ -e "$req" ] || [ -L "$req" ]; then
-      # Consume FIRST. The marker's disappearance is the shim's proof a watcher
-      # is alive, and its content is never read: the request carries nothing.
-      rm -f "$req" 2>/dev/null || true
+    # Sweep a lock a shim stranded when a signal (SIGKILL, or one that beat its
+    # trap) killed it mid-paste. It is a DIRECTORY on the shared mount that
+    # survives stop/start, and nothing else removes it, so every later paste
+    # would fail its mkdir and silently attach nothing (the same latch class as
+    # .host-ready). The shim holds it at most ~4s, so older than 10s is orphaned.
+    # rmdir, since rm -f no-ops on a directory. This runs before the first paste
+    # can, so a lock stranded by a prior session clears in time. A negative age
+    # (clock stepped back) is left alone: never yank a live lock.
+    if [ -d "$lock" ] && [ "$(( $(date +%s) - $(_path_mtime "$lock") ))" -gt 10 ]; then
+      rmdir "$lock" 2>/dev/null || true
+    fi
+    # Atomic claim: mv, not test-then-rm. Two sessions on one box each run a
+    # watcher on this shared dir, and a non-atomic [ -e ] then rm -f let both
+    # pass in one window and both serve, doubling the host clipboard read (two
+    # osascript pasteboard accesses per paste). mv makes the request vanish for
+    # exactly one winner, and its disappearance is still the shim's proof a
+    # watcher is alive. A symlink at $req is moved, not followed, then dropped
+    # unread: the request carries nothing.
+    if mv "$req" "$req.claimed" 2>/dev/null; then
+      rm -f "$req.claimed" 2>/dev/null || true
       _clipimg_serve "$cname" "$stage_dir"
     fi
     sleep 0.25

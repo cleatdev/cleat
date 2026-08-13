@@ -2770,6 +2770,42 @@ SCRIPT
     echo "REGRESSION: the planted symlink was delivered to the host clipboard"; return 1; }
 }
 
+@test "regression: a dead session's watcher marker never latches .host-ready on" {
+  # .watcher.<pid> markers carry the HOST pid of a clipboard watcher. The
+  # cleanup tested mere EXISTENCE, so a marker left by a crashed session held
+  # .host-ready on forever. docker/clip takes the file-bridge path whenever
+  # .host-ready exists, so a session with no watcher running wrote its payload
+  # to a bridge nobody was reading: the copy was swept as a stale leftover and
+  # the OSC 52 fallback that would have worked was never tried. Found live with
+  # two markers from two days earlier sitting next to the current one.
+  local dir="$TEST_TEMP/clip"
+  mkdir -p "$dir"
+
+  # No background jobs: a child outliving the test makes bats miscount tests.
+  # Live pid = this test's own shell. Dead pid = a subshell that has already
+  # exited by the time the substitution returns, which beats guessing a number
+  # the OS might be using.
+  local live=$$
+  local dead
+  dead="$(sh -c 'echo $$')"
+
+  touch "$dir/.watcher.$live" "$dir/.watcher.$dead" "$dir/.watcher.notanumber"
+  _sweep_dead_watcher_markers "$dir"
+
+  [ -e "$dir/.watcher.$live" ] || {
+    echo "REGRESSION: swept a LIVE watcher's marker, which would drop .host-ready under a working bridge"; return 1; }
+  [ ! -e "$dir/.watcher.$dead" ] || {
+    echo "REGRESSION: a dead session's marker survived and will latch .host-ready on"; return 1; }
+  [ ! -e "$dir/.watcher.notanumber" ] || {
+    echo "REGRESSION: a malformed marker survived"; return 1; }
+
+  # Last real watcher gone: nothing may remain to hold the latch on.
+  rm -f "$dir/.watcher.$live"
+  _sweep_dead_watcher_markers "$dir"
+  run bash -c "ls '$dir'/.watcher.* 2>/dev/null; true"
+  assert_output ""
+}
+
 @test "regression: a symlinked browser-bridge file is never read through" {
   # Same bug, same shared dir, different consumer: _browser_claim_url gated on
   # [ -f ] (dereferences), moved the link with mv (does not), then `cat`ed the

@@ -128,13 +128,16 @@ EOF
   touch "$_CLIP_DIR/.watcher.$$"
   touch "$_CLIP_DIR/.host-ready"
 
-  _cleanup_clipboard() {
-    rm -f "$_CLIP_DIR/.watcher.$$"
-    if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
-      rm -f "$_CLIP_DIR/.host-ready"
-    fi
-  }
-  _cleanup_clipboard
+  # This used to define its own _cleanup_clipboard and call THAT, so it passed
+  # whatever the real code did. Call the real sweep instead. The one-line `ls`
+  # gate is still mirrored here because it lives inside _cleanup_session, which
+  # cannot be invoked in isolation; the sweep is the part that carries the
+  # logic and the part the mutation targets.
+  rm -f "$_CLIP_DIR/.watcher.$$"
+  _sweep_dead_watcher_markers "$_CLIP_DIR"
+  if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
+    rm -f "$_CLIP_DIR/.host-ready"
+  fi
 
   [[ ! -f "$_CLIP_DIR/.host-ready" ]]  || return 1
 }

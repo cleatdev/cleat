@@ -5004,6 +5004,26 @@ AS
   return 1
 }
 
+# Remove .watcher.<pid> markers whose process is gone. Each marker is stamped
+# with the HOST pid of a clipboard watcher, so `kill -0` is the liveness test,
+# the same shape _box_has_attached_session uses for .attached.<pid>.
+#
+# A recycled pid can make a dead marker look live, which only delays the sweep
+# to the next session. The reverse mistake, treating a live watcher as dead,
+# would drop .host-ready out from under a working bridge, so this errs toward
+# keeping a marker.
+_sweep_dead_watcher_markers() {
+  local dir="$1" m pid
+  for m in "$dir"/.watcher.*; do
+    [ -e "$m" ] || continue
+    pid="${m##*/.watcher.}"
+    case "$pid" in
+      ''|*[!0-9]*) rm -f "$m" 2>/dev/null || true; continue ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || rm -f "$m" 2>/dev/null || true
+  done
+}
+
 # The image type of $1 by magic bytes, or empty. Never trust an extension: this
 # decides what gets pushed into a box.
 _image_magic_kind() {
@@ -5077,6 +5097,7 @@ _clipboard_watcher() {
     fi
   done
 
+  _sweep_dead_watcher_markers "$clip_dir"
   touch "$clip_dir/.host-ready"
 
   # Consume-on-read, mirroring _browser_claim_url: atomically claim the
@@ -6094,6 +6115,14 @@ exec_claude() {
     rm -f "${_CLIP_DIR:?}/.claim.$$."*
     rm -f "${_CLIP_DIR:?}/.browser-open"
     rm -f "$_CLIP_DIR/.watcher.$$"
+    # Only a LIVE sibling may hold .host-ready on. Testing mere existence let a
+    # marker from a crashed session latch it forever, and the box's shim takes
+    # the file-bridge path whenever .host-ready exists (docker/clip). So a
+    # session with no watcher running wrote its payload to a bridge nobody was
+    # reading, the copy was swept as a stale leftover, and the OSC 52 fallback
+    # that would have worked was never tried. Found with two markers from two
+    # days earlier still on disk.
+    _sweep_dead_watcher_markers "$_CLIP_DIR"
     if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
       rm -f "$_CLIP_DIR/.host-ready"
     fi

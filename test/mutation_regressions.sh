@@ -4531,6 +4531,15 @@ try "clip_claim_outside_mount" "the clipboard claim is renamed out of the box-vi
 
 PASTE_BATS="$REPO_ROOT/test/unit/paste.bats"
 
+# HOST-READY LATCH: go back to testing a watcher marker's mere existence. A
+# crashed session's marker then holds .host-ready on forever, the box keeps
+# taking the file-bridge path with nobody listening, and every copy is silently
+# swept instead of falling back to OSC 52.
+cat > "$SED_TMP" << 'SED'
+s@    kill -0 "[$]pid" 2>/dev/null || rm -f "[$]m" 2>/dev/null || true@    :@
+SED
+try "watcher_marker_liveness" "a dead session's watcher marker never latches" "$CLI" "$REGRESSIONS"
+
 # PASTE MAGIC GATE: accept whatever the clipboard reader or --file produced
 # without checking magic bytes, and any file at all gets pushed into a box under
 # an image extension.

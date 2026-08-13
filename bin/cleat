@@ -5004,6 +5004,101 @@ AS
   return 1
 }
 
+# ── Native ctrl+v image paste ─────────────────────────────────────────────
+# Claude Code's Linux clipboard contract, extracted verbatim from the 2.1.227
+# bundle:
+#   checkImage: xclip -selection clipboard -t TARGETS -o | grep -E "image/(png|jpeg|jpg|gif|webp|bmp)" || wl-paste -l ...
+#   saveImage:  xclip -selection clipboard -t image/png -o > FILE || wl-paste ... || -t image/bmp ...
+# Two separate invocations, so the host pasteboard is read ONCE on the check and
+# the bytes are cached in the box for the save.
+#
+# The shim is dropped into /home/coder/.local/bin, which bin/cleat already puts
+# first on PATH for every docker exec. Nothing under cli/docker/ changes, so no
+# image spec bump and no box is recreated.
+#
+# The shim is a CONVENIENCE, never a control: it lives inside the cage where the
+# model can replace it. Every gate that matters is host-side, and the request it
+# sends is contentless on purpose (see _clipimg_watcher).
+_CLIPIMG_BOX_DIR="/home/coder/.cleat-clipimg"
+_CLIPIMG_SHIM_PATH="/home/coder/.local/bin/xclip"
+
+# Write the shim to $1. Kept in one place so the tests can execute it directly.
+_clipimg_emit() {
+  cat > "$1" << 'CLIPIMG_SHIM_EOF'
+#!/bin/sh
+# cleat-shim v1
+# Answers Claude Code's clipboard IMAGE probes by asking the host. Anything
+# else is delegated to the real shim, so copy and text reads behave exactly as
+# they did before this file existed.
+REQ=/tmp/cleat-clip/.image-req
+LOCK=/tmp/cleat-clip/.image-lock
+D="$HOME/.cleat-clipimg"
+REAL=/usr/local/bin/xclip
+
+# Parse a COPY of the args so "$@" survives for the delegation below. A
+# substring match would misread `-selection clipboard` and `-t text/plain`.
+want_out=0; target=""; next_is_target=0
+for a in "$@"; do
+  if [ "$next_is_target" -eq 1 ]; then target="$a"; next_is_target=0; continue; fi
+  case "$a" in
+    -o|-out|-output|--out|--output) want_out=1 ;;
+    -t|-target|--target)            next_is_target=1 ;;
+    -t?*)                           target="${a#-t}" ;;
+  esac
+done
+
+[ "$want_out" -eq 1 ] || exec "$REAL" "$@"
+
+case "$target" in
+  TARGETS)  ;;
+  image/*)
+    # Save leg: hand over the bytes the check leg cached, once.
+    [ -s "$D/cache.png" ] || exit 1
+    cat "$D/cache.png"
+    rm -f "$D/cache.png" 2>/dev/null
+    exit 0 ;;
+  *) exec "$REAL" "$@" ;;
+esac
+
+# Check leg: ask the host, and always terminate. A shim that blocks forever
+# would hang the paste for the life of the session.
+mkdir -p "$D" 2>/dev/null
+rm -f "$D/in.png" "$D/in.done" "$D/cache.png" 2>/dev/null
+# Single flight. Two fast ctrl+v presses share one fixed temp path upstream, so
+# refusing the second is strictly better than racing it.
+mkdir "$LOCK" 2>/dev/null || exit 1
+: > "$REQ" 2>/dev/null || { rmdir "$LOCK" 2>/dev/null; exit 1; }
+
+# The host's first act is to rm the marker, so its disappearance is proof a
+# watcher is alive. No heartbeat needed, and no host write into this directory.
+i=0
+while [ -e "$REQ" ]; do
+  i=$((i + 1))
+  if [ "$i" -gt 24 ]; then
+    rm -f "$REQ" 2>/dev/null
+    rmdir "$LOCK" 2>/dev/null
+    exit 1
+  fi
+  sleep 0.05
+done
+
+i=0
+while [ ! -e "$D/in.done" ]; do
+  i=$((i + 1))
+  if [ "$i" -gt 50 ]; then rmdir "$LOCK" 2>/dev/null; exit 1; fi
+  sleep 0.05
+done
+rmdir "$LOCK" 2>/dev/null
+
+# An empty in.png is the host's negative answer.
+[ -s "$D/in.png" ] || exit 1
+mv "$D/in.png" "$D/cache.png" 2>/dev/null || exit 1
+echo "image/png"
+exit 0
+CLIPIMG_SHIM_EOF
+  chmod +x "$1" 2>/dev/null || true
+}
+
 # Remove .watcher.<pid> markers whose process is gone. Each marker is stamped
 # with the HOST pid of a clipboard watcher, so `kill -0` is the liveness test,
 # the same shape _box_has_attached_session uses for .attached.<pid>.

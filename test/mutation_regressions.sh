@@ -4530,6 +4530,30 @@ SED
 try "clip_claim_outside_mount" "the clipboard claim is renamed out of the box-visible dir" "$CLI" "$REGRESSIONS"
 
 PASTE_BATS="$REPO_ROOT/test/unit/paste.bats"
+CLIPIMG_BATS="$REPO_ROOT/test/unit/clipimg.bats"
+
+# SHIM TOKEN: Claude Code greps the check leg's stdout for
+# image/(png|jpeg|jpg|gif|webp|bmp). Print anything else and the grep misses,
+# so the save leg never runs and paste silently does nothing.
+cat > "$SED_TMP" << 'SED'
+s@^echo "image/png"$@echo "png"@
+SED
+try "clipimg_check_token" "a served image makes the check leg report" "$CLI" "$CLIPIMG_BATS"
+
+# SHIM CONSUME-ON-READ: leave the cache in place and the same image attaches
+# again on the next paste, whatever the user actually copied.
+cat > "$SED_TMP" << 'SED'
+s@^    rm -f "[$]D/cache.png" 2>/dev/null$@    :@
+SED
+try "clipimg_consume_on_read" "the save leg emits the cached bytes and consumes" "$CLI" "$CLIPIMG_BATS"
+
+# SHIM EMPTY ANSWER: the host answers a miss with an empty in.png. Treat that as
+# a hit and the check leg reports an image that does not exist, so the save leg
+# hands Claude Code zero bytes.
+cat > "$SED_TMP" << 'SED'
+s@^\[ -s "[$]D/in.png" \] || exit 1$@:@
+SED
+try "clipimg_empty_is_miss" "empty answer is a miss" "$CLI" "$CLIPIMG_BATS"
 
 # HOST-READY LATCH: go back to testing a watcher marker's mere existence. A
 # crashed session's marker then holds .host-ready on forever, the box keeps

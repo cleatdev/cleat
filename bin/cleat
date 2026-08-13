@@ -5021,6 +5021,7 @@ AS
 # sends is contentless on purpose (see _clipimg_watcher).
 _CLIPIMG_BOX_DIR="/home/coder/.cleat-clipimg"
 _CLIPIMG_SHIM_PATH="/home/coder/.local/bin/xclip"
+_CLIPIMG_MAX_BYTES=10485760       # 10 MB, the ceiling on a served image
 
 # Write the shim to $1. Kept in one place so the tests can execute it directly.
 _clipimg_emit() {
@@ -5146,7 +5147,7 @@ _clipimg_serve() {
   kind="$(_image_magic_kind "$img" 2>/dev/null)"
   size="$(wc -c < "$img" 2>/dev/null | tr -d '[:space:]')"
   case "$size" in ''|*[!0-9]*) size=0 ;; esac
-  if [ -z "$kind" ] || [ "$size" -eq 0 ] || [ "$size" -gt "$_PASTE_MAX_BYTES" ]; then
+  if [ -z "$kind" ] || [ "$size" -eq 0 ] || [ "$size" -gt "$_CLIPIMG_MAX_BYTES" ]; then
     : > "$img"
   fi
   chmod 0644 "$img" 2>/dev/null || true
@@ -9692,141 +9693,6 @@ _storage_fill() {
 # Honest attribution: cleat IMAGES + BOXES are label-scoped (attributable);
 # build cache and volumes are shared/other-project (never called "cleat's").
 # Never mutates: docker system df is on-demand here, never on the start path.
-# cleat paste [box] [--file PATH] [--no-copy]
-#
-# Hands ONE image to a box and prints the path it landed on. Paste that path at
-# the Claude prompt: Claude Code reads an absolute path ending .png/.jpg/.gif/
-# .webp straight off the container filesystem, with no clipboard involved on the
-# box side at all. See concept/39 for why the box is never given a clipboard
-# read of its own.
-_PASTE_MAX_BYTES=10485760       # 10 MB
-_PASTE_TTL_MINS=1440            # sweep capsules older than a day
-_PASTE_BOX_DIR="/home/coder/.cleat-paste"
-
-cmd_paste() {
-  local file="" no_copy=0 box_arg="" seen_box=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --file)    file="${2:-}"; [[ -n "$file" ]] || { error "--file needs a path"; return 1; }; shift 2 ;;
-      --no-copy) no_copy=1; shift ;;
-      -h|--help)
-        echo "Usage: cleat paste [box] [--file PATH] [--no-copy]"
-        echo "  Hands one image to a box and prints the path to paste at the prompt."
-        return 0 ;;
-      -*)        error "Unknown option: $1"; return 1 ;;
-      *)
-        [[ "$seen_box" -eq 1 ]] && { error "Unexpected argument: $1"; return 1; }
-        box_arg="$1"; seen_box=1; shift ;;
-    esac
-  done
-
-  [[ -n "$box_arg" ]] && { _set_box "$box_arg" || return 1; }
-
-  if ! _daemon_up; then
-    error "Docker is not running."
-    return 1
-  fi
-
-  local project cname
-  project="$(resolve_project)"
-  cname="$(container_name_for "$project" "${_BOX:-main}")"
-  if ! container_exists "$cname"; then
-    error "No box for this project yet."
-    echo -e "  ${DIM}Start one with ${RESET}${BOLD}cleat start${RESET}${DIM}, then paste into it.${RESET}"
-    return 1
-  fi
-  if ! is_running "$cname"; then
-    error "Box ${BOLD}${cname}${RESET} is not running."
-    echo -e "  ${DIM}Bring it up with ${RESET}${BOLD}cleat resume${RESET}${DIM} first.${RESET}"
-    return 1
-  fi
-
-  # Stage on the HOST, outside every bind mount. Writing into the box-shared
-  # clip dir would let the box pre-plant a symlink under a guessable name and
-  # turn this into arbitrary host-file overwrite as you.
-  local stage_dir="$CLEAT_RUN_DIR/$cname/paste"
-  mkdir -p "$stage_dir" 2>/dev/null || { error "Could not create $stage_dir"; return 1; }
-  local stage="$stage_dir/.incoming.$$"
-  rm -f "$stage" 2>/dev/null || true
-
-  if [[ -n "$file" ]]; then
-    [[ -f "$file" ]] || { error "No such file: $file"; return 1; }
-    [[ -r "$file" ]] || { error "Cannot read: $file"; return 1; }
-    cp "$file" "$stage" 2>/dev/null || { error "Could not read $file"; return 1; }
-  else
-    if ! _host_clip_read_image "$stage"; then
-      rm -f "$stage" 2>/dev/null || true
-      error "No image on the clipboard."
-      echo -e "  ${DIM}Copy a screenshot first, or pass one with ${RESET}${BOLD}--file <path>${RESET}${DIM}.${RESET}"
-      return 1
-    fi
-  fi
-
-  # Validate on the host, before anything crosses into the box.
-  local kind size
-  kind="$(_image_magic_kind "$stage")"
-  if [[ -z "$kind" ]]; then
-    rm -f "$stage" 2>/dev/null || true
-    error "That is not a PNG, JPEG, GIF or WebP."
-    return 1
-  fi
-  # BSD wc pads its output, so strip before comparing (a padded string fails a
-  # numeric test and has bitten this repo before).
-  size="$(wc -c < "$stage" 2>/dev/null | tr -d '[:space:]')"
-  case "$size" in ''|*[!0-9]*) size=0 ;; esac
-  if [[ "$size" -eq 0 ]]; then
-    rm -f "$stage" 2>/dev/null || true
-    error "The image is empty."
-    return 1
-  fi
-  if [[ "$size" -gt "$_PASTE_MAX_BYTES" ]]; then
-    rm -f "$stage" 2>/dev/null || true
-    error "Image is $(_human_bytes "$size"), over the $(_human_bytes "$_PASTE_MAX_BYTES") limit."
-    return 1
-  fi
-
-  local base="paste-$(date +%Y%m%d-%H%M%S)-$$.${kind}"
-  local named="$stage_dir/$base"
-  mv "$stage" "$named" 2>/dev/null || { error "Could not stage the image"; return 1; }
-
-  # docker cp resolves inside the container's rootfs, so a symlink the box
-  # planted at the destination can only redirect the file somewhere else inside
-  # the box. A host-side write into a shared mount could not say that.
-  docker exec -u root "$cname" mkdir -p "$_PASTE_BOX_DIR" >/dev/null 2>&1 || true
-  if ! docker cp "$named" "$cname:$_PASTE_BOX_DIR/$base" >/dev/null 2>&1; then
-    rm -f "$named" 2>/dev/null || true
-    error "Could not copy the image into ${BOLD}${cname}${RESET}."
-    return 1
-  fi
-  # The image builds as uid 1000 and the entrypoint remaps to HOST_UID, so a
-  # file docker cp lands as root is unreadable to coder on most hosts.
-  docker exec -u root "$cname" chown -R coder:coder "$_PASTE_BOX_DIR" >/dev/null 2>&1 || true
-  rm -f "$named" 2>/dev/null || true
-
-  # Housekeeping only. Anything handed over is readable by that box until the
-  # box dies: this bounds the disk, not the exposure.
-  docker exec -u root "$cname" find "$_PASTE_BOX_DIR" -type f -mmin "+$_PASTE_TTL_MINS" -delete >/dev/null 2>&1 || true
-
-  local box_path="$_PASTE_BOX_DIR/$base"
-  echo ""
-  ok "Image staged in ${BOLD}${cname}${RESET} ${DIM}($(_human_bytes "$size"), ${kind})${RESET}"
-  echo -e "  ${BOLD}${box_path}${RESET}"
-  echo ""
-  if [[ "$no_copy" -eq 0 ]]; then
-    local clip_cmd; clip_cmd="$(_host_clip_cmd)"
-    if [[ -n "$clip_cmd" ]] && printf '%s' "$box_path" | eval "$clip_cmd" 2>/dev/null; then
-      echo -e "  ${DIM}Copied. Paste it at the Claude prompt in the box.${RESET}"
-    else
-      echo -e "  ${DIM}Paste that path at the Claude prompt in the box.${RESET}"
-    fi
-  else
-    echo -e "  ${DIM}Paste that path at the Claude prompt in the box.${RESET}"
-  fi
-  # The box can write your host clipboard through the copy bridge, so the
-  # PRINTED path above is the trustworthy one. Say so in the docs, not here.
-  return 0
-}
-
 cmd_storage() {
   if ! _daemon_up; then
     error "Docker is not running."
@@ -12710,7 +12576,6 @@ main() {
     logs)      _set_box "$@"; cmd_logs ;;
     ps)        cmd_ps "$@" ;;
     storage)   cmd_storage "$@" ;;
-    paste)     cmd_paste "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;

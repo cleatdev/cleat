@@ -4529,7 +4529,6 @@ s@local claim="[$]claim_dir/@local claim="$clip_dir/@
 SED
 try "clip_claim_outside_mount" "the clipboard claim is renamed out of the box-visible dir" "$CLI" "$REGRESSIONS"
 
-PASTE_BATS="$REPO_ROOT/test/unit/paste.bats"
 CLIPIMG_BATS="$REPO_ROOT/test/unit/clipimg.bats"
 
 # SHIM TOKEN: Claude Code greps the check leg's stdout for
@@ -4551,7 +4550,7 @@ try "clipimg_consume_on_read" "the save leg emits the cached bytes and consumes"
 # produced is delivered, so text-shaped bytes could reach Claude Code as an
 # image.
 cat > "$SED_TMP" << 'SED'
-s@  if \[ -z "[$]kind" \] || \[ "[$]size" -eq 0 \] || \[ "[$]size" -gt "[$]_PASTE_MAX_BYTES" \]; then@  if false; then@
+s@  if \[ -z "[$]kind" \] || \[ "[$]size" -eq 0 \] || \[ "[$]size" -gt "[$]_CLIPIMG_MAX_BYTES" \]; then@  if false; then@
 SED
 try "clipimg_serve_validates" "a non-image payload is refused as a miss" "$CLI" "$CLIPIMG_BATS"
 
@@ -4593,49 +4592,6 @@ cat > "$SED_TMP" << 'SED'
 s@    kill -0 "[$]pid" 2>/dev/null || rm -f "[$]m" 2>/dev/null || true@    :@
 SED
 try "watcher_marker_liveness" "a dead session's watcher marker never latches" "$CLI" "$REGRESSIONS"
-
-# PASTE MAGIC GATE: accept whatever the clipboard reader or --file produced
-# without checking magic bytes, and any file at all gets pushed into a box under
-# an image extension.
-cat > "$SED_TMP" << 'SED'
-s@  if \[\[ -z "[$]kind" \]\]; then@  if false; then@
-SED
-try "paste_magic_gate" "refuses a file that is not an image" "$CLI" "$PASTE_BATS"
-
-# PASTE EXTENSION: the extension is the ONLY thing Claude Code's paste path
-# matches on, so hardcoding png makes a JPEG unreadable to it.
-cat > "$SED_TMP" << 'SED'
-s@[$][{]kind[}]"$@png"@
-SED
-try "paste_extension_from_magic" "the extension follows the MAGIC BYTES" "$CLI" "$PASTE_BATS"
-
-# PASTE SIZE CAP: drop the cap and a multi-GB paste crosses into the box.
-cat > "$SED_TMP" << 'SED'
-s@_PASTE_MAX_BYTES=10485760@_PASTE_MAX_BYTES=999999999999@
-SED
-try "paste_size_cap" "refuses an image over the size cap" "$CLI" "$PASTE_BATS"
-
-# PASTE CHOWN: docker cp lands the file as root, and the entrypoint remaps to
-# HOST_UID, so without the chown coder cannot read what was just handed over.
-cat > "$SED_TMP" << 'SED'
-/chown -R coder:coder "[$]_PASTE_BOX_DIR"/d
-SED
-try "paste_chown_after_cp" "chowns the drop dir" "$CLI" "$PASTE_BATS"
-
-# PASTE STAGING LOCATION: stage inside the box-writable clip mount and the box
-# can pre-plant a symlink under a guessable name, turning a paste into
-# arbitrary host-file overwrite as the user.
-cat > "$SED_TMP" << 'SED'
-s@  local stage_dir="[$]CLEAT_RUN_DIR/[$]cname/paste"@  local stage_dir="$CLEAT_RUN_DIR/$cname/clip"@
-SED
-try "paste_stage_outside_mount" "stages on the host OUTSIDE the box-writable clip mount" "$CLI" "$PASTE_BATS"
-
-# PASTE NO-COPY: the box can overwrite the host clipboard through the copy
-# bridge, so --no-copy has to actually mean it.
-cat > "$SED_TMP" << 'SED'
-s@  if \[\[ "[$]no_copy" -eq 0 \]\]; then@  if true; then@
-SED
-try "paste_no_copy_honoured" "no-copy does not touch the host clipboard" "$CLI" "$PASTE_BATS"
 
 # BROWSER BRIDGE SYMLINK READ-THROUGH: the same shape as the clipboard payload
 # path, in the consumer that `cat`s the claim. Drop the guard and a planted link

@@ -4547,6 +4547,36 @@ s@^    rm -f "[$]D/cache.png" 2>/dev/null$@    :@
 SED
 try "clipimg_consume_on_read" "the save leg emits the cached bytes and consumes" "$CLI" "$CLIPIMG_BATS"
 
+# SERVE VALIDATION: drop the magic-byte and size gate and whatever the reader
+# produced is delivered, so text-shaped bytes could reach Claude Code as an
+# image.
+cat > "$SED_TMP" << 'SED'
+s@  if \[ -z "[$]kind" \] || \[ "[$]size" -eq 0 \] || \[ "[$]size" -gt "[$]_PASTE_MAX_BYTES" \]; then@  if false; then@
+SED
+try "clipimg_serve_validates" "a non-image payload is refused as a miss" "$CLI" "$CLIPIMG_BATS"
+
+# SERVE DONE SIGNAL: skip the in.done delivery and the shim never learns the
+# answer arrived, so it waits out its full timeout on every paste.
+cat > "$SED_TMP" << 'SED'
+s@  docker cp "[$]done" "[$]cname:[$]_CLIPIMG_BOX_DIR/in.done" >/dev/null 2>&1@  :@
+SED
+try "clipimg_serve_done_signal" "delivered as in.png then in.done" "$CLI" "$CLIPIMG_BATS"
+
+# WATCHER CONSUMES REQUEST: stop removing the request marker and the watcher
+# re-serves the same request every tick, and the shim never gets its liveness
+# signal that a watcher is alive.
+cat > "$SED_TMP" << 'SED'
+s@      rm -f "[$]req" 2>/dev/null || true@      :@
+SED
+try "clipimg_watcher_consumes" "consumes the request marker and serves once" "$CLI" "$CLIPIMG_BATS"
+
+# SHIM DROP PATH: land the shim anywhere but ahead of xclip on PATH and native
+# ctrl+v never reaches it.
+cat > "$SED_TMP" << 'SED'
+s@  docker cp "[$]tmp" "[$]cname:[$]_CLIPIMG_SHIM_PATH" >/dev/null 2>&1@  docker cp "$tmp" "$cname:/tmp/wrong-path" >/dev/null 2>&1@
+SED
+try "clipimg_shim_drop_path" "copies the shim to .local/bin ahead of the real" "$CLI" "$CLIPIMG_BATS"
+
 # SHIM EMPTY ANSWER: the host answers a miss with an empty in.png. Treat that as
 # a hit and the check leg reports an image that does not exist, so the save leg
 # hands Claude Code zero bytes.

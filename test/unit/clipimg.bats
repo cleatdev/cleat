@@ -181,3 +181,143 @@ _fake_host() {
   assert_success
   assert_output "Y"
 }
+
+# ── the host side: serve and watcher ────────────────────────────────────────
+#
+# A capturing docker fake, so the tests can inspect the exact bytes that would
+# reach the box. The real docker stub only records argv, and serve deletes its
+# staging file, so neither alone can prove what was delivered.
+_use_capturing_docker() {
+  mkdir -p "$TEST_TEMP/bin" "$TEST_TEMP/captured"
+  cat > "$TEST_TEMP/bin/docker" << EOF
+#!/bin/sh
+if [ "\$1" = "cp" ]; then
+  dest="\$3"; name="\${dest##*/}"
+  cp "\$2" "$TEST_TEMP/captured/\$name" 2>/dev/null
+fi
+echo "\$@" >> "$TEST_TEMP/docker-argv"
+exit 0
+EOF
+  chmod +x "$TEST_TEMP/bin/docker"
+  export PATH="$TEST_TEMP/bin:$PATH"
+}
+
+@test "clipimg serve: a valid image is delivered as in.png then in.done" {
+  _use_capturing_docker
+  _host_clip_read_image() { printf '\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDRpix' > "$1"; return 0; }
+  _clipimg_serve "abox" "$TEST_TEMP/stage"
+
+  run bash -c "printf '%s' \"\$(cat '$TEST_TEMP/captured/in.png')\""
+  assert_output --partial "IHDRpix"
+  [ -e "$TEST_TEMP/captured/in.done" ] || { echo "no in.done delivered"; return 1; }
+  # in.png must be copied before in.done, or the shim could read a half image.
+  run cat "$TEST_TEMP/docker-argv"
+  local png_line done_line
+  png_line="$(grep -n 'in.png' "$TEST_TEMP/docker-argv" | head -1 | cut -d: -f1)"
+  done_line="$(grep -n 'in.done' "$TEST_TEMP/docker-argv" | head -1 | cut -d: -f1)"
+  [ "$png_line" -lt "$done_line" ] || { echo "in.done was copied before in.png"; return 1; }
+}
+
+@test "clipimg serve: no image still answers, with an EMPTY in.png" {
+  # The always-answer property. Without it the shim waits out its full timeout
+  # on every text paste. The box reads an empty in.png as a miss.
+  _use_capturing_docker
+  _host_clip_read_image() { return 1; }
+  _clipimg_serve "abox" "$TEST_TEMP/stage"
+
+  [ -e "$TEST_TEMP/captured/in.png" ]  || { echo "serve did not answer at all"; return 1; }
+  [ -e "$TEST_TEMP/captured/in.done" ] || { echo "no in.done on the miss path"; return 1; }
+  [ ! -s "$TEST_TEMP/captured/in.png" ] || { echo "miss delivered non-empty bytes"; return 1; }
+}
+
+@test "clipimg serve: a non-image payload is refused as a miss" {
+  # The reader returned 0 but produced junk. The magic-byte gate must collapse
+  # it to empty, exactly as cleat paste does, so text-shaped bytes can never
+  # reach Claude Code as an image.
+  _use_capturing_docker
+  _host_clip_read_image() { printf 'this is not an image' > "$1"; return 0; }
+  _clipimg_serve "abox" "$TEST_TEMP/stage"
+
+  [ ! -s "$TEST_TEMP/captured/in.png" ] || { echo "a non-image was delivered"; return 1; }
+}
+
+@test "clipimg serve: an over-cap image is refused as a miss" {
+  _use_capturing_docker
+  _host_clip_read_image() {
+    { printf '\x89PNG\r\n\x1a\n'; dd if=/dev/zero bs=1024 count=11000 2>/dev/null; } > "$1"
+    return 0
+  }
+  _clipimg_serve "abox" "$TEST_TEMP/stage"
+  [ ! -s "$TEST_TEMP/captured/in.png" ] || { echo "an over-cap image was delivered"; return 1; }
+}
+
+@test "clipimg watcher: consumes the request marker and serves once" {
+  _use_capturing_docker
+  _host_clip_read_image() { printf '\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDRz' > "$1"; return 0; }
+
+  _clipimg_watcher "$CLIPDIR" "abox" &
+  local wpid=$!
+  # The box's shim writes a contentless request into the shared dir.
+  : > "$CLIPDIR/.image-req"
+  # Give the 250 ms poll a couple of ticks plus the serve.
+  local i=0
+  while [ ! -e "$TEST_TEMP/captured/in.done" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i+1)); done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+
+  [ ! -e "$CLIPDIR/.image-req" ] || { echo "watcher never consumed the request"; return 1; }
+  run bash -c "printf '%s' \"\$(cat '$TEST_TEMP/captured/in.png')\""
+  assert_output --partial "IHDRz"
+}
+
+@test "clipimg watcher: never reads the request file's content" {
+  # The request is a signal, not a message. If the watcher ever read it, a box
+  # could smuggle a target or a path through it. Plant hostile content and prove
+  # the served image comes only from the host reader, never from the request.
+  _use_capturing_docker
+  _host_clip_read_image() { printf '\x89PNG\r\n\x1a\nFROMHOST' > "$1"; return 0; }
+
+  _clipimg_watcher "$CLIPDIR" "abox" &
+  local wpid=$!
+  printf 'text/plain\n/etc/passwd\n' > "$CLIPDIR/.image-req"
+  local i=0
+  while [ ! -e "$TEST_TEMP/captured/in.done" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i+1)); done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+
+  run bash -c "cat '$TEST_TEMP/captured/in.png'"
+  assert_output --partial "FROMHOST"
+  refute_output --partial "passwd"
+}
+
+# ── the shim drop ───────────────────────────────────────────────────────────
+
+@test "clipimg drop: copies the shim to .local/bin ahead of the real xclip" {
+  _use_capturing_docker
+  _clipimg_drop_shim "abox"
+  run cat "$TEST_TEMP/docker-argv"
+  assert_output --partial "cp"
+  assert_output --partial "abox:/home/coder/.local/bin/xclip"
+  # What landed is really our shim.
+  run cat "$TEST_TEMP/captured/xclip"
+  assert_output --partial "cleat-shim v1"
+}
+
+@test "clipimg remove: only deletes a file carrying our marker" {
+  # The removal must never delete a user's own xclip at that path. It is guarded
+  # by the marker, run inside the box, so here we just prove the guard is in the
+  # command rather than an unconditional rm.
+  mkdir -p "$TEST_TEMP/bin"
+  cat > "$TEST_TEMP/bin/docker" << EOF
+#!/bin/sh
+echo "\$@" >> "$TEST_TEMP/docker-argv"
+exit 0
+EOF
+  chmod +x "$TEST_TEMP/bin/docker"
+  export PATH="$TEST_TEMP/bin:$PATH"
+
+  _clipimg_remove_shim "abox"
+  run cat "$TEST_TEMP/docker-argv"
+  assert_output --partial "cleat-shim v1"
+  refute_output --regexp 'rm -f "?/home/coder/.local/bin/xclip"?$'
+}

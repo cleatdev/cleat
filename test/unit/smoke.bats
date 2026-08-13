@@ -283,6 +283,16 @@ cleat_bin_at() {
   refute_output --partial "command not found"
 }
 
+@test "smoke: CLEAT_NO_CLIPBOARD_IMAGE=1 start path does not crash" {
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf '' > "$DOCKER_MOCK_DIR/images_output"
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  run cleat_bin_timeout 5 status
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+}
+
 @test "smoke: cleat prune --cache --yes runs non-interactively without crashing" {
   printf '' > "$DOCKER_MOCK_DIR/images_output"
   run cleat_bin prune --cache --yes

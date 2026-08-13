@@ -5099,6 +5099,95 @@ CLIPIMG_SHIM_EOF
   chmod +x "$1" 2>/dev/null || true
 }
 
+# Drop the shim into a running box, ahead of the real xclip on PATH. Idempotent:
+# re-run every session, overwriting any earlier copy. Nothing under cli/docker/
+# changes, so no image spec bump and no recreate.
+_clipimg_drop_shim() {
+  local cname="$1"
+  local tmp="$CLEAT_RUN_DIR/$cname/.clipimg-shim.$$"
+  mkdir -p "$CLEAT_RUN_DIR/$cname" 2>/dev/null || return 1
+  _clipimg_emit "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  docker exec -u coder "$cname" mkdir -p /home/coder/.local/bin >/dev/null 2>&1 || true
+  docker cp "$tmp" "$cname:$_CLIPIMG_SHIM_PATH" >/dev/null 2>&1 || { rm -f "$tmp" 2>/dev/null; return 1; }
+  # docker cp preserves the host file's 0755, so coder can exec it. Force it
+  # anyway in case a daemon quirk drops the bit.
+  docker exec -u root "$cname" chmod 0755 "$_CLIPIMG_SHIM_PATH" >/dev/null 2>&1 || true
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+# Remove our shim, and only ours. The v1 marker on line 2 is what keeps this
+# from deleting a file the user placed at the same path. Used when the kill
+# switch is set so a box goes straight back to today's behaviour.
+_clipimg_remove_shim() {
+  local cname="$1"
+  docker exec -u coder "$cname" sh -c \
+    'f=/home/coder/.local/bin/xclip; [ -f "$f" ] && head -2 "$f" 2>/dev/null | grep -q "cleat-shim v1" && rm -f "$f"' \
+    >/dev/null 2>&1 || true
+}
+
+# Answer one image request: read the host clipboard, validate, deliver. Called
+# by the watcher after it has already consumed the request marker. ALWAYS
+# delivers, positive or negative, so the shim never waits out its timeout on a
+# text paste. A negative answer is an empty in.png.
+_clipimg_serve() {
+  local cname="$1" stage_dir="$2"
+  mkdir -p "$stage_dir" 2>/dev/null || return 0
+  local img="$stage_dir/serve.$$.png"
+  rm -f "$img" 2>/dev/null || true
+  : > "$img"
+
+  # Image-only by construction: _host_clip_read_image has no text reader. On a
+  # text or empty clipboard it fails and leaves the file empty.
+  _host_clip_read_image "$img" 2>/dev/null || true
+
+  # Validate independently of the reader, the same two gates cleat paste uses.
+  # Any failure collapses to an empty file, which the shim reads as a miss.
+  local kind size
+  kind="$(_image_magic_kind "$img" 2>/dev/null)"
+  size="$(wc -c < "$img" 2>/dev/null | tr -d '[:space:]')"
+  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+  if [ -z "$kind" ] || [ "$size" -eq 0 ] || [ "$size" -gt "$_PASTE_MAX_BYTES" ]; then
+    : > "$img"
+  fi
+  chmod 0644 "$img" 2>/dev/null || true
+
+  # Deliver in.png first and let it finish, THEN in.done. docker cp is
+  # synchronous, so once in.done exists in.png is already whole. The shim waits
+  # on in.done, so it can never read a half-copied image. docker cp resolves
+  # inside the container rootfs, so a symlink the box planted at either path can
+  # only redirect the file elsewhere inside the box.
+  docker cp "$img" "$cname:$_CLIPIMG_BOX_DIR/in.png" >/dev/null 2>&1
+  local done="$stage_dir/done.$$"
+  : > "$done"; chmod 0644 "$done" 2>/dev/null || true
+  docker cp "$done" "$cname:$_CLIPIMG_BOX_DIR/in.done" >/dev/null 2>&1
+  rm -f "$img" "$done" 2>/dev/null || true
+}
+
+# Poll for image requests and serve them. One dedicated watcher rather than
+# folding into _clipboard_watcher, because that one is event-driven off inotify
+# and this needs a tight fixed cadence at keystroke time. 250 ms worst-case
+# notice sits well inside the shim's 1.2 s give-up window.
+_clipimg_watcher() {
+  local clip_dir="$1" cname="$2"
+  trap 'exit 0' TERM INT HUP
+  local _ciw_parent=$$
+  local req="$clip_dir/.image-req"
+  local stage_dir; stage_dir="$(dirname "$clip_dir")/clipimg-stage"
+  while true; do
+    # Orphan guards, same as the other watchers: the run dir vanishing (rm/nuke)
+    # or the parent cleat dying (terminal closed, SIGKILL) stops the poll.
+    [ -d "$clip_dir" ] || exit 0
+    kill -0 "$_ciw_parent" 2>/dev/null || exit 0
+    if [ -e "$req" ] || [ -L "$req" ]; then
+      # Consume FIRST. The marker's disappearance is the shim's proof a watcher
+      # is alive, and its content is never read: the request carries nothing.
+      rm -f "$req" 2>/dev/null || true
+      _clipimg_serve "$cname" "$stage_dir"
+    fi
+    sleep 0.25
+  done
+}
+
 # Remove .watcher.<pid> markers whose process is gone. Each marker is stamped
 # with the HOST pid of a clipboard watcher, so `kill -0` is the liveness test,
 # the same shape _box_has_attached_session uses for .attached.<pid>.
@@ -6152,6 +6241,7 @@ exec_claude() {
 
   _CLIP_DIR="$CLEAT_RUN_DIR/${cname}/clip"
   _CLIP_WATCHER_PID=""
+  _CLIPIMG_WATCHER_PID=""
   _BROWSER_WATCHER_PID=""
   _HOOK_BRIDGE_PID=""
   mkdir -p "$_CLIP_DIR"
@@ -6193,6 +6283,14 @@ exec_claude() {
       kill "$_BROWSER_WATCHER_PID" 2>/dev/null || true
       wait "$_BROWSER_WATCHER_PID" 2>/dev/null || true
       _BROWSER_WATCHER_PID=""
+    fi
+    # Kill image-paste watcher. Plain kill suffices: its foreground command is
+    # `sleep 0.25`, not a blocking inotifywait, so the TERM lands between ticks
+    # and there is no blocked child to reap.
+    if [ -n "${_CLIPIMG_WATCHER_PID:-}" ]; then
+      kill "$_CLIPIMG_WATCHER_PID" 2>/dev/null || true
+      wait "$_CLIPIMG_WATCHER_PID" 2>/dev/null || true
+      _CLIPIMG_WATCHER_PID=""
     fi
     # Kill hook bridge: its EXIT/TERM trap kills child hook processes
     if [ -n "${_HOOK_BRIDGE_PID:-}" ]; then
@@ -6248,6 +6346,22 @@ exec_claude() {
     _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
     _CLIP_WATCHER_PID=$!
     disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
+
+    # Native ctrl+v image paste: drop the shim ahead of xclip on PATH, then run
+    # a watcher that answers its image requests from the host clipboard. Always
+    # on, gated only by CLEAT_NO_CLIPBOARD_IMAGE=1. Reuses the .watcher.$$ marker
+    # already touched above, so .host-ready stays correct. If the drop fails
+    # (a locked-down box, an old daemon), the shim is simply absent and paste
+    # falls back to today's "No image found", never an error.
+    if [ "${CLEAT_NO_CLIPBOARD_IMAGE:-}" != "1" ]; then
+      if _clipimg_drop_shim "$cname"; then
+        _clipimg_watcher "$_CLIP_DIR" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+        _CLIPIMG_WATCHER_PID=$!
+        disown "$_CLIPIMG_WATCHER_PID" 2>/dev/null || true
+      fi
+    else
+      _clipimg_remove_shim "$cname"
+    fi
   fi
 
   # Start browser watcher (always-on, like host connectivity). Pass whether an

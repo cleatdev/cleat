@@ -18,6 +18,20 @@ for the full reference.
 | [`setup/python`](setup/python/) | A single `script <path>` directive (install `uv`, sync deps) |
 | [`setup/rust`](setup/rust/) | **Two** `script` directives (toolchain, then extra tools) |
 
+## `per-box/`: three boxes on one project
+
+One `.cleat` can shape several boxes on the same repo. A `[box.<name>.<kind>]`
+header scopes `caps`, `resources`, `setup` or `fork` to a single box. A declared
+section replaces the project default for that box, an absent one inherits it, an
+empty one is a real value (zero caps is a hard lockdown you cannot express any
+other way).
+
+| Example | Shows |
+|---|---|
+| [`per-box`](per-box/) | One file, three boxes: a low-memory `az` box with an Azure CLI setup, a `heavy` box with the `docker` cap and 8g, a zero-cap `review` box. Also covers per-fork setup, since a fork is a box and runs `[box.<name>.setup]` on its copy. |
+
+See [`per-box/README.md`](per-box/README.md) for the full walkthrough.
+
 ### Using one
 
 ```sh

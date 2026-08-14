@@ -93,6 +93,7 @@ Cleat gives you the best of both worlds:
 - **Zero file permission issues** -- container user matches your host UID/GID automatically
 - **Shared auth** -- log in once, all containers use the same credentials
 - **Clipboard support** -- `pbcopy`, `xclip` and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
+- **Image paste (ctrl+v)** -- paste a screenshot from your host clipboard straight into Claude Code inside a box. No install, no capability, images only (clipboard text never crosses this channel)
 - **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq and socat
 - **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`) and host Docker daemon for testing dockerized apps (`--cap docker`). All disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
@@ -1024,6 +1025,29 @@ git log -1 --format=%B | clip    # copy last commit message
 ```
 
 **Limits:** Payloads are capped at 100KB. Paste (`xclip -o`, `xsel --output`, `pbpaste`) is not supported -- clipboard is copy-only.
+
+---
+
+## Image paste (ctrl+v)
+
+Paste a screenshot into Claude Code inside a box the way you would anywhere
+else. Copy the image on your host, click into the box's Claude prompt and press
+**ctrl+v**. About a second later the prompt shows `[Image #1]`.
+
+It is `ctrl+v`, not `cmd+v`. The box's Claude Code runs as Linux, which binds
+image paste to ctrl+v. On a Mac, cmd+v is captured by your terminal as a text
+paste and never reaches Claude Code.
+
+Nothing to install or enable. At session start Cleat drops a small `xclip` shim
+into the box ahead of the real one. A host watcher answers the box's image
+probes from your clipboard. An existing box picks it up on its next
+`cleat start` or `cleat resume`, no recreate needed.
+
+The channel only ever carries an **image**. The box cannot ask the host for
+clipboard text, so passwords and tokens can never travel it. The served image is
+validated on the host by magic bytes (a real PNG, JPEG, GIF or WebP, nothing
+over 10 MB) then carried in with `docker cp`, never a shared-folder write. Turn
+it off entirely with `CLEAT_NO_CLIPBOARD_IMAGE=1`.
 
 ---
 

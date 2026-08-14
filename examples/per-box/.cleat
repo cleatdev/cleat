@@ -1,0 +1,138 @@
+# Per-box config: one project, three boxes, three different setups.
+#
+# This is a single .cleat with project-wide defaults plus [box.<name>.<kind>]
+# sections that scope a setting to one box. The kinds are caps, resources, setup
+# and fork. The rule is the same for every kind: a DECLARED [box.<name>.<kind>]
+# section REPLACES the project default for that box, an ABSENT one INHERITS it.
+# Replace never merges, so a box can only ever ask for FEWER caps than the
+# project default, never sneak in more. A declared-but-empty section is a real
+# value (see the review box below), not the same as leaving it out.
+#
+# Box names match ^[a-z0-9][a-z0-9_-]{0,30}$. Launch a box by name: `cleat run
+# az`, `cleat start heavy`, `cleat run review`. A box with no section of a given
+# kind just uses the project default, so you only write the lines that differ.
+
+[caps]
+# The project default caps, inherited by every box that does not declare its
+# own [box.<name>.caps]. Caps are host-credential passthroughs, so keep this to
+# what the whole project genuinely needs. Valid caps: git ssh env hooks gh
+# docker. See `cleat config --list`.
+git
+ssh
+
+[resources]
+# A modest default ceiling. This is a cap on what a box MAY use, not a
+# reservation: a box only consumes what it actually touches. Resources resolve
+# per KEY, so a box that overrides only `memory` still inherits every other key
+# from here. Boxes that need more or less say so below.
+memory = 4g
+
+
+# Box "az": a lean cloud box with the Azure CLI.
+[box.az.caps]
+# DECLARED, so this REPLACES the project git+ssh for the az box. It drops ssh (a
+# cloud box has no business holding your host ssh keys) and adds env. The env
+# cap lets Cleat read a per-box secret sidecar: put Azure service-principal
+# credentials in a `.cleat.az.env` file (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+# AZURE_TENANT_ID) next to this one. Those load into the az box ONLY. The heavy
+# and review boxes never see them.
+git
+env
+
+[box.az.resources]
+# Deliberately BELOW the 4g project default. The Azure CLI issues cloud API
+# calls, it does not compile anything, so it runs comfortably in 2g. Project
+# memory values are honored all the way down to a roughly 6MB floor and are only
+# clamped at the 8g ceiling, so this 2g stands as written. cpus is not set here,
+# so it inherits (there is no project cpus either, so az gets Cleat's default).
+memory = 2g
+
+[box.az.setup]
+# Install the Azure CLI on the node:24-bookworm-slim base (Debian 12), amd64 or
+# arm64. This payload runs once per container, as the coder user, in /workspace,
+# under `bash -e`, after you approve it once (or with CLEAT_TRUST_SETUP=1).
+#
+# Unlike the .NET SDK example, NO architecture branch is needed here. Microsoft
+# publishes the azure-cli apt package for BOTH amd64 and arm64 on bookworm
+# (verified against packages.microsoft.com), so a single path covers Apple
+# Silicon and Intel. The one thing that matters is pinning the apt source to
+# this box's own architecture with $(dpkg --print-architecture), so apt never
+# reaches for the wrong deb. The az package bundles its own Python runtime, so
+# the slim base needs nothing extra beyond the repo plumbing below.
+export DEBIAN_FRONTEND=noninteractive
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+sudo mkdir -p /etc/apt/keyrings
+# --yes so a re-run overwrites the keyring instead of prompting on a closed
+# stdin. `cleat setup` replays this payload on a box where the file already
+# exists, and without --yes gpg would try /dev/tty, fail, and abort under bash -e.
+curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+  | sudo gpg --yes --dearmor -o /etc/apt/keyrings/microsoft.gpg
+sudo chmod go+r /etc/apt/keyrings/microsoft.gpg
+# Suites is hardcoded to bookworm to match the pinned base image. Architectures
+# is resolved live so the same file is correct on an arm64 Mac or an amd64 host.
+echo "Types: deb
+URIs: https://packages.microsoft.com/repos/azure-cli/
+Suites: bookworm
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-by: /etc/apt/keyrings/microsoft.gpg" \
+  | sudo tee /etc/apt/sources.list.d/azure-cli.sources >/dev/null
+sudo apt-get update
+sudo apt-get install -y azure-cli
+az version
+
+
+# Box "heavy": a full dev box with the docker cap and memory maxed out.
+[box.heavy.caps]
+# The project caps plus docker. WARNING: the docker cap mounts the host Docker
+# socket into the box, which is root-equivalent on the host and breaks the
+# sandbox Cleat exists to give you. Anything in this box can start privileged
+# containers that reach your whole machine. Grant it only to a box you would
+# trust with your host. Never grant it to a box running an untrusted agent.
+git
+ssh
+docker
+
+[box.heavy.resources]
+# 8g is exactly the ceiling Cleat clamps a project value to, set here on purpose
+# so heavy gets the most a project .cleat is allowed to request. Ask for more
+# (say 16g) and Cleat silently clamps it back to 8g, because a project file is
+# untrusted input. Raise the real ceiling from your GLOBAL config if a box truly
+# needs it.
+memory = 8g
+
+
+# Box "review": a minimal, locked-down box for reading code you do not trust.
+[box.review.caps]
+# DECLARED and EMPTY. This is not the same as leaving the section out. An absent
+# section would inherit the project git+ssh. This empty one REPLACES them with
+# nothing, so review gets ZERO caps: no git identity, no ssh, no host
+# credentials of any kind. A pure read-and-review box. This zero-cap lockdown is
+# the one thing you can only express by declaring an empty section, so the
+# header below stays bare on purpose.
+
+[box.review.fork]
+# review declares no [box.review.resources], so it INHERITS the 4g project
+# default. It declares no [box.review.setup], so it provisions nothing. It DOES
+# prune these paths from its copy when you create it as a fork (see the note at
+# the end). Excludes are project-relative, one per line. No absolute paths, no
+# `..`, no naming the workspace root itself.
+exclude = node_modules
+exclude = dist
+
+
+# Forks are boxes too.
+#
+# A fork is just a box created from a copy of your working tree, so every rule
+# above applies to forks unchanged. `cleat start review --fork` (the same as
+# `cleat fork start review`) makes a throwaway copy named review, gives it the
+# zero caps from [box.review.caps] and the inherited 4g, then prunes node_modules
+# and dist from the copy via [box.review.fork].
+#
+# Because a fork IS a box, [box.<name>.setup] runs on the forked copy the same
+# way it runs on a normal box. `cleat fork start az` copies the tree into a box
+# named az and runs the Azure CLI [box.az.setup] on it, with the same one-time
+# approval. To relocate where fork copies are stored, set `dir = <abspath>`
+# under a [fork] section in your GLOBAL config. That key is global-only and is
+# never read from a project .cleat.

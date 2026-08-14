@@ -219,7 +219,19 @@ source_cli() {
   # deleted file, so `source` reads OLD CLI content. That non-determinism
   # made the mutation harness flap (a mutated bin/cleat sourced as pristine →
   # spurious MISSED). A brand-new path under TEST_TEMP avoids inode recycling.
-  _cli_tmp="${TEST_TEMP:-$(mktemp -d)}/cleat-source.sh"
+  #
+  # Nested as <temp>/repo/bin/ so the sourced copy sits where the real script
+  # sits in an install: SCRIPT_DIR becomes <temp>/repo/bin and REPO_DIR
+  # <temp>/repo. Flat under TEST_TEMP, REPO_DIR resolved to TEST_TEMP's PARENT
+  # (i.e. /tmp), so anything the CLI derives from its own install root pointed
+  # at a shared directory during tests. A docker/ context is planted alongside
+  # for the same reason: `_do_build` refuses without one (a Homebrew keg on
+  # macOS before 12.3 genuinely has none), and a test meaning to reach the
+  # build should not have to know that.
+  local _cli_root="${TEST_TEMP:-$(mktemp -d)}/repo"
+  mkdir -p "$_cli_root/bin" "$_cli_root/docker"
+  : > "$_cli_root/docker/Dockerfile"
+  _cli_tmp="$_cli_root/bin/cleat-source.sh"
   # Strip `set -euo pipefail` entirely for sourced tests. Keeping any of
   # -e/-u/-o pipefail introduces subtle test-order pollution in bats because
   # function overrides and global state interact with bash's strict checks

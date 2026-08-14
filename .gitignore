@@ -10,5 +10,6 @@ concept
 .claude_update_check
 .pressure_check
 .last_seen_version
+.disk_check
 .cleat.env
 coverage/

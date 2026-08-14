@@ -861,6 +861,111 @@ _summary() {
 # Ids line up one-to-one with MANUAL-TESTS-2026-07-31.md, so "did I test
 # everything" has one answer. Gates (the ones a script must not do for you) run
 # last so the automated body always completes first.
+# ── Homebrew: the whole channel, exercised without a tap existing ────────────
+# The tap is not live, so a real `brew install cleatdev/tap/cleat` is not
+# possible yet. Everything below therefore runs against a REAL fake keg built
+# from this very binary: the physical file lives under Cellar/, the receipt sits
+# at the keg root, and bin/cleat is the RELATIVE symlink Homebrew actually
+# writes. That is the shape the detector has to recognise, and macOS is the only
+# place the BSD `readlink` / `pwd -P` legs are real.
+#
+# Nothing here may touch the machine: `brew` is a stub ahead of PATH so no real
+# upgrade can run, and ln/rm/sudo are stubs so a regressed guard records a line
+# instead of writing to /usr/local/bin.
+_fake_keg() {   # root -> echoes the path of the bin symlink
+  local root="$1" keg
+  keg="$root/Cellar/cleat/9.9.9"
+  _safe_rm "$root"
+  mkdir -p "$keg/libexec/bin" "$root/bin"
+  cp "$CLI_BIN" "$keg/libexec/bin/cleat"
+  chmod +x "$keg/libexec/bin/cleat"
+  echo '{}' > "$keg/INSTALL_RECEIPT.json"
+  ln -s "../Cellar/cleat/9.9.9/libexec/bin/cleat" "$root/bin/cleat"
+  printf '%s\n' "$root/bin/cleat"
+}
+
+_keg_stubs() {   # -> echoes a dir of recording stubs for PATH
+  local d="$RUN_DIR/keg-stubs" c
+  _safe_rm "$d"; mkdir -p "$d"
+  for c in ln rm sudo brew; do
+    printf '#!/usr/bin/env bash\necho "STUB-%s $*"\n' "$c" > "$d/$c"
+    chmod +x "$d/$c"
+  done
+  printf '%s\n' "$d"
+}
+
+check_31_homebrew_channel() {
+  local link stubs out nobrew
+  link="$(_fake_keg "$RUN_DIR/hb")"
+  stubs="$(_keg_stubs)"
+  # PATH without any brew, for the fallback leg. /usr/bin and /bin only, so a
+  # real Homebrew in /opt/homebrew or /usr/local cannot be found.
+  nobrew="/usr/bin:/bin"
+
+  # The detector itself, through the symlink, on this machine's readlink.
+  out="$(PATH="$nobrew" "$link" update 2>&1 | _strip)"
+  want     31a "$out" "Installed via Homebrew" "a keg is recognised through its relative bin symlink"
+  want     31b "$out" "brew upgrade cleatdev/tap/cleat" "and told the command to run when brew is unreachable"
+  want_not 31c "$out" "not a git installation" "never the generic no-git advice"
+  want_not 31d "$out" "install.sh" "and never the curl re-install, which would overwrite brew bin"
+
+  # With brew reachable it RUNS the upgrade instead of describing it.
+  out="$(PATH="$stubs:$nobrew" "$link" update 2>&1 | _strip)"
+  want     31e "$out" "STUB-brew upgrade cleatdev/tap/cleat" "with brew present the upgrade is run, not printed"
+  want_not 31f "$out" "Checking for updates" "and nothing below the guard runs"
+
+  # install / uninstall refuse, and prove they never reached the filesystem.
+  out="$(PATH="$stubs:$nobrew" "$link" install 2>&1 | _strip)"
+  want     31g "$out" "Installed via Homebrew" "cleat install refuses on a keg"
+  want_not 31h "$out" "STUB-ln" "without ever linking"
+  out="$(PATH="$nobrew" "$link" uninstall 2>&1 | _strip)"
+  want     31i "$out" "brew uninstall cleatdev/tap/cleat" "cleat uninstall hands the keg to brew"
+  want_not 31j "$out" "STUB-rm" "without removing anything itself"
+
+  # A path with a space: the BSD `pwd -P` leg that only matters on a Mac.
+  link="$(_fake_keg "$RUN_DIR/hb with space")"
+  out="$(PATH="$nobrew" "$link" update 2>&1 | _strip)"
+  want     31k "$out" "Installed via Homebrew" "detection survives a space in the install path"
+
+  # One install per machine: a non-keg cleat must refuse while the keg exists.
+  # Safe because the refusal exits before any symlink work, which 31m proves.
+  local plain="$RUN_DIR/plain-bin"
+  _safe_rm "$plain"; mkdir -p "$plain"
+  cp "$CLI_BIN" "$plain/cleat"; chmod +x "$plain/cleat"
+  out="$(PATH="$stubs:$RUN_DIR/hb/bin:$nobrew" "$plain/cleat" install 2>&1 | _strip)"
+  want     31l "$out" "Homebrew" "a second install is refused while a keg is on PATH"
+  want_not 31m "$out" "STUB-ln" "and refuses before touching /usr/local/bin"
+}
+
+check_32_state_survives_a_switch() {
+  # State must live outside the install tree, or a `brew upgrade` (which deletes
+  # the keg) and a channel switch both wipe it. Uses this run's isolated
+  # XDG_CONFIG_HOME, so the real ~/.config/cleat is untouched.
+  local tree="$RUN_DIR/old-install" state="$XDG_CONFIG_HOME/cleat/state"
+  _safe_rm "$tree"; mkdir -p "$tree/bin"
+  cp "$CLI_BIN" "$tree/bin/cleat"; chmod +x "$tree/bin/cleat"
+  echo "12345 9.9.9 9.9.9" > "$tree/.update_check"
+
+  "$tree/bin/cleat" version >/dev/null 2>&1 || true
+  want_file   32a "$state/update_check" "state is migrated out of the install tree on first run"
+  want_eq     32b "$(cat "$state/update_check" 2>/dev/null || true)" "12345 9.9.9 9.9.9" \
+                  "and the declined-version memory is carried across intact"
+  want_nofile 32c "$tree/.update_check" "leaving nothing behind in the install"
+
+  # The basis of a lossless switch: identity comes from the PROJECT, never from
+  # where Cleat lives. Same project, two install shapes, same container name.
+  local p keg_link from_tree from_keg
+  p="$(new_project switchid)"
+  keg_link="$(_fake_keg "$RUN_DIR/hb2")"
+  from_tree="$(cd "$p" && "$tree/bin/cleat" status 2>&1 | _strip | grep -i "^  Container:" || true)"
+  from_keg="$(cd "$p" && PATH="/usr/bin:/bin" "$keg_link" status 2>&1 | _strip | grep -i "^  Container:" || true)"
+  if [[ -z "$from_tree" ]]; then
+    skip 32d "a box is the same box on either install" "no Container line (docker down?)"
+  else
+    want_eq 32d "$from_keg" "$from_tree" "a box is the same box whichever install created it"
+  fi
+}
+
 CHECKS="02_fork_containment 04_prune_owns_only_its_own 05_disable_indented
         07_status_box_positional 08_fork_dead_end 09_unreadable_cleat
         10_env_name 11_nuke_no_tty 12_memory_floor 13_bom
@@ -870,6 +975,7 @@ CHECKS="02_fork_containment 04_prune_owns_only_its_own 05_disable_indented
         25_resources_per_key 26_materialize_and_restore 27_legacy_file_announced
         28_trust_per_box 29_per_box_setup_and_fork 30_global_refuses_and_typo_warns
         01_prune_daemon_down 03_nuke_keeps_forks 06_session_key
+        31_homebrew_channel 32_state_survives_a_switch
         15_idle_sweep_shell 16_claude_commands_symlink 19_hooks"
 
 RESUME=0; ONLY=""; NO_DOCKER=0

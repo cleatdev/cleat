@@ -525,7 +525,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `cleat status` | Show this project's boxes, image and auth status |
 | `cleat describe [box] [text]` | Show or set a box's description (host-side, never recreates) |
 | `cleat ps` | List all Cleat containers (running and stopped, with a box column) |
-| `cleat update` | Check for updates and install the latest version |
+| `cleat update` | Check for updates and install the latest version (a Homebrew install runs `brew upgrade` instead, or prints it when `brew` is off `PATH`) |
 | `cleat version` | Show current version |
 
 All commands operate on the current working directory. The optional `[box]` is a
@@ -1116,6 +1116,37 @@ rm -rf ~/.cleat   # remove the repo clone
 ```
 
 Your project files and `~/.claude` credentials are never touched.
+
+If `cleat` came from a Homebrew keg rather than this installer, the commands defer
+to brew. `cleat update` runs `brew upgrade cleatdev/tap/cleat`. `cleat uninstall`
+asks first, because `brew uninstall` removes the whole keg where this command
+normally just drops a symlink, then runs it on a yes. Deleting the prefix symlink
+by hand would leave brew believing cleat is installed while the command is gone
+from your `PATH`. `cleat install` refuses outright: brew already linked it.
+
+When `brew` isn't on your `PATH` (a shell that never ran `brew shellenv`, or cron)
+nothing is run and the command to run is printed instead. Same for
+`cleat uninstall` outside a terminal: it never removes an install unattended.
+
+**Updates work the same either way.** The on-start "update available" offer,
+its throttle and its memory of a version you declined are identical on both
+install methods. Accepting it runs `brew upgrade` on a Homebrew install and
+moves the checkout on a script install, then continues your session on the new
+version.
+
+**Switching install method loses nothing.** Config, trust, boxes, fork
+workspaces and Claude history live outside the install (`~/.config/cleat`,
+`~/.claude`, your project's own `.cleat`). Boxes are identified by project path
+rather than by where Cleat lives. Remove the install you have, then add the
+other. Every box is exactly where you left it.
+
+**One cleat per machine.** The installer and `cleat install` refuse to add a second
+install at a different path, because from then on `PATH` order decides which one
+runs. Re-installing over the path you already have is fine, that is an upgrade.
+A different path is refused and `--force` replaces it
+(`curl -fsSL https://cleat.sh/install | bash -s -- --force`). A Homebrew keg is
+never replaced, even with `--force`. `cleat status` lists them all when it finds
+more than one.
 
 ---
 

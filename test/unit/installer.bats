@@ -223,3 +223,98 @@ GITEOF
   refute_output --partial "⠋"
   refute_output --partial "⠼"
 }
+
+# ── One install per machine ─────────────────────────────────────────────────
+# A second cleat at another bin path means PATH order decides which one runs.
+# Every test here calls _patch_installer (BIN_DIR and INSTALL_DIR into TEST_TEMP)
+# AND puts ln/rm/sudo stubs ahead of PATH. Not belt and braces: without them a
+# guard that fails to fire runs the real installer, and install.sh sudo-symlinks
+# into the developer's actual /usr/local/bin. That happened once while writing
+# these, which is why the stubs assert rather than assume.
+
+# Recording stubs for the commands that touch the filesystem. Echoes the dir.
+_fs_stubs() {
+  local d="$TEST_TEMP/fsstubs" c
+  mkdir -p "$d"
+  for c in ln rm sudo; do
+    cat > "$d/$c" << STUB
+#!/usr/bin/env bash
+echo "STUB-$c \$*"
+STUB
+    chmod +x "$d/$c"
+  done
+  printf '%s\n' "$d"
+}
+
+# A Homebrew keg reachable at a bin path this installer does not own. Executable
+# on purpose: the scan only counts a cleat that would actually run, the same way
+# PATH resolution does.
+_plant_keg() {
+  mkdir -p "$HOME/hb/Cellar/cleat/9.9.9/libexec/bin" "$HOME/.local/bin"
+  printf '#!/usr/bin/env bash\necho keg\n' > "$HOME/hb/Cellar/cleat/9.9.9/libexec/bin/cleat"
+  chmod +x "$HOME/hb/Cellar/cleat/9.9.9/libexec/bin/cleat"
+  # Relative, exactly the shape brew writes into its prefix.
+  ln -s "../../hb/Cellar/cleat/9.9.9/libexec/bin/cleat" "$HOME/.local/bin/cleat"
+}
+
+_plant_git_install() {
+  mkdir -p "$HOME/.local/bin" "$TEST_TEMP/other/bin"
+  printf '#!/usr/bin/env bash\necho other\n' > "$TEST_TEMP/other/bin/cleat"
+  chmod +x "$TEST_TEMP/other/bin/cleat"
+  ln -s "$TEST_TEMP/other/bin/cleat" "$HOME/.local/bin/cleat"
+}
+
+@test "installer: refuses when Homebrew owns a cleat elsewhere" {
+  _patch_installer
+  _plant_keg
+  local stubs; stubs="$(_fs_stubs)"
+
+  run env PATH="$stubs:$PATH" bash "$FAKE_REPO/install.sh" --local
+  assert_failure
+  assert_output --partial "already installed by Homebrew"
+  assert_output --partial "brew uninstall cleatdev/tap/cleat"
+  refute_output --partial "Linked"
+  refute_output --partial "STUB-ln"
+}
+
+@test "installer: --force never overrides a Homebrew keg" {
+  # Orphaning a keg is the hazard the whole guard exists to prevent, so this is
+  # the one conflict --force must not resolve.
+  _patch_installer
+  _plant_keg
+  local stubs; stubs="$(_fs_stubs)"
+
+  run env PATH="$stubs:$PATH" bash "$FAKE_REPO/install.sh" --local --force
+  assert_failure
+  assert_output --partial "already installed by Homebrew"
+  refute_output --partial "STUB-ln"
+  refute_output --partial "STUB-rm"
+  # The keg's symlink is untouched.
+  [ -L "$HOME/.local/bin/cleat" ]
+}
+
+@test "installer: refuses a second install at another path" {
+  _patch_installer
+  _plant_git_install
+  local stubs; stubs="$(_fs_stubs)"
+
+  run env PATH="$stubs:$PATH" bash "$FAKE_REPO/install.sh" --local
+  assert_failure
+  assert_output --partial "already installed elsewhere"
+  assert_output --partial "--force"
+  # A plain second install is not a Homebrew problem, so it must not say so.
+  refute_output --partial "Homebrew"
+  refute_output --partial "STUB-ln"
+}
+
+@test "installer --force: replaces a second install at another path" {
+  _patch_installer
+  _plant_git_install
+  local stubs; stubs="$(_fs_stubs)"
+
+  run env PATH="$stubs:$PATH" bash "$FAKE_REPO/install.sh" --local --force
+  assert_success
+  assert_output --partial "Replacing the install at"
+  assert_output --partial "$HOME/.local/bin/cleat"
+  assert_output --partial "Linked"
+}

@@ -5,16 +5,20 @@ REPO="https://github.com/cleatdev/cleat.git"
 INSTALL_DIR="$HOME/.cleat"
 BIN_NAME="cleat"
 LOCAL_MODE=false
+FORCE=false
 
 # Parse flags
 for arg in "$@"; do
   case "$arg" in
     --local) LOCAL_MODE=true ;;
+    --force) FORCE=true ;;
     --help|-h)
-      echo "Usage: install.sh [--local]"
+      echo "Usage: install.sh [--local] [--force]"
       echo ""
       echo "  --local    Install from current directory (dev mode)"
       echo "             Without --local: clones from GitHub"
+      echo "  --force    Replace a cleat already installed at another path"
+      echo "             (never a Homebrew keg: run brew uninstall first)"
       exit 0
       ;;
     *)
@@ -130,6 +134,144 @@ if [[ -z "${HOME:-}" ]] || [[ "$HOME" != /* ]]; then
   exit 1
 fi
 
+# Resolve a symlink chain to the physical file. Plain readlink in a loop, not
+# `readlink -f`, which BSD did not have usably before macOS 12.3. Mirrors
+# _resolve_physical_path in bin/cleat. A relative target resolves against the
+# LINK's own directory, which is the case that matters here: Homebrew's prefix
+# symlink is relative (`../Cellar/cleat/<version>/bin/cleat`).
+resolve_physical() {
+  local p="${1:-}" target hops=0
+  while [ -L "$p" ] && [ "$hops" -lt 40 ]; do
+    target="$(readlink "$p" 2>/dev/null)" || break
+    [ -n "$target" ] || break
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  printf '%s\n' "$p"
+}
+
+# Every cleat executable reachable on this machine, as "<bin path>\t<physical
+# path>" lines: each PATH entry, then the fixed locations an installer can
+# write to even when they are NOT on PATH. That last part is the point. A
+# Homebrew prefix is invisible to a shell that never ran `brew shellenv`, and
+# a fresh ~/.local/bin usually is not on PATH yet either, so a PATH-only scan
+# would report a clean machine while a second cleat sits right there.
+find_cleat_installs() {
+  local dirs seen="" d p phys
+  dirs="$(printf '%s' "${PATH:-}" | tr ':' '\n')
+/usr/local/bin
+${HOME:-}/.local/bin
+/opt/homebrew/bin
+/home/linuxbrew/.linuxbrew/bin"
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    p="$d/cleat"
+    [ -x "$p" ] || continue
+    case "$seen" in *"[$p]"*) continue ;; esac
+    seen="$seen[$p]"
+    phys="$(resolve_physical "$p")"
+    printf '%s\t%s\n' "$p" "$phys"
+  done <<< "$dirs"
+}
+
+# Where this run will land the symlink. Mirrors the BIN_DIR choice made inside
+# the local and remote branches below (writable /usr/local/bin, else sudo to
+# the same place, else ~/.local/bin). Computed up front so the one-install
+# check knows which path counts as "ours", i.e. a re-install rather than a
+# second one. Keep in step with those two branches if either ever changes.
+pick_bin_dir() {
+  if [ -w "/usr/local/bin" ]; then
+    echo "/usr/local/bin"
+  elif command -v sudo &>/dev/null; then
+    echo "/usr/local/bin"
+  else
+    echo "$HOME/.local/bin"
+  fi
+}
+
+# One cleat per machine. A second one at a different bin path means PATH order
+# decides which runs, and the loser is invisible until it bites: a stale
+# version that "fixes itself" after a shell restart, an update that appears to
+# do nothing. Writing the SAME path we already own is a re-install, not a
+# second install, so it is always allowed (that is the documented upgrade path
+# and the --local to official switch).
+#
+# A Homebrew keg is never overridable, with or without --force: replacing
+# brew's symlink leaves brew tracking an install it no longer owns. A regular
+# file is not overridable either, since that is somebody's own copy of the
+# script rather than a link this installer created.
+refuse_other_installs() {
+  local ours="$1" p phys brews="" links="" files=""
+  while IFS="$(printf '\t')" read -r p phys; do
+    [ -n "$p" ] || continue
+    [ "$p" = "$ours" ] && continue
+    case "$phys" in
+      */Cellar/*) brews="${brews}${p}
+"; continue ;;
+    esac
+    if [ -L "$p" ]; then
+      links="${links}${p}
+"
+    else
+      files="${files}${p}
+"
+    fi
+  done <<< "$(find_cleat_installs)"
+
+  if [ -n "$brews" ]; then
+    error "cleat is already installed by Homebrew."
+    print_install_list "$brews"
+    echo -e "    ${DIM}Installing over it would leave you on a copy brew does not track.${RESET}"
+    echo -e "    ${DIM}Just updating? ${BOLD}brew upgrade cleatdev/tap/cleat${RESET}"
+    echo ""
+    echo -e "    ${DIM}Switching to this installer? Run both lines:${RESET}"
+    echo -e "      ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}"
+    echo -e "      ${BOLD}curl -fsSL https://cleat.sh/install | bash${RESET}"
+    echo -e "    ${DIM}Nothing is lost: config, boxes, trust and sessions live outside the install.${RESET}"
+    exit 1
+  fi
+  if [ -n "$files" ]; then
+    error "cleat is already installed elsewhere on this machine."
+    print_install_list "$files"
+    echo -e "    ${DIM}That is a real file, not a symlink, so this installer will not remove it.${RESET}"
+    echo -e "    ${DIM}Delete it yourself, then re-run.${RESET}"
+    exit 1
+  fi
+  [ -n "$links" ] || return 0
+
+  if [ "$FORCE" != true ]; then
+    error "cleat is already installed elsewhere on this machine."
+    print_install_list "$links"
+    echo -e "    ${DIM}Two installs mean PATH order decides which one runs.${RESET}"
+    echo -e "    ${DIM}Replace it by re-running with ${BOLD}--force${RESET}${DIM}, or remove it and re-run.${RESET}"
+    echo -e "    ${DIM}Piped form: ${BOLD}curl -fsSL https://cleat.sh/install | bash -s -- --force${RESET}"
+    exit 1
+  fi
+
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    warn "Replacing the install at ${BOLD}${p}${RESET}"
+    if [ -w "$(dirname "$p")" ]; then
+      rm -f "$p"
+    else
+      sudo rm -f "$p"
+    fi
+  done <<< "$links"
+}
+
+print_install_list() {
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    echo -e "    ${BOLD}${line}${RESET}"
+  done <<< "$1"
+}
+
+refuse_other_installs "$(pick_bin_dir)/cleat"
+
 # ── Local mode: install from current directory ─────────────────────────────
 if $LOCAL_MODE; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -175,10 +317,12 @@ fi
 
 # ── Remote mode: install from GitHub ───────────────────────────────────────
 
-# Detect existing installation via symlink
+# Detect existing installation via symlink. The target is resolved rather than
+# tested as written: a relative link (`../foo/bin/cleat`) would otherwise be
+# checked against this script's working directory and silently miss.
 for check_path in /usr/local/bin/cleat "$HOME/.local/bin/cleat"; do
   if [ -L "$check_path" ]; then
-    link_target="$(readlink "$check_path" 2>/dev/null || true)"
+    link_target="$(resolve_physical "$check_path")"
     if [[ -n "$link_target" ]]; then
       link_dir="$(dirname "$link_target")"
       if [ "$link_dir" != "$INSTALL_DIR" ] && [ -f "$link_target" ]; then

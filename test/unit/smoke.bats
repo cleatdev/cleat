@@ -143,26 +143,133 @@ cleat_bin_at() {
 
 # ── cleat update on a Homebrew install ──────────────────────────────────────
 
-@test "smoke: cleat update refuses on a real Homebrew keg layout" {
+@test "smoke: cleat update on a real Homebrew keg prints the brew command when brew is missing" {
   # Build the actual install shape a formula produces: the whole tree under
   # libexec inside the keg, the receipt at the keg root, and bin/cleat a
   # RELATIVE symlink into it. The binary is copied (not linked) because the
   # physical file has to live in the Cellar for the detector to be exercised
   # honestly. Then run it through the symlink, which is what a user's PATH
   # hits and what BASH_SOURCE reports.
+  #
+  # PATH is trimmed to the stub plus the system directories so this leg is the
+  # brew-unreachable one on every host. Without that, the suite would find the
+  # developer's real brew on a Mac and shell out to it.
   local keg="$TEST_TEMP/hb/Cellar/cleat/9.9.9"
   mkdir -p "$keg/libexec/bin" "$TEST_TEMP/hb/bin"
   cp "$CLI" "$keg/libexec/bin/cleat"
   echo '{}' > "$keg/INSTALL_RECEIPT.json"
   ln -s "../Cellar/cleat/9.9.9/libexec/bin/cleat" "$TEST_TEMP/hb/bin/cleat"
 
-  run cleat_bin_at "$TEST_TEMP/hb/bin/cleat" update
+  run env PATH="$MOCK_BIN:/usr/bin:/bin" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    "$TEST_TEMP/hb/bin/cleat" update
   assert_failure
   assert_output --partial "Installed via Homebrew"
   assert_output --partial "brew upgrade cleatdev/tap/cleat"
   # The generic no-git branch and its curl hint would wreck this install.
   refute_output --partial "not a git installation"
   refute_output --partial "install.sh"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+  refute_output --partial "syntax error"
+}
+
+@test "smoke: cleat update hands a real Homebrew keg to brew" {
+  # The delegation leg, end to end and under strict mode: the guard fires, the
+  # process is REPLACED by brew, and nothing below the guard ever runs. A stub
+  # brew ahead of everything on PATH stands in for the real one.
+  local link stub="$TEST_TEMP/brewstub"
+  link="$(_make_fake_keg "$TEST_TEMP/hb-delegate")"
+  mkdir -p "$stub"
+  cat > "$stub/brew" << 'BREWSTUB'
+#!/usr/bin/env bash
+echo "BREW $*"
+BREWSTUB
+  chmod +x "$stub/brew"
+
+  run env PATH="$stub:$MOCK_BIN:/usr/bin:/bin" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    "$link" update
+  assert_success
+  assert_output --partial "BREW upgrade cleatdev/tap/cleat"
+  refute_output --partial "Checking for updates"
+  refute_output --partial "not a git installation"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+  refute_output --partial "syntax error"
+}
+
+# Builds the keg shape above and echoes the path of its bin symlink.
+_make_fake_keg() {
+  local root="${1:-$TEST_TEMP/hb}" keg
+  keg="$root/Cellar/cleat/9.9.9"
+  mkdir -p "$keg/libexec/bin" "$root/bin"
+  cp "$CLI" "$keg/libexec/bin/cleat"
+  echo '{}' > "$keg/INSTALL_RECEIPT.json"
+  ln -s "../Cellar/cleat/9.9.9/libexec/bin/cleat" "$root/bin/cleat"
+  printf '%s\n' "$root/bin/cleat"
+}
+
+# cmd_install and cmd_uninstall hardcode /usr/local/bin and shell out to ln, rm
+# and sudo. These tests run the REAL binary, so if a guard ever regresses they
+# would reach the developer's actual PATH symlink, and on an Intel Mac that
+# directory is writable without sudo. Prepend recording stubs so the blast
+# radius of a regression is a failed assertion instead of the maintainer's
+# machine. Echoes the stub dir, for PATH.
+_make_fs_stubs() {
+  local d="$TEST_TEMP/fsstubs"
+  mkdir -p "$d"
+  local c
+  for c in ln rm sudo; do
+    cat > "$d/$c" << STUB
+#!/usr/bin/env bash
+echo "STUB-$c \$*"
+STUB
+    chmod +x "$d/$c"
+  done
+  printf '%s\n' "$d"
+}
+
+@test "smoke: cleat install refuses on a real Homebrew keg layout" {
+  # The guard exits before the symlink work. The ln/rm/sudo stubs ahead of PATH
+  # are what makes that safe to assert rather than assume: a reverted guard
+  # records a STUB line instead of writing to the developer's /usr/local/bin.
+  local link stubs
+  link="$(_make_fake_keg)"
+  stubs="$(_make_fs_stubs)"
+
+  run env PATH="$stubs:$MOCK_BIN:$PATH" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    "$link" install
+  assert_failure
+  assert_output --partial "Installed via Homebrew"
+  assert_output --partial "brew upgrade cleatdev/tap/cleat"
+  refute_output --partial "Installing CLI symlink"
+  refute_output --partial "STUB-ln"
+  refute_output --partial "STUB-sudo"
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+  refute_output --partial "syntax error"
+}
+
+@test "smoke: cleat uninstall refuses on a real Homebrew keg layout" {
+  local link stubs
+  link="$(_make_fake_keg)"
+  stubs="$(_make_fs_stubs)"
+
+  run env PATH="$stubs:$MOCK_BIN:$PATH" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    "$link" uninstall
+  assert_failure
+  assert_output --partial "Installed via Homebrew"
+  assert_output --partial "brew uninstall cleatdev/tap/cleat"
+  refute_output --partial "Removing CLI symlinks"
+  refute_output --partial "STUB-rm"
+  refute_output --partial "STUB-sudo"
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
   refute_output --partial "syntax error"

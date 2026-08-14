@@ -63,6 +63,7 @@ HUMAN_SIZE_BATS="$REPO_ROOT/test/unit/human_size.bats"
 DISK_GATE_BATS="$REPO_ROOT/test/unit/disk_gate.bats"
 STORAGE_BATS="$REPO_ROOT/test/unit/storage.bats"
 UPDATE_BATS="$REPO_ROOT/test/unit/update.bats"
+INSTALLER_BATS="$REPO_ROOT/test/unit/installer.bats"
 INT_LIFECYCLE_BATS="$REPO_ROOT/test/integration/lifecycle.bats"
 SETUP_BASH="$REPO_ROOT/test/setup.bash"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
@@ -709,8 +710,11 @@ try "v0.13.0_ask_yn_eof_declines" "EOF / redirected stdin yields decline" "$CLI"
 
 # v0.13.0: the CLI self-update must skip a dirty/dev tree (else it nags
 # "Update failed" every launch). Drop the guard; the dirty-tree skip test fails.
+# Neutered rather than DELETED: the guard now sits inside the git-channel `if`,
+# and deleting the only line of a then-block is a syntax error, which the
+# harness reports as SKIPPED (no verdict) instead of a verdict.
 cat > "$SED_TMP" << 'SED'
-/_repo_is_clean || return 0/d
+s@    _repo_is_clean || return 0@    :@
 SED
 try "v0.13.0_cli_update_skips_dirty_tree" "skips entirely on a dirty/dev tree" "$CLI" "$VERSION_BATS"
 
@@ -4480,6 +4484,185 @@ cat > "$SED_TMP" << 'SED'
 s@    \*/Cellar/\*) return 0 ;;@    */NeverAHomebrewCellar/*) return 0 ;;@
 SED
 try "vnext_brew_guard_cellar_pattern" "detects a keg through the bin symlink" "$CLI" "$UPDATE_BATS"
+
+# ON-START PROMPT GATE: the .git test alone does not exclude a keg. Where
+# `readlink -f` is missing (macOS before 12.3) REPO_DIR resolves to the
+# Homebrew PREFIX, and /opt/homebrew IS Homebrew's own git repo, so the offer
+# fires and its `git checkout v<tag>` lands inside brew's checkout. Drop the
+# brew probe and only the .git gate is left, which passes there.
+# Shares its sed with vnext_brew_install_self_guard on purpose: one edit,
+# two independent tests that must each catch it. Here the consequence is that
+# the on-start offer stops recognising a keg and falls through to the .git
+# branch, which on the pre-12.3 leg is Homebrew's own repository.
+cat > "$SED_TMP" << 'SED'
+s@if _is_brew_managed "\${BASH_SOURCE\[0\]}"; then@if false; then@
+SED
+try "vnext_brew_prompt_gate" "stays silent for a keg whose prefix has git" "$CLI" "$UPDATE_BATS"
+
+# PREFIX SYMLINK GUARD: /usr/local/bin is Homebrew's bin on an Intel Mac, so
+# `cleat uninstall` deletes brew's own symlink there and leaves brew believing
+# cleat is installed while the command is gone from PATH. Same line guards
+# `cleat install` from replacing it.
+cat > "$SED_TMP" << 'SED'
+s@if _is_brew_managed "$target/cleat"; then@if false; then@
+SED
+try "vnext_brew_bin_target_guard" "refuses to remove a Homebrew symlink from the target dir" "$CLI" "$UPDATE_BATS"
+
+# SELF GUARD ON INSTALL: a keg already has its symlink in the prefix, and
+# re-linking from inside the Cellar points the name at a tree brew does not
+# track. Narrower than vnext_brew_guard_wired: this neuters only the
+# BASH_SOURCE self-checks, not the target checks.
+cat > "$SED_TMP" << 'SED'
+s@if _is_brew_managed "\${BASH_SOURCE\[0\]}"; then@if false; then@
+SED
+try "vnext_brew_install_self_guard" "install: refuses when the running cleat is a Homebrew keg" "$CLI" "$UPDATE_BATS"
+
+# UPDATE DELEGATES TO BREW: with brew reachable, `cleat update` on a keg runs
+# the upgrade rather than printing it. Skip the call and the user is back to
+# copying a command by hand, which is the whole friction the handoff removes.
+cat > "$SED_TMP" << 'SED'
+s@if ! _brew_delegate upgrade cleatdev/tap/cleat; then@if true; then@
+SED
+try "vnext_brew_update_delegates" "hands a Homebrew install to brew upgrade" "$CLI" "$UPDATE_BATS"
+
+# DELEGATION EXECS: `brew upgrade` deletes the keg this script is being read
+# from, and bash reads a script incrementally, so the process image must be
+# replaced rather than the script left reading its own deleted file. Drop the
+# exec and control returns into a file that no longer exists.
+cat > "$SED_TMP" << 'SED'
+s|  exec brew "$@"|  brew "$@"|
+SED
+try "vnext_brew_delegate_exec" "_brew_delegate execs brew and never returns" "$CLI" "$UPDATE_BATS"
+
+# UNINSTALL CONSENT GATE: `brew uninstall` removes the whole keg, so the
+# handoff is terminal-only and asks first. Open the gate and an unattended
+# `cleat uninstall` (a script, CI, a wrapper) deletes someone's install with
+# no human in the loop.
+cat > "$SED_TMP" << 'SED'
+s@if _is_interactive && _brew_present; then@if true; then@
+SED
+try "vnext_brew_uninstall_consent_gate" "never prompts a keg without a terminal" "$CLI" "$UPDATE_BATS"
+
+# EXECFAIL BEFORE THE HANDOFF: without it a failed exec kills the shell at
+# 126/127, so the printed-command fallback is unreachable in the very case it
+# is written for (brew removed or unrunnable between the check and the call).
+cat > "$SED_TMP" << 'SED'
+s@  shopt -s execfail 2>/dev/null || true@  :@
+SED
+try "vnext_brew_delegate_execfail" "survives an exec that cannot run brew" "$CLI" "$UPDATE_BATS"
+
+# INSTALLER TAKEOVER: the guard covers the CLI verbs, but the command on the
+# homepage is install.sh, and /usr/local/bin is Homebrew's own bin on an Intel
+# Mac. Without this refusal the most advertised command in the project silently
+# replaces a brew user's symlink with a tree brew does not track.
+cat > "$SED_TMP" << 'SED'
+s@    \*/Cellar/\*)@    */NeverAHomebrewCellar/*)@
+SED
+try "vnext_brew_installer_takeover" "refuses when Homebrew owns a cleat elsewhere" "$INSTALLER" "$INSTALLER_BATS"
+
+# ONE INSTALL PER MACHINE, CLI SIDE: without the check `cleat install` happily
+# adds a second cleat at another bin path, and from then on PATH order decides
+# which one runs while the loser stays invisible.
+cat > "$SED_TMP" << 'SED'
+s@  _refuse_other_installs "$target/cleat" "$force" || exit 1@  :@
+SED
+try "vnext_one_install_wired" "refuses when another install exists elsewhere" "$CLI" "$UPDATE_BATS"
+
+# FORCE MUST NEVER OVERRIDE A KEG: every other conflict is a symlink this tool
+# created, but replacing brew's leaves brew tracking an install it no longer
+# owns. Let force through here and --force silently orphans a keg.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ -n "$brews" \]\]; then@  if false; then@
+SED
+try "vnext_one_install_force_brew" "never lets force override a keg" "$CLI" "$UPDATE_BATS"
+
+# FIXED LOCATIONS ARE SCANNED, NOT JUST PATH: a Homebrew prefix is invisible to
+# a shell that never ran `brew shellenv`, and a fresh ~/.local/bin is usually
+# not on PATH either. Drop them and the scan reports a clean machine while a
+# second cleat sits right there.
+cat > "$SED_TMP" << 'SED'
+s@^\${HOME:-}/.local/bin$@@
+SED
+try "vnext_one_install_fixed_locations" "sees a fixed location that is not on PATH" "$CLI" "$UPDATE_BATS"
+
+# ONE INSTALL PER MACHINE, INSTALLER SIDE: this is the command on the homepage,
+# so an unguarded run is the most likely way anyone ends up with two cleats.
+cat > "$SED_TMP" << 'SED'
+s@^refuse_other_installs "$(pick_bin_dir)/cleat"$@:@
+SED
+try "vnext_one_install_installer" "refuses a second install at another path" "$INSTALLER" "$INSTALLER_BATS"
+
+# STATE LIVES OUTSIDE THE INSTALL TREE: a Homebrew keg is deleted and recreated
+# by every `brew upgrade`, so in-tree throttles reset and every declined version
+# is forgotten on each upgrade. Switching install channels lost the same state.
+cat > "$SED_TMP" << 'SED'
+s@^CLEAT_STATE_DIR="$CLEAT_CONFIG_DIR/state"$@CLEAT_STATE_DIR="$REPO_DIR"@
+SED
+try "vnext_state_out_of_tree" "the update and highlight files default under the config dir" "$CLI" "$UPDATE_BATS"
+
+# MIGRATION CARRIES THE OLD STATE: without it, upgrading into this version
+# re-nags about a release the user already declined and re-shows notices.
+cat > "$SED_TMP" << 'SED'
+s@    cp "$old" "$new" 2>/dev/null || true@    :@
+SED
+try "vnext_state_migration" "migrates a file left in the old in-tree location" "$CLI" "$UPDATE_BATS"
+
+# THE SWITCH RESCUE: someone moving from a pre-1.4 script install straight to a
+# keg never launches the old install again, so without the second source their
+# state sits orphaned in ~/.cleat and the channel switch loses the very memory
+# the relocation exists to preserve.
+cat > "$SED_TMP" << 'SED'
+s@  for root in "$REPO_DIR" "${HOME:-}/.cleat"; do@  for root in "$REPO_DIR"; do@
+SED
+try "vnext_state_switch_rescue" "rescues state from a script install after a switch" "$CLI" "$UPDATE_BATS"
+
+# ONE VERSION SOURCE FOR BOTH CHANNELS: a keg has no repo to ask, so forcing
+# `origin` makes the lookup fail there and a brew user is never told a release
+# exists. This is what keeps the on-start offer identical on both channels.
+cat > "$SED_TMP" << 'SED'
+s@  \[\[ -d "$REPO_DIR/.git" \]\] && _remote="origin"@  _remote="origin"@
+SED
+try "vnext_update_remote_source" "latest_remote_tag asks the public URL when there is no repo" "$CLI" "$UPDATE_BATS"
+
+# KEG ROUTES TO BREW: mis-route the channel and the on-start offer tries to
+# `git checkout` a tag inside whatever REPO_DIR resolved to, which for a keg on
+# Apple Silicon is Homebrew's own repository.
+cat > "$SED_TMP" << 'SED'
+s@    _channel="brew"@    _channel="git"@
+SED
+try "vnext_update_channel_brew" "a keg is offered the update and upgraded through brew" "$CLI" "$UPDATE_BATS"
+
+# NO BREW MEANS NO OFFER: without brew the upgrade cannot be applied, so
+# prompting only interrupts a launch with something the user cannot act on.
+cat > "$SED_TMP" << 'SED'
+s@    _brew_present || return 0@    :@
+SED
+try "vnext_update_brew_present_gate" "a keg with no brew on PATH is never offered anything" "$CLI" "$UPDATE_BATS"
+
+# THE DIRTY-TREE GUARD IS GIT-ONLY: it exists to avoid an auto `git checkout`
+# onto uncommitted work. Apply it to a keg, which has no working tree, and the
+# offer is silenced there forever.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ "$_channel" == "git" \]\]; then@  if true; then@
+SED
+try "vnext_update_keg_dirty_tree" "a keg offer is not blocked by a dirty working tree" "$CLI" "$UPDATE_BATS"
+
+# THE UPGRADE CLEARS ITS CACHES: leave them and the new keg is judged against
+# the old version's cached answer on the next launch.
+cat > "$SED_TMP" << 'SED'
+s@  rm -f "$UPDATE_CHECK_FILE" "$CLAUDE_CHECK_FILE" 2>/dev/null || true@  :@
+SED
+try "vnext_brew_apply_clears_cache" "upgrades the formula and clears the caches" "$CLI" "$UPDATE_BATS"
+
+# A LOCAL BUILD NEEDS A CONTEXT: on macOS before 12.3 `readlink -f` does not
+# resolve the invoking symlink, so REPO_DIR is the Homebrew PREFIX rather than
+# the keg and $REPO_DIR/docker does not exist. Every image acquisition is
+# `_do_pull || _do_build`, so without this check a failed pull ends a SESSION
+# START in a raw docker error about a build context that was never there.
+cat > "$SED_TMP" << 'SED'
+s@  if \[\[ ! -f "$REPO_DIR/docker/Dockerfile" \]\]; then@  if false; then@
+SED
+try "vnext_build_needs_context" "refuses with an actionable message when there is no docker context" "$CLI" "$DOCKER_COMMANDS_BATS"
 
 # APP BUNDLE TEST SEAM: $HOME is sandboxed in tests but /Applications is not, so
 # an absent-app assertion depended on the developer's machine not having the app

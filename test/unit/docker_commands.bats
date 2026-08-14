@@ -13,7 +13,18 @@ teardown() { _common_teardown; }
 
 # ── build / rebuild ─────────────────────────────────────────────────────────
 
+# _do_build now refuses when $REPO_DIR/docker is missing, which is the real
+# state of a Homebrew keg on macOS before 12.3. A sourced test gets a REPO_DIR
+# derived from the temp copy of the script, so tests that mean to reach the
+# BUILD need a context planted first, the way a git install has one.
+_with_build_context() {
+  REPO_DIR="$TEST_TEMP/repo"
+  mkdir -p "$REPO_DIR/docker"
+  : > "$REPO_DIR/docker/Dockerfile"
+}
+
 @test "build: creates image when none exists" {
+  _with_build_context
   run cmd_build
   assert_success
   run docker_build_calls
@@ -38,6 +49,7 @@ teardown() { _common_teardown; }
 
 @test "build: tries pull before local build when image missing" {
   # Pull fails (default stub behavior) → should fall back to build
+  _with_build_context
   run cmd_build
   assert_success
   # Docker pull was attempted with the registry image
@@ -484,6 +496,7 @@ teardown() { _common_teardown; }
 }
 
 @test "run: auto-builds image if missing" {
+  _with_build_context
   mkdir -p "$TEST_TEMP/project"
   run cmd_run "$TEST_TEMP/project"
   run docker_build_calls
@@ -809,6 +822,31 @@ EOF
   assert_output --partial "running"
 }
 
+@test "status: flags a second cleat install shadowing this one" {
+  # Two installs is a state you cannot see from the inside: a bare `cleat`
+  # silently resolves to whichever comes first on PATH.
+  mkdir -p "$TEST_TEMP/project"
+  _find_cleat_installs() {
+    printf '%s\t%s\n' "/opt/homebrew/bin/cleat" "/opt/homebrew/Cellar/cleat/1.4.0/libexec/bin/cleat"
+    printf '%s\t%s\n' "$HOME/.local/bin/cleat" "$HOME/.cleat/bin/cleat"
+  }
+  run cmd_status "$TEST_TEMP/project"
+  assert_output --partial "2 installs found"
+  assert_output --partial "/opt/homebrew/bin/cleat"
+  assert_output --partial "Homebrew"
+  assert_output --partial "$HOME/.local/bin/cleat"
+  assert_output --partial "git"
+}
+
+@test "status: says nothing about installs when there is only one" {
+  # This is a warning, not a stat: a healthy machine prints no Install line.
+  mkdir -p "$TEST_TEMP/project"
+  _find_cleat_installs() { printf '%s\t%s\n' "/usr/local/bin/cleat" "$HOME/.cleat/bin/cleat"; }
+  run cmd_status "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "installs found"
+}
+
 @test "status: overcommit line names the VM on a VM-backed engine" {
   mkdir -p "$TEST_TEMP/project"
   _docker_vm_memory() { echo "8589934592"; }             # 8 GiB pool
@@ -895,4 +933,44 @@ EOF
   run main status "Bad Name"
   assert_failure
   assert_output --partial "Invalid box name"
+}
+
+# ── Local build needs a docker context, which a packaged install may not have ──
+
+@test "build: refuses with an actionable message when there is no docker context" {
+  # On macOS before 12.3 `readlink -f` does not resolve the invoking symlink,
+  # so REPO_DIR falls back to the symlink's parent, which for a Homebrew keg is
+  # the PREFIX rather than the keg. This path is reached at SESSION START, not
+  # just from `cleat rebuild`, because every image acquisition is
+  # `_do_pull || _do_build`, so a raw docker error about a context that does not
+  # exist would be the first thing a brew user sees when a pull fails.
+  REPO_DIR="$TEST_TEMP/no-context"
+  mkdir -p "$REPO_DIR"
+  _is_brew_managed() { return 1; }
+
+  run _do_build
+  assert_failure
+  assert_output --partial "No local build context"
+  assert_output --partial "cleat build"
+  # And it never reaches docker with a bogus context.
+  run cat "$DOCKER_CALLS"
+  refute_output --partial "build"
+}
+
+@test "build: points a keg at brew reinstall, a git install at neither" {
+  REPO_DIR="$TEST_TEMP/no-context"
+  mkdir -p "$REPO_DIR"
+  _is_brew_managed() { return 0; }
+
+  run _do_build
+  assert_failure
+  assert_output --partial "brew reinstall cleatdev/tap/cleat"
+}
+
+@test "build: still builds normally when the context is there" {
+  # Control: the guard must not block the ordinary git install.
+  _with_build_context
+
+  run _do_build
+  refute_output --partial "No local build context"
 }

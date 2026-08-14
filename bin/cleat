@@ -612,6 +612,135 @@ _is_brew_managed() {
   return 1
 }
 
+# Hand a keg operation back to Homebrew, replacing this process.
+#
+# `exec` is load-bearing, not a shortcut. `brew upgrade` removes the keg the
+# running script lives in, and bash reads a script incrementally rather than
+# all at once, so a file replaced underneath it can be misparsed mid-run.
+# Replacing the process image means nothing more of this file is ever read.
+#
+# Returns 1 WITHOUT exec'ing when brew is unreachable, which is a real case
+# and the reason detection never depended on brew in the first place: a keg
+# used from a shell that never ran `brew shellenv`, or from cron. The caller
+# then falls back to printing the command for the user to run.
+# Every cleat executable reachable on this machine, as "<bin path>\t<physical
+# path>" lines, in PATH order (so the first line is the one a bare `cleat`
+# actually runs) followed by the fixed locations an installer can write to.
+#
+# Those fixed locations are searched even when they are NOT on PATH, which is
+# the whole point: a Homebrew prefix is invisible to a shell that never ran
+# `eval "$(brew shellenv)"`, and a fresh ~/.local/bin often is not on PATH
+# yet either. Checking only PATH would report "no other install" while a
+# second one sits right there, which is exactly the state this exists to
+# prevent.
+#
+# Deduped by bin path, bracket-delimited so a path containing a space cannot
+# produce a false match. Emits nothing when only one cleat exists.
+_find_cleat_installs() {
+  local dirs seen="" d p phys
+  dirs="$(printf '%s' "${PATH:-}" | tr ':' '\n')
+/usr/local/bin
+${HOME:-}/.local/bin
+/opt/homebrew/bin
+/home/linuxbrew/.linuxbrew/bin"
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    p="$d/cleat"
+    [[ -x "$p" ]] || continue
+    case "$seen" in *"[$p]"*) continue ;; esac
+    seen="$seen[$p]"
+    phys="$(_resolve_physical_path "$p")"
+    printf '%s\t%s\n' "$p" "$phys"
+  done <<< "$dirs"
+}
+
+# One cleat per machine. Refuses when another cleat executable sits at a bin
+# path other than the one we are about to write, because from then on PATH
+# order decides which one runs and the loser is invisible until it bites (a
+# stale version "fixing itself" after a shell restart, an update that appears
+# to do nothing). Returns 0 when the machine is clear.
+#
+# Same bin path is NOT a conflict: re-pointing the symlink we own is a
+# re-install, which is the documented upgrade path.
+#
+# A Homebrew keg is never overridable, with or without force. Replacing brew's
+# symlink leaves brew tracking an install it no longer owns, which is the exact
+# hazard the rest of the guard exists to prevent, so the only correct move is
+# `brew uninstall` first. A conflicting REGULAR FILE is not overridable either:
+# that is somebody's own copy of the script, not something this command gets to
+# delete. Only a symlink can be replaced, and only with force.
+_refuse_other_installs() {
+  local ours="$1" force="${2:-}"
+  local p phys brews="" links="" files=""
+  while IFS=$'\t' read -r p phys; do
+    [[ -n "$p" ]] || continue
+    [[ "$p" == "$ours" ]] && continue
+    case "$phys" in
+      */Cellar/*) brews="${brews}${p}"$'\n' ; continue ;;
+    esac
+    if [[ -L "$p" ]]; then
+      links="${links}${p}"$'\n'
+    else
+      files="${files}${p}"$'\n'
+    fi
+  done <<< "$(_find_cleat_installs)"
+
+  if [[ -n "$brews" ]]; then
+    error "cleat is already installed by Homebrew."
+    _print_install_list "$brews"
+    echo -e "    ${DIM}Remove that one first: ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}"
+    echo -e "    ${DIM}Then re-run this. Your config, boxes, trust and sessions are untouched.${RESET}"
+    return 1
+  fi
+  if [[ -n "$files" ]]; then
+    error "cleat is already installed elsewhere on this machine."
+    _print_install_list "$files"
+    echo -e "    ${DIM}That is a real file, not a symlink, so Cleat will not remove it.${RESET}"
+    echo -e "    ${DIM}Delete it yourself, then re-run.${RESET}"
+    return 1
+  fi
+  [[ -n "$links" ]] || return 0
+
+  if [[ -z "$force" ]]; then
+    error "cleat is already installed elsewhere on this machine."
+    _print_install_list "$links"
+    echo -e "    ${DIM}Two installs mean PATH order decides which one runs.${RESET}"
+    echo -e "    ${DIM}Replace it with: ${BOLD}cleat install --force${RESET}"
+    return 1
+  fi
+
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    warn "Replacing the install at ${BOLD}${p}${RESET}"
+    if [[ -w "$(dirname "$p")" ]]; then
+      rm -f "$p"
+    else
+      sudo rm -f "$p"
+    fi
+  done <<< "$links"
+  return 0
+}
+
+_print_install_list() {
+  local _line
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] || continue
+    echo -e "    ${BOLD}${_line}${RESET}"
+  done <<< "$1"
+}
+
+_brew_delegate() {
+  _brew_present || return 1
+  info "Homebrew owns this install. Running: ${BOLD}brew $*${RESET}"
+  # execfail keeps a failed exec (brew on PATH but not executable, or removed
+  # between the check and the call, which in cleat uninstall spans a human
+  # prompt) from killing the shell at 126/127. Without it the printed-command
+  # fallback below the caller is unreachable in exactly the case it is for.
+  shopt -s execfail 2>/dev/null || true
+  exec brew "$@" || true
+  return 1
+}
+
 # ── Host connectivity ────────────────────────────────────────────────────
 # Docker Desktop (macOS/Windows) provides host.docker.internal automatically.
 # On Linux with Docker Engine, we need --add-host for it.
@@ -6596,11 +6725,55 @@ _maybe_explain_fork_exhaustion() {
   echo -e "    ${DIM}•${RESET} macOS per-user cap: ${BOLD}sudo sysctl kern.maxprocperuid=4096${RESET} ${DIM}(default is often ~2784)${RESET}"
 }
 
+# ── Cleat's own state: throttles and notice memory ──────────────────────────
+# These used to sit beside the script in the install tree, which breaks two
+# ways. A Homebrew keg is DELETED and recreated by every `brew upgrade`, so
+# every throttle reset and every "don't nag me about v1.5.0" was forgotten on
+# each upgrade, and a keg may not be writable at runtime anyway. And switching
+# install channels (curl to brew, or back) lost the same state for the same
+# reason. The config dir is the SAME path on every channel and survives both,
+# so state lives there and the install tree stays effectively read-only.
+CLEAT_STATE_DIR="$CLEAT_CONFIG_DIR/state"
+
+# One-shot move from the pre-1.4 location beside the script. Runs before any
+# check reads its file, so upgrading into this version does not re-nag about a
+# release you already declined or re-show a notice you already read. Entirely
+# best-effort: a keg's tree is not writable and a failed move must never fail a
+# launch, so every step swallows its error and the worst case is one stale
+# notice.
+_migrate_state_files() {
+  mkdir -p "$CLEAT_STATE_DIR" 2>/dev/null || return 0
+  local pair old new root
+  # Two sources: this install's own tree, and the well-known script-install
+  # location. The second is what makes a CHANNEL SWITCH automatic. Someone
+  # moving from a pre-1.4 script install straight to a keg never launches the
+  # old install again, so its state would sit orphaned in ~/.cleat and the
+  # switch would lose the very memory this relocation exists to preserve.
+  # When REPO_DIR already is ~/.cleat the second pass is a no-op, because the
+  # destination now exists.
+  for root in "$REPO_DIR" "${HOME:-}/.cleat"; do
+    for pair in \
+      ".update_check:update_check" \
+      ".last_seen_version:last_seen_version" \
+      ".pressure_check:pressure_check" \
+      ".claude_update_check:claude_update_check" \
+      ".disk_check:disk_check"; do
+      old="$root/${pair%%:*}"
+      new="$CLEAT_STATE_DIR/${pair##*:}"
+      [[ -f "$old" && ! -f "$new" ]] || continue
+      # Copy then unlink, not `mv`: on a read-only install tree the copy still
+      # lands and only the cleanup fails, which is the harmless half.
+      cp "$old" "$new" 2>/dev/null || true
+      rm -f "$old" 2>/dev/null || true
+    done
+  done
+}
+
 # ── Update check (every 10 minutes) ─────────────────────────────────────────
-UPDATE_CHECK_FILE="$REPO_DIR/.update_check"
+UPDATE_CHECK_FILE="$CLEAT_STATE_DIR/update_check"
 # Records the last VERSION whose on-start release highlight was shown (one line).
 # Absent or different from VERSION => the highlight shows once on the next launch.
-LAST_SEEN_VERSION_FILE="$REPO_DIR/.last_seen_version"
+LAST_SEEN_VERSION_FILE="$CLEAT_STATE_DIR/last_seen_version"
 UPDATE_CHECK_INTERVAL=600   # 10 minutes; a release cut minutes after a launch
                             # should surface on the next run, not up to a day
                             # later. The lookup is one `git ls-remote --tags`
@@ -6615,7 +6788,7 @@ UPDATE_CHECK_INTERVAL=600   # 10 minutes; a release cut minutes after a launch
 # Docker pressure check (bloat → prune offer; overload → notice), throttled
 # like the update checks, but daily: image bloat grows by the day, not the
 # minute, and the check costs a handful of docker calls.
-PRESSURE_CHECK_FILE="$REPO_DIR/.pressure_check"
+PRESSURE_CHECK_FILE="$CLEAT_STATE_DIR/pressure_check"
 PRESSURE_CHECK_INTERVAL=86400
 # Idle-session sweep: on every interactive start, stop OTHER cleat boxes that are
 # provably safe to stop (detached, no agent running, idle past the grace window),
@@ -6670,14 +6843,21 @@ _VM_ADVISORY_SHOWN=0
 _DOCKER_GATE_PENDING=0
 _DOCKER_GATE_SUMMARY=""
 
-CLAUDE_CHECK_FILE="$REPO_DIR/.claude_update_check"
+CLAUDE_CHECK_FILE="$CLEAT_STATE_DIR/claude_update_check"
 CLAUDE_CHECK_INTERVAL=600   # 10 minutes; the lookup is a tiny GET; the only
                             # real per-check cost is one throwaway container to
                             # read the image's version, bounded to once/interval.
 CLAUDE_RELEASES_URL="https://downloads.claude.ai/claude-code-releases"
 
+# The tag list is the SAME signal for every install shape, which is what makes
+# the on-start offer identical on both channels. A git checkout asks its own
+# origin. Anything else (a Homebrew keg, an unpacked tarball) has no repo to
+# ask, so it queries the public URL directly: same command, same parsing, same
+# cadence, so a brew user learns about a release exactly when a git user does.
 latest_remote_tag() {
-  git -C "$REPO_DIR" ls-remote --tags --refs origin 2>/dev/null \
+  local _remote="$REPO_URL"
+  [[ -d "$REPO_DIR/.git" ]] && _remote="origin"
+  git -C "$REPO_DIR" ls-remote --tags --refs "$_remote" 2>/dev/null \
     | awk '{print $2}' \
     | sed 's|refs/tags/v\{0,1\}||' \
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -6711,6 +6891,30 @@ _apply_cli_update() {
   return 0
 }
 
+# The keg equivalent of _apply_cli_update. Deliberately NOT an exec, unlike
+# `cleat update`: the whole point of the on-start offer is that your session
+# continues on the new version, so brew runs as a subprocess and _reexec_cli
+# takes it from there through the symlink, which now points at the new keg.
+#
+# Running brew rather than exec'ing it means this script's own file is unlinked
+# underneath us mid-run. That is safe: `brew upgrade` removes the old keg
+# directory and creates a new one, so the inode this shell is reading stays
+# alive on our open descriptor until we exec. It would NOT be safe if brew
+# rewrote the file in place, which it does not.
+#
+# The version argument is deliberately absent. brew installs whatever the tap
+# currently has, which can trail a just-cut tag by the length of a formula bump,
+# so a no-op upgrade is a real outcome and is treated as success: re-exec, the
+# version check re-runs, and the user is told again when the formula lands.
+_apply_brew_update() {
+  _brew_present || return 1
+  brew upgrade cleatdev/tap/cleat || return 1
+  # Re-check against the new keg next launch, and re-evaluate the bundled
+  # Claude Code, since the new release image ships its own.
+  rm -f "$UPDATE_CHECK_FILE" "$CLAUDE_CHECK_FILE" 2>/dev/null || true
+  return 0
+}
+
 # Re-exec the (now-updated) CLI with the ORIGINAL argv so the new version drives
 # the rest of this run. CLEAT_SKIP_CLI_UPDATE stops the new process from
 # re-prompting (belt-and-suspenders; the version check already wouldn't fire).
@@ -6739,11 +6943,30 @@ _maybe_prompt_cli_update() {
   _is_tty || return 0
   [[ "${CLEAT_SKIP_CLI_UPDATE:-}" == "1" ]] && return 0
   [[ "${CLEAT_NO_UPDATE_CHECK:-}" == "1" ]] && return 0
-  [[ -d "$REPO_DIR/.git" ]] || return 0
+  # Which updater this install actually has. The brew probe MUST come first:
+  # the .git test alone does not exclude a keg, because on macOS before 12.3
+  # there is no usable `readlink -f`, so REPO_DIR falls back to the Homebrew
+  # PREFIX, and on Apple Silicon /opt/homebrew IS Homebrew's own git repo. The
+  # .git test would pass there and the offer would fire inside brew's checkout.
+  local _channel=""
+  if _is_brew_managed "${BASH_SOURCE[0]}"; then
+    # No brew on PATH means the offer could not be acted on, so there is
+    # nothing worth interrupting a launch for. Silence is the honest answer.
+    _brew_present || return 0
+    _channel="brew"
+  elif [[ -d "$REPO_DIR/.git" ]]; then
+    _channel="git"
+  else
+    # A tarball or a hand-copied script has no updater at all.
+    return 0
+  fi
 
   # Don't offer an auto-`git checkout` onto a developer's dirty tree: it would
   # fail every launch (see _repo_is_clean). They can still run `cleat update`.
-  _repo_is_clean || return 0
+  # A keg has no working tree to be dirty.
+  if [[ "$_channel" == "git" ]]; then
+    _repo_is_clean || return 0
+  fi
 
   # Cache layout: "<timestamp> <latest-version> [declined-version]". Field 3 (if
   # present) is the version the user last declined; we don't re-nag for it.
@@ -6782,7 +7005,13 @@ _maybe_prompt_cli_update() {
   local yn=""
   _ask_yn yn "Upgrade now? ${DIM}(re-runs as the new version)${RESET} [Y/n] "
   if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-    if _apply_cli_update "$cached_version"; then
+    local _applied=1
+    if [[ "$_channel" == "brew" ]]; then
+      _apply_brew_update && _applied=0
+    else
+      _apply_cli_update "$cached_version" && _applied=0
+    fi
+    if (( _applied == 0 )); then
       success "Updated to v${cached_version}"
       info "Restarting with the new version…"
       _reexec_cli
@@ -7111,6 +7340,27 @@ _do_pull() {
 }
 
 _do_build() {
+  # A local build needs the docker/ context that ships next to the script. It
+  # is not always there: on macOS before 12.3 `readlink -f` does not resolve
+  # the invoking symlink, so REPO_DIR falls back to the symlink's own parent,
+  # which for a Homebrew keg is the PREFIX rather than the keg. This path is
+  # reached at SESSION START, not only from `cleat rebuild`, because every
+  # image acquisition is `_do_pull || _do_build`. Without this check a keg user
+  # whose pull failed (offline, a registry outage or rate limit, an arch the
+  # release did not publish) gets a raw docker error about a context that does
+  # not exist, instead of being told the pull is the thing to retry.
+  if [[ ! -f "$REPO_DIR/docker/Dockerfile" ]]; then
+    error "No local build context: ${BOLD}${REPO_DIR}/docker${RESET} is missing."
+    echo -e "    ${DIM}This install can only use the prebuilt image, so the pull is what has to work.${RESET}"
+    echo -e "    ${DIM}Retry when the registry is reachable: ${BOLD}cleat build${RESET}"
+    if _is_brew_managed "${BASH_SOURCE[0]}"; then
+      echo -e "    ${DIM}Still failing? Reinstall the keg: ${BOLD}brew reinstall cleatdev/tap/cleat${RESET}"
+    fi
+    # exit, not return: every caller is `_do_pull || _do_build`, so returning
+    # would let the run continue toward a container with no image.
+    exit 1
+  fi
+
   local build_log
   build_log="$(mktemp)"
   spin "Building image..."
@@ -8578,6 +8828,31 @@ cmd_status() {
       fi
     fi
   fi
+
+  # ── Install: only shown when there is more than one cleat on the machine.
+  # Two installs is a state you cannot see from the inside (a bare `cleat`
+  # silently resolves to whichever comes first on PATH), so the answer belongs
+  # where someone looks when a version or an update makes no sense. A single
+  # install prints nothing: this is a warning, not a stat.
+  local _installs _count _self_phys
+  _installs="$(_find_cleat_installs)"
+  _count="$(printf '%s\n' "$_installs" | grep -c . || true)"
+  if [[ "$_count" =~ ^[0-9]+$ ]] && (( _count > 1 )); then
+    _self_phys="$(_resolve_physical_path "${BASH_SOURCE[0]}")"
+    echo ""
+    echo -e "  ${BOLD}Install:${RESET}   ${AMBER}● ${_count} installs found${RESET}${DIM}, PATH order decides which one runs${RESET}"
+    local _p _phys _kind _mark
+    while IFS=$'\t' read -r _p _phys; do
+      [[ -n "$_p" ]] || continue
+      case "$_phys" in
+        */Cellar/*) _kind="Homebrew" ;;
+        *)          _kind="git" ;;
+      esac
+      if [[ "$_phys" == "$_self_phys" ]]; then _mark="${GREEN}running ${RESET}"; else _mark="${DIM}shadowed${RESET}"; fi
+      echo -e "    ${_mark} ${_p} ${DIM}(${_kind})${RESET}"
+    done <<< "$_installs"
+    echo -e "    ${DIM}Remove one: ${BOLD}cleat uninstall${RESET}${DIM}, or ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}${DIM} for the keg.${RESET}"
+  fi
   echo ""
 }
 
@@ -8816,7 +9091,7 @@ _DISK_GATE_FREE_GB=10
 # stamps PRESSURE_CHECK_FILE this run, so sharing it would suppress one of them).
 # The hard gate is never throttled: it reads fresh every interactive start and
 # holds whenever the critical predicate is true, like the undersized-VM advisory.
-DISK_CHECK_FILE="$REPO_DIR/.disk_check"
+DISK_CHECK_FILE="$CLEAT_STATE_DIR/disk_check"
 DISK_CHECK_INTERVAL=86400
 
 # Count zombie processes inside a running box by reading /proc directly (the
@@ -9841,9 +10116,33 @@ cmd_storage() {
 }
 
 cmd_install() {
-  local target="/usr/local/bin"
+  local target="/usr/local/bin" force=""
+  [[ "${1:-}" == "--force" ]] && force=1
   local script_path
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  # Homebrew already linked a keg into the prefix, so there is nothing to add.
+  if _is_brew_managed "${BASH_SOURCE[0]}"; then
+    error "Installed via Homebrew: brew already links cleat into your PATH."
+    echo -e "    ${DIM}Nothing to install. Update with: brew upgrade cleatdev/tap/cleat${RESET}"
+    echo -e "    ${DIM}To switch to the script install: ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}${DIM}, then run the installer.${RESET}"
+    exit 1
+  fi
+
+  # $target is BOTH this command's destination and Homebrew's own bin on an
+  # Intel Mac. Replacing brew's symlink there points the name at a tree brew
+  # does not track, so the next `brew upgrade` fights over the same path.
+  if _is_brew_managed "$target/cleat"; then
+    error "$target/cleat belongs to Homebrew: refusing to replace it."
+    echo -e "    ${DIM}To switch, remove that one first, then re-run this:${RESET}"
+    echo -e "      ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}"
+    echo -e "      ${BOLD}cleat install${RESET}"
+    echo -e "    ${DIM}Your config, boxes, trust and sessions are untouched by either step.${RESET}"
+    exit 1
+  fi
+
+  # One install per machine: refuse a second cleat at any other bin path.
+  _refuse_other_installs "$target/cleat" "$force" || exit 1
 
   info "Installing CLI symlink..."
 
@@ -9862,6 +10161,46 @@ cmd_install() {
 
 cmd_uninstall() {
   local target="/usr/local/bin"
+
+  # A keg is brew's to remove. Deleting the prefix symlink by hand leaves brew
+  # believing cleat is still installed while the command is gone from PATH, and
+  # only `brew link` puts it back. So hand it to brew, but ASK first: on a git
+  # install this command drops a PATH symlink and leaves the clone alone, while
+  # `brew uninstall` deletes the whole keg. That is more than the verb promises,
+  # so it is consent-first and terminal-only. A decline, a redirected stdin, a
+  # non-TTY or a brew that is off PATH all fall through to printing the command.
+  if _is_brew_managed "${BASH_SOURCE[0]}"; then
+    # _is_interactive, NOT _is_tty: the answer is read from stdin, so stdout
+    # being a terminal proves nothing. With `[[ -t 1 ]]` alone, `yes | cleat
+    # uninstall` opens the gate and the pipe answers the prompt, deleting a keg
+    # with no human in the loop. A ttyless test harness cannot tell the two
+    # apart (both false when stdout is not a tty), so no unit test catches a
+    # regression here: this comment is the guard.
+    if _is_interactive && _brew_present; then
+      warn "Homebrew owns this install."
+      echo -e "    ${DIM}brew uninstall removes the whole keg, not just the symlink on your PATH.${RESET}"
+      local _byn=""
+      _ask_yn _byn "Run brew uninstall cleatdev/tap/cleat now? [y/N] "
+      case "$_byn" in
+        [yY]|[yY][eE][sS]) _brew_delegate uninstall cleatdev/tap/cleat || true ;;
+      esac
+      info "Skipped. Uninstall later with: ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}"
+      exit 1
+    fi
+    error "Installed via Homebrew: cleat uninstall does not manage this install."
+    echo -e "    ${DIM}Uninstall with: brew uninstall cleatdev/tap/cleat${RESET}"
+    exit 1
+  fi
+
+  # The cross case: a git-installed cleat asked to clear a path Homebrew owns.
+  # On an Intel Mac $target IS brew's bin, so the rm below would take brew's
+  # symlink with it.
+  if _is_brew_managed "$target/cleat"; then
+    error "$target/cleat belongs to Homebrew: refusing to remove it."
+    echo -e "    ${DIM}Uninstall that one with: brew uninstall cleatdev/tap/cleat${RESET}"
+    exit 1
+  fi
+
   info "Removing CLI symlinks..."
   if [[ -w "$target" ]]; then
     rm -f "$target/cleat"
@@ -12319,8 +12658,17 @@ cmd_update() {
   # the update back to brew. The image side needs nothing here: the next
   # session start re-checks it against the new version.
   if _is_brew_managed "${BASH_SOURCE[0]}"; then
-    error "Installed via Homebrew: cleat update does not manage this install."
-    echo -e "    ${DIM}Update with: brew upgrade cleatdev/tap/cleat${RESET}"
+    # Run the upgrade rather than describe it: `cleat update` on a git install
+    # updates without asking, so a keg gets the same treatment through brew.
+    # The image side still needs nothing here.
+    if ! _brew_delegate upgrade cleatdev/tap/cleat; then
+      error "Installed via Homebrew: cleat update does not manage this install."
+      echo -e "    ${DIM}Update with: brew upgrade cleatdev/tap/cleat${RESET}"
+    fi
+    # Terminal either way. A successful delegation never reaches this (exec
+    # replaced the process), so the exit exists to make the branch incapable of
+    # falling through into the git updater below, which inside a keg would
+    # fetch and check out tags in whatever repository REPO_DIR resolved to.
     exit 1
   fi
 
@@ -12556,6 +12904,11 @@ main() {
   # Defense-in-depth: always kill spinner and restore cursor on exit.
   # exec_claude sets its own trap (which calls _cleanup_spin internally).
   trap '_cleanup_spin' EXIT
+
+  # Before anything reads a throttle or notice-memory file, move any left over
+  # in the old in-tree location. Costs five stats on an already-migrated
+  # install and never fails a launch.
+  _migrate_state_files
 
   parse_global_flags "$@"
   set -- "${_REMAINING_ARGS[@]+"${_REMAINING_ARGS[@]}"}"

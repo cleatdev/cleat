@@ -29,12 +29,13 @@ teardown() { _common_teardown; }
   run _maybe_show_release_highlight
   assert_success
   assert_output --partial "New in v1.4.0"
-  # "Forks" and "image paste" each carry the cyan accent, so they are wrapped in
-  # color codes; assert both accent words plus a plain-text support line, which
-  # proves both headline features are actually advertised.
+  # "Forks", "image paste" and "Homebrew" each carry the cyan accent, so they are
+  # wrapped in color codes; assert the accent words plus the plain-text support
+  # lines, which proves all three headline features are actually advertised.
   assert_output --partial "Forks"
   assert_output --partial "image paste"
   assert_output --partial "Several agents on one repo"
+  assert_output --partial "Homebrew is now a first-class install"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
 }

@@ -5053,8 +5053,9 @@ _host_clip_cmd() {
 # which inside a box hits Cleat's copy shim (exits 0, no output) and would fail
 # even without it: the box has no DISPLAY, no Wayland and no X socket. Nothing
 # in a box can reach the host pasteboard, and giving it a way to would hand the
-# model an on-demand read of everything you copy. So the image is pushed in from
-# the HOST, once, by a human running `cleat paste`.
+# model an on-demand read of everything you copy. So the image is delivered from
+# the HOST side: the box's ctrl+v shim writes a request and the host watcher
+# answers it with the current clipboard image.
 
 # Write the host clipboard's image to $1. Returns 0 on success, 1 when the
 # clipboard holds no image. Stock tools only: `pngpaste` is the usual macOS
@@ -5120,8 +5121,8 @@ AS
     return 1
   fi
 
-  # Linux desktop. Headless has no clipboard at all, which is why `cleat paste
-  # <file>` exists.
+  # Linux desktop. On a headless host there is no clipboard at all, so this
+  # finds nothing and the paste request is answered empty.
   if command -v xclip &>/dev/null; then
     xclip -selection clipboard -t image/png -o > "$out" 2>/dev/null
     [ -s "$out" ] && return 0
@@ -5303,8 +5304,9 @@ _clipimg_serve() {
   done
   wait "$_rpid" 2>/dev/null || true
 
-  # Validate independently of the reader, the same two gates cleat paste uses.
-  # Any failure collapses to an empty file, which the shim reads as a miss.
+  # Validate independently of the reader, the same two host-side gates: magic
+  # kind and size. Any failure collapses to an empty file, which the shim reads
+  # as a miss.
   local kind size
   kind="$(_image_magic_kind "$img" 2>/dev/null)"
   size="$(wc -c < "$img" 2>/dev/null | tr -d '[:space:]')"
@@ -7076,9 +7078,10 @@ _maybe_show_release_highlight() {
   # v0.16.1). We still own our OWN trailing blank below, so the bring-up that
   # follows needs none.
   [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
-  info "${BOLD}New in v1.4.0${RESET}. ${CYAN}Forks${RESET} and native ${CYAN}image paste${RESET}."
+  info "${BOLD}New in v1.4.0${RESET}. ${CYAN}Forks${RESET}, ${CYAN}image paste${RESET} and ${CYAN}Homebrew${RESET}."
   echo -e "    ${DIM}Several agents on one repo, each in its own copy: ${RESET}${BOLD}cleat fork start${RESET}"
   echo -e "    ${DIM}Paste a screenshot into a caged Claude with ${RESET}${BOLD}ctrl+v${RESET}${DIM}, just like normal.${RESET}"
+  echo -e "    ${DIM}Homebrew is now a first-class install: a keg self-updates with ${RESET}${BOLD}cleat update${RESET}${DIM}.${RESET}"
   # A clickable, version-anchored changelog link. The /changelog page IDs each
   # release `id="vX.Y.Z"` (changelog.astro), so #v1.4.0 deep-links to the 1.4.0
   # release; _hyperlink makes it a real OSC 8 link where supported (clean short

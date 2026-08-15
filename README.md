@@ -285,8 +285,6 @@ capabilities** below. One caveat: `~/.claude` (your Anthropic auth) is shared
 across boxes. A box isolates host capabilities and the writable layer, not your
 Claude login.
 
-### Kits: curated Claude pre-configurations, per box
-
 ### Forked workspaces
 
 A box normally shares your live project directory. `--fork` gives it its own
@@ -374,6 +372,8 @@ fresh copy reports its full size while sharing nearly every block with the
 project. `rm` and `refresh` refuse while the box exists, because its container
 has the copy mounted at `/workspace`. Both confirm, defaulting to no. Both say
 plainly that uncommitted agent work in the copy will be lost.
+
+### Kits: curated Claude pre-configurations, per box
 
 A **kit** is a curated Claude Code setup (a CLAUDE.md policy plus custom
 subagents) that you enable for one box with one command. The flagship kit,
@@ -986,7 +986,7 @@ Cleat checks for new release tags at most once every 10 minutes via `git ls-remo
 ```
 
 - The check runs at most **once every 10 minutes**. It will not slow down subsequent launches.
-- The result is cached in `.update_check` inside the installation directory (`~/.cleat`).
+- The result is cached in `update_check` under `~/.config/cleat/state/` (older installs are migrated automatically from `~/.cleat/.update_check`).
 - The notification is informational only. It will never interrupt or block your workflow.
 - To upgrade, run `cleat update`. To also update Claude Code inside containers, follow up with `cleat rebuild`.
 

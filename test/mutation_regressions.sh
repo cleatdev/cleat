@@ -942,6 +942,14 @@ s/New in v1.4.0/New in v9.9.9/
 SED
 try "v0.15.0_highlight_label_frozen" "fresh install" "$CLI" "$WHATS_NEW_BATS"
 
+# v1.4.0: the release highlight also announces the Homebrew channel. Corrupt the
+# Homebrew support line so the "fresh install" test's Homebrew assertion fails,
+# proving the brew line is actually guarded rather than only present.
+cat > "$SED_TMP" << 'SED'
+s/Homebrew is now a first-class install/Homebrew support landed/
+SED
+try "v1.4.0_highlight_brew_line" "fresh install" "$CLI" "$WHATS_NEW_BATS"
+
 # v0.15.0: the config-drift notice must be plain text, not a bordered
 # _notice_box. Mutate the non-TTY drift line's `info` back to `_notice_box`:
 # the box border returns and the "plain text, not a box" regression test trips

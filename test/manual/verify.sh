@@ -942,6 +942,10 @@ check_32_state_survives_a_switch() {
   # the keg) and a channel switch both wipe it. Uses this run's isolated
   # XDG_CONFIG_HOME, so the real ~/.config/cleat is untouched.
   local tree="$RUN_DIR/old-install" state="$XDG_CONFIG_HOME/cleat/state"
+  # Start from an empty state dir. The migration deliberately never clobbers
+  # newer state, so a file left by an earlier check would make this pass for
+  # the wrong reason, or fail confusingly.
+  _safe_rm "$state"
   _safe_rm "$tree"; mkdir -p "$tree/bin"
   cp "$CLI_BIN" "$tree/bin/cleat"; chmod +x "$tree/bin/cleat"
   echo "12345 9.9.9 9.9.9" > "$tree/.update_check"
@@ -957,8 +961,11 @@ check_32_state_survives_a_switch() {
   local p keg_link from_tree from_keg
   p="$(new_project switchid)"
   keg_link="$(_fake_keg "$RUN_DIR/hb2")"
+  # SAME PATH on both sides. Cleat picks its hash tool off PATH (md5sum, else
+  # md5, else a cksum fallback that is a different algorithm entirely), so
+  # varying PATH here would compare two hashes rather than two install shapes.
   from_tree="$(cd "$p" && "$tree/bin/cleat" status 2>&1 | _strip | grep -i "^  Container:" || true)"
-  from_keg="$(cd "$p" && PATH="/usr/bin:/bin" "$keg_link" status 2>&1 | _strip | grep -i "^  Container:" || true)"
+  from_keg="$(cd "$p" && "$keg_link" status 2>&1 | _strip | grep -i "^  Container:" || true)"
   if [[ -z "$from_tree" ]]; then
     skip 32d "a box is the same box on either install" "no Container line (docker down?)"
   else

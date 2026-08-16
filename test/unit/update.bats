@@ -1046,3 +1046,21 @@ BREWSTUB
   [[ -n "$key_git" && "$key_git" == "$key_keg" ]] || {
     echo "session key differs: $key_git vs $key_keg"; return 1; }
 }
+
+@test "state: the script-install rescue copies but never deletes" {
+  # ~/.cleat can still belong to a LIVE install. Running a working copy from a
+  # checkout, which is what every Cleat developer does, must not consume the
+  # installed cleat's state. Only the tree actually being run is tidied up.
+  REPO_DIR="$TEST_TEMP/new-install"
+  CLEAT_STATE_DIR="$TEST_TEMP/newstate"
+  mkdir -p "$REPO_DIR" "$HOME/.cleat"
+  echo "12345 9.9.9 9.9.9" > "$HOME/.cleat/.update_check"
+
+  run _migrate_state_files
+  assert_success
+  run cat "$CLEAT_STATE_DIR/update_check"
+  assert_output "12345 9.9.9 9.9.9"
+  # Still there: it was rescued, not taken.
+  run test -f "$HOME/.cleat/.update_check"
+  assert_success
+}

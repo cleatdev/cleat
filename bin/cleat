@@ -6766,7 +6766,13 @@ _migrate_state_files() {
       # Copy then unlink, not `mv`: on a read-only install tree the copy still
       # lands and only the cleanup fails, which is the harmless half.
       cp "$old" "$new" 2>/dev/null || true
-      rm -f "$old" 2>/dev/null || true
+      # Tidy up ONLY the install actually running. The ~/.cleat pass is a rescue
+      # for a channel switch, and that tree can still belong to a live install:
+      # consuming its file would surprise anyone merely running a working copy
+      # from a checkout, which is every developer of Cleat itself.
+      if [[ "$root" == "$REPO_DIR" ]]; then
+        rm -f "$old" 2>/dev/null || true
+      fi
     done
   done
 }

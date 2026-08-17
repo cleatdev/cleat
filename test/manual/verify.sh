@@ -48,6 +48,15 @@ set -uo pipefail
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$_here/../../.." && pwd)"
 CLI_BIN="${CLEAT_VERIFY_BIN:-$REPO_ROOT/cli/bin/cleat}"
+
+# This script EXECUTES the live bin/cleat against a real Docker daemon, so a
+# mutation-harness run rewriting that file underneath it would drive a
+# deliberately sabotaged CLI at real containers. Take the same lock the suite
+# and the harness take, before any of that starts.
+_CLEAT_TEST_LOCK_ROOT="$REPO_ROOT/cli"
+. "$REPO_ROOT/cli/test/lib/testlock.sh"
+_take_test_lock "the manual verifier"
+trap _drop_test_lock EXIT INT TERM
 RUN_DIR="${CLEAT_VERIFY_DIR:-${TMPDIR:-/tmp}/cleat-verify}"
 RUN_DIR="$(printf '%s' "$RUN_DIR" | sed 's|//*|/|g; s|/$||')"
 # The report lands inside the repo so it can be read from wherever you are

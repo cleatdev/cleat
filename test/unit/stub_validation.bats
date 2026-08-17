@@ -243,3 +243,136 @@ EOF
   assert_success
   assert_output "this-is-ps-a-output"
 }
+
+# ── The suite and the mutation harness must never run at once ───────────────
+# The harness rewrites nine tracked files in place. Anything reading or
+# EXECUTING them meanwhile fails for reasons unrelated to any change, and the
+# harness reports false MISSED against source someone else restored. Both
+# happened for real, including ACROSS MACHINES: a run inside a Cleat box and a
+# run on the host share the bind-mounted checkout but not /tmp, which is why
+# the lock lives in the repo. See test/lib/testlock.sh.
+
+_lock_lib() { printf '%s\n' "$PROJECT_ROOT/test/lib/testlock.sh"; }
+
+@test "lock: the suite refuses while the harness holds it" {
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+  echo "the mutation harness host $(hostname) pid $$ at $(date +%s)" > "$_CLEAT_TEST_LOCK_DIR/owner"
+
+  run "$PROJECT_ROOT/test.sh"
+  assert_failure
+  assert_output --partial "holds the test lock"
+  assert_output --partial "the mutation harness"
+}
+
+@test "lock: the harness refuses while the suite holds it, WITHOUT writing anything" {
+  # The refusal path must run before the backups and before the cleanup trap.
+  # Both of those cp over the nine tracked files, so a refused harness that
+  # reached them would perform the very write the lock exists to prevent.
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+  echo "the test suite host $(hostname) pid $$ at $(date +%s)" > "$_CLEAT_TEST_LOCK_DIR/owner"
+
+  local before after
+  before="$(cat "$CLI" | cksum)"
+  run "$PROJECT_ROOT/test/mutation_regressions.sh"
+  after="$(cat "$CLI" | cksum)"
+  assert_failure
+  assert_output --partial "holds the test lock"
+  [[ "$before" == "$after" ]] || { echo "the refused harness rewrote bin/cleat"; return 1; }
+}
+
+@test "lock: a holder on ANOTHER machine is obeyed, never pid-probed" {
+  # pid 1 is alive here, but it belongs to a different host. Probing our own
+  # pid table for someone else's pid is how a container stomps a host run.
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+  echo "the mutation harness host some-other-box pid 1 at $(date +%s)" > "$_CLEAT_TEST_LOCK_DIR/owner"
+
+  run "$PROJECT_ROOT/test.sh"
+  assert_failure
+  assert_output --partial "some-other-box"
+}
+
+@test "lock: a half-written lock is treated as HELD, not stale" {
+  # The winner creates the directory and only then writes the owner record. A
+  # reader arriving in that window must wait. Treating an unreadable record as
+  # stale is a race BOTH runners win.
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"   # no owner file yet
+
+  run "$PROJECT_ROOT/test.sh"
+  assert_failure
+  assert_output --partial "holds the test lock"
+}
+
+@test "lock: a clock running backwards does not expire a live lock" {
+  # A container hours behind its host was observed in this project. A negative
+  # age must read as fresh, or one machine steals the other's live lock.
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+  echo "the mutation harness host some-other-box pid 1 at $(( $(date +%s) + 86400 ))" \
+    > "$_CLEAT_TEST_LOCK_DIR/owner"
+
+  run "$PROJECT_ROOT/test.sh"
+  assert_failure
+  assert_output --partial "holds the test lock"
+}
+
+@test "lock: an aged-out holder is taken over, on any host" {
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  export _CLEAT_TEST_LOCK_STALE_SECS=1
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+  echo "the mutation harness host some-other-box pid 1 at 1000" > "$_CLEAT_TEST_LOCK_DIR/owner"
+
+  run bash -c 'source "$1"; _take_test_lock "the test suite"; cat "$_CLEAT_TEST_LOCK_DIR/owner"' \
+    _ "$(_lock_lib)"
+  assert_success
+  assert_output --partial "the test suite"
+  refute_output --partial "some-other-box"
+}
+
+@test "lock: a dead holder on THIS machine is taken over" {
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+  echo "the mutation harness host $(hostname) pid 999999 at $(date +%s)" > "$_CLEAT_TEST_LOCK_DIR/owner"
+
+  run bash -c 'source "$1"; _take_test_lock "the test suite"; cat "$_CLEAT_TEST_LOCK_DIR/owner"' \
+    _ "$(_lock_lib)"
+  assert_success
+  refute_output --partial "999999"
+}
+
+@test "lock: only the owning process releases it" {
+  # pid 42 must not release pid 4242's lock, and a foreign host's identical pid
+  # must not release ours.
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+  echo "the test suite host some-other-box pid $$ at $(date +%s)" > "$_CLEAT_TEST_LOCK_DIR/owner"
+
+  run bash -c 'source "$1"; _drop_test_lock; test -d "$_CLEAT_TEST_LOCK_DIR" && echo STILL_HELD' \
+    _ "$(_lock_lib)"
+  assert_output --partial "STILL_HELD"
+}
+
+@test "lock: concurrent takers never both win" {
+  # The regression that made the first implementation useless: rm -rf followed
+  # by mkdir has no atomicity, so every racer removed and every racer recreated.
+  export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
+  export _CLEAT_TEST_LOCK_STALE_SECS=1
+  local lib winners=0 i
+  lib="$(_lock_lib)"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    rm -rf "$_CLEAT_TEST_LOCK_DIR"
+    mkdir -p "$_CLEAT_TEST_LOCK_DIR"
+    echo "stale host some-other-box pid 1 at 1000" > "$_CLEAT_TEST_LOCK_DIR/owner"
+    local out
+    out="$( { bash -c 'source "$1"; _take_test_lock a >/dev/null 2>&1 && echo WON' _ "$lib" & \
+              bash -c 'source "$1"; _take_test_lock b >/dev/null 2>&1 && echo WON' _ "$lib" & \
+              wait; } 2>/dev/null )"
+    local n
+    n="$(printf '%s\n' "$out" | grep -c WON || true)"
+    (( n > 1 )) && winners=$(( winners + 1 ))
+  done
+  [[ "$winners" -eq 0 ]] || { echo "both racers acquired the lock in $winners of 10 rounds"; return 1; }
+}

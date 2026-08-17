@@ -89,6 +89,13 @@ YELLOW=$'\033[0;33m'
 DIM=$'\033[2m'
 RESET=$'\033[0m'
 
+# Mutual exclusion, taken BEFORE the backups and BEFORE the cleanup trap. Both
+# of those WRITE the nine tracked files this lock exists to protect, so a run
+# that is correctly refused must not have reached them.
+_CLEAT_TEST_LOCK_ROOT="$REPO_ROOT"
+. "$REPO_ROOT/test/lib/testlock.sh"
+_take_test_lock "the mutation harness"
+
 cleanup() {
   [[ -f "$BACKUP" ]] && cp "$BACKUP" "$CLI"
   [[ -f "$INSTALLER_BACKUP" ]] && cp "$INSTALLER_BACKUP" "$INSTALLER"
@@ -199,7 +206,9 @@ run_mutation() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 SED_TMP="$(mktemp)"
-trap 'cleanup; rm -f "$SED_TMP"' EXIT INT TERM
+
+
+trap 'cleanup; rm -f "$SED_TMP"; _drop_test_lock' EXIT INT TERM
 
 total=0
 caught=0
@@ -4623,6 +4632,22 @@ cat > "$SED_TMP" << 'SED'
 s@  for root in "$REPO_DIR" "${HOME:-}/.cleat"; do@  for root in "$REPO_DIR"; do@
 SED
 try "vnext_state_switch_rescue" "rescues state from a script install after a switch" "$CLI" "$UPDATE_BATS"
+
+# THE RESCUE IS COPY-ONLY: ~/.cleat can still belong to a LIVE install, so the
+# rescue pass must never unlink it. Running a working copy from a checkout,
+# which is what every Cleat developer does, would otherwise consume the
+# installed cleat's throttle and declined-version memory.
+cat > "$SED_TMP" << 'SED'
+s@      if \[\[ "$root" == "$REPO_DIR" && -f "$new" \]\]; then@      if true; then@
+SED
+try "vnext_state_rescue_copy_only" "the script-install rescue copies but never deletes" "$CLI" "$UPDATE_BATS"
+
+# AND ONLY AFTER THE COPY LANDED: a destination that cannot be written turns a
+# failed move into outright data loss if the unlink runs anyway.
+cat > "$SED_TMP" << 'SED'
+s@      if \[\[ "$root" == "$REPO_DIR" && -f "$new" \]\]; then@      if [[ "$root" == "$REPO_DIR" ]]; then@
+SED
+try "vnext_state_unlink_after_copy" "a failed copy never unlinks the original" "$CLI" "$UPDATE_BATS"
 
 # ONE VERSION SOURCE FOR BOTH CHANNELS: a keg has no repo to ask, so forcing
 # `origin` makes the lookup fail there and a brew user is never told a release

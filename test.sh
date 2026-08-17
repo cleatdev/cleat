@@ -2,6 +2,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Mutual exclusion with the mutation harness. See test/lib/testlock.sh.
+_CLEAT_TEST_LOCK_ROOT="$SCRIPT_DIR"
+. "$SCRIPT_DIR/test/lib/testlock.sh"
+_take_test_lock "the test suite"
+trap _drop_test_lock EXIT INT TERM
+
 BATS="$SCRIPT_DIR/test/bats/bin/bats"
 
 # Ensure bats submodules are initialized
@@ -17,7 +24,10 @@ fi
 
 # If specific files are passed, run them directly
 if [[ $# -gt 0 ]]; then
-  exec "$BATS" "$@"
+  # NOT `exec`: exec replaces the process image and discards the EXIT trap,
+  # which leaked the lock on every `./test.sh <file>` run.
+  "$BATS" "$@"
+  exit $?
 fi
 
 # ── Colors ──────────────────────────────────────────────────────────────────

@@ -1064,3 +1064,22 @@ BREWSTUB
   run test -f "$HOME/.cleat/.update_check"
   assert_success
 }
+
+@test "state: a failed copy never unlinks the original" {
+  # State is moved, not destroyed. If the destination cannot be written (a
+  # root-owned state dir after one `sudo cleat`, a full disk), the original has
+  # to survive: deleting it would turn a failed move into data loss.
+  REPO_DIR="$TEST_TEMP/own-install"
+  CLEAT_STATE_DIR="$TEST_TEMP/newstate"
+  mkdir -p "$REPO_DIR" "$CLEAT_STATE_DIR"
+  echo "12345 9.9.9 9.9.9" > "$REPO_DIR/.update_check"
+  # Make the copy fail without making the state dir unwritable (the test may
+  # run as root, where permissions are advisory).
+  cp() { return 1; }
+
+  run _migrate_state_files
+  unset -f cp
+  assert_success
+  run test -f "$REPO_DIR/.update_check"
+  assert_success
+}

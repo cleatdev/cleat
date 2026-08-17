@@ -6770,7 +6770,12 @@ _migrate_state_files() {
       # for a channel switch, and that tree can still belong to a live install:
       # consuming its file would surprise anyone merely running a working copy
       # from a checkout, which is every developer of Cleat itself.
-      if [[ "$root" == "$REPO_DIR" ]]; then
+      # Unlink only after confirming the copy LANDED, and only for the tree
+      # actually being run. Without the -f test, a state dir that cannot be
+      # written (root-owned after one `sudo cleat`, or a full disk) swallows the
+      # cp and then deletes the original, which destroys the state outright
+      # rather than merely failing to move it.
+      if [[ "$root" == "$REPO_DIR" && -f "$new" ]]; then
         rm -f "$old" 2>/dev/null || true
       fi
     done

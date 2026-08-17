@@ -13,3 +13,4 @@ concept
 .disk_check
 .cleat.env
 coverage/
+.test-suite.lock*

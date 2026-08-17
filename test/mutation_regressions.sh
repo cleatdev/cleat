@@ -4514,7 +4514,7 @@ try "vnext_brew_guard_cellar_pattern" "detects a keg through the bin symlink" "$
 cat > "$SED_TMP" << 'SED'
 s@if _is_brew_managed "\${BASH_SOURCE\[0\]}"; then@if false; then@
 SED
-try "vnext_brew_prompt_gate" "stays silent for a keg whose prefix has git" "$CLI" "$UPDATE_BATS"
+try "vnext_brew_prompt_gate" "routed to brew, never to git" "$CLI" "$UPDATE_BATS"
 
 # PREFIX SYMLINK GUARD: /usr/local/bin is Homebrew's bin on an Intel Mac, so
 # `cleat uninstall` deletes brew's own symlink there and leaves brew believing

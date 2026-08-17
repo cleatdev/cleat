@@ -359,12 +359,17 @@ BREWSTUB
   assert_failure
 }
 
-@test "update: the on-start prompt stays silent for a keg whose prefix has git" {
-  # The .git gate alone is not enough. On macOS before 12.3 there is no usable
-  # `readlink -f`, so REPO_DIR falls back to the Homebrew PREFIX, and on Apple
-  # Silicon /opt/homebrew IS Homebrew's own git repository. So .git EXISTS here
-  # on purpose: only the brew probe can keep the self-update offer (and its
-  # `git checkout v<tag>`) out of brew's own checkout.
+@test "update: a keg whose prefix has git is routed to brew, never to git" {
+  # The Apple Silicon leg. With no usable `readlink -f` (macOS before 12.3)
+  # REPO_DIR resolves to the Homebrew PREFIX, and /opt/homebrew IS Homebrew's
+  # own git repository, so .git EXISTS here on purpose. The .git test alone
+  # would therefore route a keg to the GIT updater, which would `git checkout`
+  # a Cleat tag inside brew's checkout. Only the brew probe prevents that.
+  #
+  # This asserts the ROUTE, not silence: since the on-start offer reached parity
+  # a keg with brew available is offered the upgrade, it is simply applied with
+  # brew. _brew_present is pinned so the DEVELOPER'S machine cannot decide the
+  # outcome: unpinned, this passed on a box with no brew and failed on the Mac.
   mkdir -p "$TEST_TEMP/.git"
   REPO_DIR="$TEST_TEMP"
   UPDATE_CHECK_FILE="$TEST_TEMP/.update_check"
@@ -372,24 +377,22 @@ BREWSTUB
   export GIT_LS_REMOTE_OUTPUT="abc123	refs/tags/v99.0.0"
   _is_tty() { return 0; }
   _repo_is_clean() { return 0; }
-  # Pins the ARGUMENT, not just the return value. Probing "$REPO_DIR" would
-  # look natural (everything else in this function is REPO_DIR-based) and a
-  # stub that ignored its argument would still pass, while in production
-  # REPO_DIR on the pre-12.3 leg IS the Homebrew prefix, which is neither a
-  # Cellar path nor a keg receipt, so the guard would quietly stop firing.
+  # Pins the ARGUMENT, not just the return value. Probing "$REPO_DIR" would look
+  # natural (everything else in this function is REPO_DIR-based) and a stub that
+  # ignored its argument would still pass, while in production REPO_DIR on that
+  # leg IS the Homebrew prefix, which is neither a Cellar path nor a keg
+  # receipt, so the guard would quietly stop firing.
   _is_brew_managed() { [[ "$1" != "$REPO_DIR" ]]; }
-  _apply_cli_update() { echo "APPLY_CALLED"; return 0; }
-  _reexec_cli() { echo "REEXEC_CALLED"; }
+  _brew_present() { return 0; }
+  _apply_cli_update() { echo "GIT_APPLY"; return 0; }
+  _apply_brew_update() { echo "BREW_APPLY"; return 0; }
+  _reexec_cli() { echo "REEXEC"; }
 
-  run _maybe_prompt_cli_update <<< "n"
+  run _maybe_prompt_cli_update <<< "y"
   assert_success
-  assert_output ""
-
-  # No prompt, no update applied, and no network throttle file written.
-  refute_output --partial "APPLY_CALLED"
-  refute_output --partial "REEXEC_CALLED"
-  run test -f "$UPDATE_CHECK_FILE"
-  assert_failure
+  assert_output --partial "BREW_APPLY"
+  # The whole point: never the git updater, whatever REPO_DIR happens to be.
+  refute_output --partial "GIT_APPLY"
 }
 
 # ── cleat install / uninstall against a Homebrew install ────────────────────

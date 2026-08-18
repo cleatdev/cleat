@@ -137,6 +137,14 @@ curl -fsSL https://cleat.sh/install | bash
 
 This clones the repo to `~/.cleat`, checks out the latest stable release tag and symlinks `cleat` into your PATH. The short URL resolves to the same `install.sh` served from the latest tagged release on GitHub.
 
+### Homebrew
+
+```bash
+brew install cleatdev/tap/cleat
+```
+
+The fully qualified name is required, since a bare `brew tap` no longer grants trust as of Homebrew 6.0.0. On a keg, `cleat update` runs `brew upgrade` and `cleat uninstall` offers `brew uninstall`. Cleat's own state lives outside the install, so switching between the script and Homebrew loses nothing.
+
 ### Dev install (from local clone)
 
 ```bash

@@ -654,6 +654,65 @@ ${HOME:-}/.local/bin
   done <<< "$dirs"
 }
 
+# Render the running/shadowed rows for a set of installs. Shared verbatim by
+# `cleat status` and the on-start multiple-install notice so their rows stay
+# byte-identical. $1 = _find_cleat_installs output (bin<TAB>phys lines),
+# $2 = the physical path of the running binary.
+_render_install_shadow_list() {
+  local _installs="$1" _self_phys="$2" _p _phys _kind _mark
+  while IFS=$'\t' read -r _p _phys; do
+    [[ -n "$_p" ]] || continue
+    case "$_phys" in
+      */Cellar/*) _kind="Homebrew" ;;
+      *)          _kind="git" ;;
+    esac
+    if [[ "$_phys" == "$_self_phys" ]]; then _mark="${GREEN}running ${RESET}"; else _mark="${DIM}shadowed${RESET}"; fi
+    echo -e "    ${_mark} ${_p} ${DIM}(${_kind})${RESET}"
+  done <<< "$_installs"
+}
+
+# On-start notice (concept/21): warn when this is not the only cleat on the
+# machine. The one-install guard lives only in cleat's OWN installers (install.sh
+# and `cleat install`), so `brew install` or a manual copy can add a second cleat
+# that a bare `cleat` then resolves by PATH order: the invisible split behind a
+# "cleat update did nothing" or a stale --version. Surfaced on every interactive
+# start until fixed. Warns, never blocks: Homebrew owns the install moment, cleat
+# can only make the state visible. Silence with CLEAT_NO_INSTALL_CHECK=1.
+_maybe_warn_multiple_installs() {
+  _is_tty || return 0
+  [[ "${CLEAT_NO_INSTALL_CHECK:-}" == "1" ]] && return 0
+  local _installs _count _self_phys
+  _installs="$(_find_cleat_installs)"
+  _count="$(printf '%s\n' "$_installs" | grep -c . || true)"
+  [[ "$_count" =~ ^[0-9]+$ ]] && (( _count > 1 )) || return 0
+  _self_phys="$(_resolve_physical_path "${BASH_SOURCE[0]}")"
+  # One guarded blank above. Do NOT touch _ONSTART_GAP_OPEN: _ensure_daemon and
+  # _maybe_sweep_idle_boxes run between this notice and the pressure/highlight
+  # cluster and ignore the flag, so a trailing-blank handoff would mis-space.
+  [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
+  warn "$_count cleat installs found. PATH order decides which one runs."
+  _render_install_shadow_list "$_installs" "$_self_phys"
+  # Remedy: name the single shadow precisely. A keg is `brew uninstall`; a script
+  # install is removing its printed bin path, because `cleat uninstall` only ever
+  # acts on the RUNNING binary, never a shadow. Fall back to the generic line for
+  # 3+ installs or the same-file-via-two-symlinks case (zero shadows).
+  local _p _phys _nshadow=0 _shadow_bin="" _shadow_phys=""
+  while IFS=$'\t' read -r _p _phys; do
+    [[ -n "$_p" ]] || continue
+    [[ "$_phys" == "$_self_phys" ]] && continue
+    _nshadow=$(( _nshadow + 1 )); _shadow_bin="$_p"; _shadow_phys="$_phys"
+  done <<< "$_installs"
+  if (( _nshadow == 1 )); then
+    case "$_shadow_phys" in
+      */Cellar/*) echo -e "    ${DIM}Remove the one you are not using: ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}" ;;
+      *)          echo -e "    ${DIM}Remove the one you are not using: ${BOLD}rm ${_shadow_bin}${RESET}${DIM} (add sudo if the directory is unwritable).${RESET}" ;;
+    esac
+  else
+    echo -e "    ${DIM}Remove one: ${BOLD}cleat uninstall${RESET}${DIM}, or ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}${DIM} for the keg.${RESET}"
+  fi
+  return 0
+}
+
 # One cleat per machine. Refuses when another cleat executable sits at a bin
 # path other than the one we are about to write, because from then on PATH
 # order decides which one runs and the loser is invisible until it bites (a
@@ -8855,16 +8914,7 @@ cmd_status() {
     _self_phys="$(_resolve_physical_path "${BASH_SOURCE[0]}")"
     echo ""
     echo -e "  ${BOLD}Install:${RESET}   ${AMBER}● ${_count} installs found${RESET}${DIM}, PATH order decides which one runs${RESET}"
-    local _p _phys _kind _mark
-    while IFS=$'\t' read -r _p _phys; do
-      [[ -n "$_p" ]] || continue
-      case "$_phys" in
-        */Cellar/*) _kind="Homebrew" ;;
-        *)          _kind="git" ;;
-      esac
-      if [[ "$_phys" == "$_self_phys" ]]; then _mark="${GREEN}running ${RESET}"; else _mark="${DIM}shadowed${RESET}"; fi
-      echo -e "    ${_mark} ${_p} ${DIM}(${_kind})${RESET}"
-    done <<< "$_installs"
+    _render_install_shadow_list "$_installs" "$_self_phys"
     echo -e "    ${DIM}Remove one: ${BOLD}cleat uninstall${RESET}${DIM}, or ${BOLD}brew uninstall cleatdev/tap/cleat${RESET}${DIM} for the keg.${RESET}"
   fi
   echo ""
@@ -12963,6 +13013,10 @@ main() {
   esac
   if [[ "$_do_preflight" -eq 1 ]]; then
     _maybe_prompt_cli_update
+    # Surface a split-brain install (e.g. a brew keg next to a curl install)
+    # before the daemon steps, which no-op or exit on a down Docker: a broken
+    # Docker machine is exactly where the wrong-cleat confusion shows up.
+    _maybe_warn_multiple_installs
     # Docker autopilot (concept/29): a down daemon is started for the user
     # (TTY-gated, bounded, remote-refusing) BEFORE the sweep/pressure/
     # announce preflights, which all no-op against a down daemon. Session

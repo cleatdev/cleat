@@ -37,6 +37,7 @@ BOX_HARDENING_BATS="$REPO_ROOT/test/unit/box_hardening.bats"
 DOCKER_CAP_BATS="$REPO_ROOT/test/unit/docker_cap.bats"
 BROWSER_BRIDGE_BATS="$REPO_ROOT/test/unit/browser_bridge.bats"
 WHATS_NEW_BATS="$REPO_ROOT/test/unit/whats_new.bats"
+INSTALL_NOTICE_BATS="$REPO_ROOT/test/unit/install_notice.bats"
 CAPABILITIES_BATS="$REPO_ROOT/test/unit/capabilities.bats"
 EXEC_CLAUDE_BATS="$REPO_ROOT/test/unit/exec_claude.bats"
 INIT_RECREATE_BATS="$REPO_ROOT/test/unit/init_recreate_check.bats"
@@ -958,6 +959,28 @@ cat > "$SED_TMP" << 'SED'
 s/Homebrew is now a first-class install/Homebrew support landed/
 SED
 try "v1.4.0_highlight_brew_line" "fresh install" "$CLI" "$WHATS_NEW_BATS"
+
+# v1.4.1: the on-start second-install notice. All three seds are range-scoped to
+# the function body so they cannot touch the byte-identical status Install block
+# (a different function) or any other function's identical guard line.
+# M1: relax the ">1 install" condition so the notice fires on a single install.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_warn_multiple_installs()/,/^}$/ s/(( _count > 1 ))/(( _count > 0 ))/
+SED
+try "v1.4.1_install_notice_count_gt1" "silent when there is exactly one install" "$CLI" "$INSTALL_NOTICE_BATS"
+
+# M2: drop the CLEAT_NO_INSTALL_CHECK kill switch so it is ignored.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_warn_multiple_installs()/,/^}$/ { /CLEAT_NO_INSTALL_CHECK/d }
+SED
+try "v1.4.1_install_notice_killswitch" "respects the CLEAT_NO_INSTALL_CHECK kill switch" "$CLI" "$INSTALL_NOTICE_BATS"
+
+# M3: drop THIS notice's TTY gate (range-scoped, not the global _is_tty guard
+# every other on-start notice shares) so it runs on a non-TTY.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_warn_multiple_installs()/,/^}$/ { /_is_tty || return 0/d }
+SED
+try "v1.4.1_install_notice_tty_only" "silent on a non-interactive" "$CLI" "$INSTALL_NOTICE_BATS"
 
 # v0.15.0: the config-drift notice must be plain text, not a bordered
 # _notice_box. Mutate the non-TTY drift line's `info` back to `_notice_box`:

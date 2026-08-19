@@ -296,6 +296,26 @@ STUB
   [[ -f "$seen" ]]  || return 1
 }
 
+# TTY-gated like the highlight, so a normal start smoke returns before this body.
+# Source the real binary under full strict mode, force the TTY path and a
+# two-install scan, and run the notice body: proves it's free of set -u /
+# pipefail crashes on the real code.
+@test "smoke: multiple-install notice body is strict-mode (set -euo pipefail) safe" {
+  run env HOME="$HOME" CLI="$CLI" PATH="$MOCK_BIN:$PATH" \
+    bash -uo pipefail -c '
+      source "$CLI"
+      _is_tty() { return 0; }
+      _resolve_physical_path() { echo /b/phys; }
+      _find_cleat_installs() {
+        printf "%s\t%s\n" /a/bin/cleat /a/Cellar/cleat
+        printf "%s\t%s\n" /b/bin/cleat /b/phys
+      }
+      _maybe_warn_multiple_installs
+    '
+  assert_success
+  assert_output --partial "installs found"
+}
+
 # ── Unknown command handling ────────────────────────────────────────────────
 
 @test "smoke: cleat unknown-command exits 1 without unbound variable" {

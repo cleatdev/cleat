@@ -1148,7 +1148,7 @@ workspaces and Claude history live outside the install (`~/.config/cleat`,
 rather than by where Cleat lives. Remove the install you have, then add the
 other. Every box is exactly where you left it.
 
-**One cleat per machine.** The installer and `cleat install` refuse to add a second
+**One cleat per machine, from cleat's own installers.** The installer and `cleat install` refuse to add a second
 install at a different path, because from then on `PATH` order decides which one
 runs. Re-installing over the path you already have is fine, that is an upgrade.
 A different path is refused and `--force` replaces it

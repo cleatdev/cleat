@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.4.0"
+VERSION="1.4.1"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows

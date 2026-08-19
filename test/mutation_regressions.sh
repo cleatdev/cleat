@@ -982,6 +982,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v1.4.1_install_notice_tty_only" "silent on a non-interactive" "$CLI" "$INSTALL_NOTICE_BATS"
 
+# v1.4.2: RELEASE_HIGHLIGHT_VERSION must equal VERSION or the on-start highlight
+# is silently disabled (the v1.4.1 miss). Corrupt the gate to a stale value: the
+# source-lockstep regression test reads both real constants from bin/cleat, sees
+# them differ, and fails, proving it guards the constant.
+cat > "$SED_TMP" << 'SED'
+s/^RELEASE_HIGHLIGHT_VERSION="[^"]*"/RELEASE_HIGHLIGHT_VERSION="0.0.0"/
+SED
+try "v1.4.2_highlight_gate_lockstep" "RELEASE_HIGHLIGHT_VERSION ships in lockstep with VERSION" "$CLI" "$REGRESSIONS"
+
 # v0.15.0: the config-drift notice must be plain text, not a bordered
 # _notice_box. Mutate the non-TTY drift line's `info` back to `_notice_box`:
 # the box border returns and the "plain text, not a box" regression test trips

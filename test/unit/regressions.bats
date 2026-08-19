@@ -1126,6 +1126,20 @@ EOF
   assert_failure
 }
 
+# v1.4.1 bumped VERSION to 1.4.1 but left RELEASE_HIGHLIGHT_VERSION at 1.4.0, so
+# the on-start highlight gate (== VERSION, in _maybe_show_release_highlight)
+# never matched and the "what's new" note went silent for the whole release.
+# Every highlight test forces the two equal in setup (whats_new.bats), so only a
+# source-level check catches a forgotten gate bump. This is the one per-release
+# must-bump constant with no other tripwire (the image spec has image_spec.bats).
+@test "regression v1.4.2: RELEASE_HIGHLIGHT_VERSION ships in lockstep with VERSION" {
+  local ver hl
+  ver=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$CLI")
+  hl=$(sed -n 's/^RELEASE_HIGHLIGHT_VERSION="\(.*\)"$/\1/p' "$CLI")
+  [ -n "$ver" ] || { echo "VERSION unreadable from $CLI"; return 1; }
+  assert_equal "$hl" "$ver"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Test harness: the integration suite computes the container name it is about
 # to inspect. A wrong computation fails every downstream test with "No such

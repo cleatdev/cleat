@@ -648,7 +648,7 @@ ${HOME:-}/.local/bin
     p="$d/cleat"
     [[ -x "$p" ]] || continue
     case "$seen" in *"[$p]"*) continue ;; esac
-    seen="$seen[$p]"
+    seen="${seen}[$p]"
     phys="$(_resolve_physical_path "$p")"
     printf '%s\t%s\n' "$p" "$phys"
   done <<< "$dirs"
@@ -685,7 +685,7 @@ _maybe_warn_multiple_installs() {
   _installs="$(_find_cleat_installs)"
   _count="$(printf '%s\n' "$_installs" | grep -c . || true)"
   [[ "$_count" =~ ^[0-9]+$ ]] && (( _count > 1 )) || return 0
-  _self_phys="$(_resolve_physical_path "${BASH_SOURCE[0]}")"
+  _self_phys="$(_resolve_physical_path "${BASH_SOURCE[0]:-$0}")"
   # One guarded blank above. Do NOT touch _ONSTART_GAP_OPEN: _ensure_daemon and
   # _maybe_sweep_idle_boxes run between this notice and the pressure/highlight
   # cluster and ignore the flag, so a trailing-blank handoff would mis-space.
@@ -8911,7 +8911,7 @@ cmd_status() {
   _installs="$(_find_cleat_installs)"
   _count="$(printf '%s\n' "$_installs" | grep -c . || true)"
   if [[ "$_count" =~ ^[0-9]+$ ]] && (( _count > 1 )); then
-    _self_phys="$(_resolve_physical_path "${BASH_SOURCE[0]}")"
+    _self_phys="$(_resolve_physical_path "${BASH_SOURCE[0]:-$0}")"
     echo ""
     echo -e "  ${BOLD}Install:${RESET}   ${AMBER}● ${_count} installs found${RESET}${DIM}, PATH order decides which one runs${RESET}"
     _render_install_shadow_list "$_installs" "$_self_phys"

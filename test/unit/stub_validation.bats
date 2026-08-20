@@ -367,8 +367,15 @@ _lock_lib() { printf '%s\n' "$PROJECT_ROOT/test/lib/testlock.sh"; }
     mkdir -p "$_CLEAT_TEST_LOCK_DIR"
     echo "stale host some-other-box pid 1 at 1000" > "$_CLEAT_TEST_LOCK_DIR/owner"
     local out
-    out="$( { bash -c 'source "$1"; _take_test_lock a >/dev/null 2>&1 && echo WON' _ "$lib" & \
-              bash -c 'source "$1"; _take_test_lock b >/dev/null 2>&1 && echo WON' _ "$lib" & \
+    # Each winner HOLDS the lock briefly before releasing. Without a held
+    # critical section the winner's pid dies microseconds after acquiring, and a
+    # slow runner (macOS bash 3.2 serializes the two forks) lets the loser reach
+    # its same-host kill -0 probe after the winner has exited: it sees a dead
+    # pid, takes over the deliberately-freed lock, and also prints WON. Holding
+    # past the loser's single refuse path keeps the winner live so the loser
+    # refuses. Fractional sleep is portable on BSD and GNU sleep.
+    out="$( { bash -c 'source "$1"; if _take_test_lock a >/dev/null 2>&1; then echo WON; sleep 0.3; _drop_test_lock; fi' _ "$lib" & \
+              bash -c 'source "$1"; if _take_test_lock b >/dev/null 2>&1; then echo WON; sleep 0.3; _drop_test_lock; fi' _ "$lib" & \
               wait; } 2>/dev/null )"
     local n
     n="$(printf '%s\n' "$out" | grep -c WON || true)"

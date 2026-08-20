@@ -171,7 +171,7 @@ ${HOME:-}/.local/bin
     p="$d/cleat"
     [ -x "$p" ] || continue
     case "$seen" in *"[$p]"*) continue ;; esac
-    seen="$seen[$p]"
+    seen="${seen}[$p]"
     phys="$(resolve_physical "$p")"
     printf '%s\t%s\n' "$p" "$phys"
   done <<< "$dirs"

@@ -366,17 +366,26 @@ _lock_lib() { printf '%s\n' "$PROJECT_ROOT/test/lib/testlock.sh"; }
     rm -rf "$_CLEAT_TEST_LOCK_DIR"
     mkdir -p "$_CLEAT_TEST_LOCK_DIR"
     echo "stale host some-other-box pid 1 at 1000" > "$_CLEAT_TEST_LOCK_DIR/owner"
-    local out
-    # Each winner HOLDS the lock briefly before releasing. Without a held
-    # critical section the winner's pid dies microseconds after acquiring, and a
-    # slow runner (macOS bash 3.2 serializes the two forks) lets the loser reach
-    # its same-host kill -0 probe after the winner has exited: it sees a dead
-    # pid, takes over the deliberately-freed lock, and also prints WON. Holding
-    # past the loser's single refuse path keeps the winner live so the loser
-    # refuses. Fractional sleep is portable on BSD and GNU sleep.
-    out="$( { bash -c 'source "$1"; if _take_test_lock a >/dev/null 2>&1; then echo WON; sleep 0.3; _drop_test_lock; fi' _ "$lib" & \
-              bash -c 'source "$1"; if _take_test_lock b >/dev/null 2>&1; then echo WON; sleep 0.3; _drop_test_lock; fi' _ "$lib" & \
-              wait; } 2>/dev/null )"
+    local out dd="$TEST_TEMP/lockdone"
+    rm -rf "$dd"; mkdir -p "$dd"
+    # The two takers start with their natural, slight stagger, so the atomic
+    # mv-reclaim of the seeded stale lock contends one-at-a-time (forcing perfect
+    # simultaneity instead surfaces a rarer reclaim TOCTOU where the loser mv's
+    # away the winner's just-created fresh lock). The hazard on a slow runner
+    # (macOS bash 3.2) is the other direction: the winner's pid dies microseconds
+    # after it acquires, so the loser's same-host kill -0 probe finds a dead
+    # holder and takes over a lock nobody really holds, and both print WON. Fix:
+    # the winner HOLDS until the loser has finished its attempt. Each racer drops
+    # a .done marker from an EXIT trap (the loser leaves via _tl_refuse's exit,
+    # so win or lose the marker lands), and the winner waits for that marker
+    # before releasing, so the loser always probes a LIVE holder and refuses. A
+    # genuine double-win still surfaces: both block in the hold, neither exits,
+    # both time out having already printed WON.
+    out="$( {
+      bash -c 'source "$1"; m="$2/$3.done"; trap "touch \"\$m\"" EXIT; if _take_test_lock "$3" >/dev/null 2>&1; then echo WON; t=0; while [ "$(ls "$2"/*.done 2>/dev/null | wc -l | tr -d " ")" -lt 1 ] && [ "$t" -lt 300 ]; do sleep 0.02; t=$(( t + 1 )); done; _drop_test_lock; fi' _ "$lib" "$dd" a &
+      bash -c 'source "$1"; m="$2/$3.done"; trap "touch \"\$m\"" EXIT; if _take_test_lock "$3" >/dev/null 2>&1; then echo WON; t=0; while [ "$(ls "$2"/*.done 2>/dev/null | wc -l | tr -d " ")" -lt 1 ] && [ "$t" -lt 300 ]; do sleep 0.02; t=$(( t + 1 )); done; _drop_test_lock; fi' _ "$lib" "$dd" b &
+      wait
+    } 2>/dev/null )"
     local n
     n="$(printf '%s\n' "$out" | grep -c WON || true)"
     (( n > 1 )) && winners=$(( winners + 1 ))

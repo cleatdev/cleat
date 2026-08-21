@@ -96,7 +96,22 @@ _take_test_lock() {   # label
     # find the lock either gone or freshly held. `rm -rf` followed by `mkdir`
     # has no such property: every racer removes and every racer recreates.
     if mv "$_CLEAT_TEST_LOCK" "${_CLEAT_TEST_LOCK}.stale.$$" 2>/dev/null; then
-      rm -rf "${_CLEAT_TEST_LOCK}.stale.$$" 2>/dev/null || true
+      # The rename is atomic, but there is a TOCTOU across it: between the
+      # staleness check above and this mv, another taker may have already
+      # reclaimed the SAME stale lock and mkdir'd a FRESH one, so what we just
+      # captured is THEIR live lock, not the dead record we validated. Blindly
+      # removing it would let us both win. Verify the captured owner is the
+      # exact stale record we saw: if so, drop it and race for a fresh mkdir; if
+      # it changed, we grabbed a live lock, so put it back and stand down.
+      local captured
+      captured="$(cat "${_CLEAT_TEST_LOCK}.stale.$$/owner" 2>/dev/null || true)"
+      if [ "$captured" = "$owner" ]; then
+        rm -rf "${_CLEAT_TEST_LOCK}.stale.$$" 2>/dev/null || true
+      else
+        mv "${_CLEAT_TEST_LOCK}.stale.$$" "$_CLEAT_TEST_LOCK" 2>/dev/null \
+          || rm -rf "${_CLEAT_TEST_LOCK}.stale.$$" 2>/dev/null || true
+        _tl_refuse "$captured"
+      fi
     fi
     tries=$(( tries + 1 ))
   done

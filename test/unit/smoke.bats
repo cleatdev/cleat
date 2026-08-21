@@ -1374,6 +1374,10 @@ EOF
 set -euo pipefail
 source "$CLI"
 _is_interactive() { return 0; }
+# Force non-WSL: the gate early-returns on a real WSL kernel (bin/cleat ~9666),
+# and the Windows/WSL2 CI leg sources this under one, which would suppress the
+# banner this test asserts.
+_is_wsl() { return 1; }
 _DOCKER_GATE_PENDING=1
 _DOCKER_GATE_SUMMARY="Docker VM memory is 8 GB (aim for 16 GB)."
 # 1. Armed + interactive + EOF stdin: banner prints, read fails open, rc 0.

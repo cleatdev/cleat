@@ -243,6 +243,14 @@ source_cli() {
   sed 's/^set -euo pipefail$/# [stripped for testing; strict mode via smoke.bats]/' "$CLI" > "$_cli_tmp"
   source "$_cli_tmp"
   rm -f "$_cli_tmp"
+  # Default to a non-WSL host. The shipped _is_wsl greps /proc/version for
+  # "microsoft"; the Windows/WSL2 CI leg runs on a real microsoft-WSL2 kernel,
+  # where the true _is_wsl silently flips the docker-gate, disk-help and prune
+  # advisory branches (bin/cleat ~9245/9666/9751) and breaks tests that stub
+  # _is_docker_desktop/_is_macos but assume a non-WSL host. Off-WSL this is a
+  # no-op (the real _is_wsl already returns false). Tests that exercise WSL
+  # behavior override this in their own body, after setup.
+  _is_wsl() { return 1; }
 }
 
 # Enable the docker stub by prepending MOCK_BIN to PATH

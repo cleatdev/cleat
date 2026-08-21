@@ -290,7 +290,11 @@ jobs:
         uses: Vampire/setup-wsl@v7
         with:
           distribution: Ubuntu-24.04
-          additional-packages: git
+          # jq: the minimal WSL Ubuntu rootfs ships without it, and the CLI's
+          # host-side .claude.json merge + hooks overlay are jq-gated; the other
+          # runners preinstall jq, which hid the dependency. git: submodule
+          # fallback insurance (the Windows-side checkout already populates BATS).
+          additional-packages: git jq
       # wsl-bash starts in root's HOME, NOT the workspace, and $RUNNER_TEMP is a
       # Windows path unusable here. cd via wslpath: `github.workspace` expands to
       # the Windows path (e.g. D:\a\cleat\cleat) before the script reaches WSL,
@@ -372,6 +376,14 @@ jobs:
           cat "$RUNNER_TEMP/dockerinfo.log"; exit "$rc"
       - name: Run integration suite against Colima
         run: |
+          # Colima's Lima VM shares $HOME into the guest but NOT the macOS default
+          # TMPDIR (/var/folders). The integration tests mktemp -d their project
+          # dir (test/setup.bash TEST_TEMP), so under the default TMPDIR cleat's
+          # -v project:/workspace bind lands EMPTY inside the VM and every
+          # box-creating test fails (the documented "unshared path mounts empty on
+          # macOS" trap). Point TMPDIR under $HOME so the project + config dirs are
+          # inside the shared scope.
+          export TMPDIR="$HOME/colima-tmp"; mkdir -p "$TMPDIR"
           rc=0; ./test/integration/run.sh > "$RUNNER_TEMP/integration.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/integration.log"; exit "$rc"
 
@@ -409,14 +421,25 @@ jobs:
           rc=0
           {
             set -x
-            # 1. Rootless prerequisites. docker-ce-rootless-extras provides
-            #    rootlesskit, dockerd-rootless.sh and dockerd-rootless-setuptool.sh
-            #    (matched to the runner's pre-installed docker-ce) AND bundles the
-            #    rootlesskit AppArmor profile. uidmap gives newuidmap/newgidmap;
-            #    dbus-user-session + slirp4netns are required for the user systemd
-            #    manager and rootless networking.
+            # 1. Rootless prerequisites. The hosted runner ships docker-ce but
+            #    WITHOUT download.docker.com in its apt sources, so
+            #    docker-ce-rootless-extras (the sole provider of rootlesskit,
+            #    dockerd-rootless.sh and dockerd-rootless-setuptool.sh) has "no
+            #    installation candidate". Register the repo + key FIRST, then
+            #    install. uidmap gives newuidmap/newgidmap; dbus-user-session +
+            #    slirp4netns are needed for the user systemd manager + networking.
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+              | sudo tee /etc/apt/sources.list.d/docker.list
             sudo apt-get update
             sudo apt-get install -y uidmap dbus-user-session slirp4netns docker-ce-rootless-extras
+            # Fail HERE at the real point if the extras did not land, instead of
+            # letting the rc-capture swallow it and reddening a step later.
+            command -v dockerd-rootless-setuptool.sh >/dev/null \
+              || { echo "docker-ce-rootless-extras did not install"; exit 1; }
 
             # 2. Ensure subuid/subgid ranges exist for the runner user. Hosted
             #    runners normally have these, but a missing range is a hard

@@ -260,6 +260,7 @@ teardown() { _common_teardown; }
 }
 
 @test "whats-new: silent (no permanent nag) when the state can't be persisted" {
+  if [ "$(id -u)" -eq 0 ]; then skip "root bypasses the read-only-dir denial, so the write succeeds (WSL2 CI runs as root)"; fi
   _is_tty() { return 0; }
   # Read-only install dir: the bumped count can't be written, so it must NOT
   # print: otherwise the note would re-show on every single launch.

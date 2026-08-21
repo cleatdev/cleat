@@ -412,6 +412,7 @@ teardown() { _common_teardown; }
 # ── EACCES: permission, not down ─────────────────────────────────────────────
 
 @test "autostart: an inaccessible local socket is diagnosed as permission, not down" {
+  if [ "$(id -u)" -eq 0 ]; then skip "root bypasses chmod, so the socket stays reachable (WSL2 CI runs as root)"; fi
   _is_tty() { return 0; }
   # a real socket-typed file we can make unwritable
   local sock="$TEST_TEMP/docker.sock"

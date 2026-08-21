@@ -1059,6 +1059,17 @@ it off entirely with `CLEAT_NO_CLIPBOARD_IMAGE=1`.
 
 ---
 
+## Companion tools
+
+If you run Cleat on macOS, [Clyde](https://github.com/kl0sin/clyde) is a menu-bar
+monitor for Claude Code sessions. It tags sessions running inside a Cleat box with
+a **cleat** badge so you can tell caged sessions apart from native ones. It also
+shows attention alerts when a session needs you. Enable the host hook bridge once
+with `cleat config --enable hooks` and Clyde picks up your boxes automatically.
+Separate MIT project, no affiliation.
+
+---
+
 ## Troubleshooting
 
 ### Clipboard not working

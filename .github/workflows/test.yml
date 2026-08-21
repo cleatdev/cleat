@@ -102,12 +102,14 @@ jobs:
   test-macos-bash32:
     name: test (macos, bash 3.2)
     runs-on: macos-15
-    # 30, not 20: on 2026-07-14 a run was cancelled with the suite green and the
-    # mutation harness mid-flight. Suite (~10 min on the macOS runner) plus the
-    # 290-entry harness (~10 min) had outgrown 20; v1.2.2's run finished 19s
-    # under the wire. File-redirected steps (see test-linux) reclaim the
-    # straggler dead-air too.
-    timeout-minutes: 30
+    # 50, not 30: the suite and the mutation harness both grew (suite ~14 min at
+    # 2169 tests, harness ~19+ min at 562 entries), and on 2026-08-21 a run was
+    # cancelled with the suite green (2169/2169) and the harness mid-flight past
+    # the old 30-minute cap. Before that the cap was 20 (2026-07-14: suite ~10 min
+    # plus a 290-entry harness ~10 min). File-redirected steps (see test-linux)
+    # reclaim the straggler dead-air too. If this keeps growing, split the harness
+    # into its own macos job the way the ubuntu legs are split.
+    timeout-minutes: 50
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -eo pipefail {0}

@@ -232,7 +232,6 @@ jobs:
     name: test (ubuntu arm64, bash 5.x)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
-    continue-on-error: true   # provisional: new coverage leg, promote to gating once proven green
     steps:
       - uses: actions/checkout@v4
         with:
@@ -268,7 +267,10 @@ jobs:
     name: test (windows, wsl2 ubuntu)
     runs-on: windows-latest
     timeout-minutes: 45
-    continue-on-error: true   # provisional: new coverage leg, promote to gating once proven green
+    # Green, but kept advisory: WSL2 provisioning on windows-2025 has a known
+    # intermittent per-user issue (actions/runner-images#14499); do not gate the
+    # board on it until it has a longer green streak.
+    continue-on-error: true
     steps:
       # MUST precede checkout. GitHub's Windows git defaults core.autocrlf on, so
       # checkout would rewrite every LF script to CRLF. A stray \r breaks bash

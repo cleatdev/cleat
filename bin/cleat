@@ -832,10 +832,21 @@ _is_macos() {
 # VM). A native or rootless Linux engine (and a WSL2 in-distro engine) draws
 # from the host's own RAM: no VM exists, so the memory advisories must not
 # call the pool one. macOS short-circuits without touching the daemon; the
-# Linux branch costs one `docker info` field read. Overridable in tests.
+# Linux branch costs one `docker info` field read, plus a context-endpoint read
+# only when the daemon is neither macOS nor Docker Desktop. Overridable in tests.
 _docker_pool_is_vm() {
   _is_macos && return 0
-  _is_docker_desktop
+  _is_docker_desktop && return 0
+  # Lima-backed engines (Colima, Rancher Desktop, plain Lima) run dockerd inside
+  # a VM on LINUX hosts too, where _is_macos and _is_docker_desktop are both
+  # false (the in-VM `docker info` names the guest distro, never "Docker
+  # Desktop"). Detect them by their context / DOCKER_HOST socket path so the
+  # docker cap binds the in-VM /var/run/docker.sock (not the unresolvable host
+  # forward path) and the memory advisories correctly name the pool a VM.
+  case "${DOCKER_HOST:-$(_docker_context_endpoint)}" in
+    */.colima/*|*/.rd/*|*/.lima/*) return 0 ;;
+  esac
+  return 1
 }
 
 # ── Docker autopilot (concept/29) ────────────────────────────────────────────
@@ -889,7 +900,11 @@ _host_sock_is_live() {  # path
 # remote (tcp/ssh/fd) endpoint that has no local socket to bind.
 _resolve_host_docker_sock() {  # endpoint
   case "$1" in
-    unix://*) printf '%s\n' "${1#unix://}" ;;
+    # Strip a single trailing slash: an env-file DOCKER_HOST like
+    # 'unix:///var/run/docker.sock/' would otherwise miss the [ -S ] liveness
+    # guard and bind nothing on a live host-local daemon. A unix socket is a
+    # file, never a directory, so a trailing slash is always spurious.
+    unix://*) local _p="${1#unix://}"; printf '%s\n' "${_p%/}" ;;
     "")       printf '%s\n' "/var/run/docker.sock" ;;
     *)        ;;
   esac
@@ -8053,6 +8068,17 @@ cmd_run() {
       mount_args+=(-v "$_host_dsock:/var/run/docker.sock")
     elif [ -z "$_host_dsock" ] && [ -n "$_docker_ep" ]; then
       docker_args+=(-e "DOCKER_HOST=$_docker_ep")
+      # A TLS-secured remote (tcp://…:2376, or DOCKER_TLS_VERIFY set) needs the
+      # client certs (DOCKER_CERT_PATH, default ~/.docker) to connect. Cleat does
+      # NOT forward them into the cage: those are host credentials and mounting
+      # them would leak keys into the box, breaking the core pillar. Warn so the
+      # in-box TLS handshake failure is not a silent mystery.
+      local _tls=""
+      [ -n "${DOCKER_TLS_VERIFY:-}" ] && _tls=1
+      case "$_docker_ep" in tcp://*:2376) _tls=1 ;; esac
+      if [ -n "$_tls" ]; then
+        warn "docker cap: DOCKER_HOST points at a TLS-secured daemon, but Cleat does not forward the client certificates into the cage (they are host credentials). The box's docker client will fail the TLS handshake. Use a unix-socket or SSH docker context for the docker cap."
+      fi
     else
       warn "docker cap: no live Docker socket at ${_host_dsock:-the daemon endpoint}. The box's docker client will not reach the host daemon until Docker is running. (cleat reads the engine from DOCKER_HOST and the active docker context.)"
     fi

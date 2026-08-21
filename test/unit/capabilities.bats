@@ -455,6 +455,55 @@ EOF
   assert_success
 }
 
+@test "docker cap: Colima on Linux is detected as a VM, binds the in-VM socket not the host forward" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  unset DOCKER_HOST
+  # A Linux host running Colima: not macOS, not Docker Desktop (the in-VM
+  # `docker info` names the guest distro), but the daemon IS in a Lima VM. The
+  # context socket is the host forward path; the daemon resolves binds in-VM at
+  # /var/run/docker.sock. _docker_pool_is_vm must detect this by endpoint path.
+  _is_macos() { return 1; }
+  _is_docker_desktop() { return 1; }
+  _docker_context_endpoint() { echo "unix:///home/u/.colima/default/docker.sock"; }
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".colima"
+  assert_success
+}
+
+@test "docker cap: a trailing slash on DOCKER_HOST still binds the real socket" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }   # host-local daemon
+  # An env-file DOCKER_HOST often carries a trailing slash; the socket bind
+  # source must still be the clean /var/run/docker.sock, not .../docker.sock/.
+  export DOCKER_HOST="unix:///var/run/docker.sock/"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: a TLS remote (tcp :2376) warns that client certs are not forwarded" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  export DOCKER_HOST="tcp://10.0.0.5:2376"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "TLS"
+  run assert_docker_run_has "$cname" "DOCKER_HOST=tcp://10.0.0.5:2376"
+  assert_success
+}
+
 @test "docker cap: bind-mounts project at its host path (identity mount)" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

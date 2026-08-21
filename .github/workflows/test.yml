@@ -65,6 +65,29 @@ jobs:
           rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
 
+  # ── Full test suite on the OLDER Ubuntu (bash 5.1 / GNU coreutils 8.x) ──────
+  # Every other Linux leg pins ubuntu-latest (24.04: bash 5.2, coreutils 9.4).
+  # coreutils 9 changed real behaviours in tools Cleat shells out to (cp, du,
+  # stat, df), and a large share of hosts and self-hosted CI still run 22.04
+  # (bash 5.1.16, coreutils 8.32, in standard support to Apr 2027). Gating: same
+  # suite, stock runner, exercises the GNU side at a second coreutils version.
+  test-linux-2204:
+    name: test (ubuntu 22.04, bash 5.1)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install inotify-tools (exercise the inotifywait watcher branch)
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools
+      - name: Bash and coreutils versions
+        run: bash --version | head -1; cp --version | head -1
+      - name: Run full BATS suite
+        run: |
+          rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/suite.log"; exit "$rc"
+
   # ── Mutation harness, its OWN job on purpose ────────────────────────────────
   # It used to run as a second step inside test-linux. The suite alone reached
   # 18m18s against that job's 20-minute cap, so every test added to the suite
@@ -194,6 +217,32 @@ jobs:
         run: |
           rc=0; /bin/bash ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
+
+  # ── Newest-macOS bash 3.2 canary (ADVISORY) ────────────────────────────────
+  # The gating bash-3.2 legs pin macos-15 for a deterministic canary. This leg
+  # tracks macos-latest (macOS 26+) for one reason: to catch a future macOS that
+  # changes or drops the /bin/bash 3.2.57 the CLI depends on BEFORE macos-15 is
+  # retired. Advisory: the day Apple ships a macOS without bash 3.2 this goes red
+  # as a heads-up, never a block. Smoke-only to keep the newest-OS runner cheap.
+  macos-latest-canary:
+    name: bash 3.2 canary (macos-latest)
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Assert /bin/bash is still 3.2.x
+        run: |
+          v="$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"')"
+          echo "/bin/bash on $(sw_vers -productVersion): $v"
+          case "$v" in
+            3.2) echo "bash 3.2 present" ;;
+            *) echo "::warning::/bin/bash is $v, not 3.2 - the macOS default shell moved"; exit 1 ;;
+          esac
+      - name: Smoke test the real binary under /bin/bash 3.2
+        run: /bin/bash ./test/bats/bin/bats test/unit/smoke.bats
 
   # ── Integration tests against real Docker (Linux only, runners have it) ──
   test-integration:

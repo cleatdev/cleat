@@ -462,6 +462,30 @@ s|mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)|mount_args+=(-v "\$
 SED
 try "vnext_docker_cap_vm_daemon_sock" "VM-backed daemon" "$CLI" "$CAPABILITIES_BATS"
 
+# vnext: Lima-backed engines on LINUX (Colima / Rancher / Lima) are VM-backed
+# but report host-local (not macOS, not Docker Desktop), so _docker_pool_is_vm
+# must detect them by endpoint path. Break the endpoint case; the Colima-on-Linux
+# test should fail (the cap would bind the unresolvable host forward path).
+cat > "$SED_TMP" << 'SED'
+s#\*/\.colima/\*|\*/\.rd/\*|\*/\.lima/\*)#NOMATCH_XYZ)#
+SED
+try "vnext_docker_pool_is_vm_lima_on_linux" "Colima on Linux is detected as a VM" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: _resolve_host_docker_sock must strip a trailing slash so an env-file
+# DOCKER_HOST like 'unix:///var/run/docker.sock/' still binds the real socket.
+# Stop stripping it; the trailing-slash test should fail.
+cat > "$SED_TMP" << 'SED'
+s#"\${_p%/}"#"$_p"#
+SED
+try "vnext_docker_cap_trailing_slash" "a trailing slash on DOCKER_HOST" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: a TLS remote (tcp://…:2376) must warn that client certs are not
+# forwarded into the cage. Stop flagging TLS; the TLS-warn test should fail.
+cat > "$SED_TMP" << 'SED'
+s#tcp://\*:2376) _tls=1 ;;#tcp://*:2376) _tls="" ;;#
+SED
+try "vnext_docker_cap_tls_warn" "a TLS remote" "$CLI" "$CAPABILITIES_BATS"
+
 # v0.10.0: docker cap must add a host-path identity mount + workdir so
 # $(pwd) inside Cleat resolves to a host-valid path. Remove the identity
 # mount; the path-remapping guard should fail.
@@ -3241,9 +3265,10 @@ SED
 try "v1.2.0_root_is_sandbox_gate" "root host rides IS_SANDBOX"
 
 # ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
-# Collapse the predicate to always-VM: the native ready test fails.
+# Collapse the predicate to always-VM (flip the host-local fall-through return):
+# the native ready test fails.
 cat > "$SED_TMP" << 'SED'
-/^_docker_pool_is_vm()/,/^}$/ s|  _is_docker_desktop$|  return 0|
+/^_docker_pool_is_vm()/,/^}$/ s|^  return 1$|  return 0|
 SED
 try "vnext_pool_noun_predicate" "native Linux engine reads ready" "$CLI" "$PRUNE_BATS"
 

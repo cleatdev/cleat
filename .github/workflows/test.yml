@@ -209,3 +209,269 @@ jobs:
         run: docker version
       - name: Run integration suite
         run: ./test/integration/run.sh
+
+
+  # ── Linux arm64: suite + real-Docker integration, built and run natively ────
+  # Cleat's documented host matrix includes Apple Silicon and arm64 Linux and
+  # the image is multi-arch, but nothing in CI ever BUILT or RAN it on arm64.
+  # The base is pinned by the node:24-bookworm-slim multi-arch OCI *index* digest
+  # (docker/Dockerfile), so `docker build` on an arm64 host resolves the arm64
+  # sub-manifest automatically. That is the prize: arch-specific base-image bugs
+  # (an arm64 box once needed libicu72 that amd64 already had) only surface when
+  # the image is really built and run on arm. The ubuntu-24.04-arm partner image
+  # ships Docker preinstalled with the daemon already running, exactly like the
+  # x64 ubuntu runners, so run.sh's `docker info` probe passes and the
+  # integration suite runs instead of skipping cleanly. Free on public repos
+  # (arm64 public-repo runners, 4 vCPU). Suite first (file-redirected to reclaim
+  # watcher-straggler dead-air, see test-linux), then integration built + run
+  # natively. inotify-tools installed so the arm leg also exercises the
+  # inotifywait event branch of the watcher, mirroring test-linux. No mutation
+  # harness here: like the intel leg this job is about arch, not test depth, and
+  # mutation is already covered on two runners.
+  test-linux-arm64:
+    name: test (ubuntu arm64, bash 5.x)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    continue-on-error: true   # provisional: new coverage leg, promote to gating once proven green
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Bash version and arch
+        run: bash --version | head -1; uname -m
+      - name: Install inotify-tools (exercise the inotifywait watcher branch)
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools
+      - name: Run full BATS suite
+        run: |
+          rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/suite.log"; exit "$rc"
+      - name: Verify docker available
+        run: docker version
+      - name: Run integration suite (builds and runs the arm64 cleat image)
+        run: ./test/integration/run.sh
+
+  # ── Windows + WSL2 (Ubuntu) ─────────────────────────────────────────────────
+  # WSL2 is a documented supported host (the CLAUDE.md matrix) yet nothing else
+  # in CI touches it. This leg checks the tree out on the Windows side, then runs
+  # the BATS suite INSIDE a WSL2 Ubuntu distro over the /mnt drvfs mount, which is
+  # exactly how a real Cleat-on-WSL2 user reaches the source. It catches the
+  # failures that only surface there: CRLF-corrupted scripts, /mnt path
+  # translation, Windows<->Linux interop, and whatever coreutils/bash the distro
+  # ships (Ubuntu-24.04 → GNU coreutils + bash 5.x).
+  #
+  # No real Docker daemon is needed: the suite runs against the mock docker stub
+  # (test/fixtures/mock_bin/docker), so this is a pure portability leg. The
+  # mutation harness and real-Docker integration are intentionally skipped
+  # (covered on the ubuntu/macos legs already), the same scope call as the intel
+  # leg: this job is about the WSL runtime, not test depth.
+  windows-wsl2:
+    name: test (windows, wsl2 ubuntu)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true   # provisional: new coverage leg, promote to gating once proven green
+    steps:
+      # MUST precede checkout. GitHub's Windows git defaults core.autocrlf on, so
+      # checkout would rewrite every LF script to CRLF. A stray \r breaks bash
+      # shebangs and string compares inside WSL, so pin LF before cloning.
+      - name: Preserve LF line endings across the Windows checkout
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # setup-wsl@v7 installs + provisions the distro and drops a `wsl-bash`
+      # wrapper usable as a step shell (it runs `bash --noprofile --norc -euo
+      # pipefail {0}` as root). Default distro is Debian-13; force Ubuntu-24.04,
+      # the documented WSL host. git is added because the minimal WSL Ubuntu
+      # rootfs ships without it and test.sh falls back to `git submodule update`
+      # if the BATS submodule is ever missing.
+      - name: Set up WSL2 with Ubuntu
+        uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: git
+      # wsl-bash starts in root's HOME, NOT the workspace, and $RUNNER_TEMP is a
+      # Windows path unusable here. cd via wslpath: `github.workspace` expands to
+      # the Windows path (e.g. D:\a\cleat\cleat) before the script reaches WSL,
+      # and wslpath maps it to /mnt/d/a/cleat/cleat.
+      - name: Environment (inside WSL2)
+        shell: wsl-bash {0}
+        run: |
+          uname -a
+          bash --version | head -1
+          cd "$(wslpath '${{ github.workspace }}')"
+          echo "REPO=$PWD"
+          git config --global --add safe.directory '*' || true
+          ls -la | head -20
+      # `bash ./test.sh` (not `./test.sh`): /mnt drvfs mounts default to
+      # metadata-off, so the exec bit is unreliable there; invoking bash directly
+      # sidesteps it. Log to a WSL-local path and cat at the end, mirroring the
+      # file-redirect convention (RUNNER_TEMP is a Windows path in WSL, so /tmp).
+      - name: Run full BATS suite inside WSL2 (mock docker, no real daemon)
+        shell: wsl-bash {0}
+        run: |
+          cd "$(wslpath '${{ github.workspace }}')"
+          rc=0; bash ./test.sh > /tmp/suite.log 2>&1 < /dev/null || rc=$?
+          cat /tmp/suite.log; exit "$rc"
+
+  # ── Colima on macOS (alternate Docker engine, real integration) ─────────────
+  # docker-autopilot targets Docker Desktop, OrbStack, Colima and rootless, but CI
+  # only ever exercised the ubuntu Docker daemon. This leg starts Colima (Lima VM +
+  # dockerd) and runs the REAL integration suite against it, so an engine other than
+  # "the Linux runner's daemon" is genuinely tested.
+  #
+  # runs-on is macos-15-intel, NOT macos-15. macos-15 is Apple Silicon (arm64) and
+  # GitHub's arm64 runners cannot nest a VM: Apple's Virtualization.framework only
+  # gained nested virtualization on M3 under macOS 15 and GitHub has not enabled it,
+  # while the M1 class has no hardware support at all. Colima therefore cannot start
+  # a daemon on macos-15. The only free GitHub-hosted label where Colima works today
+  # is macos-15-intel (x86_64), which is exactly what Colima's own CI and the
+  # douglascamata/setup-docker-macos-action use. macos-15-intel lives until Aug 2027
+  # (Apple Intel drop). Revisit an arm64 Colima leg once GitHub enables nested virt
+  # on M3+ runners.
+  #
+  # continue-on-error while it proves itself: Colima bring-up (VM boot + the virtiofs
+  # home mount that Cleat's bind mounts ride on) is the slow, occasionally-flaky part,
+  # and a red experimental engine leg must not gate merges. Promote to blocking after
+  # a few weeks green.
+  #
+  # The explicit "docker info" gate is load-bearing: test/integration/run.sh SKIPS
+  # (exit 0) when the daemon is unreachable, so without a hard gate a failed Colima
+  # bring-up would go GREEN having tested nothing. We fail loudly instead.
+  colima-macos:
+    name: integration (colima, macos intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    needs: test-linux
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Colima and the Docker CLI
+        # Docker Desktop is not on the macOS runners, so the docker CLI must be
+        # installed. brew resolves lima as a colima dependency.
+        run: |
+          rc=0; brew install colima docker > "$RUNNER_TEMP/brew.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/brew.log"; exit "$rc"
+      - name: Start Colima (Docker runtime) and let dockerd settle
+        # colima start registers and activates the "colima" docker context, so the
+        # docker CLI needs no DOCKER_HOST wiring. The sleep mirrors Colima's own CI:
+        # it avoids a race where the socket exists before dockerd is accepting calls.
+        run: |
+          rc=0
+          { colima start --runtime docker --cpu 3 --memory 6 && sleep 10; } \
+            > "$RUNNER_TEMP/colima.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/colima.log"; exit "$rc"
+      - name: Verify the daemon is really up (run.sh silently skips otherwise)
+        run: |
+          rc=0
+          { docker context show; docker ps; docker info; } \
+            > "$RUNNER_TEMP/dockerinfo.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/dockerinfo.log"; exit "$rc"
+      - name: Run integration suite against Colima
+        run: |
+          rc=0; ./test/integration/run.sh > "$RUNNER_TEMP/integration.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/integration.log"; exit "$rc"
+
+  # ── Integration tests against a ROOTLESS Docker daemon (Linux only) ──────────
+  # The existing test-integration job runs against the runner's stock ROOTFUL
+  # daemon at /var/run/docker.sock. Rootless is a different engine leg entirely:
+  # the daemon runs in a user namespace and its socket lives at
+  # unix:///run/user/<uid>/docker.sock. Cleat's docker cap mounts the socket and
+  # the autopilot brings the daemon up, both of which have only ever been
+  # unit-mocked for rootless. This is the first real rootless daemon in CI.
+  #
+  # continue-on-error is deliberate while this leg beds in. Rootless bring-up on
+  # a hosted runner is finicky (AppArmor userns restriction on 24.04, no user
+  # systemd session by default, socket-path assumptions in cleat) and a genuine
+  # cleat gap here should surface as a signal, not block every merge. Flip it to
+  # blocking once it has proven stable across a few runs.
+  integration-rootless:
+    name: integration (rootless docker)
+    runs-on: ubuntu-latest        # ubuntu-latest == ubuntu-24.04 (Aug 2026)
+    timeout-minutes: 20
+    needs: test-linux             # mirror test-integration: don't burn the finicky
+                                  # bring-up if the behavior layer is already red
+    continue-on-error: true       # provisional: see banner above
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Everything the rootless daemon needs, then the daemon itself. Verbose
+      # apt/setuptool output goes to a file and is cat'd once (the dead-air
+      # convention). The socket/host env is exported to $GITHUB_ENV at the end so
+      # the verify + run steps below inherit it.
+      - name: Set up rootless Docker (dockerd-rootless-setuptool.sh)
+        run: |
+          rc=0
+          {
+            set -x
+            # 1. Rootless prerequisites. docker-ce-rootless-extras provides
+            #    rootlesskit, dockerd-rootless.sh and dockerd-rootless-setuptool.sh
+            #    (matched to the runner's pre-installed docker-ce) AND bundles the
+            #    rootlesskit AppArmor profile. uidmap gives newuidmap/newgidmap;
+            #    dbus-user-session + slirp4netns are required for the user systemd
+            #    manager and rootless networking.
+            sudo apt-get update
+            sudo apt-get install -y uidmap dbus-user-session slirp4netns docker-ce-rootless-extras
+
+            # 2. Ensure subuid/subgid ranges exist for the runner user. Hosted
+            #    runners normally have these, but a missing range is a hard
+            #    setuptool failure, so backfill defensively.
+            grep -q "^$(whoami):" /etc/subuid || echo "$(whoami):100000:65536" | sudo tee -a /etc/subuid
+            grep -q "^$(whoami):" /etc/subgid || echo "$(whoami):100000:65536" | sudo tee -a /etc/subgid
+
+            # 3. Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1,
+            #    which blocks rootlesskit from creating user namespaces
+            #    ("fork/exec /proc/self/exe: permission denied"). The extras deb
+            #    ships a profile, but relaxing the sysctl is the reliable CI fix
+            #    and is harmless on kernels without the key.
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+            # 4. Prove we're really on rootless: disable the rootful daemon so the
+            #    integration suite cannot silently fall through to /var/run/docker.sock.
+            sudo systemctl disable --now docker.service docker.socket || true
+            sudo rm -f /var/run/docker.sock || true
+
+            # 5. Hosted runners have no lingering systemd --user session and no
+            #    XDG_RUNTIME_DIR. Enable linger so user@<uid>.service comes up, then
+            #    point the user-scoped tooling at its runtime dir + bus.
+            sudo loginctl enable-linger "$(whoami)"
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+            for _ in $(seq 1 30); do [ -S "${XDG_RUNTIME_DIR}/bus" ] && break; sleep 1; done
+
+            # 6. Install and start the rootless daemon. --force ignores any leftover
+            #    rootful socket; --skip-iptables avoids a hard failure on the
+            #    runner's iptables setup. Both are real setuptool flags.
+            dockerd-rootless-setuptool.sh install --force --skip-iptables
+            systemctl --user enable --now docker
+            for _ in $(seq 1 30); do [ -S "${XDG_RUNTIME_DIR}/docker.sock" ] && break; sleep 1; done
+
+            # 7. Hand the rootless socket to every later step in this job.
+            {
+              echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+              echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR}/bus"
+              echo "DOCKER_HOST=unix://${XDG_RUNTIME_DIR}/docker.sock"
+            } >> "$GITHUB_ENV"
+          } > "$RUNNER_TEMP/rootless-setup.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/rootless-setup.log"; exit "$rc"
+
+      # Confirm the daemon answering DOCKER_HOST is genuinely rootless, not the
+      # rootful one leaking through. SecurityOptions carries name=rootless.
+      - name: Verify rootless daemon
+        run: |
+          echo "DOCKER_HOST=$DOCKER_HOST"
+          docker version
+          docker info -f '{{.SecurityOptions}}' | grep -q 'name=rootless' \
+            || { echo "Daemon is not rootless"; docker info; exit 1; }
+
+      # Cleat's own entry point. run.sh self-skips if the daemon is unreachable,
+      # so a bring-up that half-failed degrades to a skip rather than a false red.
+      - name: Run integration suite against the rootless daemon
+        run: |
+          rc=0; ./test/integration/run.sh > "$RUNNER_TEMP/integration-rootless.log" 2>&1 < /dev/null || rc=$?
+          cat "$RUNNER_TEMP/integration-rootless.log"; exit "$rc"

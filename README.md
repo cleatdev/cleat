@@ -5,6 +5,8 @@
 [![Release](https://img.shields.io/github/v/release/cleatdev/cleat?label=release)](https://github.com/cleatdev/cleat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+**[Website](https://cleat.sh)** · **[Docs](https://cleat.sh/docs)** · **[Compare](https://cleat.sh/compare)** · **[Changelog](https://cleat.sh/changelog)**
+
 **Give the agent a cage, not your keys.**
 
 *Unattended, not unguarded.*
@@ -1199,4 +1201,4 @@ The installer and updater both resolve the latest semver tag automatically. No r
 
 ---
 
-<sub>Cleat. Give the agent a cage, not your keys. | Docker sandbox for AI coding agents | cleat.sh</sub>
+<sub>Cleat. Give the agent a cage, not your keys. | Docker sandbox for AI coding agents | <a href="https://cleat.sh">cleat.sh</a></sub>

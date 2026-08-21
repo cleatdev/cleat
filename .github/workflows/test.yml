@@ -126,13 +126,16 @@ jobs:
     name: test (macos, bash 3.2)
     runs-on: macos-15
     # Suite + fork-copy only (no mutation harness on macOS, see the note below).
-    # 60, not 35: GitHub's macOS runners are highly variable, and on 2026-08-21 a
-    # contended runner took ~35 min on the SUITE STEP ALONE (about 6x the ~5-min
-    # local time) and hit the old cap. The fork step's `brew install coreutils`
-    # adds more, and is fail-safe (skips if brew is unavailable), so it never
-    # fails this gating leg. A generous cap absorbs the slow tail; a genuinely
-    # hung run still fails, just later.
-    timeout-minutes: 60
+    # 90, not 35/60: GitHub's macOS runners are extremely variable. The same suite
+    # step that finishes in ~15 min on a fresh runner took >60 min on a contended
+    # one on 2026-08-21 (~12x the ~5-min local time, process-spawn bound: 2177
+    # tests, most spawning the CLI as a subprocess). It is slow, not hung (it
+    # passes whole on a normal runner), so a generous cap is the pragmatic fix for
+    # infra variability. The fork step's `brew install coreutils` is fail-safe
+    # (skips if unavailable) and never fails this gating leg. A truly pathological
+    # runner past 90 min is rare; re-run. Parallelising the suite (bats --jobs,
+    # needs GNU parallel + parallel-safe tests) is the deeper fix if this recurs.
+    timeout-minutes: 90
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -eo pipefail {0}

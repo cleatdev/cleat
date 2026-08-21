@@ -873,6 +873,28 @@ _docker_context_name() {
   docker context show 2>/dev/null || true
 }
 
+# Overridable in tests. Is $1 a live unix socket on the host? Gating the docker
+# cap's bind on this is the SAFETY property: a bind mount whose SOURCE is
+# missing makes the engine materialise a DIRECTORY on the host at that path
+# (the pattern that once broke git machine-wide, see the host-damage note).
+_host_sock_is_live() {  # path
+  [ -S "$1" ]
+}
+
+# The host Docker socket PATH the docker cap should bind, engine-aware so it is
+# never a blind /var/run/docker.sock: under rootless the daemon lives at
+# /run/user/<uid>/docker.sock and under Colima at ~/.colima/<profile>/docker.sock.
+# $1 is the already-resolved endpoint (DOCKER_HOST or the active context). Prints
+# the unix socket path, the standard path for an empty endpoint, or NOTHING for a
+# remote (tcp/ssh/fd) endpoint that has no local socket to bind.
+_resolve_host_docker_sock() {  # endpoint
+  case "$1" in
+    unix://*) printf '%s\n' "${1#unix://}" ;;
+    "")       printf '%s\n' "/var/run/docker.sock" ;;
+    *)        ;;
+  esac
+}
+
 # True inside WSL2 (Docker Desktop for Windows integrates via WSL; the
 # Windows-side app can be launched from here). Overridable in tests.
 _is_wsl() {
@@ -8008,7 +8030,25 @@ cmd_run() {
   # Full rationale: concept/15-docker-capability.md.
   local docker_args=()
   if cap_is_active docker; then
-    mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
+    # Bind the REAL host Docker socket, engine-aware, never a blind
+    # /var/run/docker.sock. DOCKER_HOST wins over the active context (docker's
+    # own precedence). Rootful is /var/run/docker.sock, rootless is
+    # /run/user/<uid>/docker.sock, Colima is ~/.colima/<profile>/docker.sock.
+    # Guard on a live socket: a missing source would make the engine create a
+    # DIRECTORY on the host at that path (the bind-source hazard). A remote
+    # (tcp/ssh) daemon has no socket to bind, so hand the box DOCKER_HOST
+    # instead. If nothing is reachable, warn and skip rather than mount a
+    # phantom path.
+    local _docker_ep _host_dsock
+    _docker_ep="${DOCKER_HOST:-$(_docker_context_endpoint)}"
+    _host_dsock="$(_resolve_host_docker_sock "$_docker_ep")"
+    if [ -n "$_host_dsock" ] && _host_sock_is_live "$_host_dsock"; then
+      mount_args+=(-v "$_host_dsock:/var/run/docker.sock")
+    elif [ -z "$_host_dsock" ] && [ -n "$_docker_ep" ]; then
+      docker_args+=(-e "DOCKER_HOST=$_docker_ep")
+    else
+      warn "docker cap: no live Docker socket at ${_host_dsock:-the daemon endpoint}. The box's docker client will not reach the host daemon until Docker is running. (cleat reads the engine from DOCKER_HOST and the active docker context.)"
+    fi
     # A fork box must expose its COPY at the host path, never the live tree:
     # mounting $project here would hand a fork box the real working directory
     # read-write and point its workdir at it, cancelling the isolation.

@@ -427,12 +427,31 @@ s|^KNOWN_CAPS=(git ssh env hooks gh docker)$|KNOWN_CAPS=(git ssh env hooks gh)|
 SED
 try "v0.10.0_docker_in_known_caps" "docker listed in KNOWN_CAPS"
 
-# v0.10.0: docker cap must mount the host docker socket when active. Remove
-# the socket mount; the regression guard for socket mount should fail.
+# v0.10.0: docker cap must mount the host docker socket when active. Neutralise
+# the socket mount (replace with a no-op, NOT delete: the line sits inside an
+# if/elif so deleting it leaves an empty then-body syntax error); the regression
+# guard for socket mount should fail.
 cat > "$SED_TMP" << 'SED'
-/mount_args+=(-v \/var\/run\/docker.sock/d
+s|mount_args+=(-v "\$_host_dsock:/var/run/docker.sock")|:|
 SED
 try "v0.10.0_docker_cap_socket_mount" "docker cap mounts host socket"
+
+# vnext: the docker cap must bind the socket resolved from DOCKER_HOST / the
+# active context, NOT a hard-coded /var/run/docker.sock. Hard-code it back; the
+# rootless-socket test (expecting /run/user/<uid>) should fail.
+cat > "$SED_TMP" << 'SED'
+s|mount_args+=(-v "\$_host_dsock:/var/run/docker.sock")|mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)|
+SED
+try "vnext_docker_cap_engine_aware_sock" "binds the rootless socket at" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: the missing-socket GUARD. A resolved socket that is not live must NOT be
+# bound, because a missing bind SOURCE makes the engine create a directory on the
+# host at that path. Bypass the liveness check; the missing-socket test should
+# fail as a phantom mount reappears.
+cat > "$SED_TMP" << 'SED'
+s/_host_sock_is_live "\$_host_dsock"/true/
+SED
+try "vnext_docker_cap_sock_liveness_guard" "missing socket is NOT mounted" "$CLI" "$CAPABILITIES_BATS"
 
 # v0.10.0: docker cap must add a host-path identity mount + workdir so
 # $(pwd) inside Cleat resolves to a host-valid path. Remove the identity

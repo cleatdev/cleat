@@ -1066,9 +1066,17 @@ EOF
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
   printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
 
+  # The engine-aware cap binds the REAL socket and guards on it being live.
+  # Provide a real live host socket via DOCKER_HOST so this passes
+  # deterministically even on a runner without Docker (macOS CI has no
+  # /var/run/docker.sock, so the guard would correctly skip the mount there).
+  local fake_sock="$TEST_TEMP/docker.sock"
+  python3 -c "import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])" "$fake_sock"
+  export DOCKER_HOST="unix://$fake_sock"
+
   cd "$TEST_TEMP/project"
   run cleat_bin_timeout 5 start
-  grep -qF "/var/run/docker.sock:/var/run/docker.sock" "$DOCKER_CALLS" || {
+  grep -qF "$fake_sock:/var/run/docker.sock" "$DOCKER_CALLS" || {
     echo "docker socket mount missing from docker run"
     cat "$DOCKER_CALLS"
     return 1

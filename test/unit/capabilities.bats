@@ -366,6 +366,80 @@ EOF
   assert_success
 }
 
+# ── Engine-aware docker socket (rootless / Colima / remote) + missing-socket
+# guard. The cap must bind the REAL host socket for the active engine, never a
+# blind /var/run/docker.sock, and must NEVER bind a missing source (which makes
+# the engine create a phantom directory on the host). Source: DOCKER_HOST wins
+# over the active context. See _resolve_host_docker_sock / _host_sock_is_live.
+
+@test "docker cap: binds the rootless socket at /run/user/<uid> from the context" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  unset DOCKER_HOST
+  _docker_context_endpoint() { echo "unix:///run/user/1000/docker.sock"; }
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/run/user/1000/docker.sock:/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: binds the Colima socket under ~/.colima from the context" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  unset DOCKER_HOST
+  _docker_context_endpoint() { echo "unix:///Users/dev/.colima/default/docker.sock"; }
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/Users/dev/.colima/default/docker.sock:/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: DOCKER_HOST wins over the context for the socket source" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_context_endpoint() { echo "unix:///var/run/docker.sock"; }   # would lose
+  export DOCKER_HOST="unix:///run/user/1000/docker.sock"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/run/user/1000/docker.sock:/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: a missing socket is NOT mounted (no phantom host directory)" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  unset DOCKER_HOST
+  _docker_context_endpoint() { echo "unix:///run/user/1000/docker.sock"; }
+  _host_sock_is_live() { return 1; }    # the socket is absent on the host
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "no live Docker socket"
+  run assert_docker_run_lacks "$cname" ":/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: a remote (tcp) daemon passes DOCKER_HOST instead of a socket bind" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  export DOCKER_HOST="tcp://10.0.0.5:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "DOCKER_HOST=tcp://10.0.0.5:2375"
+  assert_success
+  run assert_docker_run_lacks "$cname" ":/var/run/docker.sock"
+  assert_success
+}
+
 @test "docker cap: bind-mounts project at its host path (identity mount)" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

@@ -386,6 +386,11 @@ jobs:
           # macOS" trap). Point TMPDIR under $HOME so the project + config dirs are
           # inside the shared scope.
           export TMPDIR="$HOME/colima-tmp"; mkdir -p "$TMPDIR"
+          # The integration tests isolate $HOME, which hides Colima's docker
+          # context (it lives under the real ~/.docker). Point DOCKER_HOST at
+          # Colima's forwarded socket explicitly so cleat's engine-aware docker
+          # cap resolves + binds it regardless of the test's HOME.
+          export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
           rc=0; ./test/integration/run.sh > "$RUNNER_TEMP/integration.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/integration.log"; exit "$rc"
 

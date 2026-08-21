@@ -251,6 +251,11 @@ source_cli() {
   # no-op (the real _is_wsl already returns false). Tests that exercise WSL
   # behavior override this in their own body, after setup.
   _is_wsl() { return 1; }
+  # Default the docker-cap socket-liveness guard to TRUE so the cap-mount tests
+  # are deterministic regardless of whether the CI/dev host actually has a
+  # /var/run/docker.sock. Tests exercising the missing-socket guard override
+  # this to return 1, and the engine-aware tests override _docker_context_endpoint.
+  _host_sock_is_live() { return 0; }
 }
 
 # Enable the docker stub by prepending MOCK_BIN to PATH

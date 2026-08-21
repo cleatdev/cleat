@@ -170,14 +170,19 @@ jobs:
           cat "$RUNNER_TEMP/fork-gnu.log"; exit "$rc"
 
   # ── macOS Intel ─────────────────────────────────────────────────────────────
-  # macos-15 is Apple Silicon. Cleat's documented host matrix includes Intel
-  # Macs, and nothing else exercises them: the arch differences that have cost
-  # releases before were base-image ones (an arm64 box needed libicu72 that
+  # macos-15 (above) is Apple Silicon. Cleat's documented host matrix includes
+  # Intel Macs, and nothing else exercises them: the arch differences that have
+  # cost releases before were base-image ones (an arm64 box needed libicu72 that
   # amd64 already had). Suite only, no mutation harness: the harness is covered
   # on two runners already and this leg is about arch, not about test depth.
+  # runs-on is macos-15-intel, NOT macos-13: GitHub retired the macos-13 image on
+  # 2025-12-04, so a job pinned to it never gets a runner and sits queued for the
+  # 24h max before being cancelled (exactly what this leg did from the day it was
+  # added). macos-15-intel is the LAST x86_64 Actions image, available until
+  # August 2027, after which Apple's Intel drop retires this leg for good.
   test-macos-intel:
     name: test (macos intel, bash 3.2)
-    runs-on: macos-13
+    runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

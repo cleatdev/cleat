@@ -12,7 +12,15 @@ load "$TEST_DIR/test_helper/bats-assert/load"
 CLI="$PROJECT_ROOT/bin/cleat"
 
 _common_setup() {
-  TEST_TEMP="$(mktemp -d)"
+  # Root TEST_TEMP under $TMPDIR EXPLICITLY. macOS `mktemp -d` with no template
+  # ignores $TMPDIR and uses the Darwin per-user dir (/var/folders/...), which
+  # the Colima/Lima VM does not share into the guest, so cleat's file mounts
+  # (project, isolated HOME, claude.json) land empty or as the wrong type inside
+  # the box and every box-creating integration test fails. Passing a template
+  # rooted at $TMPDIR honours the Colima job's `export TMPDIR="$HOME/colima-tmp"`
+  # (inside Lima's shared $HOME) and is a no-op everywhere else (Linux keeps /tmp,
+  # native macOS keeps its default TMPDIR). Portable across GNU and BSD mktemp.
+  TEST_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/cleat.XXXXXXXX")"
   export TEST_TEMP
 
   MOCK_BIN="$TEST_DIR/fixtures/mock_bin"

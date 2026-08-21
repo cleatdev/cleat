@@ -1394,6 +1394,12 @@ EOF
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
 
+  # Pin the daemon location so the branch is deterministic across the matrix:
+  # host-local daemon whose socket resolves to /var/run/docker.sock.
+  unset DOCKER_HOST
+  _docker_pool_is_vm() { return 1; }
+  _docker_context_endpoint() { echo "unix:///var/run/docker.sock"; }
+
   cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
 [caps]
 docker

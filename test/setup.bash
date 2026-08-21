@@ -256,6 +256,12 @@ source_cli() {
   # /var/run/docker.sock. Tests exercising the missing-socket guard override
   # this to return 1, and the engine-aware tests override _docker_context_endpoint.
   _host_sock_is_live() { return 0; }
+  # NOTE: _docker_pool_is_vm is deliberately NOT defaulted here. It is DERIVED
+  # from _is_macos + _is_docker_desktop, and the prune "ready:" VM-advisory tests
+  # stub those two and expect the derived value to follow. A blanket default here
+  # shadows that derivation and makes those tests read an empty VM readiness line.
+  # Tests that need a fixed daemon location stub _docker_pool_is_vm in their own
+  # body: host-local as `return 1` (the docker-cap socket tests), VM as `return 0`.
 }
 
 # Enable the docker stub by prepending MOCK_BIN to PATH

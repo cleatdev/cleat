@@ -1076,7 +1076,10 @@ EOF
 
   cd "$TEST_TEMP/project"
   run cleat_bin_timeout 5 start
-  grep -qF "$fake_sock:/var/run/docker.sock" "$DOCKER_CALLS" || {
+  # Assert the DEST is bound (a socket is mounted). Source differs by daemon
+  # location: host-local (Linux) binds $fake_sock; a VM-backed daemon (macOS
+  # runner) binds the in-VM /var/run/docker.sock. Both end at :/var/run/docker.sock.
+  grep -qF ":/var/run/docker.sock" "$DOCKER_CALLS" || {
     echo "docker socket mount missing from docker run"
     cat "$DOCKER_CALLS"
     return 1

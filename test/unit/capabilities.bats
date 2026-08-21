@@ -355,6 +355,12 @@ EOF
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
 
+  # Pin a host-local daemon whose socket resolves to /var/run/docker.sock so the
+  # bound source is deterministic on every leg of the host matrix.
+  unset DOCKER_HOST
+  _docker_pool_is_vm() { return 1; }
+  _docker_context_endpoint() { echo "unix:///var/run/docker.sock"; }
+
   cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
 [caps]
 docker
@@ -372,11 +378,12 @@ EOF
 # the engine create a phantom directory on the host). Source: DOCKER_HOST wins
 # over the active context. See _resolve_host_docker_sock / _host_sock_is_live.
 
-@test "docker cap: binds the rootless socket at /run/user/<uid> from the context" {
+@test "docker cap: host-local rootless daemon binds the real /run/user/<uid> socket" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
   local cname; cname="$(container_name_for "$TEST_TEMP/project")"
   unset DOCKER_HOST
+  _docker_pool_is_vm() { return 1; }   # host-local daemon (native Linux rootless)
   _docker_context_endpoint() { echo "unix:///run/user/1000/docker.sock"; }
   printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
   run cmd_run "$TEST_TEMP/project"
@@ -385,16 +392,22 @@ EOF
   assert_success
 }
 
-@test "docker cap: binds the Colima socket under ~/.colima from the context" {
+@test "docker cap: a VM-backed daemon (Colima/Docker Desktop) binds the in-VM socket, not the host forward" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
   local cname; cname="$(container_name_for "$TEST_TEMP/project")"
   unset DOCKER_HOST
+  # A VM daemon's real socket is /var/run/docker.sock INSIDE the VM; the host
+  # context path (~/.colima/...) is only a forward the VM cannot bind. cleat
+  # must bind the in-VM path, NEVER the resolved host path.
+  _docker_pool_is_vm() { return 0; }
   _docker_context_endpoint() { echo "unix:///Users/dev/.colima/default/docker.sock"; }
   printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
   run cmd_run "$TEST_TEMP/project"
   assert_success
-  run assert_docker_run_has "$cname" "/Users/dev/.colima/default/docker.sock:/var/run/docker.sock"
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_lacks "$cname" ".colima"
   assert_success
 }
 
@@ -402,6 +415,7 @@ EOF
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"
   local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }   # host-local daemon
   _docker_context_endpoint() { echo "unix:///var/run/docker.sock"; }   # would lose
   export DOCKER_HOST="unix:///run/user/1000/docker.sock"
   printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
@@ -416,6 +430,7 @@ EOF
   mkdir -p "$TEST_TEMP/project"
   local cname; cname="$(container_name_for "$TEST_TEMP/project")"
   unset DOCKER_HOST
+  _docker_pool_is_vm() { return 1; }   # host-local daemon (guard only applies here)
   _docker_context_endpoint() { echo "unix:///run/user/1000/docker.sock"; }
   _host_sock_is_live() { return 1; }    # the socket is absent on the host
   printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"

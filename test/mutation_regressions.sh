@@ -442,7 +442,7 @@ try "v0.10.0_docker_cap_socket_mount" "docker cap mounts host socket"
 cat > "$SED_TMP" << 'SED'
 s|mount_args+=(-v "\$_host_dsock:/var/run/docker.sock")|mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)|
 SED
-try "vnext_docker_cap_engine_aware_sock" "binds the rootless socket at" "$CLI" "$CAPABILITIES_BATS"
+try "vnext_docker_cap_engine_aware_sock" "host-local rootless daemon binds" "$CLI" "$CAPABILITIES_BATS"
 
 # vnext: the missing-socket GUARD. A resolved socket that is not live must NOT be
 # bound, because a missing bind SOURCE makes the engine create a directory on the
@@ -452,6 +452,15 @@ cat > "$SED_TMP" << 'SED'
 s/_host_sock_is_live "\$_host_dsock"/true/
 SED
 try "vnext_docker_cap_sock_liveness_guard" "missing socket is NOT mounted" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: a VM-backed daemon (Docker Desktop / Colima / OrbStack) must bind the
+# in-VM /var/run/docker.sock, NOT the host context path the VM cannot bind
+# (that regressed the fix's first cut). Make the VM branch use the host path;
+# the VM-daemon test should fail.
+cat > "$SED_TMP" << 'SED'
+s|mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)|mount_args+=(-v "\$_host_dsock:/var/run/docker.sock")|
+SED
+try "vnext_docker_cap_vm_daemon_sock" "VM-backed daemon" "$CLI" "$CAPABILITIES_BATS"
 
 # v0.10.0: docker cap must add a host-path identity mount + workdir so
 # $(pwd) inside Cleat resolves to a host-valid path. Remove the identity

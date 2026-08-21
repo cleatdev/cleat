@@ -16,6 +16,13 @@
 #   filter: optional substring to select a subset of mutations by name
 #
 # Exit: 0 if every tested mutation is caught; 1 otherwise.
+#
+# BSD-sed caveat: this is designed to be GNU+BSD portable, and the Linux CI leg
+# (GNU sed) runs it green at 0 missed / 0 skipped. On BSD sed (macOS) ~8 older
+# entries currently MISS or SKIP because their seds lean on GNU-sed behaviour
+# (e.g. the `a\` append syntax and some `\[...\]` patterns differ). CI therefore
+# gates this harness on Linux only. If you run it on a Mac, expect those few
+# false MISSED/SKIPPED lines; making every sed BSD-portable is a tracked follow-up.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 

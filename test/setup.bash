@@ -11,16 +11,29 @@ load "$TEST_DIR/test_helper/bats-assert/load"
 
 CLI="$PROJECT_ROOT/bin/cleat"
 
+# The base directory TEST_TEMP is created under, with trailing slashes stripped.
+# macOS sets TMPDIR to /var/folders/.../T/ (trailing slash); "${TMPDIR}/cleat.XXX"
+# then yields a // that `mktemp -d` preserves, and that doubled slash rides into
+# every path derived from TEST_TEMP (container names, per-box run dirs) and broke
+# ~168 tests across the macOS suite (regressed 2026-08-22, last green run 18f186d).
+# Extracted as a function so the trailing-slash handling is unit-testable on any
+# platform, not only where TMPDIR happens to end in a slash. $1 overrides the
+# base for testing; unset uses ${TMPDIR:-/tmp}.
+_test_tmp_base() {
+  local b="${1-${TMPDIR:-/tmp}}"
+  while [ "$b" != "${b%/}" ]; do b="${b%/}"; done
+  [ -n "$b" ] || b=/tmp
+  printf '%s\n' "$b"
+}
+
 _common_setup() {
-  # Root TEST_TEMP under $TMPDIR EXPLICITLY. macOS `mktemp -d` with no template
-  # ignores $TMPDIR and uses the Darwin per-user dir (/var/folders/...), which
-  # the Colima/Lima VM does not share into the guest, so cleat's file mounts
-  # (project, isolated HOME, claude.json) land empty or as the wrong type inside
-  # the box and every box-creating integration test fails. Passing a template
-  # rooted at $TMPDIR honours the Colima job's `export TMPDIR="$HOME/colima-tmp"`
-  # (inside Lima's shared $HOME) and is a no-op everywhere else (Linux keeps /tmp,
-  # native macOS keeps its default TMPDIR). Portable across GNU and BSD mktemp.
-  TEST_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/cleat.XXXXXXXX")"
+  # Root TEST_TEMP under $TMPDIR EXPLICITLY (via _test_tmp_base, which strips
+  # trailing slashes: see its definition above). macOS `mktemp -d` with no
+  # template ignores $TMPDIR and uses the Darwin per-user dir, which the
+  # Colima/Lima VM does not share into the guest, so an in-VM integration run's
+  # file mounts land empty; a $TMPDIR-rooted template honours the Colima job's
+  # TMPDIR override and is a no-op elsewhere.
+  TEST_TEMP="$(mktemp -d "$(_test_tmp_base)/cleat.XXXXXXXX")"
   export TEST_TEMP
 
   MOCK_BIN="$TEST_DIR/fixtures/mock_bin"

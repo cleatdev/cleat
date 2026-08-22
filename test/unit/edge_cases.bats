@@ -36,6 +36,22 @@ setup() {
 
 teardown() { _common_teardown; }
 
+# ── test-harness: TEST_TEMP must never carry a doubled slash ─────────────────
+# 2026-08-22: macOS sets TMPDIR to /var/folders/.../T/ (trailing slash), and the
+# then-new "${TMPDIR}/cleat.XXX" template gave a // that `mktemp -d` preserved.
+# That doubled slash rode into every path derived from TEST_TEMP and broke ~168
+# tests across the macOS suite. Linux left TMPDIR unset (so /tmp had no trailing
+# slash), which hid it until the macOS suite could run to completion. This guards
+# the fix (setup.bash's _test_tmp_base) on every platform, not only macOS.
+@test "test harness: _test_tmp_base strips trailing slashes (no // in TEST_TEMP)" {
+  assert_equal "$(_test_tmp_base "/tmp/")" "/tmp"
+  assert_equal "$(_test_tmp_base "/var/folders/x/T//")" "/var/folders/x/T"
+  assert_equal "$(_test_tmp_base "/tmp")" "/tmp"
+  assert_equal "$(_test_tmp_base "/")" "/tmp"
+  # And the live TEST_TEMP this test runs under must itself be slash-clean.
+  [[ "$TEST_TEMP" != *//* ]] || fail "TEST_TEMP carries a doubled slash: $TEST_TEMP"
+}
+
 # ── resolve_project edge cases ──────────────────────────────────────────────
 
 @test "resolve_project: existing directory returns absolute path" {

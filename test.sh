@@ -50,11 +50,37 @@ start_time=$(date +%s)
 
 files=("$SCRIPT_DIR"/test/unit/*.bats)
 
+# Optional sharding for slow CI runners: TEST_SHARD_TOTAL=N + TEST_SHARD_INDEX=K
+# runs only the files at positions where (pos % N == K), so CI can split the
+# suite across N parallel runners. macOS runners are slow and highly variable, so
+# one shard finishes under the job timeout where the whole suite would not. Unset
+# (the default: local runs and the Linux CI legs) runs every file. Modulo-by-
+# position interleaves the list so each shard draws a mix of large and small files.
+_shard_note=""
+if [[ -n "${TEST_SHARD_TOTAL:-}" ]]; then
+  _shard_files=()
+  _shard_i=0
+  for _sf in "${files[@]}"; do
+    if [[ $((_shard_i % TEST_SHARD_TOTAL)) -eq "${TEST_SHARD_INDEX:-0}" ]]; then
+      _shard_files+=("$_sf")
+    fi
+    _shard_i=$((_shard_i + 1))
+  done
+  # ${#arr[@]} is safe under set -u even when empty; a bare "${arr[@]}" is not on
+  # bash 3.2, so bail before the loop rather than expand an empty array.
+  if [[ ${#_shard_files[@]} -eq 0 ]]; then
+    echo "No test files for shard ${TEST_SHARD_INDEX:-0}/${TEST_SHARD_TOTAL}."
+    exit 0
+  fi
+  files=("${_shard_files[@]}")
+  _shard_note=" ${DIM}(shard ${TEST_SHARD_INDEX:-0}/${TEST_SHARD_TOTAL})${RESET}"
+fi
+
 echo ""
 echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────┐${RESET}"
 echo -e "${BOLD}${CYAN}  │   Cleat CLI Test Suite                  │${RESET}"
 echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────┘${RESET}"
-echo -e "  ${DIM}Running ${#files[@]} test files...${RESET}"
+echo -e "  ${DIM}Running ${#files[@]} test files...${RESET}${_shard_note}"
 echo ""
 
 for f in "${files[@]}"; do

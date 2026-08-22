@@ -118,24 +118,28 @@ jobs:
   #
   # Pinned to macos-15 (not macos-latest) on purpose. GitHub is migrating the
   # `macos-latest` label to macOS 26 over Jun 15–Jul 15 2026, gradually, so the
-  # `latest` label would run this canary on a mix of OS images during the
-  # rollout. Pinning keeps the bash-3.2 canary deterministic; macos-15 is
-  # supported for ~a year. Revisit (bump to macos-26 or back to latest) once the
-  # migration settles. The 3.2.x assertion below is the backstop either way.
+  # `latest` label would run this on a mix of OS images during the rollout.
+  # Pinning keeps the bash-3.2 leg deterministic; macos-15 is supported for ~a
+  # year. The 3.2.x assertion below is the backstop either way.
+  #
+  # SHARDED across 4 parallel runners. GitHub's macOS runners are extremely
+  # variable: the whole suite finishes in ~15 min on a fresh runner but ran past
+  # 90 min on a contended one on 2026-08-21 (~12-18x the ~5-min local time,
+  # process-spawn bound: ~2181 tests, most spawning the CLI). One job could not
+  # reliably finish under any sane cap, so it cancelled at the timeout instead of
+  # going green. Each shard runs ~1/4 of the files (test.sh TEST_SHARD_*), so even
+  # a slow runner's shard clears the 45-min cap and the four run in parallel;
+  # `fail-fast: false` lets one shard's real failure surface the others. No
+  # mutation harness on macOS (see the note below); the GNU-on-Darwin fork
+  # profile is its own advisory job.
   test-macos-bash32:
-    name: test (macos, bash 3.2)
+    name: test (macos, bash 3.2) shard ${{ matrix.shard }}
     runs-on: macos-15
-    # Suite + fork-copy only (no mutation harness on macOS, see the note below).
-    # 90, not 35/60: GitHub's macOS runners are extremely variable. The same suite
-    # step that finishes in ~15 min on a fresh runner took >60 min on a contended
-    # one on 2026-08-21 (~12x the ~5-min local time, process-spawn bound: 2177
-    # tests, most spawning the CLI as a subprocess). It is slow, not hung (it
-    # passes whole on a normal runner), so a generous cap is the pragmatic fix for
-    # infra variability. The fork step's `brew install coreutils` is fail-safe
-    # (skips if unavailable) and never fails this gating leg. A truly pathological
-    # runner past 90 min is rare; re-run. Parallelising the suite (bats --jobs,
-    # needs GNU parallel + parallel-safe tests) is the deeper fix if this recurs.
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -eo pipefail {0}
@@ -145,41 +149,34 @@ jobs:
           submodules: recursive
       - name: Bash version (must be 3.2)
         run: |
-          bash --version
-          /bin/bash --version
           /bin/bash -c 'echo "BASH_VERSION=$BASH_VERSION"' | grep -E '^BASH_VERSION=3\.2\.' \
             || { echo "Expected /bin/bash to be 3.2.x"; exit 1; }
-      - name: Diagnostic, verify cleat binary runs on bash 3.2
-        run: |
-          export HOME=/tmp/cleat-diag
-          export XDG_CONFIG_HOME=/tmp/cleat-diag-xdg
-          mkdir -p "$HOME/.claude" "$XDG_CONFIG_HOME/cleat"
-          export PATH="$(pwd)/test/fixtures/mock_bin:$PATH"
-          export DOCKER_CALLS=/tmp/docker_calls DOCKER_MOCK_DIR=/tmp/docker_mock
-          touch "$DOCKER_CALLS"; mkdir -p "$DOCKER_MOCK_DIR"
-          echo "=== cleat --help ==="
-          /bin/bash bin/cleat --help 2>&1 | head -5 || echo "EXIT: $?"
-          echo "=== cleat config --enable git ==="
-          /bin/bash bin/cleat config --enable git 2>&1 || echo "EXIT: $?"
-          echo "=== cleat config --enable git (trace last 20) ==="
-          /bin/bash -x bin/cleat config --enable git 2>&1 | tail -20 || echo "EXIT: $?"
-          echo "=== which timeout ==="
-          which timeout 2>&1 || echo "timeout not found"
-          echo "=== locale ==="
-          locale 2>&1 || true
-      - name: Run full BATS suite via /bin/bash
+      - name: Run suite shard ${{ matrix.shard }}/4 via /bin/bash
+        env:
+          TEST_SHARD_TOTAL: '4'
+          TEST_SHARD_INDEX: ${{ matrix.shard }}
         run: |
           rc=0; /bin/bash ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
 
-      # ── The Homebrew-coreutils macOS profile ────────────────────────────────
-      # Plenty of macOS developers put GNU coreutils ahead of the system tools
-      # (`brew install coreutils` plus gnubin on PATH). That host is Darwin but
-      # has GNU cp, which rejects -c with "invalid option". Any code that picks
-      # tool flags from `uname -s` breaks for exactly that profile, which is why
-      # the fork copy probes the cp BINARY instead. Nothing else in CI covers
-      # this combination: the ubuntu legs are GNU-on-Linux and the macOS legs
-      # are BSD-on-Darwin, so GNU-on-Darwin only exists here.
+  # ── GNU-coreutils-on-Darwin profile (ADVISORY) ──────────────────────────────
+  # Plenty of macOS developers put GNU coreutils ahead of the system tools
+  # (`brew install coreutils` plus gnubin on PATH). That host is Darwin but has
+  # GNU cp, which rejects -c: any code that picks tool flags from `uname -s`
+  # breaks for exactly that profile, which is why the fork copy probes the cp
+  # BINARY. Nothing else covers GNU-on-Darwin (ubuntu is GNU-on-Linux, the macOS
+  # shards are BSD-on-Darwin). Advisory because `brew install coreutils` is slow
+  # and occasionally flaky and must not gate the board; fork.bats itself already
+  # gates on the sharded suite (BSD) and the ubuntu legs (GNU).
+  fork-gnu-macos:
+    name: fork (GNU coreutils on macOS)
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Fork copy under GNU coreutils on macOS
         run: |
           brew install coreutils >/dev/null 2>&1 || true

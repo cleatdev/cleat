@@ -519,6 +519,23 @@ s#\[ -n "\${DOCKER_TLS_VERIFY:-}" \] && _tls=1#:#
 SED
 try "vnext_docker_cap_tls_verify_env" "DOCKER_TLS_VERIFY set warns" "$CLI" "$CAPABILITIES_BATS"
 
+# vnext: a LOOPBACK tcp DOCKER_HOST is a host-local daemon, so the cap must bind
+# the host socket, never forward 127.0.0.1 (which inside the box is the box).
+# Through v1.4.2 that config got the socket bind. Remove the loopback branch; the
+# loopback bind test should fail.
+cat > "$SED_TMP" << 'SED'
+/^_endpoint_is_loopback()/,/^}$/ s#^    127\.0\.0\.1|localhost) return 0 ;;#    NOMATCH_LOOPBACK) return 0 ;;#
+SED
+try "vnext_docker_cap_loopback_binds_socket" "loopback tcp DOCKER_HOST binds the host socket" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: loopback detection must not swallow a ROUTABLE tcp daemon (that would
+# bind a local socket for a genuinely remote engine). Make every tcp endpoint
+# look like loopback; the routable-remote test should fail.
+cat > "$SED_TMP" << 'SED'
+/^_endpoint_is_loopback()/,/^}$/ s#^  return 1$#  return 0#
+SED
+try "vnext_docker_cap_loopback_not_overbroad" "routable tcp daemon is still treated as remote" "$CLI" "$CAPABILITIES_BATS"
+
 # vnext: DOCKER_HOST must win over the active docker context for the socket
 # source. Drop DOCKER_HOST from the precedence; the DOCKER_HOST-wins test fails.
 cat > "$SED_TMP" << 'SED'

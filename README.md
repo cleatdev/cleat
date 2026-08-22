@@ -65,17 +65,19 @@ That's it. First run pulls the prebuilt image from GHCR (~30s), starts an isolat
 
 ## Compatibility
 
-Cleat is a single bash script plus a Docker image. It runs anywhere Docker and bash do. The full host matrix below is exercised by the test suite on every push.
+Cleat is a single bash script plus a Docker image. It runs anywhere Docker and bash do. Every axis below is covered by the test suite. Most of them run on real hardware in CI on every push.
 
 | Axis | Runs on |
 |---|---|
 | **Host OS** | macOS (Apple Silicon + Intel) · Linux · Windows via WSL2 |
 | **Shell** | bash 3.2 (the macOS default) through bash 5 |
-| **Coreutils** | BSD (macOS) · GNU (Linux) |
-| **Docker engine** | Docker Desktop · OrbStack · Colima · Rancher Desktop · Lima · native Linux rootful + rootless · remote over tcp/ssh |
+| **Coreutils** | BSD (macOS) · GNU (Linux) · GNU-on-macOS (Homebrew coreutils) |
+| **Docker engine** | Docker Desktop · OrbStack · Colima · Rancher Desktop · Lima · native Linux rootful + rootless |
 | **Architecture** | arm64 · amd64 |
 
-The `docker` capability is engine-aware: it binds the right daemon socket for where the daemon actually runs, so a caged agent builds and runs containers on your engine whether that daemon lives in a VM, on the host, rootless or on a remote host.
+Cleat needs a daemon it can reach on the local machine, because a box mounts your project by host path. A remote daemon over `tcp://` or `ssh://` is not a supported target.
+
+The `docker` capability is engine-aware: it binds the right daemon socket for where the daemon actually runs, so a caged agent builds and runs containers on your engine whether that daemon lives in a VM (Docker Desktop, OrbStack, Colima, Lima), on the host, or rootless under `/run/user`.
 
 ---
 

@@ -563,6 +563,55 @@ EOF
   assert_success
 }
 
+@test "docker cap: a loopback tcp DOCKER_HOST binds the host socket, never forwards 127.0.0.1" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  # A local daemon reached over loopback TCP (dockerd -H tcp://127.0.0.1:2375, a
+  # socket-proxy, or Docker Desktop's "expose without TLS" as used from WSL2) is
+  # HOST-LOCAL. Through v1.4.2 it got the unconditional socket bind and worked.
+  # Forwarding DOCKER_HOST instead would point the box at its OWN loopback.
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 0; }   # the host socket is there
+  export DOCKER_HOST="tcp://127.0.0.1:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_lacks "$cname" "DOCKER_HOST=tcp://127.0.0.1:2375"
+  assert_success
+}
+
+@test "docker cap: a loopback tcp DOCKER_HOST with no host socket warns instead of pretending" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 1; }   # no socket to fall back on
+  export DOCKER_HOST="tcp://localhost:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "loopback"
+}
+
+@test "docker cap: a routable tcp daemon is still treated as remote, not loopback" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 0; }   # a host socket exists but must NOT be used
+  export DOCKER_HOST="tcp://10.0.0.5:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "DOCKER_HOST=tcp://10.0.0.5:2375"
+  assert_success
+  run assert_docker_run_lacks "$cname" ":/var/run/docker.sock"
+  assert_success
+}
+
 @test "docker cap: DOCKER_TLS_VERIFY set warns even on a non-2376 tcp port" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

@@ -58,6 +58,17 @@ files=("$SCRIPT_DIR"/test/unit/*.bats)
 # position interleaves the list so each shard draws a mix of large and small files.
 _shard_note=""
 if [[ -n "${TEST_SHARD_TOTAL:-}" ]]; then
+  # REFUSE a nonsense shard spec instead of running a subset (or nothing) and
+  # reporting success: a typo'd matrix would otherwise show a green job that
+  # tested less than it claimed, which is worse than a red one.
+  if [[ ! "${TEST_SHARD_TOTAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TEST_SHARD_TOTAL must be a positive integer, got '${TEST_SHARD_TOTAL}'." >&2
+    exit 1
+  fi
+  if [[ ! "${TEST_SHARD_INDEX:-0}" =~ ^[0-9]+$ ]] || [[ "${TEST_SHARD_INDEX:-0}" -ge "$TEST_SHARD_TOTAL" ]]; then
+    echo "TEST_SHARD_INDEX must be an integer in 0..$((TEST_SHARD_TOTAL - 1)), got '${TEST_SHARD_INDEX:-0}'." >&2
+    exit 1
+  fi
   _shard_files=()
   _shard_i=0
   for _sf in "${files[@]}"; do
@@ -67,10 +78,12 @@ if [[ -n "${TEST_SHARD_TOTAL:-}" ]]; then
     _shard_i=$((_shard_i + 1))
   done
   # ${#arr[@]} is safe under set -u even when empty; a bare "${arr[@]}" is not on
-  # bash 3.2, so bail before the loop rather than expand an empty array.
+  # bash 3.2, so bail before the loop rather than expand an empty array. With a
+  # validated spec this means more shards than files: still a misconfiguration,
+  # so fail rather than report a green job that ran nothing.
   if [[ ${#_shard_files[@]} -eq 0 ]]; then
-    echo "No test files for shard ${TEST_SHARD_INDEX:-0}/${TEST_SHARD_TOTAL}."
-    exit 0
+    echo "No test files for shard ${TEST_SHARD_INDEX:-0}/${TEST_SHARD_TOTAL}: more shards than test files." >&2
+    exit 1
   fi
   files=("${_shard_files[@]}")
   _shard_note=" ${DIM}(shard ${TEST_SHARD_INDEX:-0}/${TEST_SHARD_TOTAL})${RESET}"
@@ -91,9 +104,21 @@ for f in "${files[@]}"; do
   # any test that reads fd0 (e.g. a shim that falls through to `cat`) gets EOF
   # instead of blocking forever on the developer's terminal.
   output=$("$BATS" "$f" </dev/null 2>&1)
+  bats_rc=$?
   file_pass=$(echo "$output" | grep -c "^ok " || true)
   file_fail=$(echo "$output" | grep -c "^not ok " || true)
   file_skip=$(echo "$output" | grep -c "# skip" || true)
+
+  # Trust bats' EXIT STATUS, not just the "not ok" lines. A file whose bats run
+  # is killed (OOM, the job timeout, a crashed helper) can exit non-zero having
+  # printed no "not ok" at all, which counted as a clean pass and let a shard go
+  # green while testing nothing. Charge one synthetic failure so the file is
+  # reported and the suite exits non-zero.
+  if [[ "$bats_rc" -ne 0 && "$file_fail" -eq 0 ]]; then
+    file_fail=1
+    output="$output
+not ok (harness) bats exited $bats_rc without reporting a failure: the run was killed or crashed"
+  fi
 
   total_pass=$((total_pass + file_pass))
   total_fail=$((total_fail + file_fail))

@@ -852,6 +852,10 @@ _docker_pool_is_vm() {
   # phantom DIRECTORY there (the machine-damage pattern). A relocated
   # LIMA_HOME/COLIMA_HOME outside $HOME simply falls back to host-local (the
   # pre-detection behaviour): degraded, never dangerous.
+  # An empty or root HOME would degenerate the anchor to /.colima/* (or match
+  # far too broadly), reopening the over-match the anchor exists to close. No
+  # HOME means no Lima-family engine to detect, so answer host-local.
+  case "${HOME:-}" in ""|/) return 1 ;; esac
   local _ep="${DOCKER_HOST:-$(_docker_context_endpoint)}"
   _ep="${_ep#unix://}"
   case "$_ep" in
@@ -919,6 +923,26 @@ _resolve_host_docker_sock() {  # endpoint
     "")       printf '%s\n' "/var/run/docker.sock" ;;
     *)        ;;
   esac
+}
+
+# True when $1 is a tcp endpoint on the LOOPBACK interface, i.e. a host-local
+# daemon reached over TCP rather than a genuinely remote one. It matters because
+# 127.0.0.1 means something different inside the box: forwarding such a
+# DOCKER_HOST would point the box's client at ITS OWN loopback. Matches the
+# host part only, so a routable address that merely starts with those digits
+# (tcp://127.0.0.1.example.com) is not treated as loopback. Overridable in tests.
+_endpoint_is_loopback() {  # endpoint
+  local _hostport="${1#tcp://}"
+  case "$1" in tcp://*) ;; *) return 1 ;; esac
+  _hostport="${_hostport%%/*}"   # drop any path
+  _hostport="${_hostport%%:*}"   # drop the port (IPv6 handled below)
+  case "$1" in
+    "tcp://[::1]"*) return 0 ;;
+  esac
+  case "$_hostport" in
+    127.0.0.1|localhost) return 0 ;;
+  esac
+  return 1
 }
 
 # True inside WSL2 (Docker Desktop for Windows integrates via WSL; the
@@ -8077,8 +8101,23 @@ cmd_run() {
       mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     elif [ -n "$_host_dsock" ] && _host_sock_is_live "$_host_dsock"; then
       mount_args+=(-v "$_host_dsock:/var/run/docker.sock")
+    elif [ -z "$_host_dsock" ] && _endpoint_is_loopback "$_docker_ep" \
+         && _host_sock_is_live /var/run/docker.sock; then
+      # A LOOPBACK tcp endpoint (dockerd -H tcp://127.0.0.1:2375, a local
+      # socket-proxy, Docker Desktop's "expose the daemon on tcp://localhost
+      # without TLS" as used from WSL2) is a HOST-LOCAL daemon, not a remote one.
+      # Forwarding DOCKER_HOST would point the box at ITS OWN loopback, where
+      # nothing listens, so bind the host socket the daemon also serves. Through
+      # v1.4.2 this config got the unconditional socket bind and worked; keep it
+      # working rather than silently breaking it.
+      mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     elif [ -z "$_host_dsock" ] && [ -n "$_docker_ep" ]; then
       docker_args+=(-e "DOCKER_HOST=$_docker_ep")
+      # A loopback endpoint with no host socket to fall back on cannot work from
+      # inside the box: 127.0.0.1 there is the box itself. Say so plainly.
+      if _endpoint_is_loopback "$_docker_ep"; then
+        warn "docker cap: DOCKER_HOST is a loopback address ($_docker_ep) and no host socket was found at /var/run/docker.sock. Inside the box that address is the box itself, so its docker client will not reach the host daemon. Point DOCKER_HOST at a unix socket, or expose the daemon on a routable address."
+      fi
       # A TLS-secured remote (tcp://…:2376, or DOCKER_TLS_VERIFY set) needs the
       # client certs (DOCKER_CERT_PATH, default ~/.docker) to connect. Cleat does
       # NOT forward them into the cage: those are host credentials and mounting

@@ -469,14 +469,33 @@ s|mount_args+=(-v /var/run/docker.sock:/var/run/docker.sock)|mount_args+=(-v "\$
 SED
 try "vnext_docker_cap_vm_daemon_sock" "VM-backed daemon" "$CLI" "$CAPABILITIES_BATS"
 
-# vnext: Lima-backed engines on LINUX (Colima / Rancher / Lima) are VM-backed
-# but report host-local (not macOS, not Docker Desktop), so _docker_pool_is_vm
-# must detect them by endpoint path. Break the endpoint case; the Colima-on-Linux
-# test should fail (the cap would bind the unresolvable host forward path).
+# vnext: Lima-backed engines on LINUX (Colima ~/.colima, Rancher Desktop ~/.rd,
+# plain Lima ~/.lima) are VM-backed but report host-local (not macOS, not Docker
+# Desktop), so _docker_pool_is_vm detects them by their socket under $HOME. One
+# mutation per engine so a per-pattern break cannot slip through a green suite.
 cat > "$SED_TMP" << 'SED'
-s#\*/\.colima/\*|\*/\.rd/\*|\*/\.lima/\*)#NOMATCH_XYZ)#
+s#"\$HOME"/\.colima/\*|##
 SED
-try "vnext_docker_pool_is_vm_lima_on_linux" "Colima on Linux is detected as a VM" "$CLI" "$CAPABILITIES_BATS"
+try "vnext_docker_pool_colima" "Colima on Linux is detected as a VM" "$CLI" "$CAPABILITIES_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s#"\$HOME"/\.rd/\*|##
+SED
+try "vnext_docker_pool_rancher" "Rancher Desktop" "$CLI" "$CAPABILITIES_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s#|"\$HOME"/\.lima/\*##
+SED
+try "vnext_docker_pool_lima" "plain Lima" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: the VM-detection case must be ANCHORED to $HOME, not a bare */.colima/*
+# substring, or a host-local socket that merely contains such a segment (e.g.
+# unix:///opt/.rd/docker.sock) is misrouted to the guardless in-VM bind (phantom
+# host-directory risk). Un-anchor it; the incidental-path test should fail.
+cat > "$SED_TMP" << 'SED'
+s#"\$HOME"/\.colima/\*|"\$HOME"/\.rd/\*|"\$HOME"/\.lima/\*#*/.colima/*|*/.rd/*|*/.lima/*#
+SED
+try "vnext_docker_pool_home_anchor" "incidental .rd segment NOT under HOME" "$CLI" "$CAPABILITIES_BATS"
 
 # vnext: _resolve_host_docker_sock must strip a trailing slash so an env-file
 # DOCKER_HOST like 'unix:///var/run/docker.sock/' still binds the real socket.
@@ -492,6 +511,20 @@ cat > "$SED_TMP" << 'SED'
 s#tcp://\*:2376) _tls=1 ;;#tcp://*:2376) _tls="" ;;#
 SED
 try "vnext_docker_cap_tls_warn" "a TLS remote" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: TLS must be flagged off DOCKER_TLS_VERIFY too, not only the :2376 port
+# convention. Neutralize that signal; the DOCKER_TLS_VERIFY warn test should fail.
+cat > "$SED_TMP" << 'SED'
+s#\[ -n "\${DOCKER_TLS_VERIFY:-}" \] && _tls=1#:#
+SED
+try "vnext_docker_cap_tls_verify_env" "DOCKER_TLS_VERIFY set warns" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext: DOCKER_HOST must win over the active docker context for the socket
+# source. Drop DOCKER_HOST from the precedence; the DOCKER_HOST-wins test fails.
+cat > "$SED_TMP" << 'SED'
+s#_docker_ep="\${DOCKER_HOST:-\$(_docker_context_endpoint)}"#_docker_ep="$(_docker_context_endpoint)"#
+SED
+try "vnext_docker_cap_docker_host_wins" "DOCKER_HOST wins over the context" "$CLI" "$CAPABILITIES_BATS"
 
 # v0.10.0: docker cap must add a host-path identity mount + workdir so
 # $(pwd) inside Cleat resolves to a host-valid path. Remove the identity

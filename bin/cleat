@@ -840,11 +840,22 @@ _docker_pool_is_vm() {
   # Lima-backed engines (Colima, Rancher Desktop, plain Lima) run dockerd inside
   # a VM on LINUX hosts too, where _is_macos and _is_docker_desktop are both
   # false (the in-VM `docker info` names the guest distro, never "Docker
-  # Desktop"). Detect them by their context / DOCKER_HOST socket path so the
-  # docker cap binds the in-VM /var/run/docker.sock (not the unresolvable host
-  # forward path) and the memory advisories correctly name the pool a VM.
-  case "${DOCKER_HOST:-$(_docker_context_endpoint)}" in
-    */.colima/*|*/.rd/*|*/.lima/*) return 0 ;;
+  # Desktop"). Detect them by their socket living under the user's HOME dot-dir
+  # (~/.colima, ~/.rd, ~/.lima) so the docker cap binds the in-VM
+  # /var/run/docker.sock, not the unresolvable host forward path.
+  #
+  # Anchored to $HOME on purpose. A bare */.colima/* substring would also match
+  # an unrelated host-local socket that merely CONTAINS such a segment (e.g. a
+  # hand-set DOCKER_HOST=unix:///opt/.rd/docker.sock on a native daemon),
+  # misrouting it to the VM branch, which binds /var/run/docker.sock with no
+  # liveness guard: if that path is absent on the host, Docker materialises a
+  # phantom DIRECTORY there (the machine-damage pattern). A relocated
+  # LIMA_HOME/COLIMA_HOME outside $HOME simply falls back to host-local (the
+  # pre-detection behaviour): degraded, never dangerous.
+  local _ep="${DOCKER_HOST:-$(_docker_context_endpoint)}"
+  _ep="${_ep#unix://}"
+  case "$_ep" in
+    "$HOME"/.colima/*|"$HOME"/.rd/*|"$HOME"/.lima/*) return 0 ;;
   esac
   return 1
 }

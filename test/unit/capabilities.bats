@@ -596,6 +596,79 @@ EOF
   assert_output --partial "loopback"
 }
 
+@test "docker cap: IPv6 loopback [::1] binds the host socket like 127.0.0.1" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 0; }
+  export DOCKER_HOST="tcp://[::1]:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_lacks "$cname" "DOCKER_HOST="
+  assert_success
+}
+
+@test "docker cap: the whole 127/8 block counts as loopback (socket-proxy on 127.0.0.2)" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 0; }
+  export DOCKER_HOST="tcp://127.0.0.2:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: LOCALHOST is loopback too (DNS names are case-insensitive)" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 0; }
+  export DOCKER_HOST="tcp://LOCALHOST:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: a DNS name that merely starts with 127. stays remote" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 0; }   # a host socket exists but must NOT be used
+  export DOCKER_HOST="tcp://127.0.0.1.example.com:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "DOCKER_HOST=tcp://127.0.0.1.example.com:2375"
+  assert_success
+  run assert_docker_run_lacks "$cname" ":/var/run/docker.sock"
+  assert_success
+}
+
+@test "docker cap: an empty HOME never turns a bare /.colima path into a VM match" {
+  # An empty HOME would degenerate the Lima anchor to /.colima/*, reopening the
+  # over-match the anchor exists to close. The guard answers host-local instead.
+  _is_macos() { return 1; }
+  _is_docker_desktop() { return 1; }
+  _docker_context_endpoint() { echo "unix:///.colima/default/docker.sock"; }
+  local _saved_home="$HOME"
+  HOME=""
+  run _docker_pool_is_vm
+  HOME="$_saved_home"
+  assert_failure
+}
+
 @test "docker cap: a routable tcp daemon is still treated as remote, not loopback" {
   mock_docker_images "cleat"
   mkdir -p "$TEST_TEMP/project"

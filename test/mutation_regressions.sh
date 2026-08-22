@@ -523,10 +523,60 @@ try "vnext_docker_cap_tls_verify_env" "DOCKER_TLS_VERIFY set warns" "$CLI" "$CAP
 # the host socket, never forward 127.0.0.1 (which inside the box is the box).
 # Through v1.4.2 that config got the socket bind. Remove the loopback branch; the
 # loopback bind test should fail.
+# The 127/8 numeric arm serves 127.0.0.1 (and the whole block). Kill its
+# return; the loopback-bind test (tcp://127.0.0.1) should fail.
 cat > "$SED_TMP" << 'SED'
-/^_endpoint_is_loopback()/,/^}$/ s#^    127\.0\.0\.1|localhost) return 0 ;;#    NOMATCH_LOOPBACK) return 0 ;;#
+s#;; \*) return 0 ;; esac#;; *) : ;; esac#
 SED
 try "vnext_docker_cap_loopback_binds_socket" "loopback tcp DOCKER_HOST binds the host socket" "$CLI" "$CAPABILITIES_BATS"
+
+# The localhost arm is its own case branch (DNS name, matched lowercased).
+# Kill it; the case-insensitive LOCALHOST test should fail.
+cat > "$SED_TMP" << 'SED'
+/^_endpoint_is_loopback()/,/^}$/ s#^    localhost) return 0 ;;#    NOMATCH_LOOPBACK) return 0 ;;#
+SED
+try "vnext_docker_cap_loopback_localhost_arm" "LOCALHOST is loopback" "$CLI" "$CAPABILITIES_BATS"
+
+# The numeric guard keeps a DNS name like 127.0.0.1.example.com REMOTE. Break
+# the guard so any 127.* string counts as loopback; the lookalike test fails.
+cat > "$SED_TMP" << 'SED'
+s#\*\[!0-9\.\]\*) ;;#NOMATCH_NUM) ;;#
+SED
+try "vnext_docker_cap_loopback_numeric_guard" "starts with 127" "$CLI" "$CAPABILITIES_BATS"
+
+# The IPv6 [::1] arm. Kill it; the IPv6 loopback test should fail.
+cat > "$SED_TMP" << 'SED'
+s#"tcp://\[::1\]"\*) return 0 ;;#"NOMATCH_V6") return 0 ;;#
+SED
+try "vnext_docker_cap_loopback_ipv6_arm" "IPv6 loopback" "$CLI" "$CAPABILITIES_BATS"
+
+# The loopback branch may bind /var/run/docker.sock ONLY when it is live: a
+# missing source would let the daemon materialise a phantom host directory.
+# Bypass the guard; the loopback-without-socket warn test should fail.
+cat > "$SED_TMP" << 'SED'
+s#&& _host_sock_is_live /var/run/docker.sock; then#\&\& true; then#
+SED
+try "vnext_docker_cap_loopback_liveness_guard" "with no host socket warns" "$CLI" "$CAPABILITIES_BATS"
+
+# The empty/root-HOME guard in _docker_pool_is_vm: without it an empty HOME
+# degenerates the Lima anchor to /.colima/* and reopens the over-match. Remove
+# the guard; the empty-HOME predicate test should fail.
+cat > "$SED_TMP" << 'SED'
+s#case "\${HOME:-}" in ""|/) return 1 ;; esac#:#
+SED
+try "vnext_docker_pool_empty_home_guard" "empty HOME never turns" "$CLI" "$CAPABILITIES_BATS"
+
+# The two direct predicate arms of _docker_pool_is_vm, locked via the prune
+# VM-advisory tests that drive them through the real derivation.
+cat > "$SED_TMP" << 'SED'
+/^_docker_pool_is_vm()/,/^}$/ s#^  _is_macos && return 0$#  :#
+SED
+try "vnext_docker_pool_macos_arm" "macOS keeps the VM wording" "$CLI" "$PRUNE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_docker_pool_is_vm()/,/^}$/ s#^  _is_docker_desktop && return 0$#  :#
+SED
+try "vnext_docker_pool_desktop_arm" "confirms a well-sized VM" "$CLI" "$PRUNE_BATS"
 
 # vnext: loopback detection must not swallow a ROUTABLE tcp daemon (that would
 # bind a local socket for a genuinely remote engine). Make every tcp endpoint

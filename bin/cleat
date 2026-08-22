@@ -934,13 +934,25 @@ _resolve_host_docker_sock() {  # endpoint
 _endpoint_is_loopback() {  # endpoint
   local _hostport="${1#tcp://}"
   case "$1" in tcp://*) ;; *) return 1 ;; esac
-  _hostport="${_hostport%%/*}"   # drop any path
-  _hostport="${_hostport%%:*}"   # drop the port (IPv6 handled below)
+  # IPv6 loopback first, matched on the raw endpoint: the port-strip below cuts
+  # at the first ':' and would mangle a bracketed address. The quoted pattern
+  # keeps [::1] literal, so tcp://[::11]:2375 does NOT match (the ] anchors it).
   case "$1" in
     "tcp://[::1]"*) return 0 ;;
   esac
+  _hostport="${_hostport%%/*}"   # drop any path
+  _hostport="${_hostport%%:*}"   # drop the port
+  # DNS names are case-insensitive, so tcp://LOCALHOST is loopback too. bash 3.2
+  # has no ${var,,}; one tr on a launch-time path is fine.
+  _hostport="$(printf '%s' "$_hostport" | tr '[:upper:]' '[:lower:]')"
   case "$_hostport" in
-    127.0.0.1|localhost) return 0 ;;
+    localhost) return 0 ;;
+    # The WHOLE 127/8 block is loopback (a local socket-proxy often binds
+    # 127.0.0.2 and friends), but only as a NUMERIC dotted address: a DNS name
+    # that merely starts with those digits (127.0.0.1.example.com) stays remote.
+    127.*)
+      case "$_hostport" in *[!0-9.]*) ;; *) return 0 ;; esac
+      ;;
   esac
   return 1
 }

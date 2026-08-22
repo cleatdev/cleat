@@ -5,7 +5,12 @@
 [![Release](https://img.shields.io/github/v/release/cleatdev/cleat?label=release)](https://github.com/cleatdev/cleat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**[Website](https://cleat.sh)** · **[Docs](https://cleat.sh/docs)** · **[Compare](https://cleat.sh/compare)** · **[Changelog](https://cleat.sh/changelog)**
+<p align="center">
+  <a href="https://cleat.sh"><img alt="Website" src="https://img.shields.io/badge/Website-60a5fa?style=for-the-badge&labelColor=0d0e11"></a>
+  <a href="https://cleat.sh/docs"><img alt="Docs" src="https://img.shields.io/badge/Docs-16181d?style=for-the-badge&labelColor=0d0e11"></a>
+  <a href="https://cleat.sh/compare"><img alt="Compare" src="https://img.shields.io/badge/Compare-16181d?style=for-the-badge&labelColor=0d0e11"></a>
+  <a href="https://cleat.sh/changelog"><img alt="Changelog" src="https://img.shields.io/badge/Changelog-16181d?style=for-the-badge&labelColor=0d0e11"></a>
+</p>
 
 **Give the agent a cage, not your keys.**
 
@@ -55,6 +60,22 @@ That's it. First run pulls the prebuilt image from GHCR (~30s), starts an isolat
 - **macOS or Linux** (Windows support via WSL2)
 - **An [Anthropic](https://www.anthropic.com/) account** -- Pro, Max, Team, or Enterprise plan, or an API key
 - **git** -- used by the installer
+
+---
+
+## Compatibility
+
+Cleat is a single bash script plus a Docker image. It runs anywhere Docker and bash do. The full host matrix below is exercised by the test suite on every push.
+
+| Axis | Runs on |
+|---|---|
+| **Host OS** | macOS (Apple Silicon + Intel) · Linux · Windows via WSL2 |
+| **Shell** | bash 3.2 (the macOS default) through bash 5 |
+| **Coreutils** | BSD (macOS) · GNU (Linux) |
+| **Docker engine** | Docker Desktop · OrbStack · Colima · Rancher Desktop · Lima · native Linux rootful + rootless · remote over tcp/ssh |
+| **Architecture** | arm64 · amd64 |
+
+The `docker` capability is engine-aware: it binds the right daemon socket for where the daemon actually runs, so a caged agent builds and runs containers on your engine whether that daemon lives in a VM, on the host, rootless or on a remote host.
 
 ---
 

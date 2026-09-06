@@ -28,8 +28,8 @@ install forward, so upgrading is the fix path for every report.
 In scope, anything that breaks the boundary Cleat claims:
 
 - Escaping the container from a default box with no extra capabilities on
-- Reading host paths the box is documented to mask, such as `~/.ssh` or
-  `~/.aws`
+- Reading a host path a box never mounts, such as `~/.aws`, or `~/.ssh`
+  with the `ssh` capability off
 - The installer or the update path fetching or running code from
   somewhere it should not
 - Gaining write access to the host through the clipboard bridge or a

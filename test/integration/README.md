@@ -9,8 +9,10 @@ Tests in this directory use **real Docker**. They:
 ## When to use
 
 Integration tests are the only layer that catches platform-specific bugs like
-v0.6.5 (macOS Docker Desktop virtiofs behavior) or v0.6.4 (OAuth callback proxy
-IPv6 vs IPv4). Unit tests with the mock docker stub cannot reach these layers.
+v0.6.5 (macOS Docker Desktop virtiofs behavior). Unit tests with the mock
+docker stub cannot reach that layer. The OAuth callback proxy (v0.6.4, IPv6
+before IPv4) is NOT covered here: it is pinned in the unit suite by driving a
+real loopback request through the real host socat with a stub container.
 
 Because they're slow (seconds per test) and require a Docker daemon, they run:
 

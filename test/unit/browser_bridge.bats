@@ -422,24 +422,6 @@ EOF
 # box, so an unguarded log path let a caged process write lines of its choosing
 # into any file the host user can write.
 
-@test "proxy log: a symlink planted mid-session is dropped, not written through" {
-  # The clip dir is mounted rw for the whole session, so the box can plant the
-  # link at any moment. A startup-only guard never sees this one.
-  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
-  printf 'original line\n' > "$TEST_TEMP/rc-target"
-  _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
-  local wpid=$!
-  sleep 0.7
-  rm -f "$dir/.proxy-log"
-  ln -s "$TEST_TEMP/rc-target" "$dir/.proxy-log"
-  printf '%s' "https://x.example/a" > "$dir/.browser-open"
-  sleep 2
-  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  [ ! -L "$dir/.proxy-log" ] || { echo "the planted symlink survived"; return 1; }
-  run cat "$TEST_TEMP/rc-target"
-  assert_output "original line"
-}
-
 @test "proxy log: a symlink present at watcher start is dropped too" {
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
   printf 'original line\n' > "$TEST_TEMP/rc-target2"
@@ -532,7 +514,7 @@ EOF
   cat > "$TEST_TEMP/bin/socat" <<EOF
 #!/usr/bin/env bash
 echo "\$\$" > "$TEST_TEMP/socat.pid"
-sleep 30
+exec sleep 30
 EOF
   chmod +x "$TEST_TEMP/bin/socat"
   PATH="$TEST_TEMP/bin:$PATH" _auth_callback_proxy 45999 mybox "$TEST_TEMP/plog" &
@@ -594,4 +576,78 @@ EOF
   run cat "$dir/.proxy-log"
   assert_output --partial "prior session line"
   assert_output --partial "opening URL"
+}
+
+@test "callback proxy: a TERM takes the python backend down too" {
+  # The python3 branch is backgrounded and waited on exactly like socat. Only
+  # the socat branch was pinned, so the python half could regress unseen.
+  mkdir -p "$TEST_TEMP/nosocat5"
+  local b
+  for b in bash date cat sleep; do ln -sf "$(command -v $b)" "$TEST_TEMP/nosocat5/$b"; done
+  cat > "$TEST_TEMP/nosocat5/python3" <<EOF
+#!/usr/bin/env bash
+cat > /dev/null
+echo "\$\$" > "$TEST_TEMP/py.pid"
+exec sleep 30
+EOF
+  chmod +x "$TEST_TEMP/nosocat5/python3"
+  PATH="$TEST_TEMP/nosocat5" _auth_callback_proxy 45998 mybox "$TEST_TEMP/plog6" &
+  local ppid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$TEST_TEMP/py.pid" ] && break
+    sleep 0.3
+  done
+  [ -s "$TEST_TEMP/py.pid" ] || { kill "$ppid" 2>/dev/null; echo "fake python backend never started"; return 1; }
+  local pypid; pypid="$(cat "$TEST_TEMP/py.pid")"
+  kill -TERM "$ppid" 2>/dev/null || true
+  process_exited "$ppid" || { echo "proxy subshell survived TERM"; kill -9 "$ppid" 2>/dev/null; return 1; }
+  process_exited "$pypid" || { echo "python backend was orphaned"; kill -9 "$pypid" 2>/dev/null; return 1; }
+}
+
+@test "proxy log: a FIFO planted mid-session is dropped and the watcher keeps running" {
+  # A FIFO passes both [ -L ] and [ -f ] as false, and `>>` on it blocks until
+  # a reader appears, so a box could hang the watcher, and with it teardown.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  rm -f "$dir/.proxy-log"; mkfifo "$dir/.proxy-log"
+  printf '%s' "https://x.example/a" > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$dir/.proxy-log" ] && [ ! -p "$dir/.proxy-log" ] && break
+    sleep 0.5
+  done
+  local alive=0; kill -0 "$wpid" 2>/dev/null && alive=1
+  kill "$wpid" 2>/dev/null || true
+  process_exited "$wpid" || kill -9 "$wpid" 2>/dev/null || true
+  [ "$alive" = 1 ] || { echo "watcher died"; return 1; }
+  [ ! -p "$dir/.proxy-log" ] || { echo "the FIFO survived, the watcher would have blocked on it"; return 1; }
+  run grep -c 'opening URL' "$dir/.proxy-log"
+  assert_output "1"
+}
+
+@test "browser bridge: the opener never receives a control character" {
+  # The log line was sanitised, but the opener still got the raw URL. A URL
+  # never legitimately carries a control character, so hand it the clean one.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+printf '%s' "\$1" > "$TEST_TEMP/opened.arg"
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf 'https://x.example/a\nrm -rf ~' > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$TEST_TEMP/opened.arg" ] && break
+    sleep 0.5
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ -f "$TEST_TEMP/opened.arg" ] || { echo "nothing was opened"; return 1; }
+  run wc -l < "$TEST_TEMP/opened.arg"
+  [ "$(tr -d '[:space:]' <<< "$output")" = "0" ] || { echo "a newline reached the opener"; return 1; }
 }

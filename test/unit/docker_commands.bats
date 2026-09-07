@@ -974,3 +974,86 @@ EOF
   run _do_build
   refute_output --partial "No local build context"
 }
+
+# ── shell / login teardown: the bridge file sweep ────────────────────────────
+# Both verbs sweep .browser-open on exit through the same helper the session
+# uses: age-gated only while a sibling session is alive, unconditional when
+# nobody is left to claim it.
+
+@test "shell: teardown keeps a FRESH pending login URL while a sibling session is alive" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$clip/.browser-open"
+  sleep 30 &
+  local sib=$!
+  touch "$clip/.watcher.$sib"
+  run cmd_shell "$TEST_TEMP/project"
+  kill "$sib" 2>/dev/null || true; wait "$sib" 2>/dev/null || true
+  assert_success
+  [ -f "$clip/.browser-open" ] || { echo "shell teardown swallowed a sibling's pending login URL"; return 1; }
+}
+
+@test "shell: teardown removes a fresh bridge file when no session is alive" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$clip/.browser-open"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  [ ! -e "$clip/.browser-open" ] || { echo "a solo shell left a URL for the next session to open"; return 1; }
+}
+
+@test "login: teardown keeps a FRESH pending login URL while a sibling session is alive" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$clip/.browser-open"
+  sleep 30 &
+  local sib=$!
+  touch "$clip/.watcher.$sib"
+  run cmd_login "$TEST_TEMP/project"
+  kill "$sib" 2>/dev/null || true; wait "$sib" 2>/dev/null || true
+  assert_success
+  [ -f "$clip/.browser-open" ] || { echo "login teardown swallowed a sibling's pending login URL"; return 1; }
+}
+
+@test "login: teardown removes a fresh bridge file when no session is alive" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$clip/.browser-open"
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  [ ! -e "$clip/.browser-open" ] || { echo "a solo login left a URL for the next session to open"; return 1; }
+}
+
+@test "shell: caps an oversized watcher log before spawning its browser watcher" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$clip/.watcher-log"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  local sz; sz="$(wc -c < "$clip/.watcher-log" | tr -d '[:space:]')"
+  [ "$sz" -lt 1048576 ] || { echo "cleat shell never capped the watcher log: $sz bytes"; return 1; }
+}
+
+@test "login: caps an oversized watcher log before spawning its browser watcher" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$clip/.watcher-log"
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  local sz; sz="$(wc -c < "$clip/.watcher-log" | tr -d '[:space:]')"
+  [ "$sz" -lt 1048576 ] || { echo "cleat login never capped the watcher log: $sz bytes"; return 1; }
+}

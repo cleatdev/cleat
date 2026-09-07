@@ -57,7 +57,7 @@ jobs:
         # branch of _clipboard_watcher is really executed; the macOS leg has
         # neither inotifywait nor fswatch and keeps covering the polling
         # fallback. Together the matrix exercises both watch paths.
-        run: sudo apt-get update && sudo apt-get install -y inotify-tools
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat
       - name: Bash version
         run: bash --version
       - name: Run full BATS suite
@@ -80,7 +80,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install inotify-tools (exercise the inotifywait watcher branch)
-        run: sudo apt-get update && sudo apt-get install -y inotify-tools
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat
       - name: Bash and coreutils versions
         run: bash --version | head -1; cp --version | head -1
       - name: Run full BATS suite
@@ -105,6 +105,8 @@ jobs:
           submodules: recursive
       - name: Bash version
         run: bash --version
+      - name: Install socat (the OAuth forward mutations drive the real one)
+        run: sudo apt-get update && sudo apt-get install -y socat
       - name: Mutation test the regression registry
         run: |
           rc=0; ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
@@ -304,7 +306,7 @@ jobs:
       - name: Bash version and arch
         run: bash --version | head -1; uname -m
       - name: Install inotify-tools (exercise the inotifywait watcher branch)
-        run: sudo apt-get update && sudo apt-get install -y inotify-tools
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat
       - name: Run full BATS suite
         run: |
           rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?

@@ -248,18 +248,6 @@ EOF
     echo "REGRESSION: a stale .browser-open survived watcher startup"; return 1; }
   [ ! -f "$TEST_TEMP/opened.log" ] || {
     echo "REGRESSION: a stale URL from a prior session was opened on the host"; return 1; }
-
-  local body
-  body="$(declare -f _browser_watcher)"
-  local before_loop
-  before_loop="${body%%while true*}"
-
-  # The fix must NOT pre-initialize last_ts from stat (the pre-v0.6.1 bug):
-  echo "$before_loop" | grep -qE 'last_ts=\$\(stat' && {
-    echo "REGRESSION: last_ts must start empty, not from stat (pre-v0.6.1 bug)"
-    return 1
-  }
-  true
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -476,28 +464,71 @@ EOF
   run cat "$TEST_TEMP/socat.argv"
   assert_output --partial "TCP-LISTEN:45001"
   assert_output --partial "bind=127.0.0.1"
-  assert_output --partial "ignoreeof"
+  # Inside a SYSTEM: parameter both ',' and ':' are socat separators, so the
+  # exact escaped words are what must reach socat, not merely the substrings.
+  assert_output --partial 'SYSTEM:docker exec -i mybox socat -\,ignoreeof TCP6\:localhost\:45001'
+  assert_output --partial '|| docker exec -i mybox socat -\,ignoreeof TCP\:localhost\:45001'
 
   local argv; argv="$(cat "$TEST_TEMP/socat.argv")"
   local before="${argv%%TCP6*}"
   local t6=${#before}
   local t4
-  t4=$(printf '%s' "$argv" | grep -bo 'TCP:localhost' | head -1 | cut -d: -f1)
+  t4=$(printf '%s' "$argv" | grep -bo 'TCP\\*:localhost' | grep -v TCP6 | head -1 | cut -d: -f1)
   [ -n "$t4" ] || { echo "REGRESSION: IPv4 fallback missing"; return 1; }
   [ "$t6" -lt "$t4" ] || { echo "REGRESSION: TCP6 must precede the TCP fallback"; return 1; }
 }
 
-@test "regression v0.6.4: the callback proxy rewrites keep-alive to close" {
-  # The python backend owns this rewrite. Assert on the emitted program rather
-  # than on the shell function text.
-  run bash -c "sed -n '/PYEOF/,/^PYEOF/p' '$CLI' | grep -c 'Connection: close'"
-  assert_success
-  [ "$output" -ge 1 ] || { echo "REGRESSION: Connection header rewrite missing"; return 1; }
+@test "regression v0.6.4: the python proxy rewrites keep-alive to close before forwarding" {
+  # Behavioral: run the real python backend (socat masked off PATH) with a stub
+  # container that captures what it is handed, send a keep-alive request, and
+  # assert the forwarded request carries Connection: close.
+  command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+  mkdir -p "$TEST_TEMP/nosocat4"
+  local b
+  for b in bash date cat sleep python3; do ln -sf "$(command -v $b)" "$TEST_TEMP/nosocat4/$b"; done
+  cat > "$TEST_TEMP/nosocat4/docker" <<EOF
+#!/usr/bin/env bash
+cat > "$TEST_TEMP/forwarded.req"
+printf 'HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n'
+EOF
+  chmod +x "$TEST_TEMP/nosocat4/docker"
+  PATH="$TEST_TEMP/nosocat4" _auth_callback_proxy 45005 mybox "$TEST_TEMP/plog5" &
+  local ppid=$!
+  local i connected=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if exec 9<>/dev/tcp/127.0.0.1/45005 2>/dev/null; then connected=1; break; fi
+    sleep 0.3
+  done
+  [ "$connected" = 1 ] || { kill "$ppid" 2>/dev/null; echo "python proxy never bound"; return 1; }
+  printf 'GET /callback?code=x HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n' >&9
+  _portable_timeout 5 cat <&9 >/dev/null 2>&1 || true
+  exec 9<&- 2>/dev/null || true
+  wait "$ppid" 2>/dev/null || true
+  run cat "$TEST_TEMP/forwarded.req"
+  assert_output --partial "Connection: close"
+  refute_output --partial "keep-alive"
+}
+
+@test "regression v0.6.4: the socat proxy retries a busy bind" {
+  # A bind refused with exit 1 must be retried, not abandoned.
+  mkdir -p "$TEST_TEMP/bin"
+  cat > "$TEST_TEMP/bin/socat" <<EOF
+#!/usr/bin/env bash
+n=\$(cat "$TEST_TEMP/attempts" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "$TEST_TEMP/attempts"
+[ "\$n" -ge 2 ] && exit 0
+exit 1
+EOF
+  chmod +x "$TEST_TEMP/bin/socat"
+  PATH="$TEST_TEMP/bin:$PATH" _auth_callback_proxy 45004 mybox "$TEST_TEMP/plog4"
+  run cat "$TEST_TEMP/attempts"
+  assert_output "2"
+  run cat "$TEST_TEMP/plog4"
+  assert_output --partial "bind failed, retrying"
 }
 
 @test "regression vnext: the callback proxy actually forwards, it is not an EXEC no-op" {
-  # socat's EXEC address splits its string on whitespace and never invokes a
-  # shell, so `EXEC:sh -c '...'` handed sh the literal word `'docker` and every
+  # socat's EXEC address strips the quotes and splits on whitespace without a
+  # shell, so `EXEC:sh -c '...'` ran `docker` with no arguments and every
   # callback came back EMPTY on any host that HAS socat. Hosts without it took
   # the python branch, which works, which is why this hid. Drive a real
   # loopback request through the real socat with a stub docker standing in for
@@ -506,14 +537,17 @@ EOF
   mkdir -p "$TEST_TEMP/bin"
   cat > "$TEST_TEMP/bin/docker" <<'DOCKEOF'
 #!/usr/bin/env bash
-# Answer ONLY a well-formed exec. socat's EXEC address does no shell parsing,
-# so the broken form hands us the shell operators as literal argv words. A
-# stub that ignored its arguments would answer either way and prove nothing.
-for a in "$@"; do
-  case "$a" in '||'|'2>/dev/null'|"sh -c"*|"'docker") exit 1 ;; esac
-done
-[ "$1" = exec ] || exit 1
-printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'
+# Answer ONLY the exact exec line the forward must produce, and REFUSE the
+# IPv6 leg so the `||` IPv4 fallback has to survive socat's parsing as well.
+# A stub that answered any argv passed against a command socat had truncated
+# at the first unescaped colon (the box received `socat -,ignoreeof TCP6` and
+# nothing after it). That was a real false green.
+[ "$1" = exec ] && [ "$2" = -i ] && [ "$3" = mybox ] && [ "$4" = socat ] && [ "$5" = "-,ignoreeof" ] || exit 1
+case "$6" in
+  TCP6:localhost:45002) exit 1 ;;
+  TCP:localhost:45002)  printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK' ;;
+  *) exit 1 ;;
+esac
 DOCKEOF
   chmod +x "$TEST_TEMP/bin/docker"
   PATH="$TEST_TEMP/bin:$PATH" _auth_callback_proxy 45002 mybox "$TEST_TEMP/plog2" &

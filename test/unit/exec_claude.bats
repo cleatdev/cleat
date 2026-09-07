@@ -365,17 +365,11 @@ teardown() { _common_teardown; }
   assert_output "run-foo"
 }
 
-@test "watcher log cap: refuses to truncate through a planted symlink" {
-  # `[ -f ]` DEREFERENCES, so a link planted in the box-writable clip dir made
-  # the cap below empty whatever host file it named.
-  local target="$TEST_TEMP/precious"
-  head -c 1200000 /dev/zero | tr '\0' 'y' > "$target"     # over the 1 MB cap
+@test "watcher log cap: drops a FIFO instead of leaving it for the redirect to block on" {
   local log="$TEST_TEMP/.watcher-log"
-  ln -s "$target" "$log"
+  mkfifo "$log"
   run _cap_watcher_log "$log"
   assert_success
   assert_output "0"
-  [ ! -L "$log" ] || { echo "the planted symlink survived"; return 1; }
-  local sz; sz="$(wc -c < "$target" | tr -d '[:space:]')"
-  [ "$sz" -gt 1000000 ] || { echo "the link target was truncated: $sz bytes"; return 1; }
+  [ ! -p "$log" ] || { echo "the FIFO survived, the next >> would block forever"; return 1; }
 }

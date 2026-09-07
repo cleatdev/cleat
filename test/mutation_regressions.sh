@@ -270,7 +270,9 @@ try "v0.6.0_claude_guard" "skip project overlay when .claude/ missing"
 # so the range runs comment through fi: an end anchor on the rm line alone
 # would leave the range unterminated and gut the file (silent SKIPPED).
 cat > "$SED_TMP" << 'SED'
-/^  # Remove any URL left over from a previous session, and any debounce$/,/^  fi$/d
+/^_browser_watcher()/,/^}$/{
+  s|_browser_sweep_stale_bridge "\$clip_dir"|:|
+}
 SED
 try "v0.6.1_browser_stale" "browser bridge removes stale file"
 
@@ -335,7 +337,7 @@ try "v0.6.3_parse_env_last" "_parse_env_file reads last line"
 # v0.6.4: _auth_callback_proxy must try TCP6 first. Remove the 6 so the
 # call becomes pure TCP (the pre-fix behavior).
 cat > "$SED_TMP" << 'SED'
-s|TCP6:localhost|TCP:localhost|
+s|TCP6\\\\:localhost|TCP\\\\:localhost|
 SED
 try "v0.6.4_tcp6_first" "forwards TCP6 first with ignoreeof"
 
@@ -548,7 +550,7 @@ try "vnext_docker_cap_loopback_numeric_guard" "starts with 127" "$CLI" "$CAPABIL
 cat > "$SED_TMP" << 'SED'
 s#"tcp://\["\*)#"NOMATCH_V6")#
 SED
-try "vnext_docker_cap_loopback_ipv6_arm" "IPv6 loopback" "$CLI" "$CAPABILITIES_BATS"
+try "vnext_docker_cap_loopback_ipv6_arm" "cap: IPv6 loopback" "$CLI" "$CAPABILITIES_BATS"
 
 # The loopback branch may bind /var/run/docker.sock ONLY when it is live: a
 # missing source would let the daemon materialise a phantom host directory.
@@ -5105,17 +5107,10 @@ try "int_cname_threads_box" "int_cname threads a box name through" "$SETUP_BASH"
 # a symlink at needs a guard. `>>` and `[ -f ]` both follow links.
 cat > "$SED_TMP" << 'SED'
 /^_browser_watcher()/,/^}$/{
-  /if \[ -L "\$clip_dir\/\.proxy-log" \]; then/,+2d
+  s|_drop_unless_regular "\$clip_dir/\.proxy-log"|:|
 }
 SED
 try "vnext_proxy_log_symlink" "cannot append to a host file through a planted proxy log symlink"
-
-cat > "$SED_TMP" << 'SED'
-/^_browser_watcher()/,/^}$/{
-  /if \[ -L "\$clip_dir\/\.proxy-log" \]; then/,+2d
-}
-SED
-try "vnext_proxy_log_symlink_midsession" "a symlink planted mid-session is dropped, not written through" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /_cap_watcher_log "\$clip_dir\/\.proxy-log" >\/dev\/null/d
@@ -5135,25 +5130,39 @@ try "vnext_proxy_log_cap" "an oversized log is capped at watcher start" "$CLI" "
 
 # The drop must be narrow: only a symlink, only an oversized file.
 cat > "$SED_TMP" << 'SED'
-/^_browser_watcher()/,/^}$/{
-  s@if \[ -L "\$clip_dir/\.proxy-log" \]; then@if true; then@
+/^_drop_unless_regular()/,/^}$/{
+  s@if \[ -L "\$p" \]; then@if true; then@
 }
 SED
 try "vnext_proxy_log_drop_not_overbroad" "a real log is never dropped, only a symlink is" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_cap_watcher_log()/,/^}$/{
-  /if \[ -L "\$log" \]; then/,+4d
+  s|_drop_unless_regular "\$log"|:|
 }
 SED
 try "vnext_cap_log_symlink" "cap watcher log does not truncate a host file through a symlink"
 
 # socat's EXEC address does no shell parsing, so the forward never worked.
+# Real socat drives these two. Registered only where socat exists: without it
+# the paired test skips, and a skipped test reads as a missed mutation (the
+# inotifywait precedent below). CI installs socat on every Linux leg.
+if command -v socat >/dev/null 2>&1; then
 cat > "$SED_TMP" << 'SED'
 s@"SYSTEM:docker exec@"EXEC:sh -c 'docker exec@
-s@TCP:localhost:${port}"@TCP:localhost:${port}'"@
+s@TCP\\\\:localhost\\\\:${port}"@TCP\\\\:localhost\\\\:${port}'"@
 SED
 try "vnext_socat_system_address" "actually forwards, it is not an EXEC no-op"
+
+# Unescaped colons end a SYSTEM: parameter early: the box received
+# `socat -,ignoreeof TCP6` and the IPv4 fallback vanished. The argv-strict stub
+# refuses that shape.
+cat > "$SED_TMP" << 'SED'
+s@TCP6\\\\:localhost\\\\:@TCP6:localhost:@
+s@TCP\\\\:localhost\\\\:@TCP:localhost:@
+SED
+try "vnext_socat_colon_escape" "actually forwards, it is not an EXEC no-op"
+fi
 
 # The backend must be a BACKGROUND child or bash defers the trap and the
 # loopback port stays bound past session end.
@@ -5211,21 +5220,31 @@ try "vnext_clipimg_guard_not_overstrict" "a present request is still claimed" "$
 
 cat > "$SED_TMP" << 'SED'
 /^_clipimg_watcher()/,/^}$/{
-  /if \[ -L "\$lock" \]; then/,+2d
+  s|if \[ -L "\$lock" \]; then|if false; then|
 }
 SED
 try "vnext_image_lock_symlink" "a symlinked image lock is dropped, not followed" "$CLI" "$CLIPIMG_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/if \[ -L "\$clip_dir\/\.host-ready" \]; then/,+2d
+s|_drop_unless_regular "\$clip_dir/\.host-ready"|:|
 SED
 try "vnext_host_ready_symlink" "host-ready sentinel is replaced"
 
 # wc -c on a link to a character device never returns.
 cat > "$SED_TMP" << 'SED'
-/# Checked HERE as well as after the loop/,+6d
+s@^    _drop_unless_regular "\$hooks_file"$@    :@
 SED
 try "vnext_hook_spool_symlink" "a symlinked event spool is dropped instead of read through" "$CLI" "$HOOKS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@^    _drop_unless_regular "\$hooks_file"$@    :@
+SED
+try "vnext_hook_spool_fifo" "a FIFO planted as the spool is dropped" "$CLI" "$HOOKS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@if \[ -L "\$hooks_file" \] || { \[ -e "\$hooks_file" \] && \[ ! -f "\$hooks_file" \]; }; then@if false; then@
+SED
+try "vnext_hook_spool_midsession" "swapped for a symlink mid-session" "$CLI" "$HOOKS_BATS"
 
 # REUSEPORT let a box-named port co-bind a live host service.
 cat > "$SED_TMP" << 'SED'
@@ -5276,6 +5295,116 @@ cat > "$SED_TMP" << 'SED'
 s@  if ! _is_docker_desktop 2>\/dev\/null; then@  if _is_docker_desktop 2>\/dev\/null; then@
 SED
 try "vnext_add_host_desktop_gate" "adds --add-host when not Docker Desktop" "$CLI" "$HOOKS_BATS"
+
+# ── verification pass: the second round ──────────────────────────────────────
+
+# Both backends are backgrounded. The socat line was pinned; this pins python.
+cat > "$SED_TMP" << 'SED'
+/^_auth_callback_proxy()/,/^}$/{
+  s|<<'PYEOF' &$|<<'PYEOF'|
+}
+SED
+try "vnext_proxy_python_background" "takes the python backend down too" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+if command -v python3 >/dev/null 2>&1; then
+cat > "$SED_TMP" << 'SED'
+s|req_data = req_data.replace(b"Connection: keep-alive", b"Connection: close      ")|req_data = req_data|
+SED
+try "v0.6.4_keepalive_rewrite" "rewrites keep-alive to close before forwarding"
+fi
+
+cat > "$SED_TMP" << 'SED'
+s@\[\[ \$socat_rc -eq 1 \]\] || break@break@
+SED
+try "v0.6.4_bind_retry" "retries a busy bind"
+
+# Any shape that is not a regular file is dropped, not just a symlink.
+cat > "$SED_TMP" << 'SED'
+/^_drop_unless_regular()/,/^}$/{
+  s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
+}
+SED
+try "vnext_drop_fifo_proxy_log" "a FIFO planted mid-session is dropped" "$CLI" "$BROWSER_BRIDGE_BATS"
+cat > "$SED_TMP" << 'SED'
+/^_drop_unless_regular()/,/^}$/{
+  s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
+}
+SED
+try "vnext_drop_fifo_host_ready" "drops a FIFO planted at .host-ready" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+cat > "$SED_TMP" << 'SED'
+/^_drop_unless_regular()/,/^}$/{
+  s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
+}
+SED
+try "vnext_drop_fifo_cap_log" "drops a FIFO instead of leaving it" "$CLI" "$EXEC_CLAUDE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_clipimg_watcher()/,/^}$/{
+  s|elif \[ -e "\$lock" \] && \[ ! -d "\$lock" \]; then|elif false; then|
+}
+SED
+try "vnext_image_lock_file" "a regular file planted as the image lock" "$CLI" "$CLIPIMG_BATS"
+
+# A directory named `clipboard` used to kill the watcher under set -e.
+cat > "$SED_TMP" << 'SED'
+/if \[ ! -f "\$claim" \]; then/,+3d
+SED
+try "vnext_clip_claim_regular_only" "a directory planted as the payload" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# Teardown sweeps: all three sites, and the liveness gate itself.
+cat > "$SED_TMP" << 'SED'
+s|_browser_teardown_bridge "\${_CLIP_DIR:?}"|rm -f "${_CLIP_DIR:?}/.browser-open"|
+SED
+try "vnext_teardown_session_site" "teardown keeps a FRESH browser-open file for a sibling session" "$CLI" "$HOOKS_BATS"
+cat > "$SED_TMP" << 'SED'
+s|_browser_teardown_bridge "\$_shell_clip_dir"|rm -f "$_shell_clip_dir/.browser-open"|
+SED
+try "vnext_teardown_shell_site" "shell: teardown keeps a FRESH" "$CLI" "$DOCKER_COMMANDS_BATS"
+cat > "$SED_TMP" << 'SED'
+s|_browser_teardown_bridge "\$_login_clip_dir"|rm -f "$_login_clip_dir/.browser-open"|
+SED
+try "vnext_teardown_login_site" "login: teardown keeps a FRESH" "$CLI" "$DOCKER_COMMANDS_BATS"
+cat > "$SED_TMP" << 'SED'
+/^_browser_teardown_bridge()/,/^}$/{
+  s|if ls "\$dir"/.watcher.\* >/dev/null 2>&1; then|if true; then|
+}
+SED
+try "vnext_teardown_solo_unconditional" "teardown removes even a fresh browser-open" "$CLI" "$HOOKS_BATS"
+
+# cleat shell and cleat login cap the watcher log before spawning, as the
+# session always did.
+cat > "$SED_TMP" << 'SED'
+/_cap_watcher_log "\$_shell_clip_dir\/\.watcher-log" >\/dev\/null/d
+SED
+try "vnext_shell_caps_watcher_log" "shell: caps an oversized watcher log" "$CLI" "$DOCKER_COMMANDS_BATS"
+cat > "$SED_TMP" << 'SED'
+/_cap_watcher_log "\$_login_clip_dir\/\.watcher-log" >\/dev\/null/d
+SED
+try "vnext_login_caps_watcher_log" "login: caps an oversized watcher log" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# The authority ends at '/', '?' or '#'.
+cat > "$SED_TMP" << 'SED'
+s|authority="\${authority%%\[/?#\]\*}"|authority="${authority%%/*}"|
+SED
+try "vnext_callback_authority_terminators" "a path-less redirect_uri ending in a query" "$CLI" "$HOOKS_BATS"
+
+# The second userinfo form rides the host check.
+cat > "$SED_TMP" << 'SED'
+/^_extract_callback_port()/,/^}$/{
+  s@    localhost|127\.0\.0\.1) ;;@    *) ;;@
+}
+SED
+try "vnext_callback_port_userinfo_before_host" "rejects userinfo placed before a loopback host" "$CLI" "$HOOKS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s|      case "\$_v6" in \*"\]"\*) ;; \*) return 1 ;; esac     # unclosed bracket|      :|
+SED
+try "vnext_ipv6_unclosed_bracket" "an unclosed bracket is malformed" "$CLI" "$CAPABILITIES_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s|\$open_cmd "\$_clean_url"|$open_cmd "$url"|
+SED
+try "vnext_opener_clean_url" "the opener never receives a control character" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

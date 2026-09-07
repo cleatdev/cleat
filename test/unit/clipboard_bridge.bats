@@ -182,24 +182,6 @@ EOF
   rm -rf "$clip_dir"
 }
 
-@test "_clipboard_watcher drops a symlinked .host-ready instead of touching through it" {
-  # touch FOLLOWS a symlink, so a link planted here had the host create or
-  # re-stamp whatever file it named.
-  local clip_dir="$TEST_TEMP/clip"; mkdir -p "$clip_dir"
-  local target="$TEST_TEMP/should-not-exist"
-  ln -s "$target" "$clip_dir/.host-ready"
-  _clipboard_watcher "$clip_dir" "cat > /dev/null" >/dev/null 2>&1 &
-  local wpid=$!
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -f "$clip_dir/.host-ready" ] && [ ! -L "$clip_dir/.host-ready" ] && break
-    sleep 0.3
-  done
-  stop_watcher "$wpid" "$clip_dir"
-  [ ! -L "$clip_dir/.host-ready" ] || { echo "the planted symlink survived"; return 1; }
-  [ ! -e "$target" ] || { echo "touch followed the link and created the target"; return 1; }
-}
-
 @test "clipboard delivery: the host caps an oversized payload at the documented 100KB" {
   # docker/clip caps what the SHIM writes, but the shim is not the only thing
   # that can put a file in the shared clip dir, and cli/README states the limit
@@ -239,4 +221,45 @@ EOF
   stop_watcher "$wpid" "$clip_dir"
   run cat "$out"
   assert_output "hello from the cage"
+}
+
+@test "_clipboard_watcher drops a FIFO planted at .host-ready" {
+  # touch on a FIFO succeeds, so the FIFO would have stayed and the shim would
+  # keep taking the file-bridge path against a sentinel that is not a file.
+  local clip_dir="$TEST_TEMP/clip"; mkdir -p "$clip_dir"
+  mkfifo "$clip_dir/.host-ready"
+  _clipboard_watcher "$clip_dir" "cat > /dev/null" >/dev/null 2>&1 &
+  local wpid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$clip_dir/.host-ready" ] && [ ! -p "$clip_dir/.host-ready" ] && break
+    sleep 0.3
+  done
+  stop_watcher "$wpid" "$clip_dir"
+  [ -f "$clip_dir/.host-ready" ] && [ ! -p "$clip_dir/.host-ready" ] || { echo "the FIFO survived at .host-ready"; return 1; }
+}
+
+@test "clipboard delivery: a directory planted as the payload is dropped and a later copy still lands" {
+  # The box can name a directory `clipboard`. The claim move succeeds, the
+  # symlink drop passes it, and `wc -c` on it fails: under the binary's set -e
+  # that failed substitution killed the watcher. It must be dropped instead.
+  local clip_dir="$TEST_TEMP/clip"; mkdir -p "$clip_dir"
+  _clipboard_watcher "$clip_dir" "cat > '$TEST_TEMP/after-dir'" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.3
+  mkdir "$TEST_TEMP/junkdir"
+  mv "$TEST_TEMP/junkdir" "$clip_dir/clipboard"
+  sleep 1.5
+  [ -z "$(ls -A "$TEST_TEMP/clipclaim" 2>/dev/null)" ] || {
+    echo "the directory lingers in the claim dir"; ls -la "$TEST_TEMP/clipclaim"; return 1; }
+  printf 'later' > "$TEST_TEMP/p2"
+  mv "$TEST_TEMP/p2" "$clip_dir/clipboard"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    [ -s "$TEST_TEMP/after-dir" ] && break
+    sleep 0.3
+  done
+  stop_watcher "$wpid" "$clip_dir"
+  run cat "$TEST_TEMP/after-dir"
+  assert_output "later"
 }

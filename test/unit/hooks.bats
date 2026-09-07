@@ -1107,12 +1107,35 @@ EOF
   export DOCKER_EXIT_CODE=0
   mkdir -p "$CLEAT_RUN_DIR/test-cleanup2/clip"
   printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$CLEAT_RUN_DIR/test-cleanup2/clip/.browser-open"
+  # A live SIBLING session: its .watcher.<pid> marker survives the dead-marker
+  # sweep only while that pid is alive, so back it with a real process.
+  sleep 30 &
+  local sib=$!
+  touch "$CLEAT_RUN_DIR/test-cleanup2/clip/.watcher.$sib"
 
   _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup2/clip"
   run exec_claude "test-cleanup2" --dangerously-skip-permissions
+  kill "$sib" 2>/dev/null || true; wait "$sib" 2>/dev/null || true
 
   [[ -f "$CLEAT_RUN_DIR/test-cleanup2/clip/.browser-open" ]] || return 1
   rm -rf "$CLEAT_RUN_DIR/test-cleanup2/clip"
+}
+
+@test "exec_claude: a solo session's teardown removes even a fresh browser-open" {
+  # With no live sibling there is nobody left to claim it, and leaving it
+  # behind would hand it to the NEXT session on this box, which would open the
+  # previous session's URL. So it goes unconditionally, as it always did.
+  _host_clip_cmd() { echo ""; }
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  mkdir -p "$CLEAT_RUN_DIR/test-cleanup4/clip"
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$CLEAT_RUN_DIR/test-cleanup4/clip/.browser-open"
+
+  _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup4/clip"
+  run exec_claude "test-cleanup4" --dangerously-skip-permissions
+
+  [[ ! -e "$CLEAT_RUN_DIR/test-cleanup4/clip/.browser-open" ]] || return 1
+  rm -rf "$CLEAT_RUN_DIR/test-cleanup4/clip"
 }
 
 @test "exec_claude: teardown drops a SYMLINKED browser-open regardless of age" {
@@ -1831,4 +1854,54 @@ EOF
   done
   kill "$hpid" 2>/dev/null || true; wait "$hpid" 2>/dev/null || true
   [ ! -L "$spool" ] || { echo "the planted spool symlink survived"; return 1; }
+}
+
+@test "_extract_callback_port: rejects userinfo placed before a loopback host" {
+  run _extract_callback_port "https://x.example/a?redirect_uri=http%3A%2F%2Fuser%40localhost%3A9999%2F"
+  assert_failure
+}
+
+@test "_extract_callback_port: a path-less redirect_uri ending in a query still parses" {
+  # The authority ends at the first '/', '?' or '#'. Claude Code always sends
+  # a /callback path, but the old substring parser accepted this shape too.
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A5555%3Fq%3D1"
+  assert_success
+  assert_output "5555"
+}
+
+@test "hook bridge: a FIFO planted as the spool is dropped instead of blocking the bridge" {
+  # A FIFO is not a regular file, so the wait loop used to sit out its full
+  # 30s and the bridge silently never started.
+  local spool="$TEST_TEMP/events.jsonl"
+  mkfifo "$spool"
+  _hb_parent=$$
+  _hook_bridge_watcher "$spool" >/dev/null 2>&1 &
+  local hpid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ ! -p "$spool" ] && break
+    sleep 0.4
+  done
+  kill "$hpid" 2>/dev/null || true; wait "$hpid" 2>/dev/null || true
+  [ ! -p "$spool" ] || { echo "the planted FIFO survived"; return 1; }
+}
+
+@test "hook bridge: a spool swapped for a symlink mid-session stops the bridge" {
+  # The startup guards cannot see a link planted between two polls of a live
+  # bridge, and wc -c through one to /dev/zero never returns.
+  local spool="$TEST_TEMP/events.jsonl"
+  : > "$spool"
+  _hb_parent=$$
+  _hook_bridge_watcher "$spool" >/dev/null 2>&1 &
+  local hpid=$!
+  sleep 1.2
+  # A regular file, deliberately NOT /dev/zero: reading through a link to a
+  # character device never returns, so a mutated guard would leave a blocked
+  # `wc` holding this test's pipe open and hang the whole run.
+  printf 'planted\n' > "$TEST_TEMP/spool-target"
+  rm -f "$spool"; ln -s "$TEST_TEMP/spool-target" "$spool"
+  process_exited "$hpid" || { echo "bridge kept running against a swapped spool"; kill -9 "$hpid" 2>/dev/null; return 1; }
+  [ ! -L "$spool" ] || { echo "the swapped link survived"; return 1; }
+  run cat "$TEST_TEMP/spool-target"
+  assert_output "planted"
 }

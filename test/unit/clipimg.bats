@@ -476,3 +476,20 @@ EOF
   [ ! -L "$dir/.image-lock" ] || { echo "the planted symlink survived"; return 1; }
   [ -d "$TEST_TEMP/precious-dir" ] || { echo "the rmdir followed the link"; return 1; }
 }
+
+@test "clipimg watcher: a regular file planted as the image lock is swept" {
+  # The lock's only legitimate shape is a directory the shim mkdirs. A file
+  # there makes every later mkdir fail and latches image paste off.
+  local dir="$TEST_TEMP/cw4"; mkdir -p "$dir"
+  : > "$dir/.image-lock"
+  _clipimg_serve() { :; }
+  _clipimg_watcher "$dir" "mybox" >/dev/null 2>&1 &
+  local wpid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ ! -e "$dir/.image-lock" ] && break
+    sleep 0.3
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ ! -e "$dir/.image-lock" ] || { echo "a planted file at the lock path survived"; return 1; }
+}

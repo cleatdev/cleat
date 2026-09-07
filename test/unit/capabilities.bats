@@ -1480,3 +1480,8 @@ EOF
   run _endpoint_is_loopback "tcp://[::11]:2375";                assert_failure
   run _endpoint_is_loopback "tcp://[::ffff:127.0.0.1.evil.example]:2375"; assert_failure
 }
+
+@test "endpoint loopback: an unclosed bracket is malformed, not loopback" {
+  run _endpoint_is_loopback "tcp://[::1"
+  assert_failure
+}

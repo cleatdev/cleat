@@ -1443,3 +1443,40 @@ EOF
   run cmd_status "$TEST_TEMP/project"
   assert_output --partial "none"
 }
+
+# ── IPv6 loopback spellings ──────────────────────────────────────────────────
+# Only the literal [::1] matched, so an expanded, zone-scoped or v4-mapped
+# spelling of the same loopback address classified REMOTE and the docker
+# capability forwarded DOCKER_HOST into a box where ::1 means the box itself.
+
+@test "docker cap: an expanded IPv6 loopback binds the host socket like [::1]" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  _docker_pool_is_vm() { return 1; }
+  _host_sock_is_live() { return 0; }
+  export DOCKER_HOST="tcp://[0:0:0:0:0:0:0:1]:2375"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "/var/run/docker.sock:/var/run/docker.sock"
+  assert_success
+  run assert_docker_run_lacks "$cname" "DOCKER_HOST="
+  assert_success
+}
+
+@test "endpoint loopback: every loopback spelling is recognised" {
+  run _endpoint_is_loopback "tcp://[::1]:2375";                 assert_success
+  run _endpoint_is_loopback "tcp://[0:0:0:0:0:0:0:1]:2375";     assert_success
+  run _endpoint_is_loopback "tcp://[::1%eth0]:2375";            assert_success
+  run _endpoint_is_loopback "tcp://[::FFFF:127.0.0.1]:2375";    assert_success
+}
+
+@test "endpoint loopback: a wildcard or routable IPv6 address stays remote" {
+  # [::] is the wildcard, not loopback: mapping it would bind the box to
+  # something the host never meant to share.
+  run _endpoint_is_loopback "tcp://[::]:2375";                  assert_failure
+  run _endpoint_is_loopback "tcp://[fe80::1]:2375";             assert_failure
+  run _endpoint_is_loopback "tcp://[::11]:2375";                assert_failure
+  run _endpoint_is_loopback "tcp://[::ffff:127.0.0.1.evil.example]:2375"; assert_failure
+}

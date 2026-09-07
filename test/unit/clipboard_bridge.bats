@@ -181,3 +181,62 @@ EOF
   [[ ! -f "$clip_dir/.host-ready" ]]  || return 1
   rm -rf "$clip_dir"
 }
+
+@test "_clipboard_watcher drops a symlinked .host-ready instead of touching through it" {
+  # touch FOLLOWS a symlink, so a link planted here had the host create or
+  # re-stamp whatever file it named.
+  local clip_dir="$TEST_TEMP/clip"; mkdir -p "$clip_dir"
+  local target="$TEST_TEMP/should-not-exist"
+  ln -s "$target" "$clip_dir/.host-ready"
+  _clipboard_watcher "$clip_dir" "cat > /dev/null" >/dev/null 2>&1 &
+  local wpid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$clip_dir/.host-ready" ] && [ ! -L "$clip_dir/.host-ready" ] && break
+    sleep 0.3
+  done
+  stop_watcher "$wpid" "$clip_dir"
+  [ ! -L "$clip_dir/.host-ready" ] || { echo "the planted symlink survived"; return 1; }
+  [ ! -e "$target" ] || { echo "touch followed the link and created the target"; return 1; }
+}
+
+@test "clipboard delivery: the host caps an oversized payload at the documented 100KB" {
+  # docker/clip caps what the SHIM writes, but the shim is not the only thing
+  # that can put a file in the shared clip dir, and cli/README states the limit
+  # as a fact about the bridge.
+  local clip_dir="$TEST_TEMP/clip"; mkdir -p "$clip_dir"
+  local out="$TEST_TEMP/pasted"
+  _clipboard_watcher "$clip_dir" "cat > '$TEST_TEMP/pasted'" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.3
+  # Deliver the way the box shim does: mv, so the inotify branch fires too.
+  head -c 200000 /dev/zero | tr '\0' 'z' > "$TEST_TEMP/big-payload"
+  mv "$TEST_TEMP/big-payload" "$clip_dir/clipboard"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    [ -s "$out" ] && break
+    sleep 0.3
+  done
+  stop_watcher "$wpid" "$clip_dir"
+  [ -s "$out" ] || { echo "nothing was delivered to the host clipboard"; return 1; }
+  local sz; sz="$(wc -c < "$out" | tr -d '[:space:]')"
+  [ "$sz" -eq 102400 ] || { echo "host delivered $sz bytes, expected the 102400 cap"; return 1; }
+}
+
+@test "clipboard delivery: a small payload still arrives byte-identical" {
+  local clip_dir="$TEST_TEMP/clip"; mkdir -p "$clip_dir"
+  local out="$TEST_TEMP/pasted-small"
+  _clipboard_watcher "$clip_dir" "cat > '$TEST_TEMP/pasted-small'" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.3
+  printf 'hello from the cage' > "$TEST_TEMP/small-payload"
+  mv "$TEST_TEMP/small-payload" "$clip_dir/clipboard"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    [ -s "$out" ] && break
+    sleep 0.3
+  done
+  stop_watcher "$wpid" "$clip_dir"
+  run cat "$out"
+  assert_output "hello from the cage"
+}

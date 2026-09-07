@@ -1623,3 +1623,16 @@ EOF
   refute_output --partial "Starting Docker"
   refute_output --partial "unbound variable"
 }
+
+@test "smoke: cleat login with no container runs the real binary without a strict-mode crash" {
+  # House rule 13: every subcommand gets a smoke test. login was the one verb
+  # with none, and it is the verb that drives the browser bridge and the
+  # callback proxy, so a set -u slip here strands a login on a real host.
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf '' > "$DOCKER_MOCK_DIR/images_output"
+  run cleat_bin_timeout 10 login
+  refute_output --partial "unbound variable"
+  refute_output --partial "command not found"
+  refute_output --partial "syntax error"
+}

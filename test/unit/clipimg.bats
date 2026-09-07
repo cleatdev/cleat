@@ -421,3 +421,58 @@ EOF
   [ ! -e "$CLIPDIR/.image-req" ]         || { echo "request not consumed"; return 1; }
   [ ! -e "$CLIPDIR/.image-req.claimed" ] || { echo "claim residue left behind"; return 1; }
 }
+
+# ── Host-side image watcher ─────────────────────────────────────────────────
+# This loop polls four times a second for the life of every session, so an
+# unguarded claim forked `mv` on every idle tick. The symlink guards below
+# protect paths the box can plant into, since the clip dir is mounted rw.
+
+@test "clipimg watcher: an idle tick never forks an mv" {
+  local dir="$TEST_TEMP/cw"; mkdir -p "$dir"
+  local calls="$TEST_TEMP/mv-calls"
+  mv() { echo call >> "$calls"; command mv "$@"; }
+  _clipimg_serve() { :; }
+  _clipimg_watcher "$dir" "mybox" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 1.5                                   # several idle ticks
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ ! -s "$calls" ] || {
+    echo "an idle watcher forked mv $(wc -l < "$calls") times"; return 1; }
+}
+
+@test "clipimg watcher: a present request is still claimed" {
+  local dir="$TEST_TEMP/cw2"; mkdir -p "$dir"
+  _clipimg_serve() { touch "$TEST_TEMP/served"; }
+  _clipimg_watcher "$dir" "mybox" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.5
+  touch "$dir/.image-req"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$TEST_TEMP/served" ] && break
+    sleep 0.3
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ -f "$TEST_TEMP/served" ] || { echo "the guard swallowed a real request"; return 1; }
+  [ ! -e "$dir/.image-req" ] || { echo "the request was not consumed"; return 1; }
+}
+
+@test "clipimg watcher: a symlinked image lock is dropped, not followed" {
+  # `[ -d ]` DEREFERENCES, so a link to a directory aimed the rmdir at that
+  # directory, and a link to anything else latched image paste off forever
+  # because every later mkdir kept failing.
+  local dir="$TEST_TEMP/cw3"; mkdir -p "$dir"
+  mkdir -p "$TEST_TEMP/precious-dir"
+  ln -s "$TEST_TEMP/precious-dir" "$dir/.image-lock"
+  _clipimg_serve() { :; }
+  _clipimg_watcher "$dir" "mybox" >/dev/null 2>&1 &
+  local wpid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ ! -L "$dir/.image-lock" ] && break
+    sleep 0.3
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ ! -L "$dir/.image-lock" ] || { echo "the planted symlink survived"; return 1; }
+  [ -d "$TEST_TEMP/precious-dir" ] || { echo "the rmdir followed the link"; return 1; }
+}

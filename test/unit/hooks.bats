@@ -1082,18 +1082,53 @@ EOF
 
 # ── Session cleanup: browser watcher ─────────────────────────────────────
 
-@test "exec_claude: cleans up browser-open file on exit" {
+@test "exec_claude: cleans up a STALE browser-open file on exit" {
   _host_clip_cmd() { echo ""; }
   _host_open_cmd() { echo ""; }
   export DOCKER_EXIT_CODE=0
   mkdir -p "$CLEAT_RUN_DIR/test-cleanup/clip"
   touch "$CLEAT_RUN_DIR/test-cleanup/clip/.browser-open"
+  # -t is the portable form: GNU touch has -d, BSD touch does not.
+  touch -t 202001010000 "$CLEAT_RUN_DIR/test-cleanup/clip/.browser-open"
 
   _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup/clip"
   run exec_claude "test-cleanup" --dangerously-skip-permissions
 
   [[ ! -f "$CLEAT_RUN_DIR/test-cleanup/clip/.browser-open" ]] || return 1
   rm -rf "$CLEAT_RUN_DIR/test-cleanup/clip"
+}
+
+@test "exec_claude: teardown keeps a FRESH browser-open file for a sibling session" {
+  # Teardown used to rm the bridge file unconditionally, which swallowed a URL
+  # a CONCURRENT session had just written and stranded that login. Startup was
+  # age-gated for exactly this reason; teardown now matches it.
+  _host_clip_cmd() { echo ""; }
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  mkdir -p "$CLEAT_RUN_DIR/test-cleanup2/clip"
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$CLEAT_RUN_DIR/test-cleanup2/clip/.browser-open"
+
+  _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup2/clip"
+  run exec_claude "test-cleanup2" --dangerously-skip-permissions
+
+  [[ -f "$CLEAT_RUN_DIR/test-cleanup2/clip/.browser-open" ]] || return 1
+  rm -rf "$CLEAT_RUN_DIR/test-cleanup2/clip"
+}
+
+@test "exec_claude: teardown drops a SYMLINKED browser-open regardless of age" {
+  _host_clip_cmd() { echo ""; }
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  mkdir -p "$CLEAT_RUN_DIR/test-cleanup3/clip"
+  printf 'keep me\n' > "$TEST_TEMP/link-target"
+  ln -s "$TEST_TEMP/link-target" "$CLEAT_RUN_DIR/test-cleanup3/clip/.browser-open"
+
+  _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup3/clip"
+  run exec_claude "test-cleanup3" --dangerously-skip-permissions
+
+  [ ! -L "$CLEAT_RUN_DIR/test-cleanup3/clip/.browser-open" ] || return 1
+  [ -f "$TEST_TEMP/link-target" ] || return 1          # target untouched
+  rm -rf "$CLEAT_RUN_DIR/test-cleanup3/clip"
 }
 
 # ── Browser bridge ───────────────────────────────────────────────────────
@@ -1340,6 +1375,68 @@ SCRIPT
   run _extract_callback_port "$url"
   assert_success
   assert_output "55555"
+}
+
+# The port here is chosen by the CAGED side and decides which HOST port the
+# callback proxy binds, so the parser is a trust boundary, not a convenience.
+
+@test "_extract_callback_port: rejects a redirect_uri whose host is not loopback" {
+  # `*localhost:*` matched a substring ANYWHERE in the value, so this made the
+  # host bind 9999 for a destination the box picked.
+  local url="https://x.example/a?redirect_uri=http%3A%2F%2Fevil.example%2F%3Fnext%3Dlocalhost%3A9999"
+  run _extract_callback_port "$url"
+  assert_failure
+}
+
+@test "_extract_callback_port: rejects a userinfo host that hides the real destination" {
+  local url="https://x.example/a?redirect_uri=http%3A%2F%2Flocalhost%3A9999%40evil.example%2F"
+  run _extract_callback_port "$url"
+  assert_failure
+}
+
+@test "_extract_callback_port: rejects a hostname that merely starts with localhost" {
+  local url="https://x.example/a?redirect_uri=http%3A%2F%2Flocalhost.evil.example%3A9999%2Fcb"
+  run _extract_callback_port "$url"
+  assert_failure
+}
+
+@test "_extract_callback_port: rejects port 0" {
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A0%2Fcb"
+  assert_failure
+}
+
+@test "_extract_callback_port: rejects a privileged port" {
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A80%2Fcb"
+  assert_failure
+}
+
+@test "_extract_callback_port: rejects a port above 65535" {
+  # socat truncates modulo 65536 and python3 raises OverflowError, so the two
+  # backends disagree about what this even means.
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A65536%2Fcb"
+  assert_failure
+}
+
+@test "_extract_callback_port: rejects a leading-zero port" {
+  # 04000 is deliberate: bash reads a leading zero as OCTAL, and 0080 is
+  # invalid octal so it errors out and gets rejected anyway. 04000 parses
+  # cleanly to 2048 and lands in range, so only the explicit arm stops it.
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A04000%2Fcb"
+  assert_failure
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A0080%2Fcb"
+  assert_failure
+}
+
+@test "_extract_callback_port: rejects an oversized URL" {
+  local pad; pad="$(head -c 5000 /dev/zero | tr "\0" "A")"
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A5555%2Fcb&pad=$pad"
+  assert_failure
+}
+
+@test "_extract_callback_port: accepts LOCALHOST case-insensitively" {
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2FLOCALHOST%3A5555%2Fcb"
+  assert_success
+  assert_output "5555"
 }
 
 # ── Browser watcher: callback proxy integration ─────────────────────────
@@ -1688,4 +1785,50 @@ EOF
   run _hook_bridge_window 0 42
   assert_success
   assert_output "1 42"
+}
+
+@test "_extract_callback_port: keeps the top of the range at 65535" {
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3A65535%2Fcb"
+  assert_success
+  assert_output "65535"
+}
+
+@test "_extract_callback_port: rejects a non-numeric port" {
+  run _extract_callback_port "https://x/a?redirect_uri=http%3A%2F%2Flocalhost%3Aabcd%2Fcb"
+  assert_failure
+}
+
+@test "_extract_callback_port: still accepts a full Claude Code authorize URL" {
+  # Characterization: the shape the real login actually emits must survive
+  # every rule added above it.
+  local url="https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge=abc&code_challenge_method=S256&state=xyz"
+  run _extract_callback_port "$url"
+  assert_success
+  assert_output "54545"
+}
+
+@test "_extract_callback_port: a code-paste authorize URL still yields no proxy port" {
+  # The code-paste flow has no loopback callback, so it must return 1 and the
+  # login falls through to the printed code. This is unchanged behavior.
+  local url="https://console.anthropic.com/oauth/authorize?redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&state=x"
+  run _extract_callback_port "$url"
+  assert_failure
+}
+
+@test "hook bridge: a symlinked event spool is dropped instead of read through" {
+  # wc -c on a link to a fifo or /dev/zero never returns, wedging the bridge
+  # with no signal. [[ -f ]] dereferences, so the link test has to come first.
+  local spool="$TEST_TEMP/events.jsonl"
+  ln -s /dev/zero "$spool"
+  _hb_parent=$$
+  _portable_timeout 5 bash -c "true"     # ensure the helper exists before use
+  _hook_bridge_watcher "$spool" >/dev/null 2>&1 &
+  local hpid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ ! -L "$spool" ] && break
+    sleep 0.3
+  done
+  kill "$hpid" 2>/dev/null || true; wait "$hpid" 2>/dev/null || true
+  [ ! -L "$spool" ] || { echo "the planted spool symlink survived"; return 1; }
 }

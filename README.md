@@ -1003,7 +1003,7 @@ Containers can always reach services on the host via `host.docker.internal`. No 
 CLAUDE_VISUAL_URL=http://host.docker.internal:3200
 ```
 
-On Linux (Docker Engine), Cleat adds `--add-host host.docker.internal:host-gateway` automatically. Docker Desktop (macOS/Windows) provides this natively.
+On any engine other than Docker Desktop, Cleat adds `--add-host host.docker.internal:host-gateway` automatically. That covers Colima, Rancher Desktop, Lima and rootless Linux, on a Mac as well as on Linux. Docker Desktop provides it natively, so Cleat leaves it alone there.
 
 ---
 

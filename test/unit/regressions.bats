@@ -3394,3 +3394,124 @@ PYSRV
   run cat "$TEST_TEMP/plog-rp"
   assert_output --partial "bind attempt 1 failed"
 }
+
+@test "regression vnext: a busy package manager is named instead of a bare Install failed" {
+  # A fresh cloud image runs its own updater on first boot, holding the dpkg
+  # lock, so get.docker.com dies with "Could not get lock
+  # /var/lib/dpkg/lock-frontend". cleat printed a bare "Install failed" and the
+  # reader concluded cleat was broken when the fix was to wait a minute.
+  # Observed on a stock Ubuntu 24.04 droplet, 2026-09-08.
+  local stub="$TEST_TEMP/pkgbusy"
+  mkdir -p "$stub"
+  # apt-get is "running", every other name is not.
+  cat > "$stub/pgrep" <<'PG'
+#!/usr/bin/env bash
+[ "$2" = "apt-get" ] && exit 0
+exit 1
+PG
+  # The download succeeds and writes a script, the script fails the way apt does.
+  cat > "$stub/curl" <<'CURL'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+[ -n "$out" ] && printf '#!/bin/sh\nexit 1\n' > "$out"
+exit 0
+CURL
+  cat > "$stub/sudo" <<'SUDO'
+#!/usr/bin/env bash
+exit 1
+SUDO
+  chmod +x "$stub/pgrep" "$stub/curl" "$stub/sudo"
+
+  _is_macos() { return 1; }
+  _is_wsl() { return 1; }
+  PATH="$stub:$PATH"
+
+  run _offer_docker_install <<< "y"
+  assert_failure
+  assert_output --partial "the package manager is busy"
+  assert_output --partial "apt-get is already running"
+}
+
+@test "regression vnext: a docker install failure with no busy manager still hands over the manual command" {
+  # The plain failure path called error() and exited without ever printing
+  # _docker_install_hint, so a reader whose install failed for any other reason
+  # was left with no next step at all.
+  local stub="$TEST_TEMP/pkgfree"
+  mkdir -p "$stub"
+  cat > "$stub/pgrep" <<'PG'
+#!/usr/bin/env bash
+exit 1
+PG
+  cat > "$stub/curl" <<'CURL'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+[ -n "$out" ] && printf '#!/bin/sh\nexit 1\n' > "$out"
+exit 0
+CURL
+  cat > "$stub/sudo" <<'SUDO'
+#!/usr/bin/env bash
+exit 1
+SUDO
+  chmod +x "$stub/pgrep" "$stub/curl" "$stub/sudo"
+
+  _is_macos() { return 1; }
+  _is_wsl() { return 1; }
+  PATH="$stub:$PATH"
+
+  run _offer_docker_install <<< "y"
+  assert_failure
+  assert_output --partial "Install failed."
+  assert_output --partial "Install Docker yourself with"
+  refute_output --partial "the package manager is busy"
+}
+
+@test "regression vnext: the package-manager probe matches a command name, never a path or argument" {
+  # Matching the full command line would fire on anything mentioning apt, which
+  # on the failure path means blaming a lock that was never held. The ps
+  # fallback (a minimal image with no procps pgrep) must compare basenames only.
+  local stub="$TEST_TEMP/pkgname"
+  mkdir -p "$stub"
+  local b
+  for b in bash cat printf; do
+    [ -n "$(command -v $b 2>/dev/null)" ] && ln -sf "$(command -v $b)" "$stub/$b"
+  done
+  # Deliberately NO pgrep here, so _pkg_manager_busy takes the ps branch.
+  # Decoys: a path whose BASENAME is not a manager, and a local wrapper whose
+  # name merely contains one. Neither may match.
+  cat > "$stub/ps" <<'PS'
+#!/usr/bin/env bash
+printf '%s\n' /usr/lib/apt/apt.systemd.daily-helper
+printf '%s\n' my-apt-wrapper
+printf '%s\n' sshd
+PS
+  chmod +x "$stub/ps"
+  local out=""
+  out="$(PATH="$stub" _pkg_manager_busy)" || out=""
+  [ -z "$out" ] || {
+    echo "REGRESSION: false positive, matched '$out' on a decoy"; return 1; }
+
+  # A real manager reported with a leading path MUST still be detected. This is
+  # what the basename strip is for: ps on some systems prints an absolute path,
+  # and comparing the raw line there silently misses a genuinely held lock.
+  cat > "$stub/ps" <<'PS2'
+#!/usr/bin/env bash
+printf '%s\n' sshd
+printf '%s\n' /usr/bin/apt-get
+PS2
+  chmod +x "$stub/ps"
+  out="$(PATH="$stub" _pkg_manager_busy)" || out=""
+  [ "$out" = "apt-get" ] || {
+    echo "REGRESSION: a path-qualified apt-get was missed (got '$out')"; return 1; }
+
+  # And a truncated comm with no path still works.
+  cat > "$stub/ps" <<'PS3'
+#!/usr/bin/env bash
+printf '%s\n' unattended-upgr
+PS3
+  chmod +x "$stub/ps"
+  out="$(PATH="$stub" _pkg_manager_busy)" || out=""
+  [ "$out" = "unattended-upgr" ] || {
+    echo "REGRESSION: ps fallback missed a bare comm (got '$out')"; return 1; }
+}

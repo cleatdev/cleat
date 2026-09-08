@@ -1251,6 +1251,53 @@ _docker_install_hint() {
   fi
 }
 
+# Package managers whose lock a first-boot updater holds. Matched on the process
+# NAME only, never the command line, so a path or an argument that merely
+# mentions "apt" cannot produce a false positive. `unattended-upgr` is the real
+# 15-char truncated comm of unattended-upgrades, not an abbreviation of it.
+_PKG_LOCK_PROCS="apt apt-get aptitude dpkg unattended-upgr packagekitd dnf yum zypper"
+
+# Names the package manager currently running, or fails when none is. Prints the
+# process name on success.
+#
+# Why this exists: a fresh cloud image runs its own updater on first boot
+# (unattended-upgrades on Debian and Ubuntu, dnf-makecache on Fedora), which
+# holds the package lock. get.docker.com then dies with "Could not get lock
+# /var/lib/dpkg/lock-frontend" and the reader saw a bare "Install failed",
+# concluding cleat was broken when the fix was to wait a minute.
+#
+# STRICTLY A DIAGNOSTIC, only ever called on an already-failed path. Every probe
+# is best-effort: a false negative falls back to the plain message, so this can
+# never turn a working install into a failure. It must also never hang, so
+# nothing here waits on a lock, it only asks what is running right now.
+_pkg_manager_busy() {
+  local want comm
+  if command -v pgrep > /dev/null 2>&1; then
+    for want in $_PKG_LOCK_PROCS; do
+      if pgrep -x "$want" > /dev/null 2>&1; then
+        printf '%s\n' "$want"
+        return 0
+      fi
+    done
+    return 1
+  fi
+  # No pgrep (a minimal image without procps): read the command-name column from
+  # ps and strip any leading path, which is the same comparison pgrep -x makes.
+  command -v ps > /dev/null 2>&1 || return 1
+  while IFS= read -r comm; do
+    comm="${comm##*/}"
+    for want in $_PKG_LOCK_PROCS; do
+      if [ "$comm" = "$want" ]; then
+        printf '%s\n' "$want"
+        return 0
+      fi
+    done
+  done <<PKGPS
+$(ps -eo comm= 2>/dev/null || true)
+PKGPS
+  return 1
+}
+
 # Interactive install offer. Returns 0 when an install ran and the docker CLI
 # is now present (the caller re-enters the autopilot flow), non-zero exit
 # otherwise. TTY-only by contract (the caller gates).
@@ -1338,7 +1385,19 @@ _offer_docker_install() {
   fi
   if ! _install_run sudo sh "$script"; then
     rm -rf "$stage"
-    error "Install failed."
+    # Assigned on its own line: `local x=$(...)` would mask the exit status and
+    # the || guard would never fire under set -e.
+    local _busy=""
+    _busy="$(_pkg_manager_busy)" || _busy=""
+    if [ -n "$_busy" ]; then
+      error "Install failed: the package manager is busy."
+      echo -e "    ${DIM}${_busy} is already running, so Docker's installer could not take the${RESET}"
+      echo -e "    ${DIM}package lock. A fresh cloud image runs its own updater on first boot.${RESET}"
+      echo -e "    ${DIM}Wait for it to finish, then run ${BOLD}cleat${RESET}${DIM} again.${RESET}"
+    else
+      error "Install failed."
+      echo -e "    ${DIM}Install Docker yourself with: ${BOLD}$(_docker_install_hint)${RESET}"
+    fi
     exit 1
   fi
   rm -rf "$stage"

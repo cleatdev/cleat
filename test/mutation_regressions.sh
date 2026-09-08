@@ -5406,6 +5406,16 @@ s|\$open_cmd "\$_clean_url"|$open_cmd "$url"|
 SED
 try "vnext_opener_clean_url" "the opener never receives a control character" "$CLI" "$BROWSER_BRIDGE_BATS"
 
+cat > "$SED_TMP" << 'SED'
+s|if \[ -n "\$_busy" \]; then|if [ -n "" ]; then|
+SED
+try "vnext_pkg_lock_named" "a busy package manager is named instead" "$CLI" "$REGRESSIONS"
+
+cat > "$SED_TMP" << 'SED'
+s|comm="\${comm##\*/}"|comm="$comm"|
+SED
+try "vnext_pkg_probe_basename" "probe matches a command name" "$CLI" "$REGRESSIONS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -722,9 +722,10 @@ EOF
 @test "row_kind: caps map to cap:<name>, then mem, then cpus, then gen" {
   run _config_row_kind 0; assert_output "cap:git"
   run _config_row_kind 5; assert_output "cap:docker"
-  run _config_row_kind 6; assert_output "mem"
-  run _config_row_kind 7; assert_output "cpus"
-  run _config_row_kind 8; assert_output "gen"
+  run _config_row_kind 6; assert_output "cap:unsafe-rm"
+  run _config_row_kind 7; assert_output "mem"
+  run _config_row_kind 8; assert_output "cpus"
+  run _config_row_kind 9; assert_output "gen"
 }
 
 # ── draw: resource + generate rows ─────────────────────────────────────────
@@ -738,7 +739,9 @@ EOF
 }
 
 @test "config draw: shows chevrons on the cursored resource row" {
-  run _config_picker_draw 6 "" 4g all 0 0
+  # Memory is the first resource row, just past the caps. Its index is
+  # ${#KNOWN_CAPS[@]} (7 caps here), so the cursor sits on it at 7.
+  run _config_picker_draw 7 "" 4g all 0 0
   assert_output --partial "‹ 4g ›"
 }
 

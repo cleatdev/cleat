@@ -452,6 +452,28 @@ STUB
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat config --enable unsafe-rm persists to config file" {
+  run cleat_bin config --enable unsafe-rm
+  assert_success
+  assert_output --partial "unsafe-rm"
+  grep -q "^unsafe-rm$" "$CLEAT_CONFIG_DIR/config" || {
+    echo "unsafe-rm cap not persisted"
+    cat "$CLEAT_CONFIG_DIR/config"
+    return 1
+  }
+}
+
+@test "smoke: cleat --cap unsafe-rm is a valid capability (not rejected)" {
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf '' > "$DOCKER_MOCK_DIR/images_output"
+  mkdir -p "$TEST_TEMP/project"
+  run cleat_bin --cap unsafe-rm status "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Unknown capability"
+  refute_output --partial "unbound variable"
+}
+
 @test "smoke: cleat config --memory persists to config file" {
   run cleat_bin config --memory 4g
   assert_success

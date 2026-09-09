@@ -117,10 +117,14 @@ _KIT_PANE_LINES=7
 CLEAT_PROJECTS_DIR="$CLEAT_CONFIG_DIR/projects"
 
 # Known capabilities (order matters for display).
-# Two behavioral categories. See _cap_category for the mapping:
+# Three behavioral categories. See _cap_category for the mapping:
 #   mount   git, ssh, env, hooks, gh   auth/identity bind-mounts (no install)
 #   sandbox docker                     mounts host docker socket (breaks isolation)
-KNOWN_CAPS=(git ssh env hooks gh docker)
+#   guard   unsafe-rm                  disables a Claude Code safety prompt in the box
+# unsafe-rm is global/CLI only (never granted from a project .cleat): it disarms
+# the delete-safety prompt for the very agent that could write .cleat. See
+# resolve_caps and concept/42-unsafe-rm.md.
+KNOWN_CAPS=(git ssh env hooks gh docker unsafe-rm)
 
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
@@ -4195,6 +4199,14 @@ resolve_caps() {
     if [[ -f "$caps_file" ]]; then
       local _raw_project_caps
       _raw_project_caps="$(_read_caps_from_file "$caps_file" "$box")"
+      # unsafe-rm disarms the box's delete-safety guard, and the caged agent can
+      # write .cleat in its own workspace. A project file must NEVER grant it, not
+      # even a trusted one: strip it here so the only sources are the user's global
+      # config and the --cap flag. Say so, because a silent drop reads as a bug.
+      if printf '%s\n' "$_raw_project_caps" | grep -qx 'unsafe-rm'; then
+        warn "Ignoring ${BOLD}unsafe-rm${RESET} from the project .cleat: it disarms the delete-safety guard and is accepted only from your global config or ${BOLD}--cap${RESET}."
+        _raw_project_caps="$(printf '%s\n' "$_raw_project_caps" | grep -vx 'unsafe-rm' || true)"
+      fi
       if [[ -n "$_raw_project_caps" ]]; then
         if _resolve_project_trust "$project" "$trust_mode"; then
           project_caps="$_raw_project_caps"
@@ -5042,22 +5054,25 @@ show_first_run_tip() {
 # renderer breaks them into a labeled block: the categorization itself
 # teaches the user that the docker cap behaves differently.
 
-# Map a single cap name to its display category. Stdout: mount|sandbox.
+# Map a single cap name to its display category. Stdout: mount|sandbox|guard.
 _cap_category() {
   case "$1" in
-    docker) echo "sandbox" ;;
-    *)      echo "mount" ;;
+    docker)    echo "sandbox" ;;
+    unsafe-rm) echo "guard" ;;
+    *)         echo "mount" ;;
   esac
 }
 
-# Bucket ACTIVE_CAPS into _CAPS_MOUNT/_CAPS_SANDBOX globals.
+# Bucket ACTIVE_CAPS into _CAPS_MOUNT/_CAPS_SANDBOX/_CAPS_GUARD globals.
 _caps_bucket_active() {
   _CAPS_MOUNT=()
   _CAPS_SANDBOX=()
+  _CAPS_GUARD=()
   local cap
   for cap in "${ACTIVE_CAPS[@]+"${ACTIVE_CAPS[@]}"}"; do
     case "$(_cap_category "$cap")" in
       sandbox) _CAPS_SANDBOX+=("$cap") ;;
+      guard)   _CAPS_GUARD+=("$cap") ;;
       mount)   _CAPS_MOUNT+=("$cap") ;;
     esac
   done
@@ -5078,8 +5093,11 @@ _print_caps() {
   local cats=0
   [[ ${#_CAPS_MOUNT[@]}   -gt 0 ]] && cats=$((cats + 1))
   [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]] && cats=$((cats + 1))
+  [[ ${#_CAPS_GUARD[@]}   -gt 0 ]] && cats=$((cats + 1))
 
-  if [[ $cats -le 1 ]]; then
+  # A guard cap always renders in the labeled block so its "(disables ...)" note
+  # is never dropped by the single-line fast path, even when it is the only cap.
+  if [[ $cats -le 1 && ${#_CAPS_GUARD[@]} -eq 0 ]]; then
     local color s
     if [[ ${#_CAPS_SANDBOX[@]} -gt 0 ]]; then
       color="$AMBER"; s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"
@@ -5103,6 +5121,11 @@ _print_caps() {
     s="$(printf '%s, ' "${_CAPS_SANDBOX[@]}")"; s="${s%, }"
     s="$(_sanitize_repo_str "$s")"
     echo -e "${indent}  ${DIM}sandbox:${RESET}  ${AMBER}${BOLD}${s}${RESET} ${DIM}(breaks isolation)${RESET}"
+  fi
+  if [[ ${#_CAPS_GUARD[@]} -gt 0 ]]; then
+    s="$(printf '%s, ' "${_CAPS_GUARD[@]}")"; s="${s%, }"
+    s="$(_sanitize_repo_str "$s")"
+    echo -e "${indent}  ${DIM}guard:${RESET}    ${RED}${BOLD}${s}${RESET} ${DIM}(disables the delete-safety prompt)${RESET}"
   fi
 }
 
@@ -8007,6 +8030,102 @@ _upgrade_claude_image() {
   return 0
 }
 
+# The Python program behind the unsafe-rm capability's PermissionRequest hook.
+# Claude Code keeps a bypass-immune "dangerous rm" prompt alive even under
+# --dangerously-skip-permissions (a compiled circuit breaker, upstream WAI, see
+# concept/42-unsafe-rm.md). A PermissionRequest hook returning a plain
+# {behavior:"allow"} with no updatedInput is the one documented way to answer it,
+# and it works on the box's interactive path.
+#
+# This is a SINGLE SOURCE OF TRUTH: cmd_run injects it into the box's settings
+# overlay via jq, and the unit tests run it directly against sample event JSON.
+# It runs INSIDE the box (python3 ships in the image). It reads the hook event on
+# stdin and answers "allow" ONLY when every top-level segment of the Bash command
+# is rm/rmdir/cd/blank, and refuses outright when the command contains command
+# substitution. So `rm -rf $S/*` and `cd $S && rm -rf *` are auto-allowed, while
+# `curl x | sh; rm -rf $S/*` is NOT (the curl segment fails the check and the
+# prompt still fires). It never emits "deny", so a non-rm command it does not
+# recognise leaves the permission flow untouched.
+_unsafe_rm_hook_program() {
+  cat <<'URM_PY'
+import sys, json, re, shlex
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+ti = d.get("tool_input")
+cmd = ti.get("command") if isinstance(ti, dict) else None
+if not isinstance(cmd, str) or not cmd.strip():
+    sys.exit(0)
+# Refuse anything that can run ANOTHER command: command substitution $(...) and
+# backticks, arithmetic $((...)) (starts with "$("), process substitution <(...)
+# and >(...), and bash 5.2 command substitution ${ ...;} / ${|...;}. Redirections
+# are deliberately allowed: they only write or truncate, which is a subset of the
+# deletion this cap already grants, and they never spawn a new command.
+for bad in ("$(", "`", "<(", ">(", "${ ", "${|"):
+    if bad in cmd:
+        sys.exit(0)
+allow = True
+saw_rm = False
+for seg in re.split(r"&&|\|\||[;&|\n]", cmd):
+    seg = seg.strip()
+    if not seg:
+        continue
+    try:
+        toks = shlex.split(seg)
+    except Exception:
+        allow = False
+        break
+    i = 0
+    while i < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]):
+        i += 1
+    if i >= len(toks):
+        continue
+    base = toks[i].rsplit("/", 1)[-1]
+    if base in ("rm", "rmdir"):
+        saw_rm = True
+    elif base == "cd":
+        pass
+    else:
+        allow = False
+        break
+if allow and saw_rm:
+    sys.stdout.write(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        }
+    }))
+URM_PY
+}
+
+# Add the unsafe-rm PermissionRequest hook to an already-written settings overlay
+# file. Idempotent enough for the recreate rail (the overlay is rewritten from
+# scratch each cmd_run). Fails LOUD and leaves the guard on if jq is missing or
+# errors: the safe direction is the prompt staying, never silently-off.
+_inject_unsafe_rm_hook() {
+  local settings_file="$1"
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "unsafe-rm: jq not found on the host, cannot install the delete-allow hook. The box's delete-safety prompt stays ON."
+    return 0
+  fi
+  local _prog _out
+  _prog="$(_unsafe_rm_hook_program)"
+  _out="$(jq --arg prog "$_prog" '
+    .hooks.PermissionRequest = ((.hooks.PermissionRequest // []) + [{
+      matcher: "Bash",
+      hooks: [{ type: "command", command: ("python3 -c " + ($prog | @sh)) }]
+    }])
+  ' "$settings_file" 2>/dev/null)" || true
+  if [[ -n "$_out" ]]; then
+    printf '%s\n' "$_out" > "$settings_file"
+  else
+    warn "unsafe-rm: could not write the delete-allow hook (jq failed). The box's delete-safety prompt stays ON."
+  fi
+}
+
 cmd_run() {
   local project box
   project="$(resolve_project "${1:-}")"
@@ -8182,6 +8301,14 @@ cmd_run() {
   fi
   if ! $_overlay_ok; then
     echo '{}' > "$settings_overlay_dir/settings.json"
+  fi
+
+  # ── unsafe-rm guard capability ─────────────────────────────────────────────
+  # Append the delete-allow PermissionRequest hook AFTER the hooks strip/forward
+  # above, so it is never turned async (an async hook cannot answer a prompt) and
+  # never stripped. Only when the cap is active, which is global/CLI only.
+  if cap_is_active unsafe-rm; then
+    _inject_unsafe_rm_hook "$settings_overlay_dir/settings.json"
   fi
 
   # ── Per-project session isolation ──────────────────────────────────────
@@ -10705,6 +10832,7 @@ _cap_description() {
     hooks)  echo "Run your Claude Code hooks on the host (global + project)" ;;
     gh)     echo "GitHub CLI auth (persists across rm/nuke/rebuild)" ;;
     docker) echo "Host Docker socket (breaks sandbox) to test Docker apps" ;;
+    unsafe-rm) echo "Run rm without the delete-safety prompt (global/CLI only, disarms a guard)" ;;
     *)      echo "(unknown capability)" ;;
   esac
 }

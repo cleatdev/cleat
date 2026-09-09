@@ -432,7 +432,7 @@ try "v0.9.2_cli_spin_stop_line_clear" "bin/cleat spin_stop clears line before wr
 
 # v0.10.0: docker must be in KNOWN_CAPS. Remove it, guard test should fail.
 cat > "$SED_TMP" << 'SED'
-s|^KNOWN_CAPS=(git ssh env hooks gh docker)$|KNOWN_CAPS=(git ssh env hooks gh)|
+s|^KNOWN_CAPS=(git ssh env hooks gh docker unsafe-rm)$|KNOWN_CAPS=(git ssh env hooks gh unsafe-rm)|
 SED
 try "v0.10.0_docker_in_known_caps" "docker listed in KNOWN_CAPS"
 
@@ -559,6 +559,37 @@ cat > "$SED_TMP" << 'SED'
 s#&& _host_sock_is_live /var/run/docker.sock; then#\&\& true; then#
 SED
 try "vnext_docker_cap_loopback_liveness_guard" "with no host socket warns" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext unsafe-rm: the guard cap must NOT be grantable from a project .cleat (the
+# caged agent can write it). Stop stripping it from project caps; the
+# project-ignored test should fail.
+cat > "$SED_TMP" << 'SED'
+s@grep -vx 'unsafe-rm' || true@cat@
+SED
+try "vnext_unsafe_rm_project_stripped" "unsafe-rm from a project" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext unsafe-rm: --cap unsafe-rm must inject the PermissionRequest hook into the
+# box settings overlay. Neutralise the injection; the overlay-hook test fails.
+cat > "$SED_TMP" << 'SED'
+s@_inject_unsafe_rm_hook "\$settings_overlay_dir/settings.json"@:@
+SED
+try "vnext_unsafe_rm_hook_injected" "writes the delete-allow hook" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext unsafe-rm: the hook must REFUSE a non-rm segment (blast-radius guard).
+# Flip the disqualifier so a wrapped command like `curl x | sh; rm ...` is
+# allowed; the refuses-a-wrapped-command test should fail.
+cat > "$SED_TMP" << 'SED'
+s@        allow = False@        allow = True@
+SED
+try "vnext_unsafe_rm_hook_refuses_wrapped" "refuses a wrapped or non-rm command" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext unsafe-rm: the hook must REFUSE process substitution <(...) >(...), which
+# executes a command as an rm argument. Drop those two from the refuse tuple; the
+# refuses-process-substitution test should fail.
+cat > "$SED_TMP" << 'SED'
+s@"<(", ">(", @@
+SED
+try "vnext_unsafe_rm_hook_refuses_procsub" "refuses process substitution" "$CLI" "$CAPABILITIES_BATS"
 
 # The empty/root-HOME guard in _docker_pool_is_vm: without it an empty HOME
 # degenerates the Lima anchor to /.colima/* and reopens the over-match. Remove

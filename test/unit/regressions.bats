@@ -3515,3 +3515,76 @@ PS3
   [ "$out" = "unattended-upgr" ] || {
     echo "REGRESSION: ps fallback missed a bare comm (got '$out')"; return 1; }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: docs/cli.md promises "Without jq on the host the box falls back to
+# empty settings". Both arms of the create-time project overlay fell through to
+# a verbatim `cp` instead, mounting the user's real host hook commands into the
+# box, where Claude Code ran them in the container and osascript and every other
+# host-only command is not there. The host bridge never started either, because
+# _has_host_hooks needs jq to answer and its "no" is indistinguishable from a
+# real "no hooks configured", so the hooks ran nowhere at all with no message.
+# jq ships in the image but is NOT a documented host requirement.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A host with no jq. A function override is the reliable mocking level here
+# (testing rule 5): PATH surgery cannot hide jq from `command -v` without
+# rebuilding a minimal PATH that cmd_run would then be missing half of.
+_hide_jq() {
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "jq" ]; then return 1; fi
+    builtin command "$@"
+  }
+}
+
+@test "regression vnext: a jq-less host gets empty project settings, not the real hook commands" {
+  mock_docker_images "cleat"
+  cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
+[caps]
+hooks
+EOF
+  mkdir -p "$TEST_TEMP/project/.claude"
+  cat > "$TEST_TEMP/project/.claude/settings.json" << 'EOF'
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"osascript -e beep"}]}]}}
+EOF
+  _hide_jq
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/project-settings.json"
+  [ -f "$overlay" ] || { echo "REGRESSION: no overlay written at all"; return 1; }
+  run cat "$overlay"
+  refute_output --partial "osascript"
+  assert_output --partial "{}"
+}
+
+@test "regression vnext: a jq-less host gets empty project settings with the hooks cap off too" {
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  cat > "$TEST_TEMP/project/.claude/settings.json" << 'EOF'
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"osascript -e beep"}]}]}}
+EOF
+  _hide_jq
+
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/project-settings.json"
+  [ -f "$overlay" ] || { echo "REGRESSION: no overlay written at all"; return 1; }
+  run cat "$overlay"
+  refute_output --partial "osascript"
+  assert_output --partial "{}"
+}
+
+@test "regression vnext: the hooks cap says so on a host with no jq instead of forwarding nothing in silence" {
+  ACTIVE_CAPS=(hooks)
+  _hide_jq
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_output --partial "jq is not installed on the host"
+}

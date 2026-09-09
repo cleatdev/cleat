@@ -5416,6 +5416,16 @@ s|comm="\${comm##\*/}"|comm="$comm"|
 SED
 try "vnext_pkg_probe_basename" "probe matches a command name" "$CLI" "$REGRESSIONS"
 
+cat > "$SED_TMP" << 'SED'
+s|if ! command -v jq >/dev/null 2>&1; then|if false; then|
+SED
+try "vnext_jqless_empty_settings" "jq-less host gets empty project settings" "$CLI" "$REGRESSIONS"
+
+cat > "$SED_TMP" << 'SED'
+s|cap_is_active hooks 2>/dev/null && ! command -v jq >/dev/null 2>&1; then|cap_is_active hooks 2>/dev/null \&\& false; then|
+SED
+try "vnext_jqless_hooks_notice" "says so on a host with no jq" "$CLI" "$REGRESSIONS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

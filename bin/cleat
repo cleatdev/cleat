@@ -6947,7 +6947,15 @@ exec_claude() {
 
   # Start host-side hook bridge if user has hooks and hooks cap is active
   local hooks_file="$CLEAT_RUN_DIR/${cname}/hooks/events.jsonl"
-  if cap_is_active hooks 2>/dev/null && _has_host_hooks 2>/dev/null; then
+  # _has_host_hooks parses settings with jq, so on a host without jq it cannot
+  # answer and returns "no hooks". That is indistinguishable from a real "no
+  # hooks configured", so the cap used to forward nothing with no message at all
+  # while the summary block still listed it as active. jq ships in the image but
+  # is not a documented HOST requirement (cli/README.md lists Docker, the OS, an
+  # account and git), so this is a reachable configuration, not a hypothetical.
+  if cap_is_active hooks 2>/dev/null && ! command -v jq >/dev/null 2>&1; then
+    warn "hooks cap is on but jq is not installed on the host, so no hooks are forwarded. Install jq to enable them."
+  elif cap_is_active hooks 2>/dev/null && _has_host_hooks 2>/dev/null; then
     # Terminal-safety redirect (see the clipboard watcher). The bridge runs hook
     # commands `>/dev/null 2>&1` and its `( _execute_host_hooks ) &` children
     # inherit these fds, so both the bridge and its children keep fork spew off
@@ -8282,7 +8290,22 @@ cmd_run() {
       local _base _overlay_name
       _base="$(basename "$pf")"
       _overlay_name="project-$_base"
-      if cap_is_active hooks; then
+      # No jq on the host means we can neither rewrite the hook commands into the
+      # forwarder nor strip them, and BOTH arms below used to fall through to a
+      # verbatim `cp`. That mounted the user's real host hook commands into the
+      # box, where Claude Code then ran them in the container: `osascript` and
+      # every other host-only command simply is not there. Meanwhile the host
+      # bridge never starts either, because _has_host_hooks needs jq to answer,
+      # so the hooks silently ran nowhere at all.
+      #
+      # docs/cli.md already promises empty settings for a jq-less host, and the
+      # resume-side refresh already writes `echo '{}'` in its own else branch, so
+      # honour that here on both arms rather than copying. This is the create
+      # path, the only one of the three that MOUNTS: resume and shell/claude are
+      # both guarded at the block level and skip when jq is absent.
+      if ! command -v jq >/dev/null 2>&1; then
+        echo '{}' > "$settings_overlay_dir/$_overlay_name"
+      elif cap_is_active hooks; then
         # Replace hook commands with event forwarder
         if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
           jq '

@@ -110,7 +110,7 @@ _KIT_MODEL_CHOICES=(sonnet haiku opus inherit)
 # the longest _kit_description folded at 60 columns.
 _KIT_PANE_LINES=7
 
-# Rows the `cleat sessions` list shows at once. It is the first SCROLLING list
+# Rows the `cleat session` list shows at once. It is the first SCROLLING list
 # in this file: every other picker draws its whole list (9 rows at most), but a
 # project accumulates sessions without bound (27 in the maintainer's own repo),
 # and a block taller than the terminal loses its frame origin for good, because
@@ -10958,7 +10958,7 @@ cmd_storage() {
 # and a `cleanupPeriodDays` sweep that removes by last-modified date, but no way
 # to remove ONE. Cleat already owns the directory those transcripts land in
 # (_derive_project_session_key, mounted per box at cmd_run), so it is the natural
-# place to manage them. `cleat sessions` lists them with real sizes, renames one
+# place to manage them. `cleat session` lists them with real sizes, renames one
 # and moves one to a trash it can restore from.
 #
 # Two facts shape everything below.
@@ -11604,7 +11604,7 @@ _SESSIONS_CHROME_LINES=8
 _SESSIONS_MIN_COLS=40
 
 # Suppress the terminal's own echo for the duration of a raw key loop. Named
-# for what it does rather than for `cleat sessions`, which needed it first:
+# for what it does rather than for `cleat session`, which needed it first:
 # `cleat account` uses the same pair, and a second copy of a termios save and
 # restore is the last thing this file needs.
 #
@@ -12073,12 +12073,12 @@ _sessions_do_delete() {
   echo -e "    ${DIM}Title: $(_sessions_safe_title "$title")${RESET}"
   echo -e "    ${DIM}The conversation, its subagent transcripts and its tool results all go.${RESET}"
   echo -e "    ${DIM}It moves to the trash, recoverable for ${_SESSIONS_TRASH_DAYS} days with${RESET}"
-  echo -e "    ${DIM}${BOLD}cleat sessions restore ${uuid:0:8}${RESET}"
+  echo -e "    ${DIM}${BOLD}cleat session restore ${uuid:0:8}${RESET}"
 
   if [[ "$assume_yes" != "1" ]]; then
     # _is_interactive AND a default-No prompt. The pairing is the cmd_uninstall
     # precedent and it is load-bearing: _ask_yn on its own is pipe-satisfiable,
-    # so `yes | cleat sessions rm ...` would answer it.
+    # so `yes | cleat session rm ...` would answer it.
     if ! _is_interactive; then
       echo ""
       echo -e "    ${DIM}Nothing was deleted. Re-run with ${BOLD}--yes${RESET}${DIM} to do this non-interactively.${RESET}"
@@ -12097,7 +12097,7 @@ _sessions_do_delete() {
   mt_now="$(_path_mtime "$f")"
   if [[ "$mt_now" != "$mt_before" ]]; then
     error "Session ${BOLD}${uuid:0:8}${RESET} changed while you were deciding."
-    echo -e "    ${DIM}Something is still writing it. Run ${BOLD}cleat sessions${RESET}${DIM} again.${RESET}"
+    echo -e "    ${DIM}Something is still writing it. Run ${BOLD}cleat session${RESET}${DIM} again.${RESET}"
     return 1
   fi
 
@@ -12119,7 +12119,7 @@ _sessions_do_delete() {
   # Say it, because `df` will not move until the trash is swept and a user who
   # deletes a gigabyte and sees no free space assumes the command lied.
   echo -e "    ${DIM}Disk space comes back when the trash is swept, after ${_SESSIONS_TRASH_DAYS} days.${RESET}"
-  echo -e "    ${DIM}Undo: ${BOLD}cleat sessions restore ${uuid:0:8}${RESET}"
+  echo -e "    ${DIM}Undo: ${BOLD}cleat session restore ${uuid:0:8}${RESET}"
   return 0
 }
 
@@ -12127,7 +12127,7 @@ _sessions_do_delete() {
 #
 # No _sessions_live_gate and no confirm, on purpose. A restore puts files back
 # where Claude Code expects them and is undone by deleting again, so it is the
-# one action here that costs nothing to get wrong. `cleat sessions restore <id>`
+# one action here that costs nothing to get wrong. `cleat session restore <id>`
 # takes the same path and has never gated either.
 _sessions_do_restore() {
   local sdir="$1" uuid="$2"
@@ -12309,7 +12309,7 @@ _sessions_picker_tui() {
       trap - INT TERM HUP EXIT
       echo ""
       info "Window too narrow for the session list."
-      echo -e "    ${DIM}Widen it and run ${BOLD}cleat sessions${RESET}${DIM} again.${RESET}"
+      echo -e "    ${DIM}Widen it and run ${BOLD}cleat session${RESET}${DIM} again.${RESET}"
       return 0
     fi
     _sessions_clamp "$total"
@@ -12335,7 +12335,7 @@ _sessions_picker_tui() {
         printf '\033[2K'
         echo ""
         info "Window too narrow for the session list."
-        echo -e "    ${DIM}Widen it and run ${BOLD}cleat sessions${RESET}${DIM} again.${RESET}"
+        echo -e "    ${DIM}Widen it and run ${BOLD}cleat session${RESET}${DIM} again.${RESET}"
         return 0
       fi
 
@@ -12463,9 +12463,9 @@ _sessions_picker_text() {
   done
   echo ""
   if [[ "$total" -eq 1 ]]; then
-    echo -e "  ${DIM}1 session. Act on it with ${BOLD}cleat sessions rename <id>${RESET}${DIM} or ${BOLD}cleat sessions rm <id>${RESET}${DIM}.${RESET}"
+    echo -e "  ${DIM}1 session. Act on it with ${BOLD}cleat session rename <id>${RESET}${DIM} or ${BOLD}cleat session rm <id>${RESET}${DIM}.${RESET}"
   else
-    echo -e "  ${DIM}${total} sessions. Act on one with ${BOLD}cleat sessions rename <id>${RESET}${DIM} or ${BOLD}cleat sessions rm <id>${RESET}${DIM}.${RESET}"
+    echo -e "  ${DIM}${total} sessions. Act on one with ${BOLD}cleat session rename <id>${RESET}${DIM} or ${BOLD}cleat session rm <id>${RESET}${DIM}.${RESET}"
   fi
   # The picker advertises the trash on its counter line. Without this the
   # non-TTY path is the one place a deleted session could be invisible.
@@ -12473,7 +12473,7 @@ _sessions_picker_text() {
     tn="$(_sessions_trash_count "$sdir")"
     case "$tn" in ''|*[!0-9]*) tn=0 ;; esac
     if [[ "$tn" -gt 0 ]]; then
-      echo -e "  ${DIM}${tn} in the trash. See them with ${BOLD}cleat sessions trash${RESET}${DIM}.${RESET}"
+      echo -e "  ${DIM}${tn} in the trash. See them with ${BOLD}cleat session trash${RESET}${DIM}.${RESET}"
     fi
   fi
   return 0
@@ -13041,7 +13041,7 @@ _account_clock() {
 #
 # Never an unlink. What is being removed is a refresh token with weeks of life
 # in it, and the way it gets removed is a typo in a picker. Same trash shape as
-# `cleat sessions`, same 30 days, same exit codes: 2 means the trash itself is
+# `cleat session`, same 30 days, same exit codes: 2 means the trash itself is
 # unusable and nothing was touched, 1 means something was left in place, 0 means
 # it moved.
 _account_trash_dir() {
@@ -13320,7 +13320,7 @@ _account_do_restore() {
 
 # ── The picker ──────────────────────────────────────────────────────────────
 #
-# Structure lifted from `cleat sessions`, which is the one picker in this file
+# Structure lifted from `cleat session`, which is the one picker in this file
 # that has been through a rendering-bug round: rows precomputed into parallel
 # indexed arrays, the whole frame emitted in ONE printf, `\033[K` after the text
 # rather than `\033[2K` before it, echo suppressed with the full termios state
@@ -13504,7 +13504,7 @@ _accounts_frame() {
 
 # ── The picker loop ─────────────────────────────────────────────────────────
 #
-# Same two-loop shape as `cleat sessions`: the outer pass is one list screen,
+# Same two-loop shape as `cleat session`: the outer pass is one list screen,
 # every action breaks back to it, so switching an account and then renaming
 # another is one run rather than three.
 _ACCOUNTS_ACTION_LINES=5
@@ -13885,7 +13885,7 @@ cmd_account() {
   return 0
 }
 
-# `cleat sessions [list|rename|rm|restore|trash] [<id>] [box] [flags]`
+# `cleat session [list|rename|rm|restore|trash] [<id>] [box] [flags]`
 #
 # The subcommand word is reserved FIRST, then the flags, then <id>, and only
 # what is left goes to _set_box. That order matters: _set_box accepts exactly
@@ -13919,7 +13919,7 @@ cmd_sessions() {
       --title=*) want_title=1; title="${1#--title=}"; shift ;;
       -*)
         error "Unknown flag: ${BOLD}${1}${RESET}"
-        echo -e "    ${DIM}cleat sessions takes --title <text> and --yes.${RESET}"
+        echo -e "    ${DIM}cleat session takes --title <text> and --yes.${RESET}"
         return 1 ;;
       *) rest=("${rest[@]+"${rest[@]}"}" "$1"); shift ;;
     esac
@@ -13928,8 +13928,8 @@ cmd_sessions() {
   if [[ "$sub" != "list" && "$sub" != "trash" ]]; then
     id="${rest[0]:-}"
     if [[ -z "$id" ]]; then
-      error "Which session? ${DIM}cleat sessions ${sub} <id>${RESET}"
-      echo -e "    ${DIM}Run ${BOLD}cleat sessions${RESET}${DIM} to see the ids.${RESET}"
+      error "Which session? ${DIM}cleat session ${sub} <id>${RESET}"
+      echo -e "    ${DIM}Run ${BOLD}cleat session${RESET}${DIM} to see the ids.${RESET}"
       return 1
     fi
     rest=("${rest[@]:1}")
@@ -13988,7 +13988,7 @@ cmd_sessions() {
       # A plain listing, not a picker. The picker's trash view is reached with
       # the arrow key from the live list; this is the non-interactive way to
       # read the same thing and, more to the point, to get the ids that
-      # `cleat sessions restore` takes.
+      # `cleat session restore` takes.
       local tfile ti=0
       tfile="$(mktemp "${TMPDIR:-/tmp}/cleat-trash.XXXXXX" 2>/dev/null)" || {
         error "Could not create a temporary file."
@@ -14011,7 +14011,7 @@ cmd_sessions() {
       done
       echo ""
       echo -e "  ${DIM}The age column is how long ago it was deleted. Swept after ${_SESSIONS_TRASH_DAYS} days.${RESET}"
-      echo -e "  ${DIM}Put one back with ${BOLD}cleat sessions restore <id>${RESET}${DIM}.${RESET}"
+      echo -e "  ${DIM}Put one back with ${BOLD}cleat session restore <id>${RESET}${DIM}.${RESET}"
       return 0 ;;
   esac
 
@@ -14101,7 +14101,7 @@ cmd_sessions() {
 }
 
 # Resolve a prefix against the TRASH rather than the live directory, so
-# `cleat sessions restore <id>` takes the same short id the delete printed.
+# `cleat session restore <id>` takes the same short id the delete printed.
 _sessions_restore_resolve() {
   local sdir="$1" want="$2" tdir d base uuid matches=() 
   case "$want" in ''|*[!0-9a-f-]*) return 1 ;; esac
@@ -16793,7 +16793,7 @@ cmd_help() {
   echo -e "    ${GREEN}ps${RESET}                 List all Cleat containers (running & stopped)"
   echo -e "    ${GREEN}storage${RESET}            Show Docker disk usage ${DIM}(cleat vs shared vs other projects)${RESET}"
   echo -e "    ${GREEN}describe${RESET} ${DIM}[box] [text]${RESET}  Show or set a box's description"
-  echo -e "    ${GREEN}sessions${RESET} ${DIM}[box]${RESET}       List, rename, delete or restore this box's Claude sessions"
+  echo -e "    ${GREEN}session${RESET} ${DIM}[box]${RESET}        List, rename, delete or restore this box's Claude sessions"
   echo -e "    ${GREEN}account${RESET} ${DIM}[name] [box]${RESET} Switch this box between named Claude logins"
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
@@ -17004,7 +17004,7 @@ main() {
     logs)      _set_box "$@"; cmd_logs ;;
     ps)        cmd_ps "$@" ;;
     storage)   cmd_storage "$@" ;;
-    sessions|ses) cmd_sessions "$@" ;;
+    session|sessions|ses) cmd_sessions "$@" ;;
     account|accounts) cmd_account "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;

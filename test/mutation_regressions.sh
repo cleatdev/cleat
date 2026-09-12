@@ -6056,11 +6056,11 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_sessions_text_trash_note" "the text fallback points at the trash when it holds something" "$CLI" "$SESSIONS_BATS"
 
-# And `cleat sessions trash` is how the ids get read without a terminal.
+# And `cleat session trash` is how the ids get read without a terminal.
 cat > "$SED_TMP" << 'SED'
 s/^    trash)     sub="trash"; shift ;;$/    trashx)    sub="trash"; shift ;;/
 SED
-try "vnext_sessions_trash_subcommand" "cleat sessions trash lists what was deleted" "$CLI" "$SESSIONS_BATS"
+try "vnext_sessions_trash_subcommand" "cleat session trash lists what was deleted" "$CLI" "$SESSIONS_BATS"
 
 # The picker re-arms the terminal once per list screen and a view switch breaks
 # back to it without restoring first, so saving the termios state twice records
@@ -6260,6 +6260,18 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_account_pin_validated" "a hand-edited pin that is not a usable name falls back" "$CLI" "$ACCOUNTS_BATS"
+
+# The verb is SINGULAR, matching kit, fork, config and account. The plural and
+# the short form stay as aliases because they are what fingers type.
+cat > "$SED_TMP" << 'SED'
+s/^    session|sessions|ses) cmd_sessions "[$]@" ;;$/    sessions|ses) cmd_sessions "$@" ;;/
+SED
+try "vnext_session_verb_singular" "cleat session with no sessions exits cleanly" "$CLI" "$SMOKE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s/^    session|sessions|ses) cmd_sessions "[$]@" ;;$/    session) cmd_sessions "$@" ;;/
+SED
+try "vnext_session_verb_aliases" "the plural and the short form still reach the session verb" "$CLI" "$SMOKE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

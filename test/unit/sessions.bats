@@ -1073,7 +1073,7 @@ _pass_gates() {
   run _sessions_picker_text "$TEST_TEMP/rows" 1
   assert_success
   assert_output --partial "11111111"
-  assert_output --partial "cleat sessions rm"
+  assert_output --partial "cleat session rm"
 }
 
 # ── terminal state ─────────────────────────────────────────────────────────
@@ -2037,9 +2037,9 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   assert_output --partial "myproject / feat"
 }
 
-# ── cleat sessions trash ───────────────────────────────────────────────────
+# ── cleat session trash ───────────────────────────────────────────────────
 
-@test "sessions: cleat sessions trash lists what was deleted" {
+@test "sessions: cleat session trash lists what was deleted" {
   _pass_gates
   resolve_project() { echo "$TEST_TEMP/proj"; }
   _sessions_key_dir() { echo "$SDIR"; }
@@ -2049,10 +2049,10 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   assert_success
   assert_output --partial "Trashed sessions"
   assert_output --partial "deleted thing"
-  assert_output --partial "cleat sessions restore"
+  assert_output --partial "cleat session restore"
 }
 
-@test "sessions: cleat sessions trash says so when there is nothing in it" {
+@test "sessions: cleat session trash says so when there is nothing in it" {
   _pass_gates
   resolve_project() { echo "$TEST_TEMP/proj"; }
   _sessions_key_dir() { echo "$SDIR"; }
@@ -2062,7 +2062,7 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   assert_output --partial "The trash is empty."
 }
 
-@test "sessions: cleat sessions trash takes no id" {
+@test "sessions: cleat session trash takes no id" {
   _pass_gates
   resolve_project() { echo "$TEST_TEMP/proj"; }
   _sessions_key_dir() { echo "$SDIR"; }
@@ -2078,7 +2078,7 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   run _sessions_picker_text "$TEST_TEMP/rows" 1 "$SDIR"
   assert_success
   assert_output --partial "1 in the trash"
-  assert_output --partial "cleat sessions trash"
+  assert_output --partial "cleat session trash"
 }
 
 @test "sessions: the text fallback stays quiet about an empty trash" {

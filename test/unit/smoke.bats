@@ -377,8 +377,8 @@ STUB
   assert_output --partial "not running"
 }
 
-@test "smoke: cleat sessions with no sessions exits cleanly and says where it looked" {
-  run cleat_bin_timeout 10 sessions
+@test "smoke: cleat session with no sessions exits cleanly and says where it looked" {
+  run cleat_bin_timeout 10 session
   assert_success
   refute_output --partial "unbound variable"
   # The directory is the whole diagnostic: the key is hashed from the path as
@@ -386,54 +386,54 @@ STUB
   assert_output --partial "Looked in"
 }
 
-@test "smoke: cleat sessions still lists when the Docker daemon is down" {
-  # Listing is pure host filesystem and `sessions` is deliberately absent from
+@test "smoke: cleat session still lists when the Docker daemon is down" {
+  # Listing is pure host filesystem and `session` is deliberately absent from
   # the preflight allowlist, because reclaiming disk is exactly when a user is
   # likely to have Docker off.
   export DOCKER_EXIT_CODE=1
-  run cleat_bin_timeout 10 sessions
+  run cleat_bin_timeout 10 session
   assert_success
   refute_output --partial "unbound variable"
   refute_output --partial "not running"
 }
 
-@test "smoke: cleat sessions rm with no id asks which one" {
-  run cleat_bin_timeout 10 sessions rm
+@test "smoke: cleat session rm with no id asks which one" {
+  run cleat_bin_timeout 10 session rm
   assert_failure
   refute_output --partial "unbound variable"
   assert_output --partial "Which session"
 }
 
-@test "smoke: cleat sessions rm refuses a too-short id" {
-  run cleat_bin_timeout 10 sessions rm dead
+@test "smoke: cleat session rm refuses a too-short id" {
+  run cleat_bin_timeout 10 session rm dead
   assert_failure
   refute_output --partial "unbound variable"
   assert_output --partial "Too short"
 }
 
-@test "smoke: cleat sessions rm refuses a non-hex id" {
-  run cleat_bin_timeout 10 sessions rm ../../etc/passwd
+@test "smoke: cleat session rm refuses a non-hex id" {
+  run cleat_bin_timeout 10 session rm ../../etc/passwd
   assert_failure
   refute_output --partial "unbound variable"
   assert_output --partial "Not a session id"
 }
 
-@test "smoke: cleat sessions refuses an unknown flag" {
-  run cleat_bin_timeout 10 sessions --wat
+@test "smoke: cleat session refuses an unknown flag" {
+  run cleat_bin_timeout 10 session --wat
   assert_failure
   refute_output --partial "unbound variable"
   assert_output --partial "Unknown flag"
 }
 
-@test "smoke: cleat sessions refuses a stray positional like every box-aware verb" {
-  run cleat_bin_timeout 10 sessions main extra
+@test "smoke: cleat session refuses a stray positional like every box-aware verb" {
+  run cleat_bin_timeout 10 session main extra
   assert_failure
   refute_output --partial "unbound variable"
   assert_output --partial "Unexpected argument"
 }
 
-@test "smoke: cleat sessions rename needs a value for --title" {
-  run cleat_bin_timeout 10 sessions rename deadbeef01 --title
+@test "smoke: cleat session rename needs a value for --title" {
+  run cleat_bin_timeout 10 session rename deadbeef01 --title
   assert_failure
   refute_output --partial "unbound variable"
 }
@@ -489,21 +489,38 @@ STUB
   assert_output --partial "account"
 }
 
-@test "smoke: cleat sessions trash runs with nothing in it" {
-  run cleat_bin_timeout 10 sessions trash
+@test "smoke: cleat session trash runs with nothing in it" {
+  run cleat_bin_timeout 10 session trash
   assert_success
   assert_output --partial "trash"
 }
 
-@test "smoke: cleat sessions trash takes no id and refuses a stray positional" {
-  run cleat_bin_timeout 10 sessions trash main extra
+@test "smoke: cleat session trash takes no id and refuses a stray positional" {
+  run cleat_bin_timeout 10 session trash main extra
   assert_failure
 }
 
-@test "smoke: cleat sessions appears in help" {
+@test "smoke: the plural and the short form still reach the session verb" {
+  # Nothing has shipped under either name, so this is courtesy rather than
+  # compatibility. `cleat sessions` is what fingers type.
+  local alias
+  for alias in sessions ses; do
+    run cleat_bin_timeout 10 "$alias"
+    assert_success
+    assert_output --partial "Looked in"
+  done
+}
+
+@test "smoke: cleat session appears in help under its singular name" {
+  # `sessions` also appears in that same line as prose, so the assertion has to
+  # be on the VERB column or it passes whatever the verb is called. The colour
+  # escapes sit between the verb and its argument, hence the strip.
   run cleat_bin help
   assert_success
-  assert_output --partial "sessions"
+  local plain
+  plain="$(printf '%s\n' "$output" | sed $'s/\033\\[[0-9;]*m//g')"
+  [[ "$plain" == *"session [box]"* ]]
+  [[ "$plain" != *"sessions [box]"* ]]
 }
 
 @test "smoke: CLEAT_NO_CLIPBOARD_IMAGE=1 start path does not crash" {

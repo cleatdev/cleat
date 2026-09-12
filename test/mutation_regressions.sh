@@ -791,9 +791,11 @@ SED
 try "upgrade_claude_install_pipefail" "install command enables pipefail" "$CLI" "$UPGRADE_BATS"
 
 # The commit must restore CMD ["bash"]; without it the committed image would
-# re-run the installer instead of staying alive. Drop the --change flag.
+# re-run the installer instead of staying alive. Drop the --change flag. It
+# lives in the _commit_changes array (the label re-stamp made it one), so the
+# match must not depend on a trailing space.
 cat > "$SED_TMP" << 'SED'
-s|--change 'CMD \["bash"\]' ||
+s|--change 'CMD \["bash"\]'||
 SED
 try "upgrade_claude_commit_cmd_restore" "commits the result back over the working image" "$CLI" "$UPGRADE_BATS"
 

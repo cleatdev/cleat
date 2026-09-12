@@ -489,7 +489,9 @@ Only the login moves. Conversations, project history and settings are identical 
 
 The pin is per box, because the limit is per account and you probably have several boxes open. One can move to the fresh account while the others keep draining the first. The picker's first row is always your shared `~/.claude` login, so a pin is never a one-way door.
 
-A box created before this feature has no credential mount. Cleat says so and tells you to recreate it once with `cleat rm <box>`, rather than half working: without the mount, `/login` would write the store inside the container where `cleat rm` destroys it.
+A box created before this feature has no credential mount. Cleat says so and tells you to recreate it once with `cleat rm <box>`, rather than half working: without the mount, `/login` would write the store inside the container where `cleat rm` destroys it. Until you do, `cleat status` and the launch summary both call the pin not in effect rather than naming an account the box is not using. The recreate keeps your conversations, trust and env, which live on the host. It does not keep what you installed inside the box, so move that into a `[setup]` section first.
+
+Upgrading to a build that has this feature does nothing by itself: no image rebuild, no container recreate. A box picks up its credential mount the next time it is recreated for its own reasons.
 
 Claude Code refreshes its own token about every eight hours, inside the box. Every attach stages the stored login in and every detach takes the refreshed one back out, newest wins. `cleat rm`, every recreate and `cleat nuke` do that before they touch a run directory, so a refresh never sends you back to a browser.
 

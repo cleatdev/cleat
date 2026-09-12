@@ -8970,7 +8970,7 @@ cmd_start() {
     success "Container started"
   fi
 
-  success "Auth shared"
+  _print_auth_line "$(container_name_for "$project" "${_BOX:-main}")"
 
   # Docker cap is the only capability that breaks the sandbox: loud warning.
   if cap_is_active docker; then
@@ -13337,6 +13337,22 @@ _account_rename() {
 # Returns 0 ready, 1 needs a recreate, 2 could not tell (no container, or no
 # daemon). Two is not a failure: the mount is created by the next `docker run`,
 # so a box that does not exist yet is fine.
+# The launch summary's auth line. "shared" is the truth for a box on ~/.claude
+# and a lie for a pinned one, which reads a store of its own, and the line sits
+# directly above the summary block that names the account, so the two
+# contradicted each other. Printed as DATA (%s), like the Kit and Account rows,
+# because the pin file is hand-editable.
+_print_auth_line() {
+  local acct
+  acct="$(_box_account_read "${1:-}")"
+  if [[ -n "${1:-}" && "$acct" != "$_ACCOUNT_DEFAULT" ]]; then
+    printf '  %b✔%b Auth from account %b%s%b\n' "$GREEN" "$RESET" "$BLUE" "$acct" "$RESET"
+  else
+    success "Auth shared"
+  fi
+  return 0
+}
+
 _account_box_ready() {
   local cname="$1"
   _daemon_up || return 2
@@ -13429,7 +13445,19 @@ _account_do_switch() {
   # anything is repointed. Skipping this loses every refresh since the switch in.
   _account_sync_out "$cname" || true
   if [[ "$current" != "$_ACCOUNT_DEFAULT" ]]; then
-    _account_capture_meta "$current" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true
+    # The identity half of the capture is gated on the box having ACTUALLY RUN
+    # as this account, which is exactly "a credential was staged for it".
+    #
+    # The per-project claude.json holds whatever identity Claude last wrote
+    # there, and a box that was pinned but never ran as the account (a box with
+    # no auth mount, or one pinned and never started) still holds the SHARED
+    # login's. Reading it unconditionally stamped a brand-new account with the
+    # maintainer's primary email and organisation, so the list named an account
+    # that had never been logged into. Found on a real Mac, 2026-09-12.
+    local _cur_staged="$(_account_box_auth_dir "$cname")/.credentials.json"
+    if [[ -s "$_cur_staged" ]]; then
+      _account_capture_meta "$current" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true
+    fi
     _account_usage_fetch "$current" >/dev/null 2>&1 || true
   fi
 

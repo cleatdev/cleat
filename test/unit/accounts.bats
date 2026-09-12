@@ -1546,3 +1546,60 @@ _acct_keys() {
   run _account_box_ready "cleat-healthy"
   assert_success
 }
+
+@test "account: an account the box never ran as is not stamped with the shared identity" {
+  # Found on a real Mac. The per-project claude.json holds whatever identity
+  # Claude last wrote there, and a box that was pinned but never RAN as the
+  # account (no auth mount, or pinned and never started) still holds the
+  # SHARED login's. Reading it unconditionally named a brand-new account with
+  # the maintainer's own email.
+  _pass_gates
+  _mk_account work
+  _box_account_write "$CN" work
+  local key
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  printf '{"oauthAccount":{"emailAddress":"primary@example.com","organizationName":"Primary Org"}}\n' \
+    > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  # No staged credential: the box never presented this account to Claude.
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run _account_meta_get work who
+  assert_failure
+}
+
+@test "account: an account the box did run as still gets its identity captured" {
+  # The other half: gating on the staged credential must not disable the
+  # capture for the normal case, which is the only way the list can name a
+  # human at all.
+  _pass_gates
+  _mk_account work
+  _box_account_write "$CN" work
+  _mk_staged "$CN" 1789003600000
+  local key
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  printf '{"oauthAccount":{"emailAddress":"real@example.com","organizationName":"Real Org"}}\n' \
+    > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run _account_meta_get work who
+  assert_output "real@example.com"
+}
+
+@test "account: the launch summary does not call a pinned box's auth shared" {
+  # The line sits directly above the summary block that names the account, so
+  # "Auth shared" on a pinned box contradicted the line under it.
+  _mk_account work
+  _box_account_write "$CN" work
+  run _print_auth_line "$CN"
+  assert_success
+  assert_output --partial "work"
+  refute_output --partial "shared"
+}
+
+@test "account: an unpinned box still says its auth is shared" {
+  run _print_auth_line "$CN"
+  assert_success
+  assert_output --partial "Auth shared"
+}

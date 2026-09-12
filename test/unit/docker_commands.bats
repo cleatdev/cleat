@@ -986,6 +986,13 @@ EOF
   mock_docker_ps "$cname"
   local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
   printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$clip/.browser-open"
+  # FRESH means "written in the last five seconds", measured in WALL CLOCK, and
+  # everything cmd_shell/cmd_login does before the teardown counts against it.
+  # On a loaded machine that window closes mid-test and the file is swept as
+  # stale, which is what this test would then report as a swallowed login URL.
+  # Pin the age instead of racing it: the behaviour under test is the sibling
+  # check, not the clock.
+  _path_mtime() { date +%s; }
   sleep 30 &
   local sib=$!
   touch "$clip/.watcher.$sib"
@@ -1012,6 +1019,13 @@ EOF
   mock_docker_ps "$cname"
   local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
   printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$clip/.browser-open"
+  # FRESH means "written in the last five seconds", measured in WALL CLOCK, and
+  # everything cmd_shell/cmd_login does before the teardown counts against it.
+  # On a loaded machine that window closes mid-test and the file is swept as
+  # stale, which is what this test would then report as a swallowed login URL.
+  # Pin the age instead of racing it: the behaviour under test is the sibling
+  # check, not the clock.
+  _path_mtime() { date +%s; }
   sleep 30 &
   local sib=$!
   touch "$clip/.watcher.$sib"

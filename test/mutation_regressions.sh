@@ -6549,6 +6549,41 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_nuke_guard_prefix" "a directory that merely shares a prefix is not protected" "$CLI" "$ACCOUNTS_BATS"
 
+# Found on a real Mac. The per-project claude.json holds whatever identity
+# Claude last wrote there, so a box that was PINNED but never RAN as the
+# account still holds the shared login's, and reading it named a brand-new
+# account with the maintainer's own email.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^    if \[\[ -s "[$]_cur_staged" \]\]; then$@    if true; then@
+}
+SED
+try "vnext_account_no_identity_from_unused_box" "an account the box never ran as is not stamped" "$CLI" "$ACCOUNTS_BATS"
+
+# And the gate must not disable the capture for the normal case, which is the
+# only way the list can name a human at all.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^    if \[\[ -s "[$]_cur_staged" \]\]; then$@    if false; then@
+}
+SED
+try "vnext_account_identity_still_captured" "an account the box did run as still gets its identity" "$CLI" "$ACCOUNTS_BATS"
+
+# "Auth shared" on a pinned box contradicts the Account row printed under it.
+cat > "$SED_TMP" << 'SED'
+/^_print_auth_line()/,/^}$/{
+  s@^  if \[\[ -n "[$]{1:-}" \&\& "[$]acct" != "[$]_ACCOUNT_DEFAULT" \]\]; then$@  if false; then@
+}
+SED
+try "vnext_account_auth_line" "the launch summary does not call a pinned box" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_print_auth_line()/,/^}$/{
+  s@^  if \[\[ -n "[$]{1:-}" \&\& "[$]acct" != "[$]_ACCOUNT_DEFAULT" \]\]; then$@  if true; then@
+}
+SED
+try "vnext_account_auth_line_default" "an unpinned box still says its auth is shared" "$CLI" "$ACCOUNTS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -6452,7 +6452,7 @@ try "vnext_account_action_who_clamped" "the action screen clamps a long email" "
 # OUTCOME is observable, so the mutation removes the two that can carry the
 # host copy through.
 cat > "$SED_TMP" << 'SED'
-s#^        | (if [$]pinned then del(.oauthAccount) else . end)$#        | .#
+s#^        | (if [$]pinned then del(.oauthAccount).*$#        | .#
 s#^        + ( (if [$]pinned then \["userID","lastOnboardingVersion"\]$#        + ( (if false then ["userID","lastOnboardingVersion"]#
 SED
 try "vnext_account_identity_split" "a pinned box is not re-stamped" "$CLI" "$ACCOUNTS_BATS"
@@ -6583,6 +6583,55 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_account_auth_line_default" "an unpinned box still says its auth is shared" "$CLI" "$ACCOUNTS_BATS"
+
+# The two refresh paths passed the container name and the CREATE path did not,
+# so a box created while pinned got the right credential with the host account
+# name stamped on it, which is what /usage shows inside the box.
+cat > "$SED_TMP" << 'SED'
+s@^  _build_project_claude_json "[$]project_claude_json" "" "[$]cname"$@  _build_project_claude_json "$project_claude_json"@
+SED
+try "vnext_account_create_path_identity" "a box CREATED while pinned is not stamped" "$CLI" "$ACCOUNTS_BATS"
+
+# Claude shows the account email from oauthAccount in the per-project
+# claude.json and nowhere else, and a COMPLETE one freezes it for 24 hours
+# because profileFetchedAt lives inside that object. The start rebuild never
+# reaches a RUNNING box, so the switch has to invalidate it itself.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^  \[\[ "[$]current" != "[$]acct" \]\] && { _account_invalidate_identity "[$]project" "[$]box" || true; }$@  :@
+}
+SED
+try "vnext_account_switch_invalidates_identity" "switching drops the identity the box is carrying" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^    _account_invalidate_identity "[$]project" "[$]box" || true$@    :@
+}
+SED
+try "vnext_account_unpin_invalidates_identity" "unpinning drops it too" "$CLI" "$ACCOUNTS_BATS"
+
+# An atomic rename swaps the inode out from under a running container, which is
+# why the stopped-box rebuild refuses to touch one at all.
+cat > "$SED_TMP" << 'SED'
+/^_account_invalidate_identity()/,/^}$/{
+  s@^    cat "[$]tmp" > "[$]f" 2>/dev/null || true$@    mv -f "$tmp" "$f" 2>/dev/null || true@
+}
+SED
+try "vnext_account_identity_inplace" "the identity delete keeps the file" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_invalidate_identity()/,/^}$/{
+  s@^  \[\[ -L "[$]f" \]\] && return 0$@  :@
+}
+SED
+try "vnext_account_identity_symlink" "the identity delete refuses a symlinked store" "$CLI" "$ACCOUNTS_BATS"
+
+# Claude guards the usage cache against cross-account reuse with an accountUuid
+# comparison against oauthAccount, which a pinned box has removed.
+cat > "$SED_TMP" << 'SED'
+s@ | del(.cachedUsageUtilization) else . end)@ else . end)@
+SED
+try "vnext_account_usage_cache_dropped" "a pinned box does not inherit the shared usage cache" "$CLI" "$ACCOUNTS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

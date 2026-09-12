@@ -4934,7 +4934,14 @@ _build_project_claude_json() {
         # ($proj + $host) already carried the host copy into the base. NOTE: no
         # apostrophes in this comment block, it sits inside a single-quoted
         # jq program.
-        | (if $pinned then del(.oauthAccount) else . end)
+        # cachedUsageUtilization goes with it, and for a reason that is only
+        # true for a pinned box. Claude guards that cache against cross-account
+        # reuse by comparing its stored accountUuid against the one in
+        # oauthAccount, and a pinned box has deliberately removed oauthAccount,
+        # so the entry is written WITHOUT a uuid and read back as a match. A
+        # failed live fetch inside the hour would then show the OTHER account
+        # numbers under "Showing last-known usage".
+        | (if $pinned then del(.oauthAccount) | del(.cachedUsageUtilization) else . end)
         # Onboarding is complete by construction inside the cage. This flag is
         # load-bearing: Claude 2.1.x gates its startup login/onboarding screen
         # on hasCompletedOnboarding ALONE (verified in the 2.1.202 binary; an
@@ -8686,7 +8693,12 @@ cmd_run() {
   # truncate the file (→ "Configuration Error / Unexpected EOF") and leaked
   # trust/MCP approvals across projects. See _build_project_claude_json.
   local project_claude_json="$CLEAT_PROJECTS_DIR/${project_session_key}/claude.json"
-  _build_project_claude_json "$project_claude_json"
+  # The container name matters here, not only on the two refresh paths: a box
+  # that is CREATED while pinned must not be stamped with the host account's
+  # identity either. Without it a `cleat rm` followed by `cleat account <name>`
+  # and a start gave the right credential with the wrong name on it, which is
+  # what /usage inside the box shows.
+  _build_project_claude_json "$project_claude_json" "" "$cname"
   mount_args+=(-v "$project_claude_json:/home/coder/.claude.json")
 
   # ── git capability: mount gitconfig (read-only) for commit identity
@@ -13353,6 +13365,44 @@ _print_auth_line() {
   return 0
 }
 
+# Drop the identity block from the box's per-project ~/.claude.json the moment
+# the pin moves.
+#
+# Claude Code shows the account email from `oauthAccount` in that file and from
+# nowhere else: the credential blob carries no identity at all and the access
+# token is opaque, so disk is the only source. A COMPLETE oauthAccount also
+# freezes it, because `profileFetchedAt` lives INSIDE that object and the
+# refetch only runs when the key is absent.
+#
+# The file is rebuilt on create and on a stopped-box start, and that is not
+# enough. A RUNNING box is never rebuilt (the bind pins the inode, which is why
+# _refresh_project_claude_json refuses to touch one) and the attached heal
+# returns early whenever hasCompletedOnboarding is true, which the builder
+# always sets. So without this a switch left the previous account name on
+# screen while the requests went to the new one.
+#
+# Written IN PLACE with `cat >`, never temp-and-mv: an atomic rename swaps the
+# inode out from under a running container. Same form the attached heal uses.
+_account_invalidate_identity() {
+  local project="$1" box="$2" key f tmp
+  # jq-gated like every other reader of this file. Without it the box keeps a
+  # stale name until its next recreate, which is worth a line in the docs
+  # rather than a hand-rolled JSON edit.
+  command -v jq &>/dev/null || return 0
+  [[ -n "$project" ]] || return 0
+  key="$(_derive_project_session_key "$project" "$box")" || return 0
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  [[ -f "$f" && -s "$f" ]] || return 0
+  [[ -L "$f" ]] && return 0
+  tmp="${f}.acct.$$"
+  if jq 'del(.oauthAccount) | del(.cachedUsageUtilization)' "$f" > "$tmp" 2>/dev/null \
+     && [[ -s "$tmp" ]] && jq -e 'type=="object"' "$tmp" >/dev/null 2>&1; then
+    cat "$tmp" > "$f" 2>/dev/null || true
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 _account_box_ready() {
   local cname="$1"
   _daemon_up || return 2
@@ -13409,6 +13459,7 @@ _account_do_switch() {
     _account_sync_out "$cname" || true
     _box_account_remove "$cname"
     rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true
+    _account_invalidate_identity "$project" "$box" || true
     success "${BOLD}${box}${RESET} is back on your shared login ${DIM}(~/.claude)${RESET}"
     echo -e "    ${DIM}Conversations are unchanged. Resuming one started on the other account keeps${RESET}"
     echo -e "    ${DIM}the local transcript and ${BOLD}--resume${RESET}${DIM}. Its server-side history stops being${RESET}"
@@ -13491,6 +13542,10 @@ _account_do_switch() {
   # seen. The plan comes out of the account's own credential blob and last_used
   # from the clock, so both still land.
   _account_capture_meta "$acct" "" || true
+  # The pin has moved, so whatever name the box is carrying is now the wrong
+  # one. See _account_invalidate_identity: the start rebuild does not reach a
+  # running box and the attached heal cannot fix identity.
+  [[ "$current" != "$acct" ]] && { _account_invalidate_identity "$project" "$box" || true; }
 
   # The pin is DELIBERATELY left in place on this refusal. It has to outlive
   # `cleat rm`, which is exactly the remedy printed below, and the attach path

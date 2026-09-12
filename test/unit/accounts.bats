@@ -1603,3 +1603,138 @@ _acct_keys() {
   assert_success
   assert_output --partial "Auth shared"
 }
+
+@test "account: a box CREATED while pinned is not stamped with the host identity either" {
+  # The two refresh paths passed the container name; the create path did not.
+  # So `cleat rm` then `cleat account <name>` then a start gave the right
+  # credential with the WRONG name on it, which is what /usage shows inside
+  # the box. Found on a real Mac, 2026-09-12.
+  command -v jq >/dev/null || skip "needs jq"
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  _mk_account work
+  _box_account_write "$cname" work
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"userID":"abc"}\n' > "$HOME/.claude.json"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local key f
+  key="$(_derive_project_session_key "$TEST_TEMP/project" main)"
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  [ -f "$f" ]
+  run jq -r '.oauthAccount // "absent"' "$f"
+  assert_output "absent"
+}
+
+@test "account: an unpinned box created the same way still gets the host identity" {
+  command -v jq >/dev/null || skip "needs jq"
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"userID":"abc"}\n' > "$HOME/.claude.json"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local key f
+  key="$(_derive_project_session_key "$TEST_TEMP/project" main)"
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  run jq -r '.oauthAccount.emailAddress' "$f"
+  assert_output "host@example.com"
+}
+
+@test "account: switching drops the identity the box is carrying" {
+  # Claude shows the account email from oauthAccount in the per-project
+  # claude.json and from nowhere else: the credential blob carries no identity
+  # and the access token is opaque. A COMPLETE oauthAccount also freezes it,
+  # because profileFetchedAt lives inside that object and the refetch only runs
+  # when the key is absent. The start rebuild never reaches a RUNNING box.
+  command -v jq >/dev/null || skip "needs jq"
+  _pass_gates
+  _mk_account work
+  local key f
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{"oauthAccount":{"emailAddress":"previous@example.com","profileFetchedAt":9999999999999},"userID":"abc","projects":{"/workspace":{}}}\n' > "$f"
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run jq -r '.oauthAccount // "absent"' "$f"
+  assert_output "absent"
+  # Everything else in the file survives: this is a targeted delete, not a
+  # rebuild, and the file is a live bind source.
+  run jq -r '.userID' "$f"
+  assert_output "abc"
+  run jq -r '.projects["/workspace"] | type' "$f"
+  assert_output "object"
+}
+
+@test "account: unpinning drops it too" {
+  command -v jq >/dev/null || skip "needs jq"
+  _mk_account work
+  _box_account_write "$CN" work
+  local key f
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{"oauthAccount":{"emailAddress":"named@example.com"},"userID":"abc"}\n' > "$f"
+  run _account_do_switch default main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run jq -r '.oauthAccount // "absent"' "$f"
+  assert_output "absent"
+}
+
+@test "account: the identity delete keeps the file's inode for a live bind mount" {
+  # An atomic temp-and-mv swaps the inode out from under a running container,
+  # which is why _refresh_project_claude_json refuses to touch a running box at
+  # all. This one has to be safe on one.
+  command -v jq >/dev/null || skip "needs jq"
+  local key f before after
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{"oauthAccount":{"emailAddress":"x@example.com"}}\n' > "$f"
+  before="$(ls -i "$f" | awk '{print $1}')"
+  run _account_invalidate_identity "$TEST_TEMP/proj" main
+  assert_success
+  after="$(ls -i "$f" | awk '{print $1}')"
+  [ "$before" = "$after" ]
+}
+
+@test "account: the identity delete refuses a symlinked store" {
+  command -v jq >/dev/null || skip "needs jq"
+  local key f
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{"oauthAccount":{"emailAddress":"x@example.com"}}\n' > "$TEST_TEMP/outside.json"
+  ln -s "$TEST_TEMP/outside.json" "$f"
+  run _account_invalidate_identity "$TEST_TEMP/proj" main
+  assert_success
+  run jq -r '.oauthAccount.emailAddress' "$TEST_TEMP/outside.json"
+  assert_output "x@example.com"
+}
+
+@test "account: a pinned box does not inherit the shared usage cache either" {
+  # Claude guards cachedUsageUtilization against cross-account reuse by
+  # comparing its accountUuid against oauthAccount, and a pinned box has
+  # deliberately removed oauthAccount. So the entry is written with no uuid and
+  # read back as a match, and a failed live fetch inside the hour would show
+  # the OTHER account's numbers as "last-known usage".
+  command -v jq >/dev/null || skip "needs jq"
+  _mk_account work
+  _box_account_write "$CN" work
+  container_name_for() { echo "$CN"; }
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"cachedUsageUtilization":{"utilization":42}}\n' > "$HOME/.claude.json"
+  mkdir -p "$TEST_TEMP/store"
+  _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
+  run jq -r '.cachedUsageUtilization // "absent"' "$TEST_TEMP/store/claude.json"
+  assert_output "absent"
+}
+
+@test "account: an unpinned box keeps the usage cache, which is its own account's" {
+  command -v jq >/dev/null || skip "needs jq"
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"cachedUsageUtilization":{"utilization":42}}\n' > "$HOME/.claude.json"
+  mkdir -p "$TEST_TEMP/store"
+  _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
+  run jq -r '.cachedUsageUtilization.utilization' "$TEST_TEMP/store/claude.json"
+  assert_output "42"
+}

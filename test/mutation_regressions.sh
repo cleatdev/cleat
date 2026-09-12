@@ -6633,6 +6633,45 @@ s@ | del(.cachedUsageUtilization) else . end)@ else . end)@
 SED
 try "vnext_account_usage_cache_dropped" "a pinned box does not inherit the shared usage cache" "$CLI" "$ACCOUNTS_BATS"
 
+# A box created before the auth mount keeps its pin and the attach falls back
+# to the shared login, so anything that REPORTS the account has to ask the same
+# question the attach does or it names an account the box is not using.
+cat > "$SED_TMP" << 'SED'
+/^_account_effective()/,/^}$/{
+  s@^  if \[\[ [$]ready -eq 1 \]\]; then$@  if false; then@
+}
+SED
+try "vnext_account_effective_demotes" "a pin the box cannot honour reports as the shared login" "$CLI" "$ACCOUNTS_BATS"
+
+# And "cannot tell" must not demote: a box that does not exist yet gets the
+# mount from the next docker run.
+cat > "$SED_TMP" << 'SED'
+/^_account_effective()/,/^}$/{
+  s@^  if \[\[ [$]ready -eq 1 \]\]; then$@  if [[ $ready -ne 0 ]]; then@
+}
+SED
+try "vnext_account_effective_cannot_tell" "cannot-tell is not demotion" "$CLI" "$ACCOUNTS_BATS"
+
+# docker commit writes a fresh config, so the upgraded image loses the labels
+# the rebuild prompt reads. It fails open, so the cost is silent: a genuine
+# spec bump can never reach that user again.
+cat > "$SED_TMP" << 'SED'
+/^_upgrade_claude_image()/,/^}$/{
+  s@^    \[\[ -n "[$]_lbl_spec" \]\] && _commit_changes+=(--change "LABEL sh.cleat.image-spec=[$]{_lbl_spec}")$@    :@
+  s@^    \[\[ -n "[$]_lbl_ver" \]\] && _commit_changes+=(--change "LABEL sh.cleat.version=[$]{_lbl_ver}")$@    :@
+}
+SED
+try "vnext_claude_upgrade_keeps_labels" "the Claude image upgrade keeps the image" "$CLI" "$ACCOUNTS_BATS"
+
+# And an image that never carried a label must not gain a fabricated one.
+cat > "$SED_TMP" << 'SED'
+/^_upgrade_claude_image()/,/^}$/{
+  s@^    \[\[ -n "[$]_lbl_spec" \]\] @    true @
+  s@^    \[\[ -n "[$]_lbl_ver" \]\] @    true @
+}
+SED
+try "vnext_claude_upgrade_no_fake_labels" "an unlabelled image does not gain a fabricated" "$CLI" "$ACCOUNTS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

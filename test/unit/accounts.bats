@@ -1738,3 +1738,88 @@ _acct_keys() {
   run jq -r '.cachedUsageUtilization.utilization' "$TEST_TEMP/store/claude.json"
   assert_output "42"
 }
+
+@test "account: a pin the box cannot honour reports as the shared login, not as the account" {
+  # The box keeps its pin (it has to outlive the cleat rm that fixes it) and
+  # the attach falls back to the shared login, so anything that REPORTS the
+  # account has to ask the same question the attach does.
+  _mk_account work
+  _box_account_write "$CN" work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  docker() { case "$1" in inspect) printf '%s\n' "/workspace" ;; *) return 1 ;; esac; }
+  run _account_effective "$CN"
+  assert_failure
+  assert_output "default"
+}
+
+@test "account: a pin the box CAN honour reports as the account" {
+  _mk_account work
+  _box_account_write "$CN" work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  docker() { case "$1" in inspect) printf '%s\n' "/home/coder/.cleat-auth" ;; *) return 1 ;; esac; }
+  run _account_effective "$CN"
+  assert_success
+  assert_output "work"
+}
+
+@test "account: cannot-tell is not demotion, since the next run creates the mount" {
+  # A box that does not exist yet gets the mount from the next docker run, so
+  # a probe that cannot answer must not report the pin as broken.
+  _mk_account work
+  _box_account_write "$CN" work
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  run _account_effective "$CN"
+  assert_success
+  assert_output "work"
+}
+
+@test "account: an unpinned box answers with the sentinel and no docker call" {
+  : > "$TEST_TEMP/docker.log"
+  docker() { echo "$1" >> "$TEST_TEMP/docker.log"; return 1; }
+  run _account_effective "$CN"
+  assert_success
+  assert_output "default"
+  [ ! -s "$TEST_TEMP/docker.log" ]
+}
+
+@test "account: the Claude image upgrade keeps the image's own cleat labels" {
+  # docker commit writes a fresh config, so without re-stamping, the upgraded
+  # image loses sh.cleat.image-spec and sh.cleat.version. That fails OPEN in
+  # the rebuild prompt, so it never nags: the cost is that a genuine spec bump
+  # can then never reach that user again. Measured on a real Mac.
+  : > "$TEST_TEMP/commit.log"
+  image_exists() { return 0; }
+  _image_claude_version() { echo "2.1.1"; }
+  _image_spec_version() { echo "4"; }
+  _image_cleat_version() { echo "1.4.3"; }
+  docker() {
+    case "$1" in
+      commit) printf '%s\n' "$*" >> "$TEST_TEMP/commit.log"; return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  run _upgrade_claude_image latest
+  run cat "$TEST_TEMP/commit.log"
+  assert_output --partial "sh.cleat.image-spec=4"
+  assert_output --partial "sh.cleat.version=1.4.3"
+}
+
+@test "account: an unlabelled image does not gain a fabricated label" {
+  : > "$TEST_TEMP/commit.log"
+  image_exists() { return 0; }
+  _image_claude_version() { echo "2.1.1"; }
+  _image_spec_version() { echo ""; }
+  _image_cleat_version() { echo ""; }
+  docker() {
+    case "$1" in
+      commit) printf '%s\n' "$*" >> "$TEST_TEMP/commit.log"; return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  run _upgrade_claude_image latest
+  run cat "$TEST_TEMP/commit.log"
+  refute_output --partial "sh.cleat"
+}

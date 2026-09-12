@@ -5385,10 +5385,18 @@ _print_summary_block() {
   # Same rule as the Kit row: the pin file is hand-editable, so print it as
   # DATA (%s), never through echo -e. Silent on `default`, which is every box
   # that has never run the verb.
-  local _summary_acct
+  local _summary_acct _summary_eff=0
   _summary_acct="$(_box_account_read "$cname")"
   if [[ -n "$_summary_acct" && "$_summary_acct" != "$_ACCOUNT_DEFAULT" ]]; then
-    printf '  %bAccount:%b    %b%s%b\n' "$DIM" "$RESET" "$BLUE" "$_summary_acct" "$RESET"
+    _account_effective "$cname" >/dev/null || _summary_eff=$?
+    if [[ $_summary_eff -ne 0 ]]; then
+      # The warning about this prints further down, so the row must not read as
+      # a statement that the box IS on that account.
+      printf '  %bAccount:%b    %b%s%b %b(not in effect, recreate the box)%b\n' \
+        "$DIM" "$RESET" "$BLUE" "$_summary_acct" "$RESET" "$DIM" "$RESET"
+    else
+      printf '  %bAccount:%b    %b%s%b\n' "$DIM" "$RESET" "$BLUE" "$_summary_acct" "$RESET"
+    fi
   fi
   _print_caps "  " "Caps:" "       "
   _env_summary_inline "$project"
@@ -8171,6 +8179,20 @@ _upgrade_claude_image() {
   before="$(_image_claude_version)"
   old_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
 
+  # Carry the image's own labels across the commit below.
+  #
+  # `docker commit` writes a fresh config, so without this the upgraded image
+  # loses sh.cleat.image-spec and sh.cleat.version. That is silent and it does
+  # not nag: _maybe_prompt_image_rebuild fails OPEN when both are missing, on
+  # purpose, because an unlabelled image is assumed hand-built. The cost is the
+  # other direction. Once a box has taken one Claude update, a genuine spec bump
+  # can never prompt that user to rebuild again, so they quietly stop receiving
+  # image changes that matter. Measured on the maintainer's own machine, where
+  # the only surviving label was Docker Desktop's.
+  local _lbl_spec _lbl_ver
+  _lbl_spec="$(_image_spec_version)"
+  _lbl_ver="$(_image_cleat_version)"
+
   local tmp="cleat-claude-upgrade"
   # Self-heal a leftover container from a previously interrupted run.
   docker rm -f "$tmp" > /dev/null 2>&1 || true
@@ -8207,7 +8229,12 @@ _upgrade_claude_image() {
     # CMD: the throwaway container overrode it with the install command, and
     # `docker commit` would otherwise bake that in (breaking `cleat run`, which
     # relies on the image's `["bash"]` CMD to keep the container alive).
-    docker commit --change 'CMD ["bash"]' "$tmp" "$IMAGE_NAME" >> "$log" 2>&1 || rc=$?
+    local _commit_changes=(--change 'CMD ["bash"]')
+    # Re-stamp only what was actually there: an image that never carried a
+    # label must not gain a fabricated one.
+    [[ -n "$_lbl_spec" ]] && _commit_changes+=(--change "LABEL sh.cleat.image-spec=${_lbl_spec}")
+    [[ -n "$_lbl_ver" ]] && _commit_changes+=(--change "LABEL sh.cleat.version=${_lbl_ver}")
+    docker commit "${_commit_changes[@]}" "$tmp" "$IMAGE_NAME" >> "$log" 2>&1 || rc=$?
   fi
   docker rm -f "$tmp" > /dev/null 2>&1 || true
 
@@ -9592,8 +9619,9 @@ cmd_status() {
   # dead, months-old `credentials.json` sitting in the same directory and
   # reported "logged in" from it. What counts is the store this box actually
   # reads, and whether the thing in it still has a refresh token.
-  local _status_acct _status_state
-  _status_acct="$(_box_account_read "$(container_name_for "$(resolve_project "$PWD")" "$_BOX")")"
+  local _status_acct _status_state _status_cname
+  _status_cname="$(container_name_for "$(resolve_project "$PWD")" "$_BOX")"
+  _status_acct="$(_box_account_read "$_status_cname")"
   if [[ "$_status_acct" == "$_ACCOUNT_DEFAULT" ]]; then
     # Non-empty is not the same as usable. On invalid_grant the client writes
     # EMPTY tokens back to disk, so the file survives a logout and the old
@@ -9605,13 +9633,23 @@ cmd_status() {
       echo -e "  ${BOLD}Auth:${RESET}      ${YELLOW}○ not configured${RESET} ${DIM}(cleat login)${RESET}"
     fi
   else
-    _status_state="$(_account_auth_state "$_status_acct")"
-    case "$_status_state" in
-      ok) printf '  %bAuth:%b      %b● logged in%b %b(account %s)%b\n' \
-            "$BOLD" "$RESET" "$GREEN" "$RESET" "$DIM" "$_status_acct" "$RESET" ;;
-      *)  printf '  %bAuth:%b      %b○ %s%b %b(account %s, cleat account)%b\n' \
-            "$BOLD" "$RESET" "$YELLOW" "$_status_state" "$RESET" "$DIM" "$_status_acct" "$RESET" ;;
-    esac
+    # A pin the box cannot honour is reported as what the box is really using,
+    # with the reason. Saying "logged in (account work2)" for a box running on
+    # the shared login is the kind of wrong that costs every other claim.
+    local _status_eff=0
+    _account_effective "$_status_cname" >/dev/null || _status_eff=$?
+    if [[ $_status_eff -ne 0 ]]; then
+      printf '  %bAuth:%b      %b○ shared login%b %b(pinned to %s, box needs a recreate)%b\n' \
+        "$BOLD" "$RESET" "$YELLOW" "$RESET" "$DIM" "$_status_acct" "$RESET"
+    else
+      _status_state="$(_account_auth_state "$_status_acct")"
+      case "$_status_state" in
+        ok) printf '  %bAuth:%b      %b● logged in%b %b(account %s)%b\n' \
+              "$BOLD" "$RESET" "$GREEN" "$RESET" "$DIM" "$_status_acct" "$RESET" ;;
+        *)  printf '  %bAuth:%b      %b○ %s%b %b(account %s, cleat account)%b\n' \
+              "$BOLD" "$RESET" "$YELLOW" "$_status_state" "$RESET" "$DIM" "$_status_acct" "$RESET" ;;
+      esac
+    fi
   fi
 
   # Show active capabilities: same categorized renderer as the post-launch
@@ -13403,6 +13441,36 @@ _account_invalidate_identity() {
   return 0
 }
 
+# The pin AS THE BOX WILL ACTUALLY SEE IT. Returns the account name only when
+# the box can really use it, and the sentinel when it cannot.
+#
+# A box created before the auth mount keeps its pin (it has to outlive the
+# `cleat rm` that fixes it), and the attach path falls back to the shared
+# login. So anything that REPORTS the account has to ask the same question the
+# attach does, or it says the box is on an account it is not using: `cleat
+# status` claimed "logged in (account work2)" for a box running on the shared
+# login, and the launch summary printed an Account row three lines above the
+# warning that the box cannot use it.
+#
+# Exit 2 from the probe is "cannot tell" (no daemon, no container yet), and
+# that is NOT a failure: a box that does not exist yet gets the mount from the
+# next `docker run`. Only a definite "this container has no mount" demotes.
+_account_effective() {
+  local cname="$1" acct ready=0
+  acct="$(_box_account_read "$cname")"
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    printf '%s' "$_ACCOUNT_DEFAULT"
+    return 0
+  fi
+  _account_box_ready "$cname" || ready=$?
+  if [[ $ready -eq 1 ]]; then
+    printf '%s' "$_ACCOUNT_DEFAULT"
+    return 1
+  fi
+  printf '%s' "$acct"
+  return 0
+}
+
 _account_box_ready() {
   local cname="$1"
   _daemon_up || return 2
@@ -13554,7 +13622,9 @@ _account_do_switch() {
   _account_box_ready "$cname" || ready=$?
   if [[ $ready -eq 1 ]]; then
     warn "${BOLD}${box}${RESET} predates the account mount, so the switch cannot take effect yet."
-    echo -e "    ${DIM}Pinned anyway. Recreate the box once: ${BOLD}cleat rm ${box}${RESET}${DIM} then ${BOLD}cleat ${box}${RESET}${DIM}, and it takes effect. Nothing on the host is touched.${RESET}"
+    echo -e "    ${DIM}Pinned anyway. Recreate the box once: ${BOLD}cleat rm ${box}${RESET}${DIM} then ${BOLD}cleat ${box}${RESET}${DIM}, and it takes effect.${RESET}"
+    echo -e "    ${DIM}Conversations, trust and env are on the host and survive. Anything installed${RESET}"
+    echo -e "    ${DIM}INSIDE the box does not, so put it in ${BOLD}[setup]${RESET}${DIM} first if you have any.${RESET}"
     return 1
   fi
 

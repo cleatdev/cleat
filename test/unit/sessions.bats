@@ -1400,11 +1400,17 @@ _pass_gates() {
   : > "$TEST_TEMP/wcalls"
   _term_size() {
     echo x >> "$TEST_TEMP/wcalls"
-    if [[ "$(wc -l < "$TEST_TEMP/wcalls" | tr -d ' ')" -le 2 ]]; then echo "24 100"; else echo "24 30"; fi
+    # Three reads per measure (rows, cols, the narrow test), so staying wide
+    # for exactly three keeps the OUTER redraw gate happy and narrows only on
+    # the key loop's own re-measure. Without that split this test passes off
+    # the redraw gate and pins nothing here.
+    if [[ "$(wc -l < "$TEST_TEMP/wcalls" | tr -d ' ')" -le 3 ]]; then echo "24 100"; else echo "24 30"; fi
   }
   _tui_keys DOWN QUIT
   run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 20
   assert_success
+  # The frame was drawn first, which is what proves the key loop got there.
+  assert_output --partial "⏎ rename or delete"
   assert_output --partial "too narrow"
 }
 
@@ -1491,7 +1497,10 @@ _pass_gates() {
 # "Did it come back?" is asserted by counting the frame's hint line, which is
 # printed exactly once per frame and by nothing else.
 
-_hint_count() { printf '%s\n' "$output" | grep -c "↑/↓ move"; }
+# Counts LIST frames. Deliberately not "↑/↓ move", which the action screen's
+# own hint carries too: counting that made a picker that exits after one rename
+# look like a picker that came back.
+_hint_count() { printf '%s\n' "$output" | grep -c "⏎ rename or delete"; }
 
 # Widest line of a draw, in COLUMNS. Every multibyte glyph the frame can print
 # is folded to one ASCII byte first: awk's length() counts bytes under the C
@@ -1754,7 +1763,11 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
 @test "sessions: the trash count counts only real entries" {
   _mk_trashed "$U1" 100
   _mk_trashed "$U2" 200
-  mkdir -p "$SDIR/.cleat-trash/not-a-session" "$SDIR/.cleat-trash/100-notauuid"
+  # not-a-session is rejected by the uuid check, 100-notauuid by the uuid check
+  # too, and abc-<uuid> ONLY by the stamp check. All three are needed or one of
+  # the two guards can be removed without the count moving.
+  mkdir -p "$SDIR/.cleat-trash/not-a-session" "$SDIR/.cleat-trash/100-notauuid" \
+           "$SDIR/.cleat-trash/abc-$U1"
   : > "$SDIR/.cleat-trash/a-file"
   run _sessions_trash_count "$SDIR"
   assert_success
@@ -1893,13 +1906,15 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
 
 @test "sessions: a restored session is inserted in its sorted position" {
   _mk_session "$U1"
+  # One row in the future and one at the epoch, so the restored session's real
+  # mtime has to land BETWEEN them. Appending it would leave it third, which is
+  # what a missing sort actually does.
   printf '9999999999\t1\t%s\tnewer\n1\t1\t%s\toldest\n' "$U2" "$U2" > "$TEST_TEMP/rows"
   run _sessions_row_insert "$TEST_TEMP/rows" "$SDIR" "$U1"
   assert_success
-  run cat "$TEST_TEMP/rows"
-  assert_output --partial "$U1"
-  # The fake 9999999999 row is in the future, so the real one cannot be first.
-  [ "$(head -1 "$TEST_TEMP/rows" | cut -f3)" = "$U2" ]
+  [ "$(sed -n 1p "$TEST_TEMP/rows" | cut -f3)" = "$U2" ]
+  [ "$(sed -n 2p "$TEST_TEMP/rows" | cut -f3)" = "$U1" ]
+  [ "$(sed -n 3p "$TEST_TEMP/rows" | cut -f3)" = "$U2" ]
 }
 
 @test "sessions: inserting a session that is not there fails and writes nothing" {
@@ -1931,11 +1946,15 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   _mk_session "$U1" "delete me"
   _mk_session "$U2" "keep me"
   printf '1\t1\t%s\tdelete me\n2\t1\t%s\tkeep me\n' "$U1" "$U2" > "$TEST_TEMP/rows"
-  _tui_keys ENTER DOWN ENTER RIGHT QUIT
+  # Visit the empty trash FIRST so its rows are cached. Without that the very
+  # first visit rescans anyway and a missing invalidation is invisible.
+  _tui_keys RIGHT LEFT ENTER DOWN ENTER RIGHT QUIT
   run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 2
   assert_success
   assert_output --partial "⏎ restore"
-  assert_output --partial "delete me"
+  # The COUNTER, not the title: the title is also in the list above and in the
+  # delete receipt, so asserting on it passes whether or not the trash rescanned.
+  assert_output --partial "Trash: 1 item"
 }
 
 @test "sessions: the restore action prints a receipt naming the session" {

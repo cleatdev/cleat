@@ -5807,9 +5807,11 @@ SED
 try "vnext_sessions_frame_no_fork" "frame forks nothing per row" "$CLI" "$SESSIONS_BATS"
 
 # A window narrowed mid-session must leave the picker, not draw wrapping rows.
+# Six spaces: the KEY LOOP's gate. The one at four is the redraw's, guarded by
+# vnext_sessions_narrow_on_redraw.
 cat > "$SED_TMP" << 'SED'
 /^_sessions_picker_tui()/,/^}$/{
-  s/^    if \[\[ "\$_SESS_NARROW" == "1" \]\]; then/    if false; then/
+  s/^      if \[\[ "\$_SESS_NARROW" == "1" \]\]; then$/      if false; then/
 }
 SED
 try "vnext_sessions_narrow_midsession" "narrowing the window mid-session leaves" "$CLI" "$SESSIONS_BATS"
@@ -5860,7 +5862,7 @@ try "vnext_sessions_stays_open" "a rename redraws the list instead of ending the
 cat > "$SED_TMP" << 'SED'
 /^_sessions_action_tui()/,/^}$/{
   s/^          return 1$/          return 0/
-  s/^        return 1$/        return 0/
+  s/^        return 1 ;;$/        return 0 ;;/
 }
 SED
 try "vnext_sessions_backout_is_not_an_action" "backing out of the action screen says nothing" "$CLI" "$SESSIONS_BATS"
@@ -6008,9 +6010,7 @@ try "vnext_sessions_hint_width" "neither hint line is wider than the picker" "$C
 # The arrow keys are directional on purpose: the trash is to the right of the
 # sessions and nowhere else.
 cat > "$SED_TMP" << 'SED'
-/^        LEFT)$/,/^          fi ;;$/{
-  s/if \[\[ "[$]view" == "trash" \]\]/if true/
-}
+s/^        RIGHT)$/        RIGHT|LEFT)/
 SED
 try "vnext_sessions_arrow_direction" "the left arrow does nothing on the live list" "$CLI" "$SESSIONS_BATS"
 

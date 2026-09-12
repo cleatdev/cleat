@@ -5802,9 +5802,15 @@ _clipboard_watcher() {
   # signal, and a pre-existing file can never masquerade as a fresh copy.
   while true; do
     kill -0 "$_cw_parent" 2>/dev/null || exit 0
-    # -L as well as -f: a DANGLING symlink fails -f, so without this a planted
-    # link naming a nonexistent path would sit here untouched. _do_copy drops it.
-    if [ -L "$clip_dir/clipboard" ] || [ -f "$clip_dir/clipboard" ]; then
+    # -L as well as -e: a DANGLING symlink fails -e, so without this a planted
+    # link naming a nonexistent path would sit here untouched. -e rather than -f
+    # because a planted DIRECTORY (or FIFO) fails -f, and skipping it here left
+    # it wedged in the shared dir forever: the next `mv payload clipboard` moves
+    # the payload INSIDE it, so every later copy is silently swallowed. The
+    # inotify and fswatch branches never had this hole because they fire on the
+    # event, not on the shape. _do_copy claims it and drops whatever is not a
+    # regular file.
+    if [ -L "$clip_dir/clipboard" ] || [ -e "$clip_dir/clipboard" ]; then
       _do_copy
     fi
     sleep 1
@@ -8059,25 +8065,28 @@ ti = d.get("tool_input")
 cmd = ti.get("command") if isinstance(ti, dict) else None
 if not isinstance(cmd, str) or not cmd.strip():
     sys.exit(0)
-# Refuse anything that can run ANOTHER command: command substitution $(...) and
-# backticks, arithmetic $((...)) (starts with "$("), process substitution <(...)
-# and >(...), and bash 5.2 command substitution ${ ...;} / ${|...;}. Redirections
-# are deliberately allowed: they only write or truncate, which is a subset of the
-# deletion this cap already grants, and they never spawn a new command.
-for bad in ("$(", "`", "<(", ">(", "${ ", "${|"):
-    if bad in cmd:
-        sys.exit(0)
-allow = True
+# Answer only when the command actually invokes a removal. Real cleanups are
+# chained (an assignment, a comment, a mkdir, then the rm), so requiring EVERY
+# segment to be rm/cd made the cap useless in practice. It also bought little:
+# under --dangerously-skip-permissions the agent can already run any non-rm
+# command, `curl x | sh` included, with no prompt at all, so restricting what
+# may sit BESIDE the rm gates nothing the box did not already allow. What the
+# saw_rm requirement still guarantees is that this hook never answers a prompt
+# for a command that removes nothing, so it cannot blanket-approve an unrelated
+# permission ask. An rm hidden inside a substitution is not a top-level removal
+# and does not qualify.
 saw_rm = False
 for seg in re.split(r"&&|\|\||[;&|\n]", cmd):
     seg = seg.strip()
     if not seg:
         continue
     try:
-        toks = shlex.split(seg)
+        # comments=True so a full-line "# note" segment tokenises to nothing and
+        # is skipped like a bare assignment. Without it the base command reads as
+        # "#" and one comment line disqualifies an entire commented cleanup block.
+        toks = shlex.split(seg, comments=True)
     except Exception:
-        allow = False
-        break
+        continue
     i = 0
     while i < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]):
         i += 1
@@ -8086,12 +8095,8 @@ for seg in re.split(r"&&|\|\||[;&|\n]", cmd):
     base = toks[i].rsplit("/", 1)[-1]
     if base in ("rm", "rmdir"):
         saw_rm = True
-    elif base == "cd":
-        pass
-    else:
-        allow = False
         break
-if allow and saw_rm:
+if saw_rm:
     sys.stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",
@@ -8820,6 +8825,12 @@ cmd_resume() {
         ' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
       else
         jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
+      fi
+      # This refresh REWRITES settings.json from the host file, which drops the
+      # unsafe-rm hook cmd_run injected at create. Without re-injecting here the
+      # cap silently stops working after a resume and the delete prompt returns.
+      if cap_is_active unsafe-rm && [[ -s "$settings_overlay_dir/settings.json" ]]; then
+        _inject_unsafe_rm_hook "$settings_overlay_dir/settings.json"
       fi
     fi
     # Project-level settings overlays (only when .claude/ exists)

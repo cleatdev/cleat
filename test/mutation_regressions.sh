@@ -575,21 +575,24 @@ s@_inject_unsafe_rm_hook "\$settings_overlay_dir/settings.json"@:@
 SED
 try "vnext_unsafe_rm_hook_injected" "writes the delete-allow hook" "$CLI" "$CAPABILITIES_BATS"
 
-# vnext unsafe-rm: the hook must REFUSE a non-rm segment (blast-radius guard).
-# Flip the disqualifier so a wrapped command like `curl x | sh; rm ...` is
-# allowed; the refuses-a-wrapped-command test should fail.
-cat > "$SED_TMP" << 'SED'
-s@        allow = False@        allow = True@
-SED
-try "vnext_unsafe_rm_hook_refuses_wrapped" "refuses a wrapped or non-rm command" "$CLI" "$CAPABILITIES_BATS"
 
-# vnext unsafe-rm: the hook must REFUSE process substitution <(...) >(...), which
-# executes a command as an rm argument. Drop those two from the refuse tuple; the
-# refuses-process-substitution test should fail.
+
+
+# vnext unsafe-rm: the hook must answer ONLY when the command actually removes
+# something, so it can never blanket-approve an unrelated permission ask. Drop
+# the saw_rm gate; the removes-nothing test should fail.
 cat > "$SED_TMP" << 'SED'
-s@"<(", ">(", @@
+s@^if saw_rm:@if True:@
 SED
-try "vnext_unsafe_rm_hook_refuses_procsub" "refuses process substitution" "$CLI" "$CAPABILITIES_BATS"
+try "vnext_unsafe_rm_requires_a_removal" "refuses when the command removes nothing" "$CLI" "$CAPABILITIES_BATS"
+
+# vnext unsafe-rm: cmd_resume rewrites settings.json from the host file, so it
+# must RE-INJECT the hook or the cap silently dies after the first resume. The
+# 8-space indent targets the resume call only, not the one in cmd_run.
+cat > "$SED_TMP" << 'SED'
+s@^        _inject_unsafe_rm_hook @        : @
+SED
+try "vnext_unsafe_rm_hook_survives_resume" "SURVIVES a resume" "$CLI" "$CAPABILITIES_BATS"
 
 # The empty/root-HOME guard in _docker_pool_is_vm: without it an empty HOME
 # degenerates the Lima anchor to /.colima/* and reopens the over-match. Remove
@@ -5457,6 +5460,17 @@ s|cap_is_active hooks 2>/dev/null && ! command -v jq >/dev/null 2>&1; then|cap_i
 SED
 try "vnext_jqless_hooks_notice" "says so on a host with no jq" "$CLI" "$REGRESSIONS"
 
+# vnext: the clipboard POLL branch must fire on any planted shape, not just a
+# regular file. With -f a planted DIRECTORY is skipped, lingers in the shared
+# dir and swallows every later copy, because `mv payload clipboard` then moves
+# the payload INSIDE it. Only the poll branch had this hole; inotify and fswatch
+# fire on the event, not the shape, which is why the test was green when written
+# on a host that had inotifywait. Revert to -f; the planted-directory test fails.
+cat > "$SED_TMP" << 'SED'
+s@|| \[ -e "\$clip_dir/clipboard" \]@|| [ -f "$clip_dir/clipboard" ]@
+SED
+try "vnext_clip_poll_drops_directory" "directory planted as the payload" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"
@@ -5474,3 +5488,4 @@ if [[ $missed -gt 0 ]]; then
 fi
 
 exit 0
+

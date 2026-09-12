@@ -456,6 +456,33 @@ STUB
   assert_success
 }
 
+@test "smoke: cleat browser origins survives strict mode" {
+  run cleat_bin_timeout 10 browser origins
+  assert_success
+  assert_output --partial "claude.ai"
+}
+
+@test "smoke: cleat browser allow writes an origin and refuses a bad one" {
+  run cleat_bin_timeout 10 browser allow auth.example.com
+  assert_success
+  run cleat_bin_timeout 10 browser origins
+  assert_output --partial "auth.example.com"
+  run cleat_bin_timeout 10 browser allow "not a host"
+  assert_failure
+}
+
+@test "smoke: cleat browser needs no Docker daemon" {
+  # A destination allowlist is host-side policy. It must answer with the daemon
+  # down, for the same reason cleat session and cleat account do.
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 10 browser origins
+  assert_success
+}
+
+@test "smoke: cleat browser rejects an unknown subcommand" {
+  run cleat_bin_timeout 10 browser frobnicate
+  assert_failure
+}
+
 @test "smoke: cleat account trash runs with nothing in it" {
   run cleat_bin_timeout 10 account trash
   assert_success
@@ -1525,8 +1552,14 @@ fb="\$(_docker_vm_display_gb 17179869184)"; echo "fallback=[\$fb]"
 # 3. Bridge policy with the env var UNSET (set -u) and on a typo.
 unset CLEAT_BROWSER_BRIDGE
 echo "mode=[\$(_browser_bridge_mode)]"
-if _browser_should_open auto 1 0; then echo "plain=open"; else echo "plain=defer"; fi
-if _browser_should_open auto 1 1; then echo "auth=open"; else echo "auth=defer"; fi
+if _browser_should_open auto 1 0 1; then echo "plain=open"; else echo "plain=defer"; fi
+if _browser_should_open auto 1 1 1; then echo "auth=open"; else echo "auth=defer"; fi
+# 3b. The destination gate itself, under strict mode: _bridge_url_host runs a
+#     tr pipeline and _bridge_origin_allowed reads a here-doc in a while loop,
+#     both of which are the pipefail / set -u shape.
+if _bridge_dest_allowed "https://claude.ai/oauth/authorize"; then echo "listed=open"; else echo "listed=deny"; fi
+if _bridge_dest_allowed "https://evil.example.com/x"; then echo "unlisted=open"; else echo "unlisted=deny"; fi
+echo "origins=[$(_bridge_origins_effective | grep -c .)]"
 # 4. Auth classification under strict mode: the code-paste login URL (no
 #    loopback callback) is auth; a plain link is not; neither aborts set -e.
 if _is_auth_url "https://claude.ai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Fcb"; then echo "codepaste=auth"; else echo "codepaste=plain"; fi
@@ -1542,6 +1575,8 @@ EOF
   assert_output --partial "plain=defer"                  # no duplicate tab on an interactive terminal
   assert_output --partial "auth=open"                    # login URLs still open
   assert_output --partial "codepaste=auth"               # code-paste login URL counts as auth
+  assert_output --partial "listed=open"                  # the destination gate allows a shipped origin
+  assert_output --partial "unlisted=deny"                # and refuses one the box chose
   assert_output --partial "docs=plain"                   # plain links still defer
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"

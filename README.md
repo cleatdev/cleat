@@ -127,7 +127,7 @@ Cleat gives you the best of both worlds:
 - **Account switching** -- `cleat account` keeps two or more Claude logins under names and pins a box to one, so hitting the five-hour limit on one Max account is one command instead of a browser login. Conversations and project history are shared across the switch
 - **Session management** -- `cleat session` lists a box's Claude conversations with their real sizes, deletes the ones you are done with (which the Claude Code CLI itself cannot do for a single conversation) and keeps them restorable in a trash for 30 days
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
-- **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
+- **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser. Cleat checks the origin first, so the box cannot choose where your logged-in browser goes
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
 - **Configuration drift detection** -- notifies when config has changed since container creation
 - **Clean terminal output** -- braille spinners for slow operations, suppressed Docker noise, canonical startup/exit sequences
@@ -1082,9 +1082,28 @@ cleat --cap hooks start        # enable for one session
 
 ## Browser bridge
 
-When Claude Code or any tool inside the container calls `open` or `xdg-open` with a URL, it opens in your host browser. OAuth callbacks are automatically proxied back to the container. `cleat login` and any auth flow work seamlessly without manual URL copy-paste. No capability needed.
+When Claude Code or any tool inside the container calls `open` or `xdg-open` with a URL, Cleat can open it in your host browser. OAuth callbacks are proxied back to the container, so a login started inside a box completes without copy-paste. No capability needed.
 
-**One click, one tab.** Your terminal already opens a clicked link itself, so on an interactive terminal the bridge defers plain links to it and opens via the bridge only what the terminal won't: auth/OAuth-callback URLs and non-interactive runs. Clicking a link opens a single tab, on any terminal. Override with `CLEAT_BROWSER_BRIDGE=always` (open every URL through the bridge) or `off` (never auto-open, the login callback proxy still runs).
+**Cleat checks the origin first.** A box that can aim your host browser anywhere is a box that can aim it at your own logged-in accounts, so the URL is opened only when its origin is on a list Cleat ships. Every login Cleat knows about is on that list by default and there is nothing to configure. Anything else is refused, printed in full for you to open by hand, with the one command that allows it next time:
+
+```bash
+cleat browser origins                  # what your sandbox is allowed to open
+cleat browser allow auth.example.com   # add one, for every box
+```
+
+The list can never be complete. That is arithmetic rather than a gap: an AWS access portal lives on your own subdomain, an Atlassian site is your own site, a self-hosted GitLab or GitHub Enterprise is your own hostname, an MCP server names its own authorization host, one per server. You add those once. The same goes for a login Cleat has not catalogued yet. Not every tool documents which page it opens. A few ask their own server for the address at login time, so it can move without the tool changing.
+
+An origin on the list can still redirect your browser somewhere else, because following a redirect is what browsers do. The list bounds the first hop, not the last one.
+
+**One click, one tab.** Your terminal already opens a clicked link itself, so the bridge defers plain links to it and opens only what the terminal will not: an OAuth authorize URL at an allowlisted origin. Off a terminal (a pipe, cron, `nohup`, `cleat login`) a plain link is deferred too, because nobody is watching the browser during an unattended run. Override with `CLEAT_BROWSER_BRIDGE=always`, which opens every URL the box picks at any origin, or `off`, which never auto-opens while the login callback proxy still runs.
+
+**`CLEAT_BROWSER_ORIGINS`** appends to the shipped list for one shell, never replaces it:
+
+```bash
+CLEAT_BROWSER_ORIGINS="auth.acme.example,d-9067123456.awsapps.com" cleat
+```
+
+Missing a login worth shipping? Cleat prints the exact origin when it refuses one, so paste that into [an issue](https://github.com/cleatdev/cleat/issues/new) and it can ship as a default.
 
 ---
 

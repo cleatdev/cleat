@@ -1005,16 +1005,28 @@ EOF
 # exit code ignored (so a failing hook can't block the bridge).
 # ─────────────────────────────────────────────────────────────────────────────
 
-@test "regression: hook bridge wraps execution in 30s timeout" {
+@test "regression: hook bridge wraps execution in a timeout" {
+  # Retargeted from a literal `timeout 30` to a behavioural check on the
+  # resolver. The flat 30s became per-event, matching Claude Code's own values
+  # for its own hooks: a Stop hook that formats a large repo legitimately takes
+  # minutes, and a PreToolUse hook that takes 30 seconds has already wedged the
+  # turn. What this regression protects is unchanged, that a user hook is never
+  # run unwrapped, so a hung one cannot block the bridge.
   local body
   body="$(declare -f _execute_host_hooks)"
   [[ -n "$body" ]] || { echo "_execute_host_hooks function not found"; return 1; }
-
-  # There must be a `timeout 30` wrapping the user hook command
-  echo "$body" | grep -qE 'timeout 30 bash -c' || {
-    echo "REGRESSION: hook bridge must wrap user hook execution in timeout 30"
+  echo "$body" | grep -qE 'timeout "\$_hto" bash -c' || {
+    echo "REGRESSION: hook bridge must wrap user hook execution in a timeout"
     return 1
   }
+  # And the resolver always answers with a positive number of seconds, for an
+  # event name it has never seen as much as for one it has.
+  local ev
+  for ev in PreToolUse PostToolUse UserPromptSubmit Stop SubagentStop SomeFutureEvent; do
+    local t; t="$(_hook_timeout_for "$ev")"
+    case "$t" in ''|*[!0-9]*) echo "no timeout for $ev"; return 1 ;; esac
+    [ "$t" -gt 0 ] || { echo "a zero timeout for $ev would run the hook unbounded"; return 1; }
+  done
 }
 
 @test "regression: hook bridge suppresses stdout and swallows errors" {
@@ -1228,6 +1240,57 @@ EOF
   run grep -rn "cli_call.*'[\$]" \
     "$PROJECT_ROOT/test/integration" "$PROJECT_ROOT/test/setup.bash"
   assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Containment: the box is never created or exec'd with --privileged. Nothing in
+# the CLI does today, and a source guard is the cheapest way to keep it true:
+# the flag hands the container every capability and every device, which voids
+# every other boundary in the product in one word.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression containment: --privileged appears nowhere in the CLI" {
+  run grep -n -- "--privileged" "$CLI"
+  assert_failure
+}
+
+@test "regression containment: no docker run or exec carries --privileged" {
+  # Behavioural, not only textual: the run above would pass if the flag were
+  # assembled from pieces. This asserts on the recorded command line.
+  mock_docker_images "cleat"
+  mock_docker_ps_a ""
+  run cmd_run
+  run docker_calls
+  refute_output --partial "--privileged"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel 3: the ~/.claude root is mounted read-write with only named LEAVES
+# masked, so any path Claude Code starts reading at the root becomes a hole with
+# no change on Cleat's side. This guard cannot know the vendor's set, and saying
+# so is the point: it asserts the list this repo maintains has not silently
+# shrunk, which is the failure that actually happens during a refactor.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression containment: every instruction surface is masked over the box's ~/.claude" {
+  local want p
+  for want in workflows routines rules output-styles themes cowork_plugins \
+              project-settings local-settings scheduled_tasks.json launch.json \
+              loop.md keybindings.json settings.local.json; do
+    local found=0
+    for p in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+      [ "$p" = "$want" ] && found=1
+    done
+    [ "$found" = 1 ] || { echo "instruction surface $want is no longer masked"; return 1; }
+  done
+}
+
+@test "regression containment: .config.json is never masked" {
+  # Masking works by creating an empty overlay on the HOST. Creating
+  # ~/.claude/.config.json there would destroy the user's global config.
+  local p
+  for p in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+    [ "$p" = ".config.json" ] && { echo ".config.json must never be masked: the host target would overwrite the real one"; return 1; }
+  done
+  return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2396,14 +2459,22 @@ ${overlay_dir}/project-settings.local.json"
   # URL itself AND the in-container open shim writes the bridge, so the watcher
   # opened it a second time. On an interactive terminal the bridge must DEFER plain
   # links. Drop the host_opens_clicks gate and this opens (the duplicate returns).
+  # Retargeted for the browser destination gate, which added a fourth argument.
+  # The duplicate-tab property this regression exists for is untouched: auto plus
+  # an interactive terminal plus a plain link still defers. The third line
+  # INVERTED, and deliberately: off a TTY a plain link now defers too, because
+  # that window is cleat login, a pipe, cron and nohup, where nobody is watching
+  # the browser. `always` carries the old behaviour and is asserted here so the
+  # escape hatch cannot regress either.
   run bash -c '
     source "'"$CLI"'"
-    # auto + interactive terminal + plain link -> defer (rc 1).
-    if _browser_should_open auto 1 0; then echo "PLAIN OPENED (duplicate)" >&2; exit 1; fi
-    # auto + interactive + auth URL -> still opens (the bridge owns login URLs).
-    _browser_should_open auto 1 1 || { echo "auth URL wrongly deferred" >&2; exit 1; }
-    # auto + no terminal + plain -> opens (nothing else will).
-    _browser_should_open auto 0 0 || { echo "plain link wrongly deferred off a TTY" >&2; exit 1; }
+    # auto + interactive terminal + plain link -> defer (rc 1). The duplicate.
+    if _browser_should_open auto 1 0 1; then echo "PLAIN OPENED (duplicate)" >&2; exit 1; fi
+    # auto + interactive + allowlisted auth URL -> still opens (the bridge owns login URLs).
+    _browser_should_open auto 1 1 1 || { echo "auth URL wrongly deferred" >&2; exit 1; }
+    # auto + no terminal + plain -> defers now, and always still opens it.
+    if _browser_should_open auto 0 0 1; then echo "PLAIN OPENED UNATTENDED" >&2; exit 1; fi
+    _browser_should_open always 0 0 0 || { echo "always stopped being a full bypass" >&2; exit 1; }
     echo "NO_DUP_OK"
   '
   assert_success

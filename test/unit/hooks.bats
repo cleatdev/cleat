@@ -533,7 +533,14 @@ EOF
     echo "_RESOLVED_PROJECT='$_RESOLVED_PROJECT' expected '$TEST_TEMP/project'"
     return 1
   }
-  # Verify project hooks are discoverable
+  # Retargeted: _RESOLVED_PROJECT still has to be set (the project overlay and
+  # the project-hook advisory both read it), but it no longer decides whether
+  # the bridge starts. Hook COMMANDS come from the host settings file alone,
+  # because the two project files live inside the read-write /workspace mount.
+  # What is still proven here is that the project resolves, which is what this
+  # test was written for.
+  mkdir -p "${HOME}/.claude"
+  printf '{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"echo"}]}]}}\n' > "${HOME}/.claude/settings.json"
   run _has_host_hooks
   assert_success
 }
@@ -780,7 +787,13 @@ EOF
   assert_success
 }
 
-@test "_has_host_hooks: true when project settings.json has hooks" {
+@test "_has_host_hooks: FALSE when only a project settings.json has hooks" {
+  # Inverted, deliberately, and this is the escalation the inversion closes:
+  # both project files sit inside the read-write /workspace mount, so a command
+  # read from one is a command the box can write. Verified in the spec by
+  # running the old function: event one ran the user's own hook, the file was
+  # rewritten the way a box writes through /workspace, and event two executed
+  # the rewritten command on the HOST.
   mkdir -p "${HOME}/.claude"
   echo '{}' > "${HOME}/.claude/settings.json"
   mkdir -p "$TEST_TEMP/project/.claude"
@@ -789,10 +802,16 @@ EOF
 EOF
   _RESOLVED_PROJECT="$TEST_TEMP/project"
   run _has_host_hooks
-  assert_success
+  assert_failure
+  # And it is named rather than ignored in silence.
+  run _hook_project_files_with_hooks
+  assert_output --partial ".claude/settings.json"
 }
 
-@test "_has_host_hooks: true when project settings.local.json has hooks" {
+@test "_has_host_hooks: FALSE when only a project settings.local.json has hooks" {
+  # The sharper half: settings.local.json is a file Claude Code ITSELF writes
+  # during ordinary operation, which is why this is split by origin rather than
+  # gated by a consent prompt. See concept/16.
   mkdir -p "${HOME}/.claude"
   echo '{}' > "${HOME}/.claude/settings.json"
   mkdir -p "$TEST_TEMP/project/.claude"
@@ -801,7 +820,9 @@ EOF
 EOF
   _RESOLVED_PROJECT="$TEST_TEMP/project"
   run _has_host_hooks
-  assert_success
+  assert_failure
+  run _hook_project_files_with_hooks
+  assert_output --partial ".claude/settings.local.json"
 }
 
 @test "_has_host_hooks: false when no settings have hooks" {
@@ -1178,7 +1199,11 @@ SCRIPT
   local watcher_pid=$!
   sleep 0.3
 
-  printf 'https://example.com/auth' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/oauth/authorize?redirect_uri=https%%3A%%2F%%2Fconsole.anthropic.com%%2Fcb' > "$clip_dir/.browser-open"
   sleep 1
 
   kill "$watcher_pid" 2>/dev/null || true
@@ -1186,7 +1211,7 @@ SCRIPT
 
   [[ -f "$marker" ]] || return 1
   run cat "$marker"
-  assert_output "https://example.com/auth"
+  assert_output "https://claude.ai/oauth/authorize?redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Fcb"
 }
 
 @test "browser watcher: skips pre-existing URL from previous session" {
@@ -1198,7 +1223,11 @@ SCRIPT
   # days old, and the startup sweep is age-gated (a FRESH file is a live URL a
   # sibling watcher is about to claim, see browser_bridge.bats), so the
   # leftover must be demonstrably stale to be swept.
-  printf 'https://old-session.example.com' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/old?redirect_uri=https%%3A%%2F%%2Fconsole.anthropic.com%%2Fcb' > "$clip_dir/.browser-open"
   touch -t 202001010000 "$clip_dir/.browser-open"
 
   local mock_open="$TEST_TEMP/mock-open-old"
@@ -1214,7 +1243,11 @@ SCRIPT
   sleep 1
 
   # Write a new URL (touch to ensure timestamp changes)
-  printf 'https://new-session.example.com' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/new?redirect_uri=https%%3A%%2F%%2Fconsole.anthropic.com%%2Fcb' > "$clip_dir/.browser-open"
   touch "$clip_dir/.browser-open"
   sleep 1.5
 
@@ -1223,7 +1256,7 @@ SCRIPT
 
   # New URL should have been opened
   [[ -f "$marker" ]] || { echo "No URLs opened at all"; return 1; }
-  grep -q "new-session" "$marker" || { echo "New URL not opened"; return 1; }
+  grep -q "claude.ai/new" "$marker" || { echo "New URL not opened"; return 1; }
 
   # Old URL should NOT have been opened
   if grep -q "old-session" "$marker"; then
@@ -1238,7 +1271,11 @@ SCRIPT
 
   # Simulate a leftover URL from a previous session (stale mtime: the startup
   # sweep is age-gated and only removes a demonstrably old file)
-  printf 'https://stale.example.com' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/stale?redirect_uri=https%%3A%%2F%%2Fconsole.anthropic.com%%2Fcb' > "$clip_dir/.browser-open"
   touch -t 202001010000 "$clip_dir/.browser-open"
 
   local mock_open="$TEST_TEMP/mock-open-same-second"
@@ -1255,7 +1292,11 @@ SCRIPT
   sleep 0.3
 
   # Write a new URL immediately (no touch to force timestamp change)
-  printf 'https://new.example.com/auth' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/fresh?redirect_uri=https%%3A%%2F%%2Fconsole.anthropic.com%%2Fcb' > "$clip_dir/.browser-open"
   sleep 1.5
 
   kill "$watcher_pid" 2>/dev/null || true
@@ -1264,7 +1305,7 @@ SCRIPT
   # New URL must have been opened (regression: same-second write was missed)
   [[ -f "$marker" ]] || { echo "URL not opened, same-second regression"; return 1; }
   run cat "$marker"
-  assert_output --partial "new.example.com/auth"
+  assert_output --partial "claude.ai/fresh"
 
   # Stale URL must NOT have been opened
   if grep -q "stale.example.com" "$marker"; then
@@ -1474,15 +1515,25 @@ SCRIPT
   chmod +x "$mock_open"
 
   local proxy_marker="$TEST_TEMP/proxy-started"
+  # $4 is the readiness marker the real backends touch on a successful bind.
+  # Without it the watcher defers rather than opening, which is the correct new
+  # behaviour and has its own test in browser_bridge.bats.
   _auth_callback_proxy() {
     echo "$1 $2 $3" > "$proxy_marker"
+    [ -n "${4:-}" ] && : > "$4"
+    sleep 5
   }
 
+  _port_in_use() { return 1; }
   _browser_watcher "$clip_dir" "$mock_open" "test-container" &
   local watcher_pid=$!
   sleep 0.3
 
-  printf 'https://auth.example.com/login?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A34063%%2Fcallback&state=abc' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/login?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A34063%%2Fcallback&state=abc' > "$clip_dir/.browser-open"
   sleep 1.5
 
   kill "$watcher_pid" 2>/dev/null || true
@@ -1523,11 +1574,16 @@ SCRIPT
   # Stub proxy: succeed silently
   _auth_callback_proxy() { :; }
 
+  _port_in_use() { return 1; }
   _browser_watcher "$clip_dir" "$mock_open" "test-container" &
   local watcher_pid=$!
   sleep 0.3
 
-  printf 'https://auth.example.com/login?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A49152%%2Fcallback&state=xyz' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/login?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A49152%%2Fcallback&state=xyz' > "$clip_dir/.browser-open"
   sleep 1.5
 
   kill "$watcher_pid" 2>/dev/null || true
@@ -1552,17 +1608,26 @@ SCRIPT
     touch "$proxy_marker"
   }
 
+  _port_in_use() { return 1; }
   _browser_watcher "$clip_dir" "$mock_open" "test-container" &
   local watcher_pid=$!
   sleep 0.3
 
-  printf 'https://example.com/docs' > "$clip_dir/.browser-open"
+  # Retargeted for the browser destination gate: the fixture host moved onto
+  # the shipped allowlist. What this test protects is unchanged. An origin the
+  # gate refuses can never reach the opener, so the old fixture would have made
+  # the assertion pass for the wrong reason.
+  printf 'https://claude.ai/docs' > "$clip_dir/.browser-open"
   sleep 1
 
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
 
-  [[ -f "$marker" ]] || return 1
+  # The open assertion inverted with B3: a plain link off a terminal defers
+  # now, because nobody is watching the browser during an unattended run. What
+  # this test protects is the proxy, and that is unchanged: a URL with no
+  # redirect_uri must never make the host bind a port.
+  [[ ! -f "$marker" ]] || { echo "a plain link was opened with no terminal attached"; return 1; }
   [[ ! -f "$proxy_marker" ]] || { echo "Proxy should not start for non-OAuth URL"; return 1; }
 }
 
@@ -1579,15 +1644,267 @@ SCRIPT
   local watcher_pid=$!
   sleep 0.3
 
-  printf 'https://example.com/page' > "$clip_dir/.browser-open"
-  sleep 1
+  # Retargeted onto an allowlisted auth URL. This test is about the two-argument
+  # SIGNATURE still working, not about the destination, and a plain link at an
+  # unallowlisted origin can no longer reach the opener to prove anything.
+  _extract_callback_port() { echo "1455"; return 0; }
+  _auth_callback_proxy() { [ -n "${4:-}" ] && : > "$4"; sleep 5; }
+  _port_in_use() { return 1; }
+  printf 'https://claude.ai/page?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A1455%%2Fcb' > "$clip_dir/.browser-open"
+  sleep 1.5
 
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
 
   [[ -f "$marker" ]] || return 1
   run cat "$marker"
-  assert_output "https://example.com/page"
+  assert_output "https://claude.ai/page?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb"
+}
+
+
+# ── payload validation ──────────────────────────────────────────────────────
+#
+# The event JSON a host hook receives on stdin is written by the CAGED side, so
+# every field in it is attacker-chosen. These pin the six properties adopted
+# from Claude Code's own container-session posture.
+
+_ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
+  local ev="$1"; shift
+  printf '{"hook_event_name":"%s","transcript_path":"/home/coder/.claude/projects/-workspace/abc.jsonl","cwd":"/workspace"%s}' "$ev" "$*"
+}
+
+@test "hook payload: the required transcript_path becomes a sentinel, never a drop" {
+  # C1, and it is fatal if missed. transcript_path is REQUIRED on every event
+  # and in a box it lives under /home/coder/.claude/projects/-workspace/, which
+  # is never inside /workspace. A naive "every path must resolve inside the
+  # project" rule fails EVERY event, and the capability becomes a no-op with a
+  # counter.
+  run _hook_translate_event "$(_ev PreToolUse)" "/Users/you/proj"
+  assert_success
+  assert_output --partial "transcript-is-inside-the-box"
+  assert_output --partial '"cwd":"/Users/you/proj"'
+}
+
+@test "hook payload: cwd and file_path are translated to the host's own paths" {
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_input":{"file_path":"/workspace/src/a.ts"}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"file_path":"/Users/you/proj/src/a.ts"'
+}
+
+@test "hook payload: a path outside the workspace drops the event" {
+  # Property 5: the default is refuse, not sanitise. This is the class that
+  # costs real money, a host path outside every mount.
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_input":{"file_path":"/etc/passwd"}')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_input":{"file_path":"/Users/you/.ssh/id_rsa"}')" "/Users/you/proj"
+  assert_failure
+}
+
+@test "hook payload: a traversal that lands back inside is still refused" {
+  run _hook_translate_path "/workspace/../../etc/passwd" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_path "/workspace/./a" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_path "/workspace//a" "/Users/you/proj"
+  assert_failure
+}
+
+@test "hook payload: leading or trailing whitespace is refused even with the right prefix" {
+  # A value that already carries the workspace prefix is the only place this
+  # arm is reachable, which is why the upstream ~ $ % backtick prefixes are not
+  # repeated: the prefix requirement already refuses those.
+  local bad
+  for bad in " /workspace/a" "/workspace/a " "  /workspace/a  "; do
+    run _hook_translate_path "$bad" "/Users/you/proj"
+    assert_failure
+  done
+  # And the prefix requirement covers the rest.
+  for bad in "~/secrets" '$HOME/x' '%PATH%' '`id`' '!!' '=x' "relative/path"; do
+    run _hook_translate_path "$bad" "/Users/you/proj"
+    assert_failure
+  done
+}
+
+@test "hook payload: a control character or a backslash is refused" {
+  run _hook_translate_path "$(printf '/workspace/a\tb')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_path '/workspace/a\b' "/Users/you/proj"
+  assert_failure
+}
+
+@test "hook payload: a fork box translates to the COPY, never the origin tree" {
+  # C2. In a fork box the workspace is the copy and the project is the origin.
+  # Translating to the project would point the user's host hook at the origin
+  # working tree from inside a fork box, cancelling the isolation the fork
+  # feature sells.
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_input":{"file_path":"/workspace/src/a.ts"}')" "/Users/you/.config/cleat/forks/proj-abc-feat"
+  assert_success
+  assert_output --partial '"file_path":"/Users/you/.config/cleat/forks/proj-abc-feat/src/a.ts"'
+  refute_output --partial '"file_path":"/Users/you/proj/'
+}
+
+@test "hook payload: a docker-cap box's host-absolute paths still validate" {
+  # C4 in the brief's numbering: with the docker cap on, the box mounts
+  # "$_workspace:$_workspace" and sets --workdir to it, so events already carry
+  # host-absolute paths. A /workspace-prefix-only rule breaks every hook there.
+  run _hook_translate_path "/Users/you/proj/src/a.ts" "/Users/you/proj"
+  assert_success
+  assert_output "/Users/you/proj/src/a.ts"
+  run _hook_translate_path "/Users/you/proj" "/Users/you/proj"
+  assert_success
+}
+
+@test "hook payload: a sibling directory with the same prefix is not inside it" {
+  run _hook_translate_path "/Users/you/proj-evil/x" "/Users/you/proj"
+  assert_failure
+}
+
+@test "hook payload: no canonicalisation, so a symlinked project still works" {
+  # The obvious design canonicalises both sides with `cd -P ... pwd -P`, which
+  # carries three macOS-first failures that would not reproduce here: a project
+  # reached through a symlink fails every compare, APFS is case-insensitive, and
+  # the canonicaliser needs the parent to EXIST so a PreToolUse for a new file
+  # in a new directory resolves to nothing. A literal prefix has none of them.
+  run _hook_translate_path "/workspace/src/new/dir/file.ts" "/Volumes/ext/Code/proj"
+  assert_success
+  assert_output "/Volumes/ext/Code/proj/src/new/dir/file.ts"
+}
+
+@test "hook payload: the event name is bounded and charset-checked, never a roster" {
+  # A hardcoded roster means the next Claude Code release silently stops running
+  # the user's hook for a new event. concept/11 lists 25 names, 2.1.258 ships 33.
+  run _hook_event_name_ok "SomeFutureEventName"
+  assert_success
+  run _hook_event_name_ok "PreToolUse"
+  assert_success
+  run _hook_event_name_ok 'X" // [{"hooks":[{"type":"command"}]}] // "'
+  assert_failure
+  run _hook_event_name_ok ""
+  assert_failure
+  run _hook_event_name_ok "$(printf 'a%.0s' $(seq 1 100))"
+  assert_failure
+}
+
+@test "hook payload: an oversized line is dropped rather than processed" {
+  # The spool is box-written, so the length of one event was the box's to
+  # choose, and Cleat had no size cap anywhere in the bridge.
+  local big; big="$(printf 'a%.0s' $(seq 1 200))"
+  run _hook_translate_event "$(_ev PreToolUse)" "/Users/you/proj"
+  assert_success
+  _HOOK_LINE_MAX=50
+  run _hook_translate_event "$(_ev PreToolUse)" "/Users/you/proj"
+  assert_failure
+}
+
+@test "hook payload: the timeout is per event, not a flat 30 seconds" {
+  run _hook_timeout_for PreToolUse
+  assert_output "15"
+  run _hook_timeout_for PostToolUse
+  assert_output "15"
+  run _hook_timeout_for UserPromptSubmit
+  assert_output "30"
+  run _hook_timeout_for Stop
+  assert_output "120"
+  run _hook_timeout_for SubagentStop
+  assert_output "120"
+  run _hook_timeout_for SomethingNew
+  assert_output "30"
+}
+
+# ── the command source ──────────────────────────────────────────────────────
+
+@test "hook source: a command defined only in a project settings file does not run" {
+  # The escalation this closes, verified in the spec by running the function:
+  # event one ran the user's own hook, the box rewrote the file the way a box
+  # writes through /workspace, and event two executed the rewritten command on
+  # the HOST. Both project files live inside that mount.
+  mkdir -p "$TEST_TEMP/project/.claude" "$HOME/.claude"
+  printf '{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"touch %s/BOX-CHOSEN"}]}]}}\n' \
+    "$TEST_TEMP" > "$TEST_TEMP/project/.claude/settings.json"
+  cp "$TEST_TEMP/project/.claude/settings.json" "$TEST_TEMP/project/.claude/settings.local.json"
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  run _has_host_hooks
+  assert_failure
+  [ ! -f "$TEST_TEMP/BOX-CHOSEN" ] || { echo "a box-authored command ran on the host"; return 1; }
+}
+
+@test "hook source: the host settings file is the one that runs" {
+  mkdir -p "$HOME/.claude"
+  printf '{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"touch %s/USER-OWN"}]}]}}\n' \
+    "$TEST_TEMP" > "$HOME/.claude/settings.json"
+  run _has_host_hooks
+  assert_success
+  _execute_host_hooks '{"hook_event_name":"PreToolUse"}' "$HOME/.claude/settings.json"
+  [ -f "$TEST_TEMP/USER-OWN" ] || { echo "the user's own host hook did not run"; return 1; }
+}
+
+@test "hook source: a project file that defines hooks is named rather than ignored in silence" {
+  mkdir -p "$TEST_TEMP/project/.claude"
+  printf '{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' \
+    > "$TEST_TEMP/project/.claude/settings.json"
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  run _hook_project_files_with_hooks
+  assert_success
+  assert_output --partial ".claude/settings.json"
+}
+
+# ── the matcher ─────────────────────────────────────────────────────────────
+
+@test "hook matcher: a multi-line tool_name cannot satisfy an anchored matcher" {
+  # grep matches per LINE, so "Write\nBash" satisfied ^Bash$ while every other
+  # field of the payload described a Write. Anchoring was not a constraint.
+  mkdir -p "$HOME/.claude"
+  printf '{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"touch %s/MATCHED"}]}]}}\n' \
+    "$TEST_TEMP" > "$HOME/.claude/settings.json"
+  _execute_host_hooks "$(printf '{"hook_event_name":"PreToolUse","tool_name":"Write\\nBash"}')" "$HOME/.claude/settings.json"
+  [ ! -f "$TEST_TEMP/MATCHED" ] || { echo "a multi-line tool_name satisfied an anchored matcher"; return 1; }
+  # And the honest single-line case still matches.
+  _execute_host_hooks '{"hook_event_name":"PreToolUse","tool_name":"Bash"}' "$HOME/.claude/settings.json"
+  [ -f "$TEST_TEMP/MATCHED" ] || { echo "an anchored matcher stopped matching its own tool"; return 1; }
+}
+
+# ── the drop log ────────────────────────────────────────────────────────────
+
+@test "hook drops: the log lives outside every box-writable mount and every run dir" {
+  # Not the clip dir (box-writable) and not the per-box run dir, which every
+  # cleat rm, recreate and nuke removes. The box can INDUCE that removal:
+  # [resources] in a project .cleat is read with no trust gate, feeds the config
+  # fingerprint, and the recreate prompt it produces defaults to yes.
+  _hook_drop_log "payload" '{"hook_event_name":"X"}'
+  [ -f "$CLEAT_STATE_DIR/hook-drops.log" ] || { echo "the drop log was not written where it survives a teardown"; return 1; }
+  run cat "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output --partial "DROPPED-EVENT"
+  case "$CLEAT_STATE_DIR" in
+    *"/run/"*) echo "the drop log is inside a per-box run dir"; return 1 ;;
+  esac
+}
+
+@test "hook drops: a forged event cannot inject a log line or a terminal escape" {
+  _hook_drop_log "payload" "$(printf 'x\nDROPPED-EVENT\tforged\tline\n\033[2J')"
+  run cat "$CLEAT_STATE_DIR/hook-drops.log"
+  refute_output --partial $'\033[2J'
+  [ "$(grep -c DROPPED-EVENT "$CLEAT_STATE_DIR/hook-drops.log")" -eq 1 ] || {
+    echo "a forged payload wrote a second log line"; return 1; }
+}
+
+@test "hook drops: the summary says nothing when nothing was dropped" {
+  # concept/21 forbids the nag.
+  local log="$TEST_TEMP/hook-drops.log"; : > "$log"
+  run _maybe_report_hook_drops "$log" 0
+  assert_success
+  assert_output ""
+}
+
+@test "hook drops: the summary counts only this session" {
+  local log="$TEST_TEMP/hook-drops.log"
+  printf 'ts\t%s\tpayload\told\n' "$_HOOK_DROP_MARK" > "$log"
+  local off; off="$(wc -c < "$log" | tr -d ' ')"
+  run _maybe_report_hook_drops "$log" "$off"
+  assert_output ""
+  printf 'ts\t%s\tpayload\tnew\n' "$_HOOK_DROP_MARK" >> "$log"
+  run _maybe_report_hook_drops "$log" "$off"
+  assert_output --partial "Dropped"
+  assert_output --partial "1"
 }
 
 # ── cmd_login: browser bridge ───────────────────────────────────────────
@@ -1715,6 +2032,90 @@ SCRIPT
   [[ -f "$bw_started" ]] || { echo "Browser watcher not started"; return 1; }
   sleep 0.3
   [[ -f "$bw_killed" ]] || { echo "Browser watcher not killed after login failure"; return 1; }
+}
+
+@test "hook bridge: an event naming a path outside the workspace never reaches a hook" {
+  # End to end through the real watcher loop: validation runs BEFORE anything is
+  # dispatched, and a failure drops the event rather than sanitising it.
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<EOF
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"touch $TEST_TEMP/hook_ran"}]}]}}
+EOF
+  local hooks_file="$TEST_TEMP/events.jsonl"
+  : > "$hooks_file"
+  _hook_bridge_watcher "$hooks_file" "$TEST_TEMP/project" >/dev/null 2>&1 &
+  local bpid=$!
+  sleep 0.7
+  printf '{"hook_event_name":"PreToolUse","transcript_path":"/home/coder/.claude/projects/-workspace/a.jsonl","cwd":"/workspace","tool_input":{"file_path":"/Users/you/.ssh/id_rsa"}}\n' >> "$hooks_file"
+  sleep 1.5
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  [ ! -f "$TEST_TEMP/hook_ran" ] || { echo "a hook ran on an event naming a host path outside the workspace"; return 1; }
+  # And it was recorded where a teardown cannot reach it.
+  run cat "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output --partial "DROPPED-EVENT"
+}
+
+@test "hook bridge: a valid event still reaches the hook, with its paths translated" {
+  # The other half, and the one that stops the capability becoming a no-op with
+  # a counter: a well-formed event carrying the REQUIRED transcript_path must
+  # run, and the hook must see the host's own path rather than /workspace.
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<EOF
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"cat > $TEST_TEMP/hook_stdin"}]}]}}
+EOF
+  local hooks_file="$TEST_TEMP/events.jsonl"
+  : > "$hooks_file"
+  _hook_bridge_watcher "$hooks_file" "$TEST_TEMP/project" >/dev/null 2>&1 &
+  local bpid=$!
+  sleep 0.7
+  printf '{"hook_event_name":"PreToolUse","transcript_path":"/home/coder/.claude/projects/-workspace/a.jsonl","cwd":"/workspace","tool_input":{"file_path":"/workspace/src/a.ts"}}\n' >> "$hooks_file"
+  local i
+  for i in 1 2 3 4 5 6; do
+    [ -s "$TEST_TEMP/hook_stdin" ] && break
+    sleep 0.5
+  done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  [ -s "$TEST_TEMP/hook_stdin" ] || { echo "a valid event never reached the hook"; return 1; }
+  run cat "$TEST_TEMP/hook_stdin"
+  assert_output --partial "$TEST_TEMP/project/src/a.ts"
+  refute_output --partial '"file_path":"/workspace/src/a.ts"'
+  assert_output --partial "transcript-is-inside-the-box"
+}
+
+@test "hook bridge: a command defined only in a project settings file never runs through the bridge" {
+  # End to end. The escalation: event one runs the user's own hook, the box
+  # rewrites the project settings file through /workspace, event two runs the
+  # rewritten command on the HOST.
+  mkdir -p "$HOME/.claude" "$TEST_TEMP/project/.claude"
+  echo '{}' > "$HOME/.claude/settings.json"
+  cat > "$TEST_TEMP/project/.claude/settings.json" <<EOF
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"touch $TEST_TEMP/BOX_CHOSE_THIS"}]}]}}
+EOF
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  local hooks_file="$TEST_TEMP/events.jsonl"
+  : > "$hooks_file"
+  _hook_bridge_watcher "$hooks_file" "$TEST_TEMP/project" >/dev/null 2>&1 &
+  local bpid=$!
+  sleep 0.7
+  printf '{"hook_event_name":"PreToolUse","transcript_path":"/home/coder/.claude/projects/-workspace/a.jsonl","cwd":"/workspace"}\n' >> "$hooks_file"
+  sleep 1.5
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  [ ! -f "$TEST_TEMP/BOX_CHOSE_THIS" ] || { echo "a command from a file inside /workspace ran on the host"; return 1; }
+}
+
+@test "hook bridge: the watcher is handed the WORKSPACE, not the resolved project" {
+  # In a fork box those differ, and translating to the project would point the
+  # user's host hook at the ORIGIN working tree from inside a fork box.
+  local body
+  body="$(declare -f exec_claude)"
+  [[ -n "$body" ]] || { echo "exec_claude not found"; return 1; }
+  echo "$body" | grep -qE '_hook_bridge_watcher "\$hooks_file" "\$_workspace"' || {
+    echo "the hook bridge is not handed \$_workspace, so a fork box would translate to the origin tree"
+    return 1
+  }
 }
 
 @test "hook bridge: an orphaned bridge exits without executing late events" {

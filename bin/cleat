@@ -2986,11 +2986,24 @@ _maybe_note_missing_kit_masks() {
   container_exists "$cname" || return 0
   local dests d
   dests="$(docker inspect "$cname" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)" || return 0
+  # The instruction-surface masks join this list rather than bumping
+  # _IMAGE_SPEC_VERSION. That constant means image CONTENT, a mount is not image
+  # content, and the bump would cost every user the apt-get state inside their
+  # box. The config fingerprint does not cover mounts either, so this advisory
+  # is the only signal an existing box gets, which is the deliberate trade: it
+  # tells, it never forces.
+  local _instr
   for d in /home/coder/.claude/CLAUDE.md /home/coder/.claude/agents \
            /home/coder/.claude/commands /home/coder/.claude/skills \
            /home/coder/.claude/plugins; do
     if ! printf '%s\n' "$dests" | grep -qx "$d"; then
       info "This box predates the read-only ~/.claude masks. Recreate to enable them: ${BOLD}cleat rm && cleat${RESET}"
+      return 0
+    fi
+  done
+  for _instr in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+    if ! printf '%s\n' "$dests" | grep -qx "/home/coder/.claude/$_instr"; then
+      info "This box predates the ~/.claude instruction-surface masks. Recreate to enable them: ${BOLD}cleat rm && cleat${RESET}"
       return 0
     fi
   done
@@ -3036,6 +3049,24 @@ _ensure_kit_mask_targets() {
   for _p in $_CLAUDE_PRIVATE_DIRS; do
     [[ -L "${HOME}/.claude/$_p" && ! -e "${HOME}/.claude/$_p" ]] && continue
     mkdir -p "${HOME}/.claude/$_p" 2>/dev/null || true
+  done
+  # Instruction-surface targets, same rule again. Every one of these is absent
+  # on a live box, so this creates them, which is the point: an empty directory
+  # and an inert `{}` are nothing to the user's own Claude Code, and without the
+  # target the mask cannot mount at all on VirtioFS.
+  for _p in $_CLAUDE_INSTR_DIRS; do
+    [[ -L "${HOME}/.claude/$_p" && ! -e "${HOME}/.claude/$_p" ]] && continue
+    [[ -e "${HOME}/.claude/$_p" && ! -d "${HOME}/.claude/$_p" ]] && continue
+    mkdir -p "${HOME}/.claude/$_p" 2>/dev/null || true
+  done
+  for _p in $_CLAUDE_INSTR_FILES; do
+    # Never touch one that already exists: it is the user's, and its content is
+    # not ours to replace. Never follow a symlink into one either.
+    [[ -e "${HOME}/.claude/$_p" || -L "${HOME}/.claude/$_p" ]] && continue
+    case "$_p" in
+      *.json) printf '{}\n' > "${HOME}/.claude/$_p" 2>/dev/null || true ;;
+      *)      : > "${HOME}/.claude/$_p" 2>/dev/null || true ;;
+    esac
   done
 }
 
@@ -3267,6 +3298,60 @@ _generate_kit_overlay() {
 # outright, so no in-box code path resolves a path under ~/.claude/hooks.
 _CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots sessions tasks jobs hooks"
 
+# ── The third channel: the ~/.claude ROOT is writable ───────────────────────
+#
+# `-v "${HOME}/.claude:/home/coder/.claude"` is read-write and only named LEAVES
+# are masked, so the box can create any file at the root that is not on the mask
+# list. That needs no capability, no trust prompt and no egress: it is the same
+# escalation class the hooks capability spends five guards closing, reached for
+# free.
+#
+# What matters there is not runtime state, it is INSTRUCTION SURFACES: paths a
+# later session, or the user's own uncaged Claude Code, reads as configuration,
+# hooks, agents, commands, skills or rules. That set is small, enumerable and
+# has no overlap with the state Claude Code writes for itself.
+#
+# The list is the VENDOR'S, not a guess. Claude Code's own sandbox builds a
+# read-only deny list over these names and the bundle carries it four times
+# over, so refreshing it is a re-read rather than a re-derivation. Every one of
+# them is absent on a live box, which is what makes them creatable.
+#
+# The root itself is NOT made read-only, and that is a measured decision rather
+# than a missing step. Token refresh CREATES files at the root
+# (`.oauth_refresh.lock` per refresh, and 22 of the 31 root-level state names in
+# Claude Code 2.1.258's registry do not exist on a live box) and it RENAMES
+# `.credentials.json` into place, which returns EBUSY onto a mountpoint. This
+# repo already documents that rename trap three times over in its own words. The
+# failure would be silent, delayed by hours and would land as "log in again" in
+# the middle of an unattended session, which is the one thing this product
+# cannot ship broken.
+#
+# Masked with an EMPTY per-box overlay rather than a pass-through copy. None of
+# these is read at the user level by the Claude Code in the image today, so
+# passing content through would be inventing behaviour. If a future release
+# starts reading one, an empty mask makes that a visible missing feature the
+# user reports, instead of an invisible host write primitive nobody sees. That
+# inversion is the only durable property available against a vendor shipping
+# twice a day.
+_CLAUDE_INSTR_DIRS="workflows routines rules output-styles themes cowork_plugins project-settings local-settings"
+# Files, masked the same way. scheduled_tasks.json, launch.json and
+# keybindings.json are JSON, so the inert host placeholder is `{}` and not an
+# empty file: an empty one is not valid JSON and the reader that would choke on
+# it is the user's OWN Claude Code, not the box's.
+#
+# `settings.local.json` earns its place on a measurement rather than on the
+# earlier claim. Claude Code 2.1.258 resolves that file from the GIT ROOT, and
+# the literal `~/.claude/settings.local.json` appears zero times in the bundle,
+# so the widely repeated "the host's Claude Code reads it" is not true as
+# written. But when the cwd is $HOME and $HOME is not inside a git repo, the
+# local path resolves to exactly that, and it is then the highest-precedence
+# non-managed tier, hooks included. The mask costs one line.
+#
+# `.config.json` is deliberately NOT here. Masking works by creating an empty
+# overlay on the host, and creating that file host-side would destroy the user's
+# global config. If it ever matters it needs a different mechanism.
+_CLAUDE_INSTR_FILES="scheduled_tasks.json launch.json loop.md keybindings.json settings.local.json"
+
 # Build the per-box replacement content for the containment mounts. Same
 # regeneration rail as the kit overlay (create/start/resume), so adding a
 # session key is never a container recreate. Cheap: these are empty dirs, not
@@ -3332,6 +3417,23 @@ _generate_home_overlay() {
     # to whatever it points at.
     [[ -L "$home_dir/$_d" || -f "$home_dir/$_d" ]] && rm -f "$home_dir/$_d"
     mkdir -p "$home_dir/$_d"
+  done
+
+  # The instruction-surface masks. Empty, per box, regenerated on every start,
+  # so adding a surface is never a container recreate for a box that already has
+  # the mount. Same self-heal: a symlink here would be a write-through.
+  local _i
+  for _i in $_CLAUDE_INSTR_DIRS; do
+    [[ -L "$home_dir/instr/$_i" || -f "$home_dir/instr/$_i" ]] && rm -f "$home_dir/instr/$_i"
+    mkdir -p "$home_dir/instr/$_i"
+  done
+  mkdir -p "$home_dir/instr" 2>/dev/null || true
+  for _i in $_CLAUDE_INSTR_FILES; do
+    [[ -L "$home_dir/instr/$_i" || -d "$home_dir/instr/$_i" ]] && rm -rf "$home_dir/instr/$_i"
+    case "$_i" in
+      *.json) printf '{}\n' > "$home_dir/instr/$_i" 2>/dev/null || true ;;
+      *)      : > "$home_dir/instr/$_i" 2>/dev/null || true ;;
+    esac
   done
 
   # projects/: a generated parent holding ONLY this project's session keys as
@@ -4287,6 +4389,16 @@ _warn_unknown_cleat_sections() {
     seen="${seen:+$seen|}$name"
     case "$scope" in
       project)
+        # [browser] in a project file is not merely unknown, it is a section
+        # someone expected to WORK. Saying so beats the generic line: the
+        # difference between "ignored" and "ignored, and here is where it goes"
+        # is the difference between a typo and a security hole the user thinks
+        # they closed.
+        case "$name" in
+          browser)
+            warn "Section [browser] in .cleat is ignored ${DIM}(browser origins are global: ${BOLD}cleat browser allow <host>${RESET}${DIM})${RESET}"
+            continue ;;
+        esac
         # Per-box sections. The name AND the kind are both validated, so
         # [box.feta-a.caps] (a typo'd box) and [box.review.capss] still warn:
         # a silently accepted typo is a box running the wrong configuration.
@@ -4306,6 +4418,9 @@ _warn_unknown_cleat_sections() {
         esac ;;
       global)
         case "$name" in
+          # Browser origins are GLOBAL only. See _bridge_origins_from_config:
+          # the project file is one the caged agent edits as ordinary work.
+          browser) continue ;;
           # Box names are per PROJECT, so a global [box.feat-a.*] would apply to
           # every project that happens to have a box called feat-a.
           box.*)
@@ -6037,6 +6152,251 @@ _host_open_cmd() {
 }
 
 # True when a URL is an OAuth authorization request: it carries a redirect_uri=
+# ── The browser destination gate ────────────────────────────────────────────
+#
+# The box writes a URL and the HOST opens it, in the host's own browser, with
+# the host's cookies. Until this gate the destination was whatever the box
+# chose, which is the one command in the default configuration that refuted the
+# published claim. A URL is auto-opened only when its origin is an exact member
+# of a host-side list.
+#
+# The list SHIPS. There is no config file, and that is a decision rather than an
+# omission: a user blocked in the middle of a login who has to find a file,
+# guess a section name and guess a key will reach for CLEAT_BROWSER_BRIDGE=always,
+# which turns the gate off entirely. Trading a dozen narrow identity hosts for
+# one user disabling the feature is a bad trade. CLEAT_BROWSER_ORIGINS appends
+# to it and nothing subtracts from it.
+#
+# Every entry is a login page a tool actually opens, read from the vendor's own
+# documentation or from the CLI's own source. `api.anthropic.com` is NOT here:
+# it is an API host and never a browser destination, and including it would be
+# the API-versus-browser confusion that produces a list which both fails to work
+# and widens the surface.
+#
+# The list can never be complete and the docs must not claim it is. An AWS
+# access portal is the user's own subdomain, an Atlassian site is their own
+# site, a self-hosted GitLab is their own hostname, and an MCP server names its
+# own authorization host, one per server. That is arithmetic, not policy, and it
+# is why CLEAT_BROWSER_ORIGINS exists.
+_BROWSER_ORIGINS="claude.ai console.anthropic.com github.com www.npmjs.com
+login.docker.com accounts.google.com login.microsoftonline.com microsoft.com
+dash.cloudflare.com auth.openai.com cli-auth.heroku.com app.netlify.com
+app.pulumi.com app.planetscale.com app.terraform.io sentry.io gitlab.com"
+
+# Echoes the lowercased HOST of an http(s) URL, or fails. Never a substring.
+#
+# Seven properties copied from _extract_callback_port, which is the precedent in
+# this file (concept/41 rule 3: a value from the box is parsed, not searched):
+# the length bound comes first, `case` globs do the matching rather than [[ =~ ]]
+# or grep, only #/##/%/%% cut the string, `tr` folds case because bash 3.2 has
+# no ${var,,}, the match is exact alternation rather than a wildcard, and the
+# default is a hard `return 1`.
+_bridge_url_host() {
+  local url="$1" rest authority host
+  [ "${#url}" -le 2048 ] || return 1
+  # The scheme is case-insensitive (RFC 3986) and a tool really does emit
+  # HTTPS://. Fold only the scheme: the caller opens the ORIGINAL bytes, and the
+  # path and query are case-SENSITIVE.
+  local scheme="${url%%://*}"
+  [ "$scheme" != "$url" ] || return 1
+  scheme="$(printf '%s' "$scheme" | tr 'A-Z' 'a-z')"
+  case "$scheme" in http|https) ;; *) return 1 ;; esac
+  rest="${url#*://}"
+  authority="${rest%%[/?#]*}"
+  [ -n "$authority" ] || return 1
+  # Userinfo: REJECT, never strip. https://claude.ai@evil.example/ has the
+  # attacker's host to the RIGHT of the @, so ${authority%%@*} hands back the
+  # name they chose. Taking ${authority##*@} is correct; rejecting is stronger.
+  case "$authority" in *@*) return 1 ;; esac
+  # Every byte of the authority, before the port is cut. One rule kills a
+  # percent-encoded authority, a backslash, an underscore, a space, every
+  # punycode confusable that is not already ASCII, and an IPv6 literal, whose
+  # brackets are outside the set. That last one matters for the contract: a
+  # success from here always means "this is a hostname", so a later caller that
+  # treats it that way inherits no latent bug. A separate bracket arm was
+  # written first and removed: a guard that another guard already covers cannot
+  # be mutation-tested, so it is indistinguishable from a guard that does nothing.
+  case "$authority" in *[!A-Za-z0-9.:-]*) return 1 ;; esac
+  case "$authority" in *:*) host="${authority%:*}" ;; *) host="$authority" ;; esac
+  case "$host" in *:*) return 1 ;; esac
+  [ -n "$host" ] || return 1
+  # A trailing dot, a leading dot, an empty label or a leading dash all resolve
+  # to a real name while being a different string from the list entry.
+  case "$host" in .*|*.|*..*|-*|*-) return 1 ;; esac
+  printf '%s' "$host" | tr 'A-Z' 'a-z'
+}
+
+# Split CLEAT_BROWSER_ORIGINS and put every entry through the SAME parser the
+# shipped list is matched with, so a hostile value in the user's own profile
+# cannot widen matching in a way a built-in could not. A malformed entry is
+# dropped, never treated as a wildcard. $1 = "ok" for the accepted hosts,
+# "bad" for the rejected entries, so one parse serves the gate and the warning.
+_bridge_origins_from_env() {
+  local want="${1:-ok}" raw="${CLEAT_BROWSER_ORIGINS:-}" e h
+  [ -n "$raw" ] || return 0
+  # Bound it before any string work. Host-side, but it is walked per claim.
+  [ "${#raw}" -le 4096 ] || return 0
+  raw="$(printf '%s' "$raw" | tr ',;' '  ')"
+  for e in $raw; do
+    [ -n "$e" ] || continue
+    # A bare host and a full origin are both accepted: the blocked line prints
+    # the bare host, and someone reading the docs may paste a whole URL.
+    case "$e" in
+      http://*|https://*) h="$(_bridge_url_host "$e" 2>/dev/null)" || h="" ;;
+      *)                  h="$(_bridge_url_host "https://$e" 2>/dev/null)" || h="" ;;
+    esac
+    if [ -n "$h" ]; then
+      [ "$want" = "ok" ] && printf '%s\n' "$h"
+    else
+      [ "$want" = "bad" ] && printf '%s\n' "$(_sanitize_repo_str "$e")"
+    fi
+  done
+  return 0
+}
+
+# Origins the user added with `cleat browser allow`. GLOBAL config only, never
+# the project .cleat.
+#
+# That is a correctness rule, not a preference: /workspace/.cleat is a file the
+# caged agent edits as ordinary work, and this repo already treats it that way
+# (_maybe_run_setup re-hashes its payload at exec time for exactly this reason).
+# An allowlist whose escape hatch the attacker writes is not an allowlist. The
+# trust prompt would not save it either: the prompt's subject line names
+# CAPABILITIES, so an added origin is not what the user is reading, and under
+# CLEAT_TRUST_PROJECT=1 it is approved with no prompt at all.
+#
+# Every entry goes through the same parser as the shipped list, so a hand-edited
+# config cannot widen matching in a way a built-in could not.
+_bridge_origins_from_config() {
+  local want="${1:-ok}" e h
+  [[ -r "$CLEAT_GLOBAL_CONFIG" ]] || return 0
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    case "$e" in
+      http://*|https://*) h="$(_bridge_url_host "$e" 2>/dev/null)" || h="" ;;
+      *)                  h="$(_bridge_url_host "https://$e" 2>/dev/null)" || h="" ;;
+    esac
+    if [ -n "$h" ]; then
+      [ "$want" = "ok" ] && printf '%s\n' "$h"
+    else
+      [ "$want" = "bad" ] && printf '%s\n' "$(_sanitize_repo_str "$e")"
+    fi
+  done < <(_read_section_all_from_file "$CLEAT_GLOBAL_CONFIG" browser origin)
+  return 0
+}
+
+# Append one origin to [browser] in the global config, preserving every other
+# section byte for byte. Same preserve-and-rewrite shape as _write_caps_to_file,
+# including its trailing-newline guard: a config whose last section is
+# hand-written and ends without one must not lose its final line.
+_bridge_origin_write() {
+  local host="$1" file="$CLEAT_GLOBAL_CONFIG" preserved="" line _h in_sec=false
+  local existing=""
+  [ -n "$host" ] || return 1
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      _h="${line%$'\r'}"
+      _h="${_h#$'\xef\xbb\xbf'}"
+      _h="${_h#"${_h%%[![:space:]]*}"}"
+      _h="${_h%"${_h##*[![:space:]]}"}"
+      if [[ "$_h" == "[browser]" ]]; then in_sec=true; continue; fi
+      if $in_sec; then
+        if [[ "$_h" == "["*"]" ]]; then in_sec=false; preserved+="$line"$'\n'; continue; fi
+        # Keep the user's other keys in the section verbatim, and keep every
+        # existing origin: this verb ADDS one, it never rewrites the list.
+        case "$_h" in
+          origin=*|origin\ *) existing+="${_h#origin}"$'\n' ;;
+          *) [ -n "$_h" ] && existing+="$_h"$'\n' ;;
+        esac
+        continue
+      fi
+      preserved+="$line"$'\n'
+    done < "$file"
+  fi
+  {
+    [ -n "$preserved" ] && printf '%s' "$preserved"
+    echo "[browser]"
+    local ex
+    while IFS= read -r ex; do
+      ex="${ex#=}"
+      ex="${ex#"${ex%%[![:space:]]*}"}"
+      [ -n "$ex" ] || continue
+      [ "$ex" = "$host" ] && continue
+      echo "origin = $ex"
+    done <<EOF
+$existing
+EOF
+    echo "origin = $host"
+  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
+    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
+    error "Could not write ${file/#${HOME}/~}"
+    return 1
+  }
+  chmod 0600 "$file" 2>/dev/null || true
+  return 0
+}
+
+# The effective list: the shipped defaults FIRST, then the env var. It appends
+# and never replaces. A user who sets the variable to add one origin must not
+# silently lose claude.ai and break their own login, which is the single
+# property this variable stands or falls on.
+_bridge_origins_effective() {
+  local o
+  for o in $_BROWSER_ORIGINS; do
+    [ -n "$o" ] && printf '%s\n' "$o"
+  done
+  _bridge_origins_from_config ok
+  _bridge_origins_from_env ok
+  return 0
+}
+
+# Exact host membership. Not a suffix test: a `*claude.ai` pattern also matches
+# `evilclaude.ai`, and a suffix rule is how an origin allowlist usually fails.
+_bridge_origin_allowed() {
+  local host="$1" entry
+  [ -n "$host" ] || return 1
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    [ "$host" = "$entry" ] && return 0
+  done <<EOF
+$(_bridge_origins_effective)
+EOF
+  return 1
+}
+
+# Loopback, link-local and private space, tested on the authority of the URL
+# that is actually opened. Deliberately NOT on redirect_uri: that is a different
+# field with a different job, _extract_callback_port reads it, and denying it
+# would kill the hands-free login this bridge exists to complete.
+#
+# What this removes is a cookie-bearing authenticated navigation into a host
+# service. It does NOT make host loopback unreachable from the box: every box
+# gets host.docker.internal, and on Docker Desktop that gateway proxies to the
+# host's own loopback. The smaller claim is the honest one.
+_bridge_host_is_local() {
+  case "$1" in
+    localhost|*.localhost) return 0 ;;
+    127.*|0.0.0.0|::1) return 0 ;;
+    169.254.*) return 0 ;;
+    10.*|192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    *.local) return 0 ;;
+  esac
+  return 1
+}
+
+# The whole destination decision for one URL: 0 = the host may open this, 1 = it
+# may not. Pure, so it is exhaustively unit-tested the way _browser_should_open
+# already is.
+_bridge_dest_allowed() {
+  local host
+  host="$(_bridge_url_host "$1" 2>/dev/null)" || return 1
+  [ -n "$host" ] || return 1
+  _bridge_host_is_local "$host" && return 1
+  _bridge_origin_allowed "$host"
+}
+
 # query parameter. Claude Code logs in through two flows: the loopback flow
 # (redirect_uri=http://localhost:PORT/callback, which the callback proxy
 # completes hands-free) and the manual code-paste flow (redirect_uri on
@@ -6048,11 +6408,49 @@ _host_open_cmd() {
 # gh-auth-style flows and any future claude change that opens a non-loopback
 # authorize URL. Only the loopback flow additionally earns a callback proxy;
 # that stays keyed on _extract_callback_port below.
+# The old test was "the string contains redirect_uri=" anywhere, which made
+# https://evil.example/pwn?redirect_uri=x an AUTH url. The auto branch returns
+# on is_auth BEFORE it consults the terminal, so that one substring opened any
+# destination the box named even with a terminal attached. Three things are
+# required now:
+#
+#   1. The origin is on the allowlist. This is the load-bearing one.
+#   2. redirect_uri arrives as a QUERY parameter. In the fragment it is never
+#      sent to the server, so it is not part of an OAuth request. The old glob
+#      matched it there, and _extract_callback_port reads the whole string, so
+#      a fragment-borne value made the host bind a port too.
+#   3. Its value decodes to an absolute http(s) URL whose authority parses.
+#
+# Deliberately NOT "a loopback authority with a canonical port", which is what
+# the brief for this work asked for. That would drop the code-paste login flow,
+# whose redirect_uri points at console.anthropic.com and which regressions.bats
+# pins as auth. Login is the worst regression area in this repo's history, and
+# with requirement 1 in place the remaining surface is a tab to an allowlisted
+# origin. The loopback shape is still required separately by
+# _extract_callback_port, which is what gates the callback proxy.
 _is_auth_url() {
-  case "$1" in
-    *\?redirect_uri=*|*\&redirect_uri=*) return 0 ;;
+  local url="$1" enc dec
+  _bridge_dest_allowed "$url" || return 1
+  # Query only. Cut the fragment off FIRST, then look for the parameter.
+  local q="${url%%#*}"
+  case "$q" in
+    *\?redirect_uri=*|*\&redirect_uri=*) ;;
+    *) return 1 ;;
   esac
-  return 1
+  enc="${q#*redirect_uri=}"
+  enc="${enc%%&*}"
+  [ -n "$enc" ] || return 1
+  [ "${#enc}" -le 2048 ] || return 1
+  dec="$(printf '%b' "${enc//%/\\x}" 2>/dev/null)" || return 1
+  # An absolute http(s) callback whose authority parses. _bridge_url_host
+  # rejects an IPv6 literal and userinfo, so a redirect_uri of
+  # https://claude.ai@evil.example/ does not make the outer URL auth either.
+  case "$dec" in
+    http://*|https://*) ;;
+    *) return 1 ;;
+  esac
+  _bridge_url_host "$dec" >/dev/null 2>&1 || return 1
+  return 0
 }
 
 # Extracts the localhost port from a redirect_uri in an OAuth URL.
@@ -6120,10 +6518,38 @@ _extract_callback_port() {
 # TCP proxy: forwards one connection from host:PORT to container:PORT.
 # Enables OAuth callbacks to reach Claude Code's HTTP server inside Docker.
 # Uses socat on host if available, falls back to python3.
+# The exact token a refusal line carries. The foreground reads it back out of
+# the proxy log after the session, so it is a constant rather than prose: the
+# writer and the reader must never drift, and neither may a translation of the
+# surrounding sentence.
+_BROWSER_BLOCKED_MARK="BLOCKED-ORIGIN"
+
+# Is something already listening on this host loopback port? A bounded connect,
+# because the point is to decide in the foreground of the watcher loop and a
+# hang there is invisible (the watcher's fds go to a log). Returns 0 when the
+# port ANSWERS, which means a host service holds it.
+#
+# This is the half of "bind before opening" that carries the security property:
+# without it the box names a port an unrelated host service is on, the proxy
+# fails to bind, and the browser opens anyway, pointed at that service with the
+# host's cookies. bash's /dev/tcp is a builtin and present on bash 3.2.
+_port_in_use() {
+  local port="$1" _to=""
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  command -v timeout >/dev/null 2>&1 && _to="timeout 2"
+  $_to bash -c "exec 9<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null || return 1
+  return 0
+}
+
 _auth_callback_proxy() {
   local port="$1"
   local cname="$2"
   local log_file="${3:-}"
+  # Touched once the listener is actually up. The watcher waits for it rather
+  # than sleeping a fixed 0.5s and hoping, and opens NOTHING if it never
+  # appears. A backgrounded socat's bind success is not observable by the
+  # parent shell, so this file is the readiness channel.
+  local ready_file="${4:-}"
 
   _proxy_log() { [ -n "$log_file" ] && echo "[proxy $(date +%H:%M:%S)] $*" >> "$log_file"; }
 
@@ -6160,10 +6586,25 @@ _auth_callback_proxy() {
       # `TCP6` and dropped the whole IPv4 fallback. Every one of them is
       # escaped. Both interpolations are safe: the port is digits only
       # (_extract_callback_port) and the container name is cleat-generated.
-      socat "TCP-LISTEN:${port},bind=127.0.0.1,reuseaddr" \
+      # Bounded like the python backend's srv.settimeout(300). socat has no
+      # timeout of its own, so without this the port the BOX named stays bound
+      # until a connection arrives or teardown runs, and the two backends
+      # disagree about how long that is. `timeout` is absent on a stock macOS,
+      # where the wait stays unbounded exactly as it always was.
+      local _acp_to=""
+      command -v timeout >/dev/null 2>&1 && _acp_to="timeout 300"
+      $_acp_to socat "TCP-LISTEN:${port},bind=127.0.0.1,reuseaddr" \
         "SYSTEM:docker exec -i ${cname} socat -\\,ignoreeof TCP6\\:localhost\\:${port} 2>/dev/null || docker exec -i ${cname} socat -\\,ignoreeof TCP\\:localhost\\:${port}" \
         2>>"${log_file:-/dev/null}" &
       _acp_child=$!
+      # socat exits within milliseconds on EADDRINUSE, so a child still alive
+      # after a short settle has bound. Not a probe: a connect would CONSUME the
+      # single connection TCP-LISTEN accepts without `fork`, which is the one
+      # connection the login needs.
+      if [ -n "$ready_file" ]; then
+        sleep 0.3
+        kill -0 "$_acp_child" 2>/dev/null && : > "$ready_file" 2>/dev/null || true
+      fi
       wait "$_acp_child" && socat_rc=0 || socat_rc=$?
       _acp_child=""
       [[ $socat_rc -eq 1 ]] || break
@@ -6178,9 +6619,10 @@ _auth_callback_proxy() {
   if command -v python3 &>/dev/null; then
     _proxy_log "using python3 fallback"
     local py_rc=0
-    python3 - "$port" "$cname" "$log_file" <<'PYEOF' &
+    python3 - "$port" "$cname" "$log_file" "$ready_file" <<'PYEOF' &
 import socket, subprocess, sys, signal, os, time
 log_file = sys.argv[3] if len(sys.argv) > 3 else None
+ready_file = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
 def _log(msg):
     if log_file:
         try:
@@ -6224,6 +6666,12 @@ for bind_attempt in range(30):
 if not bound:
     _log(f"bind failed after 30 attempts, giving up")
     sys.exit(0)
+# Readiness, on a real bind and nowhere else. The watcher opens no browser
+# until this exists, so a failed bind can never fall through to an open.
+if ready_file:
+    try:
+        with open(ready_file, 'w') as f: f.write('1')
+    except Exception: pass
 _log(f"listening on 127.0.0.1:{port}")
 srv.listen(1)
 srv.settimeout(300)
@@ -6334,7 +6782,11 @@ _browser_claim_url() {
     rm -f "$claim" 2>/dev/null || true
     return 1
   fi
-  cat "$claim" 2>/dev/null || true
+  # Bounded. The box picks the file's size, and an unbounded `cat` here put the
+  # whole thing in a shell variable and then on an `echo` into the log. The cap
+  # is well above the 2048 _bridge_url_host accepts, so nothing that could ever
+  # be opened is cut.
+  head -c 8192 "$claim" 2>/dev/null || true
   rm -f "$claim" 2>/dev/null || true
   return 0
 }
@@ -6431,16 +6883,30 @@ _browser_bridge_mode() {
 # so it is exhaustively unit-tested. Returns 0 to OPEN, 1 to DEFER.
 # Args: $1 mode (auto|always|off), $2 host_opens_clicks (1 when an interactive
 # host terminal is attached and will open the link itself), $3 is_auth (1 when
-# the URL carries a localhost OAuth callback the user does not click).
+# the URL is an OAuth authorize URL at an allowlisted origin), $4 dest_allowed
+# (1 when the URL's own origin is on the allowlist).
+#
+# Two changes from the pre-gate behaviour, both deliberate:
+#
+# The auto branch now requires the destination. Nothing else in the function
+# can substitute for it: is_auth used to return early, so an attached terminal
+# was irrelevant to a URL carrying the literal text `redirect_uri=`.
+#
+# A plain link with NO terminal now defers instead of opening. That window is
+# `cleat login` (which passes host_opens_clicks=0 unconditionally), a pipe,
+# cron, CI and nohup, which is the unattended overnight run this product exists
+# for. With nobody watching the browser, opening a plain link the box chose has
+# no user value and is exactly the exfiltration primitive. `always` keeps the
+# old behaviour in one line for anyone who wants it.
 _browser_should_open() {
-  local mode="$1" host_opens_clicks="${2:-0}" is_auth="${3:-0}"
+  local mode="$1" host_opens_clicks="${2:-0}" is_auth="${3:-0}" dest_ok="${4:-0}"
   case "$mode" in
-    always) return 0 ;;
+    always) return 0 ;;   # a documented full bypass: any origin the box picks
     off)    return 1 ;;
     *)  # auto
+        [ "$dest_ok" = 1 ] || return 1            # not on the list: never open
         [ "$is_auth" = 1 ] && return 0            # auth URL: the bridge owns it
-        [ "$host_opens_clicks" = 1 ] && return 1  # plain link, terminal owns it
-        return 0 ;;                               # plain link, no terminal: open
+        return 1 ;;                               # plain link: the terminal, or nobody
   esac
 }
 
@@ -6495,6 +6961,8 @@ _browser_watcher() {
       wait "$_proxy_pid" 2>/dev/null || true
       _proxy_pid=""
     fi
+    [ -n "${_bw_ready:-}" ] && rm -f "$_bw_ready" 2>/dev/null
+    return 0
   }
   trap '_bw_cleanup; exit 0' TERM INT HUP
 
@@ -6511,6 +6979,10 @@ _browser_watcher() {
   local _bw_claim_dir
   _bw_claim_dir="$(dirname "$clip_dir")/clipclaim"
   mkdir -p "$_bw_claim_dir" 2>/dev/null || _bw_claim_dir="$clip_dir"
+  # Readiness marker for the callback proxy. Outside the bind mount, beside the
+  # claim dir and for the same reason: inside it the box could touch the file
+  # and make the watcher believe a listener exists that does not.
+  local _bw_ready="$_bw_claim_dir/.proxy-ready.$$"
   _browser_sweep_stale_markers "$clip_dir"
   while true; do
     # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
@@ -6534,7 +7006,9 @@ _browser_watcher() {
         url=""   # duplicate of a just-opened URL; drop it
       fi
       if [[ "$url" == http://* ]] || [[ "$url" == https://* ]]; then
-        local _is_auth=0 cb_port
+        # _bind_failed: the callback port could not be held, so the browser must
+        # not be pointed at it. Reset per claim, never carried between URLs.
+        local _is_auth=0 cb_port _bind_failed=0
         # The URL is written by the CAGED side and echoed into the log below.
         # An embedded newline let it forge whole log lines, which with a
         # planted symlink meant arbitrary lines in a host file. Strip every
@@ -6548,27 +7022,66 @@ _browser_watcher() {
         # and every append below follows one. This runs only when a URL was
         # actually claimed, so it costs nothing on an idle poll.
         _drop_unless_regular "$clip_dir/.proxy-log"
-        # Auth is ANY OAuth authorization URL, not just loopback ones: the
-        # code-paste login flow has no localhost callback but must still open
-        # (see _is_auth_url). The proxy below stays loopback-only.
-        _is_auth_url "$url" && _is_auth=1
+        # Both decisions are taken on $_clean_url, the exact bytes handed to
+        # $open_cmd below, and never on $url. Stripping control characters can
+        # REWRITE an authority: https://claude.ai<CR>.evil.example/ parses as
+        # the host `claude.ai` before the strip and as `claude.ai.evil.example`
+        # after it, so a policy that reads $url and an opener that reads
+        # $_clean_url disagree about where the browser is going.
+        local _dest_ok=0 _dest_host=""
+        _dest_host="$(_bridge_url_host "$_clean_url" 2>/dev/null)" || _dest_host=""
+        if _bridge_dest_allowed "$_clean_url"; then _dest_ok=1; fi
+        # Auth is an OAuth authorize URL at an ALLOWLISTED origin, not any
+        # string carrying redirect_uri. The code-paste login flow has no
+        # localhost callback and must still open (see _is_auth_url). The proxy
+        # below stays loopback-only on top of that.
+        _is_auth_url "$_clean_url" && _is_auth=1
         # Start auth callback proxy if URL has a localhost redirect_uri. This
         # runs in every mode (off included): the proxy forwards the OAuth
         # callback into the box, so `cleat login` completes even when the user
         # opens the URL by hand.
-        # Gated on _is_auth as well as cname: a URL the policy DEFERS to the
-        # terminal must not still make the host bind a port the box named, with
-        # no tab and nothing on screen to explain it. Every real OAuth
-        # authorize URL carries redirect_uri as a query parameter, which is
-        # exactly what _is_auth_url matches.
-        if [ -n "$cname" ] && [ "$_is_auth" = 1 ]; then
+        # Gated on the DESTINATION as well as on cname and _is_auth. Before the
+        # gate this ran in every mode, off included, so `CLEAT_BROWSER_BRIDGE=off`
+        # did not stop the box making the host bind a loopback port and forward
+        # into the container. That is the only mechanism in Cleat that makes the
+        # host bind a box-chosen port, and it contradicted the published
+        # no-published-ports claim. It costs nothing to gate: every real
+        # authorize URL is on an allowlisted origin. Still runs in `off` mode
+        # for an allowlisted origin, so `cleat login` completes when the user
+        # opens the URL by hand.
+        if [ -n "$cname" ] && [ "$_is_auth" = 1 ] && [ "$_dest_ok" = 1 ]; then
           local proxy_log="$clip_dir/.proxy-log"
-          cb_port=$(_extract_callback_port "$url" 2>/dev/null) && {
+          # The port comes from _clean_url too: the opener and the forwarder
+          # must agree about which URL they are serving.
+          cb_port=$(_extract_callback_port "$_clean_url" 2>/dev/null) && {
             _bw_cleanup  # kill any previous proxy
-            echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
-            _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" &
-            _proxy_pid=$!
-            sleep 0.5  # let proxy bind before opening browser
+            if _port_in_use "$cb_port"; then
+              # A host service already holds it. Binding is impossible, and
+              # opening the browser now would aim it at THAT service with the
+              # host's cookies, for a port the box chose. Refuse both.
+              echo "[browser-watcher $(date +%H:%M:%S)] callback port=$cb_port already in use on the host, not opening" >> "$proxy_log"
+              _bind_failed=1
+            else
+              echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
+              rm -f "$_bw_ready" 2>/dev/null || true
+              _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" "$_bw_ready" &
+              _proxy_pid=$!
+              # Wait for the LISTENER, never a fixed sleep. A backgrounded
+              # socat's bind is not observable by the parent shell, so the
+              # backend touches a file and this loop watches for it. Bounded at
+              # 4s: the watcher's fds go to a log, so a hang here is invisible.
+              local _bw_w=0
+              while [ "$_bw_w" -lt 20 ]; do
+                [ -f "$_bw_ready" ] && break
+                kill -0 "$_proxy_pid" 2>/dev/null || break
+                sleep 0.1
+                _bw_w=$(( _bw_w + 1 ))
+              done
+              if [ ! -f "$_bw_ready" ]; then
+                echo "[browser-watcher $(date +%H:%M:%S)] callback proxy never bound port=$cb_port, not opening" >> "$proxy_log"
+                _bind_failed=1
+              fi
+            fi
           } || {
             echo "[browser-watcher $(date +%H:%M:%S)] no redirect_uri port found in URL" >> "$clip_dir/.proxy-log"
           }
@@ -6586,16 +7099,125 @@ _browser_watcher() {
         # $BROWSER (never the terminal), so without the URL here an off-mode
         # loopback login would be unrecoverable by hand. Same trust domain as
         # the bridge file (the box's own run dir), so no new exposure.
-        if _browser_should_open "$bridge_mode" "$host_opens_clicks" "$_is_auth"; then
-          echo "[browser-watcher $(date +%H:%M:%S)] opening URL on host (mode=$bridge_mode auth=$_is_auth) url=$_clean_url" >> "$clip_dir/.proxy-log"
+        if [ "$_bind_failed" = 1 ]; then
+          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (callback port unavailable) url=$_clean_url" >> "$clip_dir/.proxy-log"
+        elif _browser_should_open "$bridge_mode" "$host_opens_clicks" "$_is_auth" "$_dest_ok"; then
+          echo "[browser-watcher $(date +%H:%M:%S)] opening URL on host (mode=$bridge_mode auth=$_is_auth dest=$_dest_ok) url=$_clean_url" >> "$clip_dir/.proxy-log"
           $open_cmd "$_clean_url" >/dev/null 2>&1 || true
+        elif [ "$_dest_ok" != 1 ] && [ "$bridge_mode" != "off" ]; then
+          # A REFUSED destination, not a deferral, and it gets its own marker so
+          # the foreground can find it after the exec returns. A denial that
+          # exists only in a log inside the box's own clip dir reproduces the
+          # silent-deferral regression that concept/33 blames for being
+          # undiagnosable from the field, and the box can rewrite that log.
+          # _BROWSER_BLOCKED_MARK is what the host-side reader greps for.
+          echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_BLOCKED_MARK} origin=${_dest_host:-unparsed} url=$_clean_url" >> "$clip_dir/.proxy-log"
         else
-          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (mode=$bridge_mode interactive=$host_opens_clicks auth=$_is_auth) url=$_clean_url" >> "$clip_dir/.proxy-log"
+          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (mode=$bridge_mode interactive=$host_opens_clicks auth=$_is_auth dest=$_dest_ok) url=$_clean_url" >> "$clip_dir/.proxy-log"
         fi
       fi
     fi
     sleep 0.5
   done
+}
+
+# `cleat browser`: see and extend the destination allowlist.
+#
+# With the list shipped rather than configured, a user has no other way to
+# answer "what does my sandbox trust", and "read the source" is not an answer
+# for a security feature. This verb is the whole audit story, and `allow` is the
+# single copy-pasteable line the blocked notice prints.
+cmd_browser() {
+  local sub="${1:-origins}"
+  case "$sub" in
+    --help|-h|help)
+      echo "Usage: cleat browser origins        Print the origins the bridge may open"
+      echo "       cleat browser allow <origin> Add one origin, for every box"
+      echo ""
+      echo "  The box can ask your host to open a URL, which is how a login inside"
+      echo "  a box reaches your browser. Cleat opens it only when the origin is on"
+      echo "  this list. Anything else is refused and printed for you to open by hand."
+      return 0 ;;
+    origins|list|ls) shift 2>/dev/null || true; _browser_origins_print; return 0 ;;
+    allow) ;;
+    *)
+      error "Unknown subcommand: ${BOLD}${sub}${RESET}"
+      echo -e "    ${DIM}cleat browser takes ${BOLD}origins${RESET}${DIM} and ${BOLD}allow <origin>${RESET}${DIM}.${RESET}"
+      return 1 ;;
+  esac
+  shift
+  local want="${1:-}"
+  if [[ -z "$want" ]]; then
+    error "Which origin? ${DIM}cleat browser allow <host>${RESET}"
+    echo -e "    ${DIM}Cleat prints the exact host when it refuses one.${RESET}"
+    return 1
+  fi
+  local host
+  case "$want" in
+    http://*|https://*) host="$(_bridge_url_host "$want" 2>/dev/null)" || host="" ;;
+    *)                  host="$(_bridge_url_host "https://$want" 2>/dev/null)" || host="" ;;
+  esac
+  if [[ -z "$host" ]]; then
+    error "Not a host Cleat can match: ${BOLD}$(_sanitize_repo_str "$want")${RESET}"
+    echo -e "    ${DIM}An origin is a bare hostname such as ${BOLD}auth.example.com${RESET}${DIM}, letters, digits, dots and dashes.${RESET}"
+    return 1
+  fi
+  if _bridge_host_is_local "$host"; then
+    error "${BOLD}${host}${RESET} is a loopback or private address."
+    echo -e "    ${DIM}Cleat never opens one: it would be an authenticated navigation into a service on your own machine, at an address the box chose.${RESET}"
+    return 1
+  fi
+  if _bridge_origin_allowed "$host"; then
+    info "${BOLD}${host}${RESET} is already allowed."
+    return 0
+  fi
+  _bridge_origin_write "$host" || return 1
+  success "Allowed ${BOLD}${host}${RESET} ${DIM}(every box, from the next URL on)${RESET}"
+  echo -e "    ${DIM}Stored in ${CLEAT_GLOBAL_CONFIG/#${HOME}/~}. Remove it by deleting the line.${RESET}"
+  return 0
+}
+
+_browser_origins_print() {
+  local o mode bad
+  mode="$(_browser_bridge_mode)"
+  echo ""
+  echo -e "  ${BOLD}Browser origins${RESET} ${DIM}(mode ${mode})${RESET}"
+  if [[ "$mode" == "always" ]]; then
+    echo -e "  ${DIM}CLEAT_BROWSER_BRIDGE=always is set, so the list is not consulted:${RESET}"
+    echo -e "  ${DIM}every origin the box picks is opened.${RESET}"
+  elif [[ "$mode" == "off" ]]; then
+    echo -e "  ${DIM}CLEAT_BROWSER_BRIDGE=off is set, so no URL is opened at all.${RESET}"
+  fi
+  echo ""
+  echo -e "  ${DIM}shipped with cleat${RESET}"
+  for o in $_BROWSER_ORIGINS; do
+    [ -n "$o" ] && echo "    $o"
+  done
+  local _cfg _env
+  _cfg="$(_bridge_origins_from_config ok)"
+  if [[ -n "$_cfg" ]]; then
+    echo ""
+    echo -e "  ${DIM}added with cleat browser allow${RESET}"
+    printf '%s\n' "$_cfg" | while IFS= read -r o; do [ -n "$o" ] && echo "    $o"; done
+  fi
+  _env="$(_bridge_origins_from_env ok)"
+  if [[ -n "$_env" ]]; then
+    echo ""
+    echo -e "  ${DIM}from CLEAT_BROWSER_ORIGINS${RESET}"
+    printf '%s\n' "$_env" | while IFS= read -r o; do [ -n "$o" ] && echo "    $o"; done
+  fi
+  # A dropped entry is the failure a user cannot see any other way: it reads as
+  # "I allowed it and it still does not work".
+  bad="$(_bridge_origins_from_env bad; _bridge_origins_from_config bad)"
+  if [[ -n "$bad" ]]; then
+    echo ""
+    warn "Ignored, not a host Cleat can match:"
+    printf '%s\n' "$bad" | while IFS= read -r o; do [ -n "$o" ] && echo -e "    ${DIM}${o}${RESET}"; done
+  fi
+  echo ""
+  echo -e "  ${DIM}Add one with ${BOLD}cleat browser allow <host>${RESET}${DIM}. The list can never be complete:${RESET}"
+  echo -e "  ${DIM}an MCP server, an AWS access portal or a self-hosted host is yours, not Cleat's.${RESET}"
+  return 0
 }
 
 # ── Host-side hook bridge ─────────────────────────────────────────────────
@@ -6608,6 +7230,10 @@ _HOOK_BRIDGE_CHILDREN=()
 # so its line count is attacker-influenced; this is what stops it becoming a
 # host process count. Every event still runs, just not all in one instant.
 _HOOK_BRIDGE_MAX_CONCURRENT=8
+# The token a dropped-event line carries, read back by the foreground after the
+# session. A constant for the same reason _BROWSER_BLOCKED_MARK is: the writer
+# and the reader must not drift, and neither may a rewording of the sentence.
+_HOOK_DROP_MARK="DROPPED-EVENT"
 
 # The scoped-writer channels. Declared here so an ambient value inherited from
 # the caller's ENVIRONMENT can never redirect which section a write lands in:
@@ -6616,28 +7242,58 @@ _WRITE_SECTION=""
 _WRITE_RES_SECTION=""
 _WRITE_EMPTY_SECTION=0
 
-_has_host_hooks() {
+# The ONE file a hook command may come from. Host-side, outside every mount.
+#
+# The bridge used to re-read the command from all three settings files on every
+# event, and two of them live inside the read-write /workspace mount. That is
+# not a theoretical path: event one ran the user's own hook, the box rewrote the
+# file the way a box writes through /workspace, and event two executed the
+# rewritten command on the HOST. The comment on _execute_host_hooks states the
+# intent this broke in its own words: enabling the capability is a decision to
+# run YOUR hooks on your machine, not a decision to let the box choose the
+# command.
+#
+# Split by ORIGIN rather than gated by consent, and that is the decisive
+# argument: settings.local.json is a file Claude Code itself WRITES during
+# ordinary operation, so a trust hash over it would change as a routine
+# consequence of the agent doing its job. A prompt that fires whenever a build
+# finishes is a prompt the user learns to accept, and the attacker chooses when
+# it fires. No amount of consent makes a box-authored host command safe, so the
+# project files are default-deny with no prompt at all.
+_HOOK_HOST_SETTINGS="${HOME}/.claude/settings.json"
+
+# Project-level settings files that DEFINE hooks which will not run on the host.
+# Printed once at session start so the change is visible rather than silent.
+_hook_project_files_with_hooks() {
   local f
-  for f in "${HOME}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.local.json"; do
-    if [[ -s "$f" ]] && jq -e '.hooks // empty | length > 0' "$f" >/dev/null 2>&1; then
-      return 0
-    fi
+  for f in "${_RESOLVED_PROJECT:-.}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.local.json"; do
+    [[ -s "$f" ]] || continue
+    jq -e '.hooks // empty | length > 0' "$f" >/dev/null 2>&1 || continue
+    printf '%s\n' "$f"
   done
-  return 1
+  return 0
+}
+
+_has_host_hooks() {
+  [[ -s "$_HOOK_HOST_SETTINGS" ]] || return 1
+  jq -e '.hooks // empty | length > 0' "$_HOOK_HOST_SETTINGS" >/dev/null 2>&1
 }
 
 _hook_bridge_watcher() {
   local hooks_file="$1"
+  # The WORKSPACE, for path translation. For a plain box it is the project; for
+  # a fork box it is the copy, and that distinction is the whole point (see
+  # _hook_translate_path). Defaulted so a two-argument caller still works.
+  local _hb_ws="${2:-${_RESOLVED_PROJECT:-}}"
   # Orphan guard, as in _browser_watcher: a bridge whose cleat process died
   # without the cleanup trap must not keep executing host hooks for a dead
   # session. $$ is the spawning cleat process even in this backgrounded call.
   local _hb_parent=$$
-  # Collect all settings files that define hooks (global + project)
+  # ONE settings file, and it is the host's. See _HOOK_HOST_SETTINGS: the two
+  # project files sit inside the read-write /workspace mount, so a command read
+  # from either is a command the box can write.
   local settings_files=()
-  local f
-  for f in "${HOME}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.json" "${_RESOLVED_PROJECT:-.}/.claude/settings.local.json"; do
-    [[ -s "$f" ]] && settings_files+=("$f")
-  done
+  [[ -s "$_HOOK_HOST_SETTINGS" ]] && settings_files+=("$_HOOK_HOST_SETTINGS")
   # On exit: kill all child hook processes
   trap '_hook_bridge_cleanup; exit 0' TERM INT HUP
   trap '_hook_bridge_cleanup' EXIT
@@ -6690,7 +7346,14 @@ _hook_bridge_watcher() {
 
       while IFS= read -r line; do
         [[ -n "$line" ]] || continue
-        _execute_host_hook_bg "$line" "${settings_files[@]}"
+        # Validate and translate BEFORE anything is dispatched. A failure drops
+        # the event and records it: the default is refuse, not sanitise.
+        local _ev_out=""
+        if ! _ev_out="$(_hook_translate_event "$line" "$_hb_ws" 2>/dev/null)"; then
+          _hook_drop_log "payload" "$line"
+          continue
+        fi
+        _execute_host_hook_bg "$_ev_out" "${settings_files[@]}"
       done < <(tail -c +"$_start" "$hooks_file" 2>/dev/null | head -c "$_count")
 
       byte_offset=$file_size
@@ -6804,6 +7467,195 @@ _hook_bridge_live_count() {
   printf '%s' "$n"
 }
 
+# ── Payload validation ──────────────────────────────────────────────────────
+#
+# The event JSON a host hook receives on stdin is written by the CAGED side, so
+# every field in it is attacker-chosen. Claude Code 2.1.258 already solves this
+# exact problem for its own cloud and container sessions, and its posture is
+# stronger than Cleat's was, so this adopts the vendor's six properties rather
+# than inventing a scheme. Being able to say "the same posture Claude Code
+# itself takes for container sessions" is worth as much as the code.
+#
+#   1. The two transcript fields are REPLACED with a sentinel, never validated.
+#   2. cwd and every table-known path field is translated to its host path and
+#      required to be inside the workspace.
+#   3. Per-segment rejects: empty, `.`, `..`, control characters, backslash.
+#   4. Whole-value rejects: leading or trailing whitespace, a `~` prefix, or a
+#      `$ % ` ! =` prefix.
+#   5. The default is REFUSE, not sanitise. An event naming a path this machine
+#      could not map to its own files does not run.
+#   6. The event name is bounded and charset-checked.
+
+# Claude Code's own per-line cap for the same channel. Cleat had no size cap
+# anywhere in the bridge, and the spool is box-written, so the length of one
+# event was the box's to choose.
+_HOOK_LINE_MAX=1044480
+
+# What the transcript fields become. Property 1: they name CONTAINER paths that
+# do not exist on the host, so no legitimate host hook can be using them, and
+# validating them is the trap in C1 below.
+_HOOK_TRANSCRIPT_SENTINEL="/cleat/transcript-is-inside-the-box"
+
+# Per-event timeouts, Claude Code's own values rather than Cleat's flat 30s. A
+# Stop hook that formats a large repo legitimately takes minutes, and a
+# PreToolUse hook that takes 30 seconds has already wedged the turn.
+_hook_timeout_for() {
+  case "$1" in
+    PreToolUse|PostToolUse) printf '15' ;;
+    UserPromptSubmit)       printf '30' ;;
+    Stop|SubagentStop)      printf '120' ;;
+    *)                      printf '30' ;;
+  esac
+}
+
+# A charset and a length, deliberately NOT a roster. concept/11 lists 25 event
+# names and Claude Code 2.1.258 ships 33, so the repo's own list is already
+# stale by eight, and a hardcoded one means the next Claude Code release
+# silently stops running the user's hook for a new event. The name is handed to
+# jq as --arg and indexed `.hooks[$ev]`, so an unknown name can only ever fail
+# to match a key the user wrote, which is the effective behaviour today.
+_hook_event_name_ok() {
+  local n="$1"
+  [ -n "$n" ] || return 1
+  [ "${#n}" -le 64 ] || return 1
+  case "$n" in *[!A-Za-z0-9_-]*) return 1 ;; esac
+  return 0
+}
+
+# Translate one container path to the host path that names the same file, or
+# fail. Failing is what drops the event.
+#
+# The target is $ws, the WORKSPACE, and never $_RESOLVED_PROJECT. In a fork box
+# those differ, and translating to the project would point the user's host hook
+# at the ORIGIN working tree from inside a fork box, cancelling exactly the
+# isolation the fork feature sells.
+#
+# Deliberately a PREFIX rewrite and never a canonicalisation. The obvious design
+# is `cd -P "$(dirname "$p")" && pwd -P` on both sides, and it carries three
+# macOS-first failures that would not reproduce on the Linux box this was
+# written on: resolve_project is logical rather than physical, so a project
+# reached through a symlink (~/Code on an external volume, iCloud, Dropbox,
+# /tmp on macOS) fails every comparison and every hook drops; APFS is
+# case-insensitive, so two spellings of one real directory compare unequal; and
+# the canonicaliser needs the parent to EXIST, so a PreToolUse for a file in a
+# directory the agent is about to create resolves to nothing and a formatter
+# silently stops firing for exactly the new-file case. A literal prefix has none
+# of them, and the prefix is a string Cleat itself computed.
+_hook_translate_path() {
+  local p="$1" ws="$2" rest
+  [ -n "$p" ] || return 1
+  [ -n "$ws" ] || return 1
+  [ "${#p}" -le 4096 ] || return 1
+  # Whole-value rejects (property 4). Upstream also refuses a `~`, `$`, `%`,
+  # backtick, `!` or `=` PREFIX. Those are not repeated here, and deliberately:
+  # this function requires the value to start with `/workspace` or with the
+  # workspace path, so a value beginning with any of them is already refused by
+  # the fall-through at the end. Restating them would be a guard another guard
+  # covers, which cannot be mutation-tested and is therefore indistinguishable
+  # from a guard that does nothing. Leading and trailing whitespace IS reachable
+  # (`/workspace/a ` has the right prefix) so it gets its own arm.
+  case "$p" in
+    [[:space:]]*|*[[:space:]]) return 1 ;;
+  esac
+  # Per-segment rejects (property 3). An empty segment, a dot segment, a
+  # backslash. Control characters are covered by the space class above for
+  # leading and trailing, and by the explicit test below anywhere.
+  case "$p" in
+    *//*|*/./*|*/../*|*/.|*/..|.|..) return 1 ;;
+    *\\*) return 1 ;;
+  esac
+  case "$p" in *[[:cntrl:]]*) return 1 ;; esac
+  # With the docker cap on, 8412 mounts "$_workspace:$_workspace" and sets
+  # --workdir to it, so events from such a box already carry host-absolute
+  # paths. Both shapes have to be accepted or the cap breaks every hook.
+  case "$p" in
+    /workspace)   printf '%s' "$ws"; return 0 ;;
+    /workspace/*) rest="${p#/workspace/}"; printf '%s/%s' "$ws" "$rest"; return 0 ;;
+  esac
+  if [ "$p" = "$ws" ]; then printf '%s' "$ws"; return 0; fi
+  case "$p" in
+    "$ws"/*) printf '%s' "$p"; return 0 ;;
+  esac
+  return 1
+}
+
+# Rewrite one spool line into the event a host hook receives, or fail, in which
+# case the event is DROPPED and counted. Property 5: the default is refuse.
+_hook_translate_event() {
+  local line="$1" ws="$2"
+  local ev cwd fp np rp t_cwd="" t_fp="" t_np="" t_rp="" out
+  command -v jq >/dev/null 2>&1 || return 1
+  [ "${#line}" -le "$_HOOK_LINE_MAX" ] || return 1
+  ev="$(printf '%s' "$line" | jq -r '.hook_event_name // empty' 2>/dev/null)" || return 1
+  _hook_event_name_ok "$ev" || return 1
+
+  cwd="$(printf '%s' "$line" | jq -r '.cwd // empty' 2>/dev/null || true)"
+  if [ -n "$cwd" ]; then
+    t_cwd="$(_hook_translate_path "$cwd" "$ws")" || return 1
+  fi
+  fp="$(printf '%s' "$line" | jq -r '.tool_input.file_path // empty' 2>/dev/null || true)"
+  if [ -n "$fp" ]; then
+    t_fp="$(_hook_translate_path "$fp" "$ws")" || return 1
+  fi
+  np="$(printf '%s' "$line" | jq -r '.tool_input.notebook_path // empty' 2>/dev/null || true)"
+  if [ -n "$np" ]; then
+    t_np="$(_hook_translate_path "$np" "$ws")" || return 1
+  fi
+  rp="$(printf '%s' "$line" | jq -r '.tool_response.filePath // empty' 2>/dev/null || true)"
+  if [ -n "$rp" ]; then
+    t_rp="$(_hook_translate_path "$rp" "$ws")" || return 1
+  fi
+
+  # transcript_path is a REQUIRED field on every event, and in a Cleat box it
+  # lives under /home/coder/.claude/projects/-workspace/, which is never inside
+  # /workspace. A naive "every path must resolve inside the project" rule
+  # therefore fails EVERY event and no user hook ever runs again: the capability
+  # becomes a no-op with a counter. That is why property 1 is a sentinel.
+  out="$(printf '%s' "$line" | jq -c \
+      --arg cwd "$t_cwd" --arg fp "$t_fp" --arg np "$t_np" --arg rp "$t_rp" \
+      --arg sent "$_HOOK_TRANSCRIPT_SENTINEL" '
+        (if has("transcript_path") then .transcript_path = $sent else . end)
+      | (if has("agent_transcript_path") then .agent_transcript_path = $sent else . end)
+      | (if ($cwd|length) > 0 then .cwd = $cwd else . end)
+      | (if ($fp|length) > 0 then .tool_input.file_path = $fp else . end)
+      | (if ($np|length) > 0 then .tool_input.notebook_path = $np else . end)
+      | (if ($rp|length) > 0 then .tool_response.filePath = $rp else . end)
+      ' 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+  return 0
+}
+
+# Record a dropped event where the box cannot reach it and a teardown cannot
+# delete it. NOT the clip dir (box-writable) and NOT the per-box run dir, which
+# every cleat rm, recreate and nuke removes, and which the box can INDUCE the
+# removal of: [resources] in a project .cleat is read with no trust gate, feeds
+# the config fingerprint, and the resulting recreate prompt defaults to yes.
+#
+# Graded as telemetry, not as a boundary. It reduces attacker capability by
+# zero. It is worth shipping because it turns "I think the agent did something
+# to my Mac" into a diffable artifact.
+_hook_drop_log() {
+  local reason="$1" line="$2" f
+  mkdir -p "$CLEAT_STATE_DIR" 2>/dev/null || return 0
+  f="$CLEAT_STATE_DIR/hook-drops.log"
+  [ -L "$f" ] && return 0
+  # Everything from the line is box-authored, so it is collapsed to one line and
+  # then sanitized before it is written, per concept/41 rule 2. Two steps on two
+  # lines rather than one nested expansion: the collapse stops a forged payload
+  # writing its own extra log rows, the sanitize strips the control bytes, and
+  # each is separately mutable.
+  local _safe
+  _safe="$(printf '%s' "${line:0:200}" | tr '\n\r\t' '   ')"
+  _safe="$(_sanitize_repo_str "$_safe")"
+  printf '%s\t%s\t%s\t%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" \
+    "$_HOOK_DROP_MARK" \
+    "$(_sanitize_repo_str "$reason")" \
+    "$_safe" >> "$f" 2>/dev/null || true
+  return 0
+}
+
 _execute_host_hooks() {
   local event_json="$1"
   shift
@@ -6840,11 +7692,21 @@ _execute_host_hooks() {
     while IFS= read -r entry; do
       [[ -n "$entry" ]] || continue
 
-      # Check matcher (regex against tool_name for tool events)
+      # Check matcher (regex against tool_name for tool events).
+      #
+      # `echo "$tool_name" | grep -qE` matches per LINE, so a tool_name of
+      # "Write\nBash" satisfied an ANCHORED matcher of ^Bash$ while every other
+      # field of the payload described a Write. Anchoring was therefore not a
+      # constraint at all, which is not recorded in concept/11 and should be.
+      # A tool name is one token: reject a multi-line one outright and match the
+      # single line, so an anchor means what the user wrote.
       local matcher
       matcher="$(echo "$entry" | jq -r '.matcher // empty' 2>/dev/null)" || true
       if [[ -n "$matcher" && -n "$tool_name" ]]; then
-        echo "$tool_name" | grep -qE "$matcher" 2>/dev/null || continue
+        case "$tool_name" in
+          *$'\n'*|*$'\r'*) continue ;;
+        esac
+        printf '%s' "$tool_name" | grep -qE "$matcher" 2>/dev/null || continue
       fi
 
       # Execute each command hook in the entry
@@ -6854,10 +7716,15 @@ _execute_host_hooks() {
         cmd="$(echo "$hook" | jq -r '.command // empty' 2>/dev/null)" || continue
         [[ -n "$cmd" ]] || continue
 
-        # Execute on the host with event JSON on stdin.
-        # Timeout after 30s to prevent hung hooks from blocking the bridge.
+        # Execute on the host with event JSON on stdin. The timeout is now per
+        # event rather than a flat 30s, matching Claude Code's own values for
+        # its own hooks: a Stop hook that formats a large repo legitimately
+        # takes minutes, and a PreToolUse hook that takes 30 seconds has
+        # already wedged the turn.
+        local _hto
+        _hto="$(_hook_timeout_for "$event_name")"
         if command -v timeout >/dev/null 2>&1; then
-          echo "$event_json" | timeout 30 bash -c "$cmd" >/dev/null 2>&1 || true
+          echo "$event_json" | timeout "$_hto" bash -c "$cmd" >/dev/null 2>&1 || true
         else
           echo "$event_json" | bash -c "$cmd" >/dev/null 2>&1 || true
         fi
@@ -7149,6 +8016,20 @@ exec_claude() {
   # the end-of-session fork diagnostic.
   local _watcher_log="$_CLIP_DIR/.watcher-log" _watcher_log_off
   _watcher_log_off="$(_cap_watcher_log "$_watcher_log")"
+  # The same offset trick for the bridge's own log, so the post-session report
+  # names only the URLs THIS session refused. Without the offset a refusal from
+  # a previous session re-fires on every run, which is the nagging concept/21
+  # forbids.
+  local _proxy_log_off
+  _proxy_log_off="$(_cap_watcher_log "$_CLIP_DIR/.proxy-log")"
+  # The hook bridge's drop log is per INSTALL, not per box: it has to survive
+  # the teardown of the box that wrote it, and the box must not be able to
+  # induce its deletion. Offset captured the same way.
+  local _hook_drop_log_path="$CLEAT_STATE_DIR/hook-drops.log" _hook_drop_off=0
+  if [ -f "$_hook_drop_log_path" ]; then
+    _hook_drop_off="$(wc -c < "$_hook_drop_log_path" 2>/dev/null | tr -d '[:space:]')"
+    case "$_hook_drop_off" in ''|*[!0-9]*) _hook_drop_off=0 ;; esac
+  fi
 
   local clip_cmd
   clip_cmd="$(_host_clip_cmd)"
@@ -7215,9 +8096,27 @@ exec_claude() {
     # commands `>/dev/null 2>&1` and its `( _execute_host_hooks ) &` children
     # inherit these fds, so both the bridge and its children keep fork spew off
     # the TUI while staying debuggable in the log.
-    _hook_bridge_watcher "$hooks_file" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+    # $_workspace, not the project: for a fork box they differ, and translating
+    # to the project would point the user's host hook at the ORIGIN working
+    # tree from inside a fork box.
+    _hook_bridge_watcher "$hooks_file" "$_workspace" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
     _HOOK_BRIDGE_PID=$!
     disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
+  fi
+  # A project that defines hooks in its own settings files gets one line saying
+  # they will not run on the host. Silence here would read as "my hooks broke".
+  if cap_is_active hooks 2>/dev/null && command -v jq >/dev/null 2>&1; then
+    local _pf _pf_seen=0
+    while IFS= read -r _pf; do
+      [ -n "$_pf" ] || continue
+      _pf_seen=1
+      break
+    done < <(_hook_project_files_with_hooks 2>/dev/null)
+    if [ "$_pf_seen" = "1" ]; then
+      warn "This project defines hooks in its own ${BOLD}.claude/settings*.json${RESET}. They do not run on the host."
+      echo -e "    ${DIM}Those files live in the directory the agent edits, so a command read from one is a command the box can write.${RESET}"
+      echo -e "    ${DIM}Copy the ones you want into ${BOLD}~/.claude/settings.json${RESET}${DIM} and they run.${RESET}"
+    fi
   fi
 
   trap _cleanup_session EXIT INT TERM HUP
@@ -7297,6 +8196,13 @@ exec_claude() {
   # session usually SUCCEEDS while the host-side watchers are the ones that could
   # not fork.
   _maybe_explain_fork_exhaustion "$_watcher_log" "$_watcher_log_off"
+  # And the destination gate's refusals. Same placement and the same reason: a
+  # denial that lives only in a log inside the box is undiagnosable from the
+  # field, and this is the line that makes a strict list usable rather than
+  # merely safe.
+  _maybe_report_blocked_opens "$_CLIP_DIR/.proxy-log" "$_proxy_log_off"
+  # And the hook events the bridge refused. Same rule: only when non-zero.
+  _maybe_report_hook_drops "$_hook_drop_log_path" "$_hook_drop_off"
   rm -f "$_exec_err"
 }
 
@@ -7397,6 +8303,85 @@ _maybe_explain_fork_exhaustion() {
   echo -e "    ${DIM}•${RESET} Run fewer agents at once ${DIM}(dispatch subagents sequentially)${RESET}"
   echo -e "    ${DIM}•${RESET} Raise this shell's limit before launching: ${BOLD}ulimit -u 4096${RESET}"
   echo -e "    ${DIM}•${RESET} macOS per-user cap: ${BOLD}sudo sysctl kern.maxprocperuid=4096${RESET} ${DIM}(default is often ~2784)${RESET}"
+}
+
+# Report the browser opens the destination gate refused this session. Once, on
+# the terminal, after the exec returns, reading a byte window of the proxy log
+# from an offset captured in the foreground before the session started. Exactly
+# the shape _maybe_explain_fork_exhaustion uses, and for the same reason.
+#
+# A denial that exists only in a log inside the box's own clip dir is
+# undiagnosable from the field. That is the 2026-07-07 silent-deferral
+# regression concept/33 records, and the box can rewrite that log besides. So
+# every field printed here is sanitized: the URL is box-authored by
+# construction, which is the whole point of printing it.
+#
+# The line carries three things, because each answers a different question: the
+# full URL so it can be opened by hand, the bare origin so it is
+# copy-pasteable, and the exact command that allows it next time.
+_maybe_report_blocked_opens() {
+  local log="$1" off="${2:-0}" lines n=0 l origin url shown=0
+  [ -f "$log" ] || return 0
+  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep -F "$_BROWSER_BLOCKED_MARK" 2>/dev/null)" || return 0
+  [ -n "$lines" ] || return 0
+  n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
+  n="$(printf '%s' "$n" | tr -d '[:space:]')"
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  echo ""
+  if [ "$n" -eq 1 ]; then
+    warn "Blocked ${BOLD}1${RESET} browser open from the box ${DIM}(origin not on the allowlist)${RESET}"
+  else
+    warn "Blocked ${BOLD}${n}${RESET} browser opens from the box ${DIM}(origin not on the allowlist)${RESET}"
+  fi
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    [ "$shown" -lt 3 ] || break
+    origin="${l##*origin=}"; origin="${origin%% *}"
+    url="${l##*url=}"
+    origin="$(_sanitize_repo_str "$origin")"
+    url="$(_sanitize_repo_str "$url")"
+    echo -e "    ${DIM}${url}${RESET}"
+    if [ -n "$origin" ] && [ "$origin" != "unparsed" ]; then
+      echo -e "    Allow it: ${BOLD}cleat browser allow ${origin}${RESET}"
+    else
+      echo -e "    ${DIM}Cleat could not parse an origin out of that URL, so there is nothing to allow.${RESET}"
+    fi
+    shown=$(( shown + 1 ))
+  done <<EOF
+$lines
+EOF
+  if [ "$n" -gt 3 ]; then
+    echo -e "    ${DIM}...and $(( n - 3 )) more. Every one is in ${_CLIP_DIR:-the box run dir}/.proxy-log${RESET}"
+  fi
+  echo -e "    ${DIM}Missing a login worth shipping? ${BOLD}https://github.com/cleatdev/cleat/issues/new${RESET}"
+  return 0
+}
+
+# Report the events the hook bridge refused this session. Same shape and same
+# placement as the two advisories beside it: a byte offset captured in the
+# foreground before the session, a tail from it afterwards.
+#
+# Only when the count is non-zero, because concept/21 forbids the nag. And the
+# copy never implies wider coverage than there is: the bridge starts from
+# exec_claude, not from `cleat shell` or `cleat login`.
+_maybe_report_hook_drops() {
+  local log="$1" off="${2:-0}" lines n=0
+  [ -f "$log" ] || return 0
+  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep -F "$_HOOK_DROP_MARK" 2>/dev/null)" || return 0
+  [ -n "$lines" ] || return 0
+  n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
+  n="$(printf '%s' "$n" | tr -d '[:space:]')"
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  echo ""
+  if [ "$n" -eq 1 ]; then
+    warn "Dropped ${BOLD}1${RESET} hook event from the box ${DIM}(it named a path this machine could not map to its own files)${RESET}"
+  else
+    warn "Dropped ${BOLD}${n}${RESET} hook events from the box ${DIM}(each named a path this machine could not map to its own files)${RESET}"
+  fi
+  echo -e "    ${DIM}Every one is in ${CLEAT_STATE_DIR}/hook-drops.log${RESET}"
+  return 0
 }
 
 # ── Cleat's own state: throttles and notice memory ──────────────────────────
@@ -8647,6 +9632,14 @@ cmd_run() {
   local _pd
   for _pd in $_CLAUDE_PRIVATE_DIRS; do
     mount_args+=(-v "$home_overlay/$_pd:/home/coder/.claude/$_pd")
+  done
+
+  # The instruction surfaces, :ro over an empty overlay. This is what stops the
+  # box creating a file at the ~/.claude root that a later session or the user's
+  # own uncaged Claude Code would read as configuration or as hooks.
+  local _id
+  for _id in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+    mount_args+=(-v "$home_overlay/instr/$_id:/home/coder/.claude/$_id:ro")
   done
 
   # ── hooks capability: shared directory for event forwarding to host bridge
@@ -17512,6 +18505,7 @@ cmd_help() {
   echo -e "    ${GREEN}describe${RESET} ${DIM}[box] [text]${RESET}  Show or set a box's description"
   echo -e "    ${GREEN}session${RESET} ${DIM}[box]${RESET}        List, rename, delete or restore this box's Claude sessions"
   echo -e "    ${GREEN}account${RESET} ${DIM}[name] [box]${RESET} Switch this box between named Claude logins"
+  echo -e "    ${GREEN}browser${RESET} ${DIM}origins${RESET}      Origins a box may ask your host to open"
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
   echo -e "    ${GREEN}update${RESET}             Check for updates and install the latest version"
@@ -17723,6 +18717,7 @@ main() {
     storage)   cmd_storage "$@" ;;
     session|sessions|ses) cmd_sessions "$@" ;;
     account|accounts) cmd_account "$@" ;;
+    browser) cmd_browser "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;

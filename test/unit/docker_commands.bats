@@ -993,6 +993,11 @@ EOF
   # Pin the age instead of racing it: the behaviour under test is the sibling
   # check, not the clock.
   _path_mtime() { date +%s; }
+  # And stub the watcher. It polls every 0.5s and CLAIMS the bridge file, which
+  # consumes it, so under load a real one wins the race against teardown and the
+  # test reports a swallowed URL that the teardown never touched. It has to stay
+  # alive, because teardown kills the pid it recorded.
+  _browser_watcher() { sleep 30; }
   sleep 30 &
   local sib=$!
   touch "$clip/.watcher.$sib"
@@ -1026,6 +1031,11 @@ EOF
   # Pin the age instead of racing it: the behaviour under test is the sibling
   # check, not the clock.
   _path_mtime() { date +%s; }
+  # And stub the watcher. It polls every 0.5s and CLAIMS the bridge file, which
+  # consumes it, so under load a real one wins the race against teardown and the
+  # test reports a swallowed URL that the teardown never touched. It has to stay
+  # alive, because teardown kills the pid it recorded.
+  _browser_watcher() { sleep 30; }
   sleep 30 &
   local sib=$!
   touch "$clip/.watcher.$sib"

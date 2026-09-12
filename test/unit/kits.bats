@@ -416,6 +416,57 @@ EOF
   assert_success
 }
 
+@test "containment: every instruction surface at the ~/.claude root is mounted read-only" {
+  # The third channel. `-v "${HOME}/.claude:/home/coder/.claude"` is read-write
+  # and only named LEAVES are masked, so any root path Claude Code starts
+  # reading becomes a hole with no change on Cleat's side. These are the paths
+  # its own sandbox denies, and each is absent on a live box, which is exactly
+  # what made them creatable.
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local _p
+  for _p in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+    run assert_docker_run_has "$CNAME" "/home/coder/.claude/${_p}:ro"
+    assert_success
+  done
+}
+
+@test "containment: the mask is an EMPTY overlay, never the host's own content" {
+  # A pass-through would hand the box the user's real instruction surfaces. None
+  # of these is read at the user level today, so passing content through would
+  # be inventing behaviour, and an empty mask turns a future vendor change into
+  # a missing feature the user reports rather than a host write primitive.
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$CNAME" "${CNAME}/home/instr/rules:/home/coder/.claude/rules:ro"
+  assert_success
+  [ -d "$CLEAT_RUN_DIR/$CNAME/home/instr/rules" ] || { echo "the overlay directory was never generated"; return 1; }
+  [ -z "$(ls -A "$CLEAT_RUN_DIR/$CNAME/home/instr/rules" 2>/dev/null)" ] || { echo "the mask overlay is not empty"; return 1; }
+}
+
+@test "containment: the host targets are created inert, and an existing one is never replaced" {
+  # VirtioFS refuses a nested mount whose target is missing inside the parent
+  # bind source, so every mask target has to exist on the host first. A JSON
+  # placeholder is `{}` rather than empty, because the reader that would choke
+  # on an invalid one is the user's OWN Claude Code.
+  printf '{"mine":true}\n' > "$HOME/.claude/launch.json"
+  _ensure_kit_mask_targets
+  [ -d "$HOME/.claude/rules" ] || { echo "a directory target was not created"; return 1; }
+  run cat "$HOME/.claude/keybindings.json"
+  assert_output "{}"
+  run cat "$HOME/.claude/launch.json"
+  assert_output --partial '"mine":true'
+}
+
+@test "containment: .config.json is never a mask target" {
+  # Masking creates an empty overlay on the HOST. Creating ~/.claude/.config.json
+  # there would destroy the user's global config.
+  _ensure_kit_mask_targets
+  [ ! -e "$HOME/.claude/.config.json" ] || { echo "cleat created ~/.claude/.config.json, which overwrites the user's global config"; return 1; }
+}
+
 @test "kit: the commands mask is USER-level only; project commands stay writable via /workspace" {
   # A user-level ~/.claude/commands is masked :ro. A PROJECT command
   # (<project>/.claude/commands) must NOT be masked: it rides the /workspace
@@ -748,11 +799,39 @@ EOF
 }
 
 @test "kit: a fully masked box gets no recreate note" {
+  # "Fully masked" grew: the instruction surfaces at the ~/.claude ROOT are
+  # masked too now, and a box that has the kit masks but not those is still a
+  # box that can create a file the host's own Claude Code reads as hooks. The
+  # mount list is built from the same two constants the mounts are, so this
+  # cannot drift from what a real box gets.
+  container_exists() { return 0; }
+  local dests="/home/coder/.claude/CLAUDE.md
+/home/coder/.claude/agents
+/home/coder/.claude/commands
+/home/coder/.claude/skills
+/home/coder/.claude/plugins"
+  local _p
+  for _p in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+    dests="$dests
+/home/coder/.claude/$_p"
+  done
+  mock_docker_inspect "$dests"
+  run _maybe_note_missing_kit_masks "$CNAME"
+  assert_success
+  refute_output --partial "predates"
+}
+
+@test "kit: a box missing the instruction-surface masks is told, without being forced" {
+  # A mount change fires no config-drift prompt (the fingerprint does not cover
+  # mounts) and must not bump _IMAGE_SPEC_VERSION, which means image CONTENT and
+  # would cost every user their in-box apt state. The advisory is the only
+  # signal an existing box gets, which is the deliberate trade: it tells, it
+  # never forces.
   container_exists() { return 0; }
   mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/skills\n/home/coder/.claude/plugins'
   run _maybe_note_missing_kit_masks "$CNAME"
   assert_success
-  refute_output --partial "predates"
+  assert_output --partial "predates the ~/.claude instruction-surface masks"
 }
 
 @test "kit: a box missing the skills mask gets the recreate note" {

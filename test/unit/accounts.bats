@@ -930,6 +930,59 @@ _acct_keys() {
   assert_success
 }
 
+@test "account: a wipe that would reach the account store is refused" {
+  # cmd_nuke prints "your ~/.claude auth is safe" and then removes four state
+  # directories. Today the accounts tree is merely a SIBLING of all four, so
+  # the promise holds by directory layout and by nothing else. This is the
+  # guard that makes it hold by construction: one future edit that widens a
+  # wipe to the config dir, or that moves the store under one of the four,
+  # would otherwise destroy weeks of refresh token silently.
+  _mk_account work
+  run _nuke_wipe_dir "$(dirname "$CLEAT_ACCOUNTS_DIR")"
+  assert_failure
+  assert_output --partial "named Claude logins"
+  [ -f "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" ]
+}
+
+@test "account: the store directory itself is refused, not only its parent" {
+  _mk_account work
+  run _nuke_wipe_dir "$CLEAT_ACCOUNTS_DIR"
+  assert_failure
+  [ -d "$CLEAT_ACCOUNTS_DIR/work" ]
+  run _nuke_wipe_dir "$CLEAT_BOX_ACCOUNTS_DIR"
+  assert_failure
+}
+
+@test "account: an ordinary state directory is still wiped" {
+  # The guard must refuse the account store and nothing else, or nuke stops
+  # doing its job.
+  mkdir -p "$CLEAT_RUN_DIR/somebox"
+  run _nuke_wipe_dir "$CLEAT_RUN_DIR"
+  assert_success
+  [ ! -d "$CLEAT_RUN_DIR" ]
+}
+
+@test "account: a trailing slash does not defeat the wipe guard" {
+  _mk_account work
+  run _nuke_wipe_dir "$CLEAT_ACCOUNTS_DIR/"
+  assert_failure
+  [ -d "$CLEAT_ACCOUNTS_DIR/work" ]
+}
+
+@test "account: a directory that merely shares a prefix is not protected" {
+  # The guard asks whether the STORE sits under the directory being wiped, so
+  # the dangerous shortcut is a prefix test with no slash: the store
+  # .../accounts would then read as "under" .../account, and a legitimate wipe
+  # of a differently-named sibling would be refused forever. Hence a dir whose
+  # name is a strict prefix of the store's.
+  local prefix="${CLEAT_ACCOUNTS_DIR%s}"
+  [ "$prefix" != "$CLEAT_ACCOUNTS_DIR" ]
+  mkdir -p "$prefix/something"
+  run _nuke_wipe_dir "$prefix"
+  assert_success
+  [ ! -d "$prefix" ]
+}
+
 @test "account: the store survives cleat nuke, which promises auth is safe" {
   # cmd_nuke says "your ~/.claude auth is safe" and then wipes four state
   # directories. An accounts tree caught in that wipe would destroy weeks of

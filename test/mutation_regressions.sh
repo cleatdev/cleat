@@ -6521,6 +6521,33 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_attach_restages" "every attach re-stages the stored credential" "$CLI" "$ACCOUNTS_BATS"
 
+# cmd_nuke promises "your ~/.claude auth is safe" and then removes four state
+# directories. The accounts tree being a SIBLING of all four is a directory
+# layout, not a guard, so this is the guard.
+cat > "$SED_TMP" << 'SED'
+/^_nuke_wipe_dir()/,/^}$/{
+  s@^  if _account_store_is_under "[$]dir"; then$@  if false; then@
+}
+SED
+try "vnext_account_nuke_guard" "a wipe that would reach the account store is refused" "$CLI" "$ACCOUNTS_BATS"
+
+# And the guard has to refuse the store and NOTHING else, or nuke stops doing
+# its job.
+cat > "$SED_TMP" << 'SED'
+/^_account_store_is_under()/,/^}$/{
+  s@^  return 1$@  return 0@
+}
+SED
+try "vnext_account_nuke_guard_narrow" "an ordinary state directory is still wiped" "$CLI" "$ACCOUNTS_BATS"
+
+# A prefix test without the slash would protect .../accounts-old forever.
+cat > "$SED_TMP" << 'SED'
+/^_account_store_is_under()/,/^}$/{
+  s@^    \[\[ "[$]d" == "[$]dir"/\* \]\] \&\& return 0$@    [[ "$d" == "$dir"* ]] \&\& return 0@
+}
+SED
+try "vnext_account_nuke_guard_prefix" "a directory that merely shares a prefix is not protected" "$CLI" "$ACCOUNTS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

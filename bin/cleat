@@ -10801,20 +10801,19 @@ cmd_nuke() {
   # now, so /tmp rotation won't reclaim them: wipe them explicitly.
   if [[ -d "$CLEAT_RUN_DIR" ]]; then
     info "Removing per-container runtime dirs..."
-    # Named accounts live in ~/.config/cleat/accounts and are NOT removed here,
-    # which is what the promise three lines up depends on. But the staged
-    # credential a box refreshed in place does live under the run dir, so
-    # harvest before the wipe or nuke destroys weeks of refresh token while
-    # saying it did not.
+    # The staged credential a box refreshed in place lives under the run dir,
+    # so harvest before the wipe or nuke destroys weeks of refresh token while
+    # saying it did not. The wipe itself goes through _nuke_wipe_dir, which
+    # refuses any directory holding the account store.
     _account_sync_out_all
-    rm -rf "$CLEAT_RUN_DIR" 2>/dev/null || true
+    _nuke_wipe_dir "$CLEAT_RUN_DIR"
   fi
 
   # Per-project persistent .claude.json store (trust/MCP approvals): nuke
   # removes everything Cleat-related, so clear it too. (cleat rm preserves it.)
   if [[ -d "$CLEAT_PROJECTS_DIR" ]]; then
     info "Removing per-project Claude state..."
-    rm -rf "$CLEAT_PROJECTS_DIR" 2>/dev/null || true
+    _nuke_wipe_dir "$CLEAT_PROJECTS_DIR"
   fi
 
   if [[ -d "$CLEAT_BOXES_DIR" ]]; then
@@ -10832,7 +10831,7 @@ cmd_nuke() {
       _nc="${_nk##*/}"; _nc="${_nc%.fork}"
       [[ -d "$(_fork_dir "$_nc")" ]] && _nkeep+=("$_nc")
     done
-    rm -rf "$CLEAT_BOXES_DIR" 2>/dev/null || true
+    _nuke_wipe_dir "$CLEAT_BOXES_DIR"
     for _nc in "${_nkeep[@]+"${_nkeep[@]}"}"; do
       _fork_mark "$_nc"
     done
@@ -10843,7 +10842,7 @@ cmd_nuke() {
   fi
 
   if [[ -d "$CLEAT_KITS_DIR" ]]; then
-    rm -rf "$CLEAT_KITS_DIR" 2>/dev/null || true
+    _nuke_wipe_dir "$CLEAT_KITS_DIR"
   fi
 
   # Dangling cleat builds only (label-scoped): other projects' dangling images
@@ -12794,6 +12793,44 @@ _account_wipe_run_dir() {
     return 0
   fi
   rm -rf "${CLEAT_RUN_DIR:?}/${cname}" 2>/dev/null || true
+  return 0
+}
+
+# Refuse to remove a directory that IS, or that contains, the named-account
+# store. Every state wipe in this file goes through it.
+#
+# `cmd_nuke` prints "your project files and ~/.claude auth are safe" and then
+# removes four state directories. Today the accounts tree is merely a SIBLING
+# of all four, so the promise holds by directory layout and by nothing else:
+# there is no guard to break, which also means there is nothing a mutation can
+# prove. One future edit that widens a wipe to $CLEAT_CONFIG_DIR, or that moves
+# the store under one of the four, destroys weeks of refresh token while the
+# message on screen says it did not. The failure is silent and unrecoverable,
+# which is exactly the shape that earns a real check.
+_account_store_is_under() {
+  local dir="$1" d
+  [[ -n "$dir" ]] || return 1
+  # Trailing slashes normalised so "$CLEAT_CONFIG_DIR/" and "$CLEAT_CONFIG_DIR"
+  # answer the same.
+  dir="${dir%/}"
+  for d in "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR"; do
+    d="${d%/}"
+    [[ "$d" == "$dir" ]] && return 0
+    [[ "$d" == "$dir"/* ]] && return 0
+  done
+  return 1
+}
+
+_nuke_wipe_dir() {
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  [[ -d "$dir" ]] || return 0
+  if _account_store_is_under "$dir"; then
+    warn "Refusing to remove ${BOLD}${dir}${RESET}: your named Claude logins live in there."
+    echo -e "    ${DIM}Nothing was removed from it. Remove one with ${BOLD}cleat account rm <name>${RESET}${DIM}.${RESET}"
+    return 1
+  fi
+  rm -rf "$dir" 2>/dev/null || true
   return 0
 }
 

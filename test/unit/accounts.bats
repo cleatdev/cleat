@@ -18,7 +18,14 @@ setup() {
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
   CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
-  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR"
+  # Pinned too: the identity tests write a sibling project file, and without
+  # this they would write it into the developer's REAL config directory.
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  # A fixed clock, because the harvest refuses an expiry further out than any
+  # real access token could be. Fixtures are dated against THIS, not against a
+  # year-2286 sentinel, or they exercise the refusal instead of the harvest.
+  _CLEAT_NOW_S=1789000000
 }
 teardown() { _common_teardown; }
 
@@ -29,7 +36,7 @@ CN="cleat-proj-abcdef12"
 _cred_blob() {
   # `${2-...}` and not `${2:-...}`: an EXPLICITLY empty refresh token is the
   # invalid_grant state and has to survive being passed in.
-  local exp="${1:-9999999999999}" rt="${2-r-token}" rte="${3:-}"
+  local exp="${1:-1789003600000}" rt="${2-r-token}" rte="${3:-}"
   if [[ -n "$rte" ]]; then
     printf '{"claudeAiOauth":{"accessToken":"a-token","refreshToken":"%s","expiresAt":%s,"refreshTokenExpiresAt":%s,"subscriptionType":"max"}}\n' "$rt" "$exp" "$rte"
   else
@@ -40,13 +47,13 @@ _cred_blob() {
 _mk_account() {   # $1 = name, $2 = expiresAt, $3 = refreshToken, $4 = refreshTokenExpiresAt
   mkdir -p "$CLEAT_ACCOUNTS_DIR/$1"
   chmod 700 "$CLEAT_ACCOUNTS_DIR/$1"
-  _cred_blob "${2:-9999999999999}" "${3-r-token}" "${4:-}" > "$CLEAT_ACCOUNTS_DIR/$1/.credentials.json"
+  _cred_blob "${2:-1789003600000}" "${3-r-token}" "${4:-}" > "$CLEAT_ACCOUNTS_DIR/$1/.credentials.json"
   chmod 600 "$CLEAT_ACCOUNTS_DIR/$1/.credentials.json"
 }
 
 _mk_staged() {   # $1 = cname, $2 = expiresAt
   mkdir -p "$CLEAT_RUN_DIR/$1/auth"
-  _cred_blob "${2:-9999999999999}" > "$CLEAT_RUN_DIR/$1/auth/.credentials.json"
+  _cred_blob "${2:-1789003600000}" > "$CLEAT_RUN_DIR/$1/auth/.credentials.json"
 }
 
 _pass_gates() {
@@ -211,10 +218,10 @@ _pass_gates() {
 @test "account: staging never overwrites a newer credential the box refreshed" {
   _mk_account work 1000
   _box_account_write "$CN" work
-  _mk_staged "$CN" 9999999999999
+  _mk_staged "$CN" 1789003600000
   run _account_sync_in "$CN"
   assert_success
-  run grep -c 9999999999999 "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  run grep -c 1789003600000 "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
   assert_output "1"
 }
 
@@ -230,25 +237,25 @@ _pass_gates() {
   # at /login, which is the exact pain this feature removes.
   _mk_account work 1000
   _box_account_write "$CN" work
-  _mk_staged "$CN" 9999999999999
+  _mk_staged "$CN" 1789003600000
   run _account_sync_out "$CN"
   assert_success
-  run grep -c 9999999999999 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  run grep -c 1789003600000 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
   assert_output "1"
 }
 
 @test "account: harvesting never replaces a newer stored credential with an older one" {
-  _mk_account work 9999999999999
+  _mk_account work 1789003600000
   _box_account_write "$CN" work
   _mk_staged "$CN" 1000
   run _account_sync_out "$CN"
   assert_success
-  run grep -c 9999999999999 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  run grep -c 1789003600000 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
   assert_output "1"
 }
 
 @test "account: harvesting is a no-op for an unpinned box" {
-  _mk_staged "$CN" 9999999999999
+  _mk_staged "$CN" 1789003600000
   run _account_sync_out "$CN"
   assert_success
   [ ! -d "$CLEAT_ACCOUNTS_DIR/default" ]
@@ -258,7 +265,7 @@ _pass_gates() {
   _mk_account work 1000
   _box_account_write "$CN" work
   mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
-  _cred_blob 9999999999999 > "$TEST_TEMP/planted.json"
+  _cred_blob 1789003600000 > "$TEST_TEMP/planted.json"
   ln -s "$TEST_TEMP/planted.json" "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
   run _account_sync_out "$CN"
   assert_failure
@@ -271,21 +278,21 @@ _pass_gates() {
   # not harvest throws away a token the account has no other copy of.
   _mk_account work 1000
   _box_account_write "$CN" work
-  _mk_staged "$CN" 9999999999999
+  _mk_staged "$CN" 1789003600000
   run _account_wipe_run_dir "$CN"
   assert_success
   [ ! -d "$CLEAT_RUN_DIR/$CN" ]
-  run grep -c 9999999999999 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  run grep -c 1789003600000 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
   assert_output "1"
 }
 
 @test "account: the whole-run-dir wipe harvests every pinned box" {
   _mk_account work 1000
   _box_account_write "$CN" work
-  _mk_staged "$CN" 9999999999999
+  _mk_staged "$CN" 1789003600000
   run _account_sync_out_all
   assert_success
-  run grep -c 9999999999999 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  run grep -c 1789003600000 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
   assert_output "1"
 }
 
@@ -335,13 +342,13 @@ _pass_gates() {
 @test "account: an account whose tokens were cleared reads as signed out" {
   # On invalid_grant the client writes EMPTY tokens back to disk, so a present
   # file is not the same as a working account.
-  _mk_account work 9999999999999 ""
+  _mk_account work 1789003600000 ""
   run _account_auth_state work
   assert_output "signed out"
 }
 
 @test "account: an expired refresh token reads as re-login" {
-  _mk_account work 9999999999999 r-token 1000
+  _mk_account work 1789003600000 r-token 1000
   run _account_auth_state work
   assert_output "re-login"
 }
@@ -416,7 +423,7 @@ _pass_gates() {
 }
 
 @test "account: usage is not polled again inside the throttle window" {
-  _mk_account work 99999999999999
+  _mk_account work 17890036000009
   _CLEAT_NOW_S=1000000
   _account_meta_set work usage_at 1000000
   curl() { echo "CURL RAN" >> "$TEST_TEMP/curl.log"; }
@@ -931,4 +938,411 @@ _acct_keys() {
   run cmd_nuke <<< "nuke"
   [ -f "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" ]
   [ -f "$CLEAT_BOX_ACCOUNTS_DIR/$CN" ]
+}
+
+# ── what the adversarial pass found ────────────────────────────────────────
+#
+# Everything below is a defect that a green suite did not see. They are grouped
+# because they share one property: each is silent when it breaks.
+
+@test "account: switching stages the incoming credential even when the box's is newer" {
+  # THE critical one. Newest-wins is only valid WITHIN an account. Across a
+  # switch the staged file belongs to the account being LEFT and is usually the
+  # fresher of the two, so the staging declined and the box kept the OLD
+  # account's credential while pinned to the new one.
+  _pass_gates
+  _mk_account old 1789003600000 old-token
+  _mk_account new 1789000100000 new-token
+  _box_account_write "$CN" old
+  _mk_staged "$CN" 1789003600000
+  run _account_do_switch new main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run grep -c "1789000100000" "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: switching does not write the old account's token into the new store" {
+  # The second half of the same defect, and the destructive one: the stale
+  # staged copy was harvested INTO the account just switched to, destroying its
+  # refresh token with no trash and no undo.
+  _pass_gates
+  _mk_account old 1789003600000 old-token
+  _mk_account new 1789000100000 new-token
+  _box_account_write "$CN" old
+  _mk_staged "$CN" 1789003600000
+  _account_do_switch new main "$CN" "$TEST_TEMP/proj"
+  _account_sync_out "$CN" || true
+  run grep -c "new-token" "$CLEAT_ACCOUNTS_DIR/new/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: restore does not resurrect a different account whose name ends the same" {
+  # A dash is legal inside an account name, so the old suffix glob matched
+  # <stamp>-my-work when asked for `work`: it restored the wrong store under
+  # the wrong name and stranded the real one in the trash forever.
+  _mk_account my-work 1789003600000 mine
+  _account_trash my-work
+  run _account_restore work
+  assert_failure
+  [ ! -d "$CLEAT_ACCOUNTS_DIR/work" ]
+  [ -d "$CLEAT_ACCOUNTS_DIR/.trash/"*"-my-work" ]
+}
+
+@test "account: restore still finds an account whose own name contains a dash" {
+  _mk_account my-work
+  _account_trash my-work
+  run _account_restore my-work
+  assert_success
+  [ -d "$CLEAT_ACCOUNTS_DIR/my-work" ]
+}
+
+@test "account: a box cannot destroy a stored credential with a tokenless blob" {
+  # The harvest reads a directory the box mounts read-write. "Newer" alone
+  # earned an overwrite of the host's only copy, so a box could drop a JSON
+  # object with a huge expiry and no tokens in it and sign the account out
+  # permanently.
+  _mk_account work 1789000100000 real-token
+  _box_account_write "$CN" work
+  mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
+  printf '{"claudeAiOauth":{"expiresAt":1789003600000}}\n' > "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  run _account_sync_out "$CN"
+  assert_failure
+  run grep -c "real-token" "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: a harvest is refused when the expiry is further out than any real token" {
+  _mk_account work 1789000100000 real-token
+  _box_account_write "$CN" work
+  _mk_staged "$CN" 99999999999999
+  run _account_sync_out "$CN"
+  assert_failure
+  run grep -c "real-token" "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: an oversized credential file is never read into a shell variable" {
+  _account_ensure_dir work
+  # A real credential is a few hundred bytes. This is a valid JSON OBJECT, so
+  # only the size guard can refuse it: asserting on the predicate alone would
+  # pass with the guard removed from the write path.
+  { printf '{"pad":"'; head -c 200000 /dev/zero | tr '\0' 'z'; printf '"}\n'; } > "$TEST_TEMP/big.json"
+  run _account_write_cred work "$TEST_TEMP/big.json"
+  assert_failure
+  [ ! -f "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" ]
+}
+
+@test "account: switching to a new account does not stamp it with the previous email" {
+  # The project store still holds the OUTGOING account's identity, so passing
+  # it to the capture made the list name an account it had never seen.
+  _pass_gates
+  _mk_account old
+  _mk_account new
+  _box_account_write "$CN" old
+  _account_meta_set old who "previous@example.com"
+  # The project store still holds the OUTGOING identity. Without it the capture
+  # reads nothing either way and this test passes whatever the code does.
+  local key
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  printf '{"oauthAccount":{"emailAddress":"previous@example.com","organizationName":"Old Org"}}\n' \
+    > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  run _account_do_switch new main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run _account_meta_get new who
+  assert_failure
+}
+
+@test "account: the accounts directory itself is not world-readable" {
+  # mkdir -p creates the PARENT at the host umask, so locking only the leaf
+  # left every account NAME listable by anything on the machine.
+  rm -rf "$CLEAT_ACCOUNTS_DIR"
+  umask 022
+  _account_ensure_dir work
+  [ "$(stat -c '%a' "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || stat -f '%Lp' "$CLEAT_ACCOUNTS_DIR")" = "700" ]
+}
+
+@test "account: cleat clean harvests before it prunes an orphaned run dir" {
+  _mk_account work 1000 old-token
+  _box_account_write "$CN" work
+  _mk_staged "$CN" 1789003600000
+  container_exists() { return 1; }
+  mock_docker_ps ""
+  run cmd_clean
+  run grep -c "1789003600000" "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: a failed harvest leaves the staged credential rather than deleting it" {
+  # The staged file may be the only copy of a token the box refreshed, so a
+  # wipe that follows a failed harvest must not destroy the thing the harvest
+  # was protecting.
+  _mk_account work 1789003600000 newer
+  _box_account_write "$CN" work
+  _mk_staged "$CN" 1000
+  mkdir -p "$CLEAT_RUN_DIR/$CN/clip"
+  _account_sync_out() { return 1; }
+  run _account_wipe_run_dir "$CN"
+  assert_success
+  [ -f "$CLEAT_RUN_DIR/$CN/auth/.credentials.json" ]
+  [ ! -d "$CLEAT_RUN_DIR/$CN/clip" ]
+}
+
+@test "account: removing an account harvests every pinned box before the store moves" {
+  # After the trash the store path is gone, so harvesting afterwards RECREATES
+  # the account directory and makes restore refuse.
+  _pass_gates
+  _mk_account work 1000 old-token
+  _box_account_write "box-a" work
+  mkdir -p "$CLEAT_RUN_DIR/box-a/auth"
+  _cred_blob 1789003600000 harvested > "$CLEAT_RUN_DIR/box-a/auth/.credentials.json"
+  run _account_do_remove work 1
+  assert_success
+  [ ! -d "$CLEAT_ACCOUNTS_DIR/work" ]
+  run grep -rc "harvested" "$CLEAT_ACCOUNTS_DIR/.trash/"*"-work/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: cleat login carries the credential store override" {
+  # /login is the one command whose whole job is to WRITE a credential, so a
+  # pinned box reaching it without the override wrote the new account straight
+  # into the shared host login and clobbered it.
+  _mk_account work
+  _box_account_write "cleat-logintest" work
+  docker() {
+    case "$1" in
+      inspect) printf '%s\n' "/home/coder/.cleat-auth" ;;
+      *) command docker "$@" ;;
+    esac
+  }
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  run _account_apply_exec_env "cleat-logintest"
+  assert_success
+  printf '%s\n' "${CLAUDE_ENV[@]}" > "$TEST_TEMP/env.out"
+  _account_apply_exec_env "cleat-logintest" || true
+  printf '%s\n' "${CLAUDE_ENV[@]}" > "$TEST_TEMP/env.out"
+  run cat "$TEST_TEMP/env.out"
+  assert_output --partial "CLAUDE_SECURESTORAGE_CONFIG_DIR=/home/coder/.cleat-auth"
+}
+
+@test "account: a box with no auth mount is never pointed at a store it does not have" {
+  _mk_account work
+  _box_account_write "cleat-nomount" work
+  docker() { case "$1" in inspect) printf '%s\n' "/workspace" ;; *) return 0 ;; esac; }
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  run _account_apply_exec_env "cleat-nomount"
+  assert_failure
+  assert_output --partial "cleat rm"
+  printf '%s\n' "${CLAUDE_ENV[@]}" > "$TEST_TEMP/env.out"
+  run grep -c CLAUDE_SECURESTORAGE "$TEST_TEMP/env.out"
+  assert_output "0"
+}
+
+@test "account: the mount probe reads a STOPPED box rather than execing into it" {
+  # docker exec needs a RUNNING container, so a merely stopped box answered
+  # "no mount" and every switch against one was refused for a reason that was
+  # not true.
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  : > "$TEST_TEMP/docker.log"
+  docker() {
+    echo "$1" >> "$TEST_TEMP/docker.log"
+    case "$1" in inspect) printf '%s\n' "/home/coder/.cleat-auth" ;; *) return 1 ;; esac
+  }
+  run _account_box_ready "cleat-stopped"
+  assert_success
+  run cat "$TEST_TEMP/docker.log"
+  refute_output --partial "exec"
+}
+
+@test "account: going back to the shared login respects the live-session gate" {
+  _mk_account work
+  _box_account_write "$CN" work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  _box_has_live_agent() { return 0; }
+  run _account_do_switch default main "$CN" "$TEST_TEMP/proj"
+  assert_failure
+  assert_output --partial "live Claude session"
+  run _box_account_read "$CN"
+  assert_output "work"
+}
+
+@test "account: an emptied shared credential is not reported as logged in" {
+  # On invalid_grant the client writes EMPTY tokens back to disk, so the file
+  # survives a logout. Non-empty is not the same as usable.
+  mkdir -p "$HOME/.claude"
+  printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}\n' > "$HOME/.claude/.credentials.json"
+  run _account_cred_plausible "$HOME/.claude/.credentials.json"
+  assert_failure
+}
+
+@test "account: an age is never printed with the word ago twice" {
+  _account_ensure_dir work
+  _CLEAT_NOW_S=1789000000
+  _account_meta_set work last_used 1788980000
+  _accounts_load_rows default
+  printf '%s\n' "${_ACCT_D2[1]}" > "$TEST_TEMP/d2"
+  run cat "$TEST_TEMP/d2"
+  assert_output --partial "ago"
+  refute_output --partial "ago ago"
+}
+
+@test "account: a stale usage snapshot says so even when the line is truncated" {
+  # The pane clamps from the right, so a trailing "(as of ...)" was the first
+  # thing cut on a narrow terminal and an hours-old percentage was then shown
+  # as if it were current.
+  _account_ensure_dir work
+  _CLEAT_NOW_S=1789000000
+  _account_meta_set work usage_at 1788980000
+  _account_meta_set work usage_five 16
+  _account_meta_set work usage_five_resets 1789900000
+  run _account_usage_render work
+  assert_success
+  [[ "$output" == "last known "* ]]
+}
+
+@test "account: an account name too wide for its column is visibly truncated" {
+  _mk_account a-very-long-account-name
+  _accounts_load_rows default
+  _accounts_frame 1 0 2 100 "$_ACCT_N" > "$TEST_TEMP/frame.out" 2>/dev/null
+  run cat "$TEST_TEMP/frame.out"
+  assert_output --partial "…"
+  refute_output --partial "a-very-long-account-name"
+}
+
+@test "account: a short name is never truncated and never padded away" {
+  _mk_account work
+  _accounts_load_rows default
+  _accounts_frame 1 0 2 100 "$_ACCT_N" > "$TEST_TEMP/frame.out" 2>/dev/null
+  run cat "$TEST_TEMP/frame.out"
+  assert_output --partial "work"
+}
+
+@test "account: a wide-character detail line is budgeted at two columns per glyph" {
+  # Observable as a DIFFERENCE, not as an absolute width: under the C locale
+  # bash counts BYTES, which already over-clamps, so "is it under 50 columns"
+  # passes with or without the halving. What the halving changes is how much
+  # is shown.
+  _mk_account work
+  _account_meta_set work org "株式会社株式会社株式会社株式会社株式会社株式会社"
+  _has_unicode() { return 1; }
+  _accounts_load_rows default
+  _accounts_frame 1 0 2 50 "$_ACCT_N" > "$TEST_TEMP/wide.off" 2>/dev/null
+  _has_unicode() { return 0; }
+  _accounts_load_rows default
+  _accounts_frame 1 0 2 50 "$_ACCT_N" > "$TEST_TEMP/wide.on" 2>/dev/null
+  local off on
+  off="$(wc -c < "$TEST_TEMP/wide.off" | tr -d ' ')"
+  on="$(wc -c < "$TEST_TEMP/wide.on" | tr -d ' ')"
+  [ "$on" -lt "$off" ] || { echo "unicode budget did not shrink the pane: $on vs $off"; return 1; }
+}
+
+@test "account: a wide-character organisation name cannot overflow the detail pane" {
+  _has_unicode() { return 0; }
+  _mk_account work
+  _account_meta_set work org "株式会社株式会社株式会社株式会社株式会社株式会社"
+  _accounts_load_rows default
+  _accounts_frame 1 0 2 50 "$_ACCT_N" > "$TEST_TEMP/frame.out" 2>/dev/null
+  # Column cost, not byte cost, and measured without depending on the locale:
+  # a CJK glyph is three UTF-8 bytes and paints two columns, ASCII is one of
+  # each. awk under LC_ALL=C counts BYTES, which is why the obvious version of
+  # this assertion is wrong.
+  local line plain ascii wide cols widest=0
+  while IFS= read -r line; do
+    # The frame's OWN glyphs are all single-column, so fold them to ASCII
+    # before the wide-character arithmetic or they each count as two.
+    plain="$(printf '%s' "$line" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' \
+      | sed 's/▸/>/g; s/•/o/g; s/…/./g; s/·/./g; s/↑/^/g; s/↓/v/g; s/⏎/E/g')"
+    ascii="$(printf '%s' "$plain" | LC_ALL=C tr -cd ' -~' | wc -c | tr -d ' ')"
+    wide="$(printf '%s' "$plain" | LC_ALL=C tr -d ' -~' | wc -c | tr -d ' ')"
+    cols=$(( ascii + (wide / 3) * 2 ))
+    [ "$cols" -gt "$widest" ] && widest=$cols
+  done < "$TEST_TEMP/frame.out"
+  [ "$widest" -le 50 ] || { echo "drew $widest columns"; return 1; }
+}
+
+@test "account: the action screen clamps a long email to the terminal width" {
+  # The back-out walks up a FIXED three lines, so a wrapped header line makes
+  # the redrawn list land on top of the menu it was meant to replace.
+  _mk_account work
+  _account_meta_set work who "an-extremely-long-email-address-that-would-certainly-wrap@a-very-long-domain.example.com"
+  _term_cols() { echo 40; }
+  _acct_keys QUIT
+  run _accounts_action_tui work main "$CN" "$TEST_TEMP/proj"
+  assert_failure
+  local widest
+  widest="$(printf '%s\n' "$output" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' \
+    | sed 's/…/./g; s/↑/^/g; s/↓/v/g; s/⏎/E/g; s/▸/>/g' \
+    | awk '{ n = length($0); if (n > m) m = n } END { print m + 0 }')"
+  [ "$widest" -le 40 ] || { echo "drew $widest columns"; return 1; }
+}
+
+@test "account: a pinned box is not re-stamped with the host account's identity" {
+  # The per-project builder is HOST-first for identity, which is right for a
+  # box on the shared login and wrong for a pinned one: it re-stamped the host
+  # account's email and organisation onto a box running as somebody else, on
+  # every start.
+  command -v jq >/dev/null || skip "needs jq"
+  _mk_account work
+  _box_account_write "$CN" work
+  container_name_for() { echo "$CN"; }
+  mkdir -p "$HOME/.claude"
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"userID":"abc"}\n' > "$HOME/.claude.json"
+  mkdir -p "$TEST_TEMP/store"
+  _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
+  run jq -r '.oauthAccount // "absent"' "$TEST_TEMP/store/claude.json"
+  assert_output "absent"
+  # userID is machine-scoped rather than account-scoped, so it still comes from
+  # the host.
+  run jq -r '.userID' "$TEST_TEMP/store/claude.json"
+  assert_output "abc"
+}
+
+@test "account: an unpinned box still gets the host identity, exactly as before" {
+  command -v jq >/dev/null || skip "needs jq"
+  mkdir -p "$HOME/.claude"
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"userID":"abc"}\n' > "$HOME/.claude.json"
+  mkdir -p "$TEST_TEMP/store"
+  _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
+  run jq -r '.oauthAccount.emailAddress' "$TEST_TEMP/store/claude.json"
+  assert_output "host@example.com"
+}
+
+@test "account: a pinned box does not even read a sibling box's identity file" {
+  # The gate sits behind the del, so its effect on the OUTPUT is masked. What
+  # it does observably is stop a pinned box reading other projects' files at
+  # all, which is the part worth pinning: nothing in those files says which
+  # account they belong to.
+  command -v jq >/dev/null || skip "needs jq"
+  _mk_account work
+  _box_account_write "$CN" work
+  container_name_for() { echo "$CN"; }
+  _newest_sibling_identity() { : > "$TEST_TEMP/sibling-read"; }
+  printf '{}\n' > "$HOME/.claude.json"
+  mkdir -p "$TEST_TEMP/store"
+  _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
+  [ ! -f "$TEST_TEMP/sibling-read" ]
+  # And an UNPINNED box still does, so the gate is the only difference.
+  _box_account_remove "$CN"
+  _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
+  [ -f "$TEST_TEMP/sibling-read" ]
+}
+
+@test "account: a pinned box does not inherit a sibling box's login either" {
+  # The sibling scan picks the newest per-project file holding a login, and
+  # nothing in that file says which ACCOUNT it belongs to.
+  command -v jq >/dev/null || skip "needs jq"
+  _mk_account work
+  _box_account_write "$CN" work
+  container_name_for() { echo "$CN"; }
+  mkdir -p "$CLEAT_PROJECTS_DIR/other"
+  printf '{"oauthAccount":{"emailAddress":"sibling@example.com"}}\n' > "$CLEAT_PROJECTS_DIR/other/claude.json"
+  printf '{}\n' > "$HOME/.claude.json"
+  mkdir -p "$TEST_TEMP/store"
+  _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
+  run jq -r '.oauthAccount // "absent"' "$TEST_TEMP/store/claude.json"
+  assert_output "absent"
 }

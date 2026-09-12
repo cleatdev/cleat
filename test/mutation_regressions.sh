@@ -6091,14 +6091,18 @@ try "vnext_sessions_narrow_on_redraw" "a window narrowed during an action leaves
 # The whole feature IS this env var. Without it a pinned box reads the shared
 # store and the switch is a no-op that reports success.
 cat > "$SED_TMP" << 'SED'
-s/^    CLAUDE_ENV+=(-e "CLAUDE_SECURESTORAGE_CONFIG_DIR=[$]{_ACCOUNT_BOX_DIR}")$/    :/
+/^exec_claude()/,/^}$/{
+  s@^  _account_apply_exec_env "[$]cname" .. _pinned_account="[$]_ACCOUNT_DEFAULT"$@  :@
+}
 SED
 try "vnext_account_env_var" "a pinned box gets the credential store env var" "$CLI" "$ACCOUNTS_BATS"
 
 # And the default sentinel must set NOTHING, or every box that never runs the
 # verb is a silent migration.
 cat > "$SED_TMP" << 'SED'
-s/^  if \[\[ "[$]_pinned_account" != "[$]_ACCOUNT_DEFAULT" \]\]; then$/  if true; then/
+/^_account_apply_exec_env()/,/^}$/{
+  s@^  \[\[ "[$]acct" != "[$]_ACCOUNT_DEFAULT" \]\] .. return 0$@  :@
+}
 SED
 try "vnext_account_default_sets_nothing" "an unpinned box gets no credential store env var" "$CLI" "$ACCOUNTS_BATS"
 
@@ -6127,7 +6131,7 @@ try "vnext_account_mount_source" "the per-box auth directory is created before a
 # copy of, and lands the user back on /login.
 cat > "$SED_TMP" << 'SED'
 /^_account_wipe_run_dir()/,/^}$/{
-  s/^  _account_sync_out "[$]cname" || true$/  :/
+  s@^  _account_sync_out "[$]cname" .. rc=[$]?$@  :@
 }
 SED
 try "vnext_account_wipe_harvests" "wiping a box run dir harvests first" "$CLI" "$ACCOUNTS_BATS"
@@ -6165,6 +6169,7 @@ cat > "$SED_TMP" << 'SED'
 /^_account_write_file_0600()/,/^}$/{
   s#umask 077#umask 022#
   s#^  chmod 600 "[$]tmp" 2>/dev/null .. true$#  :#
+  s#^  tmp="[$](mktemp .*#  tmp="${dest}.tmp.$$"#
 }
 SED
 try "vnext_account_cred_mode" "a new store is 0700 and its credential 0600" "$CLI" "$ACCOUNTS_BATS"
@@ -6272,6 +6277,202 @@ cat > "$SED_TMP" << 'SED'
 s/^    session|sessions|ses) cmd_sessions "[$]@" ;;$/    session) cmd_sessions "$@" ;;/
 SED
 try "vnext_session_verb_aliases" "the plural and the short form still reach the session verb" "$CLI" "$SMOKE_BATS"
+
+# ── what the adversarial pass found ────────────────────────────────────────
+#
+# Every one of these was live in a green suite. They are here because each is
+# SILENT when it breaks: a login that disappears, a token written where anyone
+# can read it, a percentage shown as current when it is hours old.
+
+# THE critical one. Newest-wins is only valid WITHIN an account, so without the
+# drop the staged file (the account being LEFT, usually the fresher one) stayed
+# put and was later harvested into the account just switched TO.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^  if \[\[ "[$]current" != "[$]acct" \]\]; then$@  if false; then@
+}
+SED
+try "vnext_account_switch_swaps_credential" "switching stages the incoming credential even when" "$CLI" "$ACCOUNTS_BATS"
+
+# The identity of the account being switched TO must not come from a project
+# file that still holds the OUTGOING account.
+cat > "$SED_TMP" << 'SED'
+s#^  _account_capture_meta "[$]acct" "" .. true$#  _account_capture_meta "$acct" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true#
+SED
+try "vnext_account_no_identity_bleed" "switching to a new account does not stamp it" "$CLI" "$ACCOUNTS_BATS"
+
+# A glob must never decide identity: a dash is legal inside an account name.
+cat > "$SED_TMP" << 'SED'
+/^_account_restore()/,/^}$/{
+  s@"[$]{base#[*]-}" == "[$]acct"@"$base" == *-"$acct"@
+}
+SED
+try "vnext_account_restore_exact_name" "restore does not resurrect a different account" "$CLI" "$ACCOUNTS_BATS"
+
+# "Newer" alone must not earn an overwrite of the only host copy: the source is
+# a directory the box mounts read-write.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_out()/,/^}$/{
+  s#^  _account_cred_plausible "[$]box_cred" .. return 1$#  :#
+}
+SED
+try "vnext_account_harvest_plausible" "a box cannot destroy a stored credential" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_out()/,/^}$/{
+  s#^  \[\[ "[$]be" -le [$](( now_ms + 7776000000 )) \]\] .. return 1$#  :#
+}
+SED
+try "vnext_account_harvest_expiry_sane" "a harvest is refused when the expiry is further out" "$CLI" "$ACCOUNTS_BATS"
+
+# A credential the box wrote is read into a shell variable, so it is capped.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  s#^  _account_cred_sane_size "[$]src" .. return 1$#  :#
+}
+SED
+try "vnext_account_cred_size_cap" "an oversized credential file is never read" "$CLI" "$ACCOUNTS_BATS"
+
+# mkdir -p creates the PARENT at the host umask.
+cat > "$SED_TMP" << 'SED'
+/^_account_ensure_dir()/,/^}$/{
+  s#^  chmod 700 "[$]CLEAT_ACCOUNTS_DIR" 2>/dev/null .. true$#  :#
+}
+SED
+try "vnext_account_parent_mode" "the accounts directory itself is not world-readable" "$CLI" "$ACCOUNTS_BATS"
+
+# cmd_clean was the one wipe in the file that skipped the harvest.
+cat > "$SED_TMP" << 'SED'
+/^cmd_clean()/,/^}$/{
+  s#^        _account_wipe_run_dir "[$]_cn"$#        rm -rf "$_d" 2>/dev/null || true#
+}
+SED
+try "vnext_account_clean_harvests" "cleat clean harvests before it prunes" "$CLI" "$ACCOUNTS_BATS"
+
+# A wipe after a FAILED harvest must not delete the thing the harvest was
+# protecting.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s#^  if \[\[ [$]rc -ne 0 \]\]; then$#  if false; then#
+}
+SED
+try "vnext_account_wipe_keeps_unharvested" "a failed harvest leaves the staged credential" "$CLI" "$ACCOUNTS_BATS"
+
+# After the trash the store path is gone, so the harvest has to come first.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s#^    _account_sync_out "[$]b" .. true$#    :#
+}
+SED
+try "vnext_account_remove_harvests_first" "removing an account harvests every pinned box" "$CLI" "$ACCOUNTS_BATS"
+
+# /login is the one command whose whole job is to WRITE a credential.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s#^  CLAUDE_ENV+=(-e "CLAUDE_SECURESTORAGE_CONFIG_DIR=[$]{_ACCOUNT_BOX_DIR}")$#  :#
+}
+SED
+try "vnext_account_login_override" "cleat login carries the credential store override" "$CLI" "$ACCOUNTS_BATS"
+
+# Never point Claude at a store the container does not have.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s#^  if \[\[ [$]ready -eq 1 \]\]; then$#  if false; then#
+}
+SED
+try "vnext_account_no_mount_no_env" "a box with no auth mount is never pointed" "$CLI" "$ACCOUNTS_BATS"
+
+# docker exec needs a RUNNING container; inspect reads a stopped one.
+cat > "$SED_TMP" << 'SED'
+/^_account_box_ready()/,/^}$/{
+  s#^  docker inspect .*#  docker exec "$cname" test -d "$_ACCOUNT_BOX_DIR" >/dev/null 2>\&1 || return 1#
+  s#^    | grep -qx "[$]_ACCOUNT_BOX_DIR" .. return 1$#  :#
+}
+SED
+try "vnext_account_probe_stopped_box" "the mount probe reads a STOPPED box" "$CLI" "$ACCOUNTS_BATS"
+
+# Going back to the shared login is still a credential swap.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s#^    if _daemon_up \&\& container_exists "[$]cname" \&\& _box_has_live_agent "[$]cname"; then$#    if false; then#
+}
+SED
+try "vnext_account_default_live_gate" "going back to the shared login respects the live-session gate" "$CLI" "$ACCOUNTS_BATS"
+
+# Non-empty is not the same as usable: a logout leaves the file in place.
+cat > "$SED_TMP" << 'SED'
+/^_account_cred_plausible()/,/^}$/{
+  s#^  \[\[ -n "[$]at" \&\& -n "[$]rt" \]\]$#  return 0#
+}
+SED
+try "vnext_account_emptied_cred" "an emptied shared credential is not reported as logged in" "$CLI" "$ACCOUNTS_BATS"
+
+# _age_from_delta already ends in the word.
+cat > "$SED_TMP" << 'SED'
+s#^      \*) d2="last used [$](_age_from_delta [$](( now - last )))" ;;$#      *) d2="last used $(_age_from_delta $(( now - last ))) ago" ;;#
+SED
+try "vnext_account_no_double_ago" "an age is never printed with the word ago twice" "$CLI" "$ACCOUNTS_BATS"
+
+# The pane clamps from the right, so a trailing stamp is the first thing cut.
+cat > "$SED_TMP" << 'SED'
+/^_account_usage_render()/,/^}$/{
+  s#^    out="last known [$]{out} (as of [$](_age_from_delta [$](( now - at ))))"$#    out="${out} (as of $(_age_from_delta $(( now - at ))))"#
+}
+SED
+try "vnext_account_stale_marker_survives" "a stale usage snapshot says so even when" "$CLI" "$ACCOUNTS_BATS"
+
+# A silently cut name creates a NEW empty account when it is retyped.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_frame()/,/^}$/{
+  s#^        printf -v meta '%s %-10.10s' "[$]{nm:0:12}…" "[$]{_ACCT_AUTH\[[$]n\]}"$#        printf -v meta '%-13.13s %-10.10s' "$nm" "${_ACCT_AUTH[$n]}"#
+}
+SED
+try "vnext_account_name_truncation_visible" "an account name too wide for its column" "$CLI" "$ACCOUNTS_BATS"
+
+# A pane clamped by character count wraps on CJK, and a wrapped line walks the
+# whole block down the screen.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_frame()/,/^}$/{
+  s#^  case "[$]d1" in \*\[!\\ -~\]\*) if _has_unicode; then d1room=[$](( droom / 2 )); (( d1room < 1 )) \&\& d1room=1; fi ;; esac$#  :#
+}
+SED
+try "vnext_account_detail_wide_chars" "a wide-character detail line is budgeted" "$CLI" "$ACCOUNTS_BATS"
+
+# The back-out walks up a FIXED three lines.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_action_tui()/,/^}$/{
+  s@^  who="[$](_sessions_safe_title "[$]who")"$@  who="$who"@
+}
+SED
+try "vnext_account_action_who_clamped" "the action screen clamps a long email" "$CLI" "$ACCOUNTS_BATS"
+
+# A pinned box must not be re-stamped with the host account identity. Three
+# parts cooperate (the overlay list, the del, the sibling gate) and only the
+# OUTCOME is observable, so the mutation removes the two that can carry the
+# host copy through.
+cat > "$SED_TMP" << 'SED'
+s#^        | (if [$]pinned then del(.oauthAccount) else . end)$#        | .#
+s#^        + ( (if [$]pinned then \["userID","lastOnboardingVersion"\]$#        + ( (if false then ["userID","lastOnboardingVersion"]#
+SED
+try "vnext_account_identity_split" "a pinned box is not re-stamped" "$CLI" "$ACCOUNTS_BATS"
+
+# The sibling gate sits BEHIND the del, so its effect on the output is masked.
+# What it does observably is stop a pinned box READING other projects' files at
+# all, which is what the test watches.
+cat > "$SED_TMP" << 'SED'
+/^_build_project_claude_json()/,/^}$/{
+  s#^    if \[\[ [$]_bpj_pinned -eq 0 \]\]; then$#    if true; then#
+}
+SED
+try "vnext_account_sibling_pin_filter" "a pinned box does not even read a sibling" "$CLI" "$ACCOUNTS_BATS"
+
+# A trash entry that holds nothing reports success and restores nothing.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash()/,/^}$/{
+  s#^  if \[\[ [$]moved -eq 0 \]\]; then$#  if false; then#
+}
+SED
+try "vnext_sessions_no_phantom_trash" "an empty trash entry is never left behind" "$CLI" "$SESSIONS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

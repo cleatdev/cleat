@@ -2134,3 +2134,30 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   assert_output --partial "Window too narrow"
   [ ! -f "$TEST_TEMP/keyread" ]
 }
+
+@test "sessions: deleting a session another window already deleted is refused, not reported as done" {
+  # The old path created the trash entry, moved nothing into it, and reported
+  # success. The row then sat in the trash view for thirty days restoring
+  # nothing.
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1"
+  # The confirm has already happened; the other window deletes it here.
+  _sessions_path_under_key() { return 0; }
+  _path_mtime() { echo 1234; }
+  rm -f "$SDIR/${U1}.jsonl"
+  run _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
+  assert_failure
+  assert_output --partial "already gone"
+  [ -z "$(ls -A "$SDIR/.cleat-trash" 2>/dev/null)" ]
+}
+
+@test "sessions: an empty trash entry is never left behind" {
+  _pass_gates
+  _mk_session "$U1"
+  rm -f "$SDIR/${U1}.jsonl"
+  run _sessions_trash "$SDIR" "$U1" "$TEST_TEMP/proj" "cleat-x"
+  [ "$status" -eq 3 ]
+  [ -z "$(ls -A "$SDIR/.cleat-trash" 2>/dev/null)" ]
+}

@@ -62,6 +62,7 @@ KITS_BATS="$REPO_ROOT/test/unit/kits.bats"
 AUTOSTART_BATS="$REPO_ROOT/test/unit/autostart.bats"
 SMOKE_BATS="$REPO_ROOT/test/unit/smoke.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
+SESSIONS_BATS="$REPO_ROOT/test/unit/sessions.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 PROVISION_BATS="$REPO_ROOT/test/unit/provision.bats"
 DOCKER_GATE_BATS="$REPO_ROOT/test/unit/docker_gate.bats"
@@ -5470,6 +5471,373 @@ cat > "$SED_TMP" << 'SED'
 s@|| \[ -e "\$clip_dir/clipboard" \]@|| [ -f "$clip_dir/clipboard" ]@
 SED
 try "vnext_clip_poll_drops_directory" "directory planted as the payload" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# vnext: _derive_project_session_key must pin the locale, like _claude_session_key
+cat > "$SED_TMP" << 'SED'
+/^_derive_project_session_key()/,/^}$/{
+  s/| LC_ALL=C tr /| tr /
+  s/| LC_ALL=C sed /| sed /
+}
+SED
+try "vnext_session_key_locale_pin" "session key is derived under a pinned C locale"
+
+# ── cleat sessions (concept/43) ────────────────────────────────────────────
+# Every mutation here reverts one guard that keeps a delete inside the strict
+# UUID allowlist. The session directory also holds the user's auto-memory and
+# cleat's own bind-mounted history.jsonl, so a missed guard is data loss.
+
+# The UUID allowlist is what stops history.jsonl, memory/ and agent scratch
+# directories from being treated as sessions.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_is_uuid()/,/^}$/{
+  s/    \*) return 1 ;;/    *) return 0 ;;/
+}
+SED
+try "vnext_sessions_uuid_allowlist" "scan never lists history.jsonl" "$CLI" "$SESSIONS_BATS"
+
+# history.jsonl is asserted by name on top of the UUID test, because it is
+# cleat's own file and a live bind source for every running box.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_path_under_key()/,/^}$/{
+  s/  case "\$base" in ''|\.|\.\.|history\.jsonl) return 1 ;; esac/  case "$base" in ''|.|..) return 1 ;; esac/
+}
+SED
+try "vnext_sessions_history_excluded" "containment refuses history.jsonl by name" "$CLI" "$SESSIONS_BATS"
+
+# Textual prefix alone is not containment: it cannot resolve '..'.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_path_under_key()/,/^}$/{
+  s/^  \[\[ "\$parent_p" == "\$root_p" \]\]/  return 0/
+}
+SED
+try "vnext_sessions_physical_parent" "containment refuses a traversal out of the key dir" "$CLI" "$SESSIONS_BATS"
+
+# A symlinked transcript would let a delete reach any file on the host.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_path_under_key()/,/^}$/{
+  /\[\[ -L "\$target" \]\] && return 1/d
+}
+SED
+try "vnext_sessions_symlink_refused" "containment refuses a symlink" "$CLI" "$SESSIONS_BATS"
+
+# The sidecar directory is most of a session's bytes, and holds its subagent
+# transcripts. Deleting only the .jsonl leaks it and lies about the reclaim.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_delete_set()/,/^}$/{
+  /printf '%s\\n' "\${sdir}\/\${uuid}"$/d
+}
+SED
+try "vnext_sessions_deletes_sidecar" "delete moves the transcript AND its sidecar" "$CLI" "$SESSIONS_BATS"
+
+# A down daemon cannot say whether the box is running, so it must refuse.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_live_gate()/,/^}$/{
+  s/^  if ! _daemon_up; then/  if false; then/
+}
+SED
+try "vnext_sessions_daemon_gate" "down daemon refuses the write" "$CLI" "$SESSIONS_BATS"
+
+# A box with a live agent is still appending to the transcript.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_live_gate()/,/^}$/{
+  s/^  if container_exists "\$cname" \&\& is_running "\$cname" \&\& _box_has_live_agent "\$cname"; then/  if false; then/
+}
+SED
+try "vnext_sessions_live_agent_gate" "live agent refuses the write" "$CLI" "$SESSIONS_BATS"
+
+# Without the tty check, a pipe satisfies the confirmation.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_do_delete()/,/^}$/{
+  s/^    if ! _is_interactive; then/    if false; then/
+}
+SED
+try "vnext_sessions_noninteractive_skip" "no tty and no --yes discloses and deletes nothing" "$CLI" "$SESSIONS_BATS"
+
+# Delete must be a move into the trash, never an unlink.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash()/,/^}$/{
+  s/^    if ! mv "\$p" "\$target" 2>\/dev\/null; then/    if ! rm -rf "$p"; then/
+}
+SED
+try "vnext_sessions_trash_not_unlink" "delete is a move, not an unlink" "$CLI" "$SESSIONS_BATS"
+
+# A rename that moves the mtime changes which conversation resumes next.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  /touch -r "\$stamp" "\$f" 2>\/dev\/null \|\| true/d
+}
+SED
+try "vnext_sessions_rename_keeps_mtime" "rename leaves the transcript mtime alone" "$CLI" "$SESSIONS_BATS"
+
+# The title whitelist is the only thing stopping a forged record.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_title_ok()/,/^)$/{
+  /\*\[\\"\\\\\]\*)  return 1 ;;/d
+}
+SED
+try "vnext_sessions_title_whitelist" "a backslash in a title is refused" "$CLI" "$SESSIONS_BATS"
+
+# The viewport must be sized from the terminal, not from a constant.
+cat > "$SED_TMP" << 'SED'
+s/^_SESSIONS_CHROME_LINES=8$/_SESSIONS_CHROME_LINES=4/
+SED
+try "vnext_sessions_chrome_budget" "frame fills the terminal height when the list is longer" "$CLI" "$SESSIONS_BATS"
+
+# The viewport must never be taller than the list.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_measure()/,/^}$/{
+  s/^  if \[\[ "\$total" -lt "\$avail" \]\]; then/  if false; then/
+}
+SED
+try "vnext_sessions_page_fits_list" "viewport never exceeds the number of sessions" "$CLI" "$SESSIONS_BATS"
+
+# Erasing a line BEFORE its replacement text is the blink.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  s|buf="\${buf}\${line}.033\[K.n"|buf="${buf}\\033[2K${line}\\n"|
+}
+SED
+try "vnext_sessions_no_leading_erase" "frame never blanks a line before rewriting" "$CLI" "$SESSIONS_BATS"
+
+# The cursor clamp is what stops a shrink leaving the highlight off-screen,
+# with ENTER still armed over a row the user cannot see.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_clamp()/,/^}$/{
+  s/^  (( _SESS_OFFSET < _SESS_CURSOR - _SESS_PAGE + 1 )) && _SESS_OFFSET=.*/  :/
+}
+SED
+try "vnext_sessions_cursor_clamp" "shrunk viewport pulls the cursor back into view" "$CLI" "$SESSIONS_BATS"
+
+# stty must be read before tput: an exported LINES poisons tput via use_env and
+# would freeze the viewport at its launch size.
+cat > "$SED_TMP" << 'SED'
+/^_term_size()/,/^}$/{
+  s|^  sz="\$(stty size 2>/dev/null .. true)"|  sz=""|
+}
+SED
+try "vnext_sessions_stty_first" "_term_size prefers the live stty reading" "$CLI" "$SESSIONS_BATS"
+
+# A zero or leading-zero size must not reach (( )).
+cat > "$SED_TMP" << 'SED'
+/^_term_size()/,/^}$/{
+  s/case "\$rows" in ..|0\*|\*\[!0-9\]\*) rows="" ;; esac/case "$rows" in ""|*[!0-9]*) rows="" ;; esac/
+  s/case "\$cols" in ..|0\*|\*\[!0-9\]\*) cols="" ;; esac/case "$cols" in ""|*[!0-9]*) cols="" ;; esac/
+}
+SED
+try "vnext_sessions_zero_size_rejected" "_term_size rejects a zero size" "$CLI" "$SESSIONS_BATS"
+
+# The action screen must be width-managed or it walks on a narrow terminal.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_action_draw()/,/^}$/{
+  /\[\[ \${#desc} -gt \$room \]\] && desc=/d
+}
+SED
+try "vnext_sessions_action_width" "action screen never exceeds the terminal width" "$CLI" "$SESSIONS_BATS"
+
+# Without truncation a long title wraps, the frame emits more physical lines
+# than the reposition moves up, and the block walks down the screen.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  /\[\[ \${#t} -gt \$rm \]\] && t=/d
+}
+SED
+try "vnext_sessions_row_truncated" "a long title is truncated to the terminal width" "$CLI" "$SESSIONS_BATS"
+
+# A title is model-written text drawn on the host terminal.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_safe_str()/,/^}$/{
+  s/^  printf '%s' "\$1" | LC_ALL=C tr -d '\\000-\\037\\177' | sed 's\/\\\\\/\\\\\\\\\/g'/  printf '%s' "$1"/
+}
+SED
+try "vnext_sessions_title_sanitized" "a newline in a title cannot split the row" "$CLI" "$SESSIONS_BATS"
+
+# A short prefix is how you delete the wrong conversation.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_id_shape()/,/^}$/{
+  s/^  \[\[ \${#1} -ge 8 \]\] || return 3/  [[ ${#1} -ge 1 ]] || return 3/
+}
+SED
+try "vnext_sessions_id_min_length" "a prefix shorter than 8 is refused" "$CLI" "$SESSIONS_BATS"
+
+# An ambiguous prefix must refuse, never pick the first match.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_resolve_id()/,/^}$/{
+  s/^    \*) for m in "\${matches\[@\]}"; do printf '%s\\n' "\$m"; done; return 4 ;;/    *) printf '%s' "${matches[0]}"; return 0 ;;/
+}
+SED
+try "vnext_sessions_ambiguous_refused" "an ambiguous prefix is refused rather than guessed" "$CLI" "$SESSIONS_BATS"
+
+# The transcript record is the one the picker reads; a sidecar-only write is
+# silently shadowed.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  /printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}\\n' "\$title" "\$uuid" >> "\$f" || return 1/d
+}
+SED
+try "vnext_sessions_rename_writes_record" "rename appends a custom-title record" "$CLI" "$SESSIONS_BATS"
+
+# A bare `stty echo` on restore discards every other terminal setting.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_echo_restore()/,/^}$/{
+  s/stty "\$_SESS_STTY"/stty echo/
+}
+SED
+try "vnext_sessions_echo_full_state" "echo-restore puts the saved state back verbatim" "$CLI" "$SESSIONS_BATS"
+
+# Echo must actually be turned off, or held arrows print into the frame.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_echo_off()/,/^}$/{
+  /stty -echo 2>\/dev\/null .. true/d
+}
+SED
+try "vnext_sessions_echo_off" "echo-off saves the whole termios state" "$CLI" "$SESSIONS_BATS"
+
+# A narrow terminal must fall back to the text list, not render wrapping rows.
+cat > "$SED_TMP" << 'SED'
+s/^_SESSIONS_MIN_COLS=40$/_SESSIONS_MIN_COLS=1/
+SED
+try "vnext_sessions_min_cols_gate" "terminal too narrow for a row is refused" "$CLI" "$SESSIONS_BATS"
+
+# The narrow check must read the RAW width; _term_cols floors at 40 and so can
+# never report a narrower terminal.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_too_narrow()/,/^}$/{
+  s|^  c="\$(_term_size)"|  c="$(_term_cols)"|
+  /c="\${c#\* }"/d
+}
+SED
+try "vnext_sessions_narrow_raw_width" "narrow check reads the raw width" "$CLI" "$SESSIONS_BATS"
+
+# A frame that shrank leaves the taller frame's tail painted below it.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/printf .\\033\[J./:/
+}
+SED
+try "vnext_sessions_shrink_erase" "frame that shrank erases the taller frame" "$CLI" "$SESSIONS_BATS"
+
+# A rename APPENDS, so it needs the same containment guard a delete has.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_do_rename()/,/^}$/{
+  s/^  if ! _sessions_path_under_key "\${sdir}\/\${uuid}.jsonl" "\$sdir"; then/  if false; then/
+}
+SED
+try "vnext_sessions_rename_containment" "rename refuses a symlinked transcript" "$CLI" "$SESSIONS_BATS"
+
+# printf pads to nine but does not truncate to it, so a 10-character age or
+# size pushes every row one column past the terminal and wraps it.
+cat > "$SED_TMP" << 'SED'
+s/%-9.9s %9.9s/%-9s %9s/g
+SED
+try "vnext_sessions_meta_col_clamp" "absurd age cannot push a full row past" "$CLI" "$SESSIONS_BATS"
+
+# The sidecar is written inside the box, so an unbounded read is a lever on
+# host memory.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_title_for()/,/^}$/{
+  s/head -c "\$_SESSIONS_TITLE_WINDOW" "\${sdir}\/\${uuid}\/custom-title.json"/cat "${sdir}\/${uuid}\/custom-title.json"/
+}
+SED
+try "vnext_sessions_sidecar_window" "sidecar title is read through the same window" "$CLI" "$SESSIONS_BATS"
+
+# A symlinked sidecar must be refused, not followed.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_title_for()/,/^}$/{
+  s/ \&\& \[\[ ! -L "\${sdir}\/\${uuid}\/custom-title.json" \]\]//
+}
+SED
+try "vnext_sessions_sidecar_symlink" "symlinked sidecar title file is refused" "$CLI" "$SESSIONS_BATS"
+
+# The trash DESTINATION needs containment too, not only the sources.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_dir()/,/^}$/{
+  s/^  if \[\[ -L "\$d" \]\]; then/  if false; then/
+}
+SED
+try "vnext_sessions_trash_symlink" "symlinked trash directory is refused" "$CLI" "$SESSIONS_BATS"
+
+# A poisoned trash must REFUSE the delete, not report success.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_do_delete()/,/^}$/{
+  s/^  if \[\[ \$_trc -eq 2 \]\]; then/  if false; then/
+}
+SED
+try "vnext_sessions_trash_refusal_fails" "delete refuses rather than trashing through" "$CLI" "$SESSIONS_BATS"
+
+# Five delete-set paths end in a bare <uuid>; a flat basename buries them.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash()/,/^}$/{
+  s/^        target="\${dest}\/ext\${idx}-\${base}" ;;/        target="${dest}\/${base}" ;;/
+}
+SED
+try "vnext_sessions_trash_namespace" "trashed items outside the key dir do not collide" "$CLI" "$SESSIONS_BATS"
+
+# Restore must refuse an ambiguous prefix, like every other id path. Turning
+# the refusal status into success is exactly the old behaviour: pick one.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_restore_resolve()/,/^}$/{
+  s/done; return 4 ;;/done; return 0 ;;/
+}
+SED
+try "vnext_sessions_restore_ambiguous" "restore refuses an ambiguous prefix" "$CLI" "$SESSIONS_BATS"
+
+# The line-oriented render sites must clamp the title to one row.
+cat > "$SED_TMP" << 'SED'
+s/_sessions_safe_title "\$title"/_sessions_safe_str "$title"/
+SED
+try "vnext_sessions_confirm_title_clamp" "huge title cannot scroll the delete confirmation" "$CLI" "$SESSIONS_BATS"
+
+# The cursor-up count must equal the frame's physical line count, or the block
+# walks down the screen one row per keypress.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^    block=\$(( _SESS_PAGE + 3 ))/    block=$(( _SESS_PAGE + 2 ))/
+}
+SED
+try "vnext_sessions_updown_balance" "loop moves up exactly as many lines" "$CLI" "$SESSIONS_BATS"
+
+# A $(printf ...) per row is a fork per row, which is most of what the redraw
+# rewrite removed.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  s/^      printf -v meta /      meta=$(printf /
+  s/"\${_SESS_SIZE\[\$n\]}"$/"${_SESS_SIZE[$n]}")/
+}
+SED
+try "vnext_sessions_frame_no_fork" "frame forks nothing per row" "$CLI" "$SESSIONS_BATS"
+
+# A window narrowed mid-session must leave the picker, not draw wrapping rows.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^    if \[\[ "\$_SESS_NARROW" == "1" \]\]; then/    if false; then/
+}
+SED
+try "vnext_sessions_narrow_midsession" "narrowing the window mid-session leaves" "$CLI" "$SESSIONS_BATS"
+
+# The frame must normalise hostile numbers rather than index an array with them.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  s/^  (( offset < 0 )) \&\& offset=0/  :/
+}
+SED
+try "vnext_sessions_frame_offset_guard" "frame normalises a hostile offset" "$CLI" "$SESSIONS_BATS"
+
+# The restore trap must be armed WITH the echo-off, before the row load can
+# fail under set -e and exit with the terminal unable to echo.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  /trap ._sessions_echo_restore; _cursor_show. EXIT/d
+}
+SED
+try "vnext_sessions_echo_exit_trap" "failure during the row load still restores" "$CLI" "$SESSIONS_BATS"
+
+# The mtime re-check closes the window between reading the list and confirming.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_do_delete()/,/^}$/{
+  s/^  if \[\[ "\$mt_now" != "\$mt_before" \]\]; then/  if false; then/
+}
+SED
+try "vnext_sessions_toctou_guard" "a transcript that changed since the scan aborts" "$CLI" "$SESSIONS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

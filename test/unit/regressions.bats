@@ -3588,3 +3588,30 @@ EOF
   run exec_claude "test-ctr" --dangerously-skip-permissions
   assert_output --partial "jq is not installed on the host"
 }
+
+@test "regression vnext: the session key is derived under a pinned C locale" {
+  # _claude_session_key pins LC_ALL=C and explains why; _derive_project_session_key
+  # did not, though it feeds the same class of path. Under a UTF-8 collation the
+  # A-Z range in its sed can match outside the letters it means, so the same
+  # project could key differently on two runs that differ only in locale. A key
+  # that moves orphans the project's entire session history and its .claude.json
+  # store, which is exactly the silent loss the dot and underscore bugs caused.
+  #
+  # The UTF-8 locale is DISCOVERED, never hardcoded: Linux images ship C.utf8
+  # and macOS ships en_US.UTF-8, and naming the wrong one makes setlocale fail
+  # silently, fall back to C, and compare C against C, which passes no matter
+  # what the code does.
+  local utf8_locale ascii utf8
+  utf8_locale="$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true)"
+  [ -n "$utf8_locale" ] || skip "no UTF-8 locale available on this host"
+  ascii="$(LC_ALL=C _derive_project_session_key "/tmp/Ärger_Project")"
+  utf8="$(LC_ALL="$utf8_locale" _derive_project_session_key "/tmp/Ärger_Project")"
+  [ "$ascii" = "$utf8" ]
+}
+
+@test "regression vnext: an ASCII project keys byte-identically to the pre-pin form" {
+  # The pin must not re-key anybody. This is the exact string the old code
+  # produced for this path.
+  run _derive_project_session_key "/Users/marcin/Workspaces/cleat"
+  assert_output "cleat-0f459ff8"
+}

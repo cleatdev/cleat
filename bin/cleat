@@ -110,6 +110,15 @@ _KIT_MODEL_CHOICES=(sonnet haiku opus inherit)
 # the longest _kit_description folded at 60 columns.
 _KIT_PANE_LINES=7
 
+# Rows the `cleat sessions` list shows at once. It is the first SCROLLING list
+# in this file: every other picker draws its whole list (9 rows at most), but a
+# project accumulates sessions without bound (27 in the maintainer's own repo),
+# and a block taller than the terminal loses its frame origin for good, because
+# cursor-up never scrolls the screen back down. The draw always emits exactly
+# this many rows, padding short pages with cleared blanks, so the redraw math
+# stays a compile-time constant the way _KIT_PANE_LINES does.
+_SESSIONS_PAGE_LINES=10
+
 # Persistent per-project Claude global-state (.claude.json) store. Unlike
 # $CLEAT_RUN_DIR (per-container, wiped on `cleat rm`/recreate), this is keyed by
 # PROJECT and deliberately survives recreate so a project's trust/MCP approvals
@@ -252,6 +261,123 @@ _is_interactive() { [[ -t 0 && -t 1 ]]; }
 _has_unicode() {
   local lang="${LANG:-}${LC_ALL:-}${LC_CTYPE:-}"
   [[ "$lang" == *UTF-8* ]] || [[ "$lang" == *utf8* ]]
+}
+
+# Terminal width, for truncating rows that carry arbitrary-length text.
+#
+# The first width helper in this file, and it arrives late: every existing
+# picker avoids wrapping by keeping its rows short by hand, which is a rule a
+# comment cannot enforce. A session row carries a model-written title of any
+# length, so it has to measure.
+#
+# COLUMNS is not exported to scripts (bash sets it for interactive shells only),
+# so it is usually empty here and tput answers instead. tput is an OPTIONAL
+# dependency in this CLI (see _cursor_hide's `command -v` guard), so 80 is the
+# floor. Clamped at both ends because the fixed-height redraw math breaks on a
+# 20-column terminal and gains nothing past 200.
+# Raw terminal geometry as "ROWS COLS", falling back to 24 80. The single
+# measurement both _term_rows and _term_cols are built on.
+#
+# ORDER MATTERS AND IT IS NOT THE OBVIOUS ONE. `stty size` comes first because
+# it is the only LIVE reading: it asks the kernel for the window size of fd 0
+# every time. `tput` is second and can be actively wrong, because ncurses
+# use_env makes an exported LINES or COLUMNS override the real ioctl, so a user
+# whose shell rc exports either would get the launch-time size forever and the
+# viewport would never follow a resize. The environment variables themselves are
+# not consulted at all: bash sets them for interactive shells and does not
+# export them, so a script never sees them anyway.
+#
+# `stty size` reads fd 0 and fails loudly (non-zero, empty) when stdin is not a
+# terminal, which is what makes the 24x80 fallback deterministic in tests. tput
+# is the opposite and cannot be error-checked: with no measurement it prints the
+# terminfo entry's static size and still exits 0.
+#
+# The reject pattern includes `0*`, which covers two real cases in one: a pty
+# whose window size was never set reports "0 0" with rc 0, and a leading-zero
+# value would be read as octal by (( )) and kill the binary under `set -e`.
+_term_size() {
+  local rows="" cols="" sz
+  sz="$(stty size 2>/dev/null || true)"
+  set -- $sz
+  rows="${1:-}"; cols="${2:-}"
+  case "$rows" in ''|0*|*[!0-9]*) rows="" ;; esac
+  case "$cols" in ''|0*|*[!0-9]*) cols="" ;; esac
+  if [[ -z "$rows" || -z "$cols" ]] && command -v tput >/dev/null 2>&1; then
+    [[ -n "$rows" ]] || rows="$(tput lines 2>/dev/null || true)"
+    [[ -n "$cols" ]] || cols="$(tput cols 2>/dev/null || true)"
+    case "$rows" in ''|0*|*[!0-9]*) rows="" ;; esac
+    case "$cols" in ''|0*|*[!0-9]*) cols="" ;; esac
+  fi
+  printf '%s %s' "${rows:-24}" "${cols:-80}"
+}
+
+# One row's worth of sanitized title, for the line-oriented render sites.
+#
+# _sessions_frame clamps the title to the row budget, but the `echo -e` lines
+# (the delete confirmation's headline, the rename prompt's "Current:" line and
+# the action screen's header) did not. A title can be as long as the title
+# window allows, so an over-long one wrapped to arbitrarily many physical lines
+# and scrolled the very line naming the session id and its size off the screen.
+# That is the line a user reads before answering a destructive prompt.
+_sessions_safe_title() {
+  local t
+  t="$(_sessions_safe_str "$1")"
+  local room
+  room=$(( $(_term_cols) - 18 ))
+  (( room < 12 )) && room=12
+  if [[ ${#t} -gt $room ]]; then
+    t="${t:0:$(( room - 1 ))}…"
+  fi
+  printf '%s' "$t"
+}
+
+# Terminal width for row truncation, clamped to what the renderer can lay out.
+#
+# The clamp is a RENDERING range, not a claim about the terminal. A window
+# narrower than the floor cannot hold this layout at all, and pretending it is
+# 40 columns wide makes every row wrap, which is what actually destroys a
+# fixed-height redraw. So callers that care must ask _term_size themselves and
+# refuse, the way cmd_sessions does before it ever opens the picker.
+_term_cols() {
+  local c
+  c="$(_term_size)"
+  c="${c#* }"
+  case "$c" in ''|0*|*[!0-9]*) c=80 ;; esac
+  (( c < 40 ))  && c=40
+  (( c > 200 )) && c=200
+  printf '%s' "$c"
+}
+
+# Terminal height, same contract.
+_term_rows() {
+  local r
+  r="$(_term_size)"
+  r="${r%% *}"
+  case "$r" in ''|0*|*[!0-9]*) r=24 ;; esac
+  (( r < 5 ))   && r=5
+  (( r > 200 )) && r=200
+  printf '%s' "$r"
+}
+
+# Render-safety for a session title or prompt preview.
+#
+# _sanitize_repo_str above is the WRONG tool for this class and must not be used
+# on it. That one deliberately KEEPS newline and tab (its input is repo-authored
+# multi-line text), and a session title is drawn as ONE row: a newline in it
+# would inject an extra physical line, desyncing the fixed-height redraw and
+# letting a title forge a convincing "Delete session X? [y/N]" line of its own.
+# It also strips \200-\237, which eats UTF-8 continuation bytes and mangles any
+# non-ASCII title.
+#
+# So: drop every C0 control byte INCLUDING newline and carriage return (a lone
+# CR rewinds the cursor to column 0, so a row could overwrite the row above and
+# hide which session is really selected) and DEL, but leave 0x80+ alone so UTF-8
+# survives. Double backslashes last, because every render site is `echo -e`.
+#
+# This text is model-written and lives in a file the box can write, so it is
+# untrusted in the same sense a repo file is. Sanitize at every render site.
+_sessions_safe_str() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | sed 's/\\/\\\\/g'
 }
 
 # True when the terminal is known to render OSC 8 hyperlinks (and we're on a
@@ -451,11 +577,18 @@ _validate_box_name() {
 # <basename>-<hash8> key BYTE-IDENTICALLY: folding a suffix in for the default
 # would orphan every existing user's session history on upgrade. A named box
 # appends "-<box>" so two boxes over one workspace never share sessions.
+#
+# LC_ALL=C pins tr and sed to ASCII, exactly as _claude_session_key does and
+# explains. Without it a UTF-8 collation can fold a non-ASCII basename
+# differently from one run to the next (a locale change between two `cleat`
+# invocations is enough), and a key that moves orphans the project's whole
+# session history and its .claude.json store. Byte-identical for every ASCII
+# basename, so no existing user is re-keyed by adding the pin.
 _derive_project_session_key() {
   local project="$1"
   local box="${2:-}"
   local _basename _hash key
-  _basename="$(basename "$project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _basename="$(basename "$project" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g')"
   _hash="$(echo -n "$project" | _md5 | head -c 8)"
   key="${_basename}-${_hash}"
   if [[ -n "$box" && "$box" != "main" ]]; then
@@ -3285,14 +3418,14 @@ _fork_dir() { printf '%s\n' "$(_fork_root)/$1"; }
 
 # How long ago the copy was taken. The fork directory's own mtime is the
 # timestamp, so there is no extra state to write or keep in sync.
-_fork_age_human() {
-  local dir="$1" now mt delta
-  [[ -d "$dir" ]] || return 0
-  mt="$(_path_mtime "$dir")"
-  [[ "$mt" =~ ^[0-9]+$ ]] && [[ "$mt" -gt 0 ]] || return 0
-  now="$(date +%s 2>/dev/null || echo 0)"
-  [[ "$now" =~ ^[0-9]+$ ]] || return 0
-  delta=$(( now - mt ))
+# Age of an EPOCH, as a short human string. Split out of _fork_age_human so a
+# file mtime can use it too (the fork helper takes a directory and stats it);
+# the tiers and the wording are unchanged, so both callers read identically.
+# The tiers, given an already-computed age in seconds. Split out so a caller
+# formatting many rows pays for ONE `date` instead of one per row: that fork was
+# a measurable part of what made the sessions picker blink.
+_age_from_delta() {
+  local delta="$1"
   # A copy taken this second, or a clock that moved backwards, is "just now"
   # rather than nothing at all: an empty age would silently drop the whole line.
   (( delta < 0 )) && delta=0
@@ -3301,6 +3434,20 @@ _fork_age_human() {
   elif (( delta < 172800 ));then printf '%dh ago' $(( delta / 3600 ))
   else                           printf '%dd ago' $(( delta / 86400 ))
   fi
+}
+
+_age_human() {
+  local mt="$1" now
+  [[ "$mt" =~ ^[0-9]+$ ]] && [[ "$mt" -gt 0 ]] || return 0
+  now="$(date +%s 2>/dev/null || echo 0)"
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+  _age_from_delta $(( now - mt ))
+}
+
+_fork_age_human() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  _age_human "$(_path_mtime "$dir")"
 }
 
 # Whether a box is a fork is recorded SEPARATELY from the copy itself, in the
@@ -10739,6 +10886,1382 @@ cmd_storage() {
   echo ""
 }
 
+# ── Sessions (concept/43-session-management.md) ─────────────────────────────
+# Claude Code writes one transcript per conversation and never deletes one on
+# demand: the terminal CLI has `claude project purge` (a whole project at once)
+# and a `cleanupPeriodDays` sweep that removes by last-modified date, but no way
+# to remove ONE. Cleat already owns the directory those transcripts land in
+# (_derive_project_session_key, mounted per box at cmd_run), so it is the natural
+# place to manage them. `cleat sessions` lists them with real sizes, renames one
+# and moves one to a trash it can restore from.
+#
+# Two facts shape everything below.
+#
+# 1. A session is TWO filesystem objects, not one: <uuid>.jsonl and a sibling
+#    <uuid>/ directory holding subagent transcripts, workflow state and tool
+#    results. Measured on the maintainer's own repo the sidecar is ~5x the
+#    transcript (118 MB vs 938 MB for the largest), so a size column or a delete
+#    that sees only the .jsonl under-reports by 8x and silently leaves most of
+#    the bytes behind. They are always handled as one unit.
+#
+# 2. The directory is NOT a pure session store. It also holds Claude Code's
+#    per-project auto-memory (memory/), cleat's own history.jsonl (created at
+#    cmd_run and bind-mounted live into every box of this project), and whatever
+#    scratch directories agents made. A `*` glob or a subtractive "everything
+#    that is not X" rule would eat the user's memory and orphan a live mount.
+#    Every operation is gated on a strict UUID allowlist instead.
+
+# The strict UUID shape, as a `case` glob rather than a regex: bash 3.2 has no
+# {n} repetition in its POSIX ERE, and writing it out leaves nothing to a
+# locale or a bracket-escape surprise. This is the single highest-value guard in
+# the feature: nothing is listed, renamed, trashed or restored whose basename
+# does not match it.
+_sessions_is_uuid() {
+  case "$1" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The host directory holding this project+box's transcripts. The SAME formula
+# cmd_run uses to create and mount it, reached through the same two helpers, so
+# the two can never drift.
+_sessions_key_dir() {
+  local project="$1" box="${2:-}"
+  local key
+  key="$(_derive_project_session_key "$project" "$box")"
+  # Defence in depth against a degenerate key: _derive_project_session_key always
+  # appends an md5 fragment so it cannot return empty, but the whole feature
+  # joins paths onto this and an empty value would aim every later operation at
+  # ~/.claude/projects itself.
+  [[ -n "$key" ]] || return 1
+  printf '%s' "${HOME}/.claude/projects/${key}"
+}
+
+# Pull the LAST value of a JSON string key out of a blob.
+#
+# ERE, not BRE. The obvious BRE form uses \| for alternation, which is a GNU
+# extension that silently matches NOTHING on BSD grep, i.e. every title on the
+# maintainer's own Mac would read "(no title)" while the Linux CI leg stayed
+# green. `grep -a` because a transcript can carry bytes that make grep call the
+# file binary and print nothing.
+#
+# The pattern requires the CLOSING quote, which is also the torn-read guard: the
+# host and a running box share this inode, so a fixed-size window can cut a
+# record mid-string. A candidate with no closing quote is simply not matched and
+# the caller falls through to the next source, which is stronger than trying to
+# validate the surrounding record shape.
+_sessions_json_str() {
+  local blob="$1" key="$2" hit
+  hit="$(printf '%s' "$blob" | LC_ALL=C grep -aoE "\"${key}\":\"([^\"\\\\]|\\\\.)*\"" | tail -1)" || hit=""
+  [[ -n "$hit" ]] || return 1
+  # Strip  "key":"  from the front and the single trailing quote.
+  hit="${hit#\"${key}\":\"}"
+  hit="${hit%\"}"
+  printf '%s' "$hit"
+}
+
+# Undo JSON string escapes, left to right.
+#
+# Left-to-right is required, not stylistic: a global ${v//\\n/ } would turn an
+# ESCAPED backslash followed by the letter n into a newline, so `C:\new` renders
+# as two lines. \uXXXX becomes '?' because bash 3.2's printf has no \u and
+# emitting the six literal characters into a terminal row is the worse of the
+# two wrong answers.
+_sessions_json_unesc() {
+  # Two statements deliberately. `local s="$1" n=${#s}` expands the whole
+  # command's words BEFORE any assignment takes effect, so n would be 0.
+  local s="$1"
+  local out="" i=0 n
+  n=${#s}
+  local c d
+  while [[ $i -lt $n ]]; do
+    c="${s:$i:1}"
+    if [[ "$c" == "\\" && $((i + 1)) -lt $n ]]; then
+      d="${s:$((i + 1)):1}"
+      case "$d" in
+        n|t)  out="${out} "; i=$((i + 2)) ;;
+        r)    i=$((i + 2)) ;;
+        u)    out="${out}?"; i=$((i + 6)) ;;
+        *)    out="${out}${d}"; i=$((i + 2)) ;;
+      esac
+    else
+      out="${out}${c}"
+      i=$((i + 1))
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# How many bytes of a transcript to read when resolving its title. Fixed, so a
+# 118 MB transcript costs the same as a 2 KB one: measured at 0.007s against the
+# real 118 MB file, and 0.226s to scan all 27 sessions including du over 1.3 GB
+# of sidecars. Reading whole files instead would make the list unusable.
+_SESSIONS_TITLE_WINDOW=65536
+
+# Resolve the label shown for a session, in Claude Code's own precedence order.
+#
+# A user-set title (/rename, Ctrl+R in the picker, -n at launch) is written as a
+# `custom-title` record and ALSO as a <uuid>/custom-title.json sidecar. The
+# record wins: on every already-titled session in the maintainer's corpus the
+# record sits inside the last 64 KiB, because Claude re-stamps it on each
+# session open. That is why a cleat rename writes BOTH and why the sidecar alone
+# is not enough (it would be silently shadowed).
+#
+# `ai-title` is Claude's own generated title and is deliberately ranked below a
+# custom one. The head read is last because it is the only one that can pick up
+# a title from a session whose tail has scrolled past it.
+_sessions_title_for() {
+  local sdir="$1" uuid="$2"
+  local f="${sdir}/${uuid}.jsonl" tail_blob head_blob v
+  if [[ -f "$f" ]]; then
+    tail_blob="$(tail -c "$_SESSIONS_TITLE_WINDOW" "$f" 2>/dev/null || true)"
+    if v="$(_sessions_json_str "$tail_blob" customTitle)"; then
+      _sessions_json_unesc "$v"; return 0
+    fi
+  fi
+  # Windowed like the transcript, and for the same reason: this file is written
+  # inside the box, so an unbounded `cat` here is an in-box agent's lever on
+  # host memory. A symlinked sidecar is refused outright rather than followed.
+  if [[ -f "${sdir}/${uuid}/custom-title.json" ]] && [[ ! -L "${sdir}/${uuid}/custom-title.json" ]]; then
+    if v="$(_sessions_json_str "$(head -c "$_SESSIONS_TITLE_WINDOW" "${sdir}/${uuid}/custom-title.json" 2>/dev/null || true)" customTitle)"; then
+      _sessions_json_unesc "$v"; return 0
+    fi
+  fi
+  if [[ -n "${tail_blob:-}" ]]; then
+    if v="$(_sessions_json_str "$tail_blob" aiTitle)"; then
+      _sessions_json_unesc "$v"; return 0
+    fi
+    if v="$(_sessions_json_str "$tail_blob" lastPrompt)"; then
+      _sessions_json_unesc "$v"; return 0
+    fi
+  fi
+  if [[ -f "$f" ]]; then
+    head_blob="$(head -c "$_SESSIONS_TITLE_WINDOW" "$f" 2>/dev/null || true)"
+    if v="$(_sessions_json_str "$head_blob" aiTitle)"; then
+      _sessions_json_unesc "$v"; return 0
+    fi
+  fi
+  printf '%s' "(no title)"
+}
+
+# Total apparent bytes a session occupies: transcript + sidecar directory.
+# _fork_size_kb is reused verbatim because it is already the one `du -sk` form
+# BSD and GNU agree on, already keeps its `|| true` INSIDE the pipeline (a du
+# that cannot descend still prints a valid total but exits non-zero, which
+# pipefail turned into "0 KB" for real multi-gigabyte trees), and already
+# carries the apparent-size caveat this feature has to repeat in its output.
+_sessions_size_kb() {
+  local sdir="$1" uuid="$2" bytes=0 kb=0 out
+  if [[ -f "${sdir}/${uuid}.jsonl" ]]; then
+    out="$(wc -c < "${sdir}/${uuid}.jsonl" 2>/dev/null || echo 0)"
+    # BSD wc left-pads its output, so take the first field rather than the word.
+    set -- $out
+    case "${1:-}" in ''|*[!0-9]*) bytes=0 ;; *) bytes="$1" ;; esac
+  fi
+  kb=$(( bytes / 1024 ))
+  if [[ -d "${sdir}/${uuid}" ]]; then
+    kb=$(( kb + $(_fork_size_kb "${sdir}/${uuid}") ))
+  fi
+  printf '%s' "$kb"
+}
+
+# One tab-joined row per session: mtime, size in KB, uuid, title. Sorted by the
+# caller. Only strict-UUID basenames are considered, which is what keeps
+# history.jsonl (same directory, matches *.jsonl, and a LIVE bind source for
+# every running box of this project) out of the list.
+_sessions_scan() {
+  local sdir="$1"
+  local f base uuid mt kb title
+  [[ -d "$sdir" ]] || return 0
+  for f in "$sdir"/*.jsonl; do
+    # No nullglob anywhere in this CLI, so an empty directory yields the literal
+    # pattern.
+    [[ -f "$f" ]] || continue
+    base="${f##*/}"
+    uuid="${base%.jsonl}"
+    _sessions_is_uuid "$uuid" || continue
+    mt="$(_path_mtime "$f")"
+    kb="$(_sessions_size_kb "$sdir" "$uuid")"
+    title="$(_sessions_title_for "$sdir" "$uuid")"
+    printf '%s\t%s\t%s\t%s\n' "$mt" "$kb" "$uuid" "$title"
+  done
+}
+
+# Newest first. `sort -rn` on the leading numeric field; an unreadable stat
+# yields mtime 0 from _path_mtime, which sorts last rather than crashing.
+_sessions_scan_sorted() {
+  _sessions_scan "$1" | sort -t "$(printf '\t')" -k1,1rn
+}
+
+# Physical containment, the guard whose absence cost a real host directory on
+# 2026-07-31 (see _fork_rm_tree). Modelled on _fork_path_under_root but takes
+# the root as a parameter, because that one hardcodes _fork_root.
+#
+# Both layers are kept and both are load-bearing. The textual test forces the
+# target ABSOLUTE and under the root: `cd -P` honours CDPATH for a relative
+# argument, so a physical-parent check used alone can be redirected. The
+# physical test then resolves '..' and symlinked parents, which the textual one
+# cannot. Parent-must-BE-root (not merely under it) is right because a
+# transcript and its sidecar both sit exactly one level down.
+_sessions_path_under_key() {
+  local target="$1" root="$2" base root_p parent_p
+  base="${target##*/}"
+  # history.jsonl is redundant against the UUID test every caller already ran,
+  # and it is asserted anyway: it is cleat's own file, it matches *.jsonl, and
+  # it is bind-mounted live into every box of this project, so losing it is the
+  # one mistake in this directory that breaks a RUNNING container.
+  case "$base" in ''|.|..|history.jsonl) return 1 ;; esac
+  case "$target" in "$root"/?*) : ;; *) return 1 ;; esac
+  [[ -L "$target" ]] && return 1
+  root_p="$(cd -P "$root" 2>/dev/null && pwd -P)" || return 1
+  parent_p="$(cd -P "$(dirname "$target")" 2>/dev/null && pwd -P)" || return 1
+  [[ "$parent_p" == "$root_p" ]]
+}
+
+# Refuse to write in this key dir when the box might still be writing it.
+#
+# "A delete must never run on a probe that cannot answer" (the rule written
+# after the 2026-07-31 fork-prune incident, where a stopped daemon made every
+# live box read as an orphan). A down daemon cannot answer whether the box is
+# running, so it refuses rather than assuming idle.
+#
+# Deliberately built on cleat's own tested primitives and NOT on Claude Code's
+# ~/.claude/sessions/<pid>.json store. That store is an undocumented internal of
+# a pinned third-party binary, its pid is container-namespaced and meaningless
+# to a Mac that has no process table for it, and reading it would add a "the
+# format moved and we silently fell open" failure mode. _box_has_live_agent
+# already fails SAFE: an unreadable or empty `docker top` counts as live.
+_sessions_live_gate() {
+  local cname="$1" box="$2"
+  if ! _daemon_up; then
+    error "Docker is not responding, so cleat cannot tell whether ${BOLD}${box}${RESET} is running."
+    echo -e "    ${DIM}Start Docker and try again. Listing sessions works without it.${RESET}"
+    return 1
+  fi
+  if container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
+    error "Box ${BOLD}${box}${RESET} has a live Claude session."
+    echo -e "    ${DIM}Stop it first: ${BOLD}cleat stop ${box}${RESET}${DIM}. Claude keeps appending to the transcript while it runs.${RESET}"
+    return 1
+  fi
+  return 0
+}
+
+# Every path a delete takes, one per line. Items 1-2 are the session itself;
+# 3-5 match Claude Code's own retention sweep; 6-9 are per-session state it
+# leaves behind. Each is existence-guarded by the caller and a missing one is
+# success, because a delete can race the vendor's own 30-day sweep.
+#
+# NOTE the two DIFFERENT key derivations, and do not conflate them: the session
+# directory is keyed <basename>-<md5_8> by _derive_project_session_key, while
+# Claude Code's own /tmp scratch path is keyed by _claude_session_key, its
+# encoding of the working directory. Conflating those two is exactly the fork
+# bug documented at _claude_session_key.
+_sessions_delete_set() {
+  local sdir="$1" uuid="$2" project="$3" cname="$4"
+  printf '%s\n' "${sdir}/${uuid}.jsonl"
+  printf '%s\n' "${sdir}/${uuid}"
+  printf '%s\n' "${sdir}/${uuid}.ccr-tip.json"
+  printf '%s\n' "${sdir}/${uuid}.precompact.json"
+  printf '%s\n' "${sdir}/${uuid}.desktop-released.json"
+  # Pre-edit copies of the user's real source files (what /rewind restores from).
+  # Per box under _CLAUDE_PRIVATE_DIRS, and on the host for a native session.
+  printf '%s\n' "${CLEAT_RUN_DIR}/${cname}/home/file-history/${uuid}"
+  printf '%s\n' "${HOME}/.claude/file-history/${uuid}"
+  printf '%s\n' "${HOME}/.claude/session-env/${uuid}"
+  printf '%s\n' "/tmp/claude-$(id -u)/$(_claude_session_key "$project")/${uuid}"
+}
+
+# Where a deleted session goes. Inside the key dir on purpose: `mv` is then a
+# rename on one filesystem, so trashing the 938 MB sidecar copies zero bytes and
+# is instant. A copy-based trash would be indefensible at that size.
+# The trash directory, refused when it is not a real directory sitting directly
+# inside the session dir. It lives in a tree the box mounts read-write, so a
+# symlink planted there would relocate a "deleted" session outside the session
+# directory while the delete reported success. Every source path is contained;
+# the destination has to be too.
+_sessions_trash_dir() {
+  local d="${1}/.cleat-trash"
+  if [[ -L "$d" ]]; then
+    return 1
+  fi
+  if [[ -e "$d" ]] && [[ ! -d "$d" ]]; then
+    return 1
+  fi
+  printf '%s' "$d"
+}
+
+_SESSIONS_TRASH_DAYS=30
+
+# Drop trash entries older than _SESSIONS_TRASH_DAYS. Matches only the
+# <epoch>-<uuid> naming this feature writes, so nothing else in the directory is
+# ever a candidate. Fail-soft: a sweep that cannot read the clock does nothing.
+_sessions_trash_sweep() {
+  local sdir="$1" tdir now cutoff d base stamp
+  tdir="$(_sessions_trash_dir "$sdir")" || return 0
+  [[ -d "$tdir" ]] || return 0
+  now="$(date +%s 2>/dev/null || echo 0)"
+  case "$now" in ''|*[!0-9]*|0) return 0 ;; esac
+  cutoff=$(( now - _SESSIONS_TRASH_DAYS * 86400 ))
+  for d in "$tdir"/*; do
+    [[ -d "$d" ]] || continue
+    base="${d##*/}"
+    stamp="${base%%-*}"
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    _sessions_is_uuid "${base#*-}" || continue
+    [[ "$stamp" -lt "$cutoff" ]] || continue
+    _sessions_path_under_key "$d" "$tdir" || continue
+    rm -rf "$d"
+  done
+}
+
+# Move one session's files into the trash. Returns 1 and touches nothing if the
+# transcript fails containment. An individual `mv` that fails is REPORTED and
+# left in place; it is never retried as an `rm`.
+_sessions_trash() {
+  local sdir="$1" uuid="$2" project="$3" cname="$4"
+  local tdir dest p base now failed=0
+  now="$(date +%s 2>/dev/null || echo 0)"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  # Exit 2 is "the trash itself is unusable", which is a REFUSAL. Exit 1 is
+  # "some individual items could not be moved", which is a warning. The caller
+  # has to tell them apart or a poisoned trash directory reads as a success.
+  tdir="$(_sessions_trash_dir "$sdir")" || return 2
+  dest="${tdir}/${now}-${uuid}"
+  mkdir -p "$dest" || return 1
+  local idx=0 target
+  while IFS= read -r p; do
+    idx=$(( idx + 1 ))
+    [[ -n "$p" ]] || continue
+    [[ -e "$p" ]] || continue
+    base="${p##*/}"
+    # Only the two objects that live in the key dir get the containment check;
+    # the rest are absolute paths this function built from fixed roots.
+    case "$p" in
+      "$sdir"/*)
+        if ! _sessions_path_under_key "$p" "$sdir"; then
+          warn "Refusing to move a path outside the session directory: ${p}"
+          failed=1
+          continue
+        fi
+        # Items in the key dir keep their real basename, because that is what
+        # _sessions_restore looks for when putting them back.
+        target="${dest}/${base}" ;;
+      *)
+        # Everything else is namespaced by its position in the delete set.
+        # FIVE of the nine paths end in a bare <uuid> (the sidecar, two
+        # file-history trees, session-env and the /tmp scratch), so a flat
+        # basename made the first one land as a directory and every later one
+        # get moved INSIDE it: the bytes were buried rather than trashed, and
+        # restore could never find them again.
+        target="${dest}/ext${idx}-${base}" ;;
+    esac
+    if ! mv "$p" "$target" 2>/dev/null; then
+      warn "Left in place ${DIM}(could not move)${RESET}: ${p}"
+      failed=1
+    fi
+  done < <(_sessions_delete_set "$sdir" "$uuid" "$project" "$cname")
+  return $failed
+}
+
+# Put a trashed session back. The reverse of _sessions_trash, under the same
+# containment guard, and it refuses to overwrite anything that reappeared.
+_sessions_restore() {
+  local sdir="$1" uuid="$2"
+  local tdir d base found="" p
+  tdir="$(_sessions_trash_dir "$sdir")" || return 1
+  [[ -d "$tdir" ]] || return 1
+  for d in "$tdir"/*-"$uuid"; do
+    [[ -d "$d" ]] || continue
+    found="$d"
+  done
+  [[ -n "$found" ]] || return 1
+  for p in "$found"/*; do
+    [[ -e "$p" ]] || continue
+    base="${p##*/}"
+    case "$base" in
+      "${uuid}.jsonl"|"$uuid"|"${uuid}."*)
+        [[ -e "${sdir}/${base}" ]] && continue
+        mv "$p" "${sdir}/${base}" 2>/dev/null || true ;;
+    esac
+  done
+  rmdir "$found" 2>/dev/null || true
+  [[ -f "${sdir}/${uuid}.jsonl" ]]
+}
+
+# What a title may contain. REJECT rather than escape, deliberately.
+#
+# bash 3.2 has no JSON encoder and jq is optional in this CLI (every use is
+# `command -v jq` guarded), so hand-rolled escaping is the kind of thing that
+# looks right and is not. The failure is not a cosmetic one: a title of
+#   x"}<newline>{"type":"user","message":{...}}<newline>{"pad":"
+# appended naively produces THREE lines that all parse as valid JSON, the middle
+# one an arbitrary forged conversation record inside the user's own transcript.
+# A whitelist cannot produce that, and it is one `case`.
+#
+# The subshell pins LC_ALL=C so ' '-'~' is a byte range and not a collation.
+# Deliberately NOT a =~ regex: POSIX ERE has no \xNN, and bash strips the
+# backslash, so ^[\x20-\x7e]{1,64}$ silently degrades into a class that ACCEPTS
+# backslash and REJECTS the space.
+_sessions_title_ok() (
+  LC_ALL=C
+  local t="$1"
+  [ -n "$t" ] || return 1
+  [ ${#t} -le 64 ] || return 1
+  case "$t" in
+    *[!\ -~]*) return 1 ;;
+    *[\"\\]*)  return 1 ;;
+    ' '*|*' ') return 1 ;;
+  esac
+  return 0
+)
+
+# Write a new title. Both stores, in Claude Code's own precedence order.
+#
+# The transcript record is the one that shows: every already-titled session in
+# the maintainer's corpus carries its custom-title record inside the last 64 KiB
+# (Claude re-stamps it on each session open), so a sidecar-only write would be
+# silently shadowed on all of them. The sidecar is written too so the two never
+# disagree, whichever one a future Claude Code reads first.
+#
+# An `ai-title` record would NOT work: that is Claude's own generated title,
+# ranked below a custom one, so it would simply be outranked.
+_sessions_rename_write() {
+  local sdir="$1" uuid="$2" title="$3"
+  local f="${sdir}/${uuid}.jsonl" stamp last tmp
+  [[ -f "$f" ]] || return 1
+
+  # Stamp the mtime so it can be put back. `touch -r` is POSIX and identical on
+  # BSD and GNU, unlike `date -r` / `date -d`, and it costs nothing next to
+  # copying a 118 MB file to preserve its timestamp.
+  stamp="${sdir}/.cleat-mtime.$$"
+  touch -r "$f" "$stamp" 2>/dev/null || stamp=""
+
+  # A record appended after a file that does not end in a newline would join the
+  # last line and corrupt both. Command substitution strips trailing newlines,
+  # so an empty result means the file already ends in one.
+  last="$(tail -c 1 "$f" 2>/dev/null || true)"
+  [[ -n "$last" ]] && printf '\n' >> "$f"
+
+  # Compact, byte-for-byte the shape Claude's own writer emits: no space after
+  # any colon. ~90 bytes, far under the 4096-byte pipe buffer, so this is a
+  # single atomic write under O_APPEND. Appending a short fixed record is why
+  # this never rewrites the file: a rewrite would need transient 2x disk on a
+  # machine cleat already gates at 95% full, and it would have a real window in
+  # which the transcript is incomplete.
+  printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}\n' "$title" "$uuid" >> "$f" || return 1
+
+  # Sidecar, written temp-then-rename in the same directory so a reader never
+  # sees a partial file.
+  mkdir -p "${sdir}/${uuid}" 2>/dev/null || true
+  if [[ -d "${sdir}/${uuid}" ]]; then
+    tmp="${sdir}/${uuid}/.custom-title.json.$$"
+    if printf '{"customTitle":"%s"}\n' "$title" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "${sdir}/${uuid}/custom-title.json" 2>/dev/null || rm -f "$tmp"
+    else
+      rm -f "$tmp" 2>/dev/null || true
+    fi
+  fi
+
+  # Put the mtime back. REQUIRED, not tidiness: `claude --continue` and the
+  # /resume picker both order by transcript mtime, so an unrestored rename of
+  # the second-newest session silently changes which conversation the next
+  # `cleat resume` continues. Safe to do here only because the live gate above
+  # guarantees nothing else is appending; it would be a bug as a general rule.
+  if [[ -n "$stamp" ]]; then
+    touch -r "$stamp" "$f" 2>/dev/null || true
+    rm -f "$stamp" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Resolve a user-typed id to exactly one session. A full UUID or an unambiguous
+# hex prefix of at least 8 characters.
+#
+# Row NUMBERS are deliberately not accepted. The list is ordered by mtime, so
+# `rm 3` would name a different conversation the next time anything touches the
+# directory, and that is precisely the mistake this feature must not make cheap.
+# Is this the SHAPE of an id, before any directory is consulted? Checked first
+# so a typo reports the typo, rather than being masked by "no sessions yet" in a
+# project that has none.
+#   2 = not hex/dashes, 3 = shorter than the 8-character minimum
+_sessions_id_shape() {
+  case "$1" in
+    ''|*[!0-9a-f-]*) return 2 ;;
+  esac
+  [[ ${#1} -ge 8 ]] || return 3
+  return 0
+}
+
+_sessions_resolve_id() {
+  local sdir="$1" want="$2"
+  local f base uuid matches=() m rc=0
+  _sessions_id_shape "$want" || rc=$?
+  [[ $rc -eq 0 ]] || return $rc
+  for f in "$sdir"/*.jsonl; do
+    [[ -f "$f" ]] || continue
+    base="${f##*/}"
+    uuid="${base%.jsonl}"
+    _sessions_is_uuid "$uuid" || continue
+    case "$uuid" in
+      "$want"*) matches=("${matches[@]+"${matches[@]}"}" "$uuid") ;;
+    esac
+  done
+  case ${#matches[@]} in
+    0) return 1 ;;
+    1) printf '%s' "${matches[0]}"; return 0 ;;
+    *) for m in "${matches[@]}"; do printf '%s\n' "$m"; done; return 4 ;;
+  esac
+}
+
+# ── The picker's render engine ─────────────────────────────────────────────
+# Rebuilt after the first version blinked. Three things caused that, all
+# measured on a real pty rather than guessed:
+#
+#   1. The frame forked ~115 times. Per ROW it ran a `sed -n Np` to fetch the
+#      line, a `date` inside the age formatter, and several command
+#      substitutions, so a ten-row frame took 28 ms and the user watched it
+#      being painted.
+#   2. It emitted `\033[2K` BEFORE each line's replacement text, in its own
+#      write(). That blanks the whole line and leaves it blank until the text
+#      arrives 2.3 ms later, so there was always exactly one empty row on
+#      screen for the whole redraw. That IS the blink.
+#   3. It used 22 write() calls per frame, which is what let the erase and its
+#      replacement be separated in time at all.
+#
+# So: every row's age, size, short id and sanitized title are computed ONCE at
+# load time into parallel indexed arrays (bash 3.2 has no associative arrays),
+# the only per-frame work is truncation and the cursor marker, the whole frame
+# is assembled into one string, and it goes out in a single printf. Erasing is
+# `\033[K` AFTER the text, which clears only the tail of a line that has already
+# been overwritten, so no cell is ever blank. `\033[K` is also the more portable
+# of the two: it is what terminfo calls `el` in 42 of 43 installed entries,
+# while no terminfo entry emits `\033[2K` for anything.
+#
+# Frame cost after this: 0 forks, 2 writes, ~0.1 ms.
+
+# Parallel row arrays. Filled by _sessions_load_rows, read by _sessions_frame.
+_SESS_N=0
+_SESS_AGE=(); _SESS_SIZE=(); _SESS_ID=(); _SESS_TITLE=()
+
+# Geometry, re-measured once per keypress so the viewport follows a resize.
+# _SESS_GEOM_DIRTY exists so a caller that holds a frame can force a re-measure;
+# the picker re-measures unconditionally and never consults it.
+_SESS_ROWS=24; _SESS_COLS=80; _SESS_PAGE=10; _SESS_GEOM_DIRTY=1; _SESS_NARROW=0
+# Cursor position (absolute index) and the index of the first visible row.
+# Globals rather than locals because the clamp is shared by the key handler and
+# the resize path, and both have to agree.
+_SESS_CURSOR=0; _SESS_OFFSET=0
+# Lines the picker owns besides the scrolling rows: cmd_sessions prints a blank,
+# a title and a path and a blank (4), the frame adds a counter, a blank and the
+# hint (3), and one line is left for the shell prompt to land on (1). So the
+# viewport may be at most (terminal rows - 8) or the block does not fit and the
+# cursor-up can no longer reach the frame's origin.
+_SESSIONS_CHROME_LINES=8
+# Below this the layout cannot be laid out at all: 34 columns of fixed matter
+# plus a title worth reading. cmd_sessions refuses the picker under it rather
+# than rendering rows that wrap, because a wrapped row makes the block walk
+# down the screen one line per keypress.
+_SESSIONS_MIN_COLS=40
+
+# Suppress the terminal's own echo for the duration of a raw key loop.
+#
+# Without this, any key byte that arrives while the loop is NOT inside
+# `read -rsn1` is echoed by the tty, so holding an arrow key prints `^[[B`
+# into the middle of the frame. The old draw left a 28 ms window per keypress
+# for that to happen; the rewritten one leaves microseconds, which made it rare
+# rather than impossible. Rare corruption of a screen whose Enter key deletes a
+# conversation is not good enough.
+#
+# The saved mode is the WHOLE termios state from `stty -g`, not a bare
+# `stty echo` afterwards, so nothing else the user had set is disturbed. Both
+# halves are no-ops without a tty, and the restore is wired to every exit path
+# AND to INT/TERM/HUP, because a cleat that exits leaving the terminal unable to
+# echo what you type is a worse bug than the one being fixed.
+_SESS_STTY=""
+_sessions_echo_off() {
+  _SESS_STTY=""
+  _is_tty || return 0
+  _SESS_STTY="$(stty -g 2>/dev/null || true)"
+  stty -echo 2>/dev/null || true
+  return 0
+}
+
+_sessions_echo_restore() {
+  _is_tty || return 0
+  if [[ -n "${_SESS_STTY:-}" ]]; then
+    stty "$_SESS_STTY" 2>/dev/null || stty echo 2>/dev/null || true
+  else
+    stty echo 2>/dev/null || true
+  fi
+  _SESS_STTY=""
+  return 0
+}
+
+# Is the terminal too narrow to lay a session row out? Reads the RAW width, not
+# _term_cols, because that one clamps up to a 40-column floor for the renderer's
+# benefit and so can never report a narrower terminal.
+_sessions_too_narrow() {
+  local c
+  c="$(_term_size)"
+  c="${c#* }"
+  case "$c" in ''|*[!0-9]*) c=80 ;; esac
+  [[ "$c" -lt "$_SESSIONS_MIN_COLS" ]]
+}
+
+# Load the scan's rows into the arrays, doing every per-row computation once.
+# ONE `date` for the whole list, not one per row per frame.
+_sessions_load_rows() {
+  local f="$1" now mt kb id title
+  _SESS_N=0
+  _SESS_AGE=(); _SESS_SIZE=(); _SESS_ID=(); _SESS_TITLE=()
+  [[ -f "$f" ]] || return 0
+  now="$(date +%s 2>/dev/null || echo 0)"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  while IFS="$(printf '\t')" read -r mt kb id title; do
+    [[ -n "$id" ]] || continue
+    case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+    case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+    if [[ "$mt" -gt 0 && "$now" -gt 0 ]]; then
+      _SESS_AGE[$_SESS_N]="$(_age_from_delta $(( now - mt )))"
+    else
+      _SESS_AGE[$_SESS_N]="unknown"
+    fi
+    _SESS_SIZE[$_SESS_N]="$(_fork_fmt_kb "$kb")"
+    _SESS_ID[$_SESS_N]="${id:0:8}"
+    _SESS_TITLE[$_SESS_N]="$(_sessions_safe_str "$title")"
+    _SESS_N=$(( _SESS_N + 1 ))
+  done < "$f"
+  return 0
+}
+
+# Re-measure the terminal and size the viewport to it.
+#
+# The viewport is the smaller of what fits and what there is to show, so three
+# sessions in a fifty-row window draw three rows rather than three rows and
+# forty-odd blanks. Floored at 1 so the frame always has a cursor row.
+_sessions_measure() {
+  local total="${1:-0}" avail
+  _SESS_ROWS="$(_term_rows)"
+  _SESS_COLS="$(_term_cols)"
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  # An empty list still gets a one-row frame rather than a terminal's worth of
+  # blanks: the picker is never opened on one, but the draw is reachable from
+  # tests and must stay well formed.
+  (( total < 1 )) && total=1
+  # The launch gate refuses a too-narrow terminal, but a window narrowed MID
+  # picker would otherwise keep drawing rows that wrap, and a wrapped row walks
+  # the block. _SESS_NARROW lets the loop notice and bail out cleanly.
+  if _sessions_too_narrow; then _SESS_NARROW=1; else _SESS_NARROW=0; fi
+  avail=$(( _SESS_ROWS - _SESSIONS_CHROME_LINES ))
+  (( avail < 1 )) && avail=1
+  if [[ "$total" -lt "$avail" ]]; then
+    _SESS_PAGE="$total"
+  else
+    _SESS_PAGE="$avail"
+  fi
+  (( _SESS_PAGE < 1 )) && _SESS_PAGE=1
+  _SESS_GEOM_DIRTY=0
+  return 0
+}
+
+# Keep the cursor visible and the offset inside the list. Called after every
+# move AND after every re-measure, because a resize changes the page size under
+# a cursor that was already placed.
+#
+# This is a safety control, not cosmetics. Without it a window shrink can leave
+# the cursor below the last drawn row: the highlight disappears, the user
+# presses Enter on a row they cannot see, and the action screen offers to delete
+# a conversation they never selected.
+_sessions_clamp() {
+  local total="$1"
+  # Normalise first. Every branch below is a conditional assignment, so a state
+  # that matches none of them would be left exactly as it was found, and an
+  # unset or non-numeric value would then reach an arithmetic test as an empty
+  # string. Cheap, and it keeps the invariant true from any starting state.
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  case "${_SESS_CURSOR:-}" in ''|*[!0-9-]*) _SESS_CURSOR=0 ;; esac
+  case "${_SESS_OFFSET:-}" in ''|*[!0-9-]*) _SESS_OFFSET=0 ;; esac
+  [[ "$total" -gt 0 ]] || { _SESS_CURSOR=0; _SESS_OFFSET=0; return 0; }
+  (( _SESS_CURSOR < 0 )) && _SESS_CURSOR=0
+  (( _SESS_CURSOR > total - 1 )) && _SESS_CURSOR=$(( total - 1 ))
+  (( _SESS_OFFSET > _SESS_CURSOR )) && _SESS_OFFSET=$_SESS_CURSOR
+  (( _SESS_OFFSET < _SESS_CURSOR - _SESS_PAGE + 1 )) && _SESS_OFFSET=$(( _SESS_CURSOR - _SESS_PAGE + 1 ))
+  (( _SESS_OFFSET > total - _SESS_PAGE )) && _SESS_OFFSET=$(( total - _SESS_PAGE ))
+  (( _SESS_OFFSET < 0 )) && _SESS_OFFSET=0
+  return 0
+}
+
+# Build and emit the whole frame in one write. Emits exactly page + 3 lines:
+# the rows, the counter, a blank and the hint. Everything is one string so the
+# terminal receives a complete frame rather than a progressive repaint.
+#
+# printf '%b' rather than '%s' because the colour variables in this file hold
+# LITERAL backslash escapes (BOLD='\033[1m'), so something has to interpret
+# them. That is also exactly why _sessions_safe_str doubles backslashes: a
+# title is model-written text, and without the doubling a title containing the
+# four characters \033 would become a real escape sequence here.
+_sessions_frame() {
+  local cursor="$1" offset="$2" page="$3" cols="$4" total="$5"
+  local buf="" i n room t line shown meta
+  # Normalise the caller's numbers rather than trusting them. A negative offset
+  # reaches an array subscript, which aborts the shell on bash 3.2 and silently
+  # renders the wrong rows on bash 5.
+  case "$cursor" in ''|*[!0-9-]*) cursor=0 ;; esac
+  case "$offset" in ''|*[!0-9-]*) offset=0 ;; esac
+  case "$page"   in ''|*[!0-9]*)  page=1 ;; esac
+  case "$total"  in ''|*[!0-9]*)  total=0 ;; esac
+  (( cursor < 0 )) && cursor=0
+  (( offset < 0 )) && offset=0
+  (( page < 1 ))   && page=1
+  room=$(( cols - 34 ))
+  (( room < 1 )) && room=1
+  i=0
+  while [[ $i -lt $page ]]; do
+    n=$(( offset + i ))
+    if [[ $n -lt $total ]]; then
+      t="${_SESS_TITLE[$n]}"
+      # A character is not always a column: CJK paints two. Under a UTF-8
+      # locale ${#t} counts characters and would under-budget; under LC_ALL=C
+      # it counts bytes and over-budgets, which is already safe. Halve only in
+      # the case that can under-count.
+      local rm=$room
+      case "$t" in
+        *[!\ -~]*) if _has_unicode; then rm=$(( room / 2 )); (( rm < 1 )) && rm=1; fi ;;
+      esac
+      [[ ${#t} -gt $rm ]] && t="${t:0:$(( rm - 1 ))}…"
+      # printf -v, not $(printf ...): a command substitution forks, and one fork
+      # per row is exactly what this rewrite existed to remove. printf -v into a
+      # PLAIN variable is bash 3.2 safe; printf -v into an ARRAY ELEMENT is
+      # bash 4.1+ and is the trap to avoid here.
+      printf -v meta '%-9.9s %9.9s' "${_SESS_AGE[$n]}" "${_SESS_SIZE[$n]}"
+      if [[ $n -eq $cursor ]]; then
+        line="  ${CYAN}▸${RESET} ${BOLD}${meta}${RESET} ${DIM}${_SESS_ID[$n]}${RESET}  ${BOLD}${t}${RESET}"
+      else
+        line="    ${meta} ${DIM}${_SESS_ID[$n]}${RESET}  ${t}"
+      fi
+      buf="${buf}${line}\033[K\n"
+    else
+      buf="${buf}\033[K\n"
+    fi
+    i=$(( i + 1 ))
+  done
+  if [[ "$total" -gt "$page" ]]; then
+    shown=$(( offset + page ))
+    (( shown > total )) && shown=$total
+    buf="${buf}    ${DIM}$(( offset + 1 ))-${shown} of ${total}${RESET}\033[K\n"
+  elif [[ "$total" -eq 1 ]]; then
+    buf="${buf}    ${DIM}1 session${RESET}\033[K\n"
+  else
+    buf="${buf}    ${DIM}${total} sessions${RESET}\033[K\n"
+  fi
+  buf="${buf}\033[K\n"
+  buf="${buf}  ${DIM}↑/↓ move  ⏎ rename or delete  q cancel${RESET}\033[K\n"
+  printf '%b' "$buf"
+  return 0
+}
+
+# Load, size and draw in one call, for a caller that holds only the rowfile.
+# The picker uses the pieces directly so it can load once and re-measure only
+# when the window actually changes.
+_sessions_picker_draw() {
+  local cursor="${1:-0}" offset="${2:-0}" rowfile="${3:-}"
+  _sessions_load_rows "$rowfile"
+  [[ "$_SESS_GEOM_DIRTY" == "0" ]] || _sessions_measure "$_SESS_N"
+  _sessions_frame "$cursor" "$offset" "$_SESS_PAGE" "$_SESS_COLS" "$_SESS_N"
+}
+
+# The four-row action screen. A separate screen rather than a hotkey inside the
+# list, for two reasons. The list's key reader (_read_keypress) collapses every
+# printable character except space and q to one token and discards the byte, so
+# `d`/`r` hotkeys would mean editing a reader that two mutation entries guard
+# and that broke the pickers once already. And an irreversible delete SHOULD
+# cost two deliberate returns: no other picker in this file performs one from
+# inside a raw key loop.
+_SESSIONS_ACTION_LINES=4
+
+_sessions_action_draw() {
+  local cursor="${1:-0}" cols="${2:-80}"
+  local i=0 room label desc line
+  local labels="Rename Delete Cancel"
+  set -- $labels
+  # Width-managed for the same reason the list rows are. The widest row here is
+  # 57 columns, so on anything narrower every row wrapped into two physical
+  # lines while the reposition moved up four LOGICAL ones, and the menu walked
+  # down the screen exactly like an over-wide list row does. Found by audit, not
+  # in the wild: the list itself renders from 40 columns up, so a reader on a
+  # narrow split pane got a good list and then a shredded menu behind Enter.
+  room=$(( cols - 14 ))
+  (( room < 8 )) && room=8
+  printf '\033[K\n'
+  while [[ $i -lt 3 ]]; do
+    case $i in
+      0) label="Rename"; desc="Give this session a name you will recognise" ;;
+      1) label="Delete"; desc="Move it to the trash (restorable for ${_SESSIONS_TRASH_DAYS} days)" ;;
+      *) label="Cancel"; desc="Leave it alone" ;;
+    esac
+    [[ ${#desc} -gt $room ]] && desc="${desc:0:$(( room - 1 ))}…"
+    if [[ $i -eq $cursor ]]; then
+      line="  ${CYAN}▸${RESET} ${BOLD}${label}${RESET}  ${DIM}${desc}${RESET}"
+    else
+      line="    ${label}  ${DIM}${desc}${RESET}"
+    fi
+    printf '%b\033[K\n' "$line"
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+
+# ── The two actions ────────────────────────────────────────────────────────
+# Both are reached from the picker AND from the command line, so both live here
+# rather than inside a TUI function: the gates must be identical either way, and
+# a gate that only exists on the interactive path is not a gate.
+
+_sessions_do_rename() {
+  local sdir="$1" uuid="$2" box="$3" cname="$4" title="$5"
+  _sessions_live_gate "$cname" "$box" || return 1
+  # The same containment the delete path runs, and for the same reason. A
+  # rename APPENDS to the transcript, and `[[ -f ]]` follows a symlink, so
+  # without this a `<uuid>.jsonl` symlink planted from inside the box (that
+  # directory is mounted read-write into the container by design) would make
+  # the host append a record to whatever it points at, and then restore the
+  # victim's mtime so nothing looked disturbed. A write needs the same guard a
+  # delete does.
+  if ! _sessions_path_under_key "${sdir}/${uuid}.jsonl" "$sdir"; then
+    error "Refusing to rename ${BOLD}${uuid:0:8}${RESET}: it does not resolve to a file in this project's session directory."
+    return 1
+  fi
+  if [[ -z "$title" ]]; then
+    if ! _is_interactive; then
+      error "No title given."
+      echo -e "    ${DIM}Re-run with ${BOLD}--title <text>${RESET}${DIM} to rename non-interactively.${RESET}"
+      return 1
+    fi
+    local cur
+    cur="$(_sessions_title_for "$sdir" "$uuid")"
+    echo -e "  ${DIM}Current: $(_sessions_safe_title "$cur")${RESET}"
+    # Plain `read -r`, matching every other prompt in this CLI. `read -e -i` is
+    # the obvious way to prefill the old name and it is bash 4.0+, so it would
+    # pass every check here and fail on the maintainer's own macOS bash 3.2.
+    echo -en "  New name: "
+    read -r title || title=""
+  fi
+  if ! _sessions_title_ok "$title"; then
+    error "Not a usable title."
+    echo -e "    ${DIM}1-64 characters, printable ASCII, no quotes or backslashes, no leading or trailing space.${RESET}"
+    echo -e "    ${DIM}For anything else (emoji, accents) use ${BOLD}/rename${RESET}${DIM} inside the session.${RESET}"
+    return 1
+  fi
+  if _sessions_rename_write "$sdir" "$uuid" "$title"; then
+    success "Renamed ${DIM}${uuid:0:8}${RESET} to ${BOLD}${title}${RESET}"
+    return 0
+  fi
+  error "Could not write the new title."
+  return 1
+}
+
+_sessions_do_delete() {
+  local sdir="$1" uuid="$2" project="$3" box="$4" cname="$5" assume_yes="${6:-0}"
+  local f="${sdir}/${uuid}.jsonl" kb size title mt_before mt_now ans
+
+  _sessions_live_gate "$cname" "$box" || return 1
+
+  # Containment before anything is shown, so a target that could never be
+  # deleted is never described as if it could.
+  if ! _sessions_path_under_key "$f" "$sdir"; then
+    error "Refusing to delete ${BOLD}${uuid:0:8}${RESET}: it does not resolve to a file in this project's session directory."
+    return 1
+  fi
+
+  kb="$(_sessions_size_kb "$sdir" "$uuid")"
+  size="$(_fork_fmt_kb "$kb")"
+  title="$(_sessions_title_for "$sdir" "$uuid")"
+  mt_before="$(_path_mtime "$f")"
+
+  warn "This removes session ${BOLD}${uuid:0:8}${RESET} ${DIM}(${size} apparent)${RESET}"
+  echo -e "    ${DIM}Title: $(_sessions_safe_title "$title")${RESET}"
+  echo -e "    ${DIM}The conversation, its subagent transcripts and its tool results all go.${RESET}"
+  echo -e "    ${DIM}It moves to the trash, recoverable for ${_SESSIONS_TRASH_DAYS} days with${RESET}"
+  echo -e "    ${DIM}${BOLD}cleat sessions restore ${uuid:0:8}${RESET}"
+
+  if [[ "$assume_yes" != "1" ]]; then
+    # _is_interactive AND a default-No prompt. The pairing is the cmd_uninstall
+    # precedent and it is load-bearing: _ask_yn on its own is pipe-satisfiable,
+    # so `yes | cleat sessions rm ...` would answer it.
+    if ! _is_interactive; then
+      echo ""
+      echo -e "    ${DIM}Nothing was deleted. Re-run with ${BOLD}--yes${RESET}${DIM} to do this non-interactively.${RESET}"
+      return 0
+    fi
+    _ask_yn ans "Delete it? [y/N] "
+    case "$ans" in
+      y|Y|yes|YES) : ;;
+      *) info "Kept."; return 0 ;;
+    esac
+  fi
+
+  # TOCTOU: the user read a list, then thought about it. If the transcript moved
+  # in between, something is writing it and the size and title just shown are
+  # stale.
+  mt_now="$(_path_mtime "$f")"
+  if [[ "$mt_now" != "$mt_before" ]]; then
+    error "Session ${BOLD}${uuid:0:8}${RESET} changed while you were deciding."
+    echo -e "    ${DIM}Something is still writing it. Run ${BOLD}cleat sessions${RESET}${DIM} again.${RESET}"
+    return 1
+  fi
+
+  local _trc=0
+  _sessions_trash "$sdir" "$uuid" "$project" "$cname" || _trc=$?
+  if [[ $_trc -eq 2 ]]; then
+    error "Refusing to delete: the trash directory is not a plain directory in the session dir."
+    echo -e "    ${DIM}Nothing was moved. Check ${sdir}/.cleat-trash${RESET}"
+    return 1
+  fi
+  if [[ $_trc -eq 0 ]]; then
+    success "Moved ${DIM}${uuid:0:8}${RESET} to the trash ${DIM}(${size} apparent)${RESET}"
+  else
+    warn "Moved ${DIM}${uuid:0:8}${RESET} to the trash, with items left in place ${DIM}(listed above)${RESET}"
+  fi
+  # Say it, because `df` will not move until the trash is swept and a user who
+  # deletes a gigabyte and sees no free space assumes the command lied.
+  echo -e "    ${DIM}Disk space comes back when the trash is swept, after ${_SESSIONS_TRASH_DAYS} days.${RESET}"
+  echo -e "    ${DIM}Undo: ${BOLD}cleat sessions restore ${uuid:0:8}${RESET}"
+  return 0
+}
+
+# ── The picker ─────────────────────────────────────────────────────────────
+
+# Screen 2. Entered only after screen 1 has torn its frame down, matching the
+# kit picker's hand-off to _kit_models_tui. Like both existing second screens it
+# ends the verb rather than returning to the list.
+_sessions_action_tui() {
+  local sdir="$1" uuid="$2" project="$3" box="$4" cname="$5"
+  local cursor=0 key title size kb
+  kb="$(_sessions_size_kb "$sdir" "$uuid")"
+  size="$(_fork_fmt_kb "$kb")"
+  title="$(_sessions_title_for "$sdir" "$uuid")"
+  echo ""
+  echo -e "  ${BOLD}$(_sessions_safe_title "$title")${RESET}"
+  echo -e "  ${DIM}${uuid}  ${size} apparent${RESET}"
+
+  local block=$(( _SESSIONS_ACTION_LINES ))
+  local cols
+  cols="$(_term_cols)"
+  _sessions_echo_off
+  trap '_sessions_echo_restore; _cursor_show; trap - INT TERM HUP; exit 130' INT TERM HUP
+  _cursor_hide
+  _sessions_action_draw "$cursor" "$cols"
+  echo ""
+  echo -e "  ${DIM}↑/↓ move  ⏎ choose  q cancel${RESET}"
+  printf '\033[%dA' "$(( block + 2 ))"
+
+  while true; do
+    key="$(_read_keypress)"
+    case "$key" in
+      UP)   [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 )) ;;
+      DOWN) [[ $cursor -lt 2 ]] && cursor=$(( cursor + 1 )) ;;
+      ENTER)
+        _cursor_show
+        _sessions_echo_restore
+        trap - INT TERM HUP
+        printf '\033[%dB' "$(( block + 2 ))"
+        printf '\033[2K'
+        echo ""
+        case "$cursor" in
+          0) _sessions_do_rename "$sdir" "$uuid" "$box" "$cname" "" ;;
+          1) _sessions_do_delete "$sdir" "$uuid" "$project" "$box" "$cname" 0 ;;
+          *) info "Cancelled." ;;
+        esac
+        return ;;
+      QUIT|ESC)
+        _cursor_show
+        _sessions_echo_restore
+        trap - INT TERM HUP
+        printf '\033[%dB' "$(( block + 2 ))"
+        printf '\033[2K'
+        echo ""
+        info "Cancelled."
+        return ;;
+    esac
+    _sessions_action_draw "$cursor" "$cols"
+    printf '\033[%dA' "$block"
+  done
+}
+
+_sessions_picker_tui() {
+  local sdir="$1" project="$2" box="$3" cname="$4" rowfile="$5" total="$6"
+  local key line uuid block prev_block
+
+  # Echo off BEFORE the row load, not after: loading runs a `du` over every
+  # session's sidecar and is the one slow moment in the picker, so it is exactly
+  # when an impatient keypress would be echoed into the output.
+  #
+  # The restore trap goes up in the SAME breath, before anything can fail. The
+  # window between them is not theoretical: the load shells out to `du` and
+  # `date`, and under `set -e` a failing pipeline in there would exit the CLI
+  # with the terminal still unable to echo. EXIT covers that and the signals
+  # cover a Ctrl-C during the slow part, which is exactly when an impatient
+  # user presses it.
+  _sessions_echo_off
+  trap '_sessions_echo_restore; _cursor_show' EXIT
+  trap '_sessions_echo_restore; _cursor_show; trap - INT TERM HUP EXIT; exit 130' INT TERM HUP
+
+  _sessions_load_rows "$rowfile"
+  total="$_SESS_N"
+  if [[ "$total" -le 0 ]]; then
+    _sessions_echo_restore
+    trap - INT TERM HUP EXIT
+    info "No sessions to show."
+    return 0
+  fi
+
+  _SESS_CURSOR=0
+  _SESS_OFFSET=0
+  _SESS_GEOM_DIRTY=1
+
+  # Resize is handled by re-measuring once per keypress, and deliberately NOT by
+  # a SIGWINCH trap.
+  #
+  # A trap looks like the right answer and buys nothing. SIGWINCH does not
+  # interrupt a blocked `read` (bash retries on EINTR, and the command
+  # substitution subshell does not run the inherited handler anyway), so bash
+  # defers the trap until the reader returns, which is exactly the moment this
+  # loop re-measures regardless. It would add signal-disposition behaviour that
+  # differs across platforms to the critical path in exchange for nothing.
+  #
+  # It is also load-bearing that nothing here tries to be cleverer by giving the
+  # reader a timeout. `_read_keypress` prints ENTER for an empty read, and ENTER
+  # opens the rename/delete screen, so a timeout would make an idle terminal
+  # offer to delete a conversation on its own. (`read -t` is bash 4 anyway.)
+  #
+  # The honest behaviour, stated in the docs: resize the window, press any key,
+  # the list reflows. One `stty size` per keypress is about 0.4 ms.
+  #
+  # (The restore traps were armed with the echo-off above, before the load.)
+
+  _sessions_measure "$total"
+  _sessions_clamp "$total"
+  block=$(( _SESS_PAGE + 3 ))
+  prev_block=$block
+
+  _cursor_hide
+  _sessions_frame "$_SESS_CURSOR" "$_SESS_OFFSET" "$_SESS_PAGE" "$_SESS_COLS" "$total"
+  printf '\033[%dA' "$block"
+
+  while true; do
+    key="$(_read_keypress)"
+
+    _sessions_measure "$total"
+    # Narrowed below the layout's minimum mid-session: leave the picker rather
+    # than draw rows that wrap, because a wrapped row walks the block down the
+    # screen one row per keypress and there is no recovering the origin.
+    if [[ "$_SESS_NARROW" == "1" ]]; then
+      _cursor_show
+      _sessions_echo_restore
+      trap - INT TERM HUP EXIT
+      printf '\033[%dB' "$block"
+      printf '\033[2K'
+      echo ""
+      info "Window too narrow for the session list."
+      echo -e "    ${DIM}Widen it and run ${BOLD}cleat sessions${RESET}${DIM} again.${RESET}"
+      return 0
+    fi
+
+    case "$key" in
+      UP)   _SESS_CURSOR=$(( _SESS_CURSOR - 1 )) ;;
+      DOWN) _SESS_CURSOR=$(( _SESS_CURSOR + 1 )) ;;
+      ENTER)
+        _cursor_show
+        _sessions_echo_restore
+        trap - INT TERM HUP EXIT
+        printf '\033[%dB' "$block"
+        printf '\033[2K'
+        line="$(sed -n "$(( _SESS_CURSOR + 1 ))p" "$rowfile" 2>/dev/null || true)"
+        # Third tab-separated field. A cursor that names no row must never reach
+        # the action screen with an empty id.
+        uuid="$(printf '%s' "$line" | awk -F'\t' '{print $3}')"
+        if ! _sessions_is_uuid "$uuid"; then
+          echo ""
+          info "Cancelled."
+          return 0
+        fi
+        _sessions_action_tui "$sdir" "$uuid" "$project" "$box" "$cname"
+        return 0 ;;
+      QUIT|ESC)
+        _cursor_show
+        _sessions_echo_restore
+        trap - INT TERM HUP EXIT
+        printf '\033[%dB' "$block"
+        printf '\033[2K'
+        echo ""
+        info "Cancelled."
+        return 0 ;;
+    esac
+
+    # Clamp AFTER the move and after any re-measure, so a shrunk window can
+    # never leave the cursor on a row that is no longer drawn.
+    _sessions_clamp "$total"
+    block=$(( _SESS_PAGE + 3 ))
+
+    _sessions_frame "$_SESS_CURSOR" "$_SESS_OFFSET" "$_SESS_PAGE" "$_SESS_COLS" "$total"
+    # A frame that shrank leaves the taller previous frame's tail on screen.
+    # The cursor is sitting exactly on that leftover, so erase from here down.
+    # Only on an actual shrink, because erase-to-end-of-screen is the one
+    # sequence here that CAN show a blank region for a moment.
+    if [[ "$block" -lt "$prev_block" ]]; then
+      printf '\033[J'
+    fi
+    prev_block=$block
+    printf '\033[%dA' "$block"
+  done
+}
+
+# Non-TTY listing. Not a REPL: the picker's only action is to open the action
+# screen, and the confirm contract that matters non-interactively lives on
+# `rm` and `rename` themselves. `cleat fork`'s bare list is the same precedent,
+# the read-only listing that doubles as the dry run for its destructive sibling.
+#
+# This is also the fallback when the terminal is too narrow to lay the picker
+# out. A list you can read beats a picker whose rows wrap, because a wrapped
+# row makes the block walk down the screen one line per keypress.
+_sessions_picker_text() {
+  local rowfile="$1" total="${2:-0}"
+  local i=0
+  _sessions_load_rows "$rowfile"
+  total="$_SESS_N"
+  while [[ $i -lt $_SESS_N ]]; do
+    echo -e "    $(printf '%-9.9s %9.9s' "${_SESS_AGE[$i]}" "${_SESS_SIZE[$i]}") ${DIM}${_SESS_ID[$i]}${RESET}  ${_SESS_TITLE[$i]}"
+    i=$(( i + 1 ))
+  done
+  echo ""
+  if [[ "$total" -eq 1 ]]; then
+    echo -e "  ${DIM}1 session. Act on it with ${BOLD}cleat sessions rename <id>${RESET}${DIM} or ${BOLD}cleat sessions rm <id>${RESET}${DIM}.${RESET}"
+  else
+    echo -e "  ${DIM}${total} sessions. Act on one with ${BOLD}cleat sessions rename <id>${RESET}${DIM} or ${BOLD}cleat sessions rm <id>${RESET}${DIM}.${RESET}"
+  fi
+  return 0
+}
+
+# `cleat sessions [list|rename|rm|restore] [<id>] [box] [flags]`
+#
+# The subcommand word is reserved FIRST, then the flags, then <id>, and only
+# what is left goes to _set_box. That order matters: _set_box accepts exactly
+# one positional and validates it as a box name (max 31 chars), so handing it a
+# 36-character UUID would fail with a confusing "Invalid box name". Routing the
+# remainder through it anyway is what gives this verb the same box validation
+# and the same stray-argument refusal as every other box-aware verb. cmd_fork
+# carries the scar that made this the house rule.
+cmd_sessions() {
+  local sub="list" id="" title="" assume_yes=0 want_title=0
+  case "${1:-}" in
+    list|ls)   sub="list"; shift ;;
+    rename|mv) sub="rename"; shift ;;
+    rm|delete) sub="rm"; shift ;;
+    restore)   sub="restore"; shift ;;
+  esac
+
+  local rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) assume_yes=1; shift ;;
+      --title)
+        want_title=1
+        title="${2:-}"
+        if [[ $# -lt 2 ]]; then
+          error "${BOLD}--title${RESET} needs a value."
+          return 1
+        fi
+        shift 2 ;;
+      --title=*) want_title=1; title="${1#--title=}"; shift ;;
+      -*)
+        error "Unknown flag: ${BOLD}${1}${RESET}"
+        echo -e "    ${DIM}cleat sessions takes --title <text> and --yes.${RESET}"
+        return 1 ;;
+      *) rest=("${rest[@]+"${rest[@]}"}" "$1"); shift ;;
+    esac
+  done
+
+  if [[ "$sub" != "list" ]]; then
+    id="${rest[0]:-}"
+    if [[ -z "$id" ]]; then
+      error "Which session? ${DIM}cleat sessions ${sub} <id>${RESET}"
+      echo -e "    ${DIM}Run ${BOLD}cleat sessions${RESET}${DIM} to see the ids.${RESET}"
+      return 1
+    fi
+    rest=("${rest[@]:1}")
+  fi
+
+  # A box positional is still validated by _set_box, which exits on a bad name.
+  _set_box "${rest[@]+"${rest[@]}"}"
+
+  # Shape-check the id BEFORE anything touches the filesystem, so a typo is
+  # reported as a typo even in a project that has no sessions yet, and so a
+  # malformed id never reaches a path join.
+  if [[ "$sub" != "list" ]]; then
+    local _shape=0
+    _sessions_id_shape "$id" || _shape=$?
+    case $_shape in
+      2) error "Not a session id: ${BOLD}${id}${RESET} ${DIM}(ids are hex and dashes)${RESET}"; return 1 ;;
+      3) error "Too short: ${BOLD}${id}${RESET}"
+         echo -e "    ${DIM}Use at least 8 characters so it can only mean one session.${RESET}"
+         return 1 ;;
+    esac
+  fi
+
+  local project sdir cname
+  project="$(resolve_project "$PWD")"
+  sdir="$(_sessions_key_dir "$project" "$_BOX")" || { error "Could not derive this project's session directory."; return 1; }
+  cname="$(container_name_for "$project" "$_BOX")"
+
+  # Housekeeping on every run, so the trash cannot grow without bound whether or
+  # not the user ever thinks about it.
+  _sessions_trash_sweep "$sdir"
+
+  case "$sub" in
+    restore)
+      local ruuid rc
+      local _rrc=0
+      ruuid="$(_sessions_restore_resolve "$sdir" "$id")" || _rrc=$?
+      if [[ $_rrc -eq 4 ]]; then
+        error "Ambiguous: ${BOLD}${id}${RESET} matches more than one trashed session."
+        printf '%s\n' "$ruuid" | while IFS= read -r m; do
+          [[ -n "$m" ]] && echo -e "    ${DIM}${m}${RESET}"
+        done
+        return 1
+      fi
+      if [[ $_rrc -ne 0 || -z "$ruuid" ]]; then
+        error "No trashed session in this project matching ${BOLD}${id}${RESET}."
+        echo -e "    ${DIM}Trash: ${sdir}/.cleat-trash${RESET}"
+        return 1
+      fi
+      if _sessions_restore "$sdir" "$ruuid"; then
+        success "Restored ${DIM}${ruuid:0:8}${RESET}"
+        return 0
+      fi
+      error "Could not restore ${BOLD}${ruuid:0:8}${RESET}."
+      return 1 ;;
+  esac
+
+  if [[ ! -d "$sdir" ]]; then
+    info "No sessions for this project yet."
+    # Naming the directory is not a debug detail, it is the whole diagnostic.
+    # The key is hashed from the path as typed, so on a case-insensitive Mac
+    # ~/Workspaces/cleat and ~/workspaces/cleat reach the same directory and
+    # hash to two different keys. Without this line that reads as data loss.
+    echo -e "    ${DIM}Looked in ${sdir}${RESET}"
+    return 0
+  fi
+
+  case "$sub" in
+    rename|rm)
+      # `|| rc=$?` and NOT `; rc=$?`. Under the binary's `set -e` a plain
+      # assignment whose command substitution exits non-zero terminates the
+      # shell right there, so the next line never runs and every rejected id
+      # exited silently with the helper's status instead of printing why.
+      local resolved="" rc=0
+      resolved="$(_sessions_resolve_id "$sdir" "$id")" || rc=$?
+      case $rc in
+        0) : ;;
+        2) error "Not a session id: ${BOLD}${id}${RESET} ${DIM}(ids are hex and dashes)${RESET}"; return 1 ;;
+        3) error "Too short: ${BOLD}${id}${RESET}"
+           echo -e "    ${DIM}Use at least 8 characters so it can only mean one session.${RESET}"
+           return 1 ;;
+        4) error "Ambiguous: ${BOLD}${id}${RESET} matches more than one session."
+           printf '%s\n' "$resolved" | while IFS= read -r m; do
+             [[ -n "$m" ]] && echo -e "    ${DIM}${m}${RESET}"
+           done
+           return 1 ;;
+        *) error "No session in this project matching ${BOLD}${id}${RESET}."
+           echo -e "    ${DIM}Looked in ${sdir}${RESET}"
+           return 1 ;;
+      esac
+      if [[ "$sub" == "rename" ]]; then
+        [[ $want_title -eq 1 && -z "$title" ]] && { error "${BOLD}--title${RESET} needs a value."; return 1; }
+        _sessions_do_rename "$sdir" "$resolved" "$_BOX" "$cname" "$title"
+        return $?
+      fi
+      _sessions_do_delete "$sdir" "$resolved" "$project" "$_BOX" "$cname" "$assume_yes"
+      return $? ;;
+  esac
+
+  # ── list ──
+  local rowfile total
+  rowfile="$(mktemp "${TMPDIR:-/tmp}/cleat-sessions.XXXXXX" 2>/dev/null)" || {
+    error "Could not create a temporary file."
+    return 1
+  }
+  _sessions_scan_sorted "$sdir" > "$rowfile" 2>/dev/null || true
+  total="$(awk 'END {print NR}' "$rowfile" 2>/dev/null || echo 0)"
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+
+  if [[ "$total" -eq 0 ]]; then
+    rm -f "$rowfile"
+    info "No sessions for this project yet."
+    echo -e "    ${DIM}Looked in ${sdir}${RESET}"
+    return 0
+  fi
+
+  # The header is part of the picker's vertical budget (_SESSIONS_CHROME_LINES
+  # counts it as four lines), so the path has to be truncated to the terminal
+  # width. A session directory is easily 100 characters and a wrapped header
+  # silently costs a row, which pushes the frame's last line off the bottom and
+  # loses the origin the redraw repositions against. Truncated from the LEFT,
+  # because the distinctive part of a path is its tail.
+  local _hdr_path="$sdir" _hdr_room
+  _hdr_room=$(( $(_term_cols) - 4 ))
+  (( _hdr_room < 12 )) && _hdr_room=12
+  if [[ ${#_hdr_path} -gt $_hdr_room ]]; then
+    _hdr_path="…${_hdr_path:$(( ${#_hdr_path} - _hdr_room + 1 ))}"
+  fi
+  echo ""
+  echo -e "  ${BOLD}Claude sessions${RESET} ${DIM}($(basename "$project")$( [[ "$_BOX" != "main" ]] && printf ' / %s' "$_BOX" ))${RESET}"
+  echo -e "  ${DIM}${_hdr_path}${RESET}"
+  echo ""
+
+  # The picker needs a terminal AND enough width to lay a row out. Below the
+  # minimum every row would wrap into two physical lines while the redraw moves
+  # up one, which walks the block down the screen a line per keypress. A plain
+  # list is the honest answer there, not a broken picker.
+  #
+  # The width half is its own function so it can be tested: the tty half is two
+  # fd tests that no sourced test can make true, so a test driving the whole
+  # condition would pass for the wrong reason and pin nothing.
+  if [[ -t 0 ]] && [[ -t 1 ]] && ! _sessions_too_narrow; then
+    _sessions_picker_tui "$sdir" "$project" "$_BOX" "$cname" "$rowfile" "$total"
+  else
+    _sessions_picker_text "$rowfile" "$total"
+  fi
+  rm -f "$rowfile"
+  return 0
+}
+
+# Resolve a prefix against the TRASH rather than the live directory, so
+# `cleat sessions restore <id>` takes the same short id the delete printed.
+_sessions_restore_resolve() {
+  local sdir="$1" want="$2" tdir d base uuid matches=() 
+  case "$want" in ''|*[!0-9a-f-]*) return 1 ;; esac
+  [[ ${#want} -ge 8 ]] || return 1
+  tdir="$(_sessions_trash_dir "$sdir")" || return 1
+  [[ -d "$tdir" ]] || return 1
+  for d in "$tdir"/*; do
+    [[ -d "$d" ]] || continue
+    base="${d##*/}"
+    uuid="${base#*-}"
+    _sessions_is_uuid "$uuid" || continue
+    case "$uuid" in
+      "$want"*) matches=("${matches[@]+"${matches[@]}"}" "$uuid") ;;
+    esac
+  done
+  # Refuse an ambiguous prefix rather than restoring the first match. Every
+  # other id resolution in this feature does, and a restore that silently picks
+  # one of two conversations is the same class of mistake as a delete that does.
+  case ${#matches[@]} in
+    0) return 1 ;;
+    1) printf '%s' "${matches[0]}"; return 0 ;;
+    *) for d in "${matches[@]}"; do printf '%s\n' "$d"; done; return 4 ;;
+  esac
+}
+
 cmd_install() {
   local target="/usr/local/bin" force=""
   [[ "${1:-}" == "--force" ]] && force=1
@@ -13405,6 +14928,7 @@ cmd_help() {
   echo -e "    ${GREEN}ps${RESET}                 List all Cleat containers (running & stopped)"
   echo -e "    ${GREEN}storage${RESET}            Show Docker disk usage ${DIM}(cleat vs shared vs other projects)${RESET}"
   echo -e "    ${GREEN}describe${RESET} ${DIM}[box] [text]${RESET}  Show or set a box's description"
+  echo -e "    ${GREEN}sessions${RESET} ${DIM}[box]${RESET}       List, rename or delete this box's Claude sessions"
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
   echo -e "    ${GREEN}update${RESET}             Check for updates and install the latest version"
@@ -13563,6 +15087,12 @@ main() {
   # never boot a VM. The preflight args drop the subcommand so the idle sweep
   # sees the box name and not the literal word "start", which would make it
   # sweep the very box being launched.
+  #
+  # `sessions` is deliberately absent: it reads the host filesystem and must
+  # keep working with Docker down, which is exactly when a user is most likely
+  # to be reclaiming disk. Its destructive subcommands do their own _daemon_up
+  # check and REFUSE rather than boot a VM, because a probe that cannot answer
+  # must never be treated as "nothing is running".
   local _do_preflight=0
   local _preflight_args=("$@")
   case "$cmd" in
@@ -13608,6 +15138,7 @@ main() {
     logs)      _set_box "$@"; cmd_logs ;;
     ps)        cmd_ps "$@" ;;
     storage)   cmd_storage "$@" ;;
+    sessions|ses) cmd_sessions "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;

@@ -377,6 +377,73 @@ STUB
   assert_output --partial "not running"
 }
 
+@test "smoke: cleat sessions with no sessions exits cleanly and says where it looked" {
+  run cleat_bin_timeout 10 sessions
+  assert_success
+  refute_output --partial "unbound variable"
+  # The directory is the whole diagnostic: the key is hashed from the path as
+  # typed, so a differently-cased cwd on a Mac reads as data loss without it.
+  assert_output --partial "Looked in"
+}
+
+@test "smoke: cleat sessions still lists when the Docker daemon is down" {
+  # Listing is pure host filesystem and `sessions` is deliberately absent from
+  # the preflight allowlist, because reclaiming disk is exactly when a user is
+  # likely to have Docker off.
+  export DOCKER_EXIT_CODE=1
+  run cleat_bin_timeout 10 sessions
+  assert_success
+  refute_output --partial "unbound variable"
+  refute_output --partial "not running"
+}
+
+@test "smoke: cleat sessions rm with no id asks which one" {
+  run cleat_bin_timeout 10 sessions rm
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "Which session"
+}
+
+@test "smoke: cleat sessions rm refuses a too-short id" {
+  run cleat_bin_timeout 10 sessions rm dead
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "Too short"
+}
+
+@test "smoke: cleat sessions rm refuses a non-hex id" {
+  run cleat_bin_timeout 10 sessions rm ../../etc/passwd
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "Not a session id"
+}
+
+@test "smoke: cleat sessions refuses an unknown flag" {
+  run cleat_bin_timeout 10 sessions --wat
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "Unknown flag"
+}
+
+@test "smoke: cleat sessions refuses a stray positional like every box-aware verb" {
+  run cleat_bin_timeout 10 sessions main extra
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "Unexpected argument"
+}
+
+@test "smoke: cleat sessions rename needs a value for --title" {
+  run cleat_bin_timeout 10 sessions rename deadbeef01 --title
+  assert_failure
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat sessions appears in help" {
+  run cleat_bin help
+  assert_success
+  assert_output --partial "sessions"
+}
+
 @test "smoke: CLEAT_NO_CLIPBOARD_IMAGE=1 start path does not crash" {
   printf '' > "$DOCKER_MOCK_DIR/ps_output"
   printf '' > "$DOCKER_MOCK_DIR/ps_a_output"

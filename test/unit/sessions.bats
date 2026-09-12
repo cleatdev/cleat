@@ -1089,7 +1089,7 @@ _pass_gates() {
   # user had. The saved value is what `stty -g` returned.
   _is_tty() { return 0; }
   stty() { case "$1" in -g) echo "SAVED-STATE" ;; *) echo "stty $*" >> "$TEST_TEMP/stty.log" ;; esac; }
-  _sessions_echo_off
+  _tui_echo_off
   [ "$_SESS_STTY" = "SAVED-STATE" ]
   run cat "$TEST_TEMP/stty.log"
   assert_output --partial "stty -echo"
@@ -1099,7 +1099,7 @@ _pass_gates() {
   _is_tty() { return 0; }
   _SESS_STTY="SAVED-STATE"
   stty() { echo "stty $*" >> "$TEST_TEMP/stty.log"; }
-  _sessions_echo_restore
+  _tui_echo_restore
   run cat "$TEST_TEMP/stty.log"
   assert_output --partial "stty SAVED-STATE"
   # Cleared, so a second restore cannot re-apply a stale state.
@@ -1111,7 +1111,7 @@ _pass_gates() {
   _is_tty() { return 0; }
   _SESS_STTY=""
   stty() { echo "stty $*" >> "$TEST_TEMP/stty.log"; }
-  _sessions_echo_restore
+  _tui_echo_restore
   run cat "$TEST_TEMP/stty.log"
   assert_output --partial "stty echo"
 }
@@ -1119,8 +1119,8 @@ _pass_gates() {
 @test "sessions: echo handling is a no-op without a terminal" {
   _is_tty() { return 1; }
   stty() { echo "CALLED" >> "$TEST_TEMP/stty.log"; }
-  _sessions_echo_off
-  _sessions_echo_restore
+  _tui_echo_off
+  _tui_echo_restore
   [ ! -f "$TEST_TEMP/stty.log" ]
 }
 

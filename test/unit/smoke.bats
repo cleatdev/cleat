@@ -438,6 +438,57 @@ STUB
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat account with no accounts exits cleanly and says how to make one" {
+  run cleat_bin_timeout 10 account
+  assert_success
+  assert_output --partial "cleat account"
+}
+
+@test "smoke: cleat account list survives strict mode" {
+  run cleat_bin_timeout 10 account list
+  assert_success
+}
+
+@test "smoke: cleat account still works when the Docker daemon is down" {
+  # Deliberately absent from the preflight allowlist, for the same reason
+  # `sessions` is: a store operation must not need a daemon.
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 10 account list
+  assert_success
+}
+
+@test "smoke: cleat account refuses a name that is not the box charset" {
+  run cleat_bin_timeout 10 account "Bad Name"
+  assert_failure
+  assert_output --partial "Invalid account name"
+}
+
+@test "smoke: cleat account refuses an unknown flag" {
+  run cleat_bin_timeout 10 account --wat
+  assert_failure
+}
+
+@test "smoke: cleat account rename needs both names" {
+  run cleat_bin_timeout 10 account rename only-one
+  assert_failure
+}
+
+@test "smoke: cleat account rm with no name asks which one" {
+  run cleat_bin_timeout 10 account rm
+  assert_failure
+  assert_output --partial "Which account"
+}
+
+@test "smoke: cleat account refuses a stray positional like every box-aware verb" {
+  run cleat_bin_timeout 10 account work main extra
+  assert_failure
+}
+
+@test "smoke: cleat account appears in help" {
+  run cleat_bin_timeout 10 help
+  assert_success
+  assert_output --partial "account"
+}
+
 @test "smoke: cleat sessions trash runs with nothing in it" {
   run cleat_bin_timeout 10 sessions trash
   assert_success

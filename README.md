@@ -124,6 +124,7 @@ Cleat gives you the best of both worlds:
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Forked workspaces** -- `--fork` gives a box its own copy of the project, so several agents can work in parallel without touching your tree
 - **Contained Claude home** -- a box sees only its own project's Claude history. The instruction surfaces your host `claude` obeys are read-only inside the cage
+- **Account switching** -- `cleat account` keeps two or more Claude logins under names and pins a box to one, so hitting the five-hour limit on one Max account is one command instead of a browser login. Conversations and project history are shared across the switch
 - **Session management** -- `cleat sessions` lists a box's Claude conversations with their real sizes, deletes the ones you are done with (which the Claude Code CLI itself cannot do for a single conversation) and keeps them restorable in a trash for 30 days
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
@@ -470,6 +471,30 @@ symlink at one of the mask paths stops box create with a
 clear fix-or-remove error (your symlink is never deleted) and a box created
 before these masks existed prints a recreate note on every start until you
 run `cleat rm && cleat`.
+
+### Accounts: two Claude logins, one command to switch
+
+A Claude Max account has a five-hour window. With two of them the only way to move between them is `/login`, in a browser, both directions, every time one runs out. `cleat account` gives each login a name and pins a box to one of them.
+
+```bash
+cleat account work2      # pin this box to a login called work2
+# start the box and run /login once. That login is remembered under the name
+
+cleat account            # picker: switch, rename or remove
+cleat account work1      # back to the first one, no browser
+```
+
+Only the login moves. Conversations, project history and settings are identical on both accounts, by construction rather than by copying: a switch relocates Claude Code's credential store for that box and nothing else. So you can hit a limit mid-conversation, switch, then carry on in the same conversation.
+
+The pin is per box, because the limit is per account and you probably have several boxes open. One can move to the fresh account while the others keep draining the first.
+
+Claude Code refreshes its own token about every eight hours, inside the box. Every attach stages the stored login in and every detach takes the refreshed one back out, newest wins. `cleat rm`, every recreate and `cleat nuke` do that before they touch a run directory, so a refresh never sends you back to a browser.
+
+Logins live in `~/.config/cleat/accounts`, not in `~/.claude`, which every box mounts read-write. Only the pinned account's credential is staged into that box, so a box can still see exactly one login.
+
+The list shows usage when it can back it up: live while that account's own access token is alive, a timestamped snapshot when it is not. Once a reset time has passed it says the window reset rather than showing a stale percentage. It never refreshes a parked login to draw a bar, because the refresh can rotate the token.
+
+One thing a mid-conversation switch costs: Claude Code ties a conversation to the account that started it. Resuming one on the other account keeps the local transcript and `--resume` as they were. What stops is that conversation's server-side history being backfilled from the switch point. Cleat says so every time.
 
 ### Sessions: list, rename and delete conversations
 

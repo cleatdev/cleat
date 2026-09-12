@@ -63,6 +63,7 @@ AUTOSTART_BATS="$REPO_ROOT/test/unit/autostart.bats"
 SMOKE_BATS="$REPO_ROOT/test/unit/smoke.bats"
 CLIPBOARD_BRIDGE_BATS="$REPO_ROOT/test/unit/clipboard_bridge.bats"
 SESSIONS_BATS="$REPO_ROOT/test/unit/sessions.bats"
+ACCOUNTS_BATS="$REPO_ROOT/test/unit/accounts.bats"
 HOOKS_BATS="$REPO_ROOT/test/unit/hooks.bats"
 PROVISION_BATS="$REPO_ROOT/test/unit/provision.bats"
 DOCKER_GATE_BATS="$REPO_ROOT/test/unit/docker_gate.bats"
@@ -5678,7 +5679,7 @@ try "vnext_sessions_rename_writes_record" "rename appends a custom-title record"
 
 # A bare `stty echo` on restore discards every other terminal setting.
 cat > "$SED_TMP" << 'SED'
-/^_sessions_echo_restore()/,/^}$/{
+/^_tui_echo_restore()/,/^}$/{
   s/stty "\$_SESS_STTY"/stty echo/
 }
 SED
@@ -5686,11 +5687,11 @@ try "vnext_sessions_echo_full_state" "echo-restore puts the saved state back ver
 
 # Echo must actually be turned off, or held arrows print into the frame.
 cat > "$SED_TMP" << 'SED'
-/^_sessions_echo_off()/,/^}$/{
+/^_tui_echo_off()/,/^}$/{
   /stty -echo 2>\/dev\/null .. true/d
 }
 SED
-try "vnext_sessions_echo_off" "echo-off saves the whole termios state" "$CLI" "$SESSIONS_BATS"
+try "vnext_tui_echo_off" "echo-off saves the whole termios state" "$CLI" "$SESSIONS_BATS"
 
 # A narrow terminal must fall back to the text list, not render wrapping rows.
 cat > "$SED_TMP" << 'SED'
@@ -5828,7 +5829,7 @@ try "vnext_sessions_frame_offset_guard" "frame normalises a hostile offset" "$CL
 # fail under set -e and exit with the terminal unable to echo.
 cat > "$SED_TMP" << 'SED'
 /^_sessions_picker_tui()/,/^}$/{
-  /trap ._sessions_echo_restore; _cursor_show. EXIT/d
+  /trap ._tui_echo_restore; _cursor_show. EXIT/d
 }
 SED
 try "vnext_sessions_echo_exit_trap" "failure during the row load still restores" "$CLI" "$SESSIONS_BATS"
@@ -6064,11 +6065,11 @@ try "vnext_sessions_trash_subcommand" "cleat sessions trash lists what was delet
 # back to it without restoring first, so saving the termios state twice records
 # the already echo-off state as the original and leaves the user unable to type.
 cat > "$SED_TMP" << 'SED'
-/^_sessions_echo_off()/,/^}$/{
+/^_tui_echo_off()/,/^}$/{
   s/^  if \[\[ -z "[$]{_SESS_STTY:-}" \]\]; then$/  if true; then/
 }
 SED
-try "vnext_sessions_echo_off_idempotent" "switching views does not poison the saved terminal state" "$CLI" "$SESSIONS_BATS"
+try "vnext_tui_echo_off_idempotent" "switching views does not poison the saved terminal state" "$CLI" "$SESSIONS_BATS"
 
 # A window can be narrowed while a rename prompt is waiting for a line of
 # input, so the redraw refuses as well as the key loop.
@@ -6078,6 +6079,183 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_sessions_narrow_on_redraw" "a window narrowed during an action leaves before drawing" "$CLI" "$SESSIONS_BATS"
+
+# ── cleat account ──────────────────────────────────────────────────────────
+#
+# Every guard below is silent when it breaks: a login that vanishes, a token
+# written world-readable, a switch that the Mac quietly undoes eight hours
+# later. None of them announce themselves, which is exactly why they each earn
+# a mutation rather than only a test.
+
+# The whole feature IS this env var. Without it a pinned box reads the shared
+# store and the switch is a no-op that reports success.
+cat > "$SED_TMP" << 'SED'
+s/^    CLAUDE_ENV+=(-e "CLAUDE_SECURESTORAGE_CONFIG_DIR=[$]{_ACCOUNT_BOX_DIR}")$/    :/
+SED
+try "vnext_account_env_var" "a pinned box gets the credential store env var" "$CLI" "$ACCOUNTS_BATS"
+
+# And the default sentinel must set NOTHING, or every box that never runs the
+# verb is a silent migration.
+cat > "$SED_TMP" << 'SED'
+s/^  if \[\[ "[$]_pinned_account" != "[$]_ACCOUNT_DEFAULT" \]\]; then$/  if true; then/
+SED
+try "vnext_account_default_sets_nothing" "an unpinned box gets no credential store env var" "$CLI" "$ACCOUNTS_BATS"
+
+# The macOS seed compares token EXPIRY and never identity, so leaving it armed
+# for a pinned box restores the Keychain's account about eight hours later.
+cat > "$SED_TMP" << 'SED'
+s/^  if \[\[ "[$]_pinned_account" == "[$]_ACCOUNT_DEFAULT" \]\]; then$/  if true; then/
+SED
+try "vnext_account_seed_skipped" "a pinned box skips the macOS Keychain seed" "$CLI" "$ACCOUNTS_BATS"
+
+# No mount, no store: /login would create it inside the container filesystem
+# where cleat rm destroys it.
+cat > "$SED_TMP" << 'SED'
+s|^    -v "[$]CLEAT_RUN_DIR/[$]{cname}/auth:[$]{_ACCOUNT_BOX_DIR}"$|    -v "/dev/null:/dev/null"|
+SED
+try "vnext_account_mount" "the per-box auth directory is mounted into the container" "$CLI" "$ACCOUNTS_BATS"
+
+# A missing bind SOURCE makes Docker create a directory at the target. That is
+# the failure that once broke git host-wide.
+cat > "$SED_TMP" << 'SED'
+s/^  mkdir -p "[$]_auth_dir"$/  :/
+SED
+try "vnext_account_mount_source" "the per-box auth directory is created before any docker run" "$CLI" "$ACCOUNTS_BATS"
+
+# A wipe that does not harvest throws away a token the account has no other
+# copy of, and lands the user back on /login.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^  _account_sync_out "[$]cname" || true$/  :/
+}
+SED
+try "vnext_account_wipe_harvests" "wiping a box run dir harvests first" "$CLI" "$ACCOUNTS_BATS"
+
+# Newest wins, keyed on expiresAt. Flipping the comparison silently downgrades
+# the stored credential to an older one on every attach.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_out()/,/^}$/{
+  s/^  \[\[ "[$]be" -gt "[$]se" \]\] || return 0$/  [[ "$be" -lt "$se" ]] || return 0/
+}
+SED
+try "vnext_account_harvest_newest_wins" "harvesting never replaces a newer stored credential" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in()/,/^}$/{
+  s/^  \[\[ "[$]se" -ge "[$]be" \]\] || return 0$/  :/
+}
+SED
+try "vnext_account_stage_newest_wins" "staging never overwrites a newer credential the box refreshed" "$CLI" "$ACCOUNTS_BATS"
+
+# An account with no credential IS the clean scope. Leaving the previous one
+# staged means /login never runs and the box keeps the old account.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in()/,/^}$/{
+  s|^    rm -f "[$]box_cred" 2>/dev/null || true$|    :|
+}
+SED
+try "vnext_account_clean_scope" "staging an empty account leaves the box signed out" "$CLI" "$ACCOUNTS_BATS"
+
+# A credential at the host default umask is readable by anything on the machine
+# and it is live for weeks.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  s|^  chmod 600 "[$]tmp" 2>/dev/null || true$|  :|
+}
+SED
+try "vnext_account_cred_mode" "a new store is 0700 and its credential 0600" "$CLI" "$ACCOUNTS_BATS"
+
+# Claude Code's store opens with O_NOFOLLOW and reports "no credentials" on a
+# symlink, so this failure is silent in both directions.
+cat > "$SED_TMP" << 'SED'
+/^_account_dir_ok()/,/^}$/{
+  s/^  \[\[ -L "[$]d" \]\] && return 1$/  :/
+}
+SED
+try "vnext_account_symlink_store" "a symlinked store is refused, not followed" "$CLI" "$ACCOUNTS_BATS"
+
+# Removing a login is removing a refresh token with weeks of life in it, and
+# the way it gets removed is a typo in a picker.
+cat > "$SED_TMP" << 'SED'
+/^_account_trash()/,/^}$/{
+  s|^  mv "[$]CLEAT_ACCOUNTS_DIR/[$]acct" "[$]dest" 2>/dev/null || return 1$|  rm -rf "${CLEAT_ACCOUNTS_DIR:?}/${acct}" 2>/dev/null; mkdir -p "$dest"|
+}
+SED
+try "vnext_account_trash_not_delete" "removing an account moves it to the trash" "$CLI" "$ACCOUNTS_BATS"
+
+# Claude Code notices the credential changing under a running session, disarms
+# its auth watcher and writes its own token back over the swap.
+cat > "$SED_TMP" << 'SED'
+s/^  if _daemon_up \&\& container_exists "[$]cname" \&\& _box_has_live_agent "[$]cname"; then$/  if false; then/
+SED
+try "vnext_account_live_gate" "switching refuses while the box has a live Claude session" "$CLI" "$ACCOUNTS_BATS"
+
+# A box that predates the mount must be told to recreate, not left to create
+# the store inside the container where cleat rm destroys it.
+cat > "$SED_TMP" << 'SED'
+s/^  _account_box_ready "[$]cname" || ready=[$]?$/  ready=0/
+SED
+try "vnext_account_mount_probe" "a box that predates the auth mount is told to recreate" "$CLI" "$ACCOUNTS_BATS"
+
+# Rule one: a refresh MAY rotate the refresh token, so polling a parked account
+# for display could revoke a credential held elsewhere.
+cat > "$SED_TMP" << 'SED'
+/^_account_usage_fetch()/,/^}$/{
+  s/^  \[\[ "[$]exp" -gt [$](( now \* 1000 )) \]\] || return 1$/  :/
+}
+SED
+try "vnext_account_never_poll_parked" "usage is never polled for an account whose token has expired" "$CLI" "$ACCOUNTS_BATS"
+
+# Without skip_spend the response carries real billing figures, which have no
+# business in a picker.
+cat > "$SED_TMP" << 'SED'
+s|^_ACCOUNT_USAGE_URL="https://api.anthropic.com/api/oauth/usage?skip_spend=1"$|_ACCOUNT_USAGE_URL="https://api.anthropic.com/api/oauth/usage"|
+SED
+try "vnext_account_skip_spend" "the usage request carries skip_spend" "$CLI" "$ACCOUNTS_BATS"
+
+# argv is visible in ps on a shared host.
+cat > "$SED_TMP" << 'SED'
+/^_account_usage_curl()/,/^}$/{
+  s|^  printf 'silent.*$|  curl -sS --max-time 3 -H "Authorization: Bearer $tok" "$_ACCOUNT_USAGE_URL" 2>/dev/null || true|
+  s|^    "[$]tok" "[$]_ACCOUNT_USAGE_URL" . curl --config - 2>/dev/null .. true$|  :|
+}
+SED
+try "vnext_account_token_off_argv" "never the token on argv" "$CLI" "$ACCOUNTS_BATS"
+
+# The subcommand words are reserved before the switch form is parsed, so an
+# account called `rm` could be created and then never selected again.
+cat > "$SED_TMP" << 'SED'
+s/^    list|rename|rm|delete|restore|trash|off|help) return 1 ;;$/    zzzunused) return 1 ;;/
+SED
+try "vnext_account_reserved_names" "refuses the subcommand words as names" "$CLI" "$ACCOUNTS_BATS"
+
+# Without the pin rewrite every box pinned to the old name silently falls back
+# to the shared store at its next attach, which reads as being logged out.
+cat > "$SED_TMP" << 'SED'
+/^_account_rename()/,/^}$/{
+  s/^    _box_account_write "[$]b" "[$]new" || true$/    :/
+}
+SED
+try "vnext_account_rename_follows_pins" "renaming moves the store and every pin follows it" "$CLI" "$ACCOUNTS_BATS"
+
+# resets_at is an absolute future instant, so it stays true while the
+# percentage goes stale. Showing the old percentage after it elapsed would be
+# the one invented figure in the feature.
+cat > "$SED_TMP" << 'SED'
+/^_account_usage_render()/,/^}$/{
+  s/^    if \[\[ "[$]fr" -gt 0 \&\& "[$]fr" -le "[$]now" \]\]; then$/    if false; then/
+}
+SED
+try "vnext_account_window_reset" "a window whose reset time has passed says so" "$CLI" "$ACCOUNTS_BATS"
+
+# A hand-edited pin holding something that is not a usable name must fall back
+# to the shared store, not reach a path join.
+cat > "$SED_TMP" << 'SED'
+/^_box_account_read()/,/^}$/{
+  s/^    if _validate_account_name "[$]v"; then$/    if true; then/
+}
+SED
+try "vnext_account_pin_validated" "a hand-edited pin that is not a usable name falls back" "$CLI" "$ACCOUNTS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

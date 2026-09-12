@@ -3316,6 +3316,16 @@ _generate_home_overlay() {
   local home_dir="$CLEAT_RUN_DIR/${cname}/home"
   local _d
 
+  # The per-box credential store. Created here for the same reason every other
+  # bind source is: a missing bind source makes Docker create a DIRECTORY at the
+  # target, which is the failure that once broke `git` host-wide. It is empty
+  # unless a named account is pinned, and an empty one is exactly what "signed
+  # out" looks like to Claude Code.
+  local _auth_dir="$CLEAT_RUN_DIR/${cname}/auth"
+  [[ -L "$_auth_dir" || -f "$_auth_dir" ]] && rm -f "$_auth_dir"
+  mkdir -p "$_auth_dir"
+  chmod 700 "$_auth_dir" 2>/dev/null || true
+
   for _d in $_CLAUDE_PRIVATE_DIRS; do
     # Self-heal a wrong type (file or symlink where the dir goes), matching
     # _generate_kit_overlay. A symlink here would make the box write through
@@ -5065,7 +5075,7 @@ _resolve_config_drift() {
         docker stop "$cname" > /dev/null 2>&1 || true
       fi
       docker rm -f "$cname" > /dev/null 2>&1 || true
-      rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+      _account_wipe_run_dir "${cname}"
       success "Removed ${BOLD}${cname}${RESET}."
       return 0
     fi
@@ -5141,7 +5151,7 @@ _maybe_prompt_image_rebuild() {
     if container_exists "$cname"; then
       is_running "$cname" && docker stop "$cname" > /dev/null 2>&1 || true
       docker rm -f "$cname" > /dev/null 2>&1 || true
-      rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+      _account_wipe_run_dir "${cname}"
     fi
   fi
 }
@@ -5174,7 +5184,7 @@ _maybe_prompt_init_recreate() {
   if [[ -z "$yn" || "$yn" == [yY]* ]]; then
     is_running "$cname" && { docker stop "$cname" > /dev/null 2>&1 || true; }
     docker rm -f "$cname" > /dev/null 2>&1 || true
-    rm -rf "${CLEAT_RUN_DIR:?}/${cname}" 2>/dev/null || true
+    _account_wipe_run_dir "${cname}"
   fi
 }
 
@@ -5336,6 +5346,14 @@ _print_summary_block() {
   _summary_kit="$(_box_kit_read "$cname")"
   if [[ -n "$_summary_kit" ]]; then
     printf '  %bKit:%b        %b%s%b\n' "$DIM" "$RESET" "$BLUE" "$_summary_kit" "$RESET"
+  fi
+  # Same rule as the Kit row: the pin file is hand-editable, so print it as
+  # DATA (%s), never through echo -e. Silent on `default`, which is every box
+  # that has never run the verb.
+  local _summary_acct
+  _summary_acct="$(_box_account_read "$cname")"
+  if [[ -n "$_summary_acct" && "$_summary_acct" != "$_ACCOUNT_DEFAULT" ]]; then
+    printf '  %bAccount:%b    %b%s%b\n' "$DIM" "$RESET" "$BLUE" "$_summary_acct" "$RESET"
   fi
   _print_caps "  " "Caps:" "       "
   _env_summary_inline "$project"
@@ -6992,10 +7010,31 @@ exec_claude() {
   # process. Fail-soft.
   touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
 
+  # Named accounts (`cleat account`). Staging happens on every attach, not only
+  # at switch time, because the stored credential may have been refreshed by
+  # ANOTHER box since this one last ran.
+  #
+  # CLAUDE_ENV is a plain `-e` array consumed by the `docker exec` below, so
+  # this is recreate-free and applies per exec, which is the right granularity
+  # for a per-box pin.
+  local _pinned_account
+  _pinned_account="$(_box_account_read "$cname")"
+  if [[ "$_pinned_account" != "$_ACCOUNT_DEFAULT" ]]; then
+    _account_sync_in "$cname" || true
+    CLAUDE_ENV+=(-e "CLAUDE_SECURESTORAGE_CONFIG_DIR=${_ACCOUNT_BOX_DIR}")
+  fi
+
   # On macOS, bridge the host Keychain's OAuth token into the box before Claude
   # launches (the ~/.claude mount is live, so a write here is visible inside the
   # running container). No-op off macOS or once the box already has a token.
-  _seed_macos_credentials
+  #
+  # Skipped for a pinned box. The seed compares token EXPIRY and never identity,
+  # so on a Mac it would quietly restore the Keychain's account about eight
+  # hours after a switch. The env var above already means a pinned box never
+  # reads ~/.claude/.credentials.json, so this is belt and braces.
+  if [[ "$_pinned_account" == "$_ACCOUNT_DEFAULT" ]]; then
+    _seed_macos_credentials
+  fi
 
   # Heal a logged-out or identity-less ~/.claude.json in the RUNNING box before
   # Claude launches (in-place, liveness-gated; see _refresh_attached_claude_json).
@@ -7188,6 +7227,10 @@ exec_claude() {
     ' _ "$@" 2>"$_exec_err" || rc=$?
 
   _cleanup_session
+  # Harvest a token the box refreshed for itself. Without this every refresh
+  # after a switch is lost and the account is back at /login, which is the exact
+  # pain this feature removes.
+  _account_sync_out "$cname" || true
   trap - EXIT INT TERM HUP
   _restore_terminal
 
@@ -8060,7 +8103,7 @@ cmd_upgrade_claude() {
           docker stop "$cname" > /dev/null 2>&1 || true
         fi
         docker rm -f "$cname" > /dev/null 2>&1 || true
-        rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+        _account_wipe_run_dir "${cname}"
         success "Removed ${BOLD}${cname}${RESET}."
         cmd_run "$project"
         return
@@ -8535,6 +8578,7 @@ cmd_run() {
     -v "$CLEAT_RUN_DIR/${cname}/kit/agents:/home/coder/.claude/agents:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/commands:/home/coder/.claude/commands:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/skills:/home/coder/.claude/skills:ro"
+    -v "$CLEAT_RUN_DIR/${cname}/auth:${_ACCOUNT_BOX_DIR}"
     -v "${HOME}/.claude/plugins:/home/coder/.claude/plugins:ro"
     -v "$clip_dir":/tmp/cleat-clip
   )
@@ -9089,7 +9133,7 @@ cmd_rm() {
     # Clean up this container's runtime dir: sessions on the host are
     # intentionally NOT touched; they live at ~/.claude/projects/<key>/ and
     # survive cleat rm.
-    rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+    _account_wipe_run_dir "${cname}"
     success "Removed ${BOLD}${cname}${RESET}."
     echo -e "    ${DIM}Sessions preserved. Run ${BOLD}cleat resume${RESET}${DIM} to pick up where you left off.${RESET}"
     echo -e "    ${DIM}The box's disk layer is freed. Its image and build cache stay in the shared Docker disk: ${RESET}${BOLD}cleat storage${RESET}${DIM} shows what is left.${RESET}"
@@ -9500,10 +9544,26 @@ cmd_status() {
     echo -e "  ${BOLD}Image:${RESET}     ${DIM}○ not built${RESET}"
   fi
 
-  if [[ -d "${HOME}/.claude" ]] && find "${HOME}/.claude" -name '.credentials*' -o -name 'credentials*' 2>/dev/null | grep -q .; then
-    echo -e "  ${BOLD}Auth:${RESET}      ${GREEN}● logged in${RESET} ${DIM}(via ~/.claude)${RESET}"
+  # Deliberately NOT a `find ... -name '*credentials*'`. That glob matched a
+  # dead, months-old `credentials.json` sitting in the same directory and
+  # reported "logged in" from it. What counts is the store this box actually
+  # reads, and whether the thing in it still has a refresh token.
+  local _status_acct _status_state
+  _status_acct="$(_box_account_read "$(container_name_for "$(resolve_project "$PWD")" "$_BOX")")"
+  if [[ "$_status_acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    if [[ -s "${HOME}/.claude/.credentials.json" ]]; then
+      echo -e "  ${BOLD}Auth:${RESET}      ${GREEN}● logged in${RESET} ${DIM}(via ~/.claude)${RESET}"
+    else
+      echo -e "  ${BOLD}Auth:${RESET}      ${YELLOW}○ not configured${RESET} ${DIM}(cleat login)${RESET}"
+    fi
   else
-    echo -e "  ${BOLD}Auth:${RESET}      ${YELLOW}○ not configured${RESET} ${DIM}(cleat login)${RESET}"
+    _status_state="$(_account_auth_state "$_status_acct")"
+    case "$_status_state" in
+      ok) printf '  %bAuth:%b      %b● logged in%b %b(account %s)%b\n' \
+            "$BOLD" "$RESET" "$GREEN" "$RESET" "$DIM" "$_status_acct" "$RESET" ;;
+      *)  printf '  %bAuth:%b      %b○ %s%b %b(account %s, cleat account)%b\n' \
+            "$BOLD" "$RESET" "$YELLOW" "$_status_state" "$RESET" "$DIM" "$_status_acct" "$RESET" ;;
+    esac
   fi
 
   # Show active capabilities: same categorized renderer as the post-launch
@@ -10702,6 +10762,12 @@ cmd_nuke() {
   # now, so /tmp rotation won't reclaim them: wipe them explicitly.
   if [[ -d "$CLEAT_RUN_DIR" ]]; then
     info "Removing per-container runtime dirs..."
+    # Named accounts live in ~/.config/cleat/accounts and are NOT removed here,
+    # which is what the promise three lines up depends on. But the staged
+    # credential a box refreshed in place does live under the run dir, so
+    # harvest before the wipe or nuke destroys weeks of refresh token while
+    # saying it did not.
+    _account_sync_out_all
     rm -rf "$CLEAT_RUN_DIR" 2>/dev/null || true
   fi
 
@@ -11537,7 +11603,10 @@ _SESSIONS_CHROME_LINES=8
 # down the screen one line per keypress.
 _SESSIONS_MIN_COLS=40
 
-# Suppress the terminal's own echo for the duration of a raw key loop.
+# Suppress the terminal's own echo for the duration of a raw key loop. Named
+# for what it does rather than for `cleat sessions`, which needed it first:
+# `cleat account` uses the same pair, and a second copy of a termios save and
+# restore is the last thing this file needs.
 #
 # Without this, any key byte that arrives while the loop is NOT inside
 # `read -rsn1` is echoed by the tty, so holding an arrow key prints `^[[B`
@@ -11560,7 +11629,7 @@ _SESSIONS_MIN_COLS=40
 # type after the picker exited. So the saved state is written once and cleared
 # only by the restore, which is what pairs them.
 _SESS_STTY=""
-_sessions_echo_off() {
+_tui_echo_off() {
   _is_tty || { _SESS_STTY=""; return 0; }
   if [[ -z "${_SESS_STTY:-}" ]]; then
     _SESS_STTY="$(stty -g 2>/dev/null || true)"
@@ -11569,7 +11638,7 @@ _sessions_echo_off() {
   return 0
 }
 
-_sessions_echo_restore() {
+_tui_echo_restore() {
   _is_tty || return 0
   if [[ -n "${_SESS_STTY:-}" ]]; then
     stty "$_SESS_STTY" 2>/dev/null || stty echo 2>/dev/null || true
@@ -11889,7 +11958,7 @@ _SESSIONS_ACTION_HEAD=3
 # "Cancelled" line for an action that never started.
 _sessions_action_backout() {
   _cursor_show
-  _sessions_echo_restore
+  _tui_echo_restore
   trap - INT TERM HUP
   printf '\033[%dA' "$_SESSIONS_ACTION_HEAD"
   printf '\033[J'
@@ -12095,8 +12164,8 @@ _sessions_action_tui() {
   local block=$(( _SESSIONS_ACTION_LINES ))
   local cols
   cols="$(_term_cols)"
-  _sessions_echo_off
-  trap '_sessions_echo_restore; _cursor_show; trap - INT TERM HUP; exit 130' INT TERM HUP
+  _tui_echo_off
+  trap '_tui_echo_restore; _cursor_show; trap - INT TERM HUP; exit 130' INT TERM HUP
   _cursor_hide
   _sessions_action_draw "$cursor" "$cols"
   echo ""
@@ -12114,7 +12183,7 @@ _sessions_action_tui() {
           return 1
         fi
         _cursor_show
-        _sessions_echo_restore
+        _tui_echo_restore
         trap - INT TERM HUP
         printf '\033[%dB' "$(( block + 2 ))"
         printf '\033[2K'
@@ -12187,9 +12256,9 @@ _sessions_picker_tui() {
     # with the terminal still unable to echo. EXIT covers that and the signals
     # cover a Ctrl-C during the slow part, which is exactly when an impatient
     # user presses it.
-    _sessions_echo_off
-    trap '_sessions_echo_restore; _cursor_show' EXIT
-    trap '_sessions_echo_restore; _cursor_show; trap - INT TERM HUP EXIT; exit 130' INT TERM HUP
+    _tui_echo_off
+    trap '_tui_echo_restore; _cursor_show' EXIT
+    trap '_tui_echo_restore; _cursor_show; trap - INT TERM HUP EXIT; exit 130' INT TERM HUP
 
     _sessions_load_rows "$cur"
     total="$_SESS_N"
@@ -12199,7 +12268,7 @@ _sessions_picker_tui() {
     # they just deleted can be got back from, and being thrown to a shell prompt
     # with an "undo" command to retype is the unfriendliness this pass is about.
     if [[ "$view" == "live" && "$total" -le 0 ]]; then
-      _sessions_echo_restore
+      _tui_echo_restore
       _cursor_show
       trap - INT TERM HUP EXIT
       if [[ "${_SESS_TRASH_N:-0}" -gt 0 ]]; then
@@ -12235,7 +12304,7 @@ _sessions_picker_tui() {
     # first frame after that would otherwise be a wrapped one. A wrapped row
     # walks the block down the screen and there is no recovering the origin.
     if [[ "$_SESS_NARROW" == "1" ]]; then
-      _sessions_echo_restore
+      _tui_echo_restore
       _cursor_show
       trap - INT TERM HUP EXIT
       echo ""
@@ -12260,7 +12329,7 @@ _sessions_picker_tui() {
       # screen one row per keypress and there is no recovering the origin.
       if [[ "$_SESS_NARROW" == "1" ]]; then
         _cursor_show
-        _sessions_echo_restore
+        _tui_echo_restore
         trap - INT TERM HUP EXIT
         printf '\033[%dB' "$block"
         printf '\033[2K'
@@ -12312,7 +12381,7 @@ _sessions_picker_tui() {
             continue
           fi
           _cursor_show
-          _sessions_echo_restore
+          _tui_echo_restore
           trap - INT TERM HUP EXIT
           # Hand the screen over by erasing the frame from its origin down. The
           # action screen then draws in the space the list occupied, which is
@@ -12343,7 +12412,7 @@ _sessions_picker_tui() {
           break ;;
         QUIT|ESC)
           _cursor_show
-          _sessions_echo_restore
+          _tui_echo_restore
           trap - INT TERM HUP EXIT
           printf '\033[%dB' "$block"
           printf '\033[2K'
@@ -12406,6 +12475,1412 @@ _sessions_picker_text() {
     if [[ "$tn" -gt 0 ]]; then
       echo -e "  ${DIM}${tn} in the trash. See them with ${BOLD}cleat sessions trash${RESET}${DIM}.${RESET}"
     fi
+  fi
+  return 0
+}
+
+# ── Named Claude auth contexts (`cleat account`) ────────────────────────────
+#
+# One Max account has a five-hour window. A maintainer with two of them should
+# not have to re-run /login in a browser every time one runs out. So a box can
+# be PINNED to a named account, and switching is one command.
+#
+# The whole feature rests on one Claude Code env var:
+#
+#   CLAUDE_SECURESTORAGE_CONFIG_DIR   relocates the CREDENTIAL STORE and nothing
+#                                     else. Verified against `claude auth status
+#                                     --json` on 2.1.267: pointed at an empty
+#                                     directory it reports loggedIn:false while
+#                                     projectsDirectory stays ~/.claude/projects.
+#
+# That is what makes this auth-scope-only, which is the requirement: the same
+# conversations, the same project history and the same settings on both
+# accounts, so you can hit a limit mid-conversation and carry on.
+# CLAUDE_CONFIG_DIR is the wrong lever and is rejected in concept/44: it moves
+# the conversations too.
+#
+# The var is UNDOCUMENTED (no --help text, no release-note string, only code and
+# an internal allowlist), so nothing here trusts it blindly. The `default`
+# sentinel sets no variable at all and is byte-identical to the behaviour before
+# this feature existed, which is what every box gets until the verb is run.
+CLEAT_ACCOUNTS_DIR="$CLEAT_CONFIG_DIR/accounts"
+CLEAT_BOX_ACCOUNTS_DIR="$CLEAT_CONFIG_DIR/box-accounts"
+# "Whatever was there before": the shared ~/.claude store, no env var, no mount
+# use. A real directory may also be named `default`, which is fine: it is only a
+# sentinel for the PIN.
+_ACCOUNT_DEFAULT="default"
+# Where the staged credential is mounted inside the box. A fresh path on
+# purpose, NOT nested inside the ~/.claude bind, so the VirtioFS nested-mount
+# rule (a nested target must already exist inside the parent bind source) does
+# not apply to it.
+_ACCOUNT_BOX_DIR="/home/coder/.cleat-auth"
+_ACCOUNTS_TRASH_DAYS=30
+# Don't poll the usage endpoint more than once a minute per account.
+_ACCOUNT_USAGE_THROTTLE=60
+
+# Box rules, not session-title rules, and the difference matters. A title may be
+# any printable ASCII; an account name becomes a DIRECTORY on a case-insensitive
+# APFS host and a path inside a case-sensitive container, so `Work` and `work`
+# would be one file on the Mac and two in the box. A dot makes a `.json` suffix
+# ambiguous and a leading dash is argv injection.
+#
+# The subcommand words are refused as names too. They are reserved before the
+# switch form is parsed, so an account called `rm` could be created and then
+# never selected again.
+_validate_account_name() {
+  local n="$1"
+  local _acct_re='^[a-z0-9][a-z0-9_-]{0,30}$'
+  [[ "$n" =~ $_acct_re ]] || return 1
+  case "$n" in
+    list|rename|rm|delete|restore|trash|off|help) return 1 ;;
+    # The sentinel. A real directory of this name could be pinned and then
+    # never staged, because every staging path treats the name as "no account".
+    "$_ACCOUNT_DEFAULT") return 1 ;;
+  esac
+  return 0
+}
+
+_account_dir()       { printf '%s' "$CLEAT_ACCOUNTS_DIR/$1"; }
+_account_cred_path() { printf '%s' "$CLEAT_ACCOUNTS_DIR/$1/.credentials.json"; }
+# Named `meta`, not `meta.json`, because it is NOT json: see _account_meta_set.
+_account_meta_path() { printf '%s' "$CLEAT_ACCOUNTS_DIR/$1/meta"; }
+_account_exists()    { [[ -d "$CLEAT_ACCOUNTS_DIR/$1" && ! -L "$CLEAT_ACCOUNTS_DIR/$1" ]]; }
+
+# Refuse a store that is not a plain directory sitting directly inside the
+# accounts dir. Same shape as _sessions_trash_dir and for the same reason: the
+# thing being written is a credential, and a symlink would relocate it while the
+# write reported success. Claude Code's own store opens with O_NOFOLLOW and maps
+# the error to "no credentials", which presents as a login screen with no
+# explanation, so a symlink here is silent in both directions.
+_account_dir_ok() {
+  local d="$CLEAT_ACCOUNTS_DIR/$1"
+  [[ -L "$d" ]] && return 1
+  [[ -e "$d" ]] && [[ ! -d "$d" ]] && return 1
+  return 0
+}
+
+_account_ensure_dir() {
+  local acct="$1" d
+  _account_dir_ok "$acct" || return 1
+  d="$CLEAT_ACCOUNTS_DIR/$acct"
+  mkdir -p "$d" 2>/dev/null || return 1
+  chmod 700 "$d" 2>/dev/null || true
+  return 0
+}
+
+# Every stored account, one per line. A name that would not validate today is
+# skipped rather than listed, so a hand-made directory cannot become a row the
+# picker will then refuse to act on.
+_account_list() {
+  local d base
+  [[ -d "$CLEAT_ACCOUNTS_DIR" ]] || return 0
+  for d in "$CLEAT_ACCOUNTS_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    [[ -L "$d" ]] && continue
+    base="${d##*/}"
+    _validate_account_name "$base" || continue
+    printf '%s\n' "$base"
+  done
+}
+
+# ── The per-box pin ─────────────────────────────────────────────────────────
+# One file per container name holding one account name, copying _box_kit_* down
+# to why it is its own directory rather than a suffixed file in boxes/: the
+# globs there must never iterate anything but a box description.
+
+_box_account_file() { printf '%s' "$CLEAT_BOX_ACCOUNTS_DIR/$1"; }
+
+_box_account_read() {
+  local f v
+  f="$(_box_account_file "$1")"
+  if [[ -f "$f" ]]; then
+    v="$(head -n1 "$f" 2>/dev/null | tr -d '\r\n' || true)"
+    if _validate_account_name "$v"; then
+      printf '%s' "$v"
+      return 0
+    fi
+  fi
+  printf '%s' "$_ACCOUNT_DEFAULT"
+}
+
+_box_account_write() {
+  local cname="$1" acct="$2" f
+  mkdir -p "$CLEAT_BOX_ACCOUNTS_DIR" 2>/dev/null || return 1
+  f="$(_box_account_file "$cname")"
+  printf '%s\n' "$acct" > "$f" || return 1
+  chmod 600 "$f" 2>/dev/null || true
+  return 0
+}
+
+_box_account_remove() { rm -f "$(_box_account_file "$1")" 2>/dev/null || true; }
+
+# Every box pinned to this account, so a remove can say what it would strand.
+_account_pinned_boxes() {
+  local acct="$1" f base
+  [[ -d "$CLEAT_BOX_ACCOUNTS_DIR" ]] || return 0
+  for f in "$CLEAT_BOX_ACCOUNTS_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    base="${f##*/}"
+    [[ "$(_box_account_read "$base")" == "$acct" ]] || continue
+    printf '%s\n' "$base"
+  done
+}
+
+# ── Credential files ────────────────────────────────────────────────────────
+
+# Epoch MILLISECONDS the stored access token expires, or 0. Reuses
+# _oauth_expires_at, the parser _seed_macos_credentials already trusts.
+_account_cred_expiry() {
+  local f="$1" v
+  [[ -s "$f" ]] || { printf '0'; return 0; }
+  v="$(_oauth_expires_at < "$f" 2>/dev/null || true)"
+  case "$v" in ''|*[!0-9]*) v=0 ;; esac
+  printf '%s' "$v"
+}
+
+# Copy a credential into place at 0600, atomically, refusing anything that is
+# not a JSON object. The umask subshell is the point: a plain `cp` would leave a
+# live OAuth token readable at the host's default umask for the length of the
+# copy. Lifted from _seed_macos_credentials, which had to solve this first.
+_account_write_file_0600() {
+  local src="$1" dest="$2" tmp ok=false
+  [[ -L "$dest" ]] && return 1
+  tmp="${dest}.tmp.$$"
+  ( umask 077; cat "$src" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  if command -v jq &>/dev/null; then
+    jq -e 'type=="object"' "$tmp" >/dev/null 2>&1 && ok=true
+  else
+    _looks_like_json_object "$tmp" && ok=true
+  fi
+  if ! $ok; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$dest" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+_account_write_cred() {
+  local acct="$1" src="$2"
+  _account_ensure_dir "$acct" || return 1
+  _account_write_file_0600 "$src" "$(_account_cred_path "$acct")"
+}
+
+# ── Staging into a box ──────────────────────────────────────────────────────
+
+_account_box_auth_dir() { printf '%s' "$CLEAT_RUN_DIR/$1/auth"; }
+
+# Every place that removes a box's run dir goes through here. The staged
+# credential lives in that dir, and Claude Code refreshes it in place about
+# every eight hours, so a wipe that does not harvest first throws away a token
+# the account has no other copy of and lands the user back on /login.
+_account_wipe_run_dir() {
+  local cname="$1"
+  [[ -n "$cname" ]] || return 0
+  _account_sync_out "$cname" || true
+  rm -rf "${CLEAT_RUN_DIR:?}/${cname}" 2>/dev/null || true
+  return 0
+}
+
+# The same, for the wipes that take the whole run directory.
+_account_sync_out_all() {
+  local f base
+  [[ -d "$CLEAT_BOX_ACCOUNTS_DIR" ]] || return 0
+  for f in "$CLEAT_BOX_ACCOUNTS_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    base="${f##*/}"
+    _account_sync_out "$base" || true
+  done
+  return 0
+}
+
+# Copy the pinned account's credential into the box's own auth directory, or
+# remove it when the account is empty so the box presents as signed out and
+# /login lands in the right store.
+#
+# Copy, never symlink, and never a bind of the file itself: a bind-mounted FILE
+# breaks the moment the host replaces it by rename, which is how every safe
+# write in this CLI is done.
+_account_sync_in() {
+  local cname="$1" acct dir store_cred box_cred be se
+  acct="$(_box_account_read "$cname")"
+  [[ "$acct" != "$_ACCOUNT_DEFAULT" ]] || return 0
+  dir="$(_account_box_auth_dir "$cname")"
+  [[ -L "$dir" ]] && return 1
+  mkdir -p "$dir" 2>/dev/null || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  store_cred="$(_account_cred_path "$acct")"
+  box_cred="${dir}/.credentials.json"
+  if [[ ! -s "$store_cred" ]]; then
+    rm -f "$box_cred" 2>/dev/null || true
+    return 0
+  fi
+  # Newest wins, keyed on expiresAt rather than mtime: every refresh pushes it
+  # about eight hours forward, and it survives a clock or filesystem-timestamp
+  # oddity in a way mtime does not. Same comparison _seed_macos_credentials
+  # makes for the same reason.
+  be="$(_account_cred_expiry "$box_cred")"
+  se="$(_account_cred_expiry "$store_cred")"
+  [[ "$se" -ge "$be" ]] || return 0
+  _account_write_file_0600 "$store_cred" "$box_cred"
+}
+
+# Harvest a token the box refreshed for itself back into the store. Without
+# this every refresh after a switch is lost and the account is back at /login,
+# which is the exact pain this feature removes. Runs at session end, at the top
+# of every `cleat account`, and BEFORE anything wipes the run directory.
+_account_sync_out() {
+  local cname="$1" acct box_cred store_cred be se
+  acct="$(_box_account_read "$cname")"
+  [[ "$acct" != "$_ACCOUNT_DEFAULT" ]] || return 0
+  box_cred="$(_account_box_auth_dir "$cname")/.credentials.json"
+  [[ -f "$box_cred" ]] || return 0
+  [[ -L "$box_cred" ]] && return 1
+  store_cred="$(_account_cred_path "$acct")"
+  be="$(_account_cred_expiry "$box_cred")"
+  se="$(_account_cred_expiry "$store_cred")"
+  [[ "$be" -gt "$se" ]] || return 0
+  _account_write_cred "$acct" "$box_cred"
+}
+
+# ── Account metadata ────────────────────────────────────────────────────────
+#
+# A flat `key<TAB>value` file, deliberately NOT JSON. Nothing but this CLI reads
+# it, jq is optional everywhere in this file, and hand-rolled JSON escaping is
+# the kind of thing that looks right and is not. The session-title whitelist
+# exists for exactly that reason. Values are stripped of control bytes and
+# clamped, so a line can only ever be one key and one value.
+_account_meta_clean() {
+  local v
+  v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' || true)"
+  printf '%s' "${v:0:160}"
+}
+
+_account_meta_get() {
+  local f kk vv
+  f="$(_account_meta_path "$1")"
+  [[ -f "$f" ]] || return 1
+  while IFS="$(printf '\t')" read -r kk vv; do
+    [[ "$kk" == "$2" ]] || continue
+    [[ -n "$vv" ]] || return 1
+    printf '%s' "$vv"
+    return 0
+  done < "$f"
+  return 1
+}
+
+_account_meta_set() {
+  local acct="$1" key="$2" val="$3" f tmp kk vv wrote=0
+  _account_ensure_dir "$acct" || return 1
+  f="$(_account_meta_path "$acct")"
+  [[ -L "$f" ]] && return 1
+  val="$(_account_meta_clean "$val")"
+  tmp="${f}.tmp.$$"
+  (
+    umask 077
+    if [[ -f "$f" ]]; then
+      while IFS="$(printf '\t')" read -r kk vv; do
+        [[ -n "$kk" ]] || continue
+        if [[ "$kk" == "$key" ]]; then
+          printf '%s\t%s\n' "$key" "$val"
+          wrote=1
+        else
+          printf '%s\t%s\n' "$kk" "$vv"
+        fi
+      done < "$f"
+    fi
+    [[ $wrote -eq 1 ]] || printf '%s\t%s\n' "$key" "$val"
+  ) > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# Pull one string field out of a JSON blob. jq when it is there, the session
+# feature's grep-based reader when it is not, which is already the house
+# fallback and already handles the escapes it can.
+_account_json_field() {
+  local blob="$1" key="$2" v
+  [[ -n "$blob" ]] || return 1
+  if command -v jq &>/dev/null; then
+    v="$(printf '%s' "$blob" | jq -r --arg k "$key" '.. | objects | select(has($k)) | .[$k] | select(type=="string")' 2>/dev/null | head -n1 || true)"
+    [[ -n "$v" && "$v" != "null" ]] && { printf '%s' "$v"; return 0; }
+    return 1
+  fi
+  v="$(_sessions_json_str "$blob" "$key")" || return 1
+  _sessions_json_unesc "$v"
+}
+
+# Record who an account belongs to. The credential blob alone cannot name an
+# account, so the email and the organisation have to come from the per-project
+# store Claude Code writes after it fetches the profile. That is the ONLY way
+# the list can show a human anything but a directory name.
+_account_capture_meta() {
+  local acct="$1" project_json="$2" cred v now
+  [[ "$acct" != "$_ACCOUNT_DEFAULT" ]] || return 0
+  _account_exists "$acct" || return 0
+  if [[ -f "$project_json" ]]; then
+    local blob
+    blob="$(head -c 262144 "$project_json" 2>/dev/null || true)"
+    if v="$(_account_json_field "$blob" emailAddress)"; then
+      _account_meta_set "$acct" who "$v" || true
+    fi
+    if v="$(_account_json_field "$blob" organizationName)"; then
+      _account_meta_set "$acct" org "$v" || true
+    fi
+  fi
+  cred="$(_account_cred_path "$acct")"
+  if [[ -s "$cred" ]]; then
+    local cblob
+    cblob="$(head -c 65536 "$cred" 2>/dev/null || true)"
+    if v="$(_account_json_field "$cblob" subscriptionType)"; then
+      _account_meta_set "$acct" plan "$v" || true
+    fi
+  fi
+  now="$(date +%s 2>/dev/null || echo 0)"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  _account_meta_set "$acct" last_used "$now" || true
+  return 0
+}
+
+# ── What the row can honestly say about the credential ──────────────────────
+#
+# Three states and no guessing. `refreshTokenExpiresAt` is OPTIONAL in the blob
+# (a 2026-05 credential on the maintainer's own machine has no such field), so
+# its absence renders as "ok" rather than as an invented expiry. An account that
+# hit invalid_grant writes EMPTY tokens back to disk, which is why a present
+# file is not the same as a working account.
+_account_auth_state() {
+  local acct="$1" cred blob rt now_ms rte
+  cred="$(_account_cred_path "$acct")"
+  if [[ ! -s "$cred" ]]; then
+    printf 'signed out'
+    return 0
+  fi
+  blob="$(head -c 65536 "$cred" 2>/dev/null || true)"
+  rt="$(_account_json_field "$blob" refreshToken 2>/dev/null || true)"
+  if [[ -z "$rt" ]]; then
+    printf 'signed out'
+    return 0
+  fi
+  now_ms=$(( ${_CLEAT_NOW_S:-$(date +%s)} * 1000 ))
+  rte="$(_account_json_num "$blob" refreshTokenExpiresAt)"
+  if [[ "$rte" -gt 0 ]] && [[ "$rte" -le "$now_ms" ]]; then
+    printf 're-login'
+    return 0
+  fi
+  printf 'ok'
+}
+
+# A numeric JSON field, 0 when absent. Kept separate from the string reader
+# because an unquoted number does not match the string pattern at all.
+_account_json_num() {
+  local blob="$1" key="$2" v
+  if command -v jq &>/dev/null; then
+    v="$(printf '%s' "$blob" | jq -r --arg k "$key" '.. | objects | select(has($k)) | .[$k] | select(type=="number")' 2>/dev/null | head -n1 || true)"
+  else
+    v="$(printf '%s' "$blob" | grep -aoE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" 2>/dev/null | head -n1 | grep -aoE '[0-9]+$' || true)"
+  fi
+  case "$v" in ''|*[!0-9]*) v=0 ;; esac
+  printf '%s' "$v"
+}
+
+# ── Usage, and the three things it must never do ────────────────────────────
+#
+# `GET /api/oauth/usage?skip_spend=1` answers with only a bearer header, with no
+# claude process and no session, and it writes nothing. So a stored account's
+# five-hour and seven-day utilisation IS obtainable. It degrades, though: an
+# access token lives about eight hours, and the account parked because it hit
+# its limit usually has a dead one by the time its reset time is interesting.
+# So there are two tiers, live and snapshot, and the snapshot carries its own
+# timestamp. resets_at is an absolute future instant, so it stays TRUE while the
+# percentage goes stale.
+#
+# Three rules, each of which would be a real defect:
+#
+#   1. Never refresh a parked token to draw a bar. The refresh response MAY
+#      carry a rotated refresh token, so polling for display could revoke a
+#      credential the maintainer's Keychain still holds.
+#   2. Never label claudeAiOauth.expiresAt as usage. It is the ~8 h OAuth token
+#      lifetime, not the five-hour rate-limit window.
+#   3. Never read another account's numbers out of ~/.claude.json. Its
+#      cachedUsageUtilization is a SINGLE slot keyed to one accountUuid and
+#      Claude Code deletes it on the first read under a different account.
+#
+# skip_spend=1 is not optional either: without it the response carries real
+# billing figures, which have no business in a picker.
+_ACCOUNT_USAGE_URL="https://api.anthropic.com/api/oauth/usage?skip_spend=1"
+
+# The token never reaches argv. `curl --config -` takes the header on stdin, so
+# it cannot appear in `ps` output on a shared host.
+_account_usage_curl() {
+  local tok="$1"
+  printf 'silent\nshow-error\nmax-time = 3\nheader = "Authorization: Bearer %s"\nurl = "%s"\n' \
+    "$tok" "$_ACCOUNT_USAGE_URL" | curl --config - 2>/dev/null || true
+}
+
+_account_access_token() {
+  local blob
+  blob="$(head -c 65536 "$(_account_cred_path "$1")" 2>/dev/null || true)"
+  [[ -n "$blob" ]] || return 1
+  _account_json_field "$blob" accessToken
+}
+
+# Refresh the stored snapshot for one account. Returns 1 and prints nothing
+# whenever it declines, which is most of the time: no curl, no jq, no live
+# token, or polled too recently.
+_account_usage_fetch() {
+  local acct="$1" now tok resp at exp
+  command -v curl &>/dev/null || return 1
+  command -v jq &>/dev/null || return 1
+  now="${_CLEAT_NOW_S:-$(date +%s)}"
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  at="$(_account_meta_get "$acct" usage_at 2>/dev/null || true)"
+  case "$at" in ''|*[!0-9]*) at=0 ;; esac
+  [[ $(( now - at )) -ge $_ACCOUNT_USAGE_THROTTLE ]] || return 1
+  # Rule 1: only ever poll with a token that is still alive on its own.
+  exp="$(_account_cred_expiry "$(_account_cred_path "$acct")")"
+  [[ "$exp" -gt $(( now * 1000 )) ]] || return 1
+  tok="$(_account_access_token "$acct")" || return 1
+  [[ -n "$tok" ]] || return 1
+  resp="$(_account_usage_curl "$tok")"
+  [[ -n "$resp" ]] || return 1
+  printf '%s' "$resp" | jq -e 'type=="object" and has("five_hour")' >/dev/null 2>&1 || return 1
+  local fu fr wu wr
+  fu="$(printf '%s' "$resp" | jq -r '.five_hour.utilization // empty' 2>/dev/null || true)"
+  fr="$(printf '%s' "$resp" | jq -r '.five_hour.resets_at // empty' 2>/dev/null || true)"
+  wu="$(printf '%s' "$resp" | jq -r '.seven_day.utilization // empty' 2>/dev/null || true)"
+  wr="$(printf '%s' "$resp" | jq -r '.seven_day.resets_at // empty' 2>/dev/null || true)"
+  case "$fu" in ''|*[!0-9]*) fu="" ;; esac
+  case "$wu" in ''|*[!0-9]*) wu="" ;; esac
+  [[ -n "$fu" || -n "$wu" ]] || return 1
+  _account_meta_set "$acct" usage_five "$fu" || true
+  _account_meta_set "$acct" usage_week "$wu" || true
+  _account_meta_set "$acct" usage_five_resets "$(_account_epoch_from_iso "$fr")" || true
+  _account_meta_set "$acct" usage_week_resets "$(_account_epoch_from_iso "$wr")" || true
+  _account_meta_set "$acct" usage_at "$now" || true
+  return 0
+}
+
+# An ISO-8601 instant to epoch seconds, or 0. `date -d` is GNU and `date -j -f`
+# is BSD, so both are tried and neither is trusted: the caller renders nothing
+# rather than a wrong time when both fail.
+_account_epoch_from_iso() {
+  local s="$1" out=""
+  [[ -n "$s" ]] || { printf '0'; return 0; }
+  s="${s%%.*}"
+  s="${s%Z}"
+  s="${s%+00:00}"
+  out="$(date -u -d "${s}Z" +%s 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    out="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "$s" +%s 2>/dev/null || true)"
+  fi
+  case "$out" in ''|*[!0-9]*) out=0 ;; esac
+  printf '%s' "$out"
+}
+
+# One short line for the picker's detail pane. Live numbers when the snapshot is
+# fresh, the snapshot with its age when it is not, and "window reset" once the
+# reset instant has passed, because at that point the percentage is known to be
+# wrong while the reset is known to be true.
+_account_usage_render() {
+  local acct="$1" now fu wu fr wr at out=""
+  now="${_CLEAT_NOW_S:-$(date +%s)}"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  at="$(_account_meta_get "$acct" usage_at 2>/dev/null || true)"
+  case "$at" in ''|*[!0-9]*) at=0 ;; esac
+  [[ "$at" -gt 0 ]] || return 1
+  fu="$(_account_meta_get "$acct" usage_five 2>/dev/null || true)"
+  wu="$(_account_meta_get "$acct" usage_week 2>/dev/null || true)"
+  fr="$(_account_meta_get "$acct" usage_five_resets 2>/dev/null || true)"
+  wr="$(_account_meta_get "$acct" usage_week_resets 2>/dev/null || true)"
+  case "$fr" in ''|*[!0-9]*) fr=0 ;; esac
+  case "$wr" in ''|*[!0-9]*) wr=0 ;; esac
+  if [[ -n "$fu" ]]; then
+    if [[ "$fr" -gt 0 && "$fr" -le "$now" ]]; then
+      out="5h window reset"
+    else
+      out="5h ${fu}%"
+      if [[ "$fr" -gt 0 ]]; then
+        local _c
+        _c="$(_account_clock "$fr" 2>/dev/null || true)"
+        [[ -n "$_c" ]] && out="${out} until ${_c}"
+      fi
+    fi
+  fi
+  if [[ -n "$wu" ]]; then
+    local w
+    if [[ "$wr" -gt 0 && "$wr" -le "$now" ]]; then
+      w="7d window reset"
+    else
+      w="7d ${wu}%"
+    fi
+    if [[ -n "$out" ]]; then out="${out} · ${w}"; else out="$w"; fi
+  fi
+  [[ -n "$out" ]] || return 1
+  # The age is part of the claim, not decoration: these numbers are a snapshot
+  # unless they were taken this minute.
+  # Plain text, no escapes: the caller stores this in a row array and clamps it
+  # by length, and a stored escape sequence would be counted as characters.
+  if [[ $(( now - at )) -gt $_ACCOUNT_USAGE_THROTTLE ]]; then
+    out="${out} (as of $(_age_from_delta $(( now - at ))) ago)"
+  fi
+  printf '%s' "$out"
+}
+
+_account_clock() {
+  local e="$1" out
+  out="$(date -r "$e" +%H:%M 2>/dev/null || true)"
+  [[ -n "$out" ]] || out="$(date -d "@$e" +%H:%M 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+# ── Removing an account ─────────────────────────────────────────────────────
+#
+# Never an unlink. What is being removed is a refresh token with weeks of life
+# in it, and the way it gets removed is a typo in a picker. Same trash shape as
+# `cleat sessions`, same 30 days, same exit codes: 2 means the trash itself is
+# unusable and nothing was touched, 1 means something was left in place, 0 means
+# it moved.
+_account_trash_dir() {
+  local d="$CLEAT_ACCOUNTS_DIR/.trash"
+  [[ -L "$d" ]] && return 1
+  [[ -e "$d" ]] && [[ ! -d "$d" ]] && return 1
+  printf '%s' "$d"
+}
+
+_account_trash_sweep() {
+  local tdir now cutoff d base stamp
+  tdir="$(_account_trash_dir)" || return 0
+  [[ -d "$tdir" ]] || return 0
+  now="$(date +%s 2>/dev/null || echo 0)"
+  case "$now" in ''|*[!0-9]*|0) return 0 ;; esac
+  cutoff=$(( now - _ACCOUNTS_TRASH_DAYS * 86400 ))
+  for d in "$tdir"/*; do
+    [[ -d "$d" ]] || continue
+    [[ -L "$d" ]] && continue
+    base="${d##*/}"
+    stamp="${base%%-*}"
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    _validate_account_name "${base#*-}" || continue
+    [[ "$stamp" -lt "$cutoff" ]] || continue
+    rm -rf "$d"
+  done
+}
+
+_account_trash() {
+  local acct="$1" tdir dest now
+  _account_exists "$acct" || return 1
+  _account_dir_ok "$acct" || return 2
+  tdir="$(_account_trash_dir)" || return 2
+  mkdir -p "$tdir" 2>/dev/null || return 2
+  chmod 700 "$tdir" 2>/dev/null || true
+  now="$(date +%s 2>/dev/null || echo 0)"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  dest="${tdir}/${now}-${acct}"
+  [[ -e "$dest" ]] && return 1
+  mv "$CLEAT_ACCOUNTS_DIR/$acct" "$dest" 2>/dev/null || return 1
+  return 0
+}
+
+_account_restore() {
+  local acct="$1" tdir d found=""
+  tdir="$(_account_trash_dir)" || return 1
+  [[ -d "$tdir" ]] || return 1
+  for d in "$tdir"/*-"$acct"; do
+    [[ -d "$d" ]] || continue
+    found="$d"
+  done
+  [[ -n "$found" ]] || return 1
+  # Refuse to overwrite an account that came back under the same name, the way
+  # the session restore does.
+  [[ -e "$CLEAT_ACCOUNTS_DIR/$acct" ]] && return 1
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || return 1
+  mv "$found" "$CLEAT_ACCOUNTS_DIR/$acct" 2>/dev/null || return 1
+  return 0
+}
+
+# Rename is a directory move plus a pin rewrite. The pins have to follow, or
+# every box pinned to the old name silently falls back to the shared store at
+# its next attach, which reads as "cleat logged me out".
+_account_rename() {
+  local old="$1" new="$2" b
+  _account_exists "$old" || return 1
+  _account_dir_ok "$old" || return 1
+  _account_dir_ok "$new" || return 1
+  [[ -e "$CLEAT_ACCOUNTS_DIR/$new" ]] && return 1
+  mv "$CLEAT_ACCOUNTS_DIR/$old" "$CLEAT_ACCOUNTS_DIR/$new" 2>/dev/null || return 1
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    _box_account_write "$b" "$new" || true
+  done < <(_account_pinned_boxes "$old")
+  return 0
+}
+
+# ── The actions ─────────────────────────────────────────────────────────────
+# Reached from the picker AND from the command line, so they live here rather
+# than inside a TUI function: a gate that only exists on the interactive path is
+# not a gate.
+
+# Is this box able to carry a pinned account at all? A box created before this
+# feature has no auth mount, and without this check `/login` would create the
+# credential store inside the container's own filesystem, where `cleat rm`
+# destroys it with no warning.
+#
+# Returns 0 ready, 1 needs a recreate, 2 could not tell (no container, or no
+# daemon). Two is not a failure: the mount is created by the next `docker run`,
+# so a box that does not exist yet is fine.
+_account_box_ready() {
+  local cname="$1"
+  _daemon_up || return 2
+  container_exists "$cname" || return 2
+  docker exec "$cname" test -d "$_ACCOUNT_BOX_DIR" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+_account_do_switch() {
+  local acct="$1" box="$2" cname="$3" project="$4" current ready=0
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    _account_sync_out "$cname" || true
+    _box_account_remove "$cname"
+    rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true
+    success "${BOLD}${box}${RESET} is back on your shared login ${DIM}(~/.claude)${RESET}"
+    return 0
+  fi
+  if ! _validate_account_name "$acct"; then
+    error "Invalid account name: ${BOLD}${acct}${RESET}"
+    echo -e "    ${DIM}Lowercase letters, digits, dash and underscore. Up to 31 characters, starting with a letter or a digit.${RESET}"
+    echo -e "    ${DIM}The subcommand words (list, rename, rm, restore) are reserved.${RESET}"
+    return 1
+  fi
+  # Switching under a live agent is the one case Claude Code actively fights:
+  # it notices the credential file change, disarms its auth watcher and writes
+  # its own token back over the swap.
+  # _box_has_live_agent answers "live" when it cannot read docker, which is the
+  # safe default where it is used but the wrong one here: this verb is
+  # deliberately outside the preflight allowlist and has to work with the
+  # daemon down. A daemon that is down means no box is running, so there is
+  # nothing to disturb.
+  if _daemon_up && container_exists "$cname" && _box_has_live_agent "$cname"; then
+    error "${BOLD}${box}${RESET} has a live Claude session."
+    echo -e "    ${DIM}Exit it first. Swapping the credential under a running session is noticed and undone.${RESET}"
+    return 1
+  fi
+
+  current="$(_box_account_read "$cname")"
+  # Harvest whatever the box refreshed for the account it is leaving, BEFORE
+  # anything is repointed. Skipping this loses every refresh since the switch in.
+  _account_sync_out "$cname" || true
+  if [[ "$current" != "$_ACCOUNT_DEFAULT" ]]; then
+    _account_capture_meta "$current" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true
+    _account_usage_fetch "$current" >/dev/null 2>&1 || true
+  fi
+
+  local fresh=0
+  if ! _account_exists "$acct"; then
+    _account_ensure_dir "$acct" || { error "Could not create the account store."; return 1; }
+    fresh=1
+  fi
+  _box_account_write "$cname" "$acct" || { error "Could not pin the account to this box."; return 1; }
+  _account_sync_in "$cname" || { error "Could not stage the credential for this box."; return 1; }
+  # Capture for the account being switched TO as well, not only the one being
+  # left. The plan comes out of the credential blob, so an account that already
+  # has a login can say what it is immediately rather than after its first
+  # round trip.
+  _account_capture_meta "$acct" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true
+
+  _account_box_ready "$cname" || ready=$?
+  if [[ $ready -eq 1 ]]; then
+    warn "${BOLD}${box}${RESET} predates the account mount, so the switch cannot take effect yet."
+    echo -e "    ${DIM}Recreate it once: ${BOLD}cleat rm ${box}${RESET}${DIM} then ${BOLD}cleat ${box}${RESET}${DIM}. Nothing on the host is touched.${RESET}"
+    return 1
+  fi
+
+  success "${BOLD}${box}${RESET} is now on account ${BOLD}${acct}${RESET}"
+  if [[ $fresh -eq 1 || "$(_account_auth_state "$acct")" == "signed out" ]]; then
+    echo -e "    ${DIM}It has no login yet. Start the box and run ${BOLD}/login${RESET}${DIM} once. It is remembered under this name.${RESET}"
+  else
+    local who
+    who="$(_account_meta_get "$acct" who 2>/dev/null || true)"
+    [[ -n "$who" ]] && echo -e "    ${DIM}${who}${RESET}"
+  fi
+  # Said once, here, because it is silent when it happens and it surprises
+  # people later. Claude Code ties a conversation to the account that started it.
+  echo -e "    ${DIM}Conversations are shared. Resuming one started on another account keeps the${RESET}"
+  echo -e "    ${DIM}local transcript and ${BOLD}--resume${RESET}${DIM}, and stops its server-side history from${RESET}"
+  echo -e "    ${DIM}being backfilled from here on.${RESET}"
+  return 0
+}
+
+_account_do_rename() {
+  local old="$1" new="$2"
+  if ! _account_exists "$old"; then
+    error "No account named ${BOLD}${old}${RESET}."
+    return 1
+  fi
+  if ! _validate_account_name "$new"; then
+    error "Invalid account name: ${BOLD}${new}${RESET}"
+    echo -e "    ${DIM}Lowercase letters, digits, dash and underscore. Up to 31 characters, starting with a letter or a digit.${RESET}"
+    return 1
+  fi
+  if _account_exists "$new"; then
+    error "There is already an account named ${BOLD}${new}${RESET}."
+    return 1
+  fi
+  if _account_rename "$old" "$new"; then
+    success "Renamed ${DIM}${old}${RESET} to ${BOLD}${new}${RESET}"
+    echo -e "    ${DIM}Every box pinned to it follows.${RESET}"
+    return 0
+  fi
+  error "Could not rename ${BOLD}${old}${RESET}."
+  return 1
+}
+
+_account_do_remove() {
+  local acct="$1" assume_yes="${2:-0}" ans pinned b live=0
+  if ! _account_exists "$acct"; then
+    error "No account named ${BOLD}${acct}${RESET}."
+    return 1
+  fi
+  pinned="$(_account_pinned_boxes "$acct")"
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    if _daemon_up && container_exists "$b" && _box_has_live_agent "$b"; then
+      error "A box pinned to ${BOLD}${acct}${RESET} has a live Claude session."
+      echo -e "    ${DIM}Exit it first.${RESET}"
+      return 1
+    fi
+    live=1
+  done <<< "$pinned"
+
+  warn "This removes the login stored as ${BOLD}${acct}${RESET}"
+  local who
+  who="$(_account_meta_get "$acct" who 2>/dev/null || true)"
+  [[ -n "$who" ]] && echo -e "    ${DIM}${who}${RESET}"
+  if [[ $live -eq 1 ]]; then
+    echo -e "    ${DIM}Boxes pinned to it go back to your shared login:${RESET}"
+    while IFS= read -r b; do
+      [[ -n "$b" ]] && echo -e "      ${DIM}${b}${RESET}"
+    done <<< "$pinned"
+  fi
+  echo -e "    ${DIM}It moves to the trash, recoverable for ${_ACCOUNTS_TRASH_DAYS} days with${RESET}"
+  echo -e "    ${DIM}${BOLD}cleat account restore ${acct}${RESET}"
+
+  if [[ "$assume_yes" != "1" ]]; then
+    if ! _is_interactive; then
+      echo ""
+      echo -e "    ${DIM}Nothing was removed. Re-run with ${BOLD}--yes${RESET}${DIM} to do this non-interactively.${RESET}"
+      return 0
+    fi
+    _ask_yn ans "Remove it? [y/N] "
+    case "$ans" in
+      y|Y|yes|YES) : ;;
+      *) info "Kept."; return 0 ;;
+    esac
+  fi
+
+  local rc=0
+  _account_trash "$acct" || rc=$?
+  if [[ $rc -eq 2 ]]; then
+    error "Refusing to remove: the account trash is not a plain directory."
+    echo -e "    ${DIM}Nothing was moved. Check ${CLEAT_ACCOUNTS_DIR}/.trash${RESET}"
+    return 1
+  fi
+  if [[ $rc -ne 0 ]]; then
+    error "Could not remove ${BOLD}${acct}${RESET}."
+    return 1
+  fi
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    _box_account_remove "$b"
+    rm -f "$(_account_box_auth_dir "$b")/.credentials.json" 2>/dev/null || true
+  done <<< "$pinned"
+  success "Removed ${BOLD}${acct}${RESET} ${DIM}(recoverable for ${_ACCOUNTS_TRASH_DAYS} days)${RESET}"
+  return 0
+}
+
+_account_do_restore() {
+  local acct="$1"
+  if _account_exists "$acct"; then
+    error "There is already an account named ${BOLD}${acct}${RESET}."
+    echo -e "    ${DIM}Nothing was overwritten.${RESET}"
+    return 1
+  fi
+  if _account_restore "$acct"; then
+    success "Restored ${BOLD}${acct}${RESET}"
+    echo -e "    ${DIM}Pin a box to it with ${BOLD}cleat account ${acct}${RESET}"
+    return 0
+  fi
+  error "No removed account named ${BOLD}${acct}${RESET}."
+  echo -e "    ${DIM}Trash: ${CLEAT_ACCOUNTS_DIR}/.trash${RESET}"
+  return 1
+}
+
+# ── The picker ──────────────────────────────────────────────────────────────
+#
+# Structure lifted from `cleat sessions`, which is the one picker in this file
+# that has been through a rendering-bug round: rows precomputed into parallel
+# indexed arrays, the whole frame emitted in ONE printf, `\033[K` after the text
+# rather than `\033[2K` before it, echo suppressed with the full termios state
+# saved, and the restore wired to EXIT and to INT/TERM/HUP.
+#
+# Unlike the session list this one is short (two to five rows), so the frame
+# carries a fixed two-line detail pane under the rows, the way the kit picker
+# does. That is where the usage goes, and it is precomputed too: a `date` per
+# frame is exactly the kind of per-frame fork the session rewrite removed.
+_ACCT_N=0
+_ACCT_NAME=(); _ACCT_AUTH=(); _ACCT_WHO=(); _ACCT_MARK=()
+_ACCT_D1=(); _ACCT_D2=()
+_ACCT_CURSOR=0; _ACCT_OFFSET=0; _ACCT_PAGE=5; _ACCT_COLS=80; _ACCT_ROWS=24; _ACCT_NARROW=0
+# How many of the rows are STORED accounts. Row zero is always the shared
+# login, so _ACCT_N is never zero and cannot answer "is there anything here".
+_ACCT_STORED=0
+# header (4) + the frame's four non-row lines + one for the shell prompt.
+_ACCOUNTS_CHROME_LINES=9
+# 4 of marker, 13 of name, 10 of state and something left for an email.
+_ACCOUNTS_MIN_COLS=44
+
+_accounts_too_narrow() {
+  local c
+  c="$(_term_size)"
+  c="${c#* }"
+  case "$c" in ''|*[!0-9]*) c=80 ;; esac
+  [[ "$c" -lt "$_ACCOUNTS_MIN_COLS" ]]
+}
+
+# Build every column for every account, once. Everything here that shells out
+# happens in this function and nowhere near a frame.
+_accounts_load_rows() {
+  local active="$1" name who org plan auth last usage d1 d2 now
+  _ACCT_N=0
+  _ACCT_NAME=(); _ACCT_AUTH=(); _ACCT_WHO=(); _ACCT_MARK=()
+  _ACCT_D1=(); _ACCT_D2=()
+  now="${_CLEAT_NOW_S:-$(date +%s)}"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  # Row zero is always the shared ~/.claude login. Without it the picker is a
+  # one-way door: you could switch to a named account and never get back.
+  _ACCT_NAME[0]="$_ACCOUNT_DEFAULT"
+  _ACCT_AUTH[0]="shared"
+  _ACCT_WHO[0]="your own ~/.claude login"
+  if [[ "$active" == "$_ACCOUNT_DEFAULT" ]]; then _ACCT_MARK[0]=1; else _ACCT_MARK[0]=0; fi
+  _ACCT_D1[0]="what every box uses until you pin it to a named account"
+  _ACCT_D2[0]="cannot be renamed or removed"
+  _ACCT_N=1
+  _ACCT_STORED=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    who="$(_account_meta_get "$name" who 2>/dev/null || true)"
+    org="$(_account_meta_get "$name" org 2>/dev/null || true)"
+    plan="$(_account_meta_get "$name" plan 2>/dev/null || true)"
+    last="$(_account_meta_get "$name" last_used 2>/dev/null || true)"
+    auth="$(_account_auth_state "$name")"
+    [[ -n "$who" ]] || who="not used yet"
+    _ACCT_NAME[$_ACCT_N]="$(_sanitize_repo_str "$name")"
+    _ACCT_AUTH[$_ACCT_N]="$auth"
+    _ACCT_WHO[$_ACCT_N]="$(_sanitize_repo_str "$who")"
+    if [[ "$name" == "$active" ]]; then _ACCT_MARK[$_ACCT_N]=1; else _ACCT_MARK[$_ACCT_N]=0; fi
+
+    # Every precomputed string is PLAIN text. Colour is applied by the frame,
+    # because a stored escape sequence would be counted by ${#s} and the width
+    # clamp would then truncate a row in the middle of an escape.
+    d1=""
+    [[ -n "$plan" ]] && d1="$(_sanitize_repo_str "$plan")"
+    if [[ -n "$org" ]]; then
+      if [[ -n "$d1" ]]; then d1="${d1} · $(_sanitize_repo_str "$org")"; else d1="$(_sanitize_repo_str "$org")"; fi
+    fi
+    usage="$(_account_usage_render "$name" 2>/dev/null || true)"
+    if [[ -n "$usage" ]]; then
+      if [[ -n "$d1" ]]; then d1="${d1} · ${usage}"; else d1="$usage"; fi
+    fi
+    [[ -n "$d1" ]] || d1="no usage recorded for this account"
+
+    d2=""
+    case "$last" in
+      ''|*[!0-9]*) d2="never used in a box" ;;
+      *) if [[ "$now" -gt "$last" ]]; then
+           d2="last used $(_age_from_delta $(( now - last ))) ago"
+         else
+           d2="last used just now"
+         fi ;;
+    esac
+    _ACCT_D1[$_ACCT_N]="$d1"
+    _ACCT_D2[$_ACCT_N]="$d2"
+    _ACCT_N=$(( _ACCT_N + 1 ))
+    _ACCT_STORED=$(( _ACCT_STORED + 1 ))
+  done < <(_account_list)
+  return 0
+}
+
+_accounts_measure() {
+  local total="${1:-0}" avail
+  _ACCT_ROWS="$(_term_rows)"
+  _ACCT_COLS="$(_term_cols)"
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  (( total < 1 )) && total=1
+  if _accounts_too_narrow; then _ACCT_NARROW=1; else _ACCT_NARROW=0; fi
+  avail=$(( _ACCT_ROWS - _ACCOUNTS_CHROME_LINES ))
+  (( avail < 1 )) && avail=1
+  if [[ "$total" -lt "$avail" ]]; then _ACCT_PAGE="$total"; else _ACCT_PAGE="$avail"; fi
+  (( _ACCT_PAGE < 1 )) && _ACCT_PAGE=1
+  return 0
+}
+
+_accounts_clamp() {
+  local total="$1"
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  case "${_ACCT_CURSOR:-}" in ''|*[!0-9-]*) _ACCT_CURSOR=0 ;; esac
+  case "${_ACCT_OFFSET:-}" in ''|*[!0-9-]*) _ACCT_OFFSET=0 ;; esac
+  [[ "$total" -gt 0 ]] || { _ACCT_CURSOR=0; _ACCT_OFFSET=0; return 0; }
+  (( _ACCT_CURSOR < 0 )) && _ACCT_CURSOR=0
+  (( _ACCT_CURSOR > total - 1 )) && _ACCT_CURSOR=$(( total - 1 ))
+  (( _ACCT_OFFSET > _ACCT_CURSOR )) && _ACCT_OFFSET=$_ACCT_CURSOR
+  (( _ACCT_OFFSET < _ACCT_CURSOR - _ACCT_PAGE + 1 )) && _ACCT_OFFSET=$(( _ACCT_CURSOR - _ACCT_PAGE + 1 ))
+  (( _ACCT_OFFSET > total - _ACCT_PAGE )) && _ACCT_OFFSET=$(( total - _ACCT_PAGE ))
+  (( _ACCT_OFFSET < 0 )) && _ACCT_OFFSET=0
+  return 0
+}
+
+# page + 5 lines, always: the rows, two detail lines, a counter, a blank and the
+# hint. A constant count is what the cursor-up reposition depends on.
+_accounts_frame() {
+  local cursor="$1" offset="$2" page="$3" cols="$4" total="$5"
+  local buf="" i n room w a line meta d1 d2
+  case "$cursor" in ''|*[!0-9-]*) cursor=0 ;; esac
+  case "$offset" in ''|*[!0-9-]*) offset=0 ;; esac
+  case "$page"   in ''|*[!0-9]*)  page=1 ;; esac
+  case "$total"  in ''|*[!0-9]*)  total=0 ;; esac
+  (( cursor < 0 )) && cursor=0
+  (( offset < 0 )) && offset=0
+  (( page < 1 ))   && page=1
+  room=$(( cols - 30 ))
+  (( room < 1 )) && room=1
+  i=0
+  while [[ $i -lt $page ]]; do
+    n=$(( offset + i ))
+    if [[ $n -lt $total ]]; then
+      w="${_ACCT_WHO[$n]}"
+      # Byte length over-budgets a multibyte string under LC_ALL=C, which is
+      # safe. Halve only in the case that can under-count, exactly as the
+      # session frame does.
+      local rm=$room
+      case "$w" in
+        *[!\ -~]*) if _has_unicode; then rm=$(( room / 2 )); (( rm < 1 )) && rm=1; fi ;;
+      esac
+      [[ ${#w} -gt $rm ]] && w="${w:0:$(( rm - 1 ))}…"
+      printf -v meta '%-13.13s %-10.10s' "${_ACCT_NAME[$n]}" "${_ACCT_AUTH[$n]}"
+      if [[ "${_ACCT_MARK[$n]}" == "1" ]]; then a="${GREEN}•${RESET}"; else a=" "; fi
+      if [[ $n -eq $cursor ]]; then
+        line="  ${CYAN}▸${RESET}${a} ${BOLD}${meta}${RESET} ${w}"
+      else
+        line="   ${a} ${meta} ${DIM}${w}${RESET}"
+      fi
+      buf="${buf}${line}\033[K\n"
+    else
+      buf="${buf}\033[K\n"
+    fi
+    i=$(( i + 1 ))
+  done
+  # The detail pane describes the HIGHLIGHTED row and is two lines whether or
+  # not it has anything to say, because a pane that changes height moves the
+  # counter and the reposition walks.
+  d1=""; d2=""
+  if [[ $cursor -lt $total ]]; then
+    d1="${_ACCT_D1[$cursor]}"
+    d2="${_ACCT_D2[$cursor]}"
+  fi
+  local droom=$(( cols - 5 ))
+  (( droom < 1 )) && droom=1
+  [[ ${#d1} -gt $droom ]] && d1="${d1:0:$(( droom - 1 ))}…"
+  [[ ${#d2} -gt $droom ]] && d2="${d2:0:$(( droom - 1 ))}…"
+  buf="${buf}\033[K\n"
+  buf="${buf}    ${DIM}${d1}${RESET}\033[K\n"
+  buf="${buf}    ${DIM}${d2}${RESET}\033[K\n"
+  buf="${buf}  ${DIM}↑/↓ move  ⏎ switch or edit  q close${RESET}\033[K\n"
+  printf '%b' "$buf"
+  return 0
+}
+
+# ── The picker loop ─────────────────────────────────────────────────────────
+#
+# Same two-loop shape as `cleat sessions`: the outer pass is one list screen,
+# every action breaks back to it, so switching an account and then renaming
+# another is one run rather than three.
+_ACCOUNTS_ACTION_LINES=5
+_ACCOUNTS_ACTION_HEAD=3
+
+_accounts_action_draw() {
+  local cursor="${1:-0}" cols="${2:-80}" active="${3:-0}"
+  local i=0 room label desc line
+  room=$(( cols - 14 ))
+  (( room < 8 )) && room=8
+  printf '\033[K\n'
+  while [[ $i -lt 4 ]]; do
+    case $i in
+      0) label="Use here"; desc="Pin this box to this account" ;;
+      1) label="Rename  "; desc="Give it a name you will recognise" ;;
+      2) label="Remove  "; desc="Move it to the trash (restorable for ${_ACCOUNTS_TRASH_DAYS} days)" ;;
+      *) label="Cancel  "; desc="Leave it alone" ;;
+    esac
+    [[ ${#desc} -gt $room ]] && desc="${desc:0:$(( room - 1 ))}…"
+    if [[ $i -eq $cursor ]]; then
+      line="  ${CYAN}▸${RESET} ${BOLD}${label}${RESET}  ${DIM}${desc}${RESET}"
+    else
+      line="    ${label}  ${DIM}${desc}${RESET}"
+    fi
+    printf '%b\033[K\n' "$line"
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+
+_accounts_action_backout() {
+  _cursor_show
+  _tui_echo_restore
+  trap - INT TERM HUP
+  printf '\033[%dA' "$_ACCOUNTS_ACTION_HEAD"
+  printf '\033[J'
+  return 0
+}
+
+# 0 = ran something and printed a receipt, 1 = backed out having printed
+# nothing. Exactly the contract _sessions_action_tui carries, for the same
+# reason: the caller redraws under the receipt or in place.
+_accounts_action_tui() {
+  local acct="$1" box="$2" cname="$3" project="$4"
+  local cursor=0 key cols who
+  who="$(_account_meta_get "$acct" who 2>/dev/null || true)"
+  echo ""
+  echo -e "  ${BOLD}${acct}${RESET}"
+  if [[ -n "$who" ]]; then
+    echo -e "  ${DIM}$(_sanitize_repo_str "$who")${RESET}"
+  else
+    echo -e "  ${DIM}no login recorded yet${RESET}"
+  fi
+  cols="$(_term_cols)"
+  _tui_echo_off
+  trap '_tui_echo_restore; _cursor_show; trap - INT TERM HUP; exit 130' INT TERM HUP
+  _cursor_hide
+  _accounts_action_draw "$cursor" "$cols"
+  echo ""
+  echo -e "  ${DIM}↑/↓ move  ⏎ choose  q back${RESET}"
+  printf '\033[%dA' "$(( _ACCOUNTS_ACTION_LINES + 2 ))"
+
+  while true; do
+    key="$(_read_keypress)"
+    case "$key" in
+      UP)   [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 )) ;;
+      DOWN) [[ $cursor -lt 3 ]] && cursor=$(( cursor + 1 )) ;;
+      ENTER)
+        if [[ $cursor -eq 3 ]]; then
+          _accounts_action_backout
+          return 1
+        fi
+        _cursor_show
+        _tui_echo_restore
+        trap - INT TERM HUP
+        printf '\033[%dB' "$(( _ACCOUNTS_ACTION_LINES + 2 ))"
+        printf '\033[2K'
+        echo ""
+        case "$cursor" in
+          0) _account_do_switch "$acct" "$box" "$cname" "$project" || true ;;
+          1|2)
+            if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+              info "Your shared login is not a stored account, so there is nothing to rename or remove."
+              return 0
+            fi
+            _accounts_action_dispatch "$cursor" "$acct" ;;
+        esac
+        return 0 ;;
+      QUIT|ESC)
+        _accounts_action_backout
+        return 1 ;;
+    esac
+    _accounts_action_draw "$cursor" "$cols"
+    printf '\033[%dA' "$_ACCOUNTS_ACTION_LINES"
+  done
+}
+
+# The two stored-account actions, split out so the sentinel row can refuse them
+# in one place rather than inside a case arm.
+_accounts_action_dispatch() {
+  local cursor="$1" acct="$2"
+  local newname=""
+  case "$cursor" in
+    1)
+      if _is_interactive; then
+        echo -en "  New name: "
+        read -r newname || newname=""
+      fi
+      if [[ -z "$newname" ]]; then
+        info "Kept."
+      else
+        _account_do_rename "$acct" "$newname" || true
+      fi ;;
+    *) _account_do_remove "$acct" 0 || true ;;
+  esac
+  return 0
+}
+
+_accounts_header() {
+  local box="$1"
+  local p="$CLEAT_ACCOUNTS_DIR" room
+  room=$(( $(_term_cols) - 4 ))
+  (( room < 12 )) && room=12
+  if [[ ${#p} -gt $room ]]; then
+    p="…${p:$(( ${#p} - room + 1 ))}"
+  fi
+  echo ""
+  echo -e "  ${BOLD}Claude accounts${RESET} ${DIM}(box ${box})${RESET}"
+  echo -e "  ${DIM}${p}${RESET}"
+  echo ""
+  return 0
+}
+
+_accounts_picker_tui() {
+  local box="$1" cname="$2" project="$3"
+  local key block prev_block total active acted=0
+
+  _ACCT_CURSOR=0
+  _ACCT_OFFSET=0
+
+  while true; do
+    active="$(_box_account_read "$cname")"
+    _tui_echo_off
+    trap '_tui_echo_restore; _cursor_show' EXIT
+    trap '_tui_echo_restore; _cursor_show; trap - INT TERM HUP EXIT; exit 130' INT TERM HUP
+
+    _accounts_load_rows "$active"
+    total="$_ACCT_N"
+    # Row zero is the shared login, so a picker of ONLY that row is a picker
+    # with nothing to pick. Say how to make the first account instead.
+    if [[ "$_ACCT_STORED" -le 0 || "$total" -le 0 ]]; then
+      _tui_echo_restore
+      _cursor_show
+      trap - INT TERM HUP EXIT
+      _accounts_empty_note "$box"
+      return 0
+    fi
+
+    _accounts_measure "$total"
+    if [[ "$_ACCT_NARROW" == "1" ]]; then
+      _tui_echo_restore
+      _cursor_show
+      trap - INT TERM HUP EXIT
+      echo ""
+      info "Window too narrow for the account list."
+      echo -e "    ${DIM}Widen it and run ${BOLD}cleat account${RESET}${DIM} again.${RESET}"
+      return 0
+    fi
+    _accounts_clamp "$total"
+    block=$(( _ACCT_PAGE + 4 ))
+    prev_block=$block
+
+    _cursor_hide
+    _accounts_frame "$_ACCT_CURSOR" "$_ACCT_OFFSET" "$_ACCT_PAGE" "$_ACCT_COLS" "$total"
+    printf '\033[%dA' "$block"
+
+    while true; do
+      key="$(_read_keypress)"
+      _accounts_measure "$total"
+      if [[ "$_ACCT_NARROW" == "1" ]]; then
+        _cursor_show
+        _tui_echo_restore
+        trap - INT TERM HUP EXIT
+        printf '\033[%dB' "$block"
+        printf '\033[2K'
+        echo ""
+        info "Window too narrow for the account list."
+        echo -e "    ${DIM}Widen it and run ${BOLD}cleat account${RESET}${DIM} again.${RESET}"
+        return 0
+      fi
+      case "$key" in
+        UP)   _ACCT_CURSOR=$(( _ACCT_CURSOR - 1 )) ;;
+        DOWN) _ACCT_CURSOR=$(( _ACCT_CURSOR + 1 )) ;;
+        ENTER)
+          local pick=""
+          [[ $_ACCT_CURSOR -lt $total ]] && pick="${_ACCT_NAME[$_ACCT_CURSOR]}"
+          # The sentinel is a real row here and deliberately NOT a valid stored
+          # account name, so it has to be allowed through by name.
+          if [[ "$pick" != "$_ACCOUNT_DEFAULT" ]] && ! _validate_account_name "$pick"; then
+            _accounts_frame "$_ACCT_CURSOR" "$_ACCT_OFFSET" "$_ACCT_PAGE" "$_ACCT_COLS" "$total"
+            printf '\033[%dA' "$block"
+            continue
+          fi
+          _cursor_show
+          _tui_echo_restore
+          trap - INT TERM HUP EXIT
+          printf '\033[J'
+          if _accounts_action_tui "$pick" "$box" "$cname" "$project"; then
+            acted=1
+            _accounts_header "$box"
+          fi
+          break ;;
+        QUIT|ESC)
+          _cursor_show
+          _tui_echo_restore
+          trap - INT TERM HUP EXIT
+          printf '\033[%dB' "$block"
+          printf '\033[2K'
+          echo ""
+          if [[ "$acted" != "1" ]]; then
+            info "Cancelled."
+          fi
+          return 0 ;;
+      esac
+      _accounts_clamp "$total"
+      block=$(( _ACCT_PAGE + 4 ))
+      _accounts_frame "$_ACCT_CURSOR" "$_ACCT_OFFSET" "$_ACCT_PAGE" "$_ACCT_COLS" "$total"
+      if [[ "$block" -lt "$prev_block" ]]; then
+        printf '\033[J'
+      fi
+      prev_block=$block
+      printf '\033[%dA' "$block"
+    done
+  done
+}
+
+# There is nothing to pick from until the first account exists, and the shortest
+# path from here to a working second account is one command, so print it.
+_accounts_empty_note() {
+  local box="$1"
+  info "No named accounts yet."
+  echo -e "    ${DIM}Make one with ${BOLD}cleat account <name>${RESET}${DIM}, then start the box and run ${BOLD}/login${RESET}${DIM}.${RESET}"
+  echo -e "    ${DIM}Until then every box uses your shared login at ~/.claude.${RESET}"
+  return 0
+}
+
+_accounts_picker_text() {
+  local box="$1" cname="$2"
+  local active i=0
+  active="$(_box_account_read "$cname")"
+  _accounts_load_rows "$active"
+  if [[ "$_ACCT_STORED" -le 0 ]]; then
+    _accounts_empty_note "$box"
+    return 0
+  fi
+  echo ""
+  echo -e "  ${BOLD}Claude accounts${RESET} ${DIM}(box ${box})${RESET}"
+  echo ""
+  while [[ $i -lt $_ACCT_N ]]; do
+    local mark=" "
+    [[ "${_ACCT_MARK[$i]}" == "1" ]] && mark="${GREEN}•${RESET}"
+    echo -e "   ${mark} $(printf '%-13.13s %-10.10s' "${_ACCT_NAME[$i]}" "${_ACCT_AUTH[$i]}") ${DIM}${_ACCT_WHO[$i]}${RESET}"
+    echo -e "      ${DIM}${_ACCT_D1[$i]}${RESET}"
+    i=$(( i + 1 ))
+  done
+  echo ""
+  echo -e "  ${DIM}Switch with ${BOLD}cleat account <name> [box]${RESET}${DIM}. Rename or remove with ${BOLD}cleat account rename${RESET}${DIM} and ${BOLD}cleat account rm${RESET}${DIM}.${RESET}"
+  return 0
+}
+
+# Refresh what the list can honestly show, for every account whose own access
+# token is still alive. Cheap in practice: the throttle and the liveness gate
+# make it a no-op for a parked account, which is most of them, and the parked
+# ones are exactly the ones that must NEVER be polled (a refresh could rotate
+# their refresh token).
+_accounts_refresh_usage() {
+  local n
+  command -v curl &>/dev/null || return 0
+  command -v jq &>/dev/null || return 0
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    _account_usage_fetch "$n" >/dev/null 2>&1 || true
+  done < <(_account_list)
+  return 0
+}
+
+# `cleat account [list|rename|rm|restore] [<name>] [box] [flags]`
+#
+# The subcommand word is reserved FIRST, then flags, then the name, and only
+# what is left goes to _set_box. `cmd_fork` carries the scar that made this the
+# house rule: _set_box takes exactly one positional and validates it as a box
+# name, so handing it anything else fails with a confusing message.
+cmd_account() {
+  local sub="switch" name="" newname="" assume_yes=0
+  case "${1:-}" in
+    --help|-h)
+      echo "Usage: cleat account                    Interactive picker for this project's default box"
+      echo "       cleat account <name> [box]       Pin a box to a named login, creating it if new"
+      echo "       cleat account list [box]         Plain list, marking the pinned one"
+      echo "       cleat account rename <old> <new> Rename a stored login"
+      echo "       cleat account rm <name> [--yes]  Move it to the trash"
+      echo "       cleat account restore <name>     Bring a removed one back"
+      return 0 ;;
+    list)            sub="list"; shift ;;
+    rename)          sub="rename"; shift ;;
+    rm|delete)       sub="rm"; shift ;;
+    restore)         sub="restore"; shift ;;
+  esac
+
+  local rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) assume_yes=1; shift ;;
+      -*)
+        error "Unknown flag: ${BOLD}${1}${RESET}"
+        echo -e "    ${DIM}cleat account takes --yes.${RESET}"
+        return 1 ;;
+      *) rest=("${rest[@]+"${rest[@]}"}" "$1"); shift ;;
+    esac
+  done
+
+  case "$sub" in
+    rename)
+      name="${rest[0]:-}"
+      newname="${rest[1]:-}"
+      if [[ -z "$name" || -z "$newname" ]]; then
+        error "Which one, and to what? ${DIM}cleat account rename <old> <new>${RESET}"
+        return 1
+      fi
+      rest=("${rest[@]:2}") ;;
+    rm|restore)
+      name="${rest[0]:-}"
+      if [[ -z "$name" ]]; then
+        error "Which account? ${DIM}cleat account ${sub} <name>${RESET}"
+        echo -e "    ${DIM}Run ${BOLD}cleat account list${RESET}${DIM} to see them.${RESET}"
+        return 1
+      fi
+      rest=("${rest[@]:1}") ;;
+    switch)
+      # Bare `cleat account` is the picker, exactly like bare `cleat kit`.
+      if [[ ${#rest[@]} -gt 0 ]]; then
+        name="${rest[0]}"
+        rest=("${rest[@]:1}")
+      fi ;;
+  esac
+
+  _set_box "${rest[@]+"${rest[@]}"}"
+
+  local project cname
+  project="$(resolve_project "$PWD")"
+  cname="$(container_name_for "$project" "$_BOX")"
+
+  # Housekeeping on every run, so the trash cannot grow without bound.
+  _account_trash_sweep
+  # And harvest anything the box refreshed for itself, before this run reads or
+  # writes a single stored credential.
+  _account_sync_out "$cname" || true
+
+  case "$sub" in
+    rename)  _account_do_rename "$name" "$newname"; return $? ;;
+    rm)      _account_do_remove "$name" "$assume_yes"; return $? ;;
+    restore) _account_do_restore "$name"; return $? ;;
+    list)    _accounts_refresh_usage; _accounts_picker_text "$_BOX" "$cname"; return 0 ;;
+  esac
+
+  if [[ -n "$name" ]]; then
+    _account_do_switch "$name" "$_BOX" "$cname" "$project"
+    return $?
+  fi
+
+  _accounts_refresh_usage
+  if [[ -t 0 ]] && [[ -t 1 ]] && ! _accounts_too_narrow; then
+    _accounts_header "$_BOX"
+    _accounts_picker_tui "$_BOX" "$cname" "$project"
+  else
+    _accounts_picker_text "$_BOX" "$cname"
   fi
   return 0
 }
@@ -14492,7 +15967,7 @@ _kit_prekit_offer() {
     _ask_yn yn "Rebuild now? [y/N] "
     if [[ "$yn" == [yY]* ]]; then
       docker rm -f "$cname" > /dev/null 2>&1 || true
-      rm -rf "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
+      _account_wipe_run_dir "${cname}"
       _box_kit_write "$cname" "$kit"
       success "Kit ${BOLD}${kit}${RESET} enabled for box ${BOLD}${box}${RESET}."
       echo -e "    ${DIM}Next ${BOLD}cleat${RESET}${DIM} rebuilds the box with the kit active.${RESET}"
@@ -15319,6 +16794,7 @@ cmd_help() {
   echo -e "    ${GREEN}storage${RESET}            Show Docker disk usage ${DIM}(cleat vs shared vs other projects)${RESET}"
   echo -e "    ${GREEN}describe${RESET} ${DIM}[box] [text]${RESET}  Show or set a box's description"
   echo -e "    ${GREEN}sessions${RESET} ${DIM}[box]${RESET}       List, rename, delete or restore this box's Claude sessions"
+  echo -e "    ${GREEN}account${RESET} ${DIM}[name] [box]${RESET} Switch this box between named Claude logins"
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
   echo -e "    ${GREEN}update${RESET}             Check for updates and install the latest version"
@@ -15529,6 +17005,7 @@ main() {
     ps)        cmd_ps "$@" ;;
     storage)   cmd_storage "$@" ;;
     sessions|ses) cmd_sessions "$@" ;;
+    account|accounts) cmd_account "$@" ;;
     status|st) cmd_status "$@" ;;
     config)    cmd_config "$@" ;;
     describe)  cmd_describe "$@" ;;

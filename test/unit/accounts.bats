@@ -560,6 +560,7 @@ _pass_gates() {
   _mk_account work
   _daemon_up() { return 0; }
   container_exists() { return 0; }
+  is_running() { return 0; }
   _box_has_live_agent() { return 0; }
   run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
   assert_failure
@@ -622,6 +623,7 @@ _pass_gates() {
   _box_account_write "$CN" work
   _daemon_up() { return 0; }
   container_exists() { return 0; }
+  is_running() { return 0; }
   _box_has_live_agent() { return 0; }
   run _account_do_remove work 1
   assert_failure
@@ -1162,6 +1164,7 @@ _acct_keys() {
   _box_account_write "$CN" work
   _daemon_up() { return 0; }
   container_exists() { return 0; }
+  is_running() { return 0; }
   _box_has_live_agent() { return 0; }
   run _account_do_switch default main "$CN" "$TEST_TEMP/proj"
   assert_failure
@@ -1345,4 +1348,148 @@ _acct_keys() {
   _build_project_claude_json "$TEST_TEMP/store/claude.json" "" "$CN"
   run jq -r '.oauthAccount // "absent"' "$TEST_TEMP/store/claude.json"
   assert_output "absent"
+}
+
+# ── what the completeness critic found ─────────────────────────────────────
+
+@test "account: a merely STOPPED box is not mistaken for one with a live session" {
+  # _box_has_live_agent maps ANY docker top failure to "live", and docker top
+  # fails on a stopped container while container_exists (docker ps -a) is true
+  # for one. Without is_running every stopped box read as live, which is the
+  # normal steady state: the idle sweep stops boxes by itself.
+  _pass_gates
+  _mk_account work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _box_has_live_agent() { return 0; }
+  docker() { case "$1" in inspect) printf '%s\n' "/home/coder/.cleat-auth" ;; *) return 1 ;; esac; }
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  refute_output --partial "live Claude session"
+}
+
+@test "account: unpinning a stopped box is not refused either" {
+  # cleat account default is the escape hatch the picker's first row exists
+  # for, so wedging it on a stopped box closes the only way back.
+  _mk_account work
+  _box_account_write "$CN" work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _box_has_live_agent() { return 0; }
+  run _account_do_switch default main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run _box_account_read "$CN"
+  assert_output "default"
+}
+
+@test "account: removing is not wedged by one stale stopped box on the machine" {
+  # _account_pinned_boxes scans EVERY pin file, not this project's, so one
+  # stopped box anywhere made the account unremovable from every directory.
+  _pass_gates
+  _mk_account work
+  _box_account_write "box-elsewhere" work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _box_has_live_agent() { return 0; }
+  run _account_do_remove work 1
+  assert_success
+  [ ! -d "$CLEAT_ACCOUNTS_DIR/work" ]
+}
+
+@test "account: identity is captured on a host with no jq" {
+  # Claude Code writes ~/.claude.json PRETTY-PRINTED, and the transcript
+  # reader deliberately forbids whitespace after the colon. macOS base has no
+  # jq, so on that host every row said "not used yet" for an account with a
+  # live credential, and the rm confirmation named only a directory.
+  _mk_account work
+  command() {
+    if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi
+    builtin command "$@"
+  }
+  printf '{\n  "oauthAccount": {\n    "emailAddress": "alice@example.com",\n    "organizationName": "Acme Ltd"\n  }\n}\n' > "$TEST_TEMP/pretty.json"
+  _account_capture_meta work "$TEST_TEMP/pretty.json"
+  unset -f command
+  run _account_meta_get work who
+  assert_output "alice@example.com"
+  run _account_meta_get work org
+  assert_output "Acme Ltd"
+}
+
+@test "account: the jq and the jq-less readers agree on the same input" {
+  command -v jq >/dev/null || skip "needs jq"
+  local blob
+  blob="$(printf '{\n  "oauthAccount": {\n    "emailAddress": "alice@example.com"\n  }\n}\n')"
+  run _account_json_field "$blob" emailAddress
+  assert_output "alice@example.com"
+  run _account_json_str_ws "$blob" emailAddress
+  assert_output "alice@example.com"
+}
+
+@test "account: a refused switch leaves no pin file behind at all" {
+  # _box_account_read SANITISES, so asserting it reports `default` passes even
+  # when a junk pin file is sitting on disk for _account_pinned_boxes and
+  # cleat account rm to iterate.
+  _pass_gates
+  run _account_do_switch "Bad Name" main "$CN" "$TEST_TEMP/proj"
+  assert_failure
+  [ ! -f "$CLEAT_BOX_ACCOUNTS_DIR/$CN" ]
+}
+
+@test "account: every attach re-stages the stored credential" {
+  # Another box may have refreshed it since this one last ran, so the staging
+  # is not only a switch-time step. Asserting the env var alone passes with
+  # the staging deleted.
+  _mk_account work 1789003600000 fresher
+  _box_account_write "cleat-stagetest" work
+  _host_clip_cmd() { echo ""; }
+  docker() {
+    case "$1" in
+      inspect) printf '%s\n' "/home/coder/.cleat-auth" ;;
+      *) command docker "$@" ;;
+    esac
+  }
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  run exec_claude "cleat-stagetest" --dangerously-skip-permissions
+  run grep -c "fresher" "$CLEAT_RUN_DIR/cleat-stagetest/auth/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: the plain listing renders a row rather than only the empty note" {
+  # cleat account list is the non-TTY path for every pipe and every CI run,
+  # and the smoke test runs it with NO accounts, so the row-rendering half
+  # never executed anywhere in the suite.
+  _mk_account work
+  _account_meta_set work who "you@example.com"
+  run _accounts_picker_text main "$CN"
+  assert_success
+  assert_output --partial "work"
+  assert_output --partial "you@example.com"
+  assert_output --partial "default"
+}
+
+@test "account: rename and restore work through their command-level wrappers" {
+  _mk_account work
+  run _account_do_rename work other
+  assert_success
+  [ -d "$CLEAT_ACCOUNTS_DIR/other" ]
+  _account_trash other
+  run _account_do_restore other
+  assert_success
+  [ -d "$CLEAT_ACCOUNTS_DIR/other" ]
+  run _account_do_restore never-existed
+  assert_failure
+}
+
+@test "account: the mount probe succeeds against a healthy modern box" {
+  # Every switch test either takes the daemon down or stubs the probe to fail,
+  # so the success path had never executed.
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  docker() { case "$1" in inspect) printf '%s\n%s\n' "/workspace" "/home/coder/.cleat-auth" ;; *) return 1 ;; esac; }
+  run _account_box_ready "cleat-healthy"
+  assert_success
 }

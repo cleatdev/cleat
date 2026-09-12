@@ -6195,7 +6195,7 @@ try "vnext_account_trash_not_delete" "removing an account moves it to the trash"
 # Claude Code notices the credential changing under a running session, disarms
 # its auth watcher and writes its own token back over the swap.
 cat > "$SED_TMP" << 'SED'
-s/^  if _daemon_up \&\& container_exists "[$]cname" \&\& _box_has_live_agent "[$]cname"; then$/  if false; then/
+s@^  if _daemon_up .*_box_has_live_agent "[$]cname"; then$@  if false; then@
 SED
 try "vnext_account_live_gate" "switching refuses while the box has a live Claude session" "$CLI" "$ACCOUNTS_BATS"
 
@@ -6394,7 +6394,7 @@ try "vnext_account_probe_stopped_box" "the mount probe reads a STOPPED box" "$CL
 # Going back to the shared login is still a credential swap.
 cat > "$SED_TMP" << 'SED'
 /^_account_do_switch()/,/^}$/{
-  s#^    if _daemon_up \&\& container_exists "[$]cname" \&\& _box_has_live_agent "[$]cname"; then$#    if false; then#
+  s#^    if _daemon_up .*_box_has_live_agent "[$]cname"; then$#    if false; then#
 }
 SED
 try "vnext_account_default_live_gate" "going back to the shared login respects the live-session gate" "$CLI" "$ACCOUNTS_BATS"
@@ -6473,6 +6473,53 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_sessions_no_phantom_trash" "an empty trash entry is never left behind" "$CLI" "$SESSIONS_BATS"
+
+# ── what the completeness critic found ─────────────────────────────────────
+
+# `docker top` fails on a STOPPED container and _box_has_live_agent maps any
+# failure to "live", so without is_running every stopped box read as live. That
+# is the normal steady state: the idle sweep stops boxes by itself.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@ \&\& is_running "[$]cname"@@
+}
+SED
+try "vnext_account_stopped_not_live" "a merely STOPPED box is not mistaken" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s@ \&\& is_running "[$]b"@@
+}
+SED
+try "vnext_account_remove_stopped_ok" "removing is not wedged by one stale stopped box" "$CLI" "$ACCOUNTS_BATS"
+
+# ~/.claude.json is PRETTY-PRINTED, and the transcript reader deliberately
+# forbids whitespace after the colon. macOS base has no jq.
+cat > "$SED_TMP" << 'SED'
+/^_account_json_field()/,/^}$/{
+  s@^  v="[$](_account_json_str_ws "[$]blob" "[$]key")" .. return 1$@  v="$(_sessions_json_str "$blob" "$key")" || return 1@
+}
+SED
+try "vnext_account_jqless_identity" "identity is captured on a host with no jq" "$CLI" "$ACCOUNTS_BATS"
+
+# A refused switch must leave NO pin file: _box_account_read sanitises, so a
+# junk one on disk is invisible to the obvious assertion but not to
+# _account_pinned_boxes.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^  if ! _validate_account_name "[$]acct"; then$@  if false; then@
+}
+SED
+try "vnext_account_refused_switch_no_pin" "a refused switch leaves no pin file" "$CLI" "$ACCOUNTS_BATS"
+
+# Another box may have refreshed the stored credential since this one last ran,
+# so the staging is not only a switch-time step.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s@^  _account_sync_in "[$]cname" .. true$@  :@
+}
+SED
+try "vnext_account_attach_restages" "every attach re-stages the stored credential" "$CLI" "$ACCOUNTS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

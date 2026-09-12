@@ -12919,9 +12919,28 @@ _account_meta_set() {
   return 0
 }
 
-# Pull one string field out of a JSON blob. jq when it is there, the session
-# feature's grep-based reader when it is not, which is already the house
-# fallback and already handles the escapes it can.
+# A string field out of a JSON blob, WITHOUT jq. Deliberately not
+# _sessions_json_str: that one forbids whitespace after the colon because it
+# reads Claude Code's compact transcript writer byte for byte, and two mutation
+# entries depend on that. ~/.claude.json is PRETTY-PRINTED by the same vendor,
+# so the account reader has to allow the space the transcript reader refuses.
+#
+# Without this, a host with no jq (macOS base has none) captured no email and
+# no organisation for any account, so every row read "not used yet" for an
+# account with a live credential and the `cleat account rm` confirmation named
+# nothing but the directory.
+_account_json_str_ws() {
+  local blob="$1" key="$2" hit
+  hit="$(printf '%s' "$blob" | LC_ALL=C grep -aoE "\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"\\\\]|\\\\.)*\"" | tail -1)" || hit=""
+  [[ -n "$hit" ]] || return 1
+  hit="${hit#*\"${key}\"}"
+  hit="${hit#*\"}"
+  hit="${hit%\"}"
+  printf '%s' "$hit"
+}
+
+# Pull one string field out of a JSON blob. jq when it is there, the
+# whitespace-tolerant grep reader when it is not.
 _account_json_field() {
   local blob="$1" key="$2" v
   [[ -n "$blob" ]] || return 1
@@ -12930,7 +12949,7 @@ _account_json_field() {
     [[ -n "$v" && "$v" != "null" ]] && { printf '%s' "$v"; return 0; }
     return 1
   fi
-  v="$(_sessions_json_str "$blob" "$key")" || return 1
+  v="$(_account_json_str_ws "$blob" "$key")" || return 1
   _sessions_json_unesc "$v"
 }
 
@@ -13329,7 +13348,7 @@ _account_do_switch() {
     # The same live gate the named switches get. Going back to the shared login
     # changes the credential under a running session exactly as much as any
     # other switch does.
-    if _daemon_up && container_exists "$cname" && _box_has_live_agent "$cname"; then
+    if _daemon_up && container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
       error "${BOLD}${box}${RESET} has a live Claude session."
       echo -e "    ${DIM}Exit it first. Swapping the credential under a running session is noticed and undone.${RESET}"
       return 1
@@ -13353,12 +13372,16 @@ _account_do_switch() {
   # Switching under a live agent is the one case Claude Code actively fights:
   # it notices the credential file change, disarms its auth watcher and writes
   # its own token back over the swap.
-  # _box_has_live_agent answers "live" when it cannot read docker, which is the
-  # safe default where it is used but the wrong one here: this verb is
-  # deliberately outside the preflight allowlist and has to work with the
-  # daemon down. A daemon that is down means no box is running, so there is
-  # nothing to disturb.
-  if _daemon_up && container_exists "$cname" && _box_has_live_agent "$cname"; then
+  # Three terms, and every one of them is load-bearing. _box_has_live_agent
+  # answers "live" whenever it cannot read docker, which is the safe default
+  # where it is used and the wrong one here twice over. With the daemon DOWN no
+  # box is running, and this verb is deliberately outside the preflight
+  # allowlist so it has to work there. And `docker top` fails on a STOPPED
+  # container while `container_exists` (docker ps -a) is true for one, so
+  # without is_running every stopped box read as live. That is the normal
+  # steady state: the idle sweep stops boxes by itself. The session gate has
+  # carried is_running since the day it was written.
+  if _daemon_up && container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
     error "${BOLD}${box}${RESET} has a live Claude session."
     echo -e "    ${DIM}Exit it first. Swapping the credential under a running session is noticed and undone.${RESET}"
     return 1
@@ -13464,7 +13487,7 @@ _account_do_remove() {
   pinned="$(_account_pinned_boxes "$acct")"
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
-    if _daemon_up && container_exists "$b" && _box_has_live_agent "$b"; then
+    if _daemon_up && container_exists "$b" && is_running "$b" && _box_has_live_agent "$b"; then
       error "A box pinned to ${BOLD}${acct}${RESET} has a live Claude session."
       echo -e "    ${DIM}Exit it first.${RESET}"
       return 1

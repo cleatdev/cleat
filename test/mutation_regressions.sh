@@ -6674,6 +6674,117 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_claude_upgrade_no_fake_labels" "an unlabelled image does not gain a fabricated" "$CLI" "$ACCOUNTS_BATS"
 
+# ── the account trash view ──────────────────────────────────────────────────
+
+# A dash is legal inside an account name, so a glob would match `<stamp>-my-work`
+# when scanning for `work`. The scan splits on the stamp for the same reason
+# _account_restore does: a glob must never decide identity here.
+cat > "$SED_TMP" << 'SED'
+/^_account_trash_scan()/,/^}$/{
+  s@^    _validate_account_name "[$]name" || continue$@    :@
+}
+SED
+try "vnext_account_trash_scan_validates" "the trash scan skips what it cannot name" "$CLI" "$ACCOUNTS_BATS"
+
+# The count has to agree with the scan. A count that included a hand-made
+# directory would advertise a trash the view then draws as empty.
+cat > "$SED_TMP" << 'SED'
+/^_account_trash_count()/,/^}$/{
+  s@^      _validate_account_name "[$]{base#\*-}" || continue$@      :@
+}
+SED
+try "vnext_account_trash_count_agrees" "the trash count counts exactly what the scan counts" "$CLI" "$ACCOUNTS_BATS"
+
+# A count that fell through to an error prints nothing where the frame expects
+# a number, and `[[ "" -gt 0 ]]` is a strict-mode error rather than a false.
+cat > "$SED_TMP" << 'SED'
+/^_account_trash_count()/,/^}$/{
+  s@^  tdir="[$](_account_trash_dir)" || { printf .0.; return 0; }$@  tdir="$(_account_trash_dir)" || return 1@
+}
+SED
+try "vnext_account_trash_count_symlink" "the trash count is zero when the trash is a symlink" "$CLI" "$ACCOUNTS_BATS"
+
+# Nothing in the trash can be the active account. A marked row would draw the
+# green dot against an account no box can possibly be using.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_load_trash_rows()/,/^}$/{
+  s@^    _ACCT_MARK\[[$]_ACCT_N\]=0$@    _ACCT_MARK[$_ACCT_N]=1@
+}
+SED
+try "vnext_account_trash_never_marked" "the trash rows carry the name, the email and when" "$CLI" "$ACCOUNTS_BATS"
+
+# A removed account keeps its meta file, which is the only thing that can say
+# whose login it was. Reading it by NAME looks in the live directory, which is
+# exactly where a removed account is not.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_load_trash_rows()/,/^}$/{
+  s@_account_meta_get_at "[$]dir" who@_account_meta_get "$name" who@
+}
+SED
+try "vnext_account_trash_meta_by_dir" "the trash rows carry the name, the email and when" "$CLI" "$ACCOUNTS_BATS"
+
+# The trash is reached with the right arrow. Without the handler the view is
+# unreachable and the only way back to a removed account is to retype a command.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_picker_tui()/,/^}$/{
+  s@^          if \[\[ "[$]view" == "live" \]\]; then$@          if false; then@
+}
+SED
+try "vnext_account_trash_right_opens" "the picker crosses to the trash and restores from it" "$CLI" "$ACCOUNTS_BATS"
+
+# And the left arrow comes back. Without it the trash is a one-way door and the
+# live list can only be reached by closing the picker.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_picker_tui()/,/^}$/{
+  s@^          if \[\[ "[$]view" == "trash" && "[$]trash_forced" != "1" \]\]; then$@          if false; then@
+}
+SED
+try "vnext_account_trash_left_returns" "left comes back to the live list without acting" "$CLI" "$ACCOUNTS_BATS"
+
+# Pressing Enter on an empty trash must not end the verb. Without the guard the
+# restore runs against an empty name and the picker closes on a keypress that
+# means nothing.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_picker_tui()/,/^}$/{
+  s@^            if ! _validate_account_name "[$]pick"; then$@            if false; then@
+}
+SED
+try "vnext_account_trash_enter_empty" "enter on an empty trash does not close the picker" "$CLI" "$ACCOUNTS_BATS"
+
+# Removing the last account leaves only the sentinel row. Dropping out to a
+# shell prompt there strands the account in a trash the user has not been told
+# about.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_picker_tui()/,/^}$/{
+  s@^      if \[\[ "[$]{_ACCT_TRASH_N:-0}" -gt 0 \]\]; then$@      if false; then@
+}
+SED
+try "vnext_account_trash_shown_when_empty" "removing the last account shows the trash instead" "$CLI" "$ACCOUNTS_BATS"
+
+# The counter line is the only place the trash is advertised in the picker.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_frame()/,/^}$/{
+  s@^    count="→ trash ([$]{_ACCT_TRASH_N})"$@    count=""@
+}
+SED
+try "vnext_account_trash_advertised" "the live frame advertises the trash only when there" "$CLI" "$ACCOUNTS_BATS"
+
+# And the trash view says what it is and how long it keeps things.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_frame()/,/^}$/{
+  s@^      count="Trash: 1 account, kept [$]{_ACCOUNTS_TRASH_DAYS} days"$@      count=""@
+}
+SED
+try "vnext_account_trash_counter" "the trash view says restore and says how to get back" "$CLI" "$ACCOUNTS_BATS"
+
+# The non-TTY path is the one place a removed account could be invisible.
+cat > "$SED_TMP" << 'SED'
+/^_accounts_picker_text()/,/^}$/{
+  s@^  if \[\[ "[$]tn" -gt 0 \]\]; then$@  if false; then@
+}
+SED
+try "vnext_account_trash_text_pointer" "the plain list points at the trash when something" "$CLI" "$ACCOUNTS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

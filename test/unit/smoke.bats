@@ -456,6 +456,12 @@ STUB
   assert_success
 }
 
+@test "smoke: cleat account trash runs with nothing in it" {
+  run cleat_bin_timeout 10 account trash
+  assert_success
+  assert_output --partial "trash"
+}
+
 @test "smoke: cleat account refuses a name that is not the box charset" {
   run cleat_bin_timeout 10 account "Bad Name"
   assert_failure

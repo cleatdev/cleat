@@ -480,7 +480,7 @@ A Claude Max account has a five-hour window. With two of them the only way to mo
 cleat account work2      # pin this box to a login called work2
 # start the box and run /login once. That login is remembered under the name
 
-cleat account            # picker: switch, rename or remove
+cleat account            # picker: switch, rename or remove, → for the trash
 cleat account work1      # back to the first one, no browser
 cleat account default    # unpin: back to your shared ~/.claude login
 ```
@@ -488,6 +488,8 @@ cleat account default    # unpin: back to your shared ~/.claude login
 Only the login moves. Conversations, project history and settings are identical on both accounts, by construction rather than by copying: a switch relocates Claude Code's credential store for that box and nothing else. So you can hit a limit mid-conversation, switch, then carry on in the same conversation.
 
 The pin is per box, because the limit is per account and you probably have several boxes open. One can move to the fresh account while the others keep draining the first. The picker's first row is always your shared `~/.claude` login, so a pin is never a one-way door.
+
+Removing a login is never an unlink: it goes to a trash kept for 30 days. `→` in the picker crosses to it and `←` comes back, the same two keys `cleat session` uses. Each row still says whose login it was and when it went. `⏎` puts it back. Remove your last account and the picker opens the trash rather than dropping you at a shell prompt, because that is the only place it can be got back from.
 
 A box created before this feature has no credential mount. Cleat says so and tells you to recreate it once with `cleat rm <box>`, rather than half working: without the mount, `/login` would write the store inside the container where `cleat rm` destroys it. Until you do, `cleat status` and the launch summary both call the pin not in effect rather than naming an account the box is not using. The recreate keeps your conversations, trust and env, which live on the host. It does not keep what you installed inside the box, so move that into a `[setup]` section first.
 
@@ -636,6 +638,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `cleat account rename <old> <new>` | Rename a stored login. Every box pinned to it follows |
 | `cleat account rm <name>` | Move a login to the trash, with `--yes` to skip the prompt |
 | `cleat account restore <name>` | Bring a removed login back (30 days) |
+| `cleat account trash` | List removed logins. The picker reaches the same list with `→` |
 
 #### Info
 | Command | Description |

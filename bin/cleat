@@ -12966,9 +12966,10 @@ _account_meta_clean() {
   printf '%s' "${v:0:160}"
 }
 
-_account_meta_get() {
-  local f kk vv
-  f="$(_account_meta_path "$1")"
+# By DIRECTORY rather than by name, because a removed account's meta file is
+# under `.trash/<stamp>-<name>/` and the trash view has to describe it there.
+_account_meta_get_at() {
+  local f="$1/meta" kk vv
   [[ -f "$f" ]] || return 1
   while IFS="$(printf '\t')" read -r kk vv; do
     [[ "$kk" == "$2" ]] || continue
@@ -12977,6 +12978,10 @@ _account_meta_get() {
     return 0
   done < "$f"
   return 1
+}
+
+_account_meta_get() {
+  _account_meta_get_at "$CLEAT_ACCOUNTS_DIR/$1" "$2"
 }
 
 _account_meta_set() {
@@ -13354,6 +13359,54 @@ _account_restore() {
   mkdir -p "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || return 1
   chmod 700 "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || true
   mv "$found" "$CLEAT_ACCOUNTS_DIR/$acct" 2>/dev/null || return 1
+  return 0
+}
+
+# Every removed account, one `<stamp>\t<name>` line each. The same identity
+# discipline as _account_restore, and for the same reason: a dash is legal
+# inside an account name, so `*-work` also matches `<stamp>-my-work`. Split on
+# the stamp and validate the remainder, never let a glob decide which directory
+# is which account.
+_account_trash_scan() {
+  local tdir d base stamp name
+  tdir="$(_account_trash_dir)" || return 0
+  [[ -d "$tdir" ]] || return 0
+  for d in "$tdir"/*; do
+    [[ -d "$d" ]] || continue
+    [[ -L "$d" ]] && continue
+    base="${d##*/}"
+    stamp="${base%%-*}"
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    name="${base#*-}"
+    _validate_account_name "$name" || continue
+    printf '%s\t%s\n' "$stamp" "$name"
+  done
+  return 0
+}
+
+# Most recently removed first, matching the live list's own order.
+_account_trash_scan_sorted() {
+  _account_trash_scan | sort -t "$(printf '\t')" -k1,1rn
+}
+
+# How many accounts are in the trash. Deliberately does NOT read a meta file:
+# this runs once per list screen only to decide whether to advertise the trash,
+# so it stays fork-free. Counts exactly what the scan would count.
+_account_trash_count() {
+  local tdir d base stamp n=0
+  tdir="$(_account_trash_dir)" || { printf '0'; return 0; }
+  if [[ -d "$tdir" ]]; then
+    for d in "$tdir"/*; do
+      [[ -d "$d" ]] || continue
+      [[ -L "$d" ]] && continue
+      base="${d##*/}"
+      stamp="${base%%-*}"
+      case "$stamp" in ''|*[!0-9]*) continue ;; esac
+      _validate_account_name "${base#*-}" || continue
+      n=$(( n + 1 ))
+    done
+  fi
+  printf '%s' "$n"
   return 0
 }
 
@@ -13776,6 +13829,12 @@ _ACCT_CURSOR=0; _ACCT_OFFSET=0; _ACCT_PAGE=5; _ACCT_COLS=80; _ACCT_ROWS=24; _ACC
 # How many of the rows are STORED accounts. Row zero is always the shared
 # login, so _ACCT_N is never zero and cannot answer "is there anything here".
 _ACCT_STORED=0
+# Which list the frame is drawing, "live" or "trash", and how many accounts are
+# in the trash. Both are globals for the same reason the session picker's are:
+# the frame takes its arguments positionally and adding two more to every call
+# site buys nothing over a value set once per list screen.
+_ACCT_VIEW="live"
+_ACCT_TRASH_N=0
 # header (4) + the frame's four non-row lines + one for the shell prompt.
 _ACCOUNTS_CHROME_LINES=9
 # 4 of marker, 13 of name, 10 of state and something left for an email.
@@ -13855,6 +13914,57 @@ _accounts_load_rows() {
   return 0
 }
 
+# The same parallel arrays from the trash, so the frame renderer is the one
+# renderer. A removed account keeps its meta file, so it can still say whose
+# login it was, which is the whole point of being able to see the trash before
+# restoring from it.
+_accounts_load_trash_rows() {
+  local stamp name who plan org d1 d2 now tdir dir
+  _ACCT_N=0
+  _ACCT_NAME=(); _ACCT_AUTH=(); _ACCT_WHO=(); _ACCT_MARK=()
+  _ACCT_D1=(); _ACCT_D2=()
+  _ACCT_STORED=0
+  now="${_CLEAT_NOW_S:-$(date +%s)}"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  tdir="$(_account_trash_dir)" || tdir=""
+  [[ -n "$tdir" ]] || return 0
+  while IFS="$(printf '\t')" read -r stamp name; do
+    [[ -n "$name" ]] || continue
+    dir="${tdir}/${stamp}-${name}"
+    who="$(_account_meta_get_at "$dir" who 2>/dev/null || true)"
+    plan="$(_account_meta_get_at "$dir" plan 2>/dev/null || true)"
+    org="$(_account_meta_get_at "$dir" org 2>/dev/null || true)"
+    [[ -n "$who" ]] || who="no login was recorded"
+    _ACCT_NAME[$_ACCT_N]="$(_sessions_safe_str "$name")"
+    # Not an auth state: the stored blob is not consulted here. A removed
+    # account is described by what it WAS, and reading its credential to draw a
+    # word would be the one thing the trash exists to avoid doing by accident.
+    _ACCT_AUTH[$_ACCT_N]="removed"
+    _ACCT_WHO[$_ACCT_N]="$(_sessions_safe_str "$who")"
+    # Nothing in the trash can be the active account, so no row is ever marked.
+    _ACCT_MARK[$_ACCT_N]=0
+    d1=""
+    [[ -n "$plan" ]] && d1="$(_sessions_safe_str "$plan")"
+    if [[ -n "$org" ]]; then
+      if [[ -n "$d1" ]]; then d1="${d1} · $(_sessions_safe_str "$org")"; else d1="$(_sessions_safe_str "$org")"; fi
+    fi
+    # No usage line. The figures are a snapshot of a live account's window and
+    # a removed one has no window worth showing.
+    [[ -n "$d1" ]] || d1="nothing was recorded about this account"
+    _ACCT_D1[$_ACCT_N]="$d1"
+    case "$stamp" in
+      ''|*[!0-9]*) d2="removed, kept ${_ACCOUNTS_TRASH_DAYS} days" ;;
+      *) d2="removed $(_age_from_delta $(( now - stamp ))), kept ${_ACCOUNTS_TRASH_DAYS} days" ;;
+    esac
+    _ACCT_D2[$_ACCT_N]="$d2"
+    _ACCT_N=$(( _ACCT_N + 1 ))
+  done < <(_account_trash_scan_sorted)
+  # Every row here is a stored account, unlike the live list where row zero is
+  # the sentinel. Keeping the two in step means nothing has to special-case it.
+  _ACCT_STORED="$_ACCT_N"
+  return 0
+}
+
 _accounts_measure() {
   local total="${1:-0}" avail
   _ACCT_ROWS="$(_term_rows)"
@@ -13890,7 +14000,7 @@ _accounts_clamp() {
 # here has to keep the arithmetic in _accounts_picker_tui (page + 4) true.
 _accounts_frame() {
   local cursor="$1" offset="$2" page="$3" cols="$4" total="$5"
-  local buf="" i n room w a line meta d1 d2
+  local buf="" i n room w a line meta d1 d2 count
   case "$cursor" in ''|*[!0-9-]*) cursor=0 ;; esac
   case "$offset" in ''|*[!0-9-]*) offset=0 ;; esac
   case "$page"   in ''|*[!0-9]*)  page=1 ;; esac
@@ -13956,10 +14066,33 @@ _accounts_frame() {
   case "$d2" in *[!\ -~]*) if _has_unicode; then d2room=$(( droom / 2 )); (( d2room < 1 )) && d2room=1; fi ;; esac
   [[ ${#d1} -gt $d1room ]] && d1="${d1:0:$(( d1room - 1 ))}…"
   [[ ${#d2} -gt $d2room ]] && d2="${d2:0:$(( d2room - 1 ))}…"
-  buf="${buf}\033[K\n"
+  # The line between the rows and the detail pane used to be a bare spacer. It
+  # is the counter now, and it is where the trash gets advertised. NOT the hint
+  # line: that is already 37 columns against a 44-column minimum, so one more
+  # word there wraps the narrowest supported terminal, and a wrapped line walks
+  # the whole block one row down the screen per keypress. The height does not
+  # change either way, which is what the cursor-up reposition depends on.
+  count=""
+  if [[ "$_ACCT_VIEW" == "trash" ]]; then
+    if [[ "$total" -le 0 ]]; then
+      count="The trash is empty"
+    elif [[ "$total" -eq 1 ]]; then
+      count="Trash: 1 account, kept ${_ACCOUNTS_TRASH_DAYS} days"
+    else
+      count="Trash: ${total} accounts, kept ${_ACCOUNTS_TRASH_DAYS} days"
+    fi
+  elif [[ "${_ACCT_TRASH_N:-0}" -gt 0 ]]; then
+    count="→ trash (${_ACCT_TRASH_N})"
+  fi
+  [[ ${#count} -gt $droom ]] && count="${count:0:$(( droom - 1 ))}…"
+  buf="${buf}    ${DIM}${count}${RESET}\033[K\n"
   buf="${buf}    ${DIM}${d1}${RESET}\033[K\n"
   buf="${buf}    ${DIM}${d2}${RESET}\033[K\n"
-  buf="${buf}  ${DIM}↑/↓ move  ⏎ switch or edit  q close${RESET}\033[K\n"
+  if [[ "$_ACCT_VIEW" == "trash" ]]; then
+    buf="${buf}  ${DIM}↑/↓ move  ⏎ restore  ← back  q close${RESET}\033[K\n"
+  else
+    buf="${buf}  ${DIM}↑/↓ move  ⏎ switch or edit  q close${RESET}\033[K\n"
+  fi
   printf '%b' "$buf"
   return 0
 }
@@ -14109,6 +14242,14 @@ _accounts_header() {
 _accounts_picker_tui() {
   local box="$1" cname="$2" project="$3"
   local key block prev_block total active acted=0
+  # Each view remembers where its own cursor was, so crossing to the trash and
+  # back does not reset the live list to the top.
+  local view="live" live_cursor=0 live_offset=0 trash_cursor=0 trash_offset=0
+  # Set when the trash was opened because the live list had nothing left in it.
+  # Going back would land on the same empty list, which would bounce straight
+  # here again and print the same line one row further down the screen on every
+  # press. So LEFT does nothing until a restore gives it somewhere to go.
+  local trash_forced=0
 
   _ACCT_CURSOR=0
   _ACCT_OFFSET=0
@@ -14119,14 +14260,31 @@ _accounts_picker_tui() {
     trap '_tui_echo_restore; _cursor_show' EXIT
     trap '_tui_echo_restore; _cursor_show; trap - INT TERM HUP EXIT; exit 130' INT TERM HUP
 
-    _accounts_load_rows "$active"
+    _ACCT_VIEW="$view"
+    _ACCT_TRASH_N="$(_account_trash_count)"
+    if [[ "$view" == "trash" ]]; then
+      _accounts_load_trash_rows
+    else
+      _accounts_load_rows "$active"
+    fi
     total="$_ACCT_N"
     # Row zero is the shared login, so a picker of ONLY that row is a picker
     # with nothing to pick. Say how to make the first account instead.
-    if [[ "$_ACCT_STORED" -le 0 || "$total" -le 0 ]]; then
+    if [[ "$view" == "live" ]] && [[ "$_ACCT_STORED" -le 0 || "$total" -le 0 ]]; then
       _tui_echo_restore
       _cursor_show
       trap - INT TERM HUP EXIT
+      # Unless the account they just removed is sitting in the trash. That is
+      # the only place it can be got back from, so show it rather than dropping
+      # to a shell prompt with a command to retype.
+      if [[ "${_ACCT_TRASH_N:-0}" -gt 0 ]]; then
+        info "No named accounts left. Showing the trash."
+        view="trash"
+        trash_forced=1
+        _ACCT_CURSOR=0
+        _ACCT_OFFSET=0
+        continue
+      fi
       _accounts_empty_note "$box"
       return 0
     fi
@@ -14166,9 +14324,56 @@ _accounts_picker_tui() {
       case "$key" in
         UP)   _ACCT_CURSOR=$(( _ACCT_CURSOR - 1 )) ;;
         DOWN) _ACCT_CURSOR=$(( _ACCT_CURSOR + 1 )) ;;
+        RIGHT)
+          # The cursor is parked on the frame's ORIGIN at the top of every pass
+          # of this loop, so erasing from here down and breaking redraws the
+          # other view in exactly this space. Nothing scrolls, the header above
+          # is untouched and no second copy of the list is left behind.
+          if [[ "$view" == "live" ]]; then
+            live_cursor=$_ACCT_CURSOR
+            live_offset=$_ACCT_OFFSET
+            view="trash"
+            _ACCT_CURSOR=$trash_cursor
+            _ACCT_OFFSET=$trash_offset
+            printf '\033[J'
+            break
+          fi ;;
+        LEFT)
+          if [[ "$view" == "trash" && "$trash_forced" != "1" ]]; then
+            trash_cursor=$_ACCT_CURSOR
+            trash_offset=$_ACCT_OFFSET
+            view="live"
+            _ACCT_CURSOR=$live_cursor
+            _ACCT_OFFSET=$live_offset
+            printf '\033[J'
+            break
+          fi ;;
         ENTER)
           local pick=""
           [[ $_ACCT_CURSOR -lt $total ]] && pick="${_ACCT_NAME[$_ACCT_CURSOR]}"
+          if [[ "$view" == "trash" ]]; then
+            # An empty trash has no row under the cursor. Pressing Enter there
+            # is an ordinary thing to do and must not end the verb, so redraw
+            # and stay put. There is no sentinel row to allow through here.
+            if ! _validate_account_name "$pick"; then
+              _accounts_frame "$_ACCT_CURSOR" "$_ACCT_OFFSET" "$_ACCT_PAGE" "$_ACCT_COLS" "$total"
+              printf '\033[%dA' "$block"
+              continue
+            fi
+            _cursor_show
+            _tui_echo_restore
+            trap - INT TERM HUP EXIT
+            printf '\033[J'
+            echo ""
+            # Restore is one step with no menu, exactly like the session trash:
+            # there is only one thing to do to something that is already gone.
+            if _account_do_restore "$pick"; then
+              trash_forced=0
+            fi
+            acted=1
+            _accounts_header "$box"
+            break
+          fi
           # The sentinel is a real row here and deliberately NOT a valid stored
           # account name, so it has to be allowed through by name.
           if [[ "$pick" != "$_ACCOUNT_DEFAULT" ]] && ! _validate_account_name "$pick"; then
@@ -14221,11 +14426,18 @@ _accounts_empty_note() {
 
 _accounts_picker_text() {
   local box="$1" cname="$2"
-  local active i=0
+  local active i=0 tn=0
   active="$(_box_account_read "$cname")"
   _accounts_load_rows "$active"
+  tn="$(_account_trash_count)"
+  case "$tn" in ''|*[!0-9]*) tn=0 ;; esac
   if [[ "$_ACCT_STORED" -le 0 ]]; then
     _accounts_empty_note "$box"
+    # Without this an account removed a minute ago is invisible on every path
+    # that is not the picker, which includes every non-TTY caller.
+    if [[ "$tn" -gt 0 ]]; then
+      echo -e "    ${DIM}${tn} in the trash. See them with ${BOLD}cleat account trash${RESET}${DIM}.${RESET}"
+    fi
     return 0
   fi
   echo ""
@@ -14242,9 +14454,37 @@ _accounts_picker_text() {
   echo ""
   echo -e "  ${DIM}Switch with ${BOLD}cleat account <name> [box]${RESET}${DIM}. Back to your shared login with ${BOLD}cleat account default${RESET}${DIM}.${RESET}"
   echo -e "  ${DIM}Rename or remove with ${BOLD}cleat account rename${RESET}${DIM} and ${BOLD}cleat account rm${RESET}${DIM}.${RESET}"
+  # The picker advertises the trash on its counter line and opens it with →.
+  # This is the same pointer for every caller that does not get the picker.
+  if [[ "$tn" -gt 0 ]]; then
+    echo -e "  ${DIM}${tn} in the trash. See them with ${BOLD}cleat account trash${RESET}${DIM}.${RESET}"
+  fi
   if ! command -v jq &>/dev/null; then
     echo -e "  ${DIM}Usage figures need ${BOLD}jq${RESET}${DIM} on the host, which is not installed, so they are not shown.${RESET}"
   fi
+  return 0
+}
+
+# `cleat account trash`. The picker reaches the same list with →, so this is
+# for a pipe, a narrow terminal and anyone who would rather type it.
+_accounts_trash_text() {
+  local i=0
+  _accounts_load_trash_rows
+  if [[ "$_ACCT_N" -le 0 ]]; then
+    info "The account trash is empty."
+    echo -e "    ${DIM}Removed accounts are kept for ${_ACCOUNTS_TRASH_DAYS} days.${RESET}"
+    return 0
+  fi
+  echo ""
+  echo -e "  ${BOLD}Removed accounts${RESET} ${DIM}(kept ${_ACCOUNTS_TRASH_DAYS} days)${RESET}"
+  echo ""
+  while [[ $i -lt $_ACCT_N ]]; do
+    echo -e "     $(printf '%-13s %-10.10s' "${_ACCT_NAME[$i]}" "${_ACCT_AUTH[$i]}") ${DIM}${_ACCT_WHO[$i]}${RESET}"
+    echo -e "      ${DIM}${_ACCT_D2[$i]}${RESET}"
+    i=$(( i + 1 ))
+  done
+  echo ""
+  echo -e "  ${DIM}Bring one back with ${BOLD}cleat account restore <name>${RESET}${DIM}.${RESET}"
   return 0
 }
 
@@ -14281,11 +14521,13 @@ cmd_account() {
       echo "       cleat account rename <old> <new> Rename a stored login"
       echo "       cleat account rm <name> [--yes]  Move it to the trash"
       echo "       cleat account restore <name>     Bring a removed one back"
+      echo "       cleat account trash              List removed accounts"
       return 0 ;;
     list)            sub="list"; shift ;;
     rename)          sub="rename"; shift ;;
     rm|delete)       sub="rm"; shift ;;
     restore)         sub="restore"; shift ;;
+    trash)           sub="trash"; shift ;;
   esac
 
   local rest=()
@@ -14342,6 +14584,7 @@ cmd_account() {
     rm)      _account_do_remove "$name" "$assume_yes"; return $? ;;
     restore) _account_do_restore "$name"; return $? ;;
     list)    _accounts_refresh_usage; _accounts_picker_text "$_BOX" "$cname"; return 0 ;;
+    trash)   _accounts_trash_text; return 0 ;;
   esac
 
   if [[ -n "$name" ]]; then

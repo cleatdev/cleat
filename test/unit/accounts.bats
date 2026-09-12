@@ -491,6 +491,255 @@ _pass_gates() {
   [ -d "$CLEAT_ACCOUNTS_DIR/.trash/not-a-stamp-work" ]
 }
 
+# ── the trash view ─────────────────────────────────────────────────────────
+
+# $1 = name, $2 = stamp, and optionally $3 = the email its meta should carry.
+_mk_trashed() {
+  local d="$CLEAT_ACCOUNTS_DIR/.trash/${2}-${1}"
+  mkdir -p "$d"
+  [ -n "${3:-}" ] && printf 'who\t%s\n' "$3" > "$d/meta"
+  return 0
+}
+
+@test "account: the trash scan lists what is in the trash, newest first" {
+  _mk_trashed old 1788000000
+  _mk_trashed recent 1788900000
+  run _account_trash_scan_sorted
+  assert_success
+  [ "$(echo "$output" | head -n1 | cut -f2)" = "recent" ]
+  [ "$(echo "$output" | tail -n1 | cut -f2)" = "old" ]
+}
+
+@test "account: the trash scan skips what it cannot name" {
+  # Same discipline as the sweep: a directory with no stamp, or whose
+  # remainder is not a legal account name, is not a row. Otherwise a hand-made
+  # directory becomes a row the picker then refuses to restore.
+  _mk_trashed work 1788000000
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/.trash/not-a-stamp-work"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/.trash/1788000001-Bad Name"
+  ln -s "$TEST_TEMP" "$CLEAT_ACCOUNTS_DIR/.trash/1788000002-linked"
+  run _account_trash_scan
+  assert_success
+  [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 1 ]
+  assert_output --partial "work"
+}
+
+@test "account: the trash count counts exactly what the scan counts" {
+  _mk_trashed work 1788000000
+  _mk_trashed other 1788000001
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/.trash/not-a-stamp-work"
+  # A real stamp with a name the picker would refuse to restore. Counting it
+  # would advertise a trash the view then draws one row shorter.
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/.trash/1788000002-Bad Name"
+  run _account_trash_count
+  assert_output "2"
+}
+
+@test "account: the trash count is zero when the trash is a symlink" {
+  # _account_trash_dir refuses it, and a count that fell through to an error
+  # would print nothing where the frame expects a number.
+  ln -s "$TEST_TEMP/outside" "$CLEAT_ACCOUNTS_DIR/.trash"
+  run _account_trash_count
+  assert_output "0"
+}
+
+@test "account: meta reads by directory, so a removed account still says whose it was" {
+  _mk_trashed work 1788000000 "gone@example.com"
+  run _account_meta_get_at "$CLEAT_ACCOUNTS_DIR/.trash/1788000000-work" who
+  assert_output "gone@example.com"
+}
+
+@test "account: the trash rows carry the name, the email and when it went" {
+  _mk_trashed work 1788996400 "gone@example.com"
+  _accounts_load_trash_rows
+  [ "$_ACCT_N" -eq 1 ]
+  [ "${_ACCT_NAME[0]}" = "work" ]
+  [ "${_ACCT_AUTH[0]}" = "removed" ]
+  [ "${_ACCT_WHO[0]}" = "gone@example.com" ]
+  # Nothing in the trash is the active account, so no row is ever marked.
+  [ "${_ACCT_MARK[0]}" = "0" ]
+  echo "${_ACCT_D2[0]}" | grep -q "removed"
+  echo "${_ACCT_D2[0]}" | grep -q "kept 30 days"
+}
+
+@test "account: a trash row with no meta says so instead of guessing" {
+  _mk_trashed work 1788996400
+  _accounts_load_trash_rows
+  [ "${_ACCT_WHO[0]}" = "no login was recorded" ]
+}
+
+@test "account: the trash frame keeps the page + 4 invariant the live one has" {
+  # The cursor-up reposition walks _ACCT_PAGE + 4 lines in both views. A view
+  # that drew one line more or fewer would leave the list walking down the
+  # screen one row per keypress.
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_trashed work 1788996400
+  _mk_trashed other 1788996401
+  _ACCT_VIEW="trash"
+  _accounts_load_trash_rows
+  _accounts_measure "$_ACCT_N"
+  [ "$_ACCT_N" -eq 2 ]
+  [ "$(_acct_draw_lines _accounts_frame 0 0 "$_ACCT_PAGE" 100 "$_ACCT_N")" -eq "$(( _ACCT_PAGE + 4 ))" ]
+  # And an EMPTY trash still draws the full block, or the reposition would walk
+  # past the top of the frame the moment the last item was restored.
+  rm -rf "$CLEAT_ACCOUNTS_DIR/.trash"
+  _accounts_load_trash_rows
+  _accounts_measure "$_ACCT_N"
+  [ "$(_acct_draw_lines _accounts_frame 0 0 "$_ACCT_PAGE" 100 "$_ACCT_N")" -eq "$(( _ACCT_PAGE + 4 ))" ]
+}
+
+@test "account: the trash view says restore and says how to get back" {
+  _mk_trashed work 1788996400
+  _ACCT_VIEW="trash"
+  _accounts_load_trash_rows
+  _accounts_frame 0 0 1 100 "$_ACCT_N" > "$TEST_TEMP/frame.out" 2>/dev/null
+  grep -q "restore" "$TEST_TEMP/frame.out"
+  grep -q "back" "$TEST_TEMP/frame.out"
+  grep -q "Trash: 1 account, kept 30 days" "$TEST_TEMP/frame.out"
+}
+
+@test "account: an empty trash says so rather than drawing nothing" {
+  _ACCT_VIEW="trash"
+  _accounts_load_trash_rows
+  [ "$_ACCT_N" -eq 0 ]
+  _accounts_frame 0 0 1 100 0 > "$TEST_TEMP/frame.out" 2>/dev/null
+  grep -q "The trash is empty" "$TEST_TEMP/frame.out"
+}
+
+@test "account: the live frame advertises the trash only when there is one" {
+  _term_cols() { echo 100; }
+  _mk_account one
+  _ACCT_VIEW="live"
+  _accounts_load_rows one
+  _ACCT_TRASH_N=0
+  _accounts_frame 0 0 "$_ACCT_N" 100 "$_ACCT_N" > "$TEST_TEMP/empty.out" 2>/dev/null
+  run grep -q "trash" "$TEST_TEMP/empty.out"
+  assert_failure
+  _ACCT_TRASH_N=2
+  _accounts_frame 0 0 "$_ACCT_N" 100 "$_ACCT_N" > "$TEST_TEMP/full.out" 2>/dev/null
+  grep -q "trash (2)" "$TEST_TEMP/full.out"
+}
+
+@test "account: the trash pointer never widens the narrowest supported frame" {
+  # It sits on the counter line and not the hint line for exactly this reason:
+  # the hint is already 37 columns against a 44-column minimum, and a wrapped
+  # line walks the whole block down the screen one row per keypress.
+  _mk_account one
+  _ACCT_VIEW="live"
+  _accounts_load_rows one
+  _ACCT_TRASH_N=99
+  _accounts_frame 0 0 1 44 1 > "$TEST_TEMP/frame.out" 2>/dev/null
+  local widest
+  widest="$(sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$TEST_TEMP/frame.out" \
+    | sed 's/↑/^/g; s/↓/v/g; s/⏎/E/g; s/▸/>/g; s/·/./g; s/…/./g; s/•/o/g; s/→/-/g; s/←/-/g' \
+    | awk '{ n = length($0); if (n > m) m = n } END { print m + 0 }')"
+  [ "$widest" -le 44 ]
+}
+
+@test "account: the picker crosses to the trash and restores from it" {
+  _pass_gates
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_account keep
+  _mk_account work
+  _account_trash work
+  [ ! -d "$CLEAT_ACCOUNTS_DIR/work" ]
+  # Right into the trash, Enter on its only row, then quit.
+  _acct_keys RIGHT ENTER QUIT
+  run _accounts_picker_tui main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  [ -d "$CLEAT_ACCOUNTS_DIR/work" ]
+}
+
+@test "account: left comes back to the live list without acting" {
+  _pass_gates
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_account keep
+  _mk_account work
+  _account_trash work
+  # Enter AFTER the left arrow, so the assertion proves which list the picker
+  # was actually on. A left arrow that did nothing would leave Enter on the
+  # trash row, and the restore would be the thing that ran.
+  _acct_keys RIGHT LEFT ENTER QUIT QUIT
+  run _accounts_picker_tui main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  [ ! -d "$CLEAT_ACCOUNTS_DIR/work" ]
+}
+
+@test "account: enter on an empty trash does not close the picker" {
+  # Pressing Enter on nothing is an ordinary thing to do. Ending the verb there
+  # would throw the user back to a shell prompt for a keypress that means
+  # nothing.
+  _pass_gates
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_account keep
+  _acct_keys RIGHT ENTER QUIT
+  run _accounts_picker_tui main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Cancelled"
+}
+
+@test "account: removing the last account shows the trash instead of dropping out" {
+  # The account just removed is in the trash and nowhere else. Being thrown to
+  # a shell prompt with a command to retype is the unfriendliness this is about.
+  _pass_gates
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_account work
+  _account_trash work
+  _acct_keys ENTER QUIT
+  run _accounts_picker_tui main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Showing the trash"
+  [ -d "$CLEAT_ACCOUNTS_DIR/work" ]
+}
+
+@test "account: restoring the wrong lookalike is still refused through the picker" {
+  # A dash is legal inside an account name, so `*-work` also matches
+  # `<stamp>-my-work`. The picker hands a NAME to the restore, which splits on
+  # the stamp, so the lookalike must stay where it is.
+  _pass_gates
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_account keep
+  _mk_account my-work
+  _account_trash my-work
+  _acct_keys RIGHT ENTER QUIT
+  run _accounts_picker_tui main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  [ -d "$CLEAT_ACCOUNTS_DIR/my-work" ]
+}
+
+@test "account: cleat account trash lists the removed ones" {
+  _mk_trashed work 1788996400 "gone@example.com"
+  run _accounts_trash_text
+  assert_success
+  assert_output --partial "work"
+  assert_output --partial "gone@example.com"
+  assert_output --partial "cleat account restore"
+}
+
+@test "account: cleat account trash says the trash is empty rather than printing a bare header" {
+  run _accounts_trash_text
+  assert_success
+  assert_output --partial "empty"
+}
+
+@test "account: the plain list points at the trash when something is in it" {
+  # The picker advertises it on the counter line. Without this the non-TTY path
+  # is the one place a removed account is invisible.
+  _mk_account keep
+  _mk_trashed work 1788996400
+  run _accounts_picker_text main "$CN"
+  assert_success
+  assert_output --partial "1 in the trash"
+}
+
+@test "account: an empty account list still points at the trash" {
+  _mk_trashed work 1788996400
+  run _accounts_picker_text main "$CN"
+  assert_success
+  assert_output --partial "No named accounts yet"
+  assert_output --partial "1 in the trash"
+}
+
 @test "account: renaming moves the store and every pin follows it" {
   # Without the pin rewrite every box pinned to the old name silently falls
   # back to the shared store at its next attach, which reads as being logged

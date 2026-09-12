@@ -694,10 +694,11 @@ try "v0.10.0_resume_auto_creates" "cleat resume after cleat rm creates container
 # ~/.claude/projects/. Append, inside cmd_rm only, an rm that clobbers the
 # whole projects dir; the "leaves session dir untouched" regression test should
 # fail. (Anchored on the per-container runtime-dir cleanup, which replaced the
-# old /tmp cleanup lines when runtime state moved off /tmp.)
+# old /tmp cleanup lines when runtime state moved off /tmp, and which became
+# _account_wipe_run_dir when named accounts made the wipe harvest first.)
 cat > "$SED_TMP" << 'SED'
 /^cmd_rm()/,/^}$/{
-  /rm -rf "\$CLEAT_RUN_DIR\/\${cname}"/a\
+  /_account_wipe_run_dir "\${cname}"/a\
     rm -rf "${HOME}/.claude/projects" 2>/dev/null || true
 }
 SED
@@ -6151,16 +6152,19 @@ try "vnext_account_stage_newest_wins" "staging never overwrites a newer credenti
 # staged means /login never runs and the box keeps the old account.
 cat > "$SED_TMP" << 'SED'
 /^_account_sync_in()/,/^}$/{
-  s|^    rm -f "[$]box_cred" 2>/dev/null || true$|    :|
+  s#^    rm -f "[$]box_cred" 2>/dev/null .. true$#    :#
 }
 SED
 try "vnext_account_clean_scope" "staging an empty account leaves the box signed out" "$CLI" "$ACCOUNTS_BATS"
 
 # A credential at the host default umask is readable by anything on the machine
-# and it is live for weeks.
+# and it is live for weeks. BOTH mechanisms are removed here on purpose: the
+# umask subshell and the chmod each produce 0600 on their own, so removing
+# either alone is invisible. What the test pins is the outcome.
 cat > "$SED_TMP" << 'SED'
 /^_account_write_file_0600()/,/^}$/{
-  s|^  chmod 600 "[$]tmp" 2>/dev/null || true$|  :|
+  s#umask 077#umask 022#
+  s#^  chmod 600 "[$]tmp" 2>/dev/null .. true$#  :#
 }
 SED
 try "vnext_account_cred_mode" "a new store is 0700 and its credential 0600" "$CLI" "$ACCOUNTS_BATS"
@@ -6178,7 +6182,7 @@ try "vnext_account_symlink_store" "a symlinked store is refused, not followed" "
 # the way it gets removed is a typo in a picker.
 cat > "$SED_TMP" << 'SED'
 /^_account_trash()/,/^}$/{
-  s|^  mv "[$]CLEAT_ACCOUNTS_DIR/[$]acct" "[$]dest" 2>/dev/null || return 1$|  rm -rf "${CLEAT_ACCOUNTS_DIR:?}/${acct}" 2>/dev/null; mkdir -p "$dest"|
+  s#^  mv "[$]CLEAT_ACCOUNTS_DIR/[$]acct" "[$]dest" 2>/dev/null .. return 1$#  rm -rf "${CLEAT_ACCOUNTS_DIR:?}/${acct}" 2>/dev/null; mkdir -p "$dest"#
 }
 SED
 try "vnext_account_trash_not_delete" "removing an account moves it to the trash" "$CLI" "$ACCOUNTS_BATS"
@@ -6216,8 +6220,8 @@ try "vnext_account_skip_spend" "the usage request carries skip_spend" "$CLI" "$A
 # argv is visible in ps on a shared host.
 cat > "$SED_TMP" << 'SED'
 /^_account_usage_curl()/,/^}$/{
-  s|^  printf 'silent.*$|  curl -sS --max-time 3 -H "Authorization: Bearer $tok" "$_ACCOUNT_USAGE_URL" 2>/dev/null || true|
-  s|^    "[$]tok" "[$]_ACCOUNT_USAGE_URL" . curl --config - 2>/dev/null .. true$|  :|
+  s#^  printf 'silent.*#  curl -sS --max-time 3 -H "Authorization: Bearer $tok" "$_ACCOUNT_USAGE_URL" 2>/dev/null || true#
+  s#^    "[$]tok" "[$]_ACCOUNT_USAGE_URL".*#  :#
 }
 SED
 try "vnext_account_token_off_argv" "never the token on argv" "$CLI" "$ACCOUNTS_BATS"

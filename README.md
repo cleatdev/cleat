@@ -482,11 +482,14 @@ cleat account work2      # pin this box to a login called work2
 
 cleat account            # picker: switch, rename or remove
 cleat account work1      # back to the first one, no browser
+cleat account default    # unpin: back to your shared ~/.claude login
 ```
 
 Only the login moves. Conversations, project history and settings are identical on both accounts, by construction rather than by copying: a switch relocates Claude Code's credential store for that box and nothing else. So you can hit a limit mid-conversation, switch, then carry on in the same conversation.
 
-The pin is per box, because the limit is per account and you probably have several boxes open. One can move to the fresh account while the others keep draining the first.
+The pin is per box, because the limit is per account and you probably have several boxes open. One can move to the fresh account while the others keep draining the first. The picker's first row is always your shared `~/.claude` login, so a pin is never a one-way door.
+
+A box created before this feature has no credential mount. Cleat says so and tells you to recreate it once with `cleat rm <box>`, rather than half working: without the mount, `/login` would write the store inside the container where `cleat rm` destroys it.
 
 Claude Code refreshes its own token about every eight hours, inside the box. Every attach stages the stored login in and every detach takes the refreshed one back out, newest wins. `cleat rm`, every recreate and `cleat nuke` do that before they touch a run directory, so a refresh never sends you back to a browser.
 
@@ -512,12 +515,12 @@ cleat session rename 1f204d6c --title "site redesign"
   Claude sessions (cleat)
   /Users/you/.claude/projects/cleat-0f459ff8
 
-  > 20h ago     1007 MB 1f204d6c  site-redesign
+  ▸ 20h ago     1007 MB 1f204d6c  site-redesign
     3d ago        91 MB aa9375b7  egress-audit
     4d ago       248 MB 68975fe4  cli-work
     27d ago       11 MB 49d8c600  growth-fable
 
-    4 sessions    -> trash (2)
+    4 sessions    → trash (2)
   up/down move  enter rename or delete  q close
 ```
 
@@ -621,12 +624,27 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `cleat login [box]` | Authenticate with Anthropic (OAuth) |
 | `cleat logs [box]` | Tail container logs |
 
+#### Accounts
+| Command | Description |
+|---|---|
+| `cleat account` | Picker for this project's default box: switch, rename or remove a login |
+| `cleat account <name> [box]` | Pin a box to a named login, creating it if new |
+| `cleat account default [box]` | Unpin a box, back to your shared `~/.claude` login |
+| `cleat account list [box]` | Plain list of stored logins, marking the pinned one |
+| `cleat account rename <old> <new>` | Rename a stored login. Every box pinned to it follows |
+| `cleat account rm <name>` | Move a login to the trash, with `--yes` to skip the prompt |
+| `cleat account restore <name>` | Bring a removed login back (30 days) |
+
 #### Info
 | Command | Description |
 |---|---|
 | `cleat status` | Show this project's boxes, image and auth status |
 | `cleat describe [box] [text]` | Show or set a box's description (host-side, never recreates) |
-| `cleat session [box]` | List this box's Claude conversations with their real sizes, then rename or delete one |
+| `cleat session [box]` | List this box's Claude conversations with the disk each one really costs, then rename or delete one |
+| `cleat session rename <id> [box]` | Give a conversation a name, or `--title <text>` to skip the prompt |
+| `cleat session rm <id> [box]` | Move a conversation and its subagent data to the trash, with `--yes` |
+| `cleat session trash [box]` | List what has been deleted and not yet swept |
+| `cleat session restore <id> [box]` | Bring a trashed conversation back (30 days) |
 | `cleat ps` | List all Cleat containers (running and stopped, with a box column) |
 | `cleat update` | Check for updates and install the latest version (a Homebrew install runs `brew upgrade` instead, or prints it when `brew` is off `PATH`) |
 | `cleat version` | Show current version |

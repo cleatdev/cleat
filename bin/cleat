@@ -14123,6 +14123,7 @@ cmd_account() {
     --help|-h)
       echo "Usage: cleat account                    Interactive picker for this project's default box"
       echo "       cleat account <name> [box]       Pin a box to a named login, creating it if new"
+      echo "       cleat account default [box]      Unpin a box, back to your shared ~/.claude login"
       echo "       cleat account list [box]         Plain list, marking the pinned one"
       echo "       cleat account rename <old> <new> Rename a stored login"
       echo "       cleat account rm <name> [--yes]  Move it to the trash"

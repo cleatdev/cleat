@@ -124,7 +124,7 @@ Cleat gives you the best of both worlds:
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Forked workspaces** -- `--fork` gives a box its own copy of the project, so several agents can work in parallel without touching your tree
 - **Contained Claude home** -- a box sees only its own project's Claude history. The instruction surfaces your host `claude` obeys are read-only inside the cage
-- **Session management** -- `cleat sessions` lists a box's Claude conversations with their real sizes and deletes the ones you are done with, which the Claude Code CLI itself cannot do for a single conversation
+- **Session management** -- `cleat sessions` lists a box's Claude conversations with their real sizes, deletes the ones you are done with (which the Claude Code CLI itself cannot do for a single conversation) and keeps them restorable in a trash for 30 days
 - **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser (auth, OAuth, docs)
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
@@ -478,6 +478,7 @@ The Claude Code CLI can rename a conversation but not delete one. `claude projec
 ```bash
 cleat sessions                    # list this project's conversations, with sizes
 cleat sessions rm 1f204d6c        # move one to the trash
+cleat sessions trash              # see what is in the trash
 cleat sessions restore 1f204d6c   # change your mind, within 30 days
 cleat sessions rename 1f204d6c --title "site redesign"
 ```
@@ -490,15 +491,24 @@ cleat sessions rename 1f204d6c --title "site redesign"
     3d ago        91 MB aa9375b7  egress-audit
     4d ago       248 MB 68975fe4  cli-work
     27d ago       11 MB 49d8c600  growth-fable
+
+    4 sessions    -> trash (2)
+  up/down move  enter rename or delete  q close
 ```
 
-On a terminal that list is a picker: `up`/`down` to move, `enter` to open Rename / Delete / Cancel, `q` to leave. Piped or redirected it prints the rows and exits, so it doubles as the dry run for `rm`.
+On a terminal that list is a picker: `up`/`down` to move, `enter` to open Rename / Delete / Cancel, `right` to open the trash, `q` to leave. Piped or redirected it prints the rows and exits, so it doubles as the dry run for `rm`.
+
+An action keeps you in the list. Rename one and it redraws with the new name on the row you were on. Delete one and it redraws without that row, with the cursor on whatever took its place, so clearing out a long history is one run rather than several. The receipt stays above the list.
+
+The trash is the second view of the same list. `right` opens it and `left` comes back. It shows what you deleted, how long ago and how much it holds. `enter` puts one back. Delete the last conversation in a project and Cleat shows you the trash rather than dropping you at a prompt. `cleat sessions trash` prints the same list without a terminal.
 
 The list fills the window, showing as many conversations as the terminal has room for or as many as you have, whichever is fewer. Resize the window and press any key and it reflows. On a pane too narrow to lay a row out, Cleat prints the plain list instead of a picker whose rows would wrap.
 
 The size column is why the list is useful. A conversation is a transcript **plus** a sibling directory of subagent transcripts and tool results. That sidecar is usually several times bigger, so the sizes shown add both and a delete always takes both. They are apparent sizes, the same caveat `cleat fork` carries.
 
 Deleting moves the conversation to a trash inside the session directory and prints how to undo it. It refuses while the box has a live Claude session. It also refuses when Docker cannot tell it whether the box is running, because a transcript removed while Claude is writing to it is lost silently. Without a terminal it shows what would go and deletes nothing unless you add `--yes`.
+
+Restoring resolves the id against the trash, so the short id the delete printed is the one that works. It never overwrites a conversation that has come back under the same name.
 
 Only a real session id is ever touched. That directory also holds this project's Claude memory and Cleat's own prompt history. Nothing in `cleat sessions` can reach them.
 

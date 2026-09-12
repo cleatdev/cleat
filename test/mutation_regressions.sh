@@ -5839,6 +5839,246 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_sessions_toctou_guard" "a transcript that changed since the scan aborts" "$CLI" "$SESSIONS_BATS"
 
+# ── staying in the tool, the trash view, and the cached rows ───────────────
+#
+# Everything below guards the second pass over `cleat sessions`: an action
+# redraws the list you were on instead of ending the verb, the trash is a
+# second view of the same picker, and the row cache is folded rather than
+# rescanned.
+
+# Ending the verb on an action is the bug this pass fixed. Turning the loop's
+# break back into a return puts it straight back.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^          break ;;$/          return 0 ;;/
+}
+SED
+try "vnext_sessions_stays_open" "a rename redraws the list instead of ending the verb" "$CLI" "$SESSIONS_BATS"
+
+# Backing out of the action screen must NOT count as an action: it printed
+# nothing, so the picker redraws in place and a later q is still a cancel.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_action_tui()/,/^}$/{
+  s/^          return 1$/          return 0/
+  s/^        return 1$/        return 0/
+}
+SED
+try "vnext_sessions_backout_is_not_an_action" "backing out of the action screen says nothing" "$CLI" "$SESSIONS_BATS"
+
+# The back-out walks up over exactly the three lines this screen printed above
+# its menu. A wrong count leaves a copy of the menu above the redrawn list.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_action_backout()/,/^}$/{
+  s/%dA' "[$]_SESSIONS_ACTION_HEAD"/%dA' 2/
+}
+SED
+try "vnext_sessions_backout_walk" "the action back-out walks back over its own three header lines" "$CLI" "$SESSIONS_BATS"
+
+# The header is part of the viewport budget, so it is reprinted under every
+# receipt. Without it the list redraws with no idea what it is listing.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^            _sessions_header "[$]sdir" "[$]project" "[$]box"$/            :/
+  s/^              _sessions_header "[$]sdir" "[$]project" "[$]box"$/              :/
+}
+SED
+try "vnext_sessions_header_reprint" "the header is reprinted under an action" "$CLI" "$SESSIONS_BATS"
+
+# A delete must leave the cached rows, or the list comes back still showing a
+# conversation that is now in the trash.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_row_apply()/,/^}$/{
+  s/'[$]3 != u'/'1'/
+}
+SED
+try "vnext_sessions_fold_delete" "a delete is folded out of the cached rows" "$CLI" "$SESSIONS_BATS"
+
+# A rename must replace the title in place and touch nothing else, because the
+# mtime is restored by the writer and the sort order therefore cannot move.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_row_apply()/,/^}$/{
+  s/{ [$]4 = t }/{ }/
+}
+SED
+try "vnext_sessions_fold_rename" "a rename is folded into the cached rows" "$CLI" "$SESSIONS_BATS"
+
+# A restored session goes back in its sorted position, not on the end.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_row_insert()/,/^}$/{
+  s/| sort -t .*-k1,1rn >/| cat >/
+}
+SED
+try "vnext_sessions_insert_sorted" "a restored session is inserted in its sorted position" "$CLI" "$SESSIONS_BATS"
+
+# The restore path has to put the row back into the LIVE list, or switching
+# back shows a session that is no longer in the trash and not in the list.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^              _sessions_row_insert "[$]rowfile" "[$]sdir" "[$]uuid" || true$/              :/
+}
+SED
+try "vnext_sessions_restore_rejoins" "a restored session is back in the live list" "$CLI" "$SESSIONS_BATS"
+
+# The trash rows are cached too, so a delete has to mark them stale.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^              \[\[ "[$]{_SESS_ACTED:-}" == "delete" \]\] && trash_stale=1$/              :/
+}
+SED
+try "vnext_sessions_trash_stale" "the trash view shows a session deleted in the same run" "$CLI" "$SESSIONS_BATS"
+
+# Only <epoch>-<uuid> is a trash entry. Dropping the stamp check lets any
+# directory whose tail happens to be a uuid be listed as a deleted session.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_scan()/,/^}$/{
+  s/^    case "[$]stamp" in ''|\*\[!0-9\]\*) continue ;; esac$/    :/
+}
+SED
+try "vnext_sessions_trash_scan_stamp" "the trash scan ignores anything not named epoch-uuid" "$CLI" "$SESSIONS_BATS"
+
+# And dropping the uuid check lets a stamped directory of anything be listed.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_scan()/,/^}$/{
+  s/^    _sessions_is_uuid "[$]uuid" || continue$/    :/
+}
+SED
+try "vnext_sessions_trash_scan_uuid" "the trash scan ignores anything not named epoch-uuid" "$CLI" "$SESSIONS_BATS"
+
+# The age column in the trash is how long ago it was DELETED, which is also how
+# long is left before the sweep takes it. The transcript's own mtime is not it.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_scan()/,/^}$/{
+  s/"[$]stamp" "[$]kb"/"0" "$kb"/
+}
+SED
+try "vnext_sessions_trash_scan_stamp_column" "the trash scan dates a row by when it was deleted" "$CLI" "$SESSIONS_BATS"
+
+# The count decides whether the live list advertises the trash at all, so it
+# has to count exactly what the scan would list.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_count()/,/^}$/{
+  s/^      case "[$]{base%%-\*}" in ''|\*\[!0-9\]\*) continue ;; esac$/      :/
+}
+SED
+try "vnext_sessions_trash_count_stamp" "the trash count counts only real entries" "$CLI" "$SESSIONS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_count()/,/^}$/{
+  s/^      _sessions_is_uuid "[$]{base#\*-}" || continue$/      :/
+}
+SED
+try "vnext_sessions_trash_count_uuid" "the trash count counts only real entries" "$CLI" "$SESSIONS_BATS"
+
+# The counter line is the only place the view names itself.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  s/^  if \[\[ "[$]_SESS_VIEW" == "trash" \]\]; then$/  if false; then/
+}
+SED
+try "vnext_sessions_counter_view" "the trash view names itself on the counter line" "$CLI" "$SESSIONS_BATS"
+
+# An empty trash is nothing to offer, and the affordance appearing at zero is
+# how a reader learns a key that does nothing useful.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  s/^    if \[\[ "[$]{_SESS_TRASH_N:-0}" -gt 0 \]\]; then$/    if true; then/
+}
+SED
+try "vnext_sessions_trash_affordance" "the live view advertises the trash only when it holds something" "$CLI" "$SESSIONS_BATS"
+
+# The hint has to name the action the view actually performs: Enter deletes in
+# one and restores in the other.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  s/⏎ restore  ← back/⏎ rename or delete/
+}
+SED
+try "vnext_sessions_hint_view" "the hint line names the action the view actually performs" "$CLI" "$SESSIONS_BATS"
+
+# The hint line is already as wide as the picker's own minimum, which is why
+# the trash is advertised on the counter line instead. One more word here and
+# every row of the narrowest supported terminal wraps.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_frame()/,/^}$/{
+  s/⏎ rename or delete  q close/⏎ rename or delete  → trash  q close/
+}
+SED
+try "vnext_sessions_hint_width" "neither hint line is wider than the picker" "$CLI" "$SESSIONS_BATS"
+
+# The arrow keys are directional on purpose: the trash is to the right of the
+# sessions and nowhere else.
+cat > "$SED_TMP" << 'SED'
+/^        LEFT)$/,/^          fi ;;$/{
+  s/if \[\[ "[$]view" == "trash" \]\]/if true/
+}
+SED
+try "vnext_sessions_arrow_direction" "the left arrow does nothing on the live list" "$CLI" "$SESSIONS_BATS"
+
+# Deleting the last session must not drop the user at a shell prompt with an
+# undo command to retype. The trash is the only place it can be got back from.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^      if \[\[ "[$]{_SESS_TRASH_N:-0}" -gt 0 \]\]; then$/      if false; then/
+}
+SED
+try "vnext_sessions_last_delete_shows_trash" "deleting the last session shows the trash rather than leaving" "$CLI" "$SESSIONS_BATS"
+
+# Both markers exist so the picker can fold an action into its rows. Without
+# them every action either rescans or shows a stale list.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_do_rename()/,/^}$/{
+  s/^    _SESS_ACTED="rename"$/    :/
+}
+SED
+try "vnext_sessions_rename_marker" "a rename marks what it changed" "$CLI" "$SESSIONS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_sessions_do_delete()/,/^}$/{
+  s/^  _SESS_ACTED="delete"$/  :/
+}
+SED
+try "vnext_sessions_delete_marker" "a delete marks what it changed" "$CLI" "$SESSIONS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_sessions_do_restore()/,/^}$/{
+  s/^  if _sessions_restore "[$]sdir" "[$]uuid"; then$/  if false; then/
+}
+SED
+try "vnext_sessions_restore_action" "the restore action puts the transcript back" "$CLI" "$SESSIONS_BATS"
+
+# The non-TTY path is the one place a deleted session could be invisible.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_text()/,/^}$/{
+  s/^    if \[\[ "[$]tn" -gt 0 \]\]; then$/    if false; then/
+}
+SED
+try "vnext_sessions_text_trash_note" "the text fallback points at the trash when it holds something" "$CLI" "$SESSIONS_BATS"
+
+# And `cleat sessions trash` is how the ids get read without a terminal.
+cat > "$SED_TMP" << 'SED'
+s/^    trash)     sub="trash"; shift ;;$/    trashx)    sub="trash"; shift ;;/
+SED
+try "vnext_sessions_trash_subcommand" "cleat sessions trash lists what was deleted" "$CLI" "$SESSIONS_BATS"
+
+# The picker re-arms the terminal once per list screen and a view switch breaks
+# back to it without restoring first, so saving the termios state twice records
+# the already echo-off state as the original and leaves the user unable to type.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_echo_off()/,/^}$/{
+  s/^  if \[\[ -z "[$]{_SESS_STTY:-}" \]\]; then$/  if true; then/
+}
+SED
+try "vnext_sessions_echo_off_idempotent" "switching views does not poison the saved terminal state" "$CLI" "$SESSIONS_BATS"
+
+# A window can be narrowed while a rename prompt is waiting for a line of
+# input, so the redraw refuses as well as the key loop.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_picker_tui()/,/^}$/{
+  s/^    if \[\[ "[$]_SESS_NARROW" == "1" \]\]; then$/    if false; then/
+}
+SED
+try "vnext_sessions_narrow_on_redraw" "a window narrowed during an action leaves before drawing" "$CLI" "$SESSIONS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

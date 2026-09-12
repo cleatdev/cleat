@@ -11289,6 +11289,59 @@ _sessions_restore() {
   [[ -f "${sdir}/${uuid}.jsonl" ]]
 }
 
+# One tab-joined row per TRASHED session, in the same four-field shape the live
+# scan emits, so the picker can render either list with the same code.
+#
+# Field 1 is the trash stamp rather than the transcript's mtime, so the age
+# column reads as "how long ago I deleted this", which is also how long is left
+# before the sweep takes it.
+#
+# The title comes from _sessions_title_for pointed at the trash ENTRY directory,
+# which works because _sessions_trash keeps the real basenames for the two items
+# that live in the key dir: <uuid>.jsonl and the <uuid>/ sidecar land inside the
+# entry under their own names. Everything else in there is namespaced ext<n>-.
+_sessions_trash_scan() {
+  local sdir="$1"
+  local tdir d base stamp uuid kb title
+  tdir="$(_sessions_trash_dir "$sdir")" || return 0
+  [[ -d "$tdir" ]] || return 0
+  for d in "$tdir"/*; do
+    [[ -d "$d" ]] || continue
+    base="${d##*/}"
+    stamp="${base%%-*}"
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    uuid="${base#*-}"
+    _sessions_is_uuid "$uuid" || continue
+    kb="$(_fork_size_kb "$d")"
+    case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+    title="$(_sessions_title_for "$d" "$uuid")"
+    printf '%s\t%s\t%s\t%s\n' "$stamp" "$kb" "$uuid" "$title"
+  done
+}
+
+# Most recently deleted first, matching the live list's newest-first order.
+_sessions_trash_scan_sorted() {
+  _sessions_trash_scan "$1" | sort -t "$(printf '\t')" -k1,1rn
+}
+
+# How many sessions are in the trash. Deliberately does NOT size or title them:
+# this runs once per list screen only to decide whether to offer the trash at
+# all, so it must stay fork-free. Counts exactly what the scan would count.
+_sessions_trash_count() {
+  local sdir="$1" tdir d base n=0
+  tdir="$(_sessions_trash_dir "$sdir")" || { printf '0'; return 0; }
+  if [[ -d "$tdir" ]]; then
+    for d in "$tdir"/*; do
+      [[ -d "$d" ]] || continue
+      base="${d##*/}"
+      case "${base%%-*}" in ''|*[!0-9]*) continue ;; esac
+      _sessions_is_uuid "${base#*-}" || continue
+      n=$(( n + 1 ))
+    done
+  fi
+  printf '%s' "$n"
+}
+
 # What a title may contain. REJECT rather than escape, deliberately.
 #
 # bash 3.2 has no JSON encoder and jq is optional in this CLI (every use is
@@ -11444,6 +11497,26 @@ _sessions_resolve_id() {
 _SESS_N=0
 _SESS_AGE=(); _SESS_SIZE=(); _SESS_ID=(); _SESS_TITLE=()
 
+# Which list the picker is showing: the live sessions or the trash. One picker
+# rather than two, because the two lists have identical geometry and the only
+# things that differ are the counter line, the hint line and what Enter does.
+# A second picker would be a second copy of the resize, clamp and containment
+# logic, which is the half of this file that has actually had bugs.
+_SESS_VIEW="live"
+# How many sessions are in the trash, so the live list can advertise it. Shown
+# only when it is greater than zero: an empty trash is nothing to offer, and
+# the first delete is exactly when the user needs to learn the key.
+_SESS_TRASH_N=0
+# The temp file holding the trash rows, so the one cleanup site in cmd_sessions
+# can remove it however the picker ended.
+_SESS_TRASHFILE=""
+# What the last action actually changed, so the picker can fold the result into
+# its cached rows instead of rescanning. A rescan forks `du`, `stat` and `tail`
+# once per session, which on a project with a hundred conversations is a visible
+# pause between two deletes. That pause is the thing this pass exists to remove.
+_SESS_ACTED=""
+_SESS_ACTED_TITLE=""
+
 # Geometry, re-measured once per keypress so the viewport follows a resize.
 # _SESS_GEOM_DIRTY exists so a caller that holds a frame can force a re-measure;
 # the picker re-measures unconditionally and never consults it.
@@ -11478,11 +11551,20 @@ _SESSIONS_MIN_COLS=40
 # halves are no-ops without a tty, and the restore is wired to every exit path
 # AND to INT/TERM/HUP, because a cleat that exits leaving the terminal unable to
 # echo what you type is a worse bug than the one being fixed.
+#
+# It is also IDEMPOTENT, and that is load-bearing rather than tidy. The picker
+# re-arms the terminal once per list screen, and a view switch breaks back to it
+# without restoring first (nothing was printed, so there is nothing to restore
+# for). A second `stty -g` there would save the ALREADY echo-off state as the
+# "original", and the user's terminal would be left unable to echo what they
+# type after the picker exited. So the saved state is written once and cleared
+# only by the restore, which is what pairs them.
 _SESS_STTY=""
 _sessions_echo_off() {
-  _SESS_STTY=""
-  _is_tty || return 0
-  _SESS_STTY="$(stty -g 2>/dev/null || true)"
+  _is_tty || { _SESS_STTY=""; return 0; }
+  if [[ -z "${_SESS_STTY:-}" ]]; then
+    _SESS_STTY="$(stty -g 2>/dev/null || true)"
+  fi
   stty -echo 2>/dev/null || true
   return 0
 }
@@ -11603,7 +11685,7 @@ _sessions_clamp() {
 # four characters \033 would become a real escape sequence here.
 _sessions_frame() {
   local cursor="$1" offset="$2" page="$3" cols="$4" total="$5"
-  local buf="" i n room t line shown meta
+  local buf="" i n room t line shown meta count
   # Normalise the caller's numbers rather than trusting them. A negative offset
   # reaches an array subscript, which aborts the shell on bash 3.2 and silently
   # renders the wrong rows on bash 5.
@@ -11646,17 +11728,46 @@ _sessions_frame() {
     fi
     i=$(( i + 1 ))
   done
-  if [[ "$total" -gt "$page" ]]; then
-    shown=$(( offset + page ))
-    (( shown > total )) && shown=$total
-    buf="${buf}    ${DIM}$(( offset + 1 ))-${shown} of ${total}${RESET}\033[K\n"
-  elif [[ "$total" -eq 1 ]]; then
-    buf="${buf}    ${DIM}1 session${RESET}\033[K\n"
+  # Counter and hint, both view-aware. Built with arithmetic expansion and
+  # plain assignment only: a $(helper) here would be one fork per frame, which
+  # is exactly what the single-write rewrite removed.
+  shown=$(( offset + page ))
+  (( shown > total )) && shown=$total
+  if [[ "$_SESS_VIEW" == "trash" ]]; then
+    if [[ "$total" -le 0 ]]; then
+      count="The trash is empty"
+    elif [[ "$total" -gt "$page" ]]; then
+      count="Trash: $(( offset + 1 ))-${shown} of ${total}, kept ${_SESSIONS_TRASH_DAYS} days"
+    elif [[ "$total" -eq 1 ]]; then
+      count="Trash: 1 item, kept ${_SESSIONS_TRASH_DAYS} days"
+    else
+      count="Trash: ${total} items, kept ${_SESSIONS_TRASH_DAYS} days"
+    fi
   else
-    buf="${buf}    ${DIM}${total} sessions${RESET}\033[K\n"
+    if [[ "$total" -le 0 ]]; then
+      count="No sessions"
+    elif [[ "$total" -gt "$page" ]]; then
+      count="$(( offset + 1 ))-${shown} of ${total}"
+    elif [[ "$total" -eq 1 ]]; then
+      count="1 session"
+    else
+      count="${total} sessions"
+    fi
+    # The only place the trash is advertised. On the counter line and not the
+    # hint line because the hint is already 40 columns wide, which is the
+    # picker's own minimum: one more word there and every row of the narrowest
+    # supported terminal wraps.
+    if [[ "${_SESS_TRASH_N:-0}" -gt 0 ]]; then
+      count="${count}    → trash (${_SESS_TRASH_N})"
+    fi
   fi
+  buf="${buf}    ${DIM}${count}${RESET}\033[K\n"
   buf="${buf}\033[K\n"
-  buf="${buf}  ${DIM}↑/↓ move  ⏎ rename or delete  q cancel${RESET}\033[K\n"
+  if [[ "$_SESS_VIEW" == "trash" ]]; then
+    buf="${buf}  ${DIM}↑/↓ move  ⏎ restore  ← back  q close${RESET}\033[K\n"
+  else
+    buf="${buf}  ${DIM}↑/↓ move  ⏎ rename or delete  q close${RESET}\033[K\n"
+  fi
   printf '%b' "$buf"
   return 0
 }
@@ -11671,6 +11782,90 @@ _sessions_picker_draw() {
   _sessions_frame "$cursor" "$offset" "$_SESS_PAGE" "$_SESS_COLS" "$_SESS_N"
 }
 
+# ── Keeping the cached rows honest without rescanning ──────────────────────
+#
+# The picker reads its rows from a file written once by _sessions_scan_sorted.
+# Staying in the tool after an action means that file is now stale, and the
+# obvious fix (rescan) is the wrong one: the scan forks `du`, `stat` and `tail`
+# per session, so on a project with a hundred conversations it is a visible
+# pause after every single delete, in a screen whose whole purpose is deleting
+# several in a row.
+#
+# So fold the change in instead. This is safe precisely because the CLI is the
+# thing that made the change and knows exactly what it was: a delete removes
+# that row, a rename replaces its title with the text that was just written and
+# leaves the mtime alone (_sessions_rename_write restores it), so the sort order
+# cannot move either.
+
+# Drop or retitle the row for one session, according to _SESS_ACTED.
+_sessions_row_apply() {
+  local rowfile="$1" uuid="$2" tmp rc=0
+  [[ -n "$uuid" && -f "$rowfile" ]] || return 0
+  case "${_SESS_ACTED:-}" in
+    delete|rename) : ;;
+    *) return 0 ;;
+  esac
+  tmp="${rowfile}.new"
+  if [[ "$_SESS_ACTED" == "delete" ]]; then
+    awk -F'\t' -v u="$uuid" '$3 != u' "$rowfile" > "$tmp" 2>/dev/null || rc=1
+  else
+    # The title is safe to hand awk -v because _sessions_title_ok already
+    # refused anything that is not printable ASCII, which rules out the tab
+    # that would split the field and the backslash that awk would re-escape.
+    awk -F'\t' -v OFS='\t' -v u="$uuid" -v t="$_SESS_ACTED_TITLE" \
+      '$3 == u { $4 = t } { print }' "$rowfile" > "$tmp" 2>/dev/null || rc=1
+  fi
+  if [[ $rc -ne 0 ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$rowfile" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  _SESS_ACTED=""
+  _SESS_ACTED_TITLE=""
+  return 0
+}
+
+# Put a restored session back into the live rows, in its sorted position. One
+# session is measured here, not the whole list, which is the point.
+_sessions_row_insert() {
+  local rowfile="$1" sdir="$2" uuid="$3" mt kb title tmp
+  [[ -n "$uuid" && -n "$rowfile" ]] || return 1
+  [[ -f "${sdir}/${uuid}.jsonl" ]] || return 1
+  mt="$(_path_mtime "${sdir}/${uuid}.jsonl")"
+  case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+  kb="$(_sessions_size_kb "$sdir" "$uuid")"
+  title="$(_sessions_title_for "$sdir" "$uuid")"
+  tmp="${rowfile}.new"
+  {
+    cat "$rowfile" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\n' "$mt" "$kb" "$uuid" "$title"
+  } | sort -t "$(printf '\t')" -k1,1rn > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$rowfile" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
+# The four lines above the frame. Extracted because the picker reprints them
+# after every action that printed a receipt, and the viewport budget
+# (_SESSIONS_CHROME_LINES) counts exactly four: print a different number here
+# and the frame's last line falls off the bottom of the terminal.
+_sessions_header() {
+  local sdir="$1" project="$2" box="$3"
+  # The path is easily longer than the terminal and a wrapped header silently
+  # costs a row, which is the same failure as an over-wide list row. Truncated
+  # from the LEFT, because the distinctive part of a path is its tail.
+  local _hdr_path="$sdir" _hdr_room
+  _hdr_room=$(( $(_term_cols) - 4 ))
+  (( _hdr_room < 12 )) && _hdr_room=12
+  if [[ ${#_hdr_path} -gt $_hdr_room ]]; then
+    _hdr_path="…${_hdr_path:$(( ${#_hdr_path} - _hdr_room + 1 ))}"
+  fi
+  echo ""
+  echo -e "  ${BOLD}Claude sessions${RESET} ${DIM}($(basename "$project")$( [[ "$box" != "main" ]] && printf ' / %s' "$box" ))${RESET}"
+  echo -e "  ${DIM}${_hdr_path}${RESET}"
+  echo ""
+  return 0
+}
+
 # The four-row action screen. A separate screen rather than a hotkey inside the
 # list, for two reasons. The list's key reader (_read_keypress) collapses every
 # printable character except space and q to one token and discards the byte, so
@@ -11679,6 +11874,27 @@ _sessions_picker_draw() {
 # cost two deliberate returns: no other picker in this file performs one from
 # inside a raw key loop.
 _SESSIONS_ACTION_LINES=4
+# The three lines this screen prints above its menu: a blank, the title and the
+# id. The back-out path walks back over them, so the number has to be here
+# rather than spelled inline.
+_SESSIONS_ACTION_HEAD=3
+
+# Leave the action screen having printed nothing, erasing it on the way out.
+#
+# The key loop parks the cursor on the first line of _sessions_action_draw, so
+# _SESSIONS_ACTION_HEAD lines up is the first line this screen printed, which
+# is also the list frame's origin (the picker erases its frame before handing
+# over). Erasing from there down and returning leaves the terminal exactly as
+# the picker left it, so the list redraws in place with nothing scrolled and no
+# "Cancelled" line for an action that never started.
+_sessions_action_backout() {
+  _cursor_show
+  _sessions_echo_restore
+  trap - INT TERM HUP
+  printf '\033[%dA' "$_SESSIONS_ACTION_HEAD"
+  printf '\033[J'
+  return 0
+}
 
 _sessions_action_draw() {
   local cursor="${1:-0}" cols="${2:-80}"
@@ -11719,6 +11935,8 @@ _sessions_action_draw() {
 
 _sessions_do_rename() {
   local sdir="$1" uuid="$2" box="$3" cname="$4" title="$5"
+  _SESS_ACTED=""
+  _SESS_ACTED_TITLE=""
   _sessions_live_gate "$cname" "$box" || return 1
   # The same containment the delete path runs, and for the same reason. A
   # rename APPENDS to the transcript, and `[[ -f ]]` follows a symlink, so
@@ -11753,6 +11971,8 @@ _sessions_do_rename() {
     return 1
   fi
   if _sessions_rename_write "$sdir" "$uuid" "$title"; then
+    _SESS_ACTED="rename"
+    _SESS_ACTED_TITLE="$title"
     success "Renamed ${DIM}${uuid:0:8}${RESET} to ${BOLD}${title}${RESET}"
     return 0
   fi
@@ -11764,6 +11984,8 @@ _sessions_do_delete() {
   local sdir="$1" uuid="$2" project="$3" box="$4" cname="$5" assume_yes="${6:-0}"
   local f="${sdir}/${uuid}.jsonl" kb size title mt_before mt_now ans
 
+  _SESS_ACTED=""
+  _SESS_ACTED_TITLE=""
   _sessions_live_gate "$cname" "$box" || return 1
 
   # Containment before anything is shown, so a target that could never be
@@ -11817,6 +12039,9 @@ _sessions_do_delete() {
     echo -e "    ${DIM}Nothing was moved. Check ${sdir}/.cleat-trash${RESET}"
     return 1
   fi
+  # Anything short of the refusal above moved at least the transcript, so the
+  # list the picker is holding is now stale either way.
+  _SESS_ACTED="delete"
   if [[ $_trc -eq 0 ]]; then
     success "Moved ${DIM}${uuid:0:8}${RESET} to the trash ${DIM}(${size} apparent)${RESET}"
   else
@@ -11827,6 +12052,29 @@ _sessions_do_delete() {
   echo -e "    ${DIM}Disk space comes back when the trash is swept, after ${_SESSIONS_TRASH_DAYS} days.${RESET}"
   echo -e "    ${DIM}Undo: ${BOLD}cleat sessions restore ${uuid:0:8}${RESET}"
   return 0
+}
+
+# Restore from the picker's trash view.
+#
+# No _sessions_live_gate and no confirm, on purpose. A restore puts files back
+# where Claude Code expects them and is undone by deleting again, so it is the
+# one action here that costs nothing to get wrong. `cleat sessions restore <id>`
+# takes the same path and has never gated either.
+_sessions_do_restore() {
+  local sdir="$1" uuid="$2"
+  _SESS_ACTED=""
+  _SESS_ACTED_TITLE=""
+  if _sessions_restore "$sdir" "$uuid"; then
+    _SESS_ACTED="restore"
+    success "Restored ${DIM}${uuid:0:8}${RESET}"
+    return 0
+  fi
+  error "Could not restore ${BOLD}${uuid:0:8}${RESET}."
+  # _sessions_restore refuses to overwrite anything that reappeared under the
+  # same name, so "it is already back" is the likeliest reason and the user can
+  # check it themselves.
+  echo -e "    ${DIM}Nothing was overwritten. Trash: ${sdir}/.cleat-trash${RESET}"
+  return 1
 }
 
 # ── The picker ─────────────────────────────────────────────────────────────
@@ -11852,7 +12100,7 @@ _sessions_action_tui() {
   _cursor_hide
   _sessions_action_draw "$cursor" "$cols"
   echo ""
-  echo -e "  ${DIM}↑/↓ move  ⏎ choose  q cancel${RESET}"
+  echo -e "  ${DIM}↑/↓ move  ⏎ choose  q back${RESET}"
   printf '\033[%dA' "$(( block + 2 ))"
 
   while true; do
@@ -11861,27 +12109,28 @@ _sessions_action_tui() {
       UP)   [[ $cursor -gt 0 ]] && cursor=$(( cursor - 1 )) ;;
       DOWN) [[ $cursor -lt 2 ]] && cursor=$(( cursor + 1 )) ;;
       ENTER)
+        if [[ $cursor -eq 2 ]]; then
+          _sessions_action_backout
+          return 1
+        fi
         _cursor_show
         _sessions_echo_restore
         trap - INT TERM HUP
         printf '\033[%dB' "$(( block + 2 ))"
         printf '\033[2K'
         echo ""
+        # `|| true` on both: a refused rename or a poisoned trash returns 1, and
+        # under the binary's `set -e` that would end the whole verb right after
+        # printing the reason. The caller has to get control back to redraw the
+        # list, which is the entire point of this pass.
         case "$cursor" in
-          0) _sessions_do_rename "$sdir" "$uuid" "$box" "$cname" "" ;;
-          1) _sessions_do_delete "$sdir" "$uuid" "$project" "$box" "$cname" 0 ;;
-          *) info "Cancelled." ;;
+          0) _sessions_do_rename "$sdir" "$uuid" "$box" "$cname" "" || true ;;
+          *) _sessions_do_delete "$sdir" "$uuid" "$project" "$box" "$cname" 0 || true ;;
         esac
-        return ;;
+        return 0 ;;
       QUIT|ESC)
-        _cursor_show
-        _sessions_echo_restore
-        trap - INT TERM HUP
-        printf '\033[%dB' "$(( block + 2 ))"
-        printf '\033[2K'
-        echo ""
-        info "Cancelled."
-        return ;;
+        _sessions_action_backout
+        return 1 ;;
     esac
     _sessions_action_draw "$cursor" "$cols"
     printf '\033[%dA' "$block"
@@ -11890,129 +12139,239 @@ _sessions_action_tui() {
 
 _sessions_picker_tui() {
   local sdir="$1" project="$2" box="$3" cname="$4" rowfile="$5" total="$6"
-  local key line uuid block prev_block
-
-  # Echo off BEFORE the row load, not after: loading runs a `du` over every
-  # session's sidecar and is the one slow moment in the picker, so it is exactly
-  # when an impatient keypress would be echoed into the output.
-  #
-  # The restore trap goes up in the SAME breath, before anything can fail. The
-  # window between them is not theoretical: the load shells out to `du` and
-  # `date`, and under `set -e` a failing pipeline in there would exit the CLI
-  # with the terminal still unable to echo. EXIT covers that and the signals
-  # cover a Ctrl-C during the slow part, which is exactly when an impatient
-  # user presses it.
-  _sessions_echo_off
-  trap '_sessions_echo_restore; _cursor_show' EXIT
-  trap '_sessions_echo_restore; _cursor_show; trap - INT TERM HUP EXIT; exit 130' INT TERM HUP
-
-  _sessions_load_rows "$rowfile"
-  total="$_SESS_N"
-  if [[ "$total" -le 0 ]]; then
-    _sessions_echo_restore
-    trap - INT TERM HUP EXIT
-    info "No sessions to show."
-    return 0
-  fi
+  local key line uuid block prev_block cur
+  local view="live" trash_stale=1 acted=0
+  local live_cursor=0 live_offset=0 trash_cursor=0 trash_offset=0
 
   _SESS_CURSOR=0
   _SESS_OFFSET=0
   _SESS_GEOM_DIRTY=1
+  _SESS_TRASHFILE=""
 
-  # Resize is handled by re-measuring once per keypress, and deliberately NOT by
-  # a SIGWINCH trap.
-  #
-  # A trap looks like the right answer and buys nothing. SIGWINCH does not
-  # interrupt a blocked `read` (bash retries on EINTR, and the command
-  # substitution subshell does not run the inherited handler anyway), so bash
-  # defers the trap until the reader returns, which is exactly the moment this
-  # loop re-measures regardless. It would add signal-disposition behaviour that
-  # differs across platforms to the critical path in exchange for nothing.
-  #
-  # It is also load-bearing that nothing here tries to be cleverer by giving the
-  # reader a timeout. `_read_keypress` prints ENTER for an empty read, and ENTER
-  # opens the rename/delete screen, so a timeout would make an idle terminal
-  # offer to delete a conversation on its own. (`read -t` is bash 4 anyway.)
-  #
-  # The honest behaviour, stated in the docs: resize the window, press any key,
-  # the list reflows. One `stty size` per keypress is about 0.4 ms.
-  #
-  # (The restore traps were armed with the echo-off above, before the load.)
-
-  _sessions_measure "$total"
-  _sessions_clamp "$total"
-  block=$(( _SESS_PAGE + 3 ))
-  prev_block=$block
-
-  _cursor_hide
-  _sessions_frame "$_SESS_CURSOR" "$_SESS_OFFSET" "$_SESS_PAGE" "$_SESS_COLS" "$total"
-  printf '\033[%dA' "$block"
-
+  # Two loops. The OUTER one is one list screen: it materialises the rows for
+  # the current view, arms the terminal, draws the frame and hands over to the
+  # key loop. Every action and every view switch breaks back to it, which is
+  # what keeps the user inside the tool instead of ending the verb on the first
+  # rename. The INNER one is the key loop, and it owns the frame it drew.
   while true; do
-    key="$(_read_keypress)"
+    if [[ "$view" == "trash" ]]; then
+      if [[ -z "$_SESS_TRASHFILE" ]]; then
+        _SESS_TRASHFILE="$(mktemp "${TMPDIR:-/tmp}/cleat-trash.XXXXXX" 2>/dev/null)" || _SESS_TRASHFILE=""
+      fi
+      # No temp file means no trash list. Say so and stay on the live list
+      # rather than drawing an empty trash, which would read as "nothing was
+      # deleted" when the truth is "this could not be read".
+      if [[ -z "$_SESS_TRASHFILE" ]]; then
+        warn "Could not create a temporary file for the trash list."
+        view="live"
+        continue
+      fi
+      if [[ "$trash_stale" == "1" ]]; then
+        _sessions_trash_scan_sorted "$sdir" > "$_SESS_TRASHFILE" 2>/dev/null || true
+        trash_stale=0
+      fi
+      cur="$_SESS_TRASHFILE"
+    else
+      cur="$rowfile"
+    fi
+    _SESS_VIEW="$view"
+    _SESS_TRASH_N="$(_sessions_trash_count "$sdir")"
 
-    _sessions_measure "$total"
-    # Narrowed below the layout's minimum mid-session: leave the picker rather
-    # than draw rows that wrap, because a wrapped row walks the block down the
-    # screen one row per keypress and there is no recovering the origin.
-    if [[ "$_SESS_NARROW" == "1" ]]; then
-      _cursor_show
+    # Echo off BEFORE the row load, not after: loading runs a `du` over every
+    # session's sidecar and is the one slow moment in the picker, so it is
+    # exactly when an impatient keypress would be echoed into the output.
+    #
+    # The restore trap goes up in the SAME breath, before anything can fail. The
+    # window between them is not theoretical: the load shells out to `du` and
+    # `date`, and under `set -e` a failing pipeline in there would exit the CLI
+    # with the terminal still unable to echo. EXIT covers that and the signals
+    # cover a Ctrl-C during the slow part, which is exactly when an impatient
+    # user presses it.
+    _sessions_echo_off
+    trap '_sessions_echo_restore; _cursor_show' EXIT
+    trap '_sessions_echo_restore; _cursor_show; trap - INT TERM HUP EXIT; exit 130' INT TERM HUP
+
+    _sessions_load_rows "$cur"
+    total="$_SESS_N"
+
+    # An empty LIVE list means the last session was just deleted. Show the trash
+    # instead of dropping out of the tool: the trash is the only place the thing
+    # they just deleted can be got back from, and being thrown to a shell prompt
+    # with an "undo" command to retype is the unfriendliness this pass is about.
+    if [[ "$view" == "live" && "$total" -le 0 ]]; then
       _sessions_echo_restore
+      _cursor_show
       trap - INT TERM HUP EXIT
-      printf '\033[%dB' "$block"
-      printf '\033[2K'
+      if [[ "${_SESS_TRASH_N:-0}" -gt 0 ]]; then
+        info "No sessions left. Showing the trash."
+        view="trash"
+        continue
+      fi
+      info "No sessions left in this project."
+      return 0
+    fi
+
+    # Resize is handled by re-measuring once per keypress, and deliberately NOT
+    # by a SIGWINCH trap.
+    #
+    # A trap looks like the right answer and buys nothing. SIGWINCH does not
+    # interrupt a blocked `read` (bash retries on EINTR, and the command
+    # substitution subshell does not run the inherited handler anyway), so bash
+    # defers the trap until the reader returns, which is exactly the moment this
+    # loop re-measures regardless. It would add signal-disposition behaviour that
+    # differs across platforms to the critical path in exchange for nothing.
+    #
+    # It is also load-bearing that nothing here tries to be cleverer by giving
+    # the reader a timeout. `_read_keypress` prints ENTER for an empty read, and
+    # ENTER opens the rename/delete screen, so a timeout would make an idle
+    # terminal offer to delete a conversation on its own. (`read -t` is bash 4
+    # anyway.)
+    #
+    # The honest behaviour, stated in the docs: resize the window, press any key,
+    # the list reflows. One `stty size` per keypress is about 0.4 ms.
+    _sessions_measure "$total"
+    # The same refusal the key loop makes, checked here too: the window can be
+    # narrowed while a rename prompt is waiting for a line of input, and the
+    # first frame after that would otherwise be a wrapped one. A wrapped row
+    # walks the block down the screen and there is no recovering the origin.
+    if [[ "$_SESS_NARROW" == "1" ]]; then
+      _sessions_echo_restore
+      _cursor_show
+      trap - INT TERM HUP EXIT
       echo ""
       info "Window too narrow for the session list."
       echo -e "    ${DIM}Widen it and run ${BOLD}cleat sessions${RESET}${DIM} again.${RESET}"
       return 0
     fi
+    _sessions_clamp "$total"
+    block=$(( _SESS_PAGE + 3 ))
+    prev_block=$block
 
-    case "$key" in
-      UP)   _SESS_CURSOR=$(( _SESS_CURSOR - 1 )) ;;
-      DOWN) _SESS_CURSOR=$(( _SESS_CURSOR + 1 )) ;;
-      ENTER)
-        _cursor_show
-        _sessions_echo_restore
-        trap - INT TERM HUP EXIT
-        printf '\033[%dB' "$block"
-        printf '\033[2K'
-        line="$(sed -n "$(( _SESS_CURSOR + 1 ))p" "$rowfile" 2>/dev/null || true)"
-        # Third tab-separated field. A cursor that names no row must never reach
-        # the action screen with an empty id.
-        uuid="$(printf '%s' "$line" | awk -F'\t' '{print $3}')"
-        if ! _sessions_is_uuid "$uuid"; then
-          echo ""
-          info "Cancelled."
-          return 0
-        fi
-        _sessions_action_tui "$sdir" "$uuid" "$project" "$box" "$cname"
-        return 0 ;;
-      QUIT|ESC)
+    _cursor_hide
+    _sessions_frame "$_SESS_CURSOR" "$_SESS_OFFSET" "$_SESS_PAGE" "$_SESS_COLS" "$total"
+    printf '\033[%dA' "$block"
+
+    while true; do
+      key="$(_read_keypress)"
+
+      _sessions_measure "$total"
+      # Narrowed below the layout's minimum mid-session: leave the picker rather
+      # than draw rows that wrap, because a wrapped row walks the block down the
+      # screen one row per keypress and there is no recovering the origin.
+      if [[ "$_SESS_NARROW" == "1" ]]; then
         _cursor_show
         _sessions_echo_restore
         trap - INT TERM HUP EXIT
         printf '\033[%dB' "$block"
         printf '\033[2K'
         echo ""
-        info "Cancelled."
-        return 0 ;;
-    esac
+        info "Window too narrow for the session list."
+        echo -e "    ${DIM}Widen it and run ${BOLD}cleat sessions${RESET}${DIM} again.${RESET}"
+        return 0
+      fi
 
-    # Clamp AFTER the move and after any re-measure, so a shrunk window can
-    # never leave the cursor on a row that is no longer drawn.
-    _sessions_clamp "$total"
-    block=$(( _SESS_PAGE + 3 ))
+      case "$key" in
+        UP)   _SESS_CURSOR=$(( _SESS_CURSOR - 1 )) ;;
+        DOWN) _SESS_CURSOR=$(( _SESS_CURSOR + 1 )) ;;
+        RIGHT)
+          # The cursor is parked on the frame's ORIGIN at the top of every pass
+          # of this loop, so erasing from here down and breaking redraws the
+          # other view in exactly this space. Nothing scrolls, the header above
+          # is untouched and no second copy of the list is left behind. Only
+          # relative movement is used, which stays correct even if the terminal
+          # scrolled under us.
+          if [[ "$view" == "live" ]]; then
+            live_cursor=$_SESS_CURSOR
+            live_offset=$_SESS_OFFSET
+            view="trash"
+            _SESS_CURSOR=$trash_cursor
+            _SESS_OFFSET=$trash_offset
+            printf '\033[J'
+            break
+          fi ;;
+        LEFT)
+          if [[ "$view" == "trash" ]]; then
+            trash_cursor=$_SESS_CURSOR
+            trash_offset=$_SESS_OFFSET
+            view="live"
+            _SESS_CURSOR=$live_cursor
+            _SESS_OFFSET=$live_offset
+            printf '\033[J'
+            break
+          fi ;;
+        ENTER)
+          line="$(sed -n "$(( _SESS_CURSOR + 1 ))p" "$cur" 2>/dev/null || true)"
+          # Third tab-separated field. A cursor that names no row must never
+          # reach an action with an empty id. Redraw and stay put rather than
+          # ending the verb: pressing Enter on an empty trash is an ordinary
+          # thing to do and must not close anything.
+          uuid="$(printf '%s' "$line" | awk -F'\t' '{print $3}')"
+          if ! _sessions_is_uuid "$uuid"; then
+            _sessions_frame "$_SESS_CURSOR" "$_SESS_OFFSET" "$_SESS_PAGE" "$_SESS_COLS" "$total"
+            printf '\033[%dA' "$block"
+            continue
+          fi
+          _cursor_show
+          _sessions_echo_restore
+          trap - INT TERM HUP EXIT
+          # Hand the screen over by erasing the frame from its origin down. The
+          # action screen then draws in the space the list occupied, which is
+          # what lets a backed-out menu put the list straight back.
+          printf '\033[J'
+          if [[ "$view" == "trash" ]]; then
+            echo ""
+            _sessions_do_restore "$sdir" "$uuid" || true
+            acted=1
+            trash_stale=1
+            if [[ "${_SESS_ACTED:-}" == "restore" ]]; then
+              _sessions_row_insert "$rowfile" "$sdir" "$uuid" || true
+            fi
+            _SESS_ACTED=""
+            _sessions_header "$sdir" "$project" "$box"
+          else
+            # 0 means it ran something and printed a receipt, so the list
+            # belongs UNDER that receipt. 1 means the user backed out without
+            # printing anything, and the menu has already erased itself and left
+            # the cursor on the frame's origin, so the redraw lands in place.
+            if _sessions_action_tui "$sdir" "$uuid" "$project" "$box" "$cname"; then
+              acted=1
+              [[ "${_SESS_ACTED:-}" == "delete" ]] && trash_stale=1
+              _sessions_row_apply "$cur" "$uuid" || true
+              _sessions_header "$sdir" "$project" "$box"
+            fi
+          fi
+          break ;;
+        QUIT|ESC)
+          _cursor_show
+          _sessions_echo_restore
+          trap - INT TERM HUP EXIT
+          printf '\033[%dB' "$block"
+          printf '\033[2K'
+          echo ""
+          # "Cancelled" is only true if nothing happened. After a rename or a
+          # delete the receipts have already said what this run did.
+          if [[ "$acted" != "1" ]]; then
+            info "Cancelled."
+          fi
+          return 0 ;;
+      esac
 
-    _sessions_frame "$_SESS_CURSOR" "$_SESS_OFFSET" "$_SESS_PAGE" "$_SESS_COLS" "$total"
-    # A frame that shrank leaves the taller previous frame's tail on screen.
-    # The cursor is sitting exactly on that leftover, so erase from here down.
-    # Only on an actual shrink, because erase-to-end-of-screen is the one
-    # sequence here that CAN show a blank region for a moment.
-    if [[ "$block" -lt "$prev_block" ]]; then
-      printf '\033[J'
-    fi
-    prev_block=$block
-    printf '\033[%dA' "$block"
+      # Clamp AFTER the move and after any re-measure, so a shrunk window can
+      # never leave the cursor on a row that is no longer drawn.
+      _sessions_clamp "$total"
+      block=$(( _SESS_PAGE + 3 ))
+
+      _sessions_frame "$_SESS_CURSOR" "$_SESS_OFFSET" "$_SESS_PAGE" "$_SESS_COLS" "$total"
+      # A frame that shrank leaves the taller previous frame's tail on screen.
+      # The cursor is sitting exactly on that leftover, so erase from here down.
+      # Only on an actual shrink, because erase-to-end-of-screen is the one
+      # sequence here that CAN show a blank region for a moment.
+      if [[ "$block" -lt "$prev_block" ]]; then
+        printf '\033[J'
+      fi
+      prev_block=$block
+      printf '\033[%dA' "$block"
+    done
   done
 }
 
@@ -12025,8 +12384,8 @@ _sessions_picker_tui() {
 # out. A list you can read beats a picker whose rows wrap, because a wrapped
 # row makes the block walk down the screen one line per keypress.
 _sessions_picker_text() {
-  local rowfile="$1" total="${2:-0}"
-  local i=0
+  local rowfile="$1" total="${2:-0}" sdir="${3:-}"
+  local i=0 tn=0
   _sessions_load_rows "$rowfile"
   total="$_SESS_N"
   while [[ $i -lt $_SESS_N ]]; do
@@ -12039,10 +12398,19 @@ _sessions_picker_text() {
   else
     echo -e "  ${DIM}${total} sessions. Act on one with ${BOLD}cleat sessions rename <id>${RESET}${DIM} or ${BOLD}cleat sessions rm <id>${RESET}${DIM}.${RESET}"
   fi
+  # The picker advertises the trash on its counter line. Without this the
+  # non-TTY path is the one place a deleted session could be invisible.
+  if [[ -n "$sdir" ]]; then
+    tn="$(_sessions_trash_count "$sdir")"
+    case "$tn" in ''|*[!0-9]*) tn=0 ;; esac
+    if [[ "$tn" -gt 0 ]]; then
+      echo -e "  ${DIM}${tn} in the trash. See them with ${BOLD}cleat sessions trash${RESET}${DIM}.${RESET}"
+    fi
+  fi
   return 0
 }
 
-# `cleat sessions [list|rename|rm|restore] [<id>] [box] [flags]`
+# `cleat sessions [list|rename|rm|restore|trash] [<id>] [box] [flags]`
 #
 # The subcommand word is reserved FIRST, then the flags, then <id>, and only
 # what is left goes to _set_box. That order matters: _set_box accepts exactly
@@ -12058,6 +12426,7 @@ cmd_sessions() {
     rename|mv) sub="rename"; shift ;;
     rm|delete) sub="rm"; shift ;;
     restore)   sub="restore"; shift ;;
+    trash)     sub="trash"; shift ;;
   esac
 
   local rest=()
@@ -12081,7 +12450,7 @@ cmd_sessions() {
     esac
   done
 
-  if [[ "$sub" != "list" ]]; then
+  if [[ "$sub" != "list" && "$sub" != "trash" ]]; then
     id="${rest[0]:-}"
     if [[ -z "$id" ]]; then
       error "Which session? ${DIM}cleat sessions ${sub} <id>${RESET}"
@@ -12097,7 +12466,7 @@ cmd_sessions() {
   # Shape-check the id BEFORE anything touches the filesystem, so a typo is
   # reported as a typo even in a project that has no sessions yet, and so a
   # malformed id never reaches a path join.
-  if [[ "$sub" != "list" ]]; then
+  if [[ "$sub" != "list" && "$sub" != "trash" ]]; then
     local _shape=0
     _sessions_id_shape "$id" || _shape=$?
     case $_shape in
@@ -12140,6 +12509,35 @@ cmd_sessions() {
       fi
       error "Could not restore ${BOLD}${ruuid:0:8}${RESET}."
       return 1 ;;
+    trash)
+      # A plain listing, not a picker. The picker's trash view is reached with
+      # the arrow key from the live list; this is the non-interactive way to
+      # read the same thing and, more to the point, to get the ids that
+      # `cleat sessions restore` takes.
+      local tfile ti=0
+      tfile="$(mktemp "${TMPDIR:-/tmp}/cleat-trash.XXXXXX" 2>/dev/null)" || {
+        error "Could not create a temporary file."
+        return 1
+      }
+      _sessions_trash_scan_sorted "$sdir" > "$tfile" 2>/dev/null || true
+      _sessions_load_rows "$tfile"
+      rm -f "$tfile"
+      if [[ "$_SESS_N" -eq 0 ]]; then
+        info "The trash is empty."
+        echo -e "    ${DIM}Deleted sessions land in ${sdir}/.cleat-trash${RESET}"
+        return 0
+      fi
+      echo ""
+      echo -e "  ${BOLD}Trashed sessions${RESET} ${DIM}($(basename "$project")$( [[ "$_BOX" != "main" ]] && printf ' / %s' "$_BOX" ))${RESET}"
+      echo ""
+      while [[ $ti -lt $_SESS_N ]]; do
+        echo -e "    $(printf '%-9.9s %9.9s' "${_SESS_AGE[$ti]}" "${_SESS_SIZE[$ti]}") ${DIM}${_SESS_ID[$ti]}${RESET}  ${_SESS_TITLE[$ti]}"
+        ti=$(( ti + 1 ))
+      done
+      echo ""
+      echo -e "  ${DIM}The age column is how long ago it was deleted. Swept after ${_SESSIONS_TRASH_DAYS} days.${RESET}"
+      echo -e "  ${DIM}Put one back with ${BOLD}cleat sessions restore <id>${RESET}${DIM}.${RESET}"
+      return 0 ;;
   esac
 
   if [[ ! -d "$sdir" ]]; then
@@ -12202,21 +12600,9 @@ cmd_sessions() {
   fi
 
   # The header is part of the picker's vertical budget (_SESSIONS_CHROME_LINES
-  # counts it as four lines), so the path has to be truncated to the terminal
-  # width. A session directory is easily 100 characters and a wrapped header
-  # silently costs a row, which pushes the frame's last line off the bottom and
-  # loses the origin the redraw repositions against. Truncated from the LEFT,
-  # because the distinctive part of a path is its tail.
-  local _hdr_path="$sdir" _hdr_room
-  _hdr_room=$(( $(_term_cols) - 4 ))
-  (( _hdr_room < 12 )) && _hdr_room=12
-  if [[ ${#_hdr_path} -gt $_hdr_room ]]; then
-    _hdr_path="…${_hdr_path:$(( ${#_hdr_path} - _hdr_room + 1 ))}"
-  fi
-  echo ""
-  echo -e "  ${BOLD}Claude sessions${RESET} ${DIM}($(basename "$project")$( [[ "$_BOX" != "main" ]] && printf ' / %s' "$_BOX" ))${RESET}"
-  echo -e "  ${DIM}${_hdr_path}${RESET}"
-  echo ""
+  # counts it as four lines), which is why it is a function: the picker reprints
+  # the same four lines after every action that left a receipt on the screen.
+  _sessions_header "$sdir" "$project" "$_BOX"
 
   # The picker needs a terminal AND enough width to lay a row out. Below the
   # minimum every row would wrap into two physical lines while the redraw moves
@@ -12229,9 +12615,13 @@ cmd_sessions() {
   if [[ -t 0 ]] && [[ -t 1 ]] && ! _sessions_too_narrow; then
     _sessions_picker_tui "$sdir" "$project" "$_BOX" "$cname" "$rowfile" "$total"
   else
-    _sessions_picker_text "$rowfile" "$total"
+    _sessions_picker_text "$rowfile" "$total" "$sdir"
   fi
   rm -f "$rowfile"
+  # The picker materialises the trash list lazily, so this is the one cleanup
+  # site for it however the picker ended.
+  [[ -n "${_SESS_TRASHFILE:-}" ]] && rm -f "$_SESS_TRASHFILE"
+  _SESS_TRASHFILE=""
   return 0
 }
 
@@ -14928,7 +15318,7 @@ cmd_help() {
   echo -e "    ${GREEN}ps${RESET}                 List all Cleat containers (running & stopped)"
   echo -e "    ${GREEN}storage${RESET}            Show Docker disk usage ${DIM}(cleat vs shared vs other projects)${RESET}"
   echo -e "    ${GREEN}describe${RESET} ${DIM}[box] [text]${RESET}  Show or set a box's description"
-  echo -e "    ${GREEN}sessions${RESET} ${DIM}[box]${RESET}       List, rename or delete this box's Claude sessions"
+  echo -e "    ${GREEN}sessions${RESET} ${DIM}[box]${RESET}       List, rename, delete or restore this box's Claude sessions"
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
   echo -e "    ${GREEN}update${RESET}             Check for updates and install the latest version"

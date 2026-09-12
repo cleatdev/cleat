@@ -1480,3 +1480,638 @@ _pass_gates() {
   run cat "$TEST_TEMP/stty.log"
   assert_output --partial "stty SAVED"
 }
+
+# ── staying in the tool ────────────────────────────────────────────────────
+#
+# The first cut of this feature ended the verb on every action: rename one
+# session and you were back at a shell prompt, with the list you were reading
+# gone. Everything below pins the second pass, where an action redraws the list
+# you were already on and leaves the cursor where it was.
+#
+# "Did it come back?" is asserted by counting the frame's hint line, which is
+# printed exactly once per frame and by nothing else.
+
+_hint_count() { printf '%s\n' "$output" | grep -c "↑/↓ move"; }
+
+# Widest line of a draw, in COLUMNS. Every multibyte glyph the frame can print
+# is folded to one ASCII byte first: awk's length() counts bytes under the C
+# locale the suite runs in, so measuring the raw output would report the hint
+# line as half again as wide as it paints. BSD sed has no \x1b either, hence the
+# $'...' literal for the escape.
+_widest_col() {
+  sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$1" \
+    | sed 's/↑/^/g; s/↓/v/g; s/⏎/E/g; s/→/>/g; s/←/</g; s/…/./g; s/▸/>/g; s/·/./g' \
+    | awk '{ n = length($0); if (n > m) m = n } END { print m + 0 }'
+}
+
+_mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
+  local uuid="$1" stamp="${2:-1789000000}" title="${3:-}"
+  mkdir -p "$SDIR/.cleat-trash/${stamp}-${uuid}"
+  {
+    printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid"
+    if [[ -n "$title" ]]; then
+      printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}\n' "$title" "$uuid"
+    fi
+  } > "$SDIR/.cleat-trash/${stamp}-${uuid}/${uuid}.jsonl"
+}
+
+@test "sessions: a rename redraws the list instead of ending the verb" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _mk_session "$U1" "before"
+  _mk_session "$U2" "other"
+  printf '1\t1\t%s\tbefore\n2\t1\t%s\tother\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _tui_keys ENTER ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 2 <<< "renamed"
+  assert_success
+  [ "$(_hint_count)" -ge 2 ]
+}
+
+@test "sessions: a rename updates the row it came back to" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _mk_session "$U1" "before"
+  printf '1\t1\t%s\tbefore\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys ENTER ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1 <<< "after"
+  assert_success
+  run cat "$TEST_TEMP/rows"
+  assert_output --partial "after"
+  refute_output --partial "before"
+}
+
+@test "sessions: a delete redraws the remaining list rather than leaving" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1" "goes"
+  _mk_session "$U2" "stays"
+  printf '1\t1\t%s\tgoes\n2\t1\t%s\tstays\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _tui_keys ENTER DOWN ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 2
+  assert_success
+  [ "$(_hint_count)" -ge 2 ]
+  assert_output --partial "stays"
+}
+
+@test "sessions: a delete drops the row from the list it comes back to" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1"
+  _mk_session "$U2"
+  printf '1\t1\t%s\tone\n2\t1\t%s\ttwo\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _tui_keys ENTER DOWN ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 2
+  assert_success
+  run cat "$TEST_TEMP/rows"
+  refute_output --partial "$U1"
+  assert_output --partial "$U2"
+}
+
+@test "sessions: the header is reprinted under an action's receipt" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1"
+  _mk_session "$U2"
+  printf '1\t1\t%s\tone\n2\t1\t%s\ttwo\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _tui_keys ENTER DOWN ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 2
+  assert_success
+  assert_output --partial "Claude sessions"
+}
+
+@test "sessions: q after an action does not claim the run was cancelled" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1"
+  _mk_session "$U2"
+  printf '1\t1\t%s\tone\n2\t1\t%s\ttwo\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _tui_keys ENTER DOWN ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 2
+  assert_success
+  refute_output --partial "Cancelled."
+}
+
+@test "sessions: backing out of the action screen says nothing and redraws" {
+  _mk_session "$U1"
+  printf '1\t1\t%s\tone\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys ENTER QUIT QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  # Exactly one Cancelled, and it is the picker's own, not the action screen's.
+  [ "$(printf '%s\n' "$output" | grep -c "Cancelled.")" -eq 1 ]
+  [ "$(_hint_count)" -ge 2 ]
+}
+
+@test "sessions: the action back-out walks back over its own three header lines" {
+  # It erases from the list frame's origin, which is _SESSIONS_ACTION_HEAD
+  # lines above where the key loop parks. A wrong number here leaves a copy of
+  # the menu above the redrawn list, or eats the header.
+  run _sessions_action_backout
+  assert_success
+  printf '%s' "$output" | cat -v | grep -q '\^\[\[3A'
+  printf '%s' "$output" | cat -v | grep -q '\^\[\[J'
+}
+
+# ── the trash view ─────────────────────────────────────────────────────────
+
+@test "sessions: the right arrow opens the trash view" {
+  _mk_session "$U1"
+  _mk_trashed "$U2" 1789000000 "deleted one"
+  printf '1\t1\t%s\tone\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys RIGHT QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  assert_output --partial "⏎ restore"
+  assert_output --partial "deleted one"
+}
+
+@test "sessions: the left arrow does nothing on the live list" {
+  _mk_session "$U1"
+  _mk_trashed "$U2"
+  printf '1\t1\t%s\tone\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys LEFT QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  refute_output --partial "⏎ restore"
+}
+
+@test "sessions: the left arrow comes back from the trash to the sessions" {
+  _mk_session "$U1" "live one"
+  _mk_trashed "$U2" 1789000000 "dead one"
+  printf '1\t1\t%s\tlive one\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys RIGHT LEFT QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  assert_output --partial "⏎ rename or delete"
+  assert_output --partial "live one"
+}
+
+@test "sessions: the trash view restores the selected session" {
+  _mk_trashed "$U1" 1789000000 "bring me back"
+  : > "$TEST_TEMP/rows"
+  printf '1\t1\t%s\tkeeper\n' "$U2" > "$TEST_TEMP/rows"
+  _mk_session "$U2"
+  _tui_keys RIGHT ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  assert_output --partial "Restored"
+  [ -f "$SDIR/${U1}.jsonl" ]
+}
+
+@test "sessions: a restored session is back in the live list" {
+  _mk_session "$U2"
+  _mk_trashed "$U1" 1789000000 "back again"
+  printf '1\t1\t%s\tkeeper\n' "$U2" > "$TEST_TEMP/rows"
+  _tui_keys RIGHT ENTER LEFT QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  run cat "$TEST_TEMP/rows"
+  assert_output --partial "$U1"
+  assert_output --partial "$U2"
+}
+
+@test "sessions: Enter on an empty trash does not close the picker" {
+  _mk_session "$U1"
+  printf '1\t1\t%s\tone\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys RIGHT ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  assert_output --partial "The trash is empty"
+  refute_output --partial "Restored"
+}
+
+@test "sessions: deleting the last session shows the trash rather than leaving" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1" "the only one"
+  printf '1\t1\t%s\tthe only one\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys ENTER DOWN ENTER QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  assert_output --partial "Showing the trash"
+  assert_output --partial "⏎ restore"
+}
+
+@test "sessions: an empty list with an empty trash says so and leaves" {
+  : > "$TEST_TEMP/rows"
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 0
+  assert_success
+  assert_output --partial "No sessions left in this project."
+}
+
+# ── the trash scan ─────────────────────────────────────────────────────────
+
+@test "sessions: the trash scan emits one row per trashed session" {
+  _mk_trashed "$U1" 1789000000 "gone"
+  run _sessions_trash_scan "$SDIR"
+  assert_success
+  assert_output --partial "$U1"
+  assert_output --partial "gone"
+}
+
+@test "sessions: the trash scan dates a row by when it was deleted" {
+  _mk_trashed "$U1" 1700000000 "old delete"
+  run _sessions_trash_scan "$SDIR"
+  assert_success
+  [ "$(printf '%s' "$output" | cut -f1)" = "1700000000" ]
+}
+
+@test "sessions: the trash scan ignores anything not named epoch-uuid" {
+  mkdir -p "$SDIR/.cleat-trash/not-a-session" "$SDIR/.cleat-trash/abc-$U1" \
+           "$SDIR/.cleat-trash/100-notauuid"
+  run _sessions_trash_scan "$SDIR"
+  assert_success
+  assert_output ""
+}
+
+@test "sessions: the trash scan is newest deletion first" {
+  _mk_trashed "$U1" 100 "older"
+  _mk_trashed "$U2" 200 "newer"
+  run _sessions_trash_scan_sorted "$SDIR"
+  assert_success
+  [ "$(printf '%s\n' "$output" | head -1 | cut -f3)" = "$U2" ]
+}
+
+@test "sessions: the trash scan of a missing trash prints nothing" {
+  run _sessions_trash_scan "$SDIR"
+  assert_success
+  assert_output ""
+}
+
+@test "sessions: the trash scan refuses a symlinked trash directory" {
+  mkdir -p "$TEST_TEMP/outside/1-$U1"
+  ln -s "$TEST_TEMP/outside" "$SDIR/.cleat-trash"
+  run _sessions_trash_scan "$SDIR"
+  assert_success
+  assert_output ""
+}
+
+@test "sessions: the trash count counts only real entries" {
+  _mk_trashed "$U1" 100
+  _mk_trashed "$U2" 200
+  mkdir -p "$SDIR/.cleat-trash/not-a-session" "$SDIR/.cleat-trash/100-notauuid"
+  : > "$SDIR/.cleat-trash/a-file"
+  run _sessions_trash_count "$SDIR"
+  assert_success
+  assert_output "2"
+}
+
+@test "sessions: the trash count is zero with no trash at all" {
+  run _sessions_trash_count "$SDIR"
+  assert_success
+  assert_output "0"
+}
+
+# ── the counter and hint lines ─────────────────────────────────────────────
+
+@test "sessions: the trash view names itself on the counter line" {
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_rows 1
+  _SESS_VIEW="trash"
+  run _sessions_picker_draw 0 0 "$TEST_TEMP/rows"
+  assert_success
+  assert_output --partial "Trash: 1 item, kept 30 days"
+}
+
+@test "sessions: the trash view pluralises and pages" {
+  _term_rows() { echo 12; }; _term_cols() { echo 100; }
+  _mk_rows 20
+  _SESS_VIEW="trash"
+  run _sessions_picker_draw 0 0 "$TEST_TEMP/rows"
+  assert_success
+  assert_output --partial "Trash: 1-4 of 20"
+}
+
+@test "sessions: an empty trash view says so on the counter line" {
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  : > "$TEST_TEMP/rows"
+  _SESS_VIEW="trash"
+  run _sessions_picker_draw 0 0 "$TEST_TEMP/rows"
+  assert_success
+  assert_output --partial "The trash is empty"
+}
+
+@test "sessions: the live view advertises the trash only when it holds something" {
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_rows 2
+  _SESS_VIEW="live"
+  _SESS_TRASH_N=0
+  run _sessions_picker_draw 0 0 "$TEST_TEMP/rows"
+  assert_success
+  refute_output --partial "→ trash"
+  _SESS_TRASH_N=3
+  run _sessions_picker_draw 0 0 "$TEST_TEMP/rows"
+  assert_success
+  assert_output --partial "→ trash (3)"
+}
+
+@test "sessions: the hint line names the action the view actually performs" {
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_rows 1
+  _SESS_VIEW="live"
+  run _sessions_picker_draw 0 0 "$TEST_TEMP/rows"
+  assert_output --partial "⏎ rename or delete"
+  refute_output --partial "⏎ restore"
+  _SESS_VIEW="trash"
+  run _sessions_picker_draw 0 0 "$TEST_TEMP/rows"
+  assert_output --partial "⏎ restore"
+  refute_output --partial "⏎ rename or delete"
+}
+
+@test "sessions: neither hint line is wider than the picker's own minimum" {
+  # _SESSIONS_MIN_COLS is the width below which the picker refuses to draw,
+  # so a hint wider than that wraps on the narrowest SUPPORTED terminal, and a
+  # wrapped line walks the whole block down the screen one row per keypress.
+  _term_rows() { echo 24; }; _term_cols() { echo "$_SESSIONS_MIN_COLS"; }
+  _mk_rows 1
+  local v widest
+  for v in live trash; do
+    _SESS_VIEW="$v"
+    _SESS_TRASH_N=9
+    _sessions_picker_draw 0 0 "$TEST_TEMP/rows" > "$TEST_TEMP/frame.out" 2>/dev/null
+    widest="$(_widest_col "$TEST_TEMP/frame.out")"
+    [ "$widest" -le "$_SESSIONS_MIN_COLS" ] || { echo "view $v drew $widest columns"; return 1; }
+  done
+}
+
+@test "sessions: the view does not change the frame's height" {
+  _term_rows() { echo 24; }; _term_cols() { echo 100; }
+  _mk_rows 3
+  _SESS_VIEW="live"
+  [ "$(_draw_lines _sessions_picker_draw 0 0 "$TEST_TEMP/rows")" -eq 6 ]
+  _SESS_VIEW="trash"
+  [ "$(_draw_lines _sessions_picker_draw 0 0 "$TEST_TEMP/rows")" -eq 6 ]
+}
+
+# ── folding an action into the cached rows ─────────────────────────────────
+
+@test "sessions: a delete is folded out of the cached rows" {
+  printf '1\t1\t%s\tone\n2\t1\t%s\ttwo\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _SESS_ACTED="delete"
+  run _sessions_row_apply "$TEST_TEMP/rows" "$U1"
+  assert_success
+  run cat "$TEST_TEMP/rows"
+  refute_output --partial "$U1"
+  assert_output --partial "$U2"
+}
+
+@test "sessions: a rename is folded into the cached rows without moving them" {
+  printf '9\t7\t%s\tbefore\n1\t1\t%s\ttwo\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _SESS_ACTED="rename"
+  _SESS_ACTED_TITLE="after"
+  run _sessions_row_apply "$TEST_TEMP/rows" "$U1"
+  assert_success
+  run head -1 "$TEST_TEMP/rows"
+  # Fields 1-3 untouched, only the title replaced: a rename keeps the mtime, so
+  # the sort order must not move either.
+  assert_output "$(printf '9\t7\t%s\tafter' "$U1")"
+}
+
+@test "sessions: nothing is folded in when no action ran" {
+  printf '1\t1\t%s\tone\n' "$U1" > "$TEST_TEMP/rows"
+  _SESS_ACTED=""
+  run _sessions_row_apply "$TEST_TEMP/rows" "$U1"
+  assert_success
+  run cat "$TEST_TEMP/rows"
+  assert_output --partial "$U1"
+}
+
+@test "sessions: folding in clears the marker so it cannot be applied twice" {
+  printf '1\t1\t%s\tone\n2\t1\t%s\ttwo\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _SESS_ACTED="delete"
+  _sessions_row_apply "$TEST_TEMP/rows" "$U1"
+  [ -z "$_SESS_ACTED" ]
+  _sessions_row_apply "$TEST_TEMP/rows" "$U2"
+  run cat "$TEST_TEMP/rows"
+  assert_output --partial "$U2"
+}
+
+@test "sessions: a restored session is inserted in its sorted position" {
+  _mk_session "$U1"
+  printf '9999999999\t1\t%s\tnewer\n1\t1\t%s\toldest\n' "$U2" "$U2" > "$TEST_TEMP/rows"
+  run _sessions_row_insert "$TEST_TEMP/rows" "$SDIR" "$U1"
+  assert_success
+  run cat "$TEST_TEMP/rows"
+  assert_output --partial "$U1"
+  # The fake 9999999999 row is in the future, so the real one cannot be first.
+  [ "$(head -1 "$TEST_TEMP/rows" | cut -f3)" = "$U2" ]
+}
+
+@test "sessions: inserting a session that is not there fails and writes nothing" {
+  printf '1\t1\t%s\tone\n' "$U2" > "$TEST_TEMP/rows"
+  run _sessions_row_insert "$TEST_TEMP/rows" "$SDIR" "$U1"
+  assert_failure
+  run cat "$TEST_TEMP/rows"
+  refute_output --partial "$U1"
+}
+
+# ── the restore action ─────────────────────────────────────────────────────
+
+@test "sessions: the restore action puts the transcript back and marks the run" {
+  _mk_trashed "$U1" 1789000000 "restore me"
+  _sessions_do_restore "$SDIR" "$U1"
+  [ -f "$SDIR/${U1}.jsonl" ]
+  [ "$_SESS_ACTED" = "restore" ]
+  run _sessions_do_restore "$SDIR" "$U2"
+  assert_failure
+}
+
+@test "sessions: the trash view shows a session deleted in the same run" {
+  # The trash rows are cached like the live ones, so a delete has to mark them
+  # stale. Without that the user deletes something, presses the arrow, and the
+  # trash looks empty.
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1" "delete me"
+  _mk_session "$U2" "keep me"
+  printf '1\t1\t%s\tdelete me\n2\t1\t%s\tkeep me\n' "$U1" "$U2" > "$TEST_TEMP/rows"
+  _tui_keys ENTER DOWN ENTER RIGHT QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 2
+  assert_success
+  assert_output --partial "⏎ restore"
+  assert_output --partial "delete me"
+}
+
+@test "sessions: the restore action prints a receipt naming the session" {
+  _mk_trashed "$U1" 1789000000 "restore me"
+  run _sessions_do_restore "$SDIR" "$U1"
+  assert_success
+  assert_output --partial "Restored"
+  assert_output --partial "${U1:0:8}"
+}
+
+@test "sessions: the restore action refuses when there is nothing to restore" {
+  run _sessions_do_restore "$SDIR" "$U1"
+  assert_failure
+  assert_output --partial "Could not restore"
+}
+
+@test "sessions: the restore action never overwrites a session that came back" {
+  _mk_session "$U1" "the live one"
+  _mk_trashed "$U1" 1789000000 "the trashed one"
+  _sessions_do_restore "$SDIR" "$U1" || true
+  run _sessions_title_for "$SDIR" "$U1"
+  assert_output "the live one"
+}
+
+# ── action markers ─────────────────────────────────────────────────────────
+
+@test "sessions: a rename marks what it changed for the list to fold in" {
+  _pass_gates
+  _mk_session "$U1"
+  _sessions_do_rename "$SDIR" "$U1" "main" "cleat-x" "picked name"
+  [ "$_SESS_ACTED" = "rename" ]
+  [ "$_SESS_ACTED_TITLE" = "picked name" ]
+}
+
+@test "sessions: a refused rename marks nothing" {
+  _pass_gates
+  _mk_session "$U1"
+  _sessions_do_rename "$SDIR" "$U1" "main" "cleat-x" 'bad"title' || true
+  [ -z "$_SESS_ACTED" ]
+}
+
+@test "sessions: a delete marks what it changed for the list to fold in" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  _mk_session "$U1"
+  _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
+  [ "$_SESS_ACTED" = "delete" ]
+}
+
+@test "sessions: a delete that was declined marks nothing" {
+  _pass_gates
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'n'; }
+  _mk_session "$U1"
+  _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 0
+  [ -z "$_SESS_ACTED" ]
+}
+
+# ── the header ─────────────────────────────────────────────────────────────
+
+@test "sessions: the header is exactly the four lines the viewport budgets for" {
+  _term_cols() { echo 100; }
+  [ "$(_draw_lines _sessions_header "$SDIR" "$TEST_TEMP/myproject" "main")" -eq 4 ]
+}
+
+@test "sessions: the header truncates a path too long for the terminal" {
+  _term_cols() { echo 40; }
+  local deep="$TEST_TEMP/aaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccc/dddddddddddddddddddd"
+  _sessions_header "$deep" "$TEST_TEMP/myproject" "main" > "$TEST_TEMP/frame.out"
+  run cat "$TEST_TEMP/frame.out"
+  assert_output --partial "…"
+  [ "$(_widest_col "$TEST_TEMP/frame.out")" -le 40 ]
+}
+
+@test "sessions: the header names a non-default box" {
+  _term_cols() { echo 100; }
+  run _sessions_header "$SDIR" "$TEST_TEMP/myproject" "feat"
+  assert_success
+  assert_output --partial "myproject / feat"
+}
+
+# ── cleat sessions trash ───────────────────────────────────────────────────
+
+@test "sessions: cleat sessions trash lists what was deleted" {
+  _pass_gates
+  resolve_project() { echo "$TEST_TEMP/proj"; }
+  _sessions_key_dir() { echo "$SDIR"; }
+  container_name_for() { echo "cleat-x"; }
+  _mk_trashed "$U1" 1789000000 "deleted thing"
+  run cmd_sessions trash
+  assert_success
+  assert_output --partial "Trashed sessions"
+  assert_output --partial "deleted thing"
+  assert_output --partial "cleat sessions restore"
+}
+
+@test "sessions: cleat sessions trash says so when there is nothing in it" {
+  _pass_gates
+  resolve_project() { echo "$TEST_TEMP/proj"; }
+  _sessions_key_dir() { echo "$SDIR"; }
+  container_name_for() { echo "cleat-x"; }
+  run cmd_sessions trash
+  assert_success
+  assert_output --partial "The trash is empty."
+}
+
+@test "sessions: cleat sessions trash takes no id" {
+  _pass_gates
+  resolve_project() { echo "$TEST_TEMP/proj"; }
+  _sessions_key_dir() { echo "$SDIR"; }
+  container_name_for() { echo "cleat-x"; }
+  run cmd_sessions trash
+  assert_success
+  refute_output --partial "Which session?"
+}
+
+@test "sessions: the text fallback points at the trash when it holds something" {
+  _mk_trashed "$U1" 1789000000 "gone"
+  printf '1\t1\t%s\tone\n' "$U2" > "$TEST_TEMP/rows"
+  run _sessions_picker_text "$TEST_TEMP/rows" 1 "$SDIR"
+  assert_success
+  assert_output --partial "1 in the trash"
+  assert_output --partial "cleat sessions trash"
+}
+
+@test "sessions: the text fallback stays quiet about an empty trash" {
+  printf '1\t1\t%s\tone\n' "$U2" > "$TEST_TEMP/rows"
+  run _sessions_picker_text "$TEST_TEMP/rows" 1 "$SDIR"
+  assert_success
+  refute_output --partial "in the trash"
+}
+
+# ── the terminal state across a view switch ────────────────────────────────
+
+@test "sessions: switching views does not poison the saved terminal state" {
+  # The picker re-arms the terminal once per list screen and a view switch
+  # breaks back to it WITHOUT restoring first, because nothing was printed. A
+  # second `stty -g` there would save the already echo-off state as the
+  # original, and the user would be left with a terminal that cannot echo.
+  _is_tty() { return 0; }
+  : > "$TEST_TEMP/stty.log"
+  stty() {
+    case "$1" in
+      -g)
+        if [ -f "$TEST_TEMP/echo.off" ]; then echo "NOECHO"; else echo "ORIGINAL"; fi ;;
+      -echo)
+        : > "$TEST_TEMP/echo.off"
+        echo "stty $*" >> "$TEST_TEMP/stty.log" ;;
+      *)
+        echo "stty $*" >> "$TEST_TEMP/stty.log" ;;
+    esac
+  }
+  _mk_session "$U1"
+  _mk_trashed "$U2" 1789000000 "gone"
+  printf '1\t1\t%s\tone\n' "$U1" > "$TEST_TEMP/rows"
+  _tui_keys RIGHT LEFT RIGHT QUIT
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  run cat "$TEST_TEMP/stty.log"
+  assert_output --partial "stty ORIGINAL"
+  refute_output --partial "stty NOECHO"
+}
+
+@test "sessions: a window narrowed during an action leaves before drawing a wrapped frame" {
+  # The key loop refuses a too-narrow window, but the window can be narrowed
+  # while a rename prompt is waiting for input, so the REDRAW has to refuse too.
+  # Asserted by proving no key was ever read: the key loop's own gate would
+  # print the same message one keypress later and pass this for the wrong
+  # reason.
+  _mk_session "$U1"
+  printf '1\t1\t%s\tone\n' "$U1" > "$TEST_TEMP/rows"
+  _sessions_too_narrow() { return 0; }
+  _read_keypress() { : > "$TEST_TEMP/keyread"; echo QUIT; }
+  run _sessions_picker_tui "$SDIR" "$TEST_TEMP/proj" "main" "cleat-x" "$TEST_TEMP/rows" 1
+  assert_success
+  assert_output --partial "Window too narrow"
+  [ ! -f "$TEST_TEMP/keyread" ]
+}

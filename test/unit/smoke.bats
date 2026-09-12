@@ -438,6 +438,17 @@ STUB
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat sessions trash runs with nothing in it" {
+  run cleat_bin_timeout 10 sessions trash
+  assert_success
+  assert_output --partial "trash"
+}
+
+@test "smoke: cleat sessions trash takes no id and refuses a stray positional" {
+  run cleat_bin_timeout 10 sessions trash main extra
+  assert_failure
+}
+
 @test "smoke: cleat sessions appears in help" {
   run cleat_bin help
   assert_success

@@ -863,9 +863,10 @@ SED
 try "run_dir_clean_prunes_orphans" "prunes orphaned run dirs but keeps live" "$CLI" "$RUN_DIR_BATS"
 
 # cmd_nuke must wipe the whole persistent run dir (it no longer self-cleans via
-# /tmp rotation). Remove the wipe; the nuke test must then fail.
+# /tmp rotation). Remove the wipe; the nuke test must then fail. The wipe became
+# _nuke_wipe_dir when the account store earned a guard, so the sed follows it.
 cat > "$SED_TMP" << 'SED'
-/rm -rf "\$CLEAT_RUN_DIR" 2>\/dev\/null || true/d
+/^    _nuke_wipe_dir "[$]CLEAT_RUN_DIR"$/d
 SED
 try "run_dir_nuke_wipes_all" "wipes the entire CLEAT_RUN_DIR" "$CLI" "$RUN_DIR_BATS"
 

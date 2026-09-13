@@ -6173,11 +6173,18 @@ _host_open_cmd() {
 # the API-versus-browser confusion that produces a list which both fails to work
 # and widens the surface.
 #
-# The list can never be complete and the docs must not claim it is. An AWS
-# access portal is the user's own subdomain, an Atlassian site is their own
-# site, a self-hosted GitLab is their own hostname, and an MCP server names its
-# own authorization host, one per server. That is arithmetic, not policy, and it
-# is why CLEAT_BROWSER_ORIGINS exists.
+# The list can never be complete and the docs must not claim it is. An
+# Atlassian site is the user's own site, a self-hosted GitLab is their own
+# hostname, and an MCP server names its own authorization host, one per server.
+# That is arithmetic, not policy, and it is why CLEAT_BROWSER_ORIGINS exists.
+#
+# AWS is NOT in that category, and an earlier draft said it was. Since AWS CLI
+# 2.22 `aws sso login` defaults to PKCE and opens
+# https://oidc.<region>.amazonaws.com/authorize (dual-stack: oidc.<region>.api.aws),
+# a fixed host per region, and only then redirects to the tenant's portal. So it
+# could ship. It does not, by the maintainer's decision on 2026-09-13: one host
+# per region is a long list for one tool, and `cleat browser allow` for the
+# region you use is a single line.
 _BROWSER_ORIGINS="claude.ai console.anthropic.com github.com www.npmjs.com
 login.docker.com accounts.google.com login.microsoftonline.com microsoft.com
 dash.cloudflare.com auth.openai.com cli-auth.heroku.com app.netlify.com
@@ -7216,7 +7223,7 @@ _browser_origins_print() {
   fi
   echo ""
   echo -e "  ${DIM}Add one with ${BOLD}cleat browser allow <host>${RESET}${DIM}. The list can never be complete:${RESET}"
-  echo -e "  ${DIM}an MCP server, an AWS access portal or a self-hosted host is yours, not Cleat's.${RESET}"
+  echo -e "  ${DIM}an MCP server, an Atlassian site or a self-hosted host is yours, not Cleat's.${RESET}"
   return 0
 }
 

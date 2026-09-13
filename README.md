@@ -1091,7 +1091,7 @@ cleat browser origins                  # what your sandbox is allowed to open
 cleat browser allow auth.example.com   # add one, for every box
 ```
 
-The list can never be complete. That is arithmetic rather than a gap: an AWS access portal lives on your own subdomain, an Atlassian site is your own site, a self-hosted GitLab or GitHub Enterprise is your own hostname, an MCP server names its own authorization host, one per server. You add those once. The same goes for a login Cleat has not catalogued yet. Not every tool documents which page it opens. A few ask their own server for the address at login time, so it can move without the tool changing.
+The list can never be complete. That is arithmetic rather than a gap: an Atlassian site is your own site, a self-hosted GitLab or GitHub Enterprise is your own hostname, an MCP server names its own authorization host, one per server. You add those once. AWS is not shipped either: `aws sso login` opens `oidc.<region>.amazonaws.com`, one host per AWS region, so allow the region you use. The same goes for a login Cleat has not catalogued yet. Not every tool documents which page it opens. A few ask their own server for the address at login time, so it can move without the tool changing.
 
 An origin on the list can still redirect your browser somewhere else, because following a redirect is what browsers do. The list bounds the first hop, not the last one.
 
@@ -1100,7 +1100,7 @@ An origin on the list can still redirect your browser somewhere else, because fo
 **`CLEAT_BROWSER_ORIGINS`** appends to the shipped list for one shell, never replaces it:
 
 ```bash
-CLEAT_BROWSER_ORIGINS="auth.acme.example,d-9067123456.awsapps.com" cleat
+CLEAT_BROWSER_ORIGINS="auth.acme.example,oidc.eu-west-1.amazonaws.com" cleat
 ```
 
 Missing a login worth shipping? Cleat prints the exact origin when it refuses one, so paste that into [an issue](https://github.com/cleatdev/cleat/issues/new) and it can ship as a default.

@@ -245,3 +245,102 @@ EOF
   assert_output --partial "NOEXP-FILE"
   refute_output --partial "sk-ant-oat01-abc"
 }
+
+# ── claudeAiOauth scoping: MCP logins share the credentials file ─────────────
+# Claude Code 2.1.270 keeps MCP server logins in the same file under mcpOAuth,
+# each with its own accessToken, refreshToken and expiresAt. It writes that key
+# AFTER claudeAiOauth once an MCP login follows a Claude login. Only the Claude
+# login's own expiry may drive a decision. Shaped like Claude's bytes: compact,
+# the login's fields in its own order and a nested discoveryState in the MCP
+# entry. $1 = cm (login first) or mc, $2 = claudeAiOauth.expiresAt, $3 = MCP.
+_claude_written_cred() {
+  local c m
+  c='"claudeAiOauth":{"accessToken":"sk-ant-oat01-FAKE","refreshToken":"sk-ant-ort01-FAKE","expiresAt":'"$2"',"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}'
+  m='"mcpOAuth":{"labmcp|cda6d80a97111f6e":{"serverName":"labmcp","serverUrl":"http://127.0.0.1:36963/mcp","accessToken":"FAKE-MCP-at","discoveryState":{"authorizationServerUrl":"http://127.0.0.1:36963","oauthMetadataFound":true},"clientId":"lab-mcp-client","refreshToken":"FAKE-MCP-rt","expiresAt":'"$3"',"scope":"read"}}'
+  if [[ "$1" == cm ]]; then printf '{%s,%s}' "$c" "$m"; else printf '{%s,%s}' "$m" "$c"; fi
+}
+
+@test "oauth_expires_at: reads the Claude login whichever side of mcpOAuth it is written, with or without jq" {
+  local mode order r pretty
+  # The pretty form is what `jq .` or an editor leaves, here with CRLF line
+  # ends. Line breaks are only ever whitespace between JSON tokens.
+  pretty="$(printf '{\r\n  "claudeAiOauth": {\r\n    "accessToken": "sk-ant-oat01-FAKE",\r\n    "expiresAt": 1789028800000,\r\n    "scopes": [\r\n      "user:inference"\r\n    ]\r\n  },\r\n  "mcpOAuth": {\r\n    "labmcp|cda6d80a97111f6e": {\r\n      "discoveryState": {\r\n        "oauthMetadataFound": true\r\n      },\r\n      "expiresAt": 1789086400000\r\n    }\r\n  }\r\n}\r\n')"
+  for mode in jq nojq; do
+    [[ "$mode" == nojq ]] && _hide_jq
+    for order in cm mc; do
+      r="$(_claude_written_cred "$order" 1789028800000 1789086400000 | _oauth_expires_at)"
+      assert_equal "$mode $order $r" "$mode $order 1789028800000"
+    done
+    r="$(printf '%s' "$pretty" | _oauth_expires_at)"
+    assert_equal "$mode pretty $r" "$mode pretty 1789028800000"
+  done
+}
+
+@test "oauth_expires_at: empty when the Claude login cannot be isolated" {
+  # Empty is the keep-safe answer: the seed keeps the file and a harvest reads
+  # 0, which never counts as newer. Guessing here is how the MCP expiry got in.
+  local j r
+  for j in \
+    '{"expiresAt":1789028800000}' \
+    '{"mcpOAuth":{"s":{"expiresAt":1789028800000}}}' \
+    '{"claudeAiOauth":{"expiresAt":1789028800000,"extra":{"x":1}}}' \
+    '{"claudeAiOauth":{"expiresAt":1},"other":{"claudeAiOauth":{"expiresAt":1789028800000}}}' \
+    '{"claudeAiOauth":{"expiresAt":1,"expiresAt":1789028800000}}' \
+    '{"claudeAiOauth":{"expiresAt":1.789e12}}' \
+    '{"claudeAiOauth":{"expiresAt":"1789028800000"}}' \
+    '{"claudeAiOauth":"expiresAt"}' \
+    '{"claudeAiOauth":{"expiresAt":01789028800000}}' \
+    '{"claudeAiOauth":{"expiresAt":1789028800000000}}'; do
+    r="$(printf '%s' "$j" | _oauth_expires_at)"
+    assert_equal "$j -> $r" "$j -> "
+  done
+  # The edges of the integer rule still read. 15 digits is allowed. A login
+  # Claude blanked to 0 after invalid_grant has to read as expired and not as
+  # unknown.
+  r="$(printf '%s' '{"claudeAiOauth":{"expiresAt":178902880000000}}' | _oauth_expires_at)"
+  assert_equal "$r" "178902880000000"
+  r="$(printf '%s' '{"claudeAiOauth":{"expiresAt":0}}' | _oauth_expires_at)"
+  assert_equal "$r" "0"
+}
+
+@test "json_flat_object: prints the login object alone or nothing when the key is ambiguous" {
+  # The shared primitive every scoped credential reader stands on. A second
+  # claudeAiOauth anywhere, flat or nested, means the reader cannot know which
+  # one Claude reads.
+  local r
+  r="$(_claude_written_cred cm 1789028800000 1789086400000 | _json_flat_object claudeAiOauth)"
+  assert_equal "$r" '{"accessToken":"sk-ant-oat01-FAKE","refreshToken":"sk-ant-ort01-FAKE","expiresAt":1789028800000,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}'
+  r="$(printf '%s' '{"claudeAiOauth":{"accessToken":"A"},"x":{"claudeAiOauth":{"accessToken":"B"}}}' | _json_flat_object claudeAiOauth)"
+  assert_equal "$r" ""
+  r="$(printf '%s' '{"claudeAiOauth":{"accessToken":"A"},"x":{"claudeAiOauth":{"n":{"accessToken":"B"}}}}' | _json_flat_object claudeAiOauth)"
+  assert_equal "$r" ""
+  # A brace inside a string is text. It neither ends the object early nor
+  # refuses it, so the reader sees what jq sees.
+  r="$(printf '%s' '{"claudeAiOauth":{"accessToken":"a}b\"{","expiresAt":5},"z":1}' | _json_flat_object claudeAiOauth)"
+  assert_equal "$r" '{"accessToken":"a}b\"{","expiresAt":5}'
+}
+
+@test "seed: re-seeds a dead Claude login even when a live MCP login follows it" {
+  _is_macos() { return 0; }
+  # invalid_grant blanks the Claude login to expiresAt 0 on disk. The MCP entry
+  # after it is still valid and must not make the file read as signed in.
+  mkdir -p "${HOME}/.claude"
+  printf '%s' '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{"s":{"accessToken":"m","expiresAt":2500000000}}}' > "$CRED"
+  _macos_keychain_credentials() { printf '%s' '{"claudeAiOauth":{"accessToken":"FRESH-KC","refreshToken":"new","expiresAt":3000000000}}'; }
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials
+  run cat "$CRED"
+  assert_output --partial "FRESH-KC"
+  assert_equal "$_SEEDED_CREDS" "1"
+}
+
+@test "seed: never re-seeds from an expired Keychain login on the strength of its MCP entry" {
+  _is_macos() { return 0; }
+  mkdir -p "${HOME}/.claude"
+  printf '%s' '{"claudeAiOauth":{"accessToken":"STALE-FILE","expiresAt":1000000000}}' > "$CRED"
+  # The Keychain's Claude login expired (1.8e9 < now 2e9). Its MCP entry runs far out.
+  _macos_keychain_credentials() { printf '%s' '{"claudeAiOauth":{"accessToken":"KC-EXPIRED","expiresAt":1800000000},"mcpOAuth":{"s":{"expiresAt":9000000000}}}'; }
+  _CLEAT_NOW_S=2000000 _seed_macos_credentials
+  run cat "$CRED"
+  assert_output --partial "STALE-FILE"
+  refute_output --partial "KC-EXPIRED"
+}

@@ -867,8 +867,10 @@ try "run_dir_clean_prunes_orphans" "prunes orphaned run dirs but keeps live" "$C
 # cmd_nuke must wipe the whole persistent run dir (it no longer self-cleans via
 # /tmp rotation). Remove the wipe; the nuke test must then fail. The wipe became
 # _nuke_wipe_dir when the account store earned a guard, so the sed follows it.
+# It sits inside the account-lock check since the lock landed, so the wipe is
+# replaced with a no-op (a delete would leave an empty then-branch).
 cat > "$SED_TMP" << 'SED'
-/^    _nuke_wipe_dir "[$]CLEAT_RUN_DIR"$/d
+s/^      _nuke_wipe_dir "[$]CLEAT_RUN_DIR"$/      :/
 SED
 try "run_dir_nuke_wipes_all" "wipes the entire CLEAT_RUN_DIR" "$CLI" "$RUN_DIR_BATS"
 
@@ -2424,12 +2426,113 @@ s|(( kc_exp > file_exp && kc_exp > now_ms ))|(( kc_exp > file_exp ))|
 SED
 try "bugfix_token_reseed_kc_valid" "does NOT re-seed from a Keychain token that is itself expired" "$CLI" "$CREDENTIALS_BATS"
 
-# AUTH (token): _oauth_expires_at must surface the parsed ms epoch. Break the
-# print so it never returns the number: the extraction test fails.
+# AUTH (token): _oauth_expires_at must surface the parsed ms epoch. Its digits
+# are validated in _json_flat_num. Refuse every value there: the extraction test
+# sees nothing.
 cat > "$SED_TMP" << 'SED'
-s|\[\[ "\$n" =~ \^\[0-9\]+\$ \]\] && printf '%s' "\$n"|printf '%s' "BROKEN"|
+/^_json_flat_num()/,/^}$/{
+  s/^  \[\[ "[$]hit" =~ [$]re \]\] || return 1$/  return 1/
+}
 SED
 try "bugfix_oauth_expires_extract" "extracts the ms epoch" "$CLI" "$CREDENTIALS_BATS"
+
+# vnext and v1.4.3: the credential expiry is the Claude login's own
+# (claudeAiOauth.expiresAt). Restore the whole-blob last match. Claude Code
+# writes mcpOAuth after claudeAiOauth once an MCP login follows a Claude login,
+# so every newest-wins decision reads an MCP server's expiry. A refresh is not
+# harvested, staging overwrites a fresher box login and a dead login beside a
+# live MCP token polls usage. The macOS re-seed puts an older Keychain login over
+# a box-refreshed one or takes an expired one on the strength of its MCP entry.
+cat > "$SED_TMP" << 'SED'
+/^_oauth_expires_at()/,/^}$/{
+  s/^  _json_flat_num "[$](_json_flat_object claudeAiOauth)" expiresAt || true$/  grep -iEo '"expiresat"[[:space:]]*:[[:space:]]*[0-9]+' | grep -Eo '[0-9]+' | tail -1 || true/
+}
+SED
+try "vnext_account_expiry_claude_login" "newest-wins reads the Claude login expiry"
+try "vnext_account_expiry_claude_login_order" "reads the Claude login whichever side of mcpOAuth" "$CLI" "$CREDENTIALS_BATS"
+try "vnext_account_expiry_claude_login_usage" "usage is never polled on an expired login because an MCP token" "$CLI" "$ACCOUNTS_BATS"
+try "v1.4.3_seed_expiry_claude_login" "re-seed keeps a box-refreshed login when an expired MCP login"
+try "v1.4.3_seed_expiry_claude_login_dead" "re-seeds a dead Claude login even when a live MCP login follows it" "$CLI" "$CREDENTIALS_BATS"
+try "v1.4.3_seed_expiry_claude_login_keychain" "never re-seeds from an expired Keychain login on the strength of its MCP entry" "$CLI" "$CREDENTIALS_BATS"
+
+# The isolated object must be flat. A greedy match swallows a nested object and
+# reads whatever expiresAt sits inside it.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_object()/,/^}$/{
+  s/[[][{][]](.*)[*][[][}][]]/[{].*[}]/
+}
+SED
+try "vnext_json_flat_object_flat_only" "empty when the Claude login cannot be isolated" "$CLI" "$CREDENTIALS_BATS"
+
+# A brace inside a string is text. Match the object as any run of non-braces
+# and it ends inside the access token, so the reader loses the fields after it.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_object()/,/^}$/{
+  s/[[][{][]](.*)[*][[][}][]]/[{][^{}]*[}]/
+}
+SED
+try "vnext_json_flat_object_brace_in_string" "prints the login object alone or nothing when the key is ambiguous" "$CLI" "$CREDENTIALS_BATS"
+
+# The key twice, flat or nested, is ambiguous. Drop the refusal: two flat copies
+# print both and a nested second copy prints the first as if it were the login.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_object()/,/^}$/{
+  /^  case "[$]hit" in ''|[*][$]'.n'[*]) return 0 ;; esac$/d
+}
+SED
+try "vnext_json_flat_object_single_key" "prints the login object alone or nothing when the key is ambiguous" "$CLI" "$CREDENTIALS_BATS"
+
+# Line breaks are whitespace between JSON tokens. Without the fold a
+# pretty-printed credential reads as no login at all.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_object()/,/^}$/{
+  s/LC_ALL=C tr '\\000\\r\\n' '   ' 2>[/]dev[/]null/cat/
+}
+SED
+try "vnext_json_flat_object_folds_newlines" "reads the Claude login whichever side of mcpOAuth" "$CLI" "$CREDENTIALS_BATS"
+
+# A leading zero is octal in bash arithmetic, so a box-planted 0800 printed an
+# arithmetic error on the host terminal at every attach.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_num()/,/^}$/{
+  /^  case "[$]v" in 0?[*]) return 1 ;; esac$/d
+}
+SED
+try "vnext_json_flat_num_leading_zero" "empty when the Claude login cannot be isolated" "$CLI" "$CREDENTIALS_BATS"
+
+# More than 15 digits can wrap in 64-bit arithmetic and read as any expiry.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_num()/,/^}$/{
+  /^  \[\[ [$]{#v} -le 15 \]\] || return 1$/d
+}
+SED
+try "vnext_json_flat_num_digit_cap" "empty when the Claude login cannot be isolated" "$CLI" "$CREDENTIALS_BATS"
+
+# The staged copy is box-writable and its expiry is read before any size check.
+cat > "$SED_TMP" << 'SED'
+/^_account_cred_expiry()/,/^}$/{
+  s/head -c "[$]_ACCOUNT_CRED_MAX_BYTES" "[$]f"/head -c 999999999 "$f"/
+}
+SED
+try "vnext_account_expiry_size_cap" "a credential file past the size cap never reads as a live login" "$CLI" "$ACCOUNTS_BATS"
+
+# v1.4.3: the seed runs bare in exec_claude under set -e. A redirect read of an
+# unreadable shared credential fails the assignment and aborts the launch.
+cat > "$SED_TMP" << 'SED'
+/^_seed_macos_credentials()/,/^}$/{
+  s/^    file_exp="[$](head -c .*$/    file_exp="$(_oauth_expires_at < "$cred" 2>\/dev\/null)"/
+}
+SED
+try "v1.4.3_seed_unreadable_no_abort" "an unreadable shared credential file does not abort the macOS launch"
+
+# v1.4.3: ~/.claude is mounted read-write into every box. Bring back the
+# guessable pid temp name: a planted symlink there receives the Keychain login.
+cat > "$SED_TMP" << 'SED'
+/^_seed_macos_credentials()/,/^}$/{
+  s/^  tmp="[$](mktemp .*$/  tmp="${cred}.tmp.$$"/
+}
+SED
+try "v1.4.3_seed_temp_mktemp" "macOS seed never writes the token through a planted temp symlink"
 
 # AUTH (onboarding): a fresh project must be born with a /workspace block so a
 # newer bundled Claude does not re-run first-run/onboarding. Empty the seeded
@@ -2473,7 +2576,7 @@ s|(( _n_boxes != 1 )) && _s="s"|_s="$( (( _n_boxes != 1 )) \&\& printf s )"|
 SED
 try "bugfix_overload_count_set_e" "set-e abort start with exactly ONE" "$CLI" "$REGRESSIONS"
 
-# IDLE SWEEP: a box with a live claude/node agent must NEVER be stopped (autonomy:
+# IDLE SWEEP: a box with a live claude agent must NEVER be stopped (autonomy:
 # unattended work). Drop the liveness skip: the "NEVER stops a box with a live
 # agent" test sees a working box stopped.
 cat > "$SED_TMP" << 'SED'
@@ -2566,7 +2669,7 @@ cat > "$SED_TMP" << 'SED'
   s|"\${CLAUDE_ENV\[@\]}"|-e HOME=/home/coder -e PATH=/home/coder/.local/bin:/usr/local/bin:/usr/bin:/bin -e TERM=xterm|
 }
 SED
-try "vnext_browser_login_env" "runs claude login as coder" "$CLI" "$DOCKER_COMMANDS_BATS"
+try "vnext_browser_login_env" "execs claude as coder with full PATH" "$CLI" "$DOCKER_COMMANDS_BATS"
 
 # BRIDGE STARTUP AGE GATE: the watcher's startup sweep must only remove a
 # STALE leftover bridge file. Reverting the gate to always-true (age > -1 is
@@ -6143,7 +6246,7 @@ try "vnext_account_mount_source" "the per-box auth directory is created before a
 # copy of, and lands the user back on /login.
 cat > "$SED_TMP" << 'SED'
 /^_account_wipe_run_dir()/,/^}$/{
-  s@^  _account_sync_out "[$]cname" .. rc=[$]?$@  :@
+  s@^  _account_sync_out_locked "[$]cname" .. rc=[$]?$@  :@
 }
 SED
 try "vnext_account_wipe_harvests" "wiping a box run dir harvests first" "$CLI" "$ACCOUNTS_BATS"
@@ -6151,27 +6254,29 @@ try "vnext_account_wipe_harvests" "wiping a box run dir harvests first" "$CLI" "
 # Newest wins, keyed on expiresAt. Flipping the comparison silently downgrades
 # the stored credential to an older one on every attach.
 cat > "$SED_TMP" << 'SED'
-/^_account_sync_out()/,/^}$/{
-  s/^  \[\[ "[$]be" -gt "[$]se" \]\] || return 0$/  [[ "$be" -lt "$se" ]] || return 0/
+/^_account_harvest_from()/,/^}$/{
+  s/^  if \[\[ "[$]be" -le "[$]se" \]\]; then$/  if [[ "$be" -ge "$se" ]]; then/
 }
 SED
 try "vnext_account_harvest_newest_wins" "harvesting never replaces a newer stored credential" "$CLI" "$ACCOUNTS_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_sync_in()/,/^}$/{
-  s/^  \[\[ "[$]se" -ge "[$]be" \]\] || return 0$/  :/
+/^_account_sync_in_locked()/,/^}$/{
+  s/^    \[\[ "[$]se" -gt "[$]be" \]\] .*return 0; }$/    :/
 }
 SED
 try "vnext_account_stage_newest_wins" "staging never overwrites a newer credential the box refreshed" "$CLI" "$ACCOUNTS_BATS"
 
-# An account with no credential IS the clean scope. Leaving the previous one
-# staged means /login never runs and the box keeps the old account.
+# An account with no credential IS the clean scope. The attach no longer clears
+# a staged file on an empty store (it can be the only copy of a login made in
+# the box), so the switch's own drop is the one thing that keeps the account
+# being LEFT out of the new account's store.
 cat > "$SED_TMP" << 'SED'
-/^_account_sync_in()/,/^}$/{
-  s#^    rm -f "[$]box_cred" 2>/dev/null .. true$#    :#
+/^_account_do_switch()/,/^}$/{
+  s@^  if \[\[ "[$]current" != "[$]acct" \]\]; then$@  if false; then@
 }
 SED
-try "vnext_account_clean_scope" "staging an empty account leaves the box signed out" "$CLI" "$ACCOUNTS_BATS"
+try "vnext_account_clean_scope" "switching from a logged-in account to a new one leaves nothing staged" "$CLI" "$ACCOUNTS_BATS"
 
 # A credential at the host default umask is readable by anything on the machine
 # and it is live for weeks. BOTH mechanisms are removed here on purpose: the
@@ -6204,8 +6309,8 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_trash_not_delete" "removing an account moves it to the trash" "$CLI" "$ACCOUNTS_BATS"
 
-# Claude Code notices the credential changing under a running session, disarms
-# its auth watcher and writes its own token back over the swap.
+# A running session takes only part of a login change, so a switch under one is
+# refused. Dropping the gate lets the swap through.
 cat > "$SED_TMP" << 'SED'
 s@^  if _daemon_up .*_box_has_live_agent "[$]cname"; then$@  if false; then@
 SED
@@ -6246,15 +6351,15 @@ try "vnext_account_token_off_argv" "never the token on argv" "$CLI" "$ACCOUNTS_B
 # The subcommand words are reserved before the switch form is parsed, so an
 # account called `rm` could be created and then never selected again.
 cat > "$SED_TMP" << 'SED'
-s/^    list|rename|rm|delete|restore|trash|off|help) return 1 ;;$/    zzzunused) return 1 ;;/
+s/^    list|rename|rm|delete|restore|trash|held|adopt|off|help) return 1 ;;$/    zzzunused) return 1 ;;/
 SED
 try "vnext_account_reserved_names" "refuses the subcommand words as names" "$CLI" "$ACCOUNTS_BATS"
 
 # Without the pin rewrite every box pinned to the old name silently falls back
 # to the shared store at its next attach, which reads as being logged out.
 cat > "$SED_TMP" << 'SED'
-/^_account_rename()/,/^}$/{
-  s/^    _box_account_write "[$]b" "[$]new" || true$/    :/
+/^_account_rename_locked()/,/^}$/{
+  s/^    _box_account_write "[$]b" "[$]new" .*$/    :/
 }
 SED
 try "vnext_account_rename_follows_pins" "renaming moves the store and every pin follows it" "$CLI" "$ACCOUNTS_BATS"
@@ -6307,15 +6412,21 @@ SED
 try "vnext_account_switch_swaps_credential" "switching stages the incoming credential even when" "$CLI" "$ACCOUNTS_BATS"
 
 # The identity of the account being switched TO must not come from a project
-# file that still holds the OUTGOING account.
+# file that still holds the OUTGOING account. The capture reads no project file
+# at all now, so the mutation re-adds the read and hands it the file.
 cat > "$SED_TMP" << 'SED'
-s#^  _account_capture_meta "[$]acct" "" .. true$#  _account_capture_meta "$acct" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true#
+/^_account_capture_meta()/,/^}$/{
+  s#^  _account_exists "[$]acct" .. return 0$#  _account_exists "$acct" || return 0; [[ -f "${2:-}" ]] \&\& _account_meta_set "$acct" who "$(grep -o '"emailAddress":"[^"]*"' "$2" | cut -d'"' -f4)"#
+}
+/^_account_do_switch()/,/^}$/{
+  s#^  _account_capture_meta "[$]acct" .. true$#  _account_capture_meta "$acct" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true#
+}
 SED
 try "vnext_account_no_identity_bleed" "switching to a new account does not stamp it" "$CLI" "$ACCOUNTS_BATS"
 
 # A glob must never decide identity: a dash is legal inside an account name.
 cat > "$SED_TMP" << 'SED'
-/^_account_restore()/,/^}$/{
+/^_account_restore_locked()/,/^}$/{
   s@"[$]{base#[*]-}" == "[$]acct"@"$base" == *-"$acct"@
 }
 SED
@@ -6324,14 +6435,14 @@ try "vnext_account_restore_exact_name" "restore does not resurrect a different a
 # "Newer" alone must not earn an overwrite of the only host copy: the source is
 # a directory the box mounts read-write.
 cat > "$SED_TMP" << 'SED'
-/^_account_sync_out()/,/^}$/{
-  s#^  _account_cred_plausible "[$]box_cred" .. return 1$#  :#
+/^_account_harvest_from()/,/^}$/{
+  s#^  _account_cred_plausible "[$]snap" .. return 1$#  :#
 }
 SED
 try "vnext_account_harvest_plausible" "a box cannot destroy a stored credential" "$CLI" "$ACCOUNTS_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_sync_out()/,/^}$/{
+/^_account_harvest_from()/,/^}$/{
   s#^  \[\[ "[$]be" -le [$](( now_ms + 7776000000 )) \]\] .. return 1$#  :#
 }
 SED
@@ -6340,7 +6451,7 @@ try "vnext_account_harvest_expiry_sane" "a harvest is refused when the expiry is
 # A credential the box wrote is read into a shell variable, so it is capped.
 cat > "$SED_TMP" << 'SED'
 /^_account_write_file_0600()/,/^}$/{
-  s#^  _account_cred_sane_size "[$]src" .. return 1$#  :#
+  s#^  \[\[ -z "[$]src" \]\] .. _account_cred_sane_size "[$]src" .. return 1$#  :#
 }
 SED
 try "vnext_account_cred_size_cap" "an oversized credential file is never read" "$CLI" "$ACCOUNTS_BATS"
@@ -6362,10 +6473,11 @@ SED
 try "vnext_account_clean_harvests" "cleat clean harvests before it prunes" "$CLI" "$ACCOUNTS_BATS"
 
 # A wipe after a FAILED harvest must not delete the thing the harvest was
-# protecting.
+# protecting. A real login in the staged file keeps auth/ for the next session
+# end to retry.
 cat > "$SED_TMP" << 'SED'
 /^_account_wipe_run_dir()/,/^}$/{
-  s#^  if \[\[ [$]rc -ne 0 \]\]; then$#  if false; then#
+  s#^        keep_auth=1$#        :#
 }
 SED
 try "vnext_account_wipe_keeps_unharvested" "a failed harvest leaves the staged credential" "$CLI" "$ACCOUNTS_BATS"
@@ -6373,7 +6485,7 @@ try "vnext_account_wipe_keeps_unharvested" "a failed harvest leaves the staged c
 # After the trash the store path is gone, so the harvest has to come first.
 cat > "$SED_TMP" << 'SED'
 /^_account_do_remove()/,/^}$/{
-  s#^    _account_sync_out "[$]b" .. true$#    :#
+  s#^    if ! _account_release_staged_locked "[$]b"; then$#    if false; then#
 }
 SED
 try "vnext_account_remove_harvests_first" "removing an account harvests every pinned box" "$CLI" "$ACCOUNTS_BATS"
@@ -6499,20 +6611,61 @@ SED
 try "vnext_account_stopped_not_live" "a merely STOPPED box is not mistaken" "$CLI" "$ACCOUNTS_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_do_remove()/,/^}$/{
+/^_account_remove_live_gate()/,/^}$/{
   s@ \&\& is_running "[$]b"@@
 }
 SED
 try "vnext_account_remove_stopped_ok" "removing is not wedged by one stale stopped box" "$CLI" "$ACCOUNTS_BATS"
 
-# ~/.claude.json is PRETTY-PRINTED, and the transcript reader deliberately
-# forbids whitespace after the colon. macOS base has no jq.
+# Who an account is comes from the server's profile answer, read with the flat
+# reader on every host. macOS base has no jq: a reader that needed it named no
+# account there.
 cat > "$SED_TMP" << 'SED'
-/^_account_json_field()/,/^}$/{
-  s@^  v="[$](_account_json_str_ws "[$]blob" "[$]key")" .. return 1$@  v="$(_sessions_json_str "$blob" "$key")" || return 1@
+/^_account_profile_parse()/,/^}$/{
+  s@^  \[\[ -n "[$]acct" \]\] .. return 1$@  command -v jq \&>/dev/null || return 1; [[ -n "$acct" ]] || return 1@
 }
 SED
 try "vnext_account_jqless_identity" "identity is captured on a host with no jq" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: every credential reader is scoped to claudeAiOauth. Read the whole
+# file instead and keep the last match of a key: Claude writes mcpOAuth after
+# claudeAiOauth once an MCP login follows a Claude login, so the reader returns
+# an MCP server's token. The usage poll sends it to api.anthropic.com. A blanked
+# login beside a live MCP entry reads as plausible and signed in. A jq-less host
+# harvests it over the good store. The regressions loop both key orders,
+# so a first-match reader fails them too.
+cat > "$SED_TMP" << 'SED'
+/^_account_cred_str()/,/^}$/{
+  s/| _json_flat_object claudeAiOauth)/| cat)/
+}
+/^_json_flat_str()/,/^}$/{
+  /^  case "[$]hit" in ''|[*][$]'.n'[*]) return 1 ;; esac$/d
+  s/^  \[\[ -n "[$]hit" \]\] || return 1$/  hit="$(printf '%s\\n' "$hit" | tail -1)"/
+}
+SED
+try "vnext_account_reader_scope" "the usage poll sends the account"
+try "vnext_account_reader_scope_harvest" "a jq-less host does not harvest a blanked login over a good store"
+try "vnext_account_reader_scope_readers" "a reader scoped to claudeAiOauth never returns a coresident MCP token" "$CLI" "$ACCOUNTS_BATS"
+try "vnext_account_reader_scope_signed_out" "a blanked login beside a live MCP entry reads as signed out" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: a key twice in the login is two answers. Drop only that refusal and
+# the reader prints both copies run together as one token.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_str()/,/^}$/{
+  s/^  case "[$]hit" in ''|[*][$]'.n'[*]) return 1 ;; esac$/  case "$hit" in '') return 1 ;; esac/
+}
+SED
+try "vnext_json_flat_str_single_match" "a reader scoped to claudeAiOauth never returns a coresident MCP token" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: the bearer goes into a curl config that takes one directive per line,
+# out of a store harvested from a directory the box can write. Drop the charset
+# guard and a token holding a quote or a folded newline reaches curl.
+cat > "$SED_TMP" << 'SED'
+/^_account_access_token()/,/^}$/{
+  /^  _account_token_ok "[$]tok" || return 1$/d
+}
+SED
+try "vnext_account_token_charset" "an access token outside the base64url alphabet is refused" "$CLI" "$ACCOUNTS_BATS"
 
 # A refused switch must leave NO pin file: _box_account_read sanitises, so a
 # junk one on disk is invisible to the obvious assertion but not to
@@ -6528,7 +6681,7 @@ try "vnext_account_refused_switch_no_pin" "a refused switch leaves no pin file" 
 # so the staging is not only a switch-time step.
 cat > "$SED_TMP" << 'SED'
 /^_account_apply_exec_env()/,/^}$/{
-  s@^  _account_sync_in "[$]cname" .. true$@  :@
+  s@^  _account_sync_in "[$]cname" .. _si=[$]?$@  :@
 }
 SED
 try "vnext_account_attach_restages" "every attach re-stages the stored credential" "$CLI" "$ACCOUNTS_BATS"
@@ -6560,25 +6713,12 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_nuke_guard_prefix" "a directory that merely shares a prefix is not protected" "$CLI" "$ACCOUNTS_BATS"
 
-# Found on a real Mac. The per-project claude.json holds whatever identity
-# Claude last wrote there, so a box that was PINNED but never RAN as the
-# account still holds the shared login's, and reading it named a brand-new
-# account with the maintainer's own email.
-cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
-  s@^    if \[\[ -s "[$]_cur_staged" \]\]; then$@    if true; then@
-}
-SED
-try "vnext_account_no_identity_from_unused_box" "an account the box never ran as is not stamped" "$CLI" "$ACCOUNTS_BATS"
-
-# And the gate must not disable the capture for the normal case, which is the
-# only way the list can name a human at all.
-cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
-  s@^    if \[\[ -s "[$]_cur_staged" \]\]; then$@    if false; then@
-}
-SED
-try "vnext_account_identity_still_captured" "an account the box did run as still gets its identity" "$CLI" "$ACCOUNTS_BATS"
+# vnext_account_no_identity_from_unused_box and
+# vnext_account_identity_still_captured guarded a gate on the capture's
+# claude.json read ("did the box run as this account"). The read is gone, so
+# the gate is too: see vnext_account_capture_no_project_file. Both tests stay as
+# guards ("capture never reads a project file", "an account the box did run as
+# still gets its identity captured").
 
 # "Auth shared" on a pinned box contradicts the Account row printed under it.
 cat > "$SED_TMP" << 'SED'
@@ -6609,14 +6749,14 @@ try "vnext_account_create_path_identity" "a box CREATED while pinned is not stam
 # reaches a RUNNING box, so the switch has to invalidate it itself.
 cat > "$SED_TMP" << 'SED'
 /^_account_do_switch()/,/^}$/{
-  s@^  \[\[ "[$]current" != "[$]acct" \]\] && { _account_invalidate_identity "[$]project" "[$]box" || true; }$@  :@
+  s@^  \[\[ "[$]current" != "[$]acct" \]\] && { _account_invalidate_identity "[$]project" "[$]box" "[$]cname" || _id_rc=[$]?; }$@  :@
 }
 SED
 try "vnext_account_switch_invalidates_identity" "switching drops the identity the box is carrying" "$CLI" "$ACCOUNTS_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_account_do_switch()/,/^}$/{
-  s@^    _account_invalidate_identity "[$]project" "[$]box" || true$@    :@
+  s@^    _account_invalidate_identity "[$]project" "[$]box" "[$]cname" || _id_rc=[$]?$@    :@
 }
 SED
 try "vnext_account_unpin_invalidates_identity" "unpinning drops it too" "$CLI" "$ACCOUNTS_BATS"
@@ -6624,18 +6764,114 @@ try "vnext_account_unpin_invalidates_identity" "unpinning drops it too" "$CLI" "
 # An atomic rename swaps the inode out from under a running container, which is
 # why the stopped-box rebuild refuses to touch one at all.
 cat > "$SED_TMP" << 'SED'
-/^_account_invalidate_identity()/,/^}$/{
-  s@^    cat "[$]tmp" > "[$]f" 2>/dev/null || true$@    mv -f "$tmp" "$f" 2>/dev/null || true@
+/^_claude_json_drop_identity()/,/^}$/{
+  s@^  _write_in_place "[$]tmp" "[$]f" || rc=1$@  mv -f "$tmp" "$f" 2>/dev/null || rc=1@
 }
 SED
 try "vnext_account_identity_inplace" "the identity delete keeps the file" "$CLI" "$ACCOUNTS_BATS"
 
+# Two guards cooperate and only the OUTCOME is observable, so the mutation
+# removes both: the refusal in the delete and the one in the writer.
 cat > "$SED_TMP" << 'SED'
-/^_account_invalidate_identity()/,/^}$/{
+/^_claude_json_drop_identity()/,/^}$/{
   s@^  \[\[ -L "[$]f" \]\] && return 0$@  :@
+}
+/^_write_in_place()/,/^}$/{
+  s@ && ! -L "[$]dst"@@
 }
 SED
 try "vnext_account_identity_symlink" "the identity delete refuses a symlinked store" "$CLI" "$ACCOUNTS_BATS"
+
+# The box's claude.json is a single-file bind mount, so it is rewritten in
+# place. A truncating write leaves it empty until the bytes land, and Claude
+# Code reads it there: a starting session stops on "Configuration error" and a
+# running one writes its cached identity back over the edit.
+cat > "$SED_TMP" << 'SED'
+/^_write_in_place()/,/^}$/{
+  s@^  cat "[$]src" 1<> "[$]dst" 2>/dev/null$@  cat "$src" > "$dst" 2>/dev/null@
+}
+SED
+try "vnext_account_identity_no_truncate" "identity delete never empties claude"
+try "v1.4.3_attach_heal_no_truncate" "attach heal never empties claude"
+
+# Without the pad a shorter rewrite leaves the old file's tail behind it, which
+# is broken JSON rather than an empty file.
+cat > "$SED_TMP" << 'SED'
+/^_write_in_place()/,/^}$/{
+  s@^  if (( new < old )); then$@  if (( new < 0 )); then@
+}
+SED
+try "vnext_account_identity_pad" "identity delete never empties claude"
+
+# The switch's own live gate runs seconds before the identity delete, with a
+# harvest, a staging and a usage poll in between.
+cat > "$SED_TMP" << 'SED'
+/^_account_invalidate_identity_key()/,/^}$/{
+  s@^  if \[\[ -n "[$]cname" \]\] && _box_claude_live "[$]cname"; then$@  if false; then@
+}
+SED
+try "vnext_account_identity_live_at_write" "starts during an account switch"
+
+# The heal's first live check runs before a rebuild that scans every sibling
+# project, which can take seconds.
+cat > "$SED_TMP" << 'SED'
+/^_refresh_attached_claude_json()/,/^}$/{
+  s@^     && ! _box_has_live_agent "[$]cname"; then$@     \&\& true; then@
+}
+SED
+try "v1.4.3_attach_heal_recheck_live" "asks for a live Claude again"
+
+# `cleat account rm` unpins boxes in other projects. Without this it left the
+# removed account's email in every one of them.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s@^      _account_invalidate_identity_key "[$]key" "[$]b" || true$@      :@
+}
+SED
+try "vnext_account_remove_invalidates_identity" "removing an account drops the identity its pinned boxes carry"
+
+# The pin's second line is the only link from a container name back to the
+# per-project file the box binds.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^  _box_account_write "[$]cname" "[$]acct" "[$](_derive_project_session_key "[$]project" "[$]box")" @  _box_account_write "$cname" "$acct" @
+}
+SED
+try "vnext_account_pin_records_key" "removing an account drops the identity its pinned boxes carry"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_rename_locked()/,/^}$/{
+  s@^    _box_account_write "[$]b" "[$]new" "[$](_box_account_key "[$]b" || true)" || true$@    _box_account_write "$b" "$new" || true@
+}
+SED
+try "vnext_account_rename_keeps_key" "a renamed account still drops its boxes" "$CLI" "$ACCOUNTS_BATS"
+
+# The pin file is hand-editable and its second line is joined into a path.
+cat > "$SED_TMP" << 'SED'
+/^_account_session_key_ok()/,/^}$/{
+  s@^  local _key_re=.*$@  local _key_re='.'@
+}
+SED
+try "vnext_account_pin_key_one_segment" "a hand-edited pin key never reaches outside the projects store" "$CLI" "$ACCOUNTS_BATS"
+
+# An in-box login lands only in that box's per-project file, so an unpinned box
+# takes the newest sibling that has one. A pinned sibling holds a named
+# account's identity and nothing inside the file says whose it is.
+cat > "$SED_TMP" << 'SED'
+/^_newest_sibling_identity()/,/^}$/{
+  s@^    \[\[ "[$]pinned" == \*":[$]{k}:"\* \]\] && continue$@    :@
+}
+SED
+try "vnext_account_sibling_skips_pinned" "inherits a pinned sibling"
+
+# The rc-3 notice reads a variable that is only set when the delete was
+# actually skipped, so both branches have to declare it.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^  local _id_rc=0$@  :@
+}
+SED
+try "vnext_account_switch_id_rc_declared" "account switch drops a stored identity" "$CLI" "$SMOKE_BATS"
 
 # Claude guards the usage cache against cross-account reuse with an accountUuid
 # comparison against oauthAccount, which a pinned box has removed.
@@ -6643,6 +6879,56 @@ cat > "$SED_TMP" << 'SED'
 s@ | del(.cachedUsageUtilization) else . end)@ else . end)@
 SED
 try "vnext_account_usage_cache_dropped" "a pinned box does not inherit the shared usage cache" "$CLI" "$ACCOUNTS_BATS"
+
+# ── the identity drop on a host with no jq ──────────────────────────────────
+#
+# The box's own jq does the transform as a stdin-to-stdout filter and the host
+# still makes the only write. What the host cannot finish right then (no jq and
+# no running box) is flagged next to the file, and the next launch clears it.
+
+# The pinned del lives inside the jq program, so the no-jq branch of the
+# builder has nothing to offer but the flag.
+cat > "$SED_TMP" << 'SED'
+/^_build_project_claude_json()/,/^}$/{
+  s@^      : > "[$]{out}.identity-stale" 2>/dev/null || true$@      :@
+}
+SED
+try "vnext_account_nojq_builder_flags" "a box created pinned on a jq-less host does not launch with the host account"
+
+# A stopped box cannot be asked for its jq, so the switch leaves the job for
+# the launch instead of dropping it.
+cat > "$SED_TMP" << 'SED'
+/^_account_invalidate_identity_key()/,/^}$/{
+  s@^    : > "[$]{f}.identity-stale" 2>/dev/null || true$@    :@
+}
+SED
+try "vnext_account_nojq_switch_flags" "clears the named account from a stopped box put back on the shared login"
+
+# The launch is the one moment that has both the flag and a running box, and it
+# is the last one before Claude reads the file.
+cat > "$SED_TMP" << 'SED'
+/^_refresh_attached_claude_json()/,/^}$/{
+  s@^  _claude_json_clear_stale_identity "[$]cname" "[$]f" "[$]box"$@  :@
+}
+SED
+try "vnext_account_nojq_launch_clears" "clears the old account from a box switched while stopped"
+
+# Without the in-box filter a jq-less host cannot edit the file at all.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_drop_identity()/,/^}$/{
+  s@^    { \[\[ -n "[$]cname" \]\] && _daemon_up && is_running "[$]cname"; } || return 1$@    return 1@
+}
+SED
+try "vnext_account_nojq_inbox_filter" "clears the old account at the switch when the box is running"
+
+# A delete under a live Claude Code makes it refuse its own later saves of that
+# file, and its cached copy lands back on top of the edit.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_clear_stale_identity()/,/^}$/{
+  s@^  if ! _box_has_live_agent "[$]cname" && _claude_json_drop_identity@  if _claude_json_drop_identity@
+}
+SED
+try "vnext_account_nojq_live_gate" "never edits the file under a live Claude"
 
 # A box created before the auth mount keeps its pin and the attach falls back
 # to the shared login, so anything that REPORTS the account has to ask the same
@@ -6793,6 +7079,1085 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_account_trash_text_pointer" "the plain list points at the trash when something" "$CLI" "$ACCOUNTS_BATS"
+
+# ── the account lock, the read-once snapshot and the refusal copy ───────────
+
+# vnext: an attach that had read pin a staged a's login over the b a concurrent
+# switch had just staged (5 in 100 natural runs). The attach waits for the lock.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in()/,/^}$/{
+  s/^  _account_with_lock _account_sync_in_locked "[$]1"$/  _account_sync_in_locked "$1"/
+}
+SED
+try "vnext_account_lock_attach" "an attach cannot stage the old account"
+
+# vnext: the switch holds the lock from its pin read to the staging, or a
+# session-end harvest writes an older generation over the one it harvested.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s/^  if ! _account_lock; then$/  if false; then/
+}
+SED
+try "vnext_account_lock_switch" "a session-end harvest cannot write the new account"
+
+# The hold runs on through the unpin, the pin write and the staging. Let go
+# after the harvest and an attach stages the old account under the new pin.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s/^  elif ! _account_release_staged_locked "[$]cname"; then$/  elif ! { _account_release_staged_locked "$cname" \&\& _account_unlock; }; then/
+  s/^  _account_unlock$/  :/
+}
+SED
+try "vnext_account_lock_switch_holds_to_staging" "an attach during the unpin and staging of a switch waits"
+
+# vnext: the session-end harvest holds it too, or it writes the credential it
+# checked over what a switch harvested and staged meanwhile.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_out()/,/^}$/{
+  s/^  _account_with_lock _account_sync_out_locked "[$]1"$/  _account_sync_out_locked "$1"/
+}
+SED
+try "vnext_account_lock_harvest" "a session-end harvest cannot write the new account"
+
+# vnext: rename moves the store before it rewrites the pins, so an attach in
+# between found no store and deleted the staged login.
+cat > "$SED_TMP" << 'SED'
+s/^_account_rename() { _account_with_lock _account_rename_locked "[$]@"; }$/_account_rename() { _account_rename_locked "$@"; }/
+SED
+try "vnext_account_lock_rename" "an attach during a rename stages from the renamed store"
+
+# vnext: remove holds it from the pinned-box read to the unpin, so no box is
+# left pinned to a store that is already in the trash.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s/^  if ! _account_lock; then$/  if false; then/
+}
+SED
+try "vnext_account_lock_remove" "a box pinned while its account is being removed"
+
+# vnext: the harvest decides and writes from ONE copy of a file the box can
+# rewrite at any moment. Hand it the box path again and a blank or a symlink to
+# a host file that lands after the checks reaches the store.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_out_locked()/,/^}$/{
+  s/_account_harvest_from "[$]acct" "[$]cname" "[$]snap"/_account_harvest_from "$acct" "$cname" "$box_cred"/
+}
+SED
+try "vnext_account_harvest_one_read" "a harvest writes only the bytes it checked"
+
+# vnext: a lock timeout never falls through to an unlocked write.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock()/,/^}$/{
+  s/^    if \[\[ [$]polls -ge [$]max \]\]; then return "[$]_ACCOUNT_LOCK_BUSY"; fi$/    if [[ $polls -ge $max ]]; then return 0; fi/
+}
+SED
+try "vnext_account_lock_no_fallthrough" "a switch that cannot take the account lock changes nothing"
+
+# Every locked action releases the lock, or every later attach waits out the timeout.
+cat > "$SED_TMP" << 'SED'
+/^_account_with_lock()/,/^}$/{
+  s/^  _account_unlock$/  :/
+}
+SED
+try "vnext_account_lock_released" "every locked action releases the account lock" "$CLI" "$ACCOUNTS_BATS"
+
+# A lock whose owner exited (a Ctrl-C inside a locked section) is taken over.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock_is_stale()/,/^}$/{
+  s/^  return 0$/  return 1/
+}
+SED
+try "vnext_account_lock_dead_owner" "a lock whose owner has exited is taken over" "$CLI" "$ACCOUNTS_BATS"
+
+# A lock with no owner record yet belongs to a winner a moment from writing it.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock_is_stale()/,/^}$/{
+  s/^    if \[\[ [$]age -gt [$]_ACCOUNT_LOCK_GRACE_S \]\]; then return 0; fi$/    return 0/
+}
+SED
+try "vnext_account_lock_grace_honoured" "a lock with no owner record yet is honoured" "$CLI" "$ACCOUNTS_BATS"
+
+# One that stays record-less past the grace period was killed in that moment.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock_is_stale()/,/^}$/{
+  s/^    if \[\[ [$]age -gt [$]_ACCOUNT_LOCK_GRACE_S \]\]; then return 0; fi$/    return 1/
+}
+SED
+try "vnext_account_lock_grace_expires" "a lock with no owner record yet is honoured" "$CLI" "$ACCOUNTS_BATS"
+
+# A pid recycled after a reboot must not wedge every account command.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock_is_stale()/,/^}$/{
+  s/^  if \[\[ [$]age -gt [$]_ACCOUNT_LOCK_STALE_S \]\]; then return 0; fi$/  :/
+}
+SED
+try "vnext_account_lock_age_bound" "a lock past the age bound is taken over" "$CLI" "$ACCOUNTS_BATS"
+
+# A live owner is waited on, never robbed.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock_is_stale()/,/^}$/{
+  /^  kill -0 "[$]o_pid" 2>\/dev\/null && return 1$/d
+  /^  ps -p "[$]o_pid" >\/dev\/null 2>&1 && return 1$/d
+}
+SED
+try "vnext_account_lock_live_owner" "a lock held by a live process is waited on" "$CLI" "$ACCOUNTS_BATS"
+
+# Another machine's pid cannot be probed from this one, so age alone decides.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock_is_stale()/,/^}$/{
+  s/^  \[\[ "[$]o_host" == "[$]{HOSTNAME:-unknown}" \]\] .. return 1$/  :/
+}
+SED
+try "vnext_account_lock_foreign_host" "a lock held by a live process is waited on" "$CLI" "$ACCOUNTS_BATS"
+
+# The steal re-checks what it moved aside and gives back a lock that changed hands.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock()/,/^}$/{
+  s/^        if \[\[ "[$]captured" == "[$]owner" \]\]; then$/        if true; then/
+}
+SED
+try "vnext_account_lock_steal_recheck" "a steal gives back a lock that changed hands" "$CLI" "$ACCOUNTS_BATS"
+
+# A release only ever removes its own lock.
+cat > "$SED_TMP" << 'SED'
+/^_account_unlock()/,/^}$/{
+  s/^  \[\[ -n "[$]_ACCOUNT_LOCK_OWNER" && "[$]owner" == "[$]_ACCOUNT_LOCK_OWNER" \]\] .. return 0$/  :/
+}
+SED
+try "vnext_account_unlock_own_only" "releasing never removes a lock another process now holds" "$CLI" "$ACCOUNTS_BATS"
+
+# Something this CLI did not create at the lock path is refused at once, never
+# polled for the whole wait.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock()/,/^}$/{
+  s/^    if \[\[ -L "[$]lock" \]\] .. { .*; then$/    if false; then/
+}
+SED
+try "vnext_account_lock_symlink" "something this CLI did not create at the lock path" "$CLI" "$ACCOUNTS_BATS"
+
+# A wipe that cannot take the lock keeps the staged credential.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^    warn "Kept the staged login for .*/    rm -rf "${CLEAT_RUN_DIR:?}\/${cname}" 2>\/dev\/null || true/
+}
+SED
+try "vnext_account_wipe_busy_keeps" "a wipe that cannot take the account lock keeps the staged credential" "$CLI" "$ACCOUNTS_BATS"
+
+# An unpinned box has no login to lose, so its wipe never waits on the lock or
+# keeps a stale run dir because of it.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^  if \[\[ ! -e "[$]pin" && ! -L "[$]pin" \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_unpinned_wipe_no_lock" "wipe takes no lock and removes everything" "$CLI" "$ACCOUNTS_BATS"
+
+# A session end that cannot take the lock says the refreshed login was not saved.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_account_harvest_busy()/,/^}$/{
+  s/^  \[\[ "[$]{1:-0}" -eq [$]_ACCOUNT_LOCK_BUSY \]\] .. return 0$/  return 0/
+}
+SED
+try "vnext_account_session_busy_says" "a session that cannot take the account lock touches neither" "$CLI" "$ACCOUNTS_BATS"
+
+# And says it after the clean-exit reclaim. Printed straight after the terminal
+# is restored, its last line was the one the reclaim's cursor-up erased.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s/^  _restore_terminal$/  _restore_terminal; _maybe_report_account_harvest_busy "$_harvest"/
+  /^  _maybe_report_account_harvest_busy "[$]_harvest"$/d
+}
+SED
+try "vnext_account_session_busy_after_reclaim" "the session-end busy note comes after the reclaim" "$CLI" "$ACCOUNTS_BATS"
+
+# nuke harvests every pinned box before it wipes the run dir. A harvest that
+# cannot take the lock keeps the dir instead of falling through to the wipe.
+cat > "$SED_TMP" << 'SED'
+/^cmd_nuke()/,/^}$/{
+  s/^    _account_release_all .. _rel=[$]?$/    :/
+}
+SED
+try "vnext_account_nuke_busy_keeps" "a nuke that cannot take the account lock keeps the run dir" "$CLI" "$ACCOUNTS_BATS"
+
+# And that harvest takes the lock at all, or it never reports busy.
+cat > "$SED_TMP" << 'SED'
+/^_account_release_all()/,/^}$/{
+  s/^  _account_with_lock _account_release_all_locked$/  _account_release_all_locked/
+}
+SED
+try "vnext_account_sync_out_all_locks" "a nuke that cannot take the account lock keeps the run dir" "$CLI" "$ACCOUNTS_BATS"
+
+# rename and restore map a busy lock to the busy copy. Dropped, a restore says
+# the account is not in the trash and a rename says it could not rename.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_rename()/,/^}$/{
+  s/^  if \[\[ [$]rc -eq [$]_ACCOUNT_LOCK_BUSY \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_rename_busy_says" "rename and restore that cannot take the account lock say so" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_restore()/,/^}$/{
+  s/^  if \[\[ [$]rc -eq [$]_ACCOUNT_LOCK_BUSY \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_restore_busy_says" "rename and restore that cannot take the account lock say so" "$CLI" "$ACCOUNTS_BATS"
+
+# And an attach that cannot take it says the box starts on the login it has.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s/^  if \[\[ [$]_si -eq [$]_ACCOUNT_LOCK_BUSY \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_attach_busy_says" "a session that cannot take the account lock touches neither" "$CLI" "$ACCOUNTS_BATS"
+
+# The top-of-verb harvest that cannot take the lock stops the verb, instead of
+# letting it wait out the timeout a second time.
+cat > "$SED_TMP" << 'SED'
+/^cmd_account()/,/^}$/{
+  s/^  if \[\[ [$]_harvest -eq [$]_ACCOUNT_LOCK_BUSY && "[$]sub" != "list" && "[$]sub" != "trash" && "[$]sub" != "held" \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_verb_busy_stops" "a verb that cannot take the account lock changes nothing" "$CLI" "$ACCOUNTS_BATS"
+
+# The plain list changes nothing, so it still draws while the lock is held.
+cat > "$SED_TMP" << 'SED'
+/^cmd_account()/,/^}$/{
+  s/ && "[$]sub" != "list" && / \&\& /
+}
+SED
+try "vnext_account_verb_busy_list_draws" "a verb that cannot take the account lock changes nothing" "$CLI" "$ACCOUNTS_BATS"
+
+# A pin rewrite is temp and rename. An empty pin reads as the shared login to
+# every reader that does not take the lock.
+cat > "$SED_TMP" << 'SED'
+/^_box_account_write()/,/^}$/{
+  s/^  printf '%s\\n' "[$]acct" > "[$]tmp" .*/  printf '%s\\n' "$acct" > "$f" || return 1/
+  s/^  mv -f "[$]tmp" "[$]f" .*/  :/
+}
+SED
+try "vnext_account_pin_atomic" "a pin rewrite never shows a reader an empty pin" "$CLI" "$ACCOUNTS_BATS"
+
+# A locked body calling a locking wrapper nests instead of timing out on itself.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock()/,/^}$/{
+  s/^  if \[\[ [$]_ACCOUNT_LOCK_DEPTH -gt 0 \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_lock_reentrant" "a locked body that calls a locking wrapper nests" "$CLI" "$ACCOUNTS_BATS"
+
+# mkdir -p creates the pin directory at the host umask, which listed every
+# container name and its account to other local users.
+cat > "$SED_TMP" << 'SED'
+/^_box_account_write()/,/^}$/{
+  s/^  chmod 700 "[$]CLEAT_BOX_ACCOUNTS_DIR" 2>\/dev\/null .. true$/  :/
+}
+SED
+try "vnext_account_pin_dir_mode" "the pin directory is not readable by other users" "$CLI" "$ACCOUNTS_BATS"
+
+# The snapshot opens the file once and checks again that the path is not a
+# symlink. Without the second check a symlink swapped in after the first one
+# has the host read the file it points at.
+cat > "$SED_TMP" << 'SED'
+/^_account_snapshot_cred()/,/^}$/{
+  s/^         \[\[ ! -L "[$]src" && "[$]src" -ef \/dev\/fd\/3 \]\] .. exit 1$/         [[ "$src" -ef \/dev\/fd\/3 ]] || exit 1/
+}
+SED
+try "vnext_account_snapshot_relink" "a snapshot refuses a symlink swapped in after the regular-file check" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: the refusal said Claude Code notices a swap and undoes it, which
+# 2.1.270 does not do. Put the old copy back in the shared printer.
+cat > "$SED_TMP" << 'SED'
+/^_account_live_refusal()/,/^}$/{
+  s@Claude Code only takes a login change in full when it starts[.]@Swapping the credential under a running session is noticed and undone.@
+}
+SED
+try "vnext_account_live_refusal_copy" "live-session refusal never claims Claude Code undoes"
+
+# The unpin gate re-inlined past the printer with the old copy.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^      _account_live_refusal "\(.*\)"$@      error "\1"; echo -e "    ${DIM}Exit it first. Swapping the credential under a running session is noticed and undone.${RESET}"@
+}
+SED
+try "vnext_account_live_refusal_default" "live-session refusal never claims Claude Code undoes"
+
+# The remove gate loses its reason, which is what it printed before.
+cat > "$SED_TMP" << 'SED'
+/^_account_remove_live_gate()/,/^}$/{
+  s@^      _account_live_refusal "\(A box pinned to .*\)"$@      error "\1"; echo -e "    ${DIM}Exit it first.${RESET}"@
+}
+SED
+try "vnext_account_live_refusal_remove" "live-session refusal never claims Claude Code undoes"
+
+# vnext: account rm asked about live sessions only before its question, which
+# can stay on screen indefinitely. Drop the second asking.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  /_ask_yn ans/,/^}$/{
+    s/^  _account_remove_live_gate "[$]acct" .. return 1$/  :/
+  }
+}
+SED
+try "vnext_account_rm_regates_after_prompt" "account rm asks again whether a session is live after its question"
+
+# And the boxes pinned while the question was open are read again under the
+# lock, or one stays pinned to a store in the trash.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  /^  if ! _account_lock; then$/,/^}$/{
+    /^  pinned="[$](_account_pinned_boxes "[$]acct")"$/d
+  }
+}
+SED
+try "vnext_account_rm_rereads_pins" "a box pinned while rm waits at its prompt is unpinned too" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: the usage poll (up to 3 s) ran between the switch's harvest and its
+# staging. Put it back before the harvest.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^  elif ! _account_release_staged_locked "[$]cname"; then$@  elif ! { _account_usage_fetch "$current" >/dev/null 2>\&1; _account_release_staged_locked "$cname"; }; then@
+}
+SED
+try "vnext_account_switch_usage_after_stage" "a switch finishes staging before it waits on the usage API"
+
+# vnext: a harvest that finished after `cleat account rm` in another terminal
+# ran mkdir -p on the store and put the account back, so restore refused. Put
+# the creating call back.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_cred()/,/^}$/{
+  s/^  _account_exists "[$]acct" .. return 1$/  _account_ensure_dir "$acct" || return 1/
+}
+SED
+try "vnext_account_harvest_never_creates" "a session-end harvest that loses the race with account rm"
+
+# The decline has to be a failure, or the wipe deletes the only copy of what
+# the box refreshed.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_cred()/,/^}$/{
+  s/^  _account_exists "[$]acct" .. return 1$/  _account_exists "$acct" || return 0/
+}
+SED
+try "vnext_account_gone_store_declines" "a harvest for an account that is gone creates nothing" "$CLI" "$ACCOUNTS_BATS"
+
+# The usage poll records its numbers after a network wait. Those writes must
+# not recreate a store removed meanwhile.
+cat > "$SED_TMP" << 'SED'
+/^_account_meta_set()/,/^}$/{
+  s/^  _account_exists "[$]acct" .. return 1$/  _account_ensure_dir "$acct" || return 1/
+}
+SED
+try "vnext_account_meta_never_creates" "a usage poll that outlives account rm" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: the attach deleted the staged file whenever the account store was
+# empty, which lost a /login made in the box that nothing had harvested and
+# signed out the Claude running on it. Put the delete back.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^      _account_sync_out_locked "[$]cname" .. true$@      rm -f "$box_cred" 2>/dev/null || true@
+}
+SED
+try "vnext_account_empty_store_keeps_login" "an unharvested login in a pinned box survives the next attach"
+
+# After that harvest nothing is staged back, so the file a live session reads
+# keeps its inode.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^    return 0$@    :@
+}
+SED
+try "vnext_account_empty_store_no_restage" "an unharvested login in a pinned box survives the next attach"
+
+# A pin to a store that is gone, or to a symlink where a store should be, stages
+# nothing over the box's login.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^  _account_exists "[$]acct" .. return 0$@  true@
+}
+SED
+try "vnext_account_missing_store_untouched" "an attach pinned to a missing account keeps the staged login" "$CLI" "$ACCOUNTS_BATS"
+
+# ── every deleter keeps what the harvest did not take ──────────────────────
+
+# vnext: a declined harvest returned 0, the same as "the store holds it", and
+# every deleter then removed a login no store had. Collapse status 3 into 0.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^    return 3$/    return 0/
+}
+SED
+try "vnext_account_declined_status" "cleat rm keeps a staged login its account store does not have"
+
+# The wipe holds a login the store does not have before it deletes.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^      _account_hold_staged_locked "[$]cname" .. keep_auth=1$/      :/
+}
+SED
+try "vnext_account_wipe_holds_declined" "cleat rm keeps a staged login its account store does not have"
+
+# A wipe that cannot take the lock still holds a journal before the rest of the
+# run dir goes.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^    _account_hold_run_extras "[$]cname" .. return 0$/    :/
+}
+SED
+try "vnext_journal_busy_wipe_holds" "a wipe that cannot take the account lock keeps the staged credential" "$CLI" "$ACCOUNTS_BATS"
+
+# The same refusal through the real binary under strict mode.
+cat > "$SED_TMP" << 'SED'
+/^cmd_clean()/,/^}$/{
+  s/^  if ! _daemon_up; then$/  if false; then/
+}
+SED
+try "v1.4.3_clean_refuses_blind_daemon_smoke" "cleat clean with the daemon down removes no box state" "$CLI" "$SMOKE_BATS"
+
+# The one choke point before a switch, a remove or nuke deletes a staged file.
+cat > "$SED_TMP" << 'SED'
+/^_account_release_staged_locked()/,/^}$/{
+  s/^  _account_hold_staged_locked "[$]cname"$/  return 0/
+}
+SED
+try "vnext_account_release_holds" "switching accounts keeps a refreshed login whose harvest failed"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s/^  elif ! _account_release_staged_locked "[$]cname"; then$/  elif ! { _account_sync_out_locked "$cname" || true; }; then/
+}
+SED
+try "vnext_account_switch_releases" "switching accounts keeps a refreshed login whose harvest failed"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s/^    if ! _account_release_staged_locked "[$]cname"; then$/    if ! { _account_sync_out_locked "$cname" || true; }; then/
+}
+SED
+try "vnext_account_unpin_releases" "going back to the shared login keeps a staged login its account does not have"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s/^    if ! _account_release_staged_locked "[$]b"; then$/    if ! { _account_sync_out_locked "$b" || true; }; then/
+}
+SED
+try "vnext_account_remove_releases" "removing an account keeps a staged login it does not have"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_release_all_locked()/,/^}$/{
+  s/^    _account_release_staged_locked "[$]base" .. rc=1$/    _account_sync_out_locked "$base" || true/
+}
+SED
+try "vnext_account_nuke_releases" "nuke keeps a staged login its account does not have"
+
+# A login that cannot be kept stops the switch, the unpin and the remove.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold()/,/^}$/{
+  s/^  hdir="[$](_account_held_dir)" || return 1$/  hdir="$(_account_held_dir)" || return 0/
+}
+SED
+try "vnext_account_switch_refuses_unkept" "a switch that cannot keep the outgoing login changes nothing" "$CLI" "$ACCOUNTS_BATS"
+
+# The store's own login is not worth a held copy.
+cat > "$SED_TMP" << 'SED'
+/^_account_staged_absorbed()/,/^}$/{
+  s/^  \[\[ -n "[$]srt" && "[$]brt" == "[$]srt" \]\]$/  false/
+}
+SED
+try "vnext_account_absorbed_no_noise" "a staged login the store already holds is wiped with no held copy" "$CLI" "$ACCOUNTS_BATS"
+
+# A link in the box's auth dir is never read into the held logins. All three
+# refusals go, or the snapshot's own check stands in for the one under test.
+cat > "$SED_TMP" << 'SED'
+/^_account_keepable_snapshot()/,/^}$/{
+  s/^  \[\[ -f "[$]f" && ! -L "[$]f" \]\] || return 1$/  [[ -f "$f" ]] || return 1/
+}
+/^_account_snapshot_cred()/,/^}$/{
+  s/^  \[\[ -f "[$]src" && ! -L "[$]src" \]\] || return 1$/  [[ -f "$src" ]] || return 1/
+  s/^         \[\[ ! -L "[$]src" && "[$]src" -ef \/dev\/fd\/3 \]\] || exit 1$/         :/
+}
+SED
+try "vnext_account_hold_refuses_symlink" "a symlinked staged credential is never copied into the held logins" "$CLI" "$ACCOUNTS_BATS"
+try "vnext_journal_skips_links" "leftover files skips links" "$CLI" "$ACCOUNTS_BATS"
+
+# auth/ swapped for a link to a host directory is not read through either.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold_run_extras()/,/^}$/{
+  s/^    \[\[ "[$]{f%\/\*}" == "[$]auth" && -L "[$]auth" \]\] && continue$/    :/
+}
+SED
+try "vnext_journal_skips_linked_auth" "leftover files skips links" "$CLI" "$ACCOUNTS_BATS"
+
+# No harvest looks at an unpinned box, so its staged file is held by release.
+cat > "$SED_TMP" << 'SED'
+/^_account_release_staged_locked()/,/^}$/{
+  s/^  if \[\[ "[$](_box_account_read "[$]cname")" != "[$]_ACCOUNT_DEFAULT" \]\]; then$/  if true; then/
+}
+SED
+try "vnext_account_release_unpinned_orphan" "switching an unpinned box keeps a login left in its auth dir" "$CLI" "$ACCOUNTS_BATS"
+
+# A refused staged file that is not a login does not keep auth/ forever.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^      elif \[\[ [$]src -ne 1 \]\]; then$/      else/
+}
+SED
+try "vnext_account_wipe_drops_junk" "a wipe does not keep a staged file that is not a credential" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: a wipe knew about one file. A journal in the run dir died with it.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^  if ! _account_hold_run_extras "[$]cname"; then$/  if false; then/
+}
+SED
+try "vnext_journal_wipe_holds" "credential journal left in a box auth dir"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s/^    if ! _account_hold_run_extras "[$]cname"; then$/    if false; then/
+}
+SED
+try "vnext_journal_unpinned_wipe_holds" "credential journal left in a box auth dir"
+
+# Every journal name starts with a dot and a bare glob skips it.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold_run_extras()/,/^}$/{
+  s#^  for f in .*; do$#  for f in "$rd"/* "$auth"/*; do#
+}
+SED
+try "vnext_journal_dotfiles" "credential journal left in a box auth dir"
+
+# nuke looked only at pinned boxes before it removed every run dir.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold_all_run_extras()/,/^}$/{
+  s/^    _account_hold_run_extras "[$]{d##\*\/}" .. rc=1$/    :/
+}
+SED
+try "vnext_journal_nuke_every_run_dir" "cleat nuke keeps a credential journal"
+
+# An unpinned box has no harvest, so its staged file is not skipped as owned.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold_run_extras()/,/^}$/{
+  s/^    owned=""$/    :/
+}
+SED
+try "vnext_journal_unpinned_staged" "cleat nuke keeps a credential journal"
+
+# A wipe that could not keep a login deletes nothing, pinned or not.
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  /^  if ! _account_hold_run_extras "[$]cname"; then$/,/^  fi$/{
+    s/^    return 0$/    :/
+  }
+}
+SED
+try "vnext_journal_wipe_deletes_nothing" "a wipe that cannot keep a credential journal deletes nothing"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  /^    if ! _account_hold_run_extras "[$]cname"; then$/,/^    fi$/{
+    s/^      return 0$/      :/
+  }
+}
+SED
+try "vnext_journal_wipe_deletes_nothing_unpinned" "a wipe that cannot keep a credential journal deletes nothing"
+
+# The attach staged the store over a login the store did not have. The guard is
+# the first line of a multi-line `if`, so neutralise that line to `if false \`
+# and let the `&& ...` continuation ride, which disables the whole hold branch.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^    if _account_cred_keepable "[$]snap" && ! _account_staged_absorbed "[$]snap" "[$]store_cred" \\@    if false \\@
+}
+SED
+try "vnext_account_attach_holds_unabsorbed" "an attach keeps a login the store does not have"
+
+# v1.4.3: cleat clean pruned every box with the daemon down.
+cat > "$SED_TMP" << 'SED'
+/^cmd_clean()/,/^}$/{
+  s/^  if ! _daemon_up; then$/  if false; then/
+}
+SED
+try "v1.4.3_clean_refuses_blind_daemon" "cleat clean with Docker down removes no box state"
+
+# The held logins are credentials: 0700 directory, 0600 files, no links.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold()/,/^}$/{
+  s/^  chmod 700 "[$]hdir" 2>\/dev\/null .. true$/  :/
+}
+SED
+try "vnext_account_held_dir_mode" "held logins are 0600 in a 0700 directory" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_held_dir()/,/^}$/{
+  s/^  \[\[ -L "[$]d" \]\] && return 1$/  :/
+}
+SED
+try "vnext_account_held_symlink" "held logins are 0600 in a 0700 directory" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_trash_sweep()/,/^}$/{
+  s/^  hdir="[$](_account_held_dir)" .. hdir=""$/  hdir=""/
+}
+SED
+try "vnext_account_held_sweep" "held logins are swept after the trash window" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_accounts_picker_text()/,/^}$/{
+  s/^  _account_held_line "  "$/  :/
+}
+SED
+try "vnext_account_held_listed" "held logins are listed with where they were headed" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_accounts_held_text()/,/^}$/{
+  s/^    echo -e "      [$]{DIM}[$]{where}[$]{RESET}"$/    :/
+}
+SED
+try "vnext_account_held_says_where" "held logins are listed with where they were headed" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_accounts_frame()/,/^}$/{
+  s/^  if \[\[ "[$]_ACCT_VIEW" != "trash" && "[$]{_ACCT_HELD_N:-0}" -gt 0 \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_held_counter" "the live frame advertises held logins" "$CLI" "$ACCOUNTS_BATS"
+
+# adopt is the recovery, so it never loses a login either.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^      _account_hold "[$]store" "[$]name" "" replaced-by-adopt \\$/      : \\/
+}
+SED
+try "vnext_account_adopt_exchange" "adopting into an existing account holds the credential it replaces" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^    _account_ensure_dir "[$]name" .. return 2$/    return 2/
+}
+SED
+try "vnext_account_adopt_creates" "a held login adopted under a new name becomes that account" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s/^    list|rename|rm|delete|restore|trash|held|adopt|off|help) return 1 ;;$/    list|rename|rm|delete|restore|trash|off|help) return 1 ;;/
+SED
+try "vnext_account_reserved_held_adopt" "refuses the subcommand words as names" "$CLI" "$ACCOUNTS_BATS"
+
+# adopt swapped only the store file. A box pinned to the account wrote its
+# fresher staged copy of the old login back at the next session end. Every
+# pinned box is released before the store is replaced...
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^    if ! _account_release_staged_locked "[$]b"; then$/    if false; then/
+}
+SED
+try "vnext_account_adopt_releases_pinned" "a login adopted into an account a box is pinned to survives the next harvest"
+
+# ...and its staged copy goes once the adopted login is written.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^    rm -f "[$](_account_box_auth_dir "[$]b")\/.credentials.json" 2>\/dev\/null .. true$/    :/
+}
+SED
+try "vnext_account_adopt_unstages_pinned" "a login adopted into an account a box is pinned to survives the next harvest"
+
+# A pinned box whose login cannot be kept stops the adopt before any write.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^      return 3$/      continue/
+}
+SED
+try "vnext_account_adopt_refuses_unkept_pinned" "an adopt that cannot keep a pinned box" "$CLI" "$ACCOUNTS_BATS"
+
+# A live session on a pinned box would lose its staged login under it.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_adopt()/,/^}$/{
+  s/^  _account_remove_live_gate "[$]name" .. return 1$/  :/
+}
+SED
+try "vnext_account_adopt_live_gate" "whose pinned box has a live session changes nothing" "$CLI" "$ACCOUNTS_BATS"
+
+# The adopted login's identity replaces the old one, blanks included.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^      if \[\[ -n "[$]v" .. [$]created -eq 0 \]\]; then$/      if [[ -n "$v" ]]; then/
+}
+SED
+try "vnext_account_adopt_identity_cleared" "an adopted login carries its own identity" "$CLI" "$ACCOUNTS_BATS"
+
+# And the replaced login is held under the identity it was saved with.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^        "[$](_account_meta_get "[$]name" who 2>\/dev\/null .. true)" \\$/        "" \\/
+}
+SED
+try "vnext_account_adopt_replaced_identity" "an adopted login carries its own identity" "$CLI" "$ACCOUNTS_BATS"
+
+# The held login is only removed once the store write has landed.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  /if ! _account_write_cred "[$]name" "[$]cred"; then/,/^  fi$/{
+    s/^    return 2$/    :/
+  }
+}
+SED
+try "vnext_account_adopt_keeps_on_failed_write" "an adopt whose store write fails keeps the held login" "$CLI" "$ACCOUNTS_BATS"
+
+# An attach that could not hold the login it would replace stages nothing...
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  /if ! _account_hold_box "[$]snap" "[$]acct" "[$]cname" unsaved; then/,/^      fi$/{
+    s/^        return 1$/        :/
+  }
+}
+SED
+try "vnext_account_attach_refuses_unkept" "an attach that cannot keep the login it would replace" "$CLI" "$ACCOUNTS_BATS"
+
+# ...and says so, or the box runs as someone else in silence.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s/^  elif \[\[ [$]_si -ne 0 && [$]_ACCOUNT_STAGE_UNKEPT -eq 1 \]\]; then$/  elif false; then/
+}
+SED
+try "vnext_account_attach_unkept_warns" "an attach that cannot keep the login it would replace" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s/^    if \[\[ [$]_ACCOUNT_STAGE_UNKEPT -eq 1 \]\]; then$/    if false; then/
+}
+SED
+try "vnext_account_reselect_names_unkept" "an attach that cannot keep the login it would replace" "$CLI" "$ACCOUNTS_BATS"
+
+# nuke keeps the run dir on any failure to keep a login, not only on a busy lock.
+cat > "$SED_TMP" << 'SED'
+/^cmd_nuke()/,/^}$/{
+  s/^    if \[\[ [$]_rel -eq 0 \]\]; then$/    if [[ $_rel -ne $_ACCOUNT_LOCK_BUSY ]]; then/
+}
+SED
+try "vnext_account_nuke_keeps_unkept" "nuke keeps the run dir when a login in it cannot be kept" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_release_all_locked()/,/^}$/{
+  s/^  _account_hold_all_run_extras .. rc=1$/  _account_hold_all_run_extras || true/
+}
+SED
+try "vnext_account_nuke_extras_unkept" "nuke keeps the run dir when a login in it cannot be kept" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_release_all_locked()/,/^}$/{
+  s/^    _account_release_staged_locked "[$]base" .. rc=1$/    _account_release_staged_locked "$base" || true/
+}
+SED
+try "vnext_account_nuke_pinned_unkept" "nuke keeps the run dir when a login in it cannot be kept" "$CLI" "$ACCOUNTS_BATS"
+
+# A copy that cannot be taken is a login that cannot be kept, never junk.
+cat > "$SED_TMP" << 'SED'
+/^_account_keepable_snapshot()/,/^}$/{
+  s/^  snap="[$](_account_snapshot_cred "[$]f")" || return 2$/  snap="$(_account_snapshot_cred "$f")" || return 1/
+}
+SED
+try "vnext_account_snapshot_failure_kept" "a login whose copy cannot be taken is never deleted" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_hold_staged_locked()/,/^}$/{
+  s/^  if \[\[ [$]src -ne 0 \]\]; then return 1; fi$/  if [[ $src -ne 0 ]]; then return 0; fi/
+}
+SED
+try "vnext_account_hold_staged_snapshot_failure" "a login whose copy cannot be taken is never deleted" "$CLI" "$ACCOUNTS_BATS"
+
+# ── identity-verified harvest ───────────────────────────────────────────────
+
+# A newer login is written over the pinned store only when the server names the
+# recorded account. A mismatch is held, never harvested.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^    if \[\[ "[$]uuid" != "[$]rec" \]\]; then$/    if false; then/
+}
+SED
+try "vnext_account_harvest_identity_mismatch" "a login for another account is never harvested over the pinned credential"
+
+# First use trusts the server, but not over a different email the account shows.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^    if \[\[ -n "[$]known" \]\] && ! _account_same_email "[$]known" "[$]who"; then$/    if false; then/
+}
+SED
+try "vnext_account_harvest_first_use_email" "first use never records a login whose email differs"
+
+# A store with no recorded uuid was only ever taken on trust. Its first verified
+# harvest holds the store's own login before writing over it...
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^    if _account_cred_keepable "[$]store_cred"; then$/    if false; then/
+}
+SED
+try "vnext_account_harvest_first_use_holds_store" "a first verified harvest holds the login it writes over"
+
+# ...and writes nothing when that login cannot be kept.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^        "[$](_account_meta_get "[$]acct" org 2>\/dev\/null .. true)" .. return 1$/        "$(_account_meta_get "$acct" org 2>\/dev\/null || true)" || true/
+}
+SED
+try "vnext_account_harvest_first_use_hold_unkept" "a first verified harvest holds the login it writes over"
+
+# A login the server cannot vouch for (401, offline, 5xx) writes nothing.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^  ident="[$](_account_cred_identity "[$]snap")" || return 3$/  ident="$(_account_cred_identity "$snap")" || { _account_write_cred "$acct" "$snap"; return $?; }/
+}
+SED
+try "vnext_account_harvest_cannot_tell" "a harvest the server cannot vouch for writes nothing"
+
+# A switch holds that unverified login before it deletes the staged file.
+cat > "$SED_TMP" << 'SED'
+/^_account_release_staged_locked()/,/^}$/{
+  s/^    case "[$]rc" in 0|2) return 0 ;; esac$/    case "$rc" in 0|2|3) return 0 ;; esac/
+}
+SED
+try "vnext_account_switch_holds_unverified" "switching away holds a staged login nobody could verify"
+
+# The capture never reads the box's project file for identity. The mutation
+# re-adds the read and hands it the file for the account being left.
+cat > "$SED_TMP" << 'SED'
+/^_account_capture_meta()/,/^}$/{
+  s#^  _account_exists "[$]acct" .. return 0$#  _account_exists "$acct" || return 0; [[ -f "${2:-}" ]] \&\& _account_meta_set "$acct" who "$(grep -o '"emailAddress":"[^"]*"' "$2" | cut -d'"' -f4)"#
+}
+/^_account_do_switch()/,/^}$/{
+  s#^  _account_capture_meta "[$]current" .. true$#  _account_capture_meta "$current" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true#
+}
+SED
+try "vnext_account_capture_no_project_file" "switching away never stamps the account with the email in the box project file"
+
+# The same grant is recognised with no request.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^  if _account_staged_absorbed "[$]snap" "[$]store_cred"; then$/  if false; then/
+}
+SED
+try "vnext_account_harvest_fast_path" "an unchanged refresh token is harvested without asking the server" "$CLI" "$ACCOUNTS_BATS"
+
+# The same grant is the Claude login's refresh token, never an MCP entry both
+# files share.
+cat > "$SED_TMP" << 'SED'
+/^_account_staged_absorbed()/,/^}$/{
+  s@^  srt="[$](_account_cred_str "[$]2" refreshToken 2>/dev/null .. true)"$@  srt="$(grep -o '"refreshToken":"[^"]*"' "$2" | head -n1)"@
+  s@^  brt="[$](_account_cred_str "[$]1" refreshToken 2>/dev/null .. true)"$@  brt="$(grep -o '"refreshToken":"[^"]*"' "$1" | head -n1)"@
+}
+SED
+try "vnext_account_fast_path_scoped" "an MCP login both files share never stands in" "$CLI" "$ACCOUNTS_BATS"
+
+# A dead access token is never sent.
+cat > "$SED_TMP" << 'SED'
+/^_account_cred_identity()/,/^}$/{
+  s/^  \[\[ "[$]exp" -gt "[$]now_ms" \]\] || return 3$/  :/
+}
+SED
+try "vnext_account_identity_expired_token" "an expired access token is never sent to the server" "$CLI" "$ACCOUNTS_BATS"
+
+# Any answer but 200 is "cannot tell", whatever its body says.
+cat > "$SED_TMP" << 'SED'
+/^_account_cred_identity()/,/^}$/{
+  s/^  \[\[ "[$]code" == "200" \]\] .. return 3$/  :/
+}
+SED
+try "vnext_account_identity_status_code" "a harvest the server cannot vouch for writes nothing"
+
+# The account object is the only one in the answer.
+cat > "$SED_TMP" << 'SED'
+/^_json_flat_object()/,/^}$/{
+  s/^  case "[$]hit" in ''|\*[$]'\\n'\*) return 0 ;; esac$/  case "$hit" in '') return 0 ;; esac/
+}
+SED
+try "vnext_account_profile_single_match" "the profile reader refuses a shape it does not know" "$CLI" "$ACCOUNTS_BATS"
+
+# The organisation's own empty objects are folded before it is read.
+cat > "$SED_TMP" << 'SED'
+/^_account_profile_parse()/,/^}$/{
+  s@/:null/g'@/:{}/g'@
+}
+SED
+try "vnext_account_profile_org_fold" "identity is captured on a host with no jq" "$CLI" "$ACCOUNTS_BATS"
+
+# One held entry per box, account and reason, the newest.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold()/,/^}$/{
+  s/^    \[\[ -n "[$]uuid" && -n "[$]cname" \]\] || continue$/    continue/
+}
+SED
+try "vnext_account_held_dedupe" "a box that keeps refreshing a foreign login keeps one held entry" "$CLI" "$ACCOUNTS_BATS"
+
+# Only generations of the same verified account fold. A third account's login
+# from the same box is its own entry.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold()/,/^}$/{
+  s/^    \[\[ "[$](_account_meta_get_at "[$]d" uuid 2>\/dev\/null .. true)" == "[$]uuid" \]\] .. continue$/    :/
+}
+SED
+try "vnext_account_held_dedupe_uuid_scope" "a box that keeps refreshing a foreign login keeps one held entry" "$CLI" "$ACCOUNTS_BATS"
+
+# Bytes already proven foreign are not sent to the server again.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  s/^  _account_held_has "[$]cname" "[$]snap" other-account && return 2$/  :/
+}
+SED
+try "vnext_account_held_not_reasked" "a login already held as another account is not sent to the server again" "$CLI" "$ACCOUNTS_BATS"
+
+# The session end says so.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s/^  if \[\[ [$]_harvest -eq 2 \]\]; then$/  if false; then/
+}
+SED
+try "vnext_account_held_notice_wired" "session end says so when the login the box used belongs to another account" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The notice names this box's entry, never a newer one another box held.
+cat > "$SED_TMP" << 'SED'
+/^_account_held_notice()/,/^}$/{
+  s/^    \[\[ -z "[$]f_id" && "[$]box" == "[$]cname" && "[$]reason" == "other-account" \]\] .. continue$/    [[ -z "$f_id" \&\& "$reason" == "other-account" ]] || continue/
+}
+SED
+try "vnext_account_held_notice_box" "session end says so when the login the box used belongs to another account" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# adopt never saves one verified person's login over another's account.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^    if \[\[ -n "[$]huuid" && -n "[$]auuid" && "[$]huuid" != "[$]auuid" \]\]; then$/    if false; then/
+}
+SED
+try "vnext_account_adopt_identity_conflict" "adopt refuses a login verified as a different person" "$CLI" "$ACCOUNTS_BATS"
+
+# An entry nobody verified never clears the identity of the account it joins.
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^  if \[\[ -n "[$]huuid" .. [$]created -eq 1 \]\]; then$/  if true; then/
+}
+SED
+try "vnext_account_adopt_unverified_keeps_identity" "a login nobody verified adopted back into its account keeps the account verified"
+
+# ── single-rename, key-scoped staging ──────────────────────────────────────
+
+# vnext: a switch staged with `rm -f` and renamed the new login in only later,
+# about 25 ms with no credential file at all. A Claude the live gate missed
+# answered "Not logged in" into it. The same removal erased the box's own MCP
+# login, so the one mutation is tried against both tests.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@^  if ! _account_sync_in_locked "[$]cname" "[$]stage_mode"; then$@  rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true; if ! _account_sync_in_locked "$cname" "$stage_mode"; then@
+}
+SED
+try "vnext_account_switch_no_file_gap" "a switch never leaves the box without a credential file"
+try "vnext_account_switch_no_file_gap_mcp" "switching a box to another account keeps its own MCP login"
+
+# Nothing is removed before the staging, so a staging that fails leaves the old
+# login in place and the pin has to go back with it.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s/^      _box_account_write "[$]cname" "[$]current" .*$/      :/
+}
+SED
+try "vnext_account_switch_failed_stage_repins" "a switch that cannot stage puts the pin back on the account it left" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s/^      _box_account_remove "[$]cname"$/      :/
+}
+SED
+try "vnext_account_switch_failed_stage_unpins" "a switch from the shared login that cannot stage leaves the box unpinned" "$CLI" "$ACCOUNTS_BATS"
+
+# A rename onto a directory moves the temp INTO it and reports success.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  s/^  \[\[ -d "[$]dest" \]\] && return 1$/  :/
+}
+SED
+try "vnext_account_stage_refuses_directory" "a switch from the shared login that cannot stage leaves the box unpinned" "$CLI" "$ACCOUNTS_BATS"
+
+# A symlink the box planted at its own staged path must not block a switch.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s/^        rm -f "[$]box_cred" 2>\/dev\/null .. true$/        :/
+}
+SED
+try "vnext_account_switch_drops_symlink" "switching replaces a symlink the box planted" "$CLI" "$ACCOUNTS_BATS"
+
+# vnext: staging copied the whole store over the box's file, erasing an MCP
+# server login made inside the box. Without the base it is a projection again.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s/^  _account_write_file_0600 "[$]store_cred" "[$]box_cred" "[$]snap" .. rc=1$/  _account_write_file_0600 "$store_cred" "$box_cred" || rc=1/
+}
+SED
+try "vnext_account_stage_keeps_box_keys" "an MCP server login made inside a pinned box survives the next attach"
+
+# vnext: the harvest copied the whole box file into the store, so one box's MCP
+# tokens reached the account and every other box pinned to it.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  s/_account_cred_merge "[$]base" "[$]src" > "[$]tmp"/cat "$src" > "$tmp"/
+}
+SED
+try "vnext_account_store_only_account_keys" "never reaches the account store or another box"
+
+# A store write carries the login the readers found. A login nested one level
+# down projected to {} and was written over the account's only copy.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  s/^  if \[\[ -n "[$]src" && -z "[$]base" && .*; then$/  if false; then/
+}
+SED
+try "vnext_account_store_write_keeps_login" "a harvest never writes a store without the login it read" "$CLI" "$ACCOUNTS_BATS"
+
+# A switch to an account with no login strips the account's keys and keeps the
+# rest. Removing the file took the box's MCP login with it.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^    if \[\[ "[$](_account_cred_merge "[$]snap" "" 2>/dev/null .. true)" != "{}" \]\]; then$@    if false; then@
+}
+SED
+try "vnext_account_force_empty_keeps_box_keys" "switching to an account with no login signs the box out but keeps its MCP login" "$CLI" "$ACCOUNTS_BATS"
+
+# The merge output goes into a box or a store, so it never reads through a link.
+cat > "$SED_TMP" << 'SED'
+/^_account_cred_merge()/,/^}$/{
+  s/^  \[\[ -L "[$]base" .. -L "[$]src" \]\] && return 1$/  :/
+}
+SED
+try "vnext_account_merge_refuses_symlink" "the credential merge refuses to read through a symlink" "$CLI" "$ACCOUNTS_BATS"
+
+# The splitter fails closed on bytes after a value instead of copying them.
+cat > "$SED_TMP" << 'SED'
+/^_ACCOUNT_MERGE_AWK='$/,/^}'$/{
+  s/^      if (done && index(" \\t\\r\\n", c) == 0) return 0$/      if (0) return 0/
+}
+SED
+try "vnext_account_merge_fails_closed" "a box file the splitter cannot read is replaced by the account" "$CLI" "$ACCOUNTS_BATS"
+
+# A jq-only branch that behaves differently is exactly the drift jq-optional forbids.
+cat > "$SED_TMP" << 'SED'
+/^_account_cred_merge()/,/^}$/{
+  s/^  local base="[$]1" src="[$]2" have_src=1$/  local base="$1" src="$2" have_src=1; command -v jq >\/dev\/null 2>\&1 \&\& base=/
+}
+SED
+try "vnext_account_merge_same_without_jq" "staging by key writes the same bytes with and without jq" "$CLI" "$ACCOUNTS_BATS"
+
+# An equal expiry rewrote the same login on every attach, moving the file under
+# any session running in the box.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s/ && \[\[ "[$]bobj" != "[$]sobj" \]\]; }/ \&\& true; }/
+}
+SED
+try "vnext_account_attach_skips_identical" "an attach does not rewrite a staged login that already matches the store" "$CLI" "$ACCOUNTS_BATS"
+
+# A held login is the bytes it was found in. A projection loses the box's MCP
+# login and never matches the dedupe's byte compare.
+cat > "$SED_TMP" << 'SED'
+/^_account_hold()/,/^}$/{
+  s/^  if ! _account_copy_whole_0600 "[$]src"/  if ! _account_write_file_0600 "$src"/
+}
+SED
+try "vnext_account_held_copy_whole" "a held login keeps every key the box had" "$CLI" "$ACCOUNTS_BATS"
 
 # ── the browser destination gate ────────────────────────────────────────────
 
@@ -8477,6 +9842,263 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_hooks_cap_description_host_file" "cap_description: hooks names the host settings file" "$CLI" "$HOOKS_BATS"
+
+# ── v1.4.3: `cleat login` never signed anyone in ────────────────────────────
+
+# Claude Code has no top-level `login` subcommand, so the bare word became the
+# first PROMPT of an interactive session.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login() {$/,/^}$/{
+  s|runuser -u coder -- claude auth login|runuser -u coder -- claude login|
+}
+SED
+try "v1.4.3_login_auth_subcommand" "cleat login runs claude auth login"
+
+# A login into a pinned box must be carried to the account. Without the harvest
+# it stayed in the box and the next attach's staging deleted it.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login() {$/,/^}$/{
+  /_account_sync_out "\$cname"/d
+}
+SED
+try "v1.4.3_login_harvests" "cleat login on a pinned box saves the login into the account"
+
+# The closing line must name the store the login really went to, never a fixed
+# claim about the shared one.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login() {$/,/^}$/{
+  s#_account_apply_exec_env "\$cname" || _login_acct="\$_ACCOUNT_DEFAULT"#_account_apply_exec_env "$cname" || true; _login_acct="$_ACCOUNT_DEFAULT"#
+}
+SED
+try "v1.4.3_login_names_account" "cleat login on a pinned box saves the login into the account"
+
+# Exit 0 with an empty account store is not a saved login.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login() {$/,/^}$/{
+  s#_login_harvest -eq 0 && "\$(_account_auth_state "\$_login_acct")" != "signed out"#_login_harvest -eq 0#
+}
+SED
+try "v1.4.3_login_unsaved_warns" "never reports a login saved that did not reach"
+
+# A failed login must exit non-zero.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login() {$/,/^}$/{
+  s#\[\[ \$login_rc -eq 0 \]\] || return "\$login_rc"#[[ $login_rc -eq 0 ]] || return 0#
+}
+SED
+try "v1.4.3_login_failure_rc" "a failed cleat login exits non-zero"
+
+# The destination gate must allow the hosts Claude Code actually authorizes at.
+cat > "$SED_TMP" << 'SED'
+s|^_BROWSER_ORIGINS="claude.ai claude.com platform.claude.com console.anthropic.com$|_BROWSER_ORIGINS="claude.ai console.anthropic.com|
+SED
+try "vnext_browser_claude_authorize_origin" "the Claude authorize URL opens through the browser bridge"
+
+# A login made inside `cleat shell` is harvested when the shell exits.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell() {$/,/^}$/{
+  /_account_sync_out "\$cname" || true/d
+}
+SED
+try "vnext_account_shell_harvests" "a login made in cleat shell on a pinned box is harvested" "$CLI" "$ACCOUNTS_BATS"
+
+# A login the harvest held as another account's is reported, never reported as
+# saved and never reported as merely "did not reach".
+cat > "$SED_TMP" << 'SED'
+/^cmd_login() {$/,/^}$/{
+  s#^  elif \[\[ \$_login_harvest -eq 2 \]\]; then$#  elif false; then#
+}
+SED
+try "vnext_login_held_notice" "cleat login says so when the browser signed in as another account" "$CLI" "$ACCOUNTS_BATS"
+
+# A busy account lock is named rather than reported as a login that missed.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login() {$/,/^}$/{
+  s#^  elif \[\[ \$_login_harvest -eq \$_ACCOUNT_LOCK_BUSY \]\]; then$#  elif false; then#
+}
+SED
+try "vnext_login_busy_notice" "cleat login says so when the harvest could not take the account lock" "$CLI" "$ACCOUNTS_BATS"
+
+# The recreate hint names the box that needs recreating, not main.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env() {$/,/^}$/{
+  s#cleat rm \${_BOX:-main}#cleat rm#
+}
+SED
+try "vnext_account_no_mount_hint_box" "names its own box in the recreate hint" "$CLI" "$ACCOUNTS_BATS"
+
+# v1.4.3: cmd_resume passed --continue, which reopens the newest conversation even
+# when a live Claude in another terminal of the same box has it open. The pick
+# must exclude live ids.
+cat > "$SED_TMP" << 'SED'
+/^_resume_pick_session()/,/^}$/{
+  /case "[$]live" in [*]"[$]uuid"[*]) continue ;; esac/d
+}
+SED
+try "v1.4.3_resume_skips_live_conversation" "resume does not reopen a conversation that is open in another terminal"
+
+# v1.4.3: the resolved id must reach Claude. Reverting the argv to --continue
+# reintroduces the wrong conversation.
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  s|_resume_args=(--resume "[$]_sid")|_resume_args=(--continue)|
+}
+SED
+try "v1.4.3_resume_names_conversation" "resume does not reopen a conversation that is open in another terminal"
+
+# v1.4.3: Claude Code restores the bare model id on resume, so a default-model
+# conversation lost the 1M beta. Dropping the carry reintroduces it.
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  /_resume_args+=(--model "[$]_model")/d
+}
+SED
+try "v1.4.3_resume_carries_1m" "resume keeps the 1M context the conversation ran on"
+
+# ── the live-agent primitive judges the executable ───────────────────────────
+
+# v1.4.3: _box_has_live_agent grepped the whole `docker top` output for
+# claude|node, so a leftover Vite server kept a detached box out of the idle
+# sweep forever. Put the whole-line grep back in front of the column reader.
+cat > "$SED_TMP" << 'SED'
+/^_box_has_live_agent()/,/^}$/{
+  s@^  {$@  grep -qiE 'claude|node' <<< "$top"; return; {@
+}
+SED
+try "v143_live_agent_whole_line_grep" "a leftover node dev server" "$CLI" "$REGRESSIONS"
+
+# The same revert judged by the REAL binary under set -euo pipefail, which is
+# the only place the column reader's arrays and slices actually run strict.
+cat > "$SED_TMP" << 'SED'
+/^_box_has_live_agent()/,/^}$/{
+  s@^  {$@  grep -qiE 'claude|node' <<< "$top"; return; {@
+}
+SED
+try "v143_live_agent_strict_mode_dev_server" "only leftover is a dev server" "$CLI" "$SMOKE_BATS"
+
+# Node alone is not Claude. This is the case the maintainer hit: cleat account
+# refused with "main has a live Claude session" over a dev server.
+cat > "$SED_TMP" << 'SED'
+/^_is_claude_argv()/,/^}$/{
+  s@^    node|\*/node|nodejs|\*/nodejs) ;;$@    node|*/node|nodejs|*/nodejs) return 0 ;;@
+}
+SED
+try "vnext_account_dev_server_not_live" "only node process is a dev server" "$CLI" "$REGRESSIONS"
+
+# The executable is matched by name, never by substring: a plugin's LSP server
+# under ~/.claude/plugins is not Claude.
+cat > "$SED_TMP" << 'SED'
+/^_is_claude_argv()/,/^}$/{
+  s@^    claude|\*/claude|\*/claude/versions/\*) return 0 ;;$@    *claude*) return 0 ;;@
+}
+SED
+try "v143_live_agent_argv0_not_substring" "a leftover node dev server" "$CLI" "$REGRESSIONS"
+
+# Only the command column is judged: on a Linux host whose user is called
+# claude, the UID column is not a process.
+cat > "$SED_TMP" << 'SED'
+/^_box_has_live_agent()/,/^}$/{
+  s#_is_claude_argv "[$]{f\[@\]:[$]col}"#_is_claude_argv "${f[@]}"#
+}
+SED
+try "v143_live_agent_command_column_only" "a leftover node dev server" "$CLI" "$REGRESSIONS"
+
+# A layout with no command column is unreadable, and unreadable means live.
+cat > "$SED_TMP" << 'SED'
+/^_box_has_live_agent()/,/^}$/{
+  s@^    (( col >= 0 )) || return 0 @    (( col >= 0 )) || return 1 @
+}
+SED
+try "v143_live_agent_unknown_layout_is_live" "no command column" "$CLI" "$IDLE_SWEEP_BATS"
+
+# A node row is Claude only when its first non-option argument is a Claude
+# entry point. Judging the options too would miss `node --no-warnings claude`.
+cat > "$SED_TMP" << 'SED'
+/^_is_claude_argv()/,/^}$/{
+  s@^      -\*) ;;$@      -*) return 1 ;;@
+}
+SED
+try "v143_live_agent_node_skips_options" "every process shape a running Claude takes" "$CLI" "$IDLE_SWEEP_BATS"
+
+# The executable name is matched WHOLE. A prefix match reads a third-party CLI
+# called claude-monitor as a live session.
+cat > "$SED_TMP" << 'SED'
+/^_is_claude_argv()/,/^}$/{
+  s@^    claude|\*/claude|\*/claude/versions/\*) return 0 ;;$@    claude*|*/claude*) return 0 ;;@
+}
+SED
+try "v143_live_agent_argv0_matched_whole" "ragged rows" "$CLI" "$IDLE_SWEEP_BATS"
+
+# v1.4.3: the kit note said a STOPPED box had a live session, because docker
+# top fails on one and the note lacked is_running.
+cat > "$SED_TMP" << 'SED'
+/^_kit_apply()/,/^}$/{
+  s@^  if container_exists "[$]cname" \&\& is_running "[$]cname" \&\& _box_has_live_agent "[$]cname"; then$@  if container_exists "$cname" \&\& _box_has_live_agent "$cname"; then@
+}
+SED
+try "v143_kit_note_stopped_box" "enabling a kit on a stopped box" "$CLI" "$REGRESSIONS"
+
+# vnext: two boxes on one account. The attach held the box that fell behind a
+# sibling's refresh, because the rotated refresh token made its staged file
+# look like a login the account does not have.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^       && ! _account_staged_superseded "[$]acct" "[$]snap"; then@       ; then@
+}
+SED
+try "vnext_account_generation_attach_hold" "a box staged on a generation its account already replaced" "$CLI" "$REGRESSIONS"
+
+# The same login through the release path, which every switch, remove and nuke
+# takes: a generation the account moved past is not an unsaved login.
+cat > "$SED_TMP" << 'SED'
+/^_account_harvest_from()/,/^}$/{
+  /_account_staged_superseded/d
+}
+SED
+try "vnext_account_generation_release_hold" "a box staged on a generation its account already replaced" "$CLI" "$REGRESSIONS"
+
+# Nothing recognises a generation the store never wrote down.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_cred()/,/^}$/{
+  /_account_seen_add/d
+}
+SED
+try "vnext_account_generation_recorded" "a box staged on a generation its account already replaced" "$CLI" "$REGRESSIONS"
+
+# vnext: a lock that cannot be MADE was polled for the full timeout, at every
+# attach and again at every session end.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock()/,/^}$/{
+  s@^    if \[\[ ! -e "[$]lock" && ! -L "[$]lock" \]\]; then@    if false; then@
+}
+SED
+try "vnext_account_lock_unwritable_no_wait" "a lock that cannot be made fails at once" "$CLI" "$REGRESSIONS"
+
+# And it named another cleat command rather than the directory it cannot write.
+cat > "$SED_TMP" << 'SED'
+/^_account_busy_msg()/,/^}$/{
+  s@^  if \[\[ "[$]{_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 \]\]; then@  if false; then@
+}
+SED
+try "vnext_account_lock_unwritable_message" "a lock that cannot be made fails at once" "$CLI" "$REGRESSIONS"
+
+# The same at the session end, where a pinned box meets it twice a session.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_account_harvest_busy()/,/^}$/{
+  s@^  if \[\[ "[$]{_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 \]\]; then@  if false; then@
+}
+SED
+try "vnext_account_lock_unwritable_harvest_message" "a lock that cannot be made fails at once" "$CLI" "$REGRESSIONS"
+
+# vnext: the session-end harvest waits on the network. Ahead of the restore it
+# froze the terminal in Claude's raw mode for the whole timeout.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _restore_terminal$@  local _harvest=0; _account_sync_out "$cname" || _harvest=$?; _restore_terminal@
+  s@^  _account_sync_out "[$]cname" || _harvest=[$]?$@  :@
+}
+SED
+try "vnext_session_end_harvest_after_restore" "the session-end harvest runs only after the terminal is back" "$CLI" "$REGRESSIONS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

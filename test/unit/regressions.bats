@@ -3732,15 +3732,8 @@ PS3
 # jq ships in the image but is NOT a documented host requirement.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# A host with no jq. A function override is the reliable mocking level here
-# (testing rule 5): PATH surgery cannot hide jq from `command -v` without
-# rebuilding a minimal PATH that cmd_run would then be missing half of.
-_hide_jq() {
-  command() {
-    if [ "$1" = "-v" ] && [ "$2" = "jq" ]; then return 1; fi
-    builtin command "$@"
-  }
-}
+# _hide_jq (a host with no jq) lives in test/setup.bash, shared with the
+# credential tests.
 
 @test "regression vnext: a jq-less host gets empty project settings, not the real hook commands" {
   mock_docker_images "cleat"
@@ -4042,4 +4035,2158 @@ _vnext_refuse_during_exec() {
   run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
   assert_success
   assert_output ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext and v1.4.3: _oauth_expires_at took the LAST "expiresAt" anywhere in a
+# credential file. Claude Code 2.1.270 keeps MCP OAuth tokens in the same file
+# under mcpOAuth, each with its own expiresAt. It writes that key after
+# claudeAiOauth once an MCP login follows a Claude login. Every newest-wins
+# decision then compared MCP token lifetimes. With the same 24 h MCP token in
+# both copies a box's refreshed login never looked newer and was never
+# harvested. Staging put an older store copy over a fresher box login whose MCP
+# token happened to be older. On macOS the shared-login re-seed read an expired
+# MCP token as an expired login and put the Keychain's older token over the
+# box's newer one, taking the MCP logins with it.
+#
+# Fixtures follow the account fixture convention: the generation tag lives in
+# accessToken and refreshToken names the grant, so it stays equal across
+# generations. These pin the expiry decision and nothing about identity.
+# ─────────────────────────────────────────────────────────────────────────────
+_mcp_cred_blob() {   # $1 = access-token tag, $2 = claudeAiOauth.expiresAt, $3 = the MCP entry's expiresAt
+  printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-%s","refreshToken":"sk-ant-ort01-SAME","expiresAt":%s,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"},"mcpOAuth":{"labmcp|cda6d80a97111f6e":{"serverName":"labmcp","serverUrl":"http://127.0.0.1:36963/mcp","accessToken":"FAKE-MCP-at","discoveryState":{"authorizationServerUrl":"http://127.0.0.1:36963","oauthMetadataFound":true},"clientId":"lab-mcp-client","refreshToken":"FAKE-MCP-rt","expiresAt":%s,"scope":"read"}}}' "$1" "$2" "$3"
+}
+
+@test "regression vnext: account newest-wins reads the Claude login expiry, not an MCP entry written after it" {
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR"
+  _CLEAT_NOW_S=1789000000
+  curl() { cat >/dev/null 2>&1; return 7; }
+  local cn="cleat-proj-abcdef12" now_ms=1789000000000 h=3600000 store box mode
+  _box_account_write "$cn" work
+  _account_ensure_dir work
+  store="$(_account_cred_path work)"
+  box="$(_account_box_auth_dir "$cn")/.credentials.json"
+  mkdir -p "${box%/*}"
+  for mode in jq nojq; do
+    [[ "$mode" == nojq ]] && _hide_jq
+    # Harvest: the box refreshed its login. Both copies hold the same MCP token.
+    _mcp_cred_blob STALE $((now_ms + h)) $((now_ms + 24 * h)) > "$store"
+    _mcp_cred_blob REFRESHED $((now_ms + 8 * h)) $((now_ms + 24 * h)) > "$box"
+    run _account_sync_out "$cn"
+    run cat "$store"
+    assert_output --partial "sk-ant-oat01-REFRESHED"
+    # Stage: the store holds the newer login, the box an older one whose MCP
+    # token runs for a week.
+    _mcp_cred_blob NEWER $((now_ms + 8 * h)) $((now_ms - 48 * h)) > "$store"
+    _mcp_cred_blob OLDER $((now_ms + 2 * h)) $((now_ms + 168 * h)) > "$box"
+    run _account_sync_in "$cn"
+    run cat "$box"
+    assert_output --partial "sk-ant-oat01-NEWER"
+  done
+}
+
+@test "regression v1.4.3: the macOS re-seed keeps a box-refreshed login when an expired MCP login shares the file" {
+  _is_macos() { return 0; }
+  _macos_keychain_credentials() {
+    printf '%s' '{"claudeAiOauth":{"accessToken":"KC-OLDER","refreshToken":"rt-kc","expiresAt":2000003600000}}'
+  }
+  local cred="$HOME/.claude/.credentials.json" leg order
+  mkdir -p "$HOME/.claude"
+  # now_ms 2e12. The box login is valid 7 h, its MCP entry expired 3 d ago and
+  # the Keychain login is valid 1 h.
+  local claude='"claudeAiOauth":{"accessToken":"BOX-REFRESHED","refreshToken":"rt-box","expiresAt":2000025200000,"scopes":["user:inference"],"subscriptionType":"max"}'
+  local mcp='"mcpOAuth":{"linear|0123456789abcdef":{"serverName":"linear","serverUrl":"https://mcp.linear.app/mcp","accessToken":"MCP-LOGIN","refreshToken":"mcp-rt","expiresAt":1999740800000,"scope":"read write"}}'
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    for order in claude-first mcp-first; do
+      if [ "$order" = claude-first ]; then
+        printf '{%s,%s}' "$claude" "$mcp" > "$cred"
+      else
+        printf '{%s,%s}' "$mcp" "$claude" > "$cred"
+      fi
+      _SEEDED_CREDS=0
+      _CLEAT_NOW_S=2000000000 _seed_macos_credentials
+      run cat "$cred"
+      assert_output --partial "BOX-REFRESHED"
+      assert_output --partial "MCP-LOGIN"
+      refute_output --partial "KC-OLDER"
+      assert_equal "$leg $order $_SEEDED_CREDS" "$leg $order 0"
+    done
+  done
+}
+
+@test "regression v1.4.3: an unreadable shared credential file does not abort the macOS launch" {
+  # The seed runs bare in exec_claude under set -e. Its read of the shared file
+  # was a redirect. A redirect that cannot open the file fails the whole
+  # assignment, so `cleat` exited before Claude started with nothing but a raw
+  # "Permission denied". Sourced tests strip strict mode, so this one puts it back.
+  [ "$(id -u)" != "0" ] || skip "root reads a mode-000 file"
+  mkdir -p "$HOME/.claude"
+  printf '{"claudeAiOauth":{"accessToken":"a","expiresAt":1}}' > "$HOME/.claude/.credentials.json"
+  chmod 000 "$HOME/.claude/.credentials.json"
+  run bash -c 'set -euo pipefail; source "$1"; set -euo pipefail
+    _is_macos() { return 0; }
+    _macos_keychain_credentials() { return 1; }
+    _seed_macos_credentials
+    echo "launch continues"' _ "$CLI"
+  chmod 600 "$HOME/.claude/.credentials.json"
+  assert_success
+  assert_output --partial "launch continues"
+  refute_output --partial "Permission denied"
+}
+
+@test "regression v1.4.3: macOS seed never writes the token through a planted temp symlink" {
+  # ~/.claude is mounted read-write into every box. The seed wrote the Keychain
+  # login to "$cred.tmp.$$", a name a box can guess, through a bare `>` that
+  # follows a symlink. A box that planted one there had the live login written
+  # onto any host file the user can write. The mv then made the credential
+  # file itself a link to it.
+  _is_macos() { return 0; }
+  # seed_blob and not blob: the CLI's own `local blob` would shadow it.
+  local seed_blob='{"claudeAiOauth":{"accessToken":"sk-ant-oat01-KEYCHAIN","refreshToken":"rt","expiresAt":3000000000000}}'
+  _macos_keychain_credentials() { printf '%s' "$seed_blob"; }
+  local cred="$HOME/.claude/.credentials.json" victim="$TEST_TEMP/precious-host-file" leg
+  mkdir -p "$HOME/.claude"
+  printf 'DO-NOT-OVERWRITE\n' > "$victim"
+  chmod 644 "$victim"
+  ln -s "$victim" "${cred}.tmp.$$"
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    : > "$cred"
+    _SEEDED_CREDS=0
+    _seed_macos_credentials
+    run cat "$victim"
+    assert_output "DO-NOT-OVERWRITE"
+    [ ! -L "$cred" ] || { echo "$leg: the credential file became a symlink"; return 1; }
+    run cat "$cred"
+    assert_output "$seed_blob"
+    assert_equal "$leg $_SEEDED_CREDS" "$leg 1"
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: the credential readers were not scoped to the Claude login. With jq
+# they took the first accessToken or refreshToken anywhere in the file and
+# without jq the last. Claude Code 2.1.270 keeps each MCP server's OAuth tokens
+# in the same file under mcpOAuth. It writes that key BEFORE claudeAiOauth when
+# the MCP login came first and AFTER it otherwise. So the order of two logins,
+# not their meaning, picked the token. On a jq host the usage poll sent the MCP
+# server's bearer to api.anthropic.com. On a jq-less host a blanked Claude login
+# beside a live MCP entry read as plausible and was harvested over the account's
+# only good credential, with no trash and no undo.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: the usage poll sends the account's own bearer, never a coresident MCP token" {
+  command -v jq >/dev/null || skip "the usage poll needs jq"
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR"
+  _CLEAT_NOW_S=1789000000
+  local exp=1789007200000 order acct
+  local claude="\"claudeAiOauth\":{\"accessToken\":\"sk-ant-oat01-ACCOUNT-OWN\",\"refreshToken\":\"sk-ant-ort01-ACCOUNT-OWN\",\"expiresAt\":$exp,\"scopes\":[\"user:inference\",\"user:profile\"],\"subscriptionType\":\"max\"}"
+  local mcp="\"mcpOAuth\":{\"linear|0123456789abcdef\":{\"serverName\":\"linear\",\"serverUrl\":\"https://mcp.linear.app/mcp\",\"accessToken\":\"MCP-SERVER-TOKEN\",\"refreshToken\":\"MCP-SERVER-REFRESH\",\"expiresAt\":1789086400000,\"scope\":\"read write\"}}"
+  # Both orders, so a reader that takes the first match anywhere and one that
+  # takes the last each fail one of them.
+  for order in cm mc; do
+    acct="acct-$order"
+    _account_ensure_dir "$acct"
+    if [ "$order" = cm ]; then
+      printf '{%s,%s}' "$claude" "$mcp" > "$(_account_cred_path "$acct")"
+    else
+      printf '{%s,%s}' "$mcp" "$claude" > "$(_account_cred_path "$acct")"
+    fi
+    curl() {
+      cat > "$TEST_TEMP/curl-$order.cfg"
+      printf '{"five_hour":{"utilization":10,"resets_at":"2026-09-13T20:00:00Z"},"seven_day":{"utilization":20,"resets_at":"2026-09-15T20:00:00Z"}}'
+    }
+    run _account_usage_fetch "$acct"
+    assert_success
+    run cat "$TEST_TEMP/curl-$order.cfg"
+    assert_output --partial "Authorization: Bearer sk-ant-oat01-ACCOUNT-OWN\""
+    refute_output --partial "MCP-SERVER"
+  done
+}
+
+@test "regression vnext: a jq-less host does not harvest a blanked login over a good store" {
+  _hide_jq
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR"
+  _CLEAT_NOW_S=1789000000
+  curl() { cat >/dev/null 2>&1; return 7; }
+  local cn="cleat-proj-abcdef12" store box order
+  _box_account_write "$cn" work
+  _account_ensure_dir work
+  store="$(_account_cred_path work)"
+  box="$(_account_box_auth_dir "$cn")/.credentials.json"
+  mkdir -p "${box%/*}"
+  # The login invalid_grant blanked beside a live MCP entry. Its expiry reads
+  # newer, which a box can always write, so only the plausibility of the Claude
+  # login's own tokens stands between it and the store. The report's case is cm
+  # (the MCP entry written after the login). mc fails a first-match reader.
+  local blanked='"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":1789007200000,"scopes":["user:inference"],"subscriptionType":"max"}'
+  local mcp='"mcpOAuth":{"labmcp|cda6d80a97111f6e":{"serverName":"labmcp","serverUrl":"http://127.0.0.1:36963/mcp","accessToken":"FAKE-MCP-at-1","clientId":"lab-mcp-client","refreshToken":"FAKE-MCP-rt-1","expiresAt":1789086400000,"scope":"read"}}'
+  for order in cm mc; do
+    printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-GOOD","refreshToken":"sk-ant-ort01-GOOD","expiresAt":1789003600000,"subscriptionType":"max"}}' > "$store"
+    if [ "$order" = cm ]; then
+      printf '{%s,%s}' "$blanked" "$mcp" > "$box"
+    else
+      printf '{%s,%s}' "$mcp" "$blanked" > "$box"
+    fi
+    run _account_sync_out "$cn"
+    assert_equal "$order $status" "$order 1"
+    run cat "$store"
+    assert_output --partial '"refreshToken":"sk-ant-ort01-GOOD"'
+    refute_output --partial "FAKE-MCP"
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: nothing serialised the account code across cleat processes. Every
+# account path read a pin, a store and a staged credential, decided and wrote,
+# and two terminals interleaved. An attach that had read pin a staged a's login
+# over the b a concurrent switch had just staged (5 in 100 natural runs), so the
+# box ran as a while pinned to b. A session-end harvest wrote b's credential
+# into a's store. An attach that read the pin between a rename's move and its
+# pin rewrite found no store and deleted the staged login. And the harvest read
+# the staged path again at write time, so bytes the box wrote after the checks
+# (a blanked login, or a symlink to any host file the user can read) went into
+# the store unchecked.
+#
+# Each race is made deterministic the same way. A function that runs INSIDE the
+# critical section under test is wrapped so that its first call starts the
+# competing command in the background, then waits until that command has either
+# finished or is waiting on the account lock (_account_lock_pause). With no lock
+# the competitor always finishes first and the interleaving that corrupted the
+# store is replayed exactly. With the lock it can only be waiting. The sleeps
+# are poll intervals. None of them decides an outcome.
+#
+# Fixtures follow the account fixture convention: accessToken carries the
+# generation (at-A1) and refreshToken the grant (rt-A).
+# ─────────────────────────────────────────────────────────────────────────────
+_acct_race_setup() {
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  _CLEAT_NOW_S=1789000000
+  _has_unicode() { return 1; }
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  _box_has_live_agent() { return 1; }
+  # A switch away from a pinned account polls usage. Never the real network.
+  curl() { cat >/dev/null 2>&1; return 7; }
+  _ACCOUNT_LOCK_WAIT_S=60
+}
+
+# $1 file, $2 grant, $3 generation, $4 expiresAt (epoch ms)
+_acct_race_cred() {
+  mkdir -p "${1%/*}"
+  printf '{"claudeAiOauth":{"accessToken":"at-%s%s","refreshToken":"rt-%s","expiresAt":%s,"subscriptionType":"max"}}\n' "$2" "$3" "$2" "$4" > "$1"
+  chmod 600 "$1"
+}
+
+_acct_race_start() {
+  _account_lock_pause() { : > "$TEST_TEMP/race.waiting"; sleep 0.05; }
+  # The competitor holds nothing: the lock depth this shell inherits at the
+  # fork belongs to the holder.
+  ( _ACCOUNT_LOCK_DEPTH=0; "$@" > "$TEST_TEMP/race.out" 2>&1; : > "$TEST_TEMP/race.done" ) 3>&- &
+  _ACCT_RACE_PID=$!
+  local i=0
+  while [[ ! -e "$TEST_TEMP/race.waiting" && ! -e "$TEST_TEMP/race.done" && $i -lt 1200 ]]; do
+    sleep 0.05
+    i=$(( i + 1 ))
+  done
+}
+
+# _acct_race_on FUNCTION COMMAND...: the first call of FUNCTION starts COMMAND.
+_acct_race_on() {
+  local fn="$1"
+  shift
+  _ACCT_RACE_CMD=("$@")
+  eval "$(declare -f "$fn" | sed "1s/^$fn /_acct_race_orig_$fn /")"
+  eval "$fn() {
+    if [[ ! -e \"\$TEST_TEMP/race.hooked\" ]]; then
+      : > \"\$TEST_TEMP/race.hooked\"
+      _acct_race_start \"\${_ACCT_RACE_CMD[@]}\"
+    fi
+    _acct_race_orig_$fn \"\$@\"
+  }"
+}
+
+_acct_race_joined() {
+  run test -e "$TEST_TEMP/race.hooked"
+  assert_success
+  wait "$_ACCT_RACE_PID"
+}
+
+@test "regression vnext: an attach cannot stage the old account after a concurrent switch pinned the new one" {
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  # Another box refreshed a since this one ran, so the attach has something to stage.
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 2 1789032400000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
+  _acct_race_cred "$staged" A 1 1789028800000
+  _box_account_write "$CN" a
+  _acct_race_on _account_write_file_0600 _account_do_switch b main "$CN" "$TEST_TEMP/proj"
+  _account_sync_in "$CN" || true
+  _acct_race_joined
+  run _box_account_read "$CN"
+  assert_output "b"
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-B0"'
+}
+
+@test "regression vnext: an attach during the unpin and staging of a switch waits, then stages the new account" {
+  # The other half of the switch's hold. The switch has harvested and is about
+  # to pin b and stage it. A switch that let go of the lock after its harvest
+  # let the attach read pin a and decide to stage a's newer login. Once that
+  # write lands after the switch's own staging, the box runs as a while pinned
+  # to b and the next session end harvests a's login into b's store. The switch
+  # stages b whatever the staged expiry says, so an attach write that lands
+  # BEFORE it is simply replaced. The attach here is held at its write until
+  # the switch has returned, as a slower one would be.
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 2 1789032400000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
+  _acct_race_cred "$staged" A 1 1789028800000
+  _box_account_write "$CN" a
+  _acct_slow_attach() {
+    eval "$(declare -f _account_write_file_0600 | sed '1s/^_account_write_file_0600 /_acct_attach_orig_write /')"
+    _account_write_file_0600() {
+      : > "$TEST_TEMP/race.waiting"
+      local i=0
+      while [[ ! -e "$TEST_TEMP/switch.done" && $i -lt 1200 ]]; do
+        sleep 0.05
+        i=$(( i + 1 ))
+      done
+      _acct_attach_orig_write "$@"
+    }
+    _account_sync_in "$@"
+  }
+  # The switch writes the pin right after its harvest.
+  _acct_race_on _box_account_write _acct_slow_attach "$CN"
+  _account_do_switch b main "$CN" "$TEST_TEMP/proj" > /dev/null 2>&1 || true
+  : > "$TEST_TEMP/switch.done"
+  _acct_race_joined
+  run _box_account_read "$CN"
+  assert_output "b"
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-B0"'
+}
+
+@test "regression vnext: a session-end harvest cannot write the new account into the old account's store" {
+  # The harvest decided on a's refreshed login, a switch then harvested, pinned b
+  # and staged b, and the harvest wrote the staged file as it was by then: b's
+  # credential into a's store. The box refreshing again inside that window is
+  # replayed too, so a harvest that only wrote its own earlier copy would still
+  # roll a back to the older generation.
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 0 1789003600000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
+  _acct_race_cred "$staged" A 1 1789028800000
+  _box_account_write "$CN" a
+  # The window opens at the write: the harvest has read both expiries and
+  # decided. (The plausibility check runs before that decision, so a hook there
+  # would let the harvest see the switch's store and decline instead.)
+  eval "$(declare -f _account_write_cred | sed '1s/^_account_write_cred /_acct_race_orig_write_cred /')"
+  _account_write_cred() {
+    if [[ ! -e "$TEST_TEMP/race.hooked" ]]; then
+      : > "$TEST_TEMP/race.hooked"
+      _acct_race_cred "$staged" A 2 1789032400000
+      _acct_race_start _account_do_switch b main "$CN" "$TEST_TEMP/proj"
+    fi
+    _acct_race_orig_write_cred "$@"
+  }
+  _account_sync_out "$CN" || true
+  _acct_race_joined
+  run cat "$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
+  assert_output --partial '"accessToken":"at-A2"'
+  run cat "$CLEAT_ACCOUNTS_DIR/b/.credentials.json"
+  assert_output --partial '"accessToken":"at-B0"'
+}
+
+@test "regression vnext: an attach during a rename stages from the renamed store" {
+  # The rename moves the store before it rewrites the pins. An attach that read
+  # the pin in between found no store and removed the box's credential (16 of 63
+  # in the band). The store also holds a newer refresh than the box, the way
+  # another box pinned to the same account leaves it, so an attach that merely
+  # keeps what is staged still fails.
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 2 1789032400000
+  _acct_race_cred "$staged" A 1 1789028800000
+  _box_account_write "$CN" a
+  _acct_race_on _box_account_write _account_sync_in "$CN"
+  _account_rename a c || true
+  _acct_race_joined
+  run _box_account_read "$CN"
+  assert_output "c"
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-A2"'
+}
+
+@test "regression vnext: a box pinned while its account is being removed is never left on a store that is gone" {
+  # remove read the pinned boxes, a switch then pinned another box to the same
+  # account and the trash took the store from under it. That box's next attach
+  # found no store and deleted its staged login.
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" CN2="cleat-race-abcdef13"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 1 1789028800000
+  _acct_race_cred "$CLEAT_RUN_DIR/$CN/auth/.credentials.json" A 1 1789028800000
+  _box_account_write "$CN" a
+  _acct_race_on _account_trash _account_do_switch a main "$CN2" "$TEST_TEMP/proj"
+  _account_do_remove a 1 > /dev/null 2>&1 || true
+  _acct_race_joined
+  run _box_account_read "$CN2"
+  assert_output "a"
+  run _account_exists a
+  assert_success
+}
+
+@test "regression vnext: a harvest writes only the bytes it checked, never what the box swaps in afterwards" {
+  # The harvest read the staged path for the expiry, again for the token check
+  # and again for the copy. Claude blanks both tokens in that file on
+  # invalid_grant, and a blank that landed after the check went over the
+  # account's only good refresh token. A symlink swapped in after the check had
+  # the host-side copy read a host file into the store, and the next attach
+  # handed it to the box.
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" staged store secret leg
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  store="$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
+  secret="$TEST_TEMP/host-secret.json"
+  # A JSON object, because only a JSON object survives the write's validation.
+  printf '{"aws_secret_access_key":"FAKE-HOST-SECRET"}\n' > "$secret"
+  _box_account_write "$CN" a
+  eval "$(declare -f _account_cred_plausible | sed '1s/^_account_cred_plausible /_acct_orig_plausible /')"
+  _account_cred_plausible() {
+    local rc=0
+    _acct_orig_plausible "$@" || rc=$?
+    if [[ "$_ACCT_SWAP_LEG" == blank ]]; then
+      printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}\n' > "$staged"
+    else
+      rm -f "$staged"
+      ln -s "$secret" "$staged"
+    fi
+    return "$rc"
+  }
+  for leg in blank symlink; do
+    _ACCT_SWAP_LEG="$leg"
+    _acct_race_cred "$store" A 0 1789003600000
+    rm -f "$staged"
+    _acct_race_cred "$staged" A 1 1789028800000
+    run _account_sync_out "$CN"
+    assert_equal "$leg $status" "$leg 0"
+    run cat "$store"
+    assert_output --partial '"accessToken":"at-A1"'
+    refute_output --partial "FAKE-HOST-SECRET"
+    # The box drops what it planted and attaches again.
+    rm -f "$staged"
+    run _account_sync_in "$CN"
+    run cat "$staged"
+    refute_output --partial "FAKE-HOST-SECRET"
+    assert_output --partial '"accessToken":"at-A1"'
+  done
+}
+
+@test "regression vnext: a switch that cannot take the account lock changes nothing" {
+  # A timeout must never fall through to an unlocked write or delete.
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 1 1789028800000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
+  _acct_race_cred "$staged" A 1 1789028800000
+  _box_account_write "$CN" a
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/.lock"
+  printf 'host %s pid %s at %s\n' "${HOSTNAME:-unknown}" "$$" "$(date +%s)" > "$CLEAT_ACCOUNTS_DIR/.lock/owner"
+  _ACCOUNT_LOCK_WAIT_S=0
+  run _account_do_switch b main "$CN" "$TEST_TEMP/proj"
+  assert_failure
+  assert_output --partial "Another cleat command is changing accounts right now."
+  assert_output --partial "Nothing was changed"
+  run _box_account_read "$CN"
+  assert_output "a"
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-A1"'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: the live-session refusal gave a reason Claude Code 2.1.270 does not
+# have. The switch said "Swapping the credential under a running session is
+# noticed and undone", from a 2.1.267 read that was never run, and the remove
+# gave no reason at all. On 2.1.270 the store's mtime change only clears caches:
+# the next request goes out on whatever token is there and nothing is written
+# back (77 lab runs). The refusal stays, because a running session keeps the
+# store path, the account identity and any turn in flight from its start. All
+# three refusals now say that.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: a live-session refusal never claims Claude Code undoes the swap" {
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  printf '{"claudeAiOauth":{"accessToken":"at-FAKE","refreshToken":"rt-FAKE","expiresAt":1}}\n' > "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  local cn="cleat-proj-abcdef12"
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _box_has_live_agent() { return 0; }
+  # Shared login to a named one.
+  run _account_do_switch work main "$cn" "$TEST_TEMP/proj"
+  assert_failure
+  refute_output --partial "undone"
+  assert_output --partial "only takes a login change in full when it starts"
+  # A named one back to the shared login.
+  _box_account_write "$cn" work
+  run _account_do_switch default main "$cn" "$TEST_TEMP/proj"
+  assert_failure
+  refute_output --partial "undone"
+  assert_output --partial "only takes a login change in full when it starts"
+  # Removing the account a live box is pinned to.
+  run _account_do_remove work 1
+  assert_failure
+  assert_output --partial "only takes a login change in full when it starts"
+  run _account_exists work
+  assert_success
+  run _box_account_read "$cn"
+  assert_output "work"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: account rm asked whether a pinned box had a live session only BEFORE
+# its "Remove it? [y/N]" question, which can stay on screen indefinitely. A
+# session started while it waited had its staged login deleted after the yes,
+# and Claude printed "Not logged in" into it.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: account rm asks again whether a session is live after its question" {
+  _acct_race_setup
+  local cn="cleat-proj-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$cn/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" W 1 1789028800000
+  _acct_race_cred "$staged" W 1 1789028800000
+  _box_account_write "$cn" work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _box_has_live_agent() { [ -e "$TEST_TEMP/session-started" ]; }
+  _is_interactive() { return 0; }
+  # The session starts while the question is on screen.
+  _ask_yn() { : > "$TEST_TEMP/session-started"; printf -v "$1" '%s' y; }
+  run _account_do_remove work 0
+  assert_failure
+  assert_output --partial "only takes a login change in full when it starts"
+  refute_output --partial "Removed"
+  run _account_exists work
+  assert_success
+  run _box_account_read "$cn"
+  assert_output "work"
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-W1"'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: a switch polled the outgoing account's usage (up to 3 s of curl)
+# between its harvest and the staging of the incoming login. A refresh the box
+# saved in that window was deleted by the staging without ever being harvested.
+# The poll now runs after the staging and outside the account lock.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: a switch finishes staging before it waits on the usage API" {
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/old/.credentials.json" O 1 1789028800000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/new/.credentials.json" N 0 1789025200000
+  _acct_race_cred "$staged" O 1 1789028800000
+  _box_account_write "$CN" old
+  eval "$(declare -f _account_sync_in_locked | sed '1s/^_account_sync_in_locked /_acct_orig_sync_in_locked /')"
+  _account_sync_in_locked() { echo "stage" >> "$TEST_TEMP/order"; _acct_orig_sync_in_locked "$@"; }
+  _account_usage_fetch() {
+    if grep -q '"accessToken":"at-N0"' "$staged" 2>/dev/null; then
+      echo "usage staged=new" >> "$TEST_TEMP/order"
+    else
+      echo "usage staged=old" >> "$TEST_TEMP/order"
+    fi
+    return 1
+  }
+  run _account_do_switch new main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run cat "$TEST_TEMP/order"
+  # The first line is the staging, and every usage request found the new login
+  # already staged.
+  assert_line --index 0 "stage"
+  assert_output --partial "usage staged=new"
+  refute_output --partial "usage staged=old"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: writers that created an account, and an attach that deleted a login.
+#
+# The harvest and the metadata writer both began with a mkdir -p of the store,
+# so one that finished after `cleat account rm` in another terminal put the
+# account back under its old name, and `restore` then refused. Only the
+# explicit switch to a new name creates a store now.
+#
+# The attach removed the staged credential whenever the account store was
+# empty. A /login made inside a pinned box lives only in that file until a
+# session end harvests it, and `cleat shell` and `cleat login` never do, so the
+# next attach threw the login away and the Claude still running on it printed
+# "Not logged in". The attach harvests instead and stages nothing back.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: a session-end harvest that loses the race with account rm does not recreate the account" {
+  _acct_race_setup
+  local CN="cleat-race-abcdef12"
+  # With the store gone the harvest no longer sees the same grant, so the server
+  # is asked, and it vouches: the harvest reaches its write.
+  _acct_ident_profile "$_ACCT_UUID_A" a@example.com
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 0 1789003600000
+  _acct_race_cred "$CLEAT_RUN_DIR/$CN/auth/.credentials.json" A 1 1789007200000
+  _box_account_write "$CN" a
+  # The remove lands where the lab's stalled session end sat: after the harvest
+  # decided, before it wrote. It runs in-process, nested in the harvest's hold.
+  eval "$(declare -f _account_cred_plausible | sed '1s/^_account_cred_plausible /_acct_orig_plausible /')"
+  _account_cred_plausible() {
+    if [[ ! -e "$TEST_TEMP/rm.done" ]]; then
+      : > "$TEST_TEMP/rm.done"
+      _account_do_remove a 1 > /dev/null 2>&1 || true
+    fi
+    _acct_orig_plausible "$@"
+  }
+  _account_sync_out "$CN" || true
+  run test -e "$TEST_TEMP/rm.done"
+  assert_success
+  run test -e "$CLEAT_ACCOUNTS_DIR/a"
+  assert_failure
+  run _account_do_restore a
+  assert_success
+  # What comes back is the remove's own harvest of the box's refresh.
+  run cat "$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
+  assert_output --partial '"accessToken":"at-A1"'
+}
+
+@test "regression vnext: an unharvested login in a pinned box survives the next attach while its account store is empty" {
+  _acct_race_setup
+  _account_box_ready() { return 0; }
+  local mode cn staged store
+  # The store has no refresh token to match, so the server names the login.
+  _acct_ident_profile "$_ACCT_UUID_A" in-box@example.com
+  for mode in jq nojq; do
+    [[ "$mode" == nojq ]] && _hide_jq
+    cn="cleat-login-$mode"
+    _account_ensure_dir "fresh-$mode"
+    _box_account_write "$cn" "fresh-$mode"
+    staged="$(_account_box_auth_dir "$cn")/.credentials.json"
+    store="$(_account_cred_path "fresh-$mode")"
+    mkdir -p "${staged%/*}"
+    # What claude /login inside the box wrote.
+    printf '{"claudeAiOauth":{"accessToken":"at-in-box","refreshToken":"rt-in-box-%s","expiresAt":1789028800000,"subscriptionType":"max"}}\n' "$mode" > "$staged"
+    ln "$staged" "$TEST_TEMP/staged-$mode.link"
+    CLAUDE_ENV=()
+    run _account_apply_exec_env "$cn"
+    assert_success
+    # Same inode: the file the running Claude reads was neither removed nor
+    # replaced.
+    run test "$staged" -ef "$TEST_TEMP/staged-$mode.link"
+    assert_success
+    run grep -c "rt-in-box-$mode" "$staged"
+    assert_output "1"
+    # And it is harvested, so a sibling box on the same account gets it.
+    run grep -c "rt-in-box-$mode" "$store"
+    assert_output "1"
+  done
+  unset -f command
+  # Offline, the login cannot be verified. It is still never deleted: the harvest
+  # says cannot tell (3) and the attach leaves the file as it is.
+  _account_profile_curl() { printf '\n000'; }
+  cn="cleat-login-offline"
+  _account_ensure_dir fresh-offline
+  _box_account_write "$cn" fresh-offline
+  staged="$(_account_box_auth_dir "$cn")/.credentials.json"
+  mkdir -p "${staged%/*}"
+  printf '{"claudeAiOauth":{"accessToken":"at-in-box","refreshToken":"rt-in-box-offline","expiresAt":1789028800000,"subscriptionType":"max"}}\n' > "$staged"
+  ln "$staged" "$TEST_TEMP/staged-offline.link"
+  run _account_sync_out "$cn"
+  assert_equal "$status" 3
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$cn"
+  assert_success
+  run test "$staged" -ef "$TEST_TEMP/staged-offline.link"
+  assert_success
+  run grep -c "rt-in-box-offline" "$staged"
+  assert_output "1"
+  run test -s "$(_account_cred_path fresh-offline)"
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: every deleter trusted a declined harvest.
+#
+# The harvest returned 0 both when the store already held the staged login and
+# when it simply declined a file that was not newer. `cleat rm`, both switches,
+# `cleat account rm` and nuke then deleted the staged file. A /login made in the
+# box as someone else behind a sibling box's fresher refresh, or a refresh whose
+# store write failed, existed nowhere afterwards. A declined login the store
+# does not hold is now status 3, and every deleter copies what the harvest did
+# not take to accounts/.held first, or deletes nothing.
+#
+# The same wipes only ever looked at the one staged file of a pinned box. Any
+# other credential in run/<cname>/ (a staged file an unpinned box was left with,
+# a rollback journal) went with the directory. They are held first too.
+#
+# Fixtures follow the account fixture convention: accessToken carries the
+# generation (at-W5) and refreshToken the grant (rt-W).
+# ─────────────────────────────────────────────────────────────────────────────
+_held_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+
+# $1 box, $2 grant of the store, $3 grant staged in the box (a different login
+# that is not newer)
+_held_declined_pair() {
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" "$2" 5 1789028800000
+  _acct_race_cred "$CLEAT_RUN_DIR/$1/auth/.credentials.json" "$3" 0 1789025200000
+  _box_account_write "$1" work
+}
+
+@test "regression vnext: cleat rm keeps a staged login its account store does not have" {
+  _acct_race_setup
+  local mode proj cn
+  for mode in jq nojq; do
+    [[ "$mode" == nojq ]] && _hide_jq
+    proj="$TEST_TEMP/proj-$mode"
+    mkdir -p "$proj"
+    cn="$(container_name_for "$proj" main)"
+    _held_declined_pair "$cn" W "B$mode"
+    mock_docker_ps ""
+    mock_docker_ps_a "$cn"
+    run cmd_rm "$proj"
+    assert_success
+    assert_output --partial "Kept a login from"
+    run test -d "$CLEAT_RUN_DIR/$cn"
+    assert_failure
+    run grep -rl "rt-B$mode" "$CLEAT_ACCOUNTS_DIR/.held"
+    assert_success
+    assert_equal "${#lines[@]}" 1
+    run _held_mode "${lines[0]}"
+    assert_output "600"
+    run cat "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+    assert_output --partial '"accessToken":"at-W5"'
+  done
+  unset -f command
+}
+
+@test "regression vnext: switching accounts keeps a refreshed login whose harvest failed" {
+  _acct_race_setup
+  local CN="cleat-held-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" W 0 1789003600000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/other/.credentials.json" O 0 1789025200000
+  _acct_race_cred "$staged" W 1 1789028800000
+  _box_account_write "$CN" work
+  # The store write fails, the way a full disk does.
+  _account_write_cred() { return 1; }
+  run _account_do_switch other main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Kept a login from"
+  run grep -rl '"accessToken":"at-W1"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-O0"'
+}
+
+@test "regression vnext: going back to the shared login keeps a staged login its account does not have" {
+  _acct_race_setup
+  local CN="cleat-held-abcdef12"
+  _held_declined_pair "$CN" W B
+  run _account_do_switch default main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run test -e "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  assert_failure
+  run grep -rl '"refreshToken":"rt-B"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+}
+
+@test "regression vnext: removing an account keeps a staged login it does not have" {
+  _acct_race_setup
+  local CN="cleat-held-abcdef12"
+  _held_declined_pair "$CN" W B
+  run _account_do_remove work 1
+  assert_success
+  run _account_exists work
+  assert_failure
+  run test -e "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  assert_failure
+  run grep -rl '"refreshToken":"rt-B"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+}
+
+@test "regression vnext: nuke keeps a staged login its account does not have" {
+  _acct_race_setup
+  local CN="cleat-held-abcdef12"
+  _held_declined_pair "$CN" W B
+  mock_docker_ps_a ""
+  run cmd_nuke <<< "nuke"
+  assert_success
+  run test -d "$CLEAT_RUN_DIR"
+  assert_failure
+  run grep -rl '"refreshToken":"rt-B"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+}
+
+@test "regression vnext: a credential journal left in a box auth dir is kept when cleat rm wipes the run dir" {
+  _acct_race_setup
+  local leg proj cn
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
+  for leg in pinned unpinned; do
+    proj="$TEST_TEMP/proj-$leg"
+    mkdir -p "$proj"
+    cn="$(container_name_for "$proj" main)"
+    if [[ "$leg" == pinned ]]; then
+      # The staged file is b's own, so the harvest has nothing to do.
+      _acct_race_cred "$CLEAT_RUN_DIR/$cn/auth/.credentials.json" B 0 1789025200000
+      _box_account_write "$cn" b
+    fi
+    # The only copy of the account the box was switched away from.
+    _acct_race_cred "$CLEAT_RUN_DIR/$cn/auth/.cleat-prev.json" "A$leg" 1 1789028800000
+    mock_docker_ps ""
+    mock_docker_ps_a "$cn"
+    run cmd_rm "$proj"
+    assert_success
+    run test -d "$CLEAT_RUN_DIR/$cn"
+    assert_failure
+    run grep -rl "rt-A$leg" "$CLEAT_ACCOUNTS_DIR/.held"
+    assert_success
+    assert_equal "${#lines[@]}" 1
+    run _held_mode "${lines[0]}"
+    assert_output "600"
+  done
+  # And b's own login was never held.
+  run grep -rl '"refreshToken":"rt-B"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_failure
+}
+
+@test "regression vnext: cleat nuke keeps a credential journal from a box that is not pinned" {
+  _acct_race_setup
+  local CN="cleat-held-abcdef12"
+  _acct_race_cred "$CLEAT_RUN_DIR/$CN/.prev.1789000000" A 1 1789028800000
+  _acct_race_cred "$CLEAT_RUN_DIR/$CN/auth/.credentials.json" L 0 1789025200000
+  mock_docker_ps_a ""
+  run cmd_nuke <<< "nuke"
+  assert_success
+  run test -d "$CLEAT_RUN_DIR"
+  assert_failure
+  run grep -rl '"refreshToken":"rt-A"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+  run grep -rl '"refreshToken":"rt-L"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+}
+
+@test "regression vnext: a wipe that cannot keep a credential journal deletes nothing" {
+  _acct_race_setup
+  local cn
+  # Something that is not a directory where the held logins go.
+  : > "$CLEAT_ACCOUNTS_DIR/.held"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
+  for cn in cleat-unpinned-abcdef12 cleat-pinned-abcdef12; do
+    if [[ "$cn" == cleat-pinned-abcdef12 ]]; then
+      _acct_race_cred "$CLEAT_RUN_DIR/$cn/auth/.credentials.json" B 0 1789025200000
+      _box_account_write "$cn" b
+    fi
+    _acct_race_cred "$CLEAT_RUN_DIR/$cn/auth/.cleat-prev.json" A 1 1789028800000
+    mkdir -p "$CLEAT_RUN_DIR/$cn/clip"
+    run _account_wipe_run_dir "$cn"
+    assert_success
+    assert_output --partial "it holds a login that could not be saved anywhere else"
+    run cat "$CLEAT_RUN_DIR/$cn/auth/.cleat-prev.json"
+    assert_output --partial '"accessToken":"at-A1"'
+    run test -d "$CLEAT_RUN_DIR/$cn/clip"
+    assert_success
+  done
+  run test -e "$CLEAT_ACCOUNTS_DIR/.lock"
+  assert_failure
+}
+
+@test "regression vnext: an attach keeps a login the store does not have before staging over it" {
+  _acct_race_setup
+  local CN="cleat-held-abcdef12"
+  _held_declined_pair "$CN" W B
+  run _account_sync_in "$CN"
+  assert_success
+  assert_output --partial "Kept a login from"
+  run cat "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  assert_output --partial '"accessToken":"at-W5"'
+  run grep -rl '"refreshToken":"rt-B"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+}
+
+# adopt, the recovery for everything above, swapped only the store file. A box
+# pinned to that account still had the old login staged, fresher than the one
+# adopted. The next session end wrote it straight back. The held entry was
+# already gone, so the adopted login existed nowhere.
+@test "regression vnext: a login adopted into an account a box is pinned to survives the next harvest" {
+  _acct_race_setup
+  local CN="cleat-held-abcdef12" mode staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  for mode in jq nojq; do
+    [[ "$mode" == nojq ]] && _hide_jq
+    _acct_race_cred "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" "W$mode" 5 1789028800000
+    # A refresh the box saved that no session end has harvested yet.
+    _acct_race_cred "$staged" "W$mode" 6 1789032400000
+    _box_account_write "$CN" work
+    _acct_race_cred "$TEST_TEMP/held-src.json" "Y$mode" 0 1789007200000
+    _account_hold "$TEST_TEMP/held-src.json" "" cleat-other-abcdef12 left-in-box
+    run _account_do_adopt "$_ACCOUNT_HELD_ID" work
+    assert_success
+    # The next session end on the pinned box.
+    run _account_sync_out "$CN"
+    assert_success
+    run grep -c "rt-Y$mode" "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+    assert_output "1"
+    # The refresh the box had is kept, never written back and never lost.
+    run grep -rl "\"accessToken\":\"at-W${mode}6\"" "$CLEAT_ACCOUNTS_DIR/.held"
+    assert_success
+    # And the next attach stages the adopted login.
+    run _account_sync_in "$CN"
+    assert_success
+    run grep -c "rt-Y$mode" "$staged"
+    assert_output "1"
+  done
+  unset -f command
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: a harvest had no identity check.
+#
+# The session-end harvest wrote a staged login over the pinned account's store
+# on "newer and plausible" alone. The staged file sits in a directory the box
+# writes, so a /login as someone else inside a pinned box put that other
+# account's login over the account's only credential, with no trash. The list
+# kept the old name while usage went out on the other bearer. Separately, a
+# switch stamped the account it was leaving with whatever email the box's
+# per-project claude.json held, and printed it as fact.
+#
+# A newer login is written now only when it is the same grant (the same refresh
+# token), or GET /api/oauth/profile names the account uuid recorded for the
+# store, or on first use the server's email is not a different one than the
+# account shows. A login proven to be someone else's is held. One nobody could
+# verify is left in place, and a deleter holds it.
+#
+# Fixtures follow the account fixture convention: accessToken carries the
+# generation (at-A1) and refreshToken the grant (rt-A).
+# ─────────────────────────────────────────────────────────────────────────────
+_ACCT_UUID_A="11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_ACCT_UUID_B="22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+# The profile request answers 200 with this account. $1 uuid, $2 email, $3 org.
+_acct_ident_profile() {
+  _ACCT_IDENT_BODY="$(printf '{"account":{"uuid":"%s","email":"%s","full_name":"Lab"},"organization":{"uuid":"org-1","name":"%s","cc_onboarding_flags":{}}}' "$1" "$2" "${3:-Lab Org}")"
+  _account_profile_curl() { printf '%s\n200' "$_ACCT_IDENT_BODY"; }
+}
+
+@test "regression vnext: a login for another account is never harvested over the pinned credential" {
+  _acct_race_setup
+  local mode cn store
+  for mode in jq nojq; do
+    [[ "$mode" == nojq ]] && _hide_jq
+    cn="cleat-ident-$mode"
+    store="$CLEAT_ACCOUNTS_DIR/a-$mode/.credentials.json"
+    _acct_race_cred "$store" A 0 1789003600000
+    printf 'uuid\t%s\nwho\tlab-a@lab.invalid\n' "$_ACCT_UUID_A" > "$CLEAT_ACCOUNTS_DIR/a-$mode/meta"
+    _box_account_write "$cn" "a-$mode"
+    # /login as B inside the box.
+    _acct_race_cred "$CLEAT_RUN_DIR/$cn/auth/.credentials.json" "B$mode" 1 1789028800000
+    _acct_ident_profile "$_ACCT_UUID_B" lab-b@lab.invalid "Org B"
+    run _account_sync_out "$cn"
+    assert_equal "$mode $status" "$mode 2"
+    run cat "$store"
+    assert_output --partial '"accessToken":"at-A0"'
+    run grep -rl "\"refreshToken\":\"rt-B$mode\"" "$CLEAT_ACCOUNTS_DIR/.held"
+    assert_success
+    run _account_meta_get_at "${lines[0]%/.credentials.json}" who
+    assert_output "lab-b@lab.invalid"
+    run _account_meta_get "a-$mode" who
+    assert_output "lab-a@lab.invalid"
+  done
+  unset -f command
+}
+
+@test "regression vnext: first use never records a login whose email differs from the one the account shows" {
+  _acct_race_setup
+  local CN="cleat-ident-abcdef12" store
+  store="$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
+  _acct_race_cred "$store" A 0 1789003600000
+  printf 'who\talice@example.com\n' > "$CLEAT_ACCOUNTS_DIR/a/meta"
+  _box_account_write "$CN" a
+  _acct_race_cred "$CLEAT_RUN_DIR/$CN/auth/.credentials.json" B 1 1789028800000
+  _acct_ident_profile "$_ACCT_UUID_B" bob@example.com
+  run _account_sync_out "$CN"
+  assert_equal "$status" 2
+  run cat "$store"
+  assert_output --partial '"accessToken":"at-A0"'
+  run _account_meta_get a who
+  assert_output "alice@example.com"
+  run _account_meta_get a uuid
+  assert_failure
+  # The same person's login under a differently cased email is theirs: saved,
+  # and the uuid is recorded from then on.
+  _acct_race_cred "$CLEAT_RUN_DIR/$CN/auth/.credentials.json" C 1 1789028800000
+  _acct_ident_profile "$_ACCT_UUID_A" Alice@Example.COM
+  run _account_sync_out "$CN"
+  assert_success
+  run cat "$store"
+  assert_output --partial '"accessToken":"at-C1"'
+  run _account_meta_get a uuid
+  assert_output "$_ACCT_UUID_A"
+}
+
+# A store with no recorded uuid had only ever been taken on trust: saved before
+# the check, adopted from an entry nobody verified, or one whose uuid was never
+# written. Its first verified harvest wrote whatever login the box held over it
+# with no copy anywhere, so a /login as someone else still replaced the only
+# credential. The store's own login is held first now, and a store login that
+# cannot be kept stops the write.
+@test "regression vnext: a first verified harvest holds the login it writes over" {
+  _acct_race_setup
+  local CN="cleat-ident-abcdef12" store staged
+  store="$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$store" A 0 1789003600000
+  _box_account_write "$CN" a
+  # /login as B inside the box, before the account ever had a verified harvest.
+  _acct_race_cred "$staged" B 1 1789028800000
+  _acct_ident_profile "$_ACCT_UUID_B" lab-b@lab.invalid
+  # Nowhere to keep A's login: nothing is written and the staged login stays.
+  : > "$CLEAT_ACCOUNTS_DIR/.held"
+  run _account_sync_out "$CN"
+  assert_equal "unkept $status" "unkept 1"
+  run cat "$store"
+  assert_output --partial '"accessToken":"at-A0"'
+  run grep -c '"accessToken":"at-B1"' "$staged"
+  assert_output "1"
+  run _account_meta_get a uuid
+  assert_failure
+  mv "$CLEAT_ACCOUNTS_DIR/.held" "$TEST_TEMP/held-was-a-file"
+  # With somewhere to keep it, A's login is held and then B's is saved.
+  run _account_sync_out "$CN"
+  assert_success
+  run cat "$store"
+  assert_output --partial '"accessToken":"at-B1"'
+  run grep -rl '"refreshToken":"rt-A"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+  run _accounts_held_text
+  assert_output --partial "from account a"
+  assert_output --partial "replaced by the first login Anthropic verified for its account"
+  # The uuid is recorded, so the next login as someone else is held instead.
+  run _account_meta_get a uuid
+  assert_output "$_ACCT_UUID_B"
+}
+
+# The recovery for a login a switch could not verify is adopting it back into
+# its account. Adopt copied the entry's identity blanks included, and an entry
+# held unverified carries no uuid, so it cleared the uuid of an account the
+# server had already verified. If refresh tokens do not rotate the uuid was
+# never recorded again, and any later /login as someone else in a box pinned to
+# that account went through the first-use harvest and over the adopted login.
+@test "regression vnext: a login nobody verified adopted back into its account keeps the account verified" {
+  _acct_race_setup
+  local CN="cleat-ident-abcdef12" staged d id=""
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" W 0 1789000500000
+  printf 'uuid\t%s\nwho\twork@lab.invalid\n' "$_ACCT_UUID_A" > "$CLEAT_ACCOUNTS_DIR/work/meta"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/other/.credentials.json" O 0 1789000500000
+  _box_account_write "$CN" work
+  # The box rotated work's refresh token. The switch away cannot reach the
+  # server (the setup's curl), so it holds that login unverified.
+  _acct_race_cred "$staged" R 1 1789028800000
+  run _account_do_switch other main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  for d in "$CLEAT_ACCOUNTS_DIR/.held"/*; do
+    grep -q '"refreshToken":"rt-R"' "$d/.credentials.json" 2>/dev/null && id="${d##*/}"
+  done
+  run test -n "$id"
+  assert_success
+  run _account_do_adopt "$id" work
+  assert_success
+  run _account_meta_get work uuid
+  assert_output "$_ACCT_UUID_A"
+  run _account_meta_get work who
+  assert_output "work@lab.invalid"
+  # Back on work, then a /login as someone else.
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  _acct_race_cred "$staged" S 1 1789030000000
+  _acct_ident_profile "$_ACCT_UUID_B" stranger@lab.invalid
+  run _account_sync_out "$CN"
+  assert_equal "$status" 2
+  run cat "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  assert_output --partial '"refreshToken":"rt-R"'
+  run _account_meta_get work who
+  assert_output "work@lab.invalid"
+}
+
+@test "regression vnext: a harvest the server cannot vouch for writes nothing and deletes nothing" {
+  _acct_race_setup
+  local CN="cleat-ident-abcdef12" store staged code
+  store="$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$store" A 0 1789003600000
+  printf 'uuid\t%s\n' "$_ACCT_UUID_A" > "$CLEAT_ACCOUNTS_DIR/a/meta"
+  _box_account_write "$CN" a
+  # A refresh that rotated the token.
+  _acct_race_cred "$staged" R 1 1789028800000
+  cp "$staged" "$TEST_TEMP/staged.orig"
+  for code in 401 000 503; do
+    _ACCT_IDENT_CODE="$code"
+    # A body that would verify as this very account, so the status code is the
+    # only thing that can stop the write. 000 is curl reaching nobody: no body.
+    if [[ "$code" == "000" ]]; then
+      _ACCT_IDENT_BODY=""
+    else
+      _ACCT_IDENT_BODY="$(printf '{"account":{"uuid":"%s","email":"lab-a@lab.invalid"}}' "$_ACCT_UUID_A")"
+    fi
+    _account_profile_curl() { printf '%s\n%s' "$_ACCT_IDENT_BODY" "$_ACCT_IDENT_CODE"; }
+    run _account_sync_out "$CN"
+    assert_equal "$code $status" "$code 3"
+    run cat "$store"
+    assert_output --partial '"accessToken":"at-A0"'
+    run cmp "$staged" "$TEST_TEMP/staged.orig"
+    assert_success
+    run test -e "$CLEAT_ACCOUNTS_DIR/.held"
+    assert_failure
+  done
+}
+
+@test "regression vnext: switching away holds a staged login nobody could verify instead of deleting it" {
+  _acct_race_setup
+  local CN="cleat-ident-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" W 0 1789003600000
+  printf 'uuid\t%s\n' "$_ACCT_UUID_A" > "$CLEAT_ACCOUNTS_DIR/work/meta"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/other/.credentials.json" O 0 1789025200000
+  # A rotated refresh, and the profile is unreachable (the setup's curl).
+  _acct_race_cred "$staged" R 1 1789028800000
+  _box_account_write "$CN" work
+  run _account_do_switch other main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Kept a login from"
+  run grep -rl '"refreshToken":"rt-R"' "$CLEAT_ACCOUNTS_DIR/.held"
+  assert_success
+  run cat "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  assert_output --partial '"accessToken":"at-W0"'
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-O0"'
+}
+
+@test "regression vnext: switching away never stamps the account with the email in the box project file" {
+  _acct_race_setup
+  local CN="cleat-ident-abcdef12" key
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 0 1789025200000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
+  printf 'who\tlab-b@lab.invalid\n' > "$CLEAT_ACCOUNTS_DIR/b/meta"
+  # The box ran as b, so its staged file is b's own and the harvest has nothing
+  # to do. Its project file still names a, from an earlier session.
+  _acct_race_cred "$CLEAT_RUN_DIR/$CN/auth/.credentials.json" B 0 1789025200000
+  _box_account_write "$CN" b
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  printf '{"oauthAccount":{"emailAddress":"lab-a@lab.invalid","organizationName":"Org A"}}\n' \
+    > "$CLEAT_PROJECTS_DIR/$key/claude.json"
+  run _account_do_switch a main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run _account_meta_get b who
+  assert_output "lab-b@lab.invalid"
+  run _account_meta_get a who
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: a switch staged the incoming login by removing the staged file and
+# renaming the new one in later. For about 25 ms the box had no credential file,
+# and a Claude the live gate missed answered "Not logged in" into that moment.
+# Both staging directions also copied the WHOLE file. Claude Code keeps an MCP
+# server's login (mcpOAuth) in that same file, so an in-box `claude mcp login`
+# was erased at the next attach (Claude then called the server with no bearer)
+# and one box's MCP tokens reached the account store and every box pinned to it.
+# Only the account's keys cross now, by one rename.
+#
+# Fixtures follow the account fixture convention: accessToken carries the
+# generation, refreshToken the grant.
+# ─────────────────────────────────────────────────────────────────────────────
+# $1 grant, $2 generation, $3 expiresAt (epoch ms). A member, not an object.
+_acct_key_login() {
+  printf '"claudeAiOauth":{"accessToken":"at-%s%s","refreshToken":"rt-%s","expiresAt":%s,"scopes":["user:inference"],"subscriptionType":"max"}' "$1" "$2" "$1" "$3"
+}
+
+# $1 label. The shape Claude Code 2.1.270 writes for an MCP server login.
+_acct_key_mcp() {
+  printf '"mcpOAuth":{"linear|0123456789abcdef":{"serverName":"linear","serverUrl":"https://mcp.linear.app/mcp","accessToken":"FAKE-MCP-%s","refreshToken":"FAKE-MCP-R-%s","expiresAt":1789002000000,"scope":"read"}}' "$1" "$1"
+}
+
+@test "regression vnext: a switch never leaves the box without a credential file even for a moment" {
+  _acct_race_setup
+  local CN="cleat-gap-abcdef12" staged f
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/old/.credentials.json" O 0 1789003600000
+  _acct_race_cred "$CLEAT_ACCOUNTS_DIR/new/.credentials.json" N 0 1789003600000
+  _acct_race_cred "$staged" O 0 1789003600000
+  _box_account_write "$CN" old
+  # Every step from the last harvest to the rename looks at the staged path as
+  # it starts, which is what a Claude reading at that moment would have found.
+  export GAP_STAGED="$staged" GAP_LOG="$TEST_TEMP/gap.log"
+  : > "$GAP_LOG"
+  for f in _account_release_staged_locked _box_account_write _account_sync_in_locked _account_write_file_0600; do
+    eval "$(declare -f "$f" | sed "1s/^$f /_gap_orig_$f /")"
+    eval "$f() { if [[ -e \"\$GAP_STAGED\" ]]; then echo \"$f present\"; else echo \"$f gone\"; fi >> \"\$GAP_LOG\"; _gap_orig_$f \"\$@\"; }"
+  done
+  run _account_do_switch new main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run cat "$GAP_LOG"
+  refute_output --partial "gone"
+  # The probe ran at the pin write and inside the staging, so a pass is not vacuous.
+  assert_output --partial "_box_account_write present"
+  assert_output --partial "_account_write_file_0600 present"
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-N0"'
+}
+
+@test "regression vnext: an MCP server login made inside a pinned box survives the next attach" {
+  _acct_race_setup
+  local CN="cleat-mcp-abcdef12" staged store
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  store="$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  mkdir -p "${store%/*}"
+  printf '{%s}\n' "$(_acct_key_login W 0 1789003600000)" > "$store"
+  _box_account_write "$CN" work
+  run _account_sync_in "$CN"
+  assert_success
+  # In the box: `claude mcp login linear`. Claude rewrites its store with the
+  # MCP entry after the login it already had and refreshes nothing.
+  printf '{%s,%s}\n' "$(_acct_key_login W 0 1789003600000)" "$(_acct_key_mcp box1)" > "$staged"
+  run _account_sync_out "$CN"
+  assert_success
+  run _account_sync_in "$CN"
+  assert_success
+  run cat "$staged"
+  assert_output --partial '"accessToken":"FAKE-MCP-box1"'
+  assert_output --partial '"accessToken":"at-W0"'
+  # A sibling box on the same account refreshed it, so this attach stages the
+  # newer login and keeps the MCP login beside it.
+  printf '{%s}\n' "$(_acct_key_login W 1 1789028800000)" > "$store"
+  run _account_sync_in "$CN"
+  assert_success
+  run cat "$staged"
+  assert_output --partial '"accessToken":"FAKE-MCP-box1"'
+  assert_output --partial '"accessToken":"at-W1"'
+  refute_output --partial '"accessToken":"at-W0"'
+}
+
+@test "regression vnext: one box's MCP login never reaches the account store or another box" {
+  _acct_race_setup
+  local one="cleat-one-abcdef12" two="cleat-two-abcdef12" store
+  store="$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  mkdir -p "${store%/*}" "$CLEAT_RUN_DIR/$one/auth" "$CLEAT_RUN_DIR/$two/auth"
+  printf '{%s}\n' "$(_acct_key_login W 0 1789003600000)" > "$store"
+  _box_account_write "$one" work
+  _box_account_write "$two" work
+  printf '{%s,%s}\n' "$(_acct_key_login W 0 1789003600000)" "$(_acct_key_mcp two)" \
+    > "$CLEAT_RUN_DIR/$two/auth/.credentials.json"
+  # Box one signed into its own MCP server and Claude refreshed the login.
+  printf '{%s,%s}\n' "$(_acct_key_login W 1 1789028800000)" "$(_acct_key_mcp one)" \
+    > "$CLEAT_RUN_DIR/$one/auth/.credentials.json"
+  run _account_sync_out "$one"
+  assert_success
+  run cat "$store"
+  assert_output --partial '"accessToken":"at-W1"'
+  refute_output --partial "FAKE-MCP"
+  run _account_sync_in "$two"
+  assert_success
+  run cat "$CLEAT_RUN_DIR/$two/auth/.credentials.json"
+  assert_output --partial '"accessToken":"at-W1"'
+  assert_output --partial "FAKE-MCP-two"
+  refute_output --partial "FAKE-MCP-one"
+}
+
+@test "regression vnext: switching a box to another account keeps its own MCP login" {
+  _acct_race_setup
+  local CN="cleat-mcp-abcdef12" staged
+  staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/old" "$CLEAT_ACCOUNTS_DIR/new" "${staged%/*}"
+  printf '{%s}\n' "$(_acct_key_login O 1 1789028800000)" > "$CLEAT_ACCOUNTS_DIR/old/.credentials.json"
+  printf '{%s}\n' "$(_acct_key_login N 0 1789000100000)" > "$CLEAT_ACCOUNTS_DIR/new/.credentials.json"
+  _box_account_write "$CN" old
+  # The box's login is the fresher one, which newest-wins alone would keep.
+  printf '{%s,%s}\n' "$(_acct_key_mcp box1)" "$(_acct_key_login O 1 1789028800000)" > "$staged"
+  run _account_do_switch new main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run cat "$staged"
+  assert_output --partial '"accessToken":"at-N0"'
+  refute_output --partial '"accessToken":"at-O1"'
+  assert_output --partial "FAKE-MCP-box1"
+  run cat "$CLEAT_ACCOUNTS_DIR/old/.credentials.json"
+  assert_output --partial '"accessToken":"at-O1"'
+  refute_output --partial "FAKE-MCP"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.4.3: cleat clean asked docker whether each box still exists and pruned on
+# every "no". With the daemon down every answer is no, so it removed every box
+# description and every run dir (the overlays, the conversations' file history
+# and a staged login) for boxes that still existed. It now refuses.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.4.3: cleat clean with Docker down removes no box state" {
+  local cn="cleat-live-aaaa1111"
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  mkdir -p "$CLEAT_RUN_DIR/$cn/settings" "$CLEAT_BOXES_DIR"
+  printf 'a box that still exists\n' > "$CLEAT_BOXES_DIR/$cn"
+  run cmd_clean
+  assert_failure
+  assert_output --partial "Docker is not running"
+  assert_output --partial "Nothing was removed"
+  run test -d "$CLEAT_RUN_DIR/$cn/settings"
+  assert_success
+  run test -f "$CLEAT_BOXES_DIR/$cn"
+  assert_success
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The box sees its per-project claude.json through a single-file bind mount, so
+# cleat rewrites it in place. `cat tmp > f` truncates first, and Claude Code
+# reads the file inside that empty window: a running session "auto-repairs" by
+# writing its cached copy (the OLD identity) back in place, the rest of cleat's
+# write lands on top and the file is left as broken JSON. A session starting in
+# the window stops on "Configuration error". Reproduced against Claude Code
+# 2.1.270 with rename made to fail the way it does on a bind mount.
+#
+# The stand-in reader below runs at the moment cleat starts copying its temp
+# file into place, which is exactly the window, and does what Claude does with
+# an unparseable file on a bind mount.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: the identity delete never empties claude.json under a reading Claude" {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  local key f cached
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{\n  "oauthAccount": {"emailAddress": "previous@example.com", "organizationName": "Previous Org"},\n  "userID": "abc",\n  "projects": {"/workspace": {"lastCost": 1}}\n}\n' > "$f"
+  cached="$(command cat "$f")"
+  _daemon_up() { return 1; }     # nothing running: the write is allowed
+  _with_reading_claude() {
+    cat() {
+      if [[ "${1:-}" == "$f".* ]]; then
+        : >> "$TEST_TEMP/copy-seen"
+        if ! _looks_like_json_object "$f"; then
+          : >> "$TEST_TEMP/claude-saw-bad-json"
+          printf '%s\n' "$cached" > "$f"   # Claude's in-place auto-repair
+        fi
+      fi
+      command cat "$@"
+    }
+    _account_invalidate_identity "$@"
+  }
+  run _with_reading_claude "$TEST_TEMP/proj" main
+  assert_success
+  run test -e "$TEST_TEMP/copy-seen"
+  assert_success
+  run test -e "$TEST_TEMP/claude-saw-bad-json"
+  assert_failure
+  run jq -e 'type=="object"' "$f"
+  assert_success
+  run jq -r '.oauthAccount // "absent"' "$f"
+  assert_output "absent"
+  run jq -r '.userID' "$f"
+  assert_output "abc"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The switch checks for a live session once, at the top. Then it harvests,
+# stages, captures metadata and polls usage with a three second timeout before
+# it reaches the identity delete. A claude started from another terminal in that
+# time was written under, and deleting oauthAccount beneath a running Claude
+# Code makes it refuse every later save of its config
+# (tengu_config_auth_loss_prevented, 4 of 4 against 2.1.270). The delete asks
+# again right before it writes, and the switch says how to finish the job.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: a Claude that starts during an account switch keeps its identity file untouched" {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  _CLEAT_NOW_S=1789000000
+  curl() { cat >/dev/null 2>&1; return 7; }
+  local CN="cleat-proj-abcdef12" key f
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work"
+  chmod 700 "$CLEAT_ACCOUNTS_DIR/work"
+  printf '{"claudeAiOauth":{"accessToken":"a-token","refreshToken":"r-token","expiresAt":1789003600000,"subscriptionType":"max"}}\n' > "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  chmod 600 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{"oauthAccount":{"emailAddress":"previous@example.com"},"userID":"abc"}\n' > "$f"
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _account_box_ready() { return 0; }
+  # Not live when the switch first asks, live from then on. A counter, never a
+  # sleep: the interleaving is the point, the timing is not.
+  _box_has_live_agent() {
+    [[ -e "$TEST_TEMP/claude-started" ]] && return 0
+    : > "$TEST_TEMP/claude-started"
+    return 1
+  }
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "during the switch"
+  assert_output --partial "cleat stop main"
+  run jq -r '.oauthAccount.emailAddress' "$f"
+  assert_output "previous@example.com"
+  run _box_account_read "$CN"
+  assert_output "work"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.4.3: the same truncating write in the attach heal, which has shipped since
+# v1.1.1. It runs while no claude is live in the box, but a second terminal
+# attaching at the same moment starts one that reads the file in the window and
+# stops on "Configuration error ... Reset with default configuration"
+# (reproduced against 2.1.270).
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.4.3: the attach heal never empties claude.json under a starting Claude" {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  local key f
+  mkdir -p "$TEST_TEMP/project"
+  key="$(_derive_project_session_key "$TEST_TEMP/project" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{\n  "hasCompletedOnboarding": false,\n  "oauthAccount": {"emailAddress": "heal@login.dev"},\n  "projects": {"/workspace": {"x": 1}}\n}\n' > "$f"
+  rm -f "${HOME}/.claude.json"
+  _box_has_live_agent() { return 1; }
+  _with_starting_claude() {
+    cat() {
+      if [[ "${1:-}" == "$f".* ]]; then
+        : >> "$TEST_TEMP/copy-seen"
+        _looks_like_json_object "$f" || : >> "$TEST_TEMP/claude-saw-bad-json"
+      fi
+      command cat "$@"
+    }
+    _refresh_attached_claude_json heal-ctr "$TEST_TEMP/project" main
+  }
+  run _with_starting_claude
+  assert_success
+  run test -e "$TEST_TEMP/copy-seen"
+  assert_success
+  run test -e "$TEST_TEMP/claude-saw-bad-json"
+  assert_failure
+  run jq -r '.hasCompletedOnboarding' "$f"
+  assert_output "true"
+  run jq -r '.projects["/workspace"].x' "$f"
+  assert_output "1"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.4.3: the heal's live check ran before a rebuild that scans every sibling
+# project, so a claude started by another terminal during that scan was written
+# under. The check is repeated immediately before the write.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.4.3: the attach heal asks for a live Claude again right before it writes" {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  local key f
+  mkdir -p "$TEST_TEMP/project"
+  key="$(_derive_project_session_key "$TEST_TEMP/project" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  printf '{"hasCompletedOnboarding":false,"projects":{"/workspace":{"x":1}}}\n' > "$f"
+  rm -f "${HOME}/.claude.json"
+  _box_has_live_agent() {
+    [[ -e "$TEST_TEMP/claude-started" ]] && return 0
+    : > "$TEST_TEMP/claude-started"
+    return 1
+  }
+  run _refresh_attached_claude_json heal-ctr "$TEST_TEMP/project" main
+  assert_success
+  run jq -r '.hasCompletedOnboarding' "$f"
+  assert_output "false"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# `cleat account rm` dropped every pin to the account and left the account's
+# oauthAccount in each pinned box's per-project claude.json. The default switch
+# already dropped it. The remove could not: it knows those boxes only by
+# container name, the name truncates the directory segment and the project path
+# is recorded nowhere. A detached box that is still running passes the live
+# gate and is never rebuilt, so its next session ran on the shared login under
+# the removed account's email. On a host whose own ~/.claude.json has no
+# oauthAccount, the stopped-box rebuild kept it too. The pin now carries the
+# box's per-project key on a second line.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: removing an account drops the identity its pinned boxes carry" {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  _CLEAT_NOW_S=1789000000
+  curl() { cat >/dev/null 2>&1; return 7; }
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work" "$TEST_TEMP/proj-a" "$TEST_TEMP/proj-b"
+  chmod 700 "$CLEAT_ACCOUNTS_DIR/work"
+  printf '{"claudeAiOauth":{"accessToken":"a-token","refreshToken":"r-token","expiresAt":1789003600000,"subscriptionType":"max"}}\n' \
+    > "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  chmod 600 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  # Two boxes in two projects, one of them a named box, pinned through the real
+  # switch with the daemon down.
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  _box_has_live_agent() { return 1; }
+  local pa="$TEST_TEMP/proj-a" pb="$TEST_TEMP/proj-b" ca cb fa fb
+  ca="$(container_name_for "$pa" main)"
+  cb="$(container_name_for "$pb" dev)"
+  run _account_do_switch work main "$ca" "$pa"
+  assert_success
+  run _account_do_switch work dev "$cb" "$pb"
+  assert_success
+  fa="$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$pa" main)/claude.json"
+  fb="$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$pb" dev)/claude.json"
+  mkdir -p "${fa%/*}" "${fb%/*}"
+  # What Claude writes into each box once it has fetched the profile as work.
+  printf '{"oauthAccount":{"emailAddress":"work@example.com","profileFetchedAt":1789000000000},"userID":"abc","hasCompletedOnboarding":true}\n' > "$fa"
+  cp "$fa" "$fb"
+  # Both detached and still running: no live claude, so the gate lets it through.
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _box_has_live_agent() { return 1; }
+  run _account_do_remove work 1
+  assert_success
+  run _box_account_read "$cb"
+  assert_output "default"
+  run jq -r '.oauthAccount // "absent"' "$fa"
+  assert_output "absent"
+  run jq -r '.oauthAccount // "absent"' "$fb"
+  assert_output "absent"
+  # A targeted delete on a live bind source, not a rebuild.
+  run jq -r '.userID' "$fb"
+  assert_output "abc"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# An in-box login lands only in that box's per-project claude.json, so an
+# unpinned box picks the newest sibling file that has one. A box on a NAMED
+# account holds that account's identity there, and the file says nothing about
+# whose it is, so the newest pinned sibling stamped every shared-login box with
+# the other person's email. concept/44 claimed this guard existed. It did not.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: an unpinned box never inherits a pinned sibling's account name" {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_PROJECTS_DIR"
+  printf '{"projects":{}}\n' > "$HOME/.claude.json"
+  local pinned_key="pinned-11111111" shared_key="shared-22222222" out
+  mkdir -p "$CLEAT_PROJECTS_DIR/$pinned_key" "$CLEAT_PROJECTS_DIR/$shared_key"
+  printf '{"oauthAccount":{"emailAddress":"work@example.com"},"hasCompletedOnboarding":true}\n' \
+    > "$CLEAT_PROJECTS_DIR/$pinned_key/claude.json"
+  printf '{"oauthAccount":{"emailAddress":"shared@example.com"},"hasCompletedOnboarding":true}\n' \
+    > "$CLEAT_PROJECTS_DIR/$shared_key/claude.json"
+  # The pinned one is the NEWEST, so without the guard it wins the scan.
+  touch -t 202601010101.01 "$CLEAT_PROJECTS_DIR/$shared_key/claude.json"
+  touch -t 202601010202.02 "$CLEAT_PROJECTS_DIR/$pinned_key/claude.json"
+  _box_account_write "cleat-pinned-11111111" work "$pinned_key"
+  out="$CLEAT_PROJECTS_DIR/third-33333333/claude.json"
+  run _build_project_claude_json "$out"
+  assert_success
+  run jq -r '.oauthAccount.emailAddress' "$out"
+  assert_output "shared@example.com"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.4.3: `cleat login` never signed anyone in. Claude Code has no top-level
+# `login` subcommand, so commander read the word as the first PROMPT of an
+# interactive session. A signed-in box sent it to the model as a real request
+# and kept a conversation called "login". A signed-out one answered "Not logged
+# in". Nothing errored, and the command always claimed the shared ~/.claude.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.4.3: cleat login runs claude auth login, never a bare login prompt" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo ""; }
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  run grep -c -e "-- claude auth login\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c -e "-- claude login\$" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+# A pinned box whose `docker exec` of `claude auth login` does what Claude Code
+# does: write the store the override names. $1 = 1 to write, 0 to write nothing.
+_b13_pinned_login_box() {
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$TEST_TEMP/project"
+  _B13_CNAME="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$_B13_CNAME"
+  _host_open_cmd() { echo ""; }
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  _account_ensure_dir fresh
+  _box_account_write "$_B13_CNAME" fresh
+  _B13_STAGED="$(_account_box_auth_dir "$_B13_CNAME")/.credentials.json"
+  _B13_WRITES="$1"
+  # The harvest asks the server whose login this is. A shell function also
+  # satisfies the `command -v curl` guard on a host with no curl at all.
+  curl() { cat >/dev/null 2>&1; return 7; }
+  _account_profile_curl() {
+    printf '{"account":{"uuid":"0b8f2a6e-1c3d-4e5f-8a9b-0c1d2e3f4a5b","email":"fresh@example.com"},"organization":{"uuid":"org-1","name":"Acme Ltd","cc_onboarding_flags":{}}}\n200'
+  }
+  docker() {
+    case "$1" in
+      inspect) printf '%s\n' "/home/coder/.cleat-auth" ;;
+      exec)
+        if [[ "$_B13_WRITES" == 1 && "$*" == *"CLAUDE_SECURESTORAGE_CONFIG_DIR="*"-- claude auth login" ]]; then
+          mkdir -p "${_B13_STAGED%/*}"
+          printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-b13","refreshToken":"sk-ant-ort01-b13","expiresAt":%s,"subscriptionType":"max"}}\n' \
+            "$(( ($(date +%s) + 28800) * 1000 ))" > "$_B13_STAGED"
+        fi
+        command docker "$@" ;;
+      *) command docker "$@" ;;
+    esac
+  }
+}
+
+@test "regression v1.4.3: cleat login on a pinned box saves the login into the account, not ~/.claude" {
+  # The login lands in the box's staged copy and nothing harvested it. The
+  # account still read "signed out" and the next attach's staging deleted the
+  # new login. The success line named the shared ~/.claude it never touched.
+  _b13_pinned_login_box 1
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Auth saved to account"
+  refute_output --partial "~/.claude"
+  run _account_auth_state fresh
+  assert_output "ok"
+  run grep -c "sk-ant-ort01-b13" "$(_account_cred_path fresh)"
+  assert_output "1"
+}
+
+@test "regression v1.4.3: cleat login never reports a login saved that did not reach the pinned account" {
+  # The store override is an undocumented Claude Code variable. A Claude that
+  # exits 0 without writing the relocated store must not be reported as a login
+  # saved under the account's name.
+  _b13_pinned_login_box 0
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "did not reach account"
+  refute_output --partial "Auth saved"
+}
+
+@test "regression v1.4.3: a failed cleat login exits non-zero and claims nothing" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=1
+  run cmd_login "$TEST_TEMP/project"
+  assert_failure
+  refute_output --partial "Auth saved"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: the browser destination gate shipped without the hosts Claude Code
+# 2.1.270 actually authorizes at (claude.com and platform.claude.com). The gate
+# refused the one login Cleat ships a bridge FOR, so the watcher never opened
+# the URL and never started the callback proxy, and every login fell back to
+# pasting a code by hand while `cleat login` promised the browser would open.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: the Claude authorize URL opens through the browser bridge" {
+  local u
+  u="https://claude.com/cai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A40701%2Fcallback"
+  run _bridge_dest_allowed "$u"
+  assert_success
+  run _is_auth_url "$u"
+  assert_success
+  run _extract_callback_port "$u"
+  assert_output "40701"
+  u="https://platform.claude.com/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+  run _bridge_dest_allowed "$u"
+  assert_success
+  run _is_auth_url "$u"
+  assert_success
+  # Exact hosts, never a suffix: a neighbour that merely ends in the same name
+  # is still refused.
+  run _bridge_dest_allowed "https://evilclaude.com/cai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback"
+  assert_failure
+  run _bridge_dest_allowed "https://auth.claude.com/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback"
+  assert_failure
+}
+
+@test "regression v1.4.3: resume does not reopen a conversation that is open in another terminal" {
+  # cmd_resume ran `claude --continue`, which reopens the newest conversation in
+  # the box's folder and skips a live one only when it is a BACKGROUND session.
+  # With a second Claude still working in another terminal of the same box, the
+  # newest conversation was that terminal's: the resumed process opened it,
+  # registered the same session id, and both appended divergent histories to one
+  # transcript (Claude Code 2.1.270 lab: 6/6 in the account investigation, 2/2
+  # again on the v1.4.3 argv). Resume now names the newest conversation that no
+  # live process holds.
+  mkdir -p "$TEST_TEMP/project"
+  local cname sdir mine="11111111-1111-4111-8111-111111111111" other="22222222-2222-4222-8222-222222222222" id
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  mock_docker_ps_a "$cname"
+  sdir="$(_sessions_key_dir "$TEST_TEMP/project" main)"
+  mkdir -p "$sdir"
+  for id in "$mine" "$other"; do
+    printf '%s\n' '{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hi"},"entrypoint":"cli","sessionId":"'"$id"'"}' > "$sdir/$id.jsonl"
+  done
+  # Mine ended first; the other terminal wrote after that.
+  touch -t 202601010000 "$sdir/$mine.jsonl"
+  _box_live_session_ids() { printf '%s\n' "22222222-2222-4222-8222-222222222222"; }
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "--dangerously-skip-permissions --resume $mine"
+  assert_success
+  run grep -F -- "$other" "$DOCKER_CALLS"
+  assert_failure
+  run grep -F -- "--continue" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "regression v1.4.3: resume keeps the 1M context the conversation ran on" {
+  # Claude Code restores a resumed conversation's model from its last assistant
+  # message, which records the bare id, and re-adds [1m] only when a model is
+  # configured with it. On the default model nothing is, so `cleat resume`
+  # brought an "Opus 5 (1M context)" conversation back as "Opus 5" and every
+  # request lost the context-1m beta (lab: 4/4 x3, 2/2 critic, 2/2 again here).
+  # The run's own usage record names the model it really ran, and resume now
+  # passes it back.
+  mkdir -p "$TEST_TEMP/project"
+  local cname sdir id="11111111-1111-4111-8111-111111111111"
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
+  sdir="$(_sessions_key_dir "$TEST_TEMP/project" main)"
+  mkdir -p "$sdir"
+  printf '%s\n' \
+    '{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hi"},"entrypoint":"cli","sessionId":"'"$id"'"}' \
+    '{"parentUuid":"u1","isSidechain":false,"message":{"id":"m1","type":"message","role":"assistant","model":"claude-opus-5","content":[]},"type":"assistant","sessionId":"'"$id"'"}' \
+    '{"type":"cost-state","sessionId":"'"$id"'","modelUsage":{"claude-opus-5[1m]":{"inputTokens":12}}}' > "$sdir/$id.jsonl"
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "--resume $id --model claude-opus-5[1m]"
+  assert_success
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.4.3: _box_has_live_agent grepped the WHOLE `docker top` output for
+# claude|node, so any node process read as a live Claude session. Claude exits,
+# a `vite --host` (or an MCP server, or a shell Claude's Bash tool started)
+# stays up, and the box is "live" forever: the idle sweep never reclaims it and
+# the attach heal never runs (both released), `cleat account` refuses with
+# "main has a live Claude session" and a session delete refuses (both
+# unreleased). Found by the maintainer on a real box, 2026-09-13.
+#
+# The fix judges only the command column, and only by its executable
+# (_is_claude_argv). The fixture is what `docker top` prints for that box: the
+# cleat PID 1 chain plus four leftovers, each a different decoy. The node one
+# is the reported bug. The .claude/ paths (a plugin's MCP and LSP servers, a
+# shell Claude's Bash tool started) are what a grep for claude alone still
+# matched. The user name in the UID column is what a native Linux host prints
+# when its user is called claude.
+# ─────────────────────────────────────────────────────────────────────────────
+_b17_top_after_claude_exited() {
+  printf '%s\n' \
+    'UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD' \
+    'root                48213               48190               0                   09:14               ?                   00:00:00            /sbin/docker-init -- /entrypoint.sh bash' \
+    'root                48260               48213               0                   09:14               ?                   00:00:00            su -s /bin/bash coder' \
+    'claude              48262               48260               0                   09:14               ?                   00:00:00            bash' \
+    'claude              50111               48213               0                   09:40               ?                   00:00:04            node /workspace/node_modules/.bin/vite --host' \
+    'claude              50200               48213               0                   09:41               ?                   00:00:01            node /home/coder/.claude/plugins/cache/acme/mcp/dist/index.js' \
+    'claude              50250               48213               0                   09:41               ?                   00:00:00            /home/coder/.claude/plugins/cache/acme/bin/acme-lsp --stdio' \
+    "claude              50300               48213               0                   09:41               ?                   00:00:00            /bin/bash -c source /home/coder/.claude/shell-snapshots/snapshot-bash-1789295352419-hrzih4.sh 2>/dev/null || true && eval 'python3 -m http.server 8000' < /dev/null"
+}
+
+@test "regression v1.4.3: a leftover node dev server does not keep a detached box out of the idle sweep" {
+  docker() {
+    case "$1" in
+      top)     _b17_top_after_claude_exited ;;
+      inspect) echo 0 ;;
+      stop)    printf '%s\n' "$*" >> "$TEST_TEMP/stopped" ;;
+    esac
+    return 0
+  }
+  run _box_has_live_agent "cleat-dev-11111111"
+  assert_failure
+
+  _running_cleat_boxes() { printf '%s\n' "cleat-dev-11111111"; }
+  _path_mtime() { echo 1000; }            # detached long past the grace window
+  run _sweep_idle_boxes "" 1800
+  assert_success
+  assert_output --partial "Stopped 1 idle session"
+  run cat "$TEST_TEMP/stopped"
+  assert_output "stop cleat-dev-11111111"
+
+  # The same box with Claude still running in it must stay untouchable. This is
+  # the "leave it running, walk away" promise the gate exists for.
+  : > "$TEST_TEMP/stopped"
+  docker() {
+    case "$1" in
+      top) _b17_top_after_claude_exited
+           printf '%s\n' 'claude              50400               50390               0                   09:45               pts/0               00:00:09            claude --dangerously-skip-permissions --continue' ;;
+      stop) printf '%s\n' "$*" >> "$TEST_TEMP/stopped" ;;
+    esac
+    return 0
+  }
+  run _sweep_idle_boxes "" 1800
+  refute_output --partial "Stopped"
+  [ ! -s "$TEST_TEMP/stopped" ]
+}
+
+@test "regression vnext: cleat account switches a box whose only node process is a dev server" {
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/b" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  chmod 700 "$CLEAT_ACCOUNTS_DIR/b"
+  _CLEAT_NOW_S=1789000000
+  _has_unicode() { return 1; }
+  curl() { cat >/dev/null 2>&1; return 7; }
+  printf '{"claudeAiOauth":{"accessToken":"at-B0","refreshToken":"rt-B","expiresAt":1789003600000,"subscriptionType":"max"}}\n' \
+    > "$CLEAT_ACCOUNTS_DIR/b/.credentials.json"
+  chmod 600 "$CLEAT_ACCOUNTS_DIR/b/.credentials.json"
+  # The box is up and the only thing left running in it is a dev server.
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  docker() {
+    case "$1" in
+      top)     _b17_top_after_claude_exited ;;
+      inspect) printf '%s\n' "/home/coder/.cleat-auth" ;;
+    esac
+    return 0
+  }
+  run _account_do_switch b main "cleat-proj-abcdef12" "$TEST_TEMP/proj"
+  assert_success
+  refute_output --partial "live Claude session"
+  run _box_account_read "cleat-proj-abcdef12"
+  assert_output "b"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.4.3: enabling a kit on a STOPPED box said "A session is live in this box".
+# `docker top` fails on a stopped container and _box_has_live_agent maps any
+# failure to "live", which is right for a gate and wrong for a note. The note
+# lacked the is_running term every other caller carries.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.4.3: enabling a kit on a stopped box does not claim a live session" {
+  CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
+  CLEAT_KITS_DIR="$CLEAT_CONFIG_DIR/kits"
+  CLEAT_BOXES_DIR="$CLEAT_CONFIG_DIR/boxes"
+  CLEAT_PROJECTS_DIR="$CLEAT_CONFIG_DIR/projects"
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps ""
+  mock_docker_ps_a "$cname"
+  _container_has_kit_mounts() { return 0; }
+  DOCKER_EXIT_CODE=1   # every docker call the stub does not special-case fails, top included
+  export DOCKER_EXIT_CODE
+  run cmd_kit plan-big-execute-small <<< "y"
+  assert_success
+  refute_output --partial "A session is live in this box"
+  assert_output --partial "Takes effect next session"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext (unreleased account switching): on a host with no jq a pinned box kept
+# or gained the wrong identity. _account_invalidate_identity returned at once
+# without jq, and the builder's no-jq branch kept the persisted copy or copied
+# the host file whole, so the box launched carrying the previous account's (or
+# the host's) oauthAccount. That name is what Claude shows, and its
+# organisation goes out with the new account's token. The host still has no jq
+# after the fix: the BOX's own jq does the transform, at the switch when the
+# box is running and just before the next launch otherwise.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A jq-less host whose box has jq. The stand-in answers exactly the in-box
+# filter call with the real binary and hands every other docker call to the
+# stub, so nothing else changes behaviour.
+_b12_setup() {
+  command -v jq >/dev/null || skip "needs jq to stand in for the box's own"
+  _B12_JQ="$(command -v jq)"
+  _B12_PROJ="$TEST_TEMP/proj"
+  mkdir -p "$_B12_PROJ"
+  _B12_CN="$(container_name_for "$_B12_PROJ" main)"
+  _B12_KEY="$(_derive_project_session_key "$_B12_PROJ" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$_B12_KEY"
+  _B12_F="$CLEAT_PROJECTS_DIR/$_B12_KEY/claude.json"
+  # No switch here has a login to harvest, so nothing should reach the network.
+  # If anything ever does, it fails instead of asking a real Anthropic host.
+  curl() { cat >/dev/null 2>&1; return 7; }
+  _account_usage_fetch() { return 0; }
+  _box_has_live_agent() { return 1; }
+  _account_box_ready() { return 0; }
+  _hide_jq
+}
+_b12_box_stopped() {
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  is_running() { return 1; }
+}
+_b12_box_running() {
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  docker() {
+    if [ "$1" = exec ] && [ "$2" = -i ] && [ "$4" = jq ]; then
+      shift 4
+      "$_B12_JQ" "$@"
+      return
+    fi
+    command docker "$@"
+  }
+}
+_b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_F"; }
+
+@test "regression vnext: a jq-less host clears the old account from a box switched while stopped" {
+  _b12_setup
+  _b12_box_stopped
+  _account_ensure_dir a
+  _box_account_write "$_B12_CN" a "$_B12_KEY"
+  printf '{"oauthAccount":{"emailAddress":"a@example.com","organizationUuid":"org-a","profileFetchedAt":9999999999999},"userID":"abc","cachedUsageUtilization":{"x":1}}\n' > "$_B12_F"
+  run _account_do_switch b main "$_B12_CN" "$_B12_PROJ"
+  assert_success
+  # The next start: the rebuild runs while the box is stopped, then the box
+  # comes up and the launch hook runs.
+  _refresh_project_claude_json "$_B12_PROJ" main
+  _b12_box_running
+  # The real launch path, not the hook on its own: exec_claude is what has to
+  # reach the file before Claude does.
+  _RESOLVED_PROJECT="$_B12_PROJ"
+  _BOX=main
+  run exec_claude "$_B12_CN" --dangerously-skip-permissions
+  run _b12_identity
+  assert_output "absent"
+  run "$_B12_JQ" -r '.cachedUsageUtilization // "absent"' "$_B12_F"
+  assert_output "absent"
+  # A targeted delete, not a reset: the rest of the file survives.
+  run "$_B12_JQ" -r '.userID' "$_B12_F"
+  assert_output "abc"
+}
+
+@test "regression vnext: a jq-less host clears the old account at the switch when the box is running" {
+  _b12_setup
+  _b12_box_running
+  _account_ensure_dir a
+  _box_account_write "$_B12_CN" a "$_B12_KEY"
+  printf '{"oauthAccount":{"emailAddress":"a@example.com"},"userID":"abc"}\n' > "$_B12_F"
+  local before after
+  before="$(ls -i "$_B12_F" | awk '{print $1}')"
+  run _account_do_switch b main "$_B12_CN" "$_B12_PROJ"
+  assert_success
+  run _b12_identity
+  assert_output "absent"
+  # The box binds this file, so the edit has to keep its inode.
+  after="$(ls -i "$_B12_F" | awk '{print $1}')"
+  [ "$before" = "$after" ] || { echo "inode changed under a running box"; return 1; }
+}
+
+@test "regression vnext: a box created pinned on a jq-less host does not launch with the host account" {
+  _b12_setup
+  _account_ensure_dir work
+  _box_account_write "$_B12_CN" work "$_B12_KEY"
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"userID":"abc"}\n' > "$HOME/.claude.json"
+  _build_project_claude_json "$_B12_F" "" "$_B12_CN"
+  _b12_box_running
+  run _refresh_attached_claude_json "$_B12_CN" "$_B12_PROJ" main
+  assert_success
+  run _b12_identity
+  assert_output "absent"
+  run "$_B12_JQ" -r '.userID' "$_B12_F"
+  assert_output "abc"
+}
+
+@test "regression vnext: a jq-less host clears the named account from a stopped box put back on the shared login" {
+  _b12_setup
+  _b12_box_stopped
+  _account_ensure_dir a
+  _box_account_write "$_B12_CN" a "$_B12_KEY"
+  printf '{"oauthAccount":{"emailAddress":"host@example.com"},"userID":"abc"}\n' > "$HOME/.claude.json"
+  printf '{"oauthAccount":{"emailAddress":"a@example.com"},"userID":"abc"}\n' > "$_B12_F"
+  run _account_do_switch default main "$_B12_CN" "$_B12_PROJ"
+  assert_success
+  # An unpinned box is not flagged by the rebuild, so only the switch's own
+  # flag can carry this one to the launch.
+  _refresh_project_claude_json "$_B12_PROJ" main
+  _b12_box_running
+  run _refresh_attached_claude_json "$_B12_CN" "$_B12_PROJ" main
+  assert_success
+  run _b12_identity
+  assert_output "absent"
+}
+
+@test "regression vnext: the jq-less identity clear never edits the file under a live Claude" {
+  # A config write racing the in-place copy puts the old name straight back,
+  # and a delete under a live Claude Code freezes its own later saves of that
+  # file. The next launch tries again.
+  _b12_setup
+  _b12_box_stopped
+  _account_ensure_dir a
+  _box_account_write "$_B12_CN" a "$_B12_KEY"
+  printf '{"oauthAccount":{"emailAddress":"a@example.com"},"userID":"abc"}\n' > "$_B12_F"
+  run _account_do_switch b main "$_B12_CN" "$_B12_PROJ"
+  assert_success
+  _b12_box_running
+  _box_has_live_agent() { return 0; }
+  run _refresh_attached_claude_json "$_B12_CN" "$_B12_PROJ" main
+  assert_output --partial "still carries another account"
+  run _b12_identity
+  assert_output "a@example.com"
+  # And the next launch, with the session gone, still clears it.
+  _box_has_live_agent() { return 1; }
+  run _refresh_attached_claude_json "$_B12_CN" "$_B12_PROJ" main
+  refute_output --partial "still carries another account"
+  run _b12_identity
+  assert_output "absent"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Two boxes on ONE account, the shipped Boxes plus cleat account combination.
+# Claude rotates the refresh token on nearly every refresh, so the box that
+# refreshed last advanced the store and the OTHER box was left staged on the
+# generation before it. The attach read that as "a login this account does not
+# have": it warned on the terminal, kept a copy of a live refresh token for
+# thirty days and offered to adopt it as a separate account. Every attach of
+# the box that fell behind did it again, so the copies piled up. The same hold
+# fired from the release path on `cleat account default` and on a re-pin.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: a box staged on a generation its account already replaced is not held" {
+  _acct_race_setup
+  local mode acct a b c store staged_a staged_b staged_c
+  for mode in jq nojq; do
+    [[ "$mode" == nojq ]] && _hide_jq
+    acct="work-$mode"
+    a="cleat-main-$mode"; b="cleat-api-$mode"; c="cleat-docs-$mode"
+    store="$CLEAT_ACCOUNTS_DIR/$acct/.credentials.json"
+    staged_a="$CLEAT_RUN_DIR/$a/auth/.credentials.json"
+    staged_b="$CLEAT_RUN_DIR/$b/auth/.credentials.json"
+    staged_c="$CLEAT_RUN_DIR/$c/auth/.credentials.json"
+    # One account, one login, three boxes pinned to it, all on generation 1.
+    _acct_race_cred "$store" "G1$mode" a 1789003600000
+    _acct_race_cred "$staged_a" "G1$mode" a 1789003600000
+    _acct_race_cred "$staged_b" "G1$mode" a 1789003600000
+    _acct_race_cred "$staged_c" "G1$mode" a 1789003600000
+    _box_account_write "$a" "$acct"
+    _box_account_write "$b" "$acct"
+    _box_account_write "$c" "$acct"
+    printf 'uuid\t%s\nwho\tlab-a@lab.invalid\n' "$_ACCT_UUID_A" > "$CLEAT_ACCOUNTS_DIR/$acct/meta"
+    _acct_ident_profile "$_ACCT_UUID_A" lab-a@lab.invalid
+    # Box A's Claude refreshes. The refresh token rotates, so the store and the
+    # two other boxes are a generation behind from here on.
+    _acct_race_cred "$staged_a" "G2$mode" a 1789028800000
+    run _account_sync_out "$a"
+    assert_equal "$mode harvest $status" "$mode harvest 0"
+    run grep -c "rt-G2$mode" "$store"
+    assert_output "1"
+    # Box B attaches on the old generation. Nothing is held and nothing is said.
+    run _account_sync_in "$b"
+    assert_success
+    refute_output --partial "Kept a login"
+    run grep -c "rt-G2$mode" "$staged_b"
+    assert_output "1"
+    # And the release path, which every switch, remove and nuke goes through.
+    run _account_with_lock _account_release_staged_locked "$c"
+    assert_success
+    refute_output --partial "Kept a login"
+    run test -e "$CLEAT_ACCOUNTS_DIR/.held"
+    assert_failure
+  done
+  unset -f command
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Every mkdir failure read as "someone else holds the lock", so an accounts
+# directory that could not take a lock at all (root-owned after a sudo run, a
+# read-only mount, a full disk) was polled for the whole twenty seconds, twice
+# per session (attach and session end), and the line at the end of it named
+# another cleat command and asked for a retry that could never work.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: a lock that cannot be made fails at once and names the directory" {
+  _acct_race_setup
+  local rc=0 lock
+  _ACCOUNT_LOCK_WAIT_S=20
+  lock="$(_account_lock_path)"
+  _account_lock_pause() { echo poll >> "$TEST_TEMP/polls"; }
+  # What EACCES, EROFS and ENOSPC all look like: mkdir fails and leaves nothing
+  # at the path.
+  mkdir() {
+    [[ "$1" == "$lock" ]] && return 1
+    command mkdir "$@"
+  }
+  _account_lock || rc=$?
+  assert_equal "unwritable $rc" "unwritable $_ACCOUNT_LOCK_BUSY"
+  run test -e "$TEST_TEMP/polls"
+  assert_failure
+  run _account_busy_msg
+  assert_output --partial "Check that $CLEAT_ACCOUNTS_DIR is writable."
+  refute_output --partial "Try again in a moment"
+  # And the session end, which is where a pinned box meets this twice a session.
+  run _maybe_report_account_harvest_busy "$_ACCOUNT_LOCK_BUSY"
+  assert_output --partial "Check that $CLEAT_ACCOUNTS_DIR is writable."
+  refute_output --partial "saved when the next session ends"
+  unset -f mkdir
+  # A lock another live command holds is still waited on, and still says so.
+  rc=0
+  _ACCOUNT_LOCK_WAIT_S=1
+  command mkdir -p "$lock"
+  printf 'host %s pid %s at %s\n' "${HOSTNAME:-unknown}" "$$" "$(date +%s)" > "$lock/owner"
+  _account_lock || rc=$?
+  assert_equal "busy $rc" "busy $_ACCOUNT_LOCK_BUSY"
+  run wc -l < "$TEST_TEMP/polls"
+  assert_output --partial "10"
+  run _account_busy_msg
+  assert_output --partial "Try again in a moment"
+  refute_output --partial "is writable"
+  run _maybe_report_account_harvest_busy "$_ACCOUNT_LOCK_BUSY"
+  assert_output --partial "saved when the next session ends"
+  refute_output --partial "is writable"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The session-end harvest makes a bounded network request whenever the box
+# refreshed and the refresh token rotated. It ran BEFORE the terminal restore,
+# so a black-holed route, a captive portal or a dropped VPN left the terminal
+# in Claude's raw mode for the whole timeout with nothing on screen saying why.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression vnext: the session-end harvest runs only after the terminal is back" {
+  _account_sync_out() { echo harvest >> "$TEST_TEMP/order"; return 0; }
+  _restore_terminal() { echo restore >> "$TEST_TEMP/order"; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  run cat "$TEST_TEMP/order"
+  assert_output "$(printf 'restore\nharvest')"
 }

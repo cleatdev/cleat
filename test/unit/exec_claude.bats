@@ -338,6 +338,62 @@ teardown() { _common_teardown; }
   assert_output --partial "Dropped 1 hook event from the box"
 }
 
+# ── session-end held notice ──────────────────────────────────────────────────
+# A harvest that found the box's login belongs to another account holds it
+# instead of saving it over the pinned one (status 2). Nothing else on screen
+# says so, and the box keeps running on that login until the next switch.
+
+_held_other_account() {
+  printf '{"claudeAiOauth":{"accessToken":"at-B1","refreshToken":"rt-B","expiresAt":1789028800000}}\n' > "$TEST_TEMP/held-src.json"
+  _account_hold "$TEST_TEMP/held-src.json" work test-ctr other-account \
+    "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb" other@example.com "Other Org"
+  HELD_ID="$_ACCOUNT_HELD_ID"
+}
+
+@test "session end says so when the login the box used belongs to another account" {
+  local elsewhere
+  _held_other_account
+  run test -n "$HELD_ID"
+  assert_success
+  # A newer entry another box held is never this session's.
+  printf '{"claudeAiOauth":{"accessToken":"at-C1","refreshToken":"rt-C","expiresAt":1789028800000}}\n' > "$TEST_TEMP/held-elsewhere.json"
+  date() { printf '9000000000\n'; }
+  _account_hold "$TEST_TEMP/held-elsewhere.json" work other-ctr other-account \
+    "33333333-cccc-4ccc-8ccc-cccccccccccc" elsewhere@example.com ""
+  unset -f date
+  elsewhere="$_ACCOUNT_HELD_ID"
+  run test -n "$elsewhere"
+  assert_success
+  _account_sync_out() { return 2; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "a login for another account, so it was not saved to"
+  assert_output --partial "work"
+  assert_output --partial "other@example.com"
+  assert_output --partial "cleat account adopt $HELD_ID <name>"
+  refute_output --partial "$elsewhere"
+  refute_output --partial "elsewhere@example.com"
+  # After the reclaim, which erases the line above it.
+  local end_line notice_line
+  end_line="$(printf '%s\n' "$output" | grep -n 'Session ended' | head -1 | cut -d: -f1)"
+  notice_line="$(printf '%s\n' "$output" | grep -n "a login for another account, so it was not saved to" | head -1 | cut -d: -f1)"
+  run test "${notice_line:-0}" -gt "${end_line:-999999}"
+  assert_success
+}
+
+@test "session end stays quiet when the harvest had nothing to hold" {
+  _held_other_account
+  local rc
+  for rc in 0 1 3; do
+    _HARVEST_RC="$rc"
+    _account_sync_out() { return "$_HARVEST_RC"; }
+    run exec_claude "test-ctr" --dangerously-skip-permissions
+    assert_success
+    refute_output --partial "another account"
+    refute_output --partial "cleat account adopt"
+  done
+}
+
 # ── attach heal (_refresh_attached_claude_json) ──────────────────────────────
 # The end-to-end heal (poisoned flag fixed in place, same inode) is pinned in
 # regressions.bats; these pin the guards around it.

@@ -293,3 +293,195 @@ teardown() { _common_teardown; }
   run docker_run_calls
   assert_output --partial "docker run"
 }
+
+# ── Resume target: conversation and model (B14) ─────────────────────────────
+
+_rs_mine="11111111-1111-4111-8111-111111111111"
+_rs_other="22222222-2222-4222-8222-222222222222"
+
+# A minimal transcript in Claude Code 2.1.270's shape. $1 dir, $2 id, $3 the
+# assistant model, $4 the cost-state usage key (what the run really ran).
+_rs_conv() {
+  mkdir -p "$1"
+  printf '%s\n' \
+    '{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hi"},"uuid":"u1","timestamp":"2026-09-13T10:00:00.000Z","entrypoint":"cli","sessionId":"'"$2"'"}' \
+    '{"parentUuid":"u1","isSidechain":false,"message":{"id":"m1","type":"message","role":"assistant","model":"'"$3"'","content":[{"type":"text","text":"ok"}]},"type":"assistant","uuid":"u2","timestamp":"2026-09-13T10:00:01.000Z","entrypoint":"cli","sessionId":"'"$2"'"}' \
+    '{"type":"cost-state","sessionId":"'"$2"'","modelUsage":{"'"$4"'":{"inputTokens":1}}}' > "$1/$2.jsonl"
+}
+
+@test "resume: names the newest saved conversation instead of passing --continue" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname sdir
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
+  sdir="$(_sessions_key_dir "$TEST_TEMP/project" main)"
+  _rs_conv "$sdir" "$_rs_other" claude-sonnet-5 claude-sonnet-5
+  touch -t 202601010000 "$sdir/$_rs_other.jsonl"
+  _rs_conv "$sdir" "$_rs_mine" claude-sonnet-5 claude-sonnet-5
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "--dangerously-skip-permissions --resume $_rs_mine"
+  assert_success
+  run grep -F -- "--continue" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "resume: starts a new conversation when the only one is open in another terminal" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname sdir
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  mock_docker_ps_a "$cname"
+  sdir="$(_sessions_key_dir "$TEST_TEMP/project" main)"
+  _rs_conv "$sdir" "$_rs_other" claude-opus-5 "claude-opus-5[1m]"
+  _box_live_session_ids() { printf '%s\n' "22222222-2222-4222-8222-222222222222"; }
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "open in another terminal. Starting a new one."
+  run grep -E -- "--continue|--resume" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "resume: a live session with no saved conversation keeps --continue and says nothing" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  mock_docker_ps_a "$cname"
+  _box_live_session_ids() { printf '%s\n' "22222222-2222-4222-8222-222222222222"; }
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "open in another terminal"
+  run assert_docker_exec_has "--dangerously-skip-permissions --continue"
+  assert_success
+}
+
+@test "resume: a configured model suppresses the 1M carry (env pin or settings)" {
+  # Claude Code loses [1m] only when no model is configured. With one configured,
+  # its own restore is the user's choice (opusplan[1m] switches models by mode).
+  mkdir -p "$TEST_TEMP/project/.claude"
+  local cname sdir
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  mock_docker_ps_a "$cname"
+  sdir="$(_sessions_key_dir "$TEST_TEMP/project" main)"
+  _rs_conv "$sdir" "$_rs_mine" claude-opus-5 "claude-opus-5[1m]"
+
+  _CLI_ENVS=("ANTHROPIC_MODEL=claude-sonnet-5")
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "--resume $_rs_mine"
+  assert_success
+  run grep -F -- "--model" "$DOCKER_CALLS"
+  assert_failure
+
+  _CLI_ENVS=()
+  : > "$DOCKER_CALLS"
+  printf '{\n  "model" : "opusplan[1m]"\n}\n' > "$TEST_TEMP/project/.claude/settings.local.json"
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "--resume $_rs_mine"
+  assert_success
+  run grep -F -- "--model" "$DOCKER_CALLS"
+  assert_failure
+
+  printf '{}' > "$TEST_TEMP/project/.claude/settings.local.json"
+  : > "$DOCKER_CALLS"
+  printf '{"env":{"ANTHROPIC_MODEL":"claude-sonnet-5"}}' > "$HOME/.claude/settings.json"
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run grep -F -- "--model" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "resume pick: skips a transcript with no conversation, a sidechain and a claude -p session" {
+  local sdir="$TEST_TEMP/sessions" a b c
+  _rs_conv "$sdir" "$_rs_mine" claude-opus-5 claude-opus-5
+  touch -t 202601010000 "$sdir/$_rs_mine.jsonl"
+  a="33333333-3333-4333-8333-333333333333"
+  b="44444444-4444-4444-8444-444444444444"
+  c="55555555-5555-4555-8555-555555555555"
+  printf '%s\n' '{"type":"custom-title","customTitle":"x","sessionId":"'"$a"'"}' > "$sdir/$a.jsonl"
+  printf '%s\n' '{"parentUuid":null,"isSidechain":true,"type":"user","sessionId":"'"$b"'"}' > "$sdir/$b.jsonl"
+  printf '%s\n' '{"parentUuid":null,"isSidechain":false,"type":"user","entrypoint":"sdk-cli","sessionId":"'"$c"'"}' > "$sdir/$c.jsonl"
+
+  run _resume_pick_session "$sdir" ""
+  assert_success
+  assert_output "$_rs_mine"
+}
+
+@test "resume pick: never follows a symlinked transcript or a non-session file" {
+  local sdir="$TEST_TEMP/sessions" link="66666666-6666-4666-8666-666666666666"
+  _rs_conv "$sdir" "$_rs_mine" claude-opus-5 claude-opus-5
+  touch -t 202601010000 "$sdir/$_rs_mine.jsonl"
+  _rs_conv "$TEST_TEMP/elsewhere" "$link" claude-opus-5 claude-opus-5
+  ln -s "$TEST_TEMP/elsewhere/$link.jsonl" "$sdir/$link.jsonl"
+  printf '%s\n' '{"parentUuid":null,"type":"user"}' > "$sdir/history.jsonl"
+
+  run _resume_pick_session "$sdir" ""
+  assert_output "$_rs_mine"
+}
+
+@test "resume carry: the 1M form only when the run recorded its usage under it" {
+  local sdir="$TEST_TEMP/sessions"
+  _rs_conv "$sdir" "$_rs_mine" claude-opus-5 "claude-opus-5[1m]"
+  run _resume_model_carry "$sdir/$_rs_mine.jsonl"
+  assert_output "claude-opus-5[1m]"
+
+  # Switched to Sonnet mid-conversation: the last assistant model has no 1M record.
+  _rs_conv "$sdir" "$_rs_other" claude-sonnet-5 "claude-opus-5[1m]"
+  run _resume_model_carry "$sdir/$_rs_other.jsonl"
+  assert_output ""
+}
+
+@test "resume carry: skips a synthetic error message and refuses a malformed model id" {
+  local sdir="$TEST_TEMP/sessions"
+  _rs_conv "$sdir" "$_rs_mine" claude-opus-5 "claude-opus-5[1m]"
+  # A usage-limit reply is an assistant record with model <synthetic>.
+  printf '%s\n' '{"parentUuid":"u2","isSidechain":false,"message":{"id":"x","type":"message","role":"assistant","model":"<synthetic>","content":[]},"type":"assistant","isApiErrorMessage":true}' >> "$sdir/$_rs_mine.jsonl"
+  run _resume_model_carry "$sdir/$_rs_mine.jsonl"
+  assert_output "claude-opus-5[1m]"
+
+  _rs_conv "$sdir" "$_rs_other" 'claude-x;touch' 'claude-x;touch[1m]'
+  run _resume_model_carry "$sdir/$_rs_other.jsonl"
+  assert_output ""
+}
+
+@test "resume probe: reports only sessions whose process is alive with the recorded start time" {
+  local d="$TEST_TEMP/sess" pr="$TEST_TEMP/proc"
+  mkdir -p "$d" "$pr/101" "$pr/102" "$pr/104" "$pr/105"
+  # Field 22 (starttime) is the 20th after "pid (comm) "; the comm holds ") ".
+  printf '101 (cl) aude) S 1 1 1 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 11 0 555 0\n' > "$pr/101/stat"
+  printf '102 (claude) S 1 1 1 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 11 0 555 0\n' > "$pr/102/stat"
+  printf '104 (claude) S 1 1 1 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 11 0 888 0\n' > "$pr/104/stat"
+  printf '105 (claude) S 1 1 1 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 11 0 999 0\n' > "$pr/105/stat"
+  printf '{"pid":101,"sessionId":"%s","procStart":"555"}' "$_rs_mine" > "$d/101.json"
+  # pid reused after a restart: the start time does not match
+  printf '{"pid":102,"sessionId":"33333333-3333-4333-8333-333333333333","procStart":"777"}' > "$d/102.json"
+  # left behind by a SIGKILL: no process at all
+  printf '{"pid":103,"sessionId":"44444444-4444-4444-8444-444444444444","procStart":"1"}' > "$d/103.json"
+  # pretty-printed is read the same
+  printf '{\n  "pid": 104,\n  "sessionId": "%s",\n  "procStart": "888"\n}\n' "$_rs_other" > "$d/104.json"
+  # a symlink is never read through
+  printf '{"pid":105,"sessionId":"55555555-5555-4555-8555-555555555555","procStart":"999"}' > "$TEST_TEMP/target.json"
+  ln -s "$TEST_TEMP/target.json" "$d/105.json"
+
+  run sh -c "$_RESUME_LIVE_PROBE" _ "$d" "$pr"
+  assert_success
+  assert_output "$(printf '%s\n%s' "$_rs_mine" "$_rs_other")"
+}
+
+@test "resume probe: box output that is not a session id is dropped" {
+  mkdir -p "$TEST_TEMP/fakebin"
+  printf '#!/bin/sh\nprintf "%%s\\n" "not-a-uuid" "%s" "\\$(touch x)" ""\n' "$_rs_mine" > "$TEST_TEMP/fakebin/docker"
+  chmod +x "$TEST_TEMP/fakebin/docker"
+  PATH="$TEST_TEMP/fakebin:$PATH" run _box_live_session_ids cleat-x
+  assert_success
+  assert_output "$_rs_mine"
+}

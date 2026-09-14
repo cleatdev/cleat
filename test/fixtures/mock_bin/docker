@@ -211,6 +211,11 @@ case "$1" in
   inspect)
     _mock "inspect_output"
     ;;
+  top)
+    # The container process table. Absent by default, which keeps the historic
+    # behaviour (empty output, which _box_has_live_agent reads as "live").
+    _mock "top_output"
+    ;;
   run)
     # Validate bind mounts in strict / virtiofs modes. This must happen
     # BEFORE we emit DOCKER_STDERR / exit so the strict errors take priority.

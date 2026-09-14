@@ -1696,18 +1696,100 @@ _macos_keychain_credentials() {
   return 1
 }
 
-# Extract the OAuth token's expiry (epoch MILLISECONDS) from a Claude credentials
-# blob on stdin; empty when absent or unparseable. Pure-bash grep (no jq dep),
-# case-insensitive so it matches `expiresAt` whatever the wrapper key around it,
-# same leading-zero-safe style as the swap reader. Claude stores expiresAt in ms;
-# a missing, non-numeric, or seconds-scaled value just fails the validity compare
-# in _seed_macos_credentials, which then keeps the existing file untouched (the
-# safe path). Overridable indirectly via the blob the caller pipes in.
+# The one flat object held under KEY in a JSON blob on stdin, printed as its own
+# JSON text, or nothing. KEY is a plain identifier.
+#
+# A credential file holds more than the Claude login. Claude Code keeps sibling
+# keys in the same blob: mcpOAuth has one entry per MCP server, each with its
+# OWN accessToken, refreshToken and expiresAt. 2.1.270 writes it AFTER
+# claudeAiOauth once an MCP login follows a Claude login. A reader that searches
+# the whole blob for a field answers about whichever entry comes last, which is
+# key order and not meaning. Every reader of a credential scopes through this.
+#
+# One path and no jq, so a host with jq and a host without give the same answer
+# by construction. The login object Claude writes is flat (strings, numbers and
+# an array of strings), so the object ends at the first closing brace outside a
+# string. Anything that cannot be isolated unambiguously prints nothing: no KEY,
+# KEY more than once at any depth, or an object nested inside it. Nothing is the
+# keep-safe answer every caller already handles. Newlines are only ever
+# whitespace between JSON tokens, so they fold to spaces first and a
+# pretty-printed file reads the same as the compact one Claude writes. A NUL
+# folds too, or bash warns about it on the host terminal from a box-written file.
+#
+# It reads ALL of stdin, deliberately. Stopping early would SIGPIPE a
+# `printf | _oauth_expires_at` caller. Under the CLI's pipefail that aborts the
+# launch. A caller reading a file the box can write caps it with head -c.
+# Always returns 0: callers assign it in `x="$(...)"` under set -e.
+_json_flat_object() {
+  local key="$1" blob hit re='[{].*'
+  blob="$(LC_ALL=C tr '\000\r\n' '   ' 2>/dev/null || true)"
+  # Every occurrence of the key, nested or not. A second one means there is no
+  # way to know which object Claude reads.
+  hit="$(printf '%s' "$blob" | LC_ALL=C grep -aoE "\"${key}\"[[:space:]]*:" 2>/dev/null || true)"
+  case "$hit" in ''|*$'\n'*) return 0 ;; esac
+  # Strings are matched whole, so a brace inside one neither ends the object
+  # nor refuses it. A brace outside a string is a nested object and no match.
+  hit="$(printf '%s' "$blob" \
+    | LC_ALL=C grep -aoE "\"${key}\"[[:space:]]*:[[:space:]]*[{]([^{}\"]|\"([^\"\\\\]|\\\\.)*\")*[}]" 2>/dev/null || true)"
+  # From the first brace on, which is the object's own: the key holds none.
+  [[ "$hit" =~ $re ]] || return 0
+  printf '%s' "${BASH_REMATCH[0]}"
+  return 0
+}
+
+# The integer held under KEY in a flat object (the output of _json_flat_object).
+# Prints it, or returns 1 when KEY is absent, appears twice or holds anything
+# but a plain integer: a string, a fraction, an exponent, a leading zero or more
+# than 15 digits. A leading zero reads as octal in bash arithmetic, where
+# `(( 0800 > x ))` prints an error on the host terminal. More than 15 digits can
+# wrap. An epoch in milliseconds has 13.
+_json_flat_num() {
+  local obj="$1" key="$2" hit v
+  local re='^"[^"]*"[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*[,}]$'
+  # One line per occurrence of the key. The anchored match below takes exactly
+  # one line holding a bare integer, so a second occurrence of any type refuses.
+  hit="$(printf '%s' "$obj" | LC_ALL=C grep -aoE "\"${key}\"[[:space:]]*:[^,}]*[,}]?" 2>/dev/null || true)"
+  [[ "$hit" =~ $re ]] || return 1
+  v="${BASH_REMATCH[1]}"
+  case "$v" in 0?*) return 1 ;; esac
+  [[ ${#v} -le 15 ]] || return 1
+  printf '%s' "$v"
+}
+
+# The string held under KEY in a flat object (the output of _json_flat_object),
+# with its JSON escapes decoded. Prints it (possibly empty), or returns 1 when
+# KEY is absent, appears twice or holds anything but a string.
+#
+# Two copies of a key are two answers and no way to know which one Claude reads,
+# so the reader refuses rather than picking the first or the last. That pick is
+# exactly how an MCP server's token was once read as the Claude login's. In the
+# JSON Claude writes, "KEY" followed by a colon can only be a key. A quote inside
+# a string is always escaped. A string value is never followed by a colon.
+_json_flat_str() {
+  local obj="$1" key="$2" hit
+  # One line per occurrence of the key, whatever it holds.
+  hit="$(printf '%s' "$obj" | LC_ALL=C grep -aoE "\"${key}\"[[:space:]]*:" 2>/dev/null || true)"
+  case "$hit" in ''|*$'\n'*) return 1 ;; esac
+  hit="$(printf '%s' "$obj" | LC_ALL=C grep -aoE "\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"\\\\]|\\\\.)*\"" 2>/dev/null || true)"
+  [[ -n "$hit" ]] || return 1
+  hit="${hit#*\"${key}\"}"
+  hit="${hit#*\"}"
+  hit="${hit%\"}"
+  case "$hit" in
+    *\\*) _sessions_json_unesc "$hit" ;;
+    *)    printf '%s' "$hit" ;;
+  esac
+}
+
+# The Claude login's access-token expiry (epoch MILLISECONDS) from a credential
+# blob on stdin: claudeAiOauth.expiresAt and nothing else, never an MCP server's
+# token beside it. Empty when the login cannot be isolated or its expiresAt is
+# not a plain integer. Claude stores it in ms. An empty value makes
+# _seed_macos_credentials keep the file and reads as 0 in _account_cred_expiry,
+# which never earns a harvest. A seconds-scaled value is NOT kept: it reads as
+# long expired.
 _oauth_expires_at() {
-  local n
-  n="$(grep -iEo '"expiresat"[[:space:]]*:[[:space:]]*[0-9]+' 2>/dev/null \
-         | grep -Eo '[0-9]+' | tail -1 || true)"
-  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n"
+  _json_flat_num "$(_json_flat_object claudeAiOauth)" expiresAt || true
   # Always succeed: the caller assigns this in `x="$(...)"`, and a non-zero exit
   # there trips the CLI's `set -e` (a missing/absent expiresAt is normal, not an
   # error). The empty stdout is the signal; the exit code must stay 0.
@@ -1729,10 +1811,17 @@ _oauth_expires_at() {
 # refresh token, so a freshly-created box that has never refreshed reads a dead
 # token from the shared file and drops to an interactive LOGIN. A still-valid
 # file token is never touched (the box refreshes its own and may be fresher than
-# the Keychain). Anything we can't parse (no expiresAt, non-numeric, seconds
-# scale) falls through to "keep the file", so an unrecognized schema can never
-# trigger a clobber. Sets _SEEDED_CREDS=1 on a write. _CLEAT_NOW_S overrides the
-# clock for tests.
+# the Keychain). Only the Claude login's own expiry counts
+# (claudeAiOauth.expiresAt). MCP server logins kept in the same file under
+# mcpOAuth carry their own expiresAt and never count, in the file or in the
+# Keychain blob. Anything we can't parse (no claudeAiOauth object, a nested or
+# second copy of it, a missing or non-numeric expiresAt) falls through to "keep
+# the file", so an unrecognized schema can never trigger a clobber. Sets
+# _SEEDED_CREDS=1 on a write. _CLEAT_NOW_S overrides the clock for tests.
+#
+# ~/.claude is mounted read-write into every box, so the file is box-writable.
+# Its read is capped and cannot abort the launch when the file is unreadable.
+# The temp file is a mktemp name a box cannot guess and plant a link at.
 _SEEDED_CREDS=0
 _seed_macos_credentials() {
   _is_macos || return 0
@@ -1740,7 +1829,7 @@ _seed_macos_credentials() {
   local blob=""
   if [[ -s "$cred" ]]; then
     local file_exp kc_exp now_ms
-    file_exp="$(_oauth_expires_at < "$cred" 2>/dev/null)"
+    file_exp="$(head -c "$_ACCOUNT_CRED_MAX_BYTES" "$cred" 2>/dev/null | _oauth_expires_at || true)"
     [[ "$file_exp" =~ ^[0-9]+$ ]] || return 0          # unparseable file token -> keep
     now_ms=$(( ${_CLEAT_NOW_S:-$(date +%s)} * 1000 ))
     (( file_exp > now_ms )) && return 0                # file token still valid -> keep
@@ -1756,7 +1845,12 @@ _seed_macos_credentials() {
     [[ -n "$blob" ]] || return 0
   fi
   mkdir -p "${HOME}/.claude" 2>/dev/null || return 0
-  local tmp="${cred}.tmp.$$"
+  # mktemp, not "$cred.tmp.$$". A pid is guessable. A box that planted a
+  # symlink at that name had the Keychain login written through it onto any
+  # host file the user can write. mktemp refuses an existing path (symlink or
+  # FIFO included) and creates at 0600 on both BSD and GNU.
+  local tmp
+  tmp="$(mktemp "${cred}.tmp.XXXXXX" 2>/dev/null)" || return 0
   ( umask 077; printf '%s' "$blob" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
   # Never write a non-JSON-object (e.g. an error string) into the creds file.
   local ok=false
@@ -5096,6 +5190,45 @@ _looks_like_json_object() {
   [[ -n "$content" && "${content:0:1}" == "{" && "${content: -1}" == "}" ]]
 }
 
+# Replace a bind-mounted file's content IN PLACE without ever leaving it empty.
+#
+# The box sees ~/.claude.json through a single-file bind mount, so a new copy
+# cannot be renamed over it (that swaps the inode out from under the mount) and
+# has to be written into the same inode. `cat new > file` does that by
+# TRUNCATING first, and until the write lands the file is empty. A reader in a
+# tight loop saw it empty in about 1 read in 100 across 300 such rewrites on a
+# Linux host, and Claude Code 2.1.270 does real damage with what it reads
+# there. A session starting in the window stops on "Configuration error" and
+# offers to reset the whole file. A running one "auto-repairs" by writing its
+# cached copy back in place, after which the rest of our write lands on top of
+# it and leaves broken JSON behind (reproduced against the real binary with
+# rename made to fail the way it does on a bind mount).
+#
+# `1<>` opens the file without truncating it, and the new content is padded
+# with trailing spaces to at least the old length, which JSON allows. A reader
+# sees the whole old object or the whole new one, never an empty file and never
+# a leftover tail. The file keeps the size of its largest past version until
+# Claude next writes it, which resets the padding.
+#
+# This protects READERS only. A process writing the same file at the same time
+# still tears it, so every caller checks for a live Claude right before.
+#
+# SRC is padded in place, so it must be a temp file the caller owns and drops.
+_write_in_place() {
+  local src="$1" dst="$2" old new
+  [[ -f "$dst" && ! -L "$dst" && -f "$src" && -s "$src" ]] || return 1
+  # wc pads its output on BSD, so the count goes through tr before it is used
+  # as a number.
+  old="$(wc -c < "$dst" 2>/dev/null | tr -d '[:space:]')"
+  new="$(wc -c < "$src" 2>/dev/null | tr -d '[:space:]')"
+  case "$old" in ''|*[!0-9]*) return 1 ;; esac
+  case "$new" in ''|*[!0-9]*) return 1 ;; esac
+  if (( new < old )); then
+    printf '%*s' "$(( old - new ))" '' >> "$src" 2>/dev/null || return 1
+  fi
+  cat "$src" 1<> "$dst" 2>/dev/null
+}
+
 # Print the path of the newest sibling per-project claude.json that carries an
 # oauthAccount, excluding $1 (the file being rebuilt). A login done INSIDE a
 # box writes oauthAccount only into that box's mounted per-project file, and
@@ -5104,12 +5237,22 @@ _looks_like_json_object() {
 # every OTHER box that gets built or started afterwards: login once, every box.
 # Prints nothing when no sibling has one. Requires jq (callers only use the
 # result on the jq path). Fail-soft: any unreadable/corrupt sibling is skipped.
+# A sibling whose box is pinned to a named account is skipped as well, see
+# _pinned_project_keys.
 _newest_sibling_identity() {
-  local exclude="$1" f best="" best_m=0 m
+  local exclude="$1" f best="" best_m=0 m pinned k
   command -v jq &>/dev/null || return 0
+  pinned="$(_pinned_project_keys)"
   for f in "$CLEAT_PROJECTS_DIR"/*/claude.json; do
     [[ -f "$f" ]] || continue
     [[ "$f" == "$exclude" ]] && continue
+    # A box on a NAMED account holds that account's identity in its file, and
+    # nothing inside the file says whose it is. Handing it to a box on the
+    # shared login stamps the wrong email on it, which is the mirror of the
+    # guard the builder already has for a pinned box reading the host file.
+    k="${f%/claude.json}"
+    k="${k##*/}"
+    [[ "$pinned" == *":${k}:"* ]] && continue
     jq -e '.oauthAccount? != null' "$f" >/dev/null 2>&1 || continue
     m="$(_path_mtime "$f")"
     if (( m > best_m )); then best_m=$m; best="$f"; fi
@@ -5284,6 +5427,14 @@ _build_project_claude_json() {
     else
       echo '{}' > "$out"
     fi
+    # Both of those sources can carry an account this pinned box is not on: the
+    # host login, or the one the box was on before a switch. The jq branch above
+    # deletes it on every build and a host with no jq cannot, so flag it. The
+    # launch clears it through the box's own jq before Claude reads the file
+    # (_claude_json_clear_stale_identity).
+    if [[ $_bpj_pinned -eq 1 ]]; then
+      : > "${out}.identity-stale" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -5322,7 +5473,7 @@ _refresh_project_claude_json() {
 # user-scoped mcpServers), then copies the temp over the SAME inode with a
 # truncating cat (the bind mount pins the inode; an atomic mv would detach the
 # container's view). It runs only past the liveness gate (docker top shows no
-# claude/node; fail-safe: unknown counts as live), so no concurrent writer
+# claude process; fail-safe: unknown counts as live), so no concurrent writer
 # exists and the only reader (the claude this session is about to exec) starts
 # after the write completes. Two simultaneous attaches can both heal; they
 # write near-identical objects microseconds apart (last writer wins), a benign
@@ -5330,10 +5481,14 @@ _refresh_project_claude_json() {
 _refresh_attached_claude_json() {
   local cname="$1" project="$2" box="$3"
   [[ -n "$project" ]] || return 0
-  command -v jq &>/dev/null || return 0
   local key f
   key="$(_derive_project_session_key "$project" "$box")"
   f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  # Before the jq gate, because this is the half of the identity drop a host
+  # with no jq leaves for the launch, and it is the launch that has a running
+  # box to borrow a jq from.
+  _claude_json_clear_stale_identity "$cname" "$f" "$box"
+  command -v jq &>/dev/null || return 0
   [[ -f "$f" && -s "$f" ]] || return 0
   # Cheap gate first: an onboarded box shows no login screen, nothing to fix,
   # no docker call. Only a logout-poisoned (or never-onboarded) box proceeds.
@@ -5342,9 +5497,13 @@ _refresh_attached_claude_json() {
   local tmp="${f}.attach.$$"
   _build_project_claude_json "$tmp" "$f" "$cname"
   # Refuse to copy anything that is not a healed object (a failed build leaves
-  # {} or nothing): a truncating write must never make the file worse.
-  if [[ -s "$tmp" ]] && jq -e '.hasCompletedOnboarding == true' "$tmp" >/dev/null 2>&1; then
-    cat "$tmp" > "$f" 2>/dev/null || true
+  # {} or nothing): an in-place write must never make the file worse.
+  # The build above scans every sibling project, which can take seconds, and a
+  # second terminal's claude may have started in that time. Its own saves write
+  # this same file in place, so two in-place writers tear it. Ask again here.
+  if [[ -s "$tmp" ]] && jq -e '.hasCompletedOnboarding == true' "$tmp" >/dev/null 2>&1 \
+     && ! _box_has_live_agent "$cname"; then
+    _write_in_place "$tmp" "$f" || true
   fi
   rm -f "$tmp" 2>/dev/null
   return 0
@@ -9156,12 +9315,23 @@ exec_claude() {
     ' _ "$@" 2>"$_exec_err" || rc=$?
 
   _cleanup_session
-  # Harvest a token the box refreshed for itself. Without this every refresh
-  # after a switch is lost and the account is back at /login, which is the exact
-  # pain this feature removes.
-  _account_sync_out "$cname" || true
   trap - EXIT INT TERM HUP
   _restore_terminal
+
+  # Harvest a token the box refreshed for itself. Without this every refresh
+  # after a switch is lost and the account is back at /login, which is the exact
+  # pain this feature removes. A lock that cannot be had writes nothing, and that
+  # is said once the reclaim below has run (see
+  # _maybe_report_account_harvest_busy), never over Claude's screen.
+  #
+  # AFTER the terminal is back, never before it. A rotated refresh token sends
+  # this through one bounded profile request, and on a black-holed route, a
+  # captive portal or a VPN that dropped, that request waits out its whole
+  # max-time. Run ahead of the restore it held the terminal in Claude's raw
+  # mode for those seconds, with nothing on screen to say why. It prints
+  # nothing itself, so it cannot lose a line to the reclaim below.
+  local _harvest=0
+  _account_sync_out "$cname" || _harvest=$?
 
   if [[ $rc -eq 0 ]]; then
     # Reclaim claude's leftover trailing line (cursor up, erase it), drop back
@@ -9178,6 +9348,18 @@ exec_claude() {
     _maybe_explain_oom "$cname" "$rc" "${_mem_bytes:-}"
   fi
 
+  # The harvest that could not take the account lock. After the rc==0 reclaim
+  # for the same reason as the fork advisory below: printed before it, its last
+  # line sat directly above the cursor and the reclaim's `\033[A\033[2K` erased
+  # it on every clean exit at a terminal.
+  _maybe_report_account_harvest_busy "$_harvest"
+  # The session ended on a login the server says is another account's, so it
+  # was held rather than saved over the pinned one. Said after the reclaim for
+  # the same reason. Said every time too: the box keeps running on that login
+  # until the next switch. Nothing else on screen says so.
+  if [[ $_harvest -eq 2 ]]; then
+    _account_held_notice "$cname"
+  fi
   # If the host ran out of process slots this session (watcher logged fork
   # errors), explain it once. Placed AFTER the rc==0 reclaim: on success that
   # reclaim does `\033[A\033[2K` to erase claude's leftover line, and running
@@ -9298,6 +9480,23 @@ _maybe_explain_fork_exhaustion() {
   echo -e "    ${DIM}•${RESET} Run fewer agents at once ${DIM}(dispatch subagents sequentially)${RESET}"
   echo -e "    ${DIM}•${RESET} Raise this shell's limit before launching: ${BOLD}ulimit -u 4096${RESET}"
   echo -e "    ${DIM}•${RESET} macOS per-user cap: ${BOLD}sudo sysctl kern.maxprocperuid=4096${RESET} ${DIM}(default is often ~2784)${RESET}"
+}
+
+# Say that the session-end harvest wrote nothing because another cleat command
+# held the account lock. $1 is _account_sync_out's status. Called by
+# exec_claude only after its reclaim, for the reason given there.
+_maybe_report_account_harvest_busy() {
+  [[ "${1:-0}" -eq $_ACCOUNT_LOCK_BUSY ]] || return 0
+  # The same two causes _account_busy_msg separates, said the same way. A next
+  # session end cannot help when the directory itself is the problem, so that
+  # one names the directory rather than promising a retry.
+  if [[ "${_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 ]]; then
+    warn "The login this session refreshed was not saved: Cleat cannot write to the accounts directory."
+    echo -e "    ${DIM}It stays in the box. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+    return 0
+  fi
+  warn "The login this session refreshed was not saved: another cleat command is changing accounts."
+  echo -e "    ${DIM}It stays in the box and is saved when the next session ends.${RESET}"
 }
 
 # Report the browser opens the destination gate refused this session. Once, on
@@ -11179,11 +11378,16 @@ cmd_resume() {
     fi
   fi
 
+  # Only a box that was already up can hold a live Claude in another terminal.
+  # One this command starts or recreates has none, so it skips the probe.
+  local _was_running=0
+  is_running "$cname" && _was_running=1
+
   # Start container if stopped
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
       # Detect stale mounts and recreate transparently (sessions live on the
-      # host, so --continue below still resumes the conversation). A missing
+      # host, so the resume below still reopens the conversation). A missing
       # settings overlay (_settings_overlay_intact) or any vanished bind source,
       # most often the macOS SSH agent socket, whose launchd path rotates
       # every reboot (_container_bind_sources_present), would otherwise make
@@ -11210,7 +11414,7 @@ cmd_resume() {
       fi
     else
       # No container exists (e.g., after `cleat rm`). Session files live on
-      # the host at ~/.claude/projects/<key>/, so `--continue` below will
+      # the host at ~/.claude/projects/<key>/, so the resume below will
       # pick up right where Claude left off. Create a fresh container and
       # fall through to the resume flow.
       info "No container for this project. Creating fresh ${DIM}(sessions will resume from host)${RESET}"
@@ -11230,7 +11434,32 @@ cmd_resume() {
   _print_summary_block "$cname" "$project"
   _maybe_gate_on_disk_fill "$cname"
   echo ""
-  exec_claude "$cname" --dangerously-skip-permissions --continue
+
+  # Name the conversation instead of passing --continue (see
+  # _resume_pick_session), and carry its 1M context (see _resume_model_carry).
+  # Resolved last, after every prompt above, so the live probe is as fresh as
+  # it can be. --continue stays the answer when nothing resolves, so a box with
+  # no conversation gets Claude Code's own message, as before.
+  # The array gets its own `local`: bash 3.2 is the floor, and a compound
+  # assignment sharing a `local` with scalar names is the one form of it the
+  # file does not already prove on macOS.
+  local _sdir _live="" _sid _model
+  local _resume_args=(--continue)
+  _sdir="$(_sessions_key_dir "$project" "$box")" || _sdir=""
+  [[ "$_was_running" == "1" ]] && _live="$(_box_live_session_ids "$cname")"
+  _sid="$(_resume_pick_session "$_sdir" "$_live")"
+  if [[ -n "$_sid" ]]; then
+    _resume_args=(--resume "$_sid")
+    _model=""
+    _resume_model_configured "$project" || _model="$(_resume_model_carry "$_sdir/$_sid.jsonl")"
+    [[ -n "$_model" ]] && _resume_args+=(--model "$_model")
+  elif [[ -n "$_live" && -n "$(_resume_pick_session "$_sdir" "")" ]]; then
+    # Every conversation left is open in another terminal. Reopening one would
+    # have two processes append to one transcript, so start a new one.
+    _resume_args=()
+    info "The latest conversation in this box is open in another terminal. Starting a new one."
+  fi
+  exec_claude "$cname" --dangerously-skip-permissions "${_resume_args[@]+"${_resume_args[@]}"}"
 }
 
 cmd_stop() {
@@ -11358,6 +11587,14 @@ cmd_shell() {
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
     runuser -u coder -- bash || shell_rc=$?
 
+  # A shell is a place people run `claude`, so it is also a place people run
+  # `/login` or `claude auth login`. Only a harvest carries that login to the
+  # account the box is pinned to. Without one it stayed in the box until some
+  # later session end happened to pick it up, and the next attach's staging
+  # deleted it first. Quiet by design: nothing here is destructive, a login the
+  # harvest declines stays staged and `cleat account list` names what is held.
+  _account_sync_out "$cname" || true
+
   rm -f "$_attach_marker" 2>/dev/null || true
   touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
 
@@ -11406,8 +11643,9 @@ cmd_login() {
     mkdir -p "$_login_clip_dir"
     local _login_bridge_mode
     _login_bridge_mode="$(_browser_bridge_mode)"
-    # host_opens_clicks=0: this watcher only ever sees the auth URL `claude login`
-    # launches programmatically through the open shim, never a link the user
+    # host_opens_clicks=0: this watcher only ever sees the auth URL
+    # `claude auth login` launches programmatically through the open shim,
+    # never a link the user
     # clicked, so the terminal will NOT open it and deferral is never correct here.
     # The bridge must open it in auto/always: _is_auth_url matches an authorize
     # URL at an allowlisted origin, the code-paste one included, so both login
@@ -11431,14 +11669,23 @@ cmd_login() {
   echo ""
 
   _ensure_docker_access "$cname"
-  # `claude login` is the one command whose whole job is to WRITE a credential,
-  # so a pinned box that reaches it without the store override writes the new
-  # account straight into the shared host login and clobbers it.
-  _account_apply_exec_env "$cname" || true
+  # Logging in is the one job whose whole point is to WRITE a credential, so a
+  # pinned box that reaches it without the store override writes the new account
+  # straight into the shared host login and clobbers it. Which store it lands in
+  # is decided HERE, and a pin the box cannot honour falls back to the shared
+  # login, so the closing line has to be told which one it was.
+  local _login_acct
+  _login_acct="$(_box_account_read "$cname")"
+  _account_apply_exec_env "$cname" || _login_acct="$_ACCOUNT_DEFAULT"
+  # `claude auth login`, never `claude login`. Claude Code has no top-level
+  # `login` subcommand, so commander read the word as the first PROMPT of an
+  # interactive session. A signed-in box sent it to the model as a real request
+  # and kept a conversation called "login". A signed-out one answered "Not
+  # logged in". Nobody was ever signed in, and nothing ever errored.
   local login_rc=0
   docker exec -it "${CLAUDE_ENV[@]}" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
-    runuser -u coder -- claude login || login_rc=$?
+    runuser -u coder -- claude auth login || login_rc=$?
   _restore_terminal
 
   # Cleanup browser bridge
@@ -11452,9 +11699,34 @@ cmd_login() {
   # why it did not.
   _CLIP_DIR="$_login_clip_dir" _maybe_report_blocked_opens "$_login_clip_dir/.proxy-log" "$_login_proxy_off"
 
-  if [[ $login_rc -eq 0 ]]; then
-    success "Auth saved to ~/.claude (shared across all containers)."
+  # A login into a pinned box lands in that box's staged copy. Only a harvest
+  # carries it to the account. Without one the account still read "signed out"
+  # and the next attach's staging deleted the login this command just made. This
+  # is the call a session end makes, under the same lock and the same identity
+  # check, so a login as the wrong person is held rather than written.
+  local _login_harvest=0
+  _account_sync_out "$cname" || _login_harvest=$?
+
+  [[ $login_rc -eq 0 ]] || return "$login_rc"
+  if [[ "$_login_acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    success "Auth saved to ~/.claude, the shared login of every box not pinned to an account."
+  elif [[ $_login_harvest -eq 0 && "$(_account_auth_state "$_login_acct")" != "signed out" ]]; then
+    success "Auth saved to account ${BOLD}${_login_acct}${RESET}."
+  elif [[ $_login_harvest -eq 2 ]]; then
+    _account_held_notice "$cname" "You signed in as another account"
+  elif [[ $_login_harvest -eq $_ACCOUNT_LOCK_BUSY ]]; then
+    warn "Signed in, but the login was not saved to ${BOLD}${_login_acct}${RESET}: another cleat command is changing accounts."
+    echo -e "    ${DIM}It stays in the box and is saved when the next session ends.${RESET}"
+  else
+    # rc 0 with a signed-out store is the case that matters most: the override is
+    # an undocumented Claude Code variable, so a Claude that stops honouring it
+    # exits 0 having written somewhere else entirely. Residual, and deliberately
+    # not guessed at: a store that already held a login reads as "ok" either way,
+    # so that one leg is caught by the account row rather than by this line.
+    warn "Signed in, but the login did not reach account ${BOLD}${_login_acct}${RESET}."
+    echo -e "    ${DIM}Check it with ${BOLD}cleat account list${RESET}${DIM}.${RESET}"
   fi
+  return 0
 }
 
 cmd_claude() {
@@ -12188,14 +12460,6 @@ _print_docker_vm_fix() {
 }
 
 # ── Idle-session sweep ───────────────────────────────────────────────────────
-# True when a real agent is running inside the box: claude (a node process) or a
-# bare node shows in the container's process list. A DETACHED box (terminal
-# closed, the foreground exec gone) runs only docker-init/su/bash, so this is
-# false. A box working UNATTENDED keeps its host `docker exec` (and thus the
-# claude/node process) alive, so this is TRUE and the sweep leaves it strictly
-# alone (the "leave it running, walk away" promise). `docker top` reads the
-# process list from the daemon (the image ships no `ps`), so no exec is needed.
-# Fails SAFE: any error, or output we can't read, is treated as "live" → skip.
 # True when a host-side session has this box open (today: `cleat shell`, which
 # the in-container process list cannot distinguish from a detached box). Each
 # marker is named for the claiming PID, so one left by a killed session is
@@ -12215,11 +12479,72 @@ _box_has_attached_session() {
   return $found
 }
 
+# True when one process's argv, passed as separate words, is Claude Code. This
+# is the one definition of "a Claude process" that every liveness reader shares:
+# _box_has_live_agent feeds it the command column of `docker top`, and an in-box
+# probe can ship it with `declare -f` and feed it /proc/<pid>/cmdline. It judges
+# the EXECUTABLE, never a substring of the line. Claude is:
+#   - the launcher by name or path (`claude`, ~/.local/bin/claude), which is how
+#     exec_claude, a `cleat shell` user and a scripted `claude -p` all run it
+#   - a native versioned binary run directly (.../claude/versions/<v>), which
+#     is also what Claude's own background-agent daemon runs as
+#   - node running a Claude entry point (an npm install, pre-native images)
+# Not Claude: a dev server or MCP server that is merely node, anything whose
+# arguments mention .claude/ (plugin MCP servers, Claude's Bash-tool shells)
+# and cleat's own `bash -c` wrapper, whose script text names claude. Every live
+# Claude has a process row of its own, so judging argv0 misses none of them.
+_is_claude_argv() {
+  case "${1:-}" in
+    claude|*/claude|*/claude/versions/*) return 0 ;;
+    node|*/node|nodejs|*/nodejs) ;;
+    *) return 1 ;;
+  esac
+  # node: the FIRST non-option argument decides, and nothing after it. Walked
+  # with $# rather than `for w in "$@"`, which bash 3.2 calls unbound when the
+  # row is a bare `node` REPL with no arguments at all.
+  while [[ $# -gt 1 ]]; do
+    shift
+    case "$1" in
+      -*) ;;
+      claude|*/claude|*/claude/versions/*|*/@anthropic-ai/claude-code/*) return 0 ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
+
+# True when Claude Code is running inside the box. A DETACHED box (terminal
+# closed, the foreground exec gone) runs only docker-init/su/bash, so this is
+# false. A box working UNATTENDED keeps its host `docker exec` (and thus the
+# claude process) alive, so this is TRUE and the sweep leaves it strictly alone
+# (the "leave it running, walk away" promise). `docker top` reads the process
+# list from the daemon (the image ships no `ps`), so no exec is needed.
+#
+# Only the command column is judged, and only by _is_claude_argv. A grep of the
+# whole line for claude|node read a leftover Vite or MCP server as a live
+# session (refusing `cleat account`, session deletes and the idle sweep) and on
+# a Linux host matched a user name in the UID column.
+#
+# Fails SAFE: any error, empty output or a header with no CMD/COMMAND column is
+# treated as "live" → skip.
 _box_has_live_agent() {
-  local top
+  # f is assigned empty, never merely declared: bash 3.2 calls ${#f[@]} on a
+  # declared-but-never-assigned array unbound under `set -u`.
+  local top col=-1 i f=()
   top="$(docker top "$1" 2>/dev/null)" || return 0     # unreadable → assume live (safe)
   [[ -n "$top" ]] || return 0                          # empty → assume live (safe)
-  printf '%s\n' "$top" | grep -qiE 'claude|node'
+  {
+    IFS=$' \t' read -r -a f || true
+    for (( i = 0; i < ${#f[@]}; i++ )); do
+      case "${f[$i]}" in CMD|COMMAND) col=$i ;; esac
+    done
+    (( col >= 0 )) || return 0                         # unknown layout → assume live (safe)
+    while IFS=$' \t' read -r -a f; do
+      (( ${#f[@]} > col )) || continue
+      _is_claude_argv "${f[@]:$col}" && return 0
+    done
+  } <<< "$top"
+  return 1
 }
 
 # Stop cleat boxes that are PROVABLY safe to stop: detached (no live agent) AND
@@ -12251,7 +12576,7 @@ _sweep_idle_boxes() {
     # a shell runs bash and a DETACHED box runs bash too, so the process list
     # cannot tell them apart. Host-side, so it costs nothing.
     _box_has_attached_session "$name" && continue
-    # Liveness gate: a claude/node process means the box is attached or working
+    # Liveness gate: a claude process means the box is attached or working
     # unattended → never touch it. Fail-safe (an unreadable `docker top` = live).
     _box_has_live_agent "$name" && continue
     mem="$(docker inspect --format '{{.HostConfig.Memory}}' "$name" 2>/dev/null)" || mem=0
@@ -12850,6 +13175,15 @@ _maybe_gate_on_disk_fill() {
 }
 
 cmd_clean() {
+  # Every prune below asks docker whether a box still exists. With the daemon
+  # down every answer is no, so every box description and every run dir (the
+  # overlays, the conversations' file history and a staged login) was removed
+  # for boxes that still exist.
+  if ! _daemon_up; then
+    error "Docker is not running, so cleat cannot tell which boxes still exist."
+    echo -e "    ${DIM}Start it, then run ${BOLD}cleat clean${RESET}${DIM} again. Nothing was removed.${RESET}"
+    return 1
+  fi
   cmd_stop_all
   if image_exists; then
     info "Removing image..."
@@ -12937,10 +13271,18 @@ cmd_nuke() {
     info "Removing per-container runtime dirs..."
     # The staged credential a box refreshed in place lives under the run dir,
     # so harvest before the wipe or nuke destroys weeks of refresh token while
-    # saying it did not. The wipe itself goes through _nuke_wipe_dir, which
-    # refuses any directory holding the account store.
-    _account_sync_out_all
-    _nuke_wipe_dir "$CLEAT_RUN_DIR"
+    # saying it did not. What the harvest does not take, and any other login in
+    # a run dir, is held first. The wipe itself goes through _nuke_wipe_dir,
+    # which refuses any directory holding the account store.
+    local _rel=0
+    _account_release_all || _rel=$?
+    if [[ $_rel -eq 0 ]]; then
+      _nuke_wipe_dir "$CLEAT_RUN_DIR"
+    elif [[ $_rel -eq $_ACCOUNT_LOCK_BUSY ]]; then
+      warn "Kept ${CLEAT_RUN_DIR}: another cleat command is changing accounts."
+    else
+      warn "Kept ${CLEAT_RUN_DIR}: a box there holds a login that could not be saved anywhere else."
+    fi
   fi
 
   # Per-project persistent .claude.json store (trust/MCP approvals): nuke
@@ -13383,6 +13725,136 @@ _sessions_live_gate() {
     return 1
   fi
   return 0
+}
+
+# ── Resume target: which conversation `cleat resume` reopens, on which model ──
+#
+# In-box probe, run as the box user. Prints the sessionId of every Claude Code
+# process that is ALIVE in this box, one per line. Claude Code registers each
+# running process at ~/.claude/sessions/<pid>.json with its sessionId (it
+# follows /clear) and its start time (field 22 of /proc/<pid>/stat,
+# "procStart"). The file is removed on a clean exit but survives a SIGKILL, an
+# OOM or a container stop, and pids restart at 1 after a restart, so a bare
+# kill -0 would count a stale file as live. $1 = sessions dir, $2 = proc root:
+# parameters so the probe runs in a test without a container or a Linux /proc.
+# Plain sed, no jq. The output is box-authored: the host keeps only UUID lines
+# and only ever uses them to EXCLUDE a conversation.
+_RESUME_LIVE_PROBE='d="$1"; pr="$2"
+for f in "$d"/*.json; do
+  [ -f "$f" ] && [ ! -L "$f" ] || continue
+  p="${f##*/}"; p="${p%.json}"
+  case "$p" in ""|*[!0-9]*) continue ;; esac
+  [ -r "$pr/$p/stat" ] || continue
+  st="$(sed "s/^.*) //" "$pr/$p/stat" 2>/dev/null | cut -d" " -f20)"
+  j="$(head -c 16384 "$f" 2>/dev/null)"
+  ps="$(printf "%s\n" "$j" | sed -n "s/.*\"procStart\"[[:space:]]*:[[:space:]]*\"\([0-9]*\)\".*/\1/p" | head -n 1)"
+  [ -n "$st" ] && [ "$st" = "$ps" ] || continue
+  printf "%s\n" "$j" | sed -n "s/.*\"sessionId\"[[:space:]]*:[[:space:]]*\"\([0-9a-f-]*\)\".*/\1/p" | head -n 1
+done'
+
+# Session ids held by a live Claude Code process in a RUNNING box, one per
+# line. A probe that cannot answer prints nothing, which is today's behaviour
+# (nothing excluded), never a refusal.
+_box_live_session_ids() {
+  local cname="$1" out="" line _to=""
+  command -v timeout >/dev/null 2>&1 && _to="timeout 8"
+  out="$($_to docker exec "$cname" runuser -u coder -- sh -c "$_RESUME_LIVE_PROBE" _ \
+        /home/coder/.claude/sessions /proc 2>/dev/null)" || out=""
+  while IFS= read -r line; do
+    _sessions_is_uuid "$line" && printf '%s\n' "$line"
+  done <<EOF
+$out
+EOF
+  return 0
+}
+
+# The head and tail a resume reads: the same 64 KiB Claude Code reads when it
+# lists sessions, so the two agree on what counts as a conversation.
+_RESUME_WINDOW=65536
+
+# The conversation `cleat resume` reopens: the one Claude Code's own --continue
+# would pick, minus any conversation a live process in this box already has
+# open. Prints a UUID, or nothing when there is no candidate.
+#
+# Why not --continue itself: it skips a live conversation only when it is a
+# BACKGROUND session. An interactive one open in another terminal is fair game,
+# so the resumed process and the live one append to one transcript with
+# different histories in memory.
+#
+# Mirrors Claude Code 2.1.270's --continue: newest transcript by mtime (measured
+# in the lab, not the /resume picker's last-message date), skipping one with no
+# conversation record ("parentUuid"), a sidechain and a `claude -p` (sdk-*)
+# session. $1 = host session dir, $2 = newline-separated live ids.
+_resume_pick_session() {
+  local sdir="$1" live="$2" tab f uuid mt rows="" head_blob tail_blob
+  [[ -d "$sdir" ]] || return 0
+  tab="$(printf '\t')"
+  for f in "$sdir"/*.jsonl; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    uuid="${f##*/}"; uuid="${uuid%.jsonl}"
+    _sessions_is_uuid "$uuid" || continue
+    case "$live" in *"$uuid"*) continue ;; esac
+    rows="${rows}$(_path_mtime "$f")${tab}${uuid}
+"
+  done
+  [[ -n "$rows" ]] || return 0
+  while IFS="$tab" read -r mt uuid; do
+    [[ -n "$uuid" ]] || continue
+    f="$sdir/$uuid.jsonl"
+    head_blob="$(head -c "$_RESUME_WINDOW" "$f" 2>/dev/null || true)"
+    case "$head_blob" in *'"isSidechain":true'*|*'"entrypoint":"sdk-'*) continue ;; esac
+    tail_blob="$(tail -c "$_RESUME_WINDOW" "$f" 2>/dev/null || true)"
+    case "$head_blob$tail_blob" in *'"parentUuid":'*) ;; *) continue ;; esac
+    printf '%s' "$uuid"
+    return 0
+  done <<ROWS
+$(printf '%s' "$rows" | sort -t "$tab" -k1,1rn)
+ROWS
+  return 0
+}
+
+# The --model a resumed conversation needs to keep the context window it had,
+# or nothing. Claude Code restores a resumed conversation's model from its last
+# assistant message, which records the bare id (claude-opus-5), and adds [1m]
+# back only when a model is CONFIGURED with [1m]. On the default model nothing
+# is configured, so every --continue and --resume came back on the standard
+# window. The run that wrote the transcript recorded its usage under the model
+# it really ran ("claude-opus-5[1m]" in its cost-state record): that is the
+# evidence. Without it nothing is passed, so a conversation that never had 1M
+# keeps Claude Code's own restore.
+_RESUME_CARRY_WINDOW=1048576
+_resume_model_carry() {
+  local f="$1" blob line m
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  blob="$(tail -c "$_RESUME_CARRY_WINDOW" "$f" 2>/dev/null || true)"
+  line="$(printf '%s\n' "$blob" | LC_ALL=C grep -a '"role":"assistant"' \
+          | LC_ALL=C grep -av '"isSidechain":true' | LC_ALL=C grep -a '"model":"claude-' | tail -n 1)" || line=""
+  [[ -n "$line" ]] || return 0
+  m="${line#*\"model\":\"}"; m="${m%%\"*}"
+  case "$m" in claude-*) ;; *) return 0 ;; esac
+  case "$m" in *[!a-z0-9.-]*) return 0 ;; esac
+  case "$blob" in *"\"${m}[1m]\":"*) printf '%s[1m]' "$m" ;; esac
+  return 0
+}
+
+# Whether the box has a model CONFIGURED: an env pin (.cleat.env, --env), or a
+# "model" or ANTHROPIC_*MODEL entry in the user's or the project's settings.
+# Claude Code loses [1m] only when none is. With one configured, its own restore
+# is what the user chose (opusplan[1m], for one, switches models by mode and
+# must not be pinned), so the carry applies only to the unconfigured default.
+# A symlink is never read.
+_resume_model_configured() {
+  local project="$1" e f blob re='"(model|ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_[A-Z]+_MODEL)"[[:space:]]*:'
+  for e in "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"; do
+    case "$e" in ANTHROPIC_MODEL=*|ANTHROPIC_DEFAULT_*_MODEL=*) return 0 ;; esac
+  done
+  for f in "${HOME}/.claude/settings.json" "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    # No pipe into grep -q: under pipefail an early grep exit fails the pipeline.
+    blob="$(head -c "$_RESUME_CARRY_WINDOW" "$f" 2>/dev/null || true)"
+    [[ "$blob" =~ $re ]] && return 0
+  done
+  return 1
 }
 
 # Every path a delete takes, one per line. Items 1-2 are the session itself;
@@ -14722,7 +15194,7 @@ _validate_account_name() {
   local _acct_re='^[a-z0-9][a-z0-9_-]{0,30}$'
   [[ "$n" =~ $_acct_re ]] || return 1
   case "$n" in
-    list|rename|rm|delete|restore|trash|off|help) return 1 ;;
+    list|rename|rm|delete|restore|trash|held|adopt|off|help) return 1 ;;
     # The sentinel. A real directory of this name could be pinned and then
     # never staged, because every staging path treats the name as "no account".
     "$_ACCOUNT_DEFAULT") return 1 ;;
@@ -14798,13 +15270,78 @@ _box_account_read() {
   printf '%s' "$_ACCOUNT_DEFAULT"
 }
 
+# Temp and rename, never a truncating write. The attach, status and the launch
+# summary read the pin WITHOUT the account lock, and an empty pin reads as the
+# shared login, so a switch caught between truncate and write launched a pinned
+# box on the shared login. mv also replaces a symlink at the pin path rather
+# than writing through it. The temp name starts with a dot so no glob over this
+# directory mistakes a leftover for a box.
+#
+# The directory is 0700 for the same reason the accounts directory is. At the
+# host umask it listed every container name and the account it is pinned to.
+# $3 is the box's per-project session key, written on a SECOND line. Every
+# existing reader takes line one only, so the key is invisible to all of them.
+#
+# The key is there for the paths that know a box only by its container name.
+# `cleat account rm` unpins boxes in other projects, and a container name
+# cannot be turned back into its per-project claude.json: the name truncates
+# the directory segment and the project path is recorded nowhere else. Without
+# it the remove dropped the pin and left the removed account's email in the
+# box. `_newest_sibling_identity` reads it too, to tell a pinned box's file
+# from a shared-login one.
 _box_account_write() {
-  local cname="$1" acct="$2" f
+  local cname="$1" acct="$2" key="${3:-}" f tmp
   mkdir -p "$CLEAT_BOX_ACCOUNTS_DIR" 2>/dev/null || return 1
+  chmod 700 "$CLEAT_BOX_ACCOUNTS_DIR" 2>/dev/null || true
   f="$(_box_account_file "$cname")"
-  printf '%s\n' "$acct" > "$f" || return 1
-  chmod 600 "$f" 2>/dev/null || true
+  # mv onto a directory would move the temp INTO it and report success.
+  [[ -d "$f" && ! -L "$f" ]] && return 1
+  tmp="$(mktemp "$CLEAT_BOX_ACCOUNTS_DIR/.pin.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$acct" > "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  if _account_session_key_ok "$key"; then
+    printf '%s\n' "$key" >> "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
   return 0
+}
+
+# A per-project session key is ONE path segment under $CLEAT_PROJECTS_DIR:
+# _derive_project_session_key only ever emits [a-z0-9-] plus a validated box
+# suffix. The pin file is hand-editable, so anything else is refused before it
+# is joined into a path. This is what stops a hand-written `../outside` on line
+# two from reaching a file outside the projects store.
+_account_session_key_ok() {
+  local _key_re='^[a-z0-9_-]+$'
+  [[ "${1:-}" =~ $_key_re ]]
+}
+
+# The key recorded with the pin, or nothing (exit 1) for a pin written before
+# keys were recorded, or one whose second line fails the check above.
+_box_account_key() {
+  local f v
+  f="$(_box_account_file "$1")"
+  [[ -f "$f" ]] || return 1
+  v="$(sed -n '2p' "$f" 2>/dev/null | tr -d '\r\n' || true)"
+  _account_session_key_ok "$v" || return 1
+  printf '%s' "$v"
+}
+
+# Every per-project key whose box is pinned to a NAMED account, as ":a:b:".
+# Colon-delimited because a key can never contain one, so a membership test is
+# one glob and no fork per candidate.
+_pinned_project_keys() {
+  local f base k out=":"
+  if [[ -d "$CLEAT_BOX_ACCOUNTS_DIR" ]]; then
+    for f in "$CLEAT_BOX_ACCOUNTS_DIR"/*; do
+      [[ -f "$f" ]] || continue
+      base="${f##*/}"
+      [[ "$(_box_account_read "$base")" == "$_ACCOUNT_DEFAULT" ]] && continue
+      k="$(_box_account_key "$base")" || continue
+      out="${out}${k}:"
+    done
+  fi
+  printf '%s' "$out"
 }
 
 _box_account_remove() { rm -f "$(_box_account_file "$1")" 2>/dev/null || true; }
@@ -14819,6 +15356,196 @@ _account_pinned_boxes() {
     [[ "$(_box_account_read "$base")" == "$acct" ]] || continue
     printf '%s\n' "$base"
   done
+}
+
+# ── The account lock ────────────────────────────────────────────────────────
+#
+# Every read-decide-write of a pin, a store or a staged credential runs under
+# ONE host lock. Without it two terminals interleaved. An attach that had read
+# pin a staged a's credential after a switch pinned b and staged b (5 in 100
+# natural runs). A session-end harvest wrote b's credential into a's store. An
+# attach that read the pin between a rename's move and its pin rewrite found no
+# store and deleted the staged login.
+#
+# One lock rather than one per box, because rename and remove rewrite every
+# box's pin and two boxes pinned to one account share its store. With a single
+# lock no ordering between locks can invert. Holds are short: file operations
+# plus at most one bounded profile request per harvest. Prompts, docker calls,
+# the usage poll and identity invalidation never run under it. A `_locked`
+# suffix means the caller already holds it, and those bodies call only other
+# `_locked` bodies. It is reentrant within one shell, so a body that calls a
+# locking wrapper by mistake nests instead of waiting on itself until the
+# timeout and then skipping its write without a word.
+#
+# The primitive is test/lib/testlock.sh's with its TOCTOU-fixed steal, changed
+# in three ways. It waits instead of refusing. A directory with no owner record
+# yet (mkdir comes first, the record a moment later) is honoured for a grace
+# period rather than stolen at once or honoured forever. And a record older than
+# an age bound is stale whatever its pid says, so a pid recycled after a reboot
+# cannot wedge every account command.
+#
+# A timeout returns _ACCOUNT_LOCK_BUSY and NEVER falls through to an unlocked
+# write or delete. The attach starts on what is staged, a session end keeps the
+# staged file, a wipe keeps auth/, nuke keeps the run dirs and a verb prints the
+# busy message. A lock left by a crash just before macOS renames the host (a
+# network change moves $HOSTNAME) reads as another machine's and is honoured
+# until the age bound, which fails safe.
+_ACCOUNT_LOCK_DEPTH=0
+_ACCOUNT_LOCK_WAIT_S=20
+_ACCOUNT_LOCK_GRACE_S=10
+_ACCOUNT_LOCK_STALE_S=300
+_ACCOUNT_LOCK_BUSY=75
+# The exact record this shell wrote, so a release removes only its own lock.
+_ACCOUNT_LOCK_OWNER=""
+# Did the last attempt fail because the directory cannot take a lock at all,
+# rather than because another command holds one? Read only by the message.
+_ACCOUNT_LOCK_UNWRITABLE=0
+
+_account_lock_path() { printf '%s' "$CLEAT_ACCOUNTS_DIR/.lock"; }
+
+# One poll while another command holds the lock. A function so a test can
+# observe a waiter instead of timing one.
+_account_lock_pause() { sleep 0.1; }
+
+# The real clock, never _CLEAT_NOW_S. The record is compared with directory
+# mtimes, which are real.
+_account_lock_now() { date +%s 2>/dev/null || echo 0; }
+
+# Is the lock held by this owner record provably abandoned? Anything uncertain
+# answers no.
+_account_lock_is_stale() {
+  local owner="$1" now mtime age o_host o_pid o_at
+  local re='^host (.+) pid ([1-9][0-9]{0,9}) at ([1-9][0-9]{0,14})$'
+  now="$(_account_lock_now)"
+  case "$now" in ''|*[!0-9]*|0) return 1 ;; esac
+  if [[ ! "$owner" =~ $re ]]; then
+    # mkdir precedes the record write, so a record-less lock is usually a
+    # winner a moment from writing it. One that stays record-less was killed in
+    # that moment.
+    mtime="$(_path_mtime "$(_account_lock_path)")"
+    case "$mtime" in ''|*[!0-9]*|0) return 1 ;; esac
+    age=$(( now - mtime ))
+    if [[ $age -gt $_ACCOUNT_LOCK_GRACE_S ]]; then return 0; fi
+    return 1
+  fi
+  o_host="${BASH_REMATCH[1]}"
+  o_pid="${BASH_REMATCH[2]}"
+  o_at="${BASH_REMATCH[3]}"
+  age=$(( now - o_at ))
+  # A clock that stepped backwards is never a reason to take a live lock.
+  if [[ $age -lt 0 ]]; then return 1; fi
+  if [[ $age -gt $_ACCOUNT_LOCK_STALE_S ]]; then return 0; fi
+  # Another machine sharing this directory cannot be probed, so age decides.
+  [[ "$o_host" == "${HOSTNAME:-unknown}" ]] || return 1
+  kill -0 "$o_pid" 2>/dev/null && return 1
+  # kill -0 also fails with EPERM for a live process of another user.
+  ps -p "$o_pid" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+_account_lock() {
+  local lock owner captured aside polls=0 max unmade=0
+  if [[ $_ACCOUNT_LOCK_DEPTH -gt 0 ]]; then
+    _ACCOUNT_LOCK_DEPTH=$(( _ACCOUNT_LOCK_DEPTH + 1 ))
+    return 0
+  fi
+  _ACCOUNT_LOCK_UNWRITABLE=0
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || { _ACCOUNT_LOCK_UNWRITABLE=1; return "$_ACCOUNT_LOCK_BUSY"; }
+  chmod 700 "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || true
+  lock="$(_account_lock_path)"
+  max=$(( _ACCOUNT_LOCK_WAIT_S * 10 ))
+  while :; do
+    if [[ -L "$lock" ]] || { [[ -e "$lock" ]] && [[ ! -d "$lock" ]]; }; then
+      # This CLI only ever makes a directory here, so anything else was planted.
+      # It is never followed, cleared or waited on.
+      return "$_ACCOUNT_LOCK_BUSY"
+    fi
+    if mkdir "$lock" 2>/dev/null; then
+      _ACCOUNT_LOCK_OWNER="host ${HOSTNAME:-unknown} pid $$ at $(_account_lock_now)"
+      ( umask 077; printf '%s\n' "$_ACCOUNT_LOCK_OWNER" > "$lock/owner" ) 2>/dev/null || true
+      _ACCOUNT_LOCK_DEPTH=1
+      return 0
+    fi
+    # A lock that cannot be MADE is not a lock somebody else is holding. mkdir
+    # fails with EEXIST while another command holds it, and with EACCES, EROFS
+    # or ENOSPC when the accounts directory cannot take a directory at all: a
+    # sudo run that left it root-owned, a read-only mount, a full disk. Waiting
+    # the whole timeout out on those is twenty seconds of frozen terminal per
+    # call, at every attach and again at every session end, and the line at the
+    # end of it names the wrong cause and asks for a retry that can never work.
+    # So the path is looked at. Nothing there means the failure was not EEXIST,
+    # and the wait is over before it starts. A release that landed between the
+    # mkdir and this look leaves nothing there either, so the make is retried
+    # once, without a pause, before the directory is called unwritable.
+    if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+      if [[ $unmade -eq 0 ]]; then
+        unmade=1
+        continue
+      fi
+      _ACCOUNT_LOCK_UNWRITABLE=1
+      return "$_ACCOUNT_LOCK_BUSY"
+    fi
+    owner=""
+    IFS= read -r owner 2>/dev/null < "$lock/owner" || true
+    if [[ -d "$lock" && ! -L "$lock" ]] && _account_lock_is_stale "$owner"; then
+      # Claim the right to clear it with a rename only one process can win,
+      # then check that what was moved aside is still the record judged stale.
+      # If another taker cleared it and made a fresh lock in between, that
+      # fresh lock goes back.
+      aside="${lock}.stale.$$"
+      rm -rf "$aside" 2>/dev/null || true
+      if mv "$lock" "$aside" 2>/dev/null; then
+        captured=""
+        IFS= read -r captured 2>/dev/null < "$aside/owner" || true
+        if [[ "$captured" == "$owner" ]]; then
+          rm -rf "$aside" 2>/dev/null || true
+          continue
+        fi
+        if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+          mv "$aside" "$lock" 2>/dev/null || true
+        fi
+        rm -rf "$aside" 2>/dev/null || true
+      fi
+    fi
+    if [[ $polls -ge $max ]]; then return "$_ACCOUNT_LOCK_BUSY"; fi
+    polls=$(( polls + 1 ))
+    _account_lock_pause
+  done
+}
+
+# Only ever our own lock. After an age-bound steal the directory may be another
+# command's, and removing that one would let two commands in at once.
+_account_unlock() {
+  local lock owner=""
+  [[ $_ACCOUNT_LOCK_DEPTH -gt 0 ]] || return 0
+  _ACCOUNT_LOCK_DEPTH=$(( _ACCOUNT_LOCK_DEPTH - 1 ))
+  [[ $_ACCOUNT_LOCK_DEPTH -eq 0 ]] || return 0
+  lock="$(_account_lock_path)"
+  [[ -d "$lock" && ! -L "$lock" ]] || return 0
+  IFS= read -r owner 2>/dev/null < "$lock/owner" || true
+  [[ -n "$_ACCOUNT_LOCK_OWNER" && "$owner" == "$_ACCOUNT_LOCK_OWNER" ]] || return 0
+  rm -rf "$lock" 2>/dev/null || true
+  return 0
+}
+
+# Run FUNCTION ARGS under the lock and return its status, or _ACCOUNT_LOCK_BUSY
+# without running it.
+_account_with_lock() {
+  local rc=0
+  _account_lock || return "$_ACCOUNT_LOCK_BUSY"
+  "$@" || rc=$?
+  _account_unlock
+  return "$rc"
+}
+
+_account_busy_msg() {
+  if [[ "${_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 ]]; then
+    error "Cleat cannot write to the accounts directory."
+    echo -e "    ${DIM}Nothing was changed. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+    return 0
+  fi
+  error "Another cleat command is changing accounts right now."
+  echo -e "    ${DIM}Nothing was changed. Try again in a moment.${RESET}"
 }
 
 # ── Credential files ────────────────────────────────────────────────────────
@@ -14837,6 +15564,44 @@ _account_cred_sane_size() {
   [[ "$1" -le "$_ACCOUNT_CRED_MAX_BYTES" ]]
 }
 
+# One field of the Claude login in a credential file: claudeAiOauth.KEY and
+# nothing else. Every reader of a credential goes through these two.
+#
+# The file also holds mcpOAuth, one entry per MCP server, each with its OWN
+# accessToken, refreshToken and expiresAt. The old readers searched the whole
+# blob and took the first match with jq and the last without it. Claude writes
+# mcpOAuth BEFORE claudeAiOauth when the MCP login came first, so on a host with
+# jq the usage poll sent the MCP server's bearer to api.anthropic.com. Without
+# jq a blanked login beside a live MCP entry read as plausible and was harvested
+# over the account's only good credential. This is one path with no jq, so both
+# hosts give the same answer. A login it cannot isolate reads as empty, which
+# every caller treats as signed out: never harvested, never polled.
+#
+# Capped at the credential size: the staged copy is in a directory the box can
+# write. A missing file reads as empty.
+_account_cred_str() {
+  _json_flat_str "$(head -c "$_ACCOUNT_CRED_MAX_BYTES" "$1" 2>/dev/null | _json_flat_object claudeAiOauth)" "$2"
+}
+
+_account_cred_num() {
+  _json_flat_num "$(head -c "$_ACCOUNT_CRED_MAX_BYTES" "$1" 2>/dev/null | _json_flat_object claudeAiOauth)" "$2"
+}
+
+# A bearer that may go into a curl config: base64url plus the few characters an
+# OAuth token uses. Nothing else passes. The token comes from a store harvested out
+# of a directory the box mounts read-write. The curl config takes one directive
+# per line. A newline starts a new one. A quote or a backslash changes where the
+# header value ends. A box that planted any of them could turn a usage poll
+# into a host file write (output =) or read (upload-file =). The letters are
+# spelled out because an A-Z range can match outside ASCII under a UTF-8
+# collation.
+_account_token_ok() {
+  case "$1" in
+    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-]*) return 1 ;;
+  esac
+  return 0
+}
+
 # Does this blob actually look like a Claude credential, rather than merely
 # like JSON? Only ever asked of a file the box could have written.
 #
@@ -14845,43 +15610,180 @@ _account_cred_sane_size() {
 # overwriting the host's real refresh token with something that contains no
 # token at all. There is no trash on that path and no undo: the account is
 # simply signed out and the weeks of refresh life are gone.
+#
+# Both tokens are the Claude login's own. An MCP server's tokens beside a
+# blanked login do not make it plausible.
 _account_cred_plausible() {
-  local blob at rt
-  blob="$(head -c "$_ACCOUNT_CRED_MAX_BYTES" "$1" 2>/dev/null || true)"
-  [[ -n "$blob" ]] || return 1
-  at="$(_account_json_field "$blob" accessToken 2>/dev/null || true)"
-  rt="$(_account_json_field "$blob" refreshToken 2>/dev/null || true)"
+  local at rt
+  at="$(_account_cred_str "$1" accessToken 2>/dev/null || true)"
+  rt="$(_account_cred_str "$1" refreshToken 2>/dev/null || true)"
   [[ -n "$at" && -n "$rt" ]]
 }
 
-# Epoch MILLISECONDS the stored access token expires, or 0. Reuses
-# _oauth_expires_at, the parser _seed_macos_credentials already trusts.
+# Epoch MILLISECONDS the Claude login in this file expires (claudeAiOauth only,
+# never an MCP server's token beside it), or 0. Reuses _oauth_expires_at, the
+# parser _seed_macos_credentials already trusts. Capped at the credential size
+# because the staged copy lives in a directory the box can write. Its expiry is
+# read before any size check.
 _account_cred_expiry() {
   local f="$1" v
   [[ -s "$f" ]] || { printf '0'; return 0; }
-  v="$(_oauth_expires_at < "$f" 2>/dev/null || true)"
+  v="$(head -c "$_ACCOUNT_CRED_MAX_BYTES" "$f" 2>/dev/null | _oauth_expires_at || true)"
   case "$v" in ''|*[!0-9]*) v=0 ;; esac
   printf '%s' "$v"
 }
 
-# Copy a credential into place at 0600, atomically, refusing anything that is
+# The keys of a Claude Code credential store that belong to the ACCOUNT. Exactly
+# the set Claude Code 2.1.270 deletes when a /login replaces the account while it
+# keeps every MCP and plugin secret (performLogout with preserveNonAnthropicAuth).
+# Everything else in the file (mcpOAuth, mcpOAuthClientConfig, mcpXaaIdp,
+# pluginSecrets, coworkRemoteDevice) belongs to the box that wrote it. Copying
+# the whole file erased an MCP server login at the next attach, so Claude called
+# the server with no bearer, and it carried one box's MCP tokens into the store
+# and on to every box pinned to the same account.
+# Re-check this list on every Claude Code bump (grep the bundle for
+# `delete n.claudeAiOauth`).
+_ACCOUNT_SCOPED_KEYS="claudeAiOauth organizationUuid trustedDeviceToken enterpriseGateway designOauth"
+
+# One JSON object split into its top-level members, each copied verbatim. awk
+# and not jq, on every host: a host with jq and one without must write the same
+# bytes, and a second implementation would be a second answer. POSIX awk only
+# (split, substr, index, sub, `(i,j) in A`), checked on mawk, gawk and the BWK
+# awk macOS ships.
+#
+# Input is BASE, a line holding only \001, then SRC. Output is every member of
+# BASE whose key is not account-scoped, then every member of SRC whose key is.
+# Anything the splitter does not fully understand fails the split rather than
+# being guessed at: a backslash in a top-level key, a repeated key, unbalanced
+# brackets, bytes after a value or after the object, a value that starts after
+# stray bytes and a bare word that is not true, false, null or a number. A SRC
+# that fails exits 1. A BASE that fails contributes nothing.
+_ACCOUNT_MERGE_AWK='
+function skip(s, i, L) {
+  while (i <= L && index(" \t\r\n", substr(s, i, 1)) > 0) i++
+  return i
+}
+function members(s, p,    L, i, c, ks, key, vs, d, q, e, n, val, done) {
+  L = length(s); n = 0
+  i = skip(s, 1, L)
+  if (substr(s, i, 1) != "{") return 0
+  i = skip(s, i + 1, L)
+  if (substr(s, i, 1) == "}") { N[p] = 0; return skip(s, i + 1, L) > L }
+  while (1) {
+    if (substr(s, i, 1) != "\"") return 0
+    ks = ++i
+    while (i <= L && (c = substr(s, i, 1)) != "\"") { if (c == "\\") return 0; i++ }
+    if (i > L) return 0
+    key = substr(s, ks, i - ks)
+    if ((p, key) in SEEN) return 0
+    SEEN[p, key] = 1
+    i = skip(s, i + 1, L)
+    if (substr(s, i, 1) != ":") return 0
+    i = skip(s, i + 1, L)
+    vs = i; d = 0; q = 0; e = 0; done = 0
+    for (; i <= L; i++) {
+      c = substr(s, i, 1)
+      if (q) { if (e) e = 0; else if (c == "\\") e = 1; else if (c == "\"") { q = 0; if (d == 0) done = 1 } continue }
+      if (d == 0 && (c == "," || c == "}")) break
+      if (done && index(" \t\r\n", c) == 0) return 0
+      if (d == 0 && i != vs && (c == "\"" || c == "{" || c == "[")) return 0
+      if (c == "\"") q = 1
+      else if (c == "{" || c == "[") d++
+      else if (c == "}" || c == "]") { if (d == 0) return 0; if (--d == 0) done = 1 }
+    }
+    if (i > L) return 0
+    val = substr(s, vs, i - vs)
+    sub(/[ \t\r\n]+$/, "", val)
+    if (!done && val !~ /^(true|false|null|-?[0-9][0-9.eE+-]*)$/) return 0
+    n++; K[p, n] = key; M[p, n] = "\"" key "\":" val
+    if (c == "}") { N[p] = n; return skip(s, i + 1, L) > L }
+    i = skip(s, i + 1, L)
+  }
+}
+BEGIN { nk = split(keys, a, " "); for (j = 1; j <= nk; j++) ACCT[a[j]] = 1; part = 1 }
+part == 1 && $0 == "\001" { part = 2; next }
+{ buf[part] = buf[part] $0 "\n" }
+END {
+  if (!members(buf[2], 2)) { if (have_src) exit 1; N[2] = 0 }
+  if (!members(buf[1], 1)) N[1] = 0
+  out = ""
+  for (j = 1; j <= N[1]; j++) if (!(K[1, j] in ACCT)) out = out (out == "" ? "" : ",") M[1, j]
+  for (j = 1; j <= N[2]; j++) if (K[2, j] in ACCT) out = out (out == "" ? "" : ",") M[2, j]
+  printf "{%s}\n", out
+}'
+
+# Print one credential object: the box's own members of BASE and the account's
+# members of SRC. Either may be "". So `merge "" store` is the shape a stored
+# account may have, `merge staged store` stages an account without touching
+# what the box signed into for itself and `merge staged ""` signs the box out of
+# the account and nothing else. Returns 1 when SRC is given and cannot be split.
+#
+# Both are host-private (a store, or a snapshot taken by _account_snapshot_cred,
+# which already did the read-once and -ef checks on the box's bytes), so a link
+# is simply refused. Capped at the credential size. NUL is dropped because awks
+# disagree on it, and \001 in BASE because it is the separator. Tokens travel on
+# stdin, never on argv.
+_account_cred_merge() {
+  local base="$1" src="$2" have_src=1
+  if [[ -z "$src" ]]; then
+    src=/dev/null
+    have_src=0
+  fi
+  [[ -n "$base" ]] || base=/dev/null
+  [[ -L "$base" || -L "$src" ]] && return 1
+  [[ "$src" == /dev/null || -f "$src" ]] || return 1
+  [[ "$base" == /dev/null || -f "$base" ]] || base=/dev/null
+  { head -c "$_ACCOUNT_CRED_MAX_BYTES" "$base" 2>/dev/null | LC_ALL=C tr -d '\000\001'
+    printf '\n\001\n'
+    head -c "$_ACCOUNT_CRED_MAX_BYTES" "$src" 2>/dev/null | LC_ALL=C tr -d '\000'
+  } | LC_ALL=C awk -v keys="$_ACCOUNT_SCOPED_KEYS" -v have_src="$have_src" "$_ACCOUNT_MERGE_AWK"
+}
+
+# The Claude login in a credential file exactly as every reader sees it (the
+# flat claudeAiOauth object), or nothing. Two files hold the same login when
+# this prints the same text for both.
+_account_cred_login() {
+  [[ -n "$1" ]] || return 0
+  head -c "$_ACCOUNT_CRED_MAX_BYTES" "$1" 2>/dev/null | _json_flat_object claudeAiOauth || true
+}
+
+# Write a credential into place at 0600, atomically, refusing anything that is
 # not a JSON object. The umask subshell is the point: a plain `cp` would leave a
 # live OAuth token readable at the host's default umask for the length of the
 # copy. Lifted from _seed_macos_credentials, which had to solve this first.
+#
+# What is written is _account_cred_merge BASE SRC: the account's keys of SRC
+# over the box's own keys of BASE. With no BASE that is the account's keys alone,
+# which is what every store write is, so a store an older build filled with a
+# box's MCP tokens loses them at its next harvest. An empty SRC means "no
+# account keys".
 _account_write_file_0600() {
-  local src="$1" dest="$2" tmp ok=false
+  local src="$1" dest="$2" base="${3:-}" tmp ok=false
   [[ -L "$dest" ]] && return 1
+  # A directory there would take the temp file INTO it, report success and
+  # leave the box with no credential at all.
+  [[ -d "$dest" ]] && return 1
   # A source the BOX can write is capped before it is read, because the next
   # thing that happens to it is a `cat` into a host file and, later, a shell
   # variable. A credential is under 4 KB.
-  _account_cred_sane_size "$src" || return 1
+  [[ -z "$src" ]] || _account_cred_sane_size "$src" || return 1
   # mktemp, not "$dest.tmp.$$". The old name was guessable and unguarded, and
   # half the destinations live in a directory the box mounts read-write, so a
   # planted symlink there would have redirected a live credential to any host
   # file the user can write. mktemp refuses an existing path (symlink or FIFO
   # included) and creates at 0600 on both BSD and GNU.
   tmp="$(mktemp "${dest}.tmp.XXXXXX" 2>/dev/null)" || return 1
-  ( umask 077; cat "$src" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  # By key, never the whole file. See _account_cred_merge.
+  ( umask 077; _account_cred_merge "$base" "$src" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  # A store takes exactly the login every reader found in the source. The
+  # readers find claudeAiOauth at any depth and the merge copies top-level keys
+  # only, so a login a box nested inside another key read as plausible and
+  # projected to {}: a harvest of the same grant wrote a store with no login
+  # over the account's only copy.
+  if [[ -n "$src" && -z "$base" && "$(_account_cred_login "$tmp")" != "$(_account_cred_login "$src")" ]]; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
   if command -v jq &>/dev/null; then
     jq -e 'type=="object"' "$tmp" >/dev/null 2>&1 && ok=true
   else
@@ -14896,10 +15798,324 @@ _account_write_file_0600() {
   return 0
 }
 
+# Writes into a store that exists and never creates one. A harvest decides early
+# and writes late, and a `cleat account rm` or a rename in another terminal can
+# move the store away in between. A mkdir -p here put the account back under its
+# old name, empty or refilled, and `restore` then refused. Past this check
+# nothing creates a directory: mktemp, the redirect and mv all fail when the
+# store has gone. The decline returns 1, so the wipe that asked keeps the staged
+# file. The one place that creates a store is the explicit switch to a new name.
 _account_write_cred() {
-  local acct="$1" src="$2"
-  _account_ensure_dir "$acct" || return 1
-  _account_write_file_0600 "$src" "$(_account_cred_path "$acct")"
+  local acct="$1" src="$2" gone
+  _account_exists "$acct" || return 1
+  # The generation this write replaces, fingerprinted before it goes (see
+  # _account_seen_add). A box still staged on it is behind this account, not on
+  # another account's login, and must not be quarantined for that at its next
+  # attach.
+  gone="$(_account_rt_fingerprint "$(_account_cred_str "$(_account_cred_path "$acct")" refreshToken 2>/dev/null || true)" 2>/dev/null || true)"
+  _account_write_file_0600 "$src" "$(_account_cred_path "$acct")" || return 1
+  [[ -z "$gone" ]] || _account_seen_add "$acct" "$gone" || true
+  return 0
+}
+
+# A held login is kept as the exact bytes it was found in, MCP logins and all.
+# The dedupe compares those bytes, and an adopt takes the account's keys out of
+# them later. DEST is a new file in a new entry directory under the host-only
+# accounts tree, so there is nothing to merge with and no link to race. The
+# checks are the ones _account_cred_keepable makes, so what it calls keepable
+# can always be kept.
+_account_copy_whole_0600() {
+  local src="$1" dest="$2"
+  [[ -f "$src" && ! -L "$src" ]] || return 1
+  [[ ! -e "$dest" && ! -L "$dest" ]] || return 1
+  _account_cred_sane_size "$src" || return 1
+  if command -v jq &>/dev/null; then
+    jq -e 'type=="object"' "$src" >/dev/null 2>&1 || return 1
+  else
+    _looks_like_json_object "$src" || return 1
+  fi
+  ( umask 077; cat "$src" > "$dest" ) 2>/dev/null || { rm -f "$dest" 2>/dev/null; return 1; }
+  chmod 600 "$dest" 2>/dev/null || true
+  return 0
+}
+
+# ONE read of a credential file the box can rewrite at any moment, into a
+# host-private copy. Prints the copy's path, or returns 1. The caller removes
+# the copy.
+#
+# Every decision about box-written bytes (the expiry, the plausibility, the
+# write) is made on this copy and never on the path again. Reading the path
+# three times let bytes that landed after the checks reach the store unchecked:
+# Claude blanking both tokens on invalid_grant, or a symlink the box swapped in,
+# which had the host-side copy read any host file the user can read into the
+# account store and the next attach hand it back into the box.
+#
+# The file is opened once. A symlink swapped in before the open and left there
+# fails the second -L. One swapped in and swapped back to a regular file fails
+# -ef, because the descriptor holds a different file. The copy lives in the
+# host-only accounts directory, never under the run directory the box mounts.
+# A FIFO swapped in between the check and the open blocks the reader until it is
+# killed. The lock's age bound then lets the next command in.
+_account_snapshot_cred() {
+  local src="$1" tmp
+  [[ -f "$src" && ! -L "$src" ]] || return 1
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || return 1
+  chmod 700 "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || true
+  tmp="$(mktemp "$CLEAT_ACCOUNTS_DIR/.snap.XXXXXX" 2>/dev/null)" || return 1
+  if ! ( exec 3<"$src" || exit 1
+         [[ ! -L "$src" && "$src" -ef /dev/fd/3 ]] || exit 1
+         umask 077
+         head -c $(( _ACCOUNT_CRED_MAX_BYTES + 1 )) <&3 > "$tmp" ) 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! _account_cred_sane_size "$tmp"; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s' "$tmp"
+}
+
+# Would a hold (_account_copy_whole_0600) take this host-private copy, and is it
+# a Claude login rather than junk? It must accept exactly what that writer
+# accepts, or a hold fails on content and the command that asked refuses for
+# good over a file nothing could ever save.
+_account_cred_keepable() {
+  _account_cred_plausible "$1" || return 1
+  if command -v jq &>/dev/null; then
+    jq -e 'type=="object"' "$1" >/dev/null 2>&1
+  else
+    _looks_like_json_object "$1"
+  fi
+}
+
+# A host-private copy of FILE when it holds a login worth keeping. Prints the
+# copy's path (the caller removes it). Returns 1 when there is nothing worth
+# keeping (absent, a link, a pipe, oversized, no tokens, not a JSON object) and
+# 2 when a login is there but could not be copied.
+#
+# The cheap bounded read comes first, so a box with nothing in it never creates
+# the accounts directory. The decision is then made again on the copy.
+_account_keepable_snapshot() {
+  local f="$1" snap
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  _account_cred_sane_size "$f" || return 1
+  _account_cred_plausible "$f" || return 1
+  snap="$(_account_snapshot_cred "$f")" || return 2
+  if ! _account_cred_keepable "$snap"; then
+    rm -f "$snap" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s' "$snap"
+}
+
+# ── Held logins ─────────────────────────────────────────────────────────────
+#
+# A login a box had that no account store took. Every command that deletes or
+# replaces a staged credential used to trust the harvest's exit code, and the
+# harvest returned 0 both when the store already held the login and when it
+# simply declined a file that was not newer. So `cleat rm`, both switches,
+# `cleat account rm` and nuke deleted a /login made inside the box as someone
+# else, a refresh whose store write failed and a refresh misread as older,
+# leaving no copy anywhere. Whatever the harvest does not take is copied here
+# first, and a command that cannot copy it deletes nothing.
+#
+# .held/<epoch>-XXXXXX/ holds .credentials.json and meta (acct, box, reason,
+# uuid, who, org). It lives under the accounts directory, which is host-only,
+# never mounted into a box and refused by every wipe. No credential copy is ever
+# kept under the run directory: every wipe removes it, and its auth/ is the
+# box's own read-write mount. The id is the directory name mktemp made, so
+# nothing has to be parsed out of an account or container name. Entries are
+# swept on the trash clock.
+#
+# Reasons: unsaved (the pinned store has a different login), left-in-box (a
+# login a wipe or a switch found where no harvest looks), other-account,
+# replaced-by-adopt, replaced-by-harvest (a store with no verified owner, at its
+# first verified harvest) and journal.
+_ACCOUNT_HELD_ID=""
+
+_account_held_dir() {
+  local d="$CLEAT_ACCOUNTS_DIR/.held"
+  [[ -L "$d" ]] && return 1
+  [[ -e "$d" ]] && [[ ! -d "$d" ]] && return 1
+  printf '%s' "$d"
+}
+
+# An id is exactly what _account_hold makes: a plain epoch (no leading zero,
+# which bash arithmetic would read as octal) and mktemp's six characters.
+_account_held_id_ok() {
+  local re='^[1-9][0-9]{0,14}-[A-Za-z0-9]{6}$'
+  [[ "$1" =~ $re ]]
+}
+
+# An entry that is a real directory with a credential in it. Prints its path.
+_account_held_entry() {
+  local hdir d
+  _account_held_id_ok "$1" || return 1
+  hdir="$(_account_held_dir)" || return 1
+  d="$hdir/$1"
+  [[ -d "$d" && ! -L "$d" ]] || return 1
+  [[ -f "$d/.credentials.json" && ! -L "$d/.credentials.json" ]] || return 1
+  printf '%s' "$d"
+}
+
+# Copy SRC into a new held entry. SRC must be host-private: a snapshot or a
+# store file, never a path the box can write. Returns 0 when it is kept (a new
+# entry, or the same bytes from the same box already are, which leaves
+# _ACCOUNT_HELD_ID empty) and 1 when it could not be.
+_account_hold() {
+  local src="$1" acct="$2" cname="$3" reason="$4" uuid="${5:-}" who="${6:-}" org="${7:-}"
+  local hdir d now entry older="" nexp="" dexp nl=$'\n'
+  _ACCOUNT_HELD_ID=""
+  [[ -f "$src" && ! -L "$src" ]] || return 1
+  _account_cred_sane_size "$src" || return 1
+  hdir="$(_account_held_dir)" || return 1
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || return 1
+  chmod 700 "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || true
+  mkdir -p "$hdir" 2>/dev/null || return 1
+  chmod 700 "$hdir" 2>/dev/null || true
+  # A command retried after a refusal must not stack copies of one file.
+  for d in "$hdir"/*; do
+    _account_held_entry "${d##*/}" >/dev/null || continue
+    [[ "$(_account_meta_get_at "$d" box 2>/dev/null || true)" == "$cname" ]] || continue
+    cmp -s "$d/.credentials.json" "$src" 2>/dev/null && return 0
+    # Nor copies of one verified login a box keeps refreshing. Claude refreshes
+    # about every eight hours. Every session end on a box running as another
+    # account holds the new generation. One entry per box, account and reason
+    # stays, the one with the newest expiry. A login no server vouched for has
+    # no uuid and only ever folds into identical bytes (above).
+    [[ -n "$uuid" && -n "$cname" ]] || continue
+    [[ "$(_account_meta_get_at "$d" reason 2>/dev/null || true)" == "$reason" ]] || continue
+    [[ "$(_account_meta_get_at "$d" uuid 2>/dev/null || true)" == "$uuid" ]] || continue
+    [[ -n "$nexp" ]] || nexp="$(_account_cred_expiry "$src")"
+    dexp="$(_account_cred_expiry "$d/.credentials.json")"
+    [[ "$dexp" -lt "$nexp" ]] || return 0
+    older="${older}${d}${nl}"
+  done
+  now="$(date +%s 2>/dev/null || true)"
+  case "$now" in ''|0*|*[!0-9]*) return 1 ;; esac
+  entry="$(mktemp -d "$hdir/${now}-XXXXXX" 2>/dev/null)" || return 1
+  chmod 700 "$entry" 2>/dev/null || true
+  if ! _account_copy_whole_0600 "$src" "$entry/.credentials.json" \
+     || ! ( umask 077
+            printf 'acct\t%s\nbox\t%s\nreason\t%s\nuuid\t%s\nwho\t%s\norg\t%s\n' \
+              "$(_account_meta_clean "$acct")" "$(_account_meta_clean "$cname")" \
+              "$(_account_meta_clean "$reason")" "$(_account_meta_clean "$uuid")" \
+              "$(_account_meta_clean "$who")" "$(_account_meta_clean "$org")" > "$entry/meta"
+          ) 2>/dev/null; then
+    rm -rf "$entry" 2>/dev/null || true
+    return 1
+  fi
+  chmod 600 "$entry/meta" 2>/dev/null || true
+  _ACCOUNT_HELD_ID="${entry##*/}"
+  # The older generations go only once the newer one is safely kept.
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    rm -rf "$d" 2>/dev/null || true
+  done <<< "$older"
+  return 0
+}
+
+# The same, saying so. A login set aside in silence is as good as lost to the
+# person who has to find it.
+_account_hold_box() {
+  local acct="$2" cname="$3" reason="$4"
+  _account_hold "$1" "$acct" "$cname" "$reason" || return 1
+  [[ -n "$_ACCOUNT_HELD_ID" ]] || return 0
+  if [[ -n "$acct" && "$reason" == "unsaved" ]]; then
+    warn "Kept a login from ${BOLD}${cname}${RESET} that account ${BOLD}${acct}${RESET} does not have."
+  else
+    warn "Kept a login left behind in ${BOLD}${cname}${RESET}."
+  fi
+  echo -e "    ${DIM}Nothing was deleted. It is held as ${BOLD}${_ACCOUNT_HELD_ID}${RESET}${DIM} (see ${BOLD}cleat account held${RESET}${DIM}).${RESET}"
+  echo -e "    ${DIM}Save it with ${BOLD}cleat account adopt ${_ACCOUNT_HELD_ID} <name>${RESET}${DIM}.${RESET}"
+  return 0
+}
+
+# The notice for a harvest that held a login as another account's. Names who the
+# server says it belongs to, the entry and how to save it. The newest such entry
+# for this box is the one this harvest held or matched.
+#
+# $2 is the opening clause, so the caller says how the login got here. A session
+# end and a `cleat login` are the two callers and neither sentence fits the
+# other: the login verb has not ended a session, it has just signed someone in.
+_account_held_notice() {
+  local cname="$1" lead="${2:-This session ended on a login for another account}"
+  local stamp id acct box reason who
+  local f_id="" f_acct="" f_who=""
+  while IFS="$(printf '\t')" read -r stamp id acct box reason who; do
+    [[ -z "$f_id" && "$box" == "$cname" && "$reason" == "other-account" ]] || continue
+    f_id="$id"
+    f_acct="$acct"
+    f_who="$who"
+  done < <(_account_held_scan)
+  if [[ -z "$f_id" ]]; then
+    warn "${lead}. It was not saved."
+    echo -e "    ${DIM}See it with ${BOLD}cleat account held${RESET}${DIM}.${RESET}"
+    return 0
+  fi
+  if [[ "$f_acct" != "-" ]]; then
+    warn "${lead}, so it was not saved to ${BOLD}$(_sessions_safe_str "$f_acct")${RESET}."
+  else
+    warn "${lead}. It was not saved."
+  fi
+  if [[ "$f_who" != "-" ]]; then
+    echo -e "    ${DIM}Anthropic says it is $(_sessions_safe_str "$f_who"). It is held as ${BOLD}${f_id}${RESET}${DIM}.${RESET}"
+  else
+    echo -e "    ${DIM}It is held as ${BOLD}${f_id}${RESET}${DIM}.${RESET}"
+  fi
+  echo -e "    ${DIM}Save it with ${BOLD}cleat account adopt ${f_id} <name>${RESET}${DIM}.${RESET}"
+  return 0
+}
+
+# Every held login, one `stamp<TAB>id<TAB>acct<TAB>box<TAB>reason<TAB>who` line
+# each, newest first. An empty value is written as `-`, because a tab is IFS
+# whitespace and `read` would fold two of them into one.
+_account_held_scan() {
+  local hdir d id acct box reason who
+  hdir="$(_account_held_dir)" || return 0
+  [[ -d "$hdir" ]] || return 0
+  for d in "$hdir"/*; do
+    id="${d##*/}"
+    _account_held_entry "$id" >/dev/null || continue
+    acct="$(_account_meta_get_at "$d" acct 2>/dev/null || true)"
+    box="$(_account_meta_get_at "$d" box 2>/dev/null || true)"
+    reason="$(_account_meta_get_at "$d" reason 2>/dev/null || true)"
+    who="$(_account_meta_get_at "$d" who 2>/dev/null || true)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${id%%-*}" "$id" \
+      "${acct:--}" "${box:--}" "${reason:--}" "${who:--}"
+  done | sort -t "$(printf '\t')" -k1,1rn -k2,2
+  return 0
+}
+
+# How many. Fork-free like _account_trash_count: it runs once per list screen.
+_account_held_count() {
+  local hdir d n=0
+  hdir="$(_account_held_dir)" || { printf '0'; return 0; }
+  if [[ -d "$hdir" ]]; then
+    for d in "$hdir"/*; do
+      [[ -d "$d" && ! -L "$d" ]] || continue
+      _account_held_id_ok "${d##*/}" || continue
+      [[ -f "$d/.credentials.json" && ! -L "$d/.credentials.json" ]] || continue
+      n=$(( n + 1 ))
+    done
+  fi
+  printf '%s' "$n"
+  return 0
+}
+
+# Is this exact file already held for this box with this reason?
+_account_held_has() {
+  local cname="$1" snap="$2" reason="$3" hdir d
+  hdir="$(_account_held_dir)" || return 1
+  [[ -d "$hdir" ]] || return 1
+  for d in "$hdir"/*; do
+    _account_held_entry "${d##*/}" >/dev/null || continue
+    [[ "$(_account_meta_get_at "$d" box 2>/dev/null || true)" == "$cname" ]] || continue
+    [[ "$(_account_meta_get_at "$d" reason 2>/dev/null || true)" == "$reason" ]] || continue
+    cmp -s "$d/.credentials.json" "$snap" 2>/dev/null && return 0
+  done
+  return 1
 }
 
 # ── Staging into a box ──────────────────────────────────────────────────────
@@ -14910,27 +16126,169 @@ _account_box_auth_dir() { printf '%s' "$CLEAT_RUN_DIR/$1/auth"; }
 # credential lives in that dir, and Claude Code refreshes it in place about
 # every eight hours, so a wipe that does not harvest first throws away a token
 # the account has no other copy of and lands the user back on /login.
+#
+# A harvest that declines is not "nothing to lose". Status 3 is a login the
+# store does not have, which is held before the delete. Status 1 on a real
+# login (a failed write of a newer token, or a store that is gone) keeps auth/
+# for the next session end or a restore. Status 1 on junk deletes it, or the
+# directory survived every `cleat clean`, which reported pruning it each time.
+# Any other login in the directory is held first too, and a wipe that cannot
+# keep one deletes nothing.
 _account_wipe_run_dir() {
-  local cname="$1" rc=0 auth
+  local cname="$1" rc=0 pin keep_auth=0 snap src=0
   [[ -n "$cname" ]] || return 0
-  _account_sync_out "$cname" || rc=$?
-  if [[ $rc -ne 0 ]]; then
-    # The harvest declined or failed, and the staged file may be the only copy
-    # of a token the box refreshed. Wipe everything EXCEPT the auth directory,
-    # which is what the recreate needs cleared, and leave that one file for the
-    # next attach to stage from or the next session end to retry. Deleting it
-    # here would destroy the thing the harvest was protecting.
-    auth="$(_account_box_auth_dir "$cname")"
-    local _e
-    for _e in "${CLEAT_RUN_DIR:?}/${cname}"/*; do
-      [[ -e "$_e" ]] || continue
-      [[ "$_e" == "$auth" ]] && continue
-      rm -rf "$_e" 2>/dev/null || true
-    done
+  # A box that was never pinned has no store to harvest into and takes no lock.
+  # A login left in it (a staged file orphaned by a crash, or a journal) is
+  # still held before the delete.
+  pin="$(_box_account_file "$cname")"
+  if [[ ! -e "$pin" && ! -L "$pin" ]]; then
+    if ! _account_hold_run_extras "$cname"; then
+      warn "Kept ${BOLD}${cname}${RESET}'s runtime dir: it holds a login that could not be saved anywhere else."
+      return 0
+    fi
+    rm -rf "${CLEAT_RUN_DIR:?}/${cname}" 2>/dev/null || true
+    return 0
+  fi
+  # Harvest and delete under one hold. A lock that cannot be had is a declined
+  # harvest, so the staged file stays. Any other login in the directory is held
+  # first, which needs no lock (exactly as for a box that is not pinned), and one
+  # that cannot be kept keeps the whole directory.
+  if ! _account_lock; then
+    warn "Kept the staged login for ${BOLD}${cname}${RESET}: another cleat command is changing accounts."
+    _account_hold_run_extras "$cname" || return 0
+    _account_wipe_keep_auth "$cname"
+    return 0
+  fi
+  _account_sync_out_locked "$cname" || rc=$?
+  case "$rc" in
+    0|2) : ;;
+    3)
+      # A login the store does not have. Held, or the auth dir stays.
+      _account_hold_staged_locked "$cname" || keep_auth=1
+      ;;
+    *)
+      # Refused or failed. A real login stays in place for the next session end
+      # to retry. Junk goes.
+      snap="$(_account_keepable_snapshot "$(_account_box_auth_dir "$cname")/.credentials.json")" || src=$?
+      if [[ $src -eq 0 ]]; then
+        rm -f "$snap" 2>/dev/null || true
+        keep_auth=1
+      elif [[ $src -ne 1 ]]; then
+        keep_auth=1
+      fi
+      ;;
+  esac
+  if ! _account_hold_run_extras "$cname"; then
+    _account_unlock
+    warn "Kept ${BOLD}${cname}${RESET}'s runtime dir: it holds a login that could not be saved anywhere else."
+    return 0
+  fi
+  if [[ $keep_auth -eq 1 ]]; then
+    # Wipe everything EXCEPT the auth directory, which is what the recreate
+    # needs cleared, and leave that one file for the next attach to stage from
+    # or the next session end to retry.
+    _account_wipe_keep_auth "$cname"
+    _account_unlock
     return 0
   fi
   rm -rf "${CLEAT_RUN_DIR:?}/${cname}" 2>/dev/null || true
+  _account_unlock
   return 0
+}
+
+# Wipe a box's run dir except its auth directory.
+_account_wipe_keep_auth() {
+  local cname="$1" auth _e
+  auth="$(_account_box_auth_dir "$cname")"
+  for _e in "${CLEAT_RUN_DIR:?}/${cname}"/*; do
+    [[ -e "$_e" ]] || continue
+    [[ "$_e" == "$auth" ]] && continue
+    rm -rf "$_e" 2>/dev/null || true
+  done
+  return 0
+}
+
+# Hold every OTHER login in a box's run dir before a wipe removes it. Returns 0
+# when nothing is left that could not be kept, 1 when a copy failed.
+#
+# A wipe knew about one file, the staged credential of a pinned box. A staged
+# file an unpinned box was left with, a temp file from an interrupted write and
+# any rollback journal all went with the directory. The run dir root and auth/
+# are both looked at, dotfiles included, because every name a journal is likely
+# to get starts with a dot and a bare glob skips it. auth/ is the box's own
+# read-write mount, so a link there can point at any host file: links and
+# anything that is not a regular file are never read (_account_keepable_snapshot
+# refuses them). A pinned box's staged file is the harvest's, and a copy of the
+# pinned store's own login (same refresh token) is not worth a held entry.
+#
+# Every current caller runs after the container is gone, so no box process is
+# racing these checks. Each copy is still decided on a snapshot.
+_account_hold_run_extras() {
+  local cname="$1" rd auth acct label owned srt="" f snap src rc=0
+  [[ -n "$cname" ]] || return 0
+  rd="$CLEAT_RUN_DIR/$cname"
+  [[ -d "$rd" && ! -L "$rd" ]] || return 0
+  auth="$rd/auth"
+  owned="$auth/.credentials.json"
+  acct="$(_box_account_read "$cname")"
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    # No harvest ever looks at an unpinned box's staged file.
+    label=""
+    owned=""
+  else
+    label="$acct"
+    srt="$(_account_cred_str "$(_account_cred_path "$acct")" refreshToken 2>/dev/null || true)"
+  fi
+  for f in "$rd"/* "$rd"/.[!.]* "$auth"/* "$auth"/.[!.]*; do
+    # auth/ itself swapped for a link is never read through.
+    [[ "${f%/*}" == "$auth" && -L "$auth" ]] && continue
+    [[ -n "$owned" && "$f" == "$owned" ]] && continue
+    # A link, a pipe, a directory or an unmatched pattern is refused there
+    # without a read.
+    src=0
+    snap="$(_account_keepable_snapshot "$f")" || src=$?
+    if [[ $src -eq 1 ]]; then continue; fi
+    if [[ $src -ne 0 ]]; then rc=1; continue; fi
+    if [[ -n "$srt" && "$(_account_cred_str "$snap" refreshToken 2>/dev/null || true)" == "$srt" ]]; then
+      rm -f "$snap" 2>/dev/null || true
+      continue
+    fi
+    _account_hold_box "$snap" "$label" "$cname" left-in-box || rc=1
+    rm -f "$snap" 2>/dev/null || true
+  done
+  return "$rc"
+}
+
+# Hold a box's staged credential. Returns 0 when it is kept or holds nothing
+# worth keeping, 1 when a login could not be kept.
+_account_hold_staged_locked() {
+  local cname="$1" acct reason=unsaved snap src=0 rc=0
+  acct="$(_box_account_read "$cname")"
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    acct=""
+    reason=left-in-box
+  fi
+  snap="$(_account_keepable_snapshot "$(_account_box_auth_dir "$cname")/.credentials.json")" || src=$?
+  if [[ $src -eq 1 ]]; then return 0; fi
+  if [[ $src -ne 0 ]]; then return 1; fi
+  _account_hold_box "$snap" "$acct" "$cname" "$reason" || rc=1
+  rm -f "$snap" 2>/dev/null || true
+  return "$rc"
+}
+
+# The one step before ANY delete or replace of a staged credential (both
+# switches, remove, nuke). Harvest it, and hold whatever the harvest did not
+# take: a login the store does not have (3), a refused or failed write of a
+# real login (1), or a login staged in a box that is not pinned at all, which
+# no harvest looks at. Returns 1 only when a real login could not be kept, and
+# the caller then deletes nothing.
+_account_release_staged_locked() {
+  local cname="$1" rc=0
+  if [[ "$(_box_account_read "$cname")" != "$_ACCOUNT_DEFAULT" ]]; then
+    _account_sync_out_locked "$cname" || rc=$?
+    case "$rc" in 0|2) return 0 ;; esac
+  fi
+  _account_hold_staged_locked "$cname"
 }
 
 # Refuse to remove a directory that IS, or that contains, the named-account
@@ -14971,73 +16329,448 @@ _nuke_wipe_dir() {
   return 0
 }
 
-# The same, for the wipes that take the whole run directory.
-_account_sync_out_all() {
-  local f base
-  [[ -d "$CLEAT_BOX_ACCOUNTS_DIR" ]] || return 0
+# The same, for nuke, which takes the whole run directory. Every pinned box is
+# released and every run dir's other logins are held. Returns 1 when a login
+# could not be kept and _ACCOUNT_LOCK_BUSY when the lock cannot be had, and the
+# caller keeps the dirs on either. With nothing pinned there is no store to
+# harvest into, so like an unpinned wipe it takes no lock.
+_account_release_all() {
+  [[ -d "$CLEAT_BOX_ACCOUNTS_DIR" ]] || { _account_hold_all_run_extras; return $?; }
+  _account_with_lock _account_release_all_locked
+}
+
+_account_release_all_locked() {
+  local f base rc=0
   for f in "$CLEAT_BOX_ACCOUNTS_DIR"/*; do
     [[ -f "$f" ]] || continue
     base="${f##*/}"
-    _account_sync_out "$base" || true
+    _account_release_staged_locked "$base" || rc=1
   done
-  return 0
+  _account_hold_all_run_extras || rc=1
+  return "$rc"
 }
 
-# Copy the pinned account's credential into the box's own auth directory, or
-# remove it when the account is empty so the box presents as signed out and
-# /login lands in the right store.
+# Not only the pinned boxes: an unpinned box's run dir can hold a login too.
+_account_hold_all_run_extras() {
+  local d rc=0
+  [[ -d "$CLEAT_RUN_DIR" && ! -L "$CLEAT_RUN_DIR" ]] || return 0
+  for d in "$CLEAT_RUN_DIR"/*; do
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    _account_hold_run_extras "${d##*/}" || rc=1
+  done
+  return "$rc"
+}
+
+# Stage the pinned account's login into the box's own auth directory, by key:
+# the account's keys (_ACCOUNT_SCOPED_KEYS) are replaced and everything else the
+# box signed into for itself (an MCP server, a plugin secret) stays. An account
+# with no login stages nothing at an attach, so the box keeps whatever it holds,
+# which may be a /login made inside the box that no session end has harvested
+# yet. A pin to a store that is gone stages nothing and touches nothing.
 #
 # Copy, never symlink, and never a bind of the file itself: a bind-mounted FILE
 # breaks the moment the host replaces it by rename, which is how every safe
 # write in this CLI is done.
+#
+# An unpinned box is decided without the lock because nothing is touched. A pin
+# that appears a moment later is a switch that simply came after this attach,
+# and that switch stages for itself.
+#
+# `force` is the switch. The incoming account always wins, whatever the staged
+# expiry says, because newest-wins is only valid WITHIN one account. Across a
+# switch the staged file belongs to the account being LEFT and is usually the
+# fresher of the two (the box refreshed it minutes ago, the account being
+# switched to has been parked for hours). Declining would leave the old login
+# under the new pin, and the next detach would harvest it INTO the new account's
+# store. The switch has already harvested or held that login under the same hold
+# of the lock. Only the account's keys are replaced, with one rename in the auth
+# directory. Nothing is ever removed first: a removal before the rename left the
+# box with no credential file for about 25 ms, and a Claude the live gate missed
+# answered "Not logged in" into that moment.
+#
+# _ACCOUNT_STAGE_UNKEPT is set to 1 when the staging stopped because the login
+# it would have replaced could not be kept, so the attach can say so.
+_ACCOUNT_STAGE_UNKEPT=0
 _account_sync_in() {
-  local cname="$1" acct dir store_cred box_cred be se
+  _ACCOUNT_STAGE_UNKEPT=0
+  [[ "$(_box_account_read "$1")" != "$_ACCOUNT_DEFAULT" ]] || return 0
+  _account_with_lock _account_sync_in_locked "$1"
+}
+
+_account_sync_in_locked() {
+  local cname="$1" mode="${2:-}" acct dir store_cred box_cred be se snap="" bobj sobj rc=0
+  _ACCOUNT_STAGE_UNKEPT=0
+  # Read again under the lock. The pin read before it may already be stale.
   acct="$(_box_account_read "$cname")"
   [[ "$acct" != "$_ACCOUNT_DEFAULT" ]] || return 0
+  # A store that is gone (removed by hand, or trashed or renamed away while this
+  # pin was read) is not something to stage from, and a symlink is not a store.
+  # The staged login stays untouched, and `cleat account restore` reconnects it.
+  _account_exists "$acct" || return 0
   dir="$(_account_box_auth_dir "$cname")"
   [[ -L "$dir" ]] && return 1
   mkdir -p "$dir" 2>/dev/null || return 1
   chmod 700 "$dir" 2>/dev/null || true
   store_cred="$(_account_cred_path "$acct")"
   box_cred="${dir}/.credentials.json"
-  if [[ ! -s "$store_cred" ]]; then
-    rm -f "$box_cred" 2>/dev/null || true
+  sobj="$(_account_cred_login "$store_cred")"
+  if [[ -z "$sobj" && "$mode" != force ]]; then
+    # Never delete here. With no login in the store, a staged file is the ONLY
+    # copy of a login made inside this box that nothing has harvested yet: a
+    # second terminal attached, or a login that arrived between two harvests.
+    # Removing it lost the login and signed out the Claude still running on it
+    # ("Not logged in"). Harvest it through
+    # the one gated path instead, and stage nothing back: the bytes are already
+    # in place, and a rewrite would replace the file under a live session.
+    if [[ -f "$box_cred" ]]; then
+      _account_sync_out_locked "$cname" || true
+    fi
     return 0
   fi
-  # Newest wins, keyed on expiresAt rather than mtime: every refresh pushes it
-  # about eight hours forward, and it survives a clock or filesystem-timestamp
-  # oddity in a way mtime does not. Same comparison _seed_macos_credentials
-  # makes for the same reason.
-  be="$(_account_cred_expiry "$box_cred")"
-  se="$(_account_cred_expiry "$store_cred")"
-  [[ "$se" -ge "$be" ]] || return 0
-  _account_write_file_0600 "$store_cred" "$box_cred"
+  # The box's file is read once, into a host-private copy. The staged expiry,
+  # the hold and the box's own keys that the merge keeps all come from that copy.
+  # An attach does not overwrite blind what it cannot copy (a symlink, a pipe, a
+  # directory, past the size cap). A switch replaces it: a link or a pipe the box
+  # planted is not a login and the writer refuses to rename over a link, so it is
+  # removed first. Claude opens its store without following links, so a link
+  # already read as signed out and removing it opens no gap. Anything else is
+  # renamed over with nothing of it kept, which past the size cap includes the
+  # box's own MCP logins.
+  if [[ -e "$box_cred" || -L "$box_cred" ]]; then
+    if ! snap="$(_account_snapshot_cred "$box_cred")"; then
+      snap=""
+      [[ "$mode" == force ]] || return 1
+      if [[ -L "$box_cred" || ( -e "$box_cred" && ! -f "$box_cred" && ! -d "$box_cred" ) ]]; then
+        rm -f "$box_cred" 2>/dev/null || true
+      fi
+    fi
+  fi
+  if [[ -z "$sobj" ]]; then
+    # A switch to an account with no login signs the box out of the account it
+    # leaves and of nothing else. A file left with nothing in it goes.
+    if [[ "$(_account_cred_merge "$snap" "" 2>/dev/null || true)" != "{}" ]]; then
+      _account_write_file_0600 "" "$box_cred" "$snap" || rc=1
+    else
+      rm -f "$box_cred" 2>/dev/null || true
+    fi
+    [[ -z "$snap" ]] || rm -f "$snap" 2>/dev/null || true
+    return "$rc"
+  fi
+  if [[ -n "$snap" && "$mode" != force ]]; then
+    # Newest wins, keyed on expiresAt rather than mtime: every refresh pushes it
+    # about eight hours forward, and it survives a clock or filesystem-timestamp
+    # oddity in a way mtime does not. Same comparison _seed_macos_credentials
+    # makes for the same reason. An equal expiry stages only a different login.
+    # The same login already in place is left alone, because a rewrite moves
+    # the file under any session running in the box and gains nothing.
+    bobj="$(_account_cred_login "$snap")"
+    be="$(_json_flat_num "$bobj" expiresAt 2>/dev/null || true)"
+    se="$(_json_flat_num "$sobj" expiresAt 2>/dev/null || true)"
+    case "$be" in ''|*[!0-9]*) be=0 ;; esac
+    case "$se" in ''|*[!0-9]*) se=0 ;; esac
+    [[ "$se" -gt "$be" ]] || { [[ "$se" -eq "$be" ]] && [[ "$bobj" != "$sobj" ]]; } || { rm -f "$snap" 2>/dev/null; return 0; }
+    # Not newer is not the same login. A /login made in the box as someone else,
+    # while a sibling box on this account saved a fresher refresh, is overwritten
+    # here, so it is held first. Nothing is staged over a login that could not be
+    # kept, and the box starts on what it has. A generation of this account's own
+    # grant that the store has moved past is only this box falling behind a
+    # sibling on the same account, so it is staged over without a word.
+    if _account_cred_keepable "$snap" && ! _account_staged_absorbed "$snap" "$store_cred" \
+       && ! _account_staged_superseded "$acct" "$snap"; then
+      if ! _account_hold_box "$snap" "$acct" "$cname" unsaved; then
+        rm -f "$snap" 2>/dev/null || true
+        _ACCOUNT_STAGE_UNKEPT=1
+        return 1
+      fi
+    fi
+  fi
+  _account_write_file_0600 "$store_cred" "$box_cred" "$snap" || rc=1
+  [[ -z "$snap" ]] || rm -f "$snap" 2>/dev/null || true
+  return "$rc"
 }
 
 # Harvest a token the box refreshed for itself back into the store. Without
 # this every refresh after a switch is lost and the account is back at /login,
 # which is the exact pain this feature removes. Runs at session end, at the top
-# of every `cleat account`, and BEFORE anything wipes the run directory.
+# of every `cleat account`, BEFORE anything wipes the run directory, and at an
+# attach while the account store is still empty (see _account_sync_in).
+#
+# Returns 0 harvested, nothing staged or the store already holds this login.
+# 1 refused or failed: the staged file is left. 3 unsaved: a login the store
+# does not hold and this harvest will not write. A caller that deletes or
+# replaces the staged file goes through _account_release_staged_locked, which
+# holds it. _ACCOUNT_LOCK_BUSY comes from the wrapper when the lock cannot be
+# had. (2, held as another account's login, is reserved for the identity check.)
 _account_sync_out() {
-  local cname="$1" acct box_cred store_cred be se
+  [[ "$(_box_account_read "$1")" != "$_ACCOUNT_DEFAULT" ]] || return 0
+  _account_with_lock _account_sync_out_locked "$1"
+}
+
+_account_sync_out_locked() {
+  local cname="$1" acct box_cred snap rc=0
   acct="$(_box_account_read "$cname")"
   [[ "$acct" != "$_ACCOUNT_DEFAULT" ]] || return 0
   box_cred="$(_account_box_auth_dir "$cname")/.credentials.json"
   [[ -f "$box_cred" ]] || return 0
   [[ -L "$box_cred" ]] && return 1
+  # A pin to a store that is gone declines and never creates one. The staged
+  # file stays for `cleat account restore` to reconnect.
+  _account_exists "$acct" || return 1
+  snap="$(_account_snapshot_cred "$box_cred")" || return 1
+  _account_harvest_from "$acct" "$cname" "$snap" || rc=$?
+  rm -f "$snap" 2>/dev/null || true
+  return "$rc"
+}
+
+# Every harvest decision, made on a host-private snapshot of the staged file
+# (see _account_snapshot_cred), never on the box's path. CNAME is the box it
+# came from. Statuses are _account_sync_out's.
+#
+# "Newer" only says the file was refreshed. It does not say whose login it is.
+# Neither the credential nor the store names an account. The staged file sits in
+# a directory the box writes: a /login as someone else inside a pinned box, or a
+# switch that raced an attach, leaves another account's login there. Harvesting
+# on "newer" alone wrote that login over the account's only credential, with no
+# trash. The list kept the old name while usage went out on the other bearer.
+# The next switch relabelled the account. So a newer login is written only when
+# it is provably the same account:
+#   1. the same refresh token as the store (the same grant, no request), or
+#   2. GET /api/oauth/profile names the account uuid recorded for this store, or
+#   3. no uuid is recorded yet (the first verified harvest) and the email the
+#      server gives is not a different one than the account already shows. The
+#      login it replaces is held first (replaced-by-harvest), because nothing
+#      ever proved whose that one was either.
+# A login proven to be another account's is held (2) and never written. One the
+# server cannot vouch for right now (offline, expired, revoked, an answer this
+# reader does not know) is left where it is (3). The identity check never
+# refreshes a token, so the usage rule that a parked token is never refreshed
+# still holds. A 401 reads as "cannot tell", never as "someone else".
+_account_harvest_from() {
+  local acct="$1" cname="$2" snap="$3" store_cred be se now_ms
+  local ident uuid who org rec known
   store_cred="$(_account_cred_path "$acct")"
-  be="$(_account_cred_expiry "$box_cred")"
+  # The source of this file is a directory the box mounts read-write. A blob
+  # with no tokens in it has nothing to harvest and nothing to keep.
+  _account_cred_plausible "$snap" || return 1
+  be="$(_account_cred_expiry "$snap")"
   se="$(_account_cred_expiry "$store_cred")"
-  [[ "$be" -gt "$se" ]] || return 0
-  # The source of this file is a directory the box mounts read-write, so
-  # "newer" is not enough to earn an overwrite of the host's only copy. An
-  # expiry further out than any real access token, or a blob with no tokens in
-  # it, is refused rather than harvested.
-  local now_ms
+  # Not newer. Nothing to do only when the store holds this same login. Any
+  # other login (a /login as someone else behind a sibling's fresher refresh,
+  # or a refresh misread as older) is unsaved, and a deleter must keep it.
+  if [[ "$be" -le "$se" ]]; then
+    _account_staged_absorbed "$snap" "$store_cred" && return 0
+    # A generation this account has already moved past is not a login it does
+    # not have. There is nothing to write and nothing for a deleter to keep.
+    _account_staged_superseded "$acct" "$snap" && return 0
+    return 3
+  fi
+  # "Newer" is not enough to earn an overwrite of the host's only copy. An
+  # expiry further out than any real access token is refused.
   now_ms=$(( ${_CLEAT_NOW_S:-$(date +%s)} * 1000 ))
   [[ "$be" -le $(( now_ms + 7776000000 )) ]] || return 1
-  _account_cred_plausible "$box_cred" || return 1
-  _account_write_cred "$acct" "$box_cred"
+  # The same grant refreshed. Both refresh tokens are the Claude login's own
+  # (claudeAiOauth), never an MCP server's entry the two files share.
+  if _account_staged_absorbed "$snap" "$store_cred"; then
+    _account_write_cred "$acct" "$snap" || return 1
+    return 0
+  fi
+  # Bytes already proven to be another account's are not asked about again.
+  _account_held_has "$cname" "$snap" other-account && return 2
+  ident="$(_account_cred_identity "$snap")" || return 3
+  IFS="$(printf '\t')" read -r uuid who org <<< "$ident"
+  [[ -n "$uuid" && -n "$who" ]] || return 3
+  rec="$(_account_meta_get "$acct" uuid 2>/dev/null || true)"
+  if [[ -n "$rec" ]]; then
+    if [[ "$uuid" != "$rec" ]]; then
+      _account_hold "$snap" "$acct" "$cname" other-account "$uuid" "$who" "$org" || return 1
+      return 2
+    fi
+  else
+    # Trust on first use, but not over a name the account already shows. The
+    # recorded email may predate this check. A stranger's login is exactly what
+    # a first harvest must not adopt.
+    known="$(_account_meta_get "$acct" who 2>/dev/null || true)"
+    if [[ -n "$known" ]] && ! _account_same_email "$known" "$who"; then
+      _account_hold "$snap" "$acct" "$cname" other-account "$uuid" "$who" "$org" || return 1
+      return 2
+    fi
+    # Nor is the login it writes over proven to be anyone's. A store with no
+    # uuid (saved before this check, adopted from an entry nobody verified, or
+    # one whose first recording failed) has only ever been taken on trust, and
+    # the email the account shows may be missing or itself unverified. Without
+    # a uuid there is nothing to hold a stranger's login against. So the store's
+    # own login is held first, and nothing is written when it cannot be kept.
+    # Once the uuid is recorded below, this branch is never reached again.
+    if _account_cred_keepable "$store_cred"; then
+      _account_hold "$store_cred" "$acct" "" replaced-by-harvest "" "$known" \
+        "$(_account_meta_get "$acct" org 2>/dev/null || true)" || return 1
+    fi
+  fi
+  _account_write_cred "$acct" "$snap" || return 1
+  # The server's answer for the login just written is the only source of who
+  # the account is. An organisation it did not give is cleared, never kept from
+  # an older record.
+  _account_meta_set "$acct" uuid "$uuid" || true
+  _account_meta_set "$acct" who "$who" || true
+  _account_meta_set "$acct" org "$org" || true
+  return 0
+}
+
+# Case-insensitive email comparison without ${v,,}, which bash 3.2 lacks.
+_account_same_email() {
+  local a b
+  a="$(printf '%s' "$1" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+  b="$(printf '%s' "$2" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+  [[ "$a" == "$b" ]]
+}
+
+# ── Whose login is this ─────────────────────────────────────────────────────
+#
+# GET /api/oauth/profile with the login's own access token answers with the
+# account it belongs to. It is the request Claude Code makes after /login. The
+# shape read here is Claude's own check of the answer: account.uuid and
+# account.email strings, organization.uuid. Nothing on disk can answer this. The
+# credential blob names no account. claude.json's oauthAccount is written by the
+# box.
+_ACCOUNT_PROFILE_URL="https://api.anthropic.com/api/oauth/profile"
+
+# The request, with the status code on the last line. max-time is 3, the usage
+# poll's bound, chosen for the same reason: this one runs at a session end, so
+# every second of it is a second the user waits after Claude has already gone,
+# and it holds the account lock while it waits.
+_account_profile_curl() {
+  local tok="$1"
+  printf 'silent\nmax-time = 3\nheader = "Authorization: Bearer %s"\nurl = "%s"\nwrite-out = "\\n%%{http_code}"\n' \
+    "$tok" "$_ACCOUNT_PROFILE_URL" | _account_curl | LC_ALL=C tr -d '\000'
+}
+
+# uuid<TAB>email<TAB>org out of a profile body, or return 1.
+#
+# The flat reader on every host, never jq, so a host with jq and one without
+# agree by construction. The account object must be flat and the only "account"
+# key in the body. uuid and email must each appear once inside it. A key
+# is only ever matched where a real key can be (a quote inside a string is
+# always escaped), so a full_name crafted to contain "uuid" forges nothing. The
+# uuid is held to a plain alphabet because it is compared and stored. The
+# organisation object carries empty objects of its own (cc_onboarding_flags),
+# which are folded to null first so the flat reader can isolate it. An
+# organisation it still cannot read leaves org empty and costs nothing else.
+_account_profile_parse() {
+  local body="$1" acct orgobj uuid email org="" re='^[A-Za-z0-9-]{8,64}$'
+  # Capped by expansion, not head -c: a head that stops reading SIGPIPEs the
+  # printf. Under the CLI's pipefail that aborts the session end.
+  body="$(printf '%s' "${body:0:$_ACCOUNT_CRED_MAX_BYTES}" | LC_ALL=C tr '\000\r\n' '   ')"
+  acct="$(printf '%s' "$body" | _json_flat_object account)"
+  [[ -n "$acct" ]] || return 1
+  uuid="$(_json_flat_str "$acct" uuid)" || return 1
+  [[ "$uuid" =~ $re ]] || return 1
+  email="$(_json_flat_str "$acct" email)" || return 1
+  email="$(_account_meta_clean "$email")"
+  [[ -n "$email" ]] || return 1
+  orgobj="$(printf '%s' "$body" | LC_ALL=C sed 's/:[[:space:]]*[{][[:space:]]*[}]/:null/g' | _json_flat_object organization)"
+  if [[ -n "$orgobj" ]]; then
+    org="$(_json_flat_str "$orgobj" name 2>/dev/null || true)"
+    org="$(_account_meta_clean "$org")"
+  fi
+  printf '%s\t%s\t%s' "$uuid" "$email" "$org"
+}
+
+# Who the Claude login in FILE (host-private) belongs to: uuid<TAB>email<TAB>org
+# and status 0, or status 3 when it cannot be told right now. No curl, an access
+# token that is empty or unsafe in a curl config, one that has expired, any
+# answer but 200 (offline 000, 401 expired or revoked, 403 no profile scope,
+# 429, 5xx) and a body of a shape this reader does not know all read as 3. Only
+# a token still alive on its own is sent, so nothing here ever refreshes one.
+_account_cred_identity() {
+  local f="$1" tok exp now_ms out code body nl=$'\n'
+  command -v curl &>/dev/null || return 3
+  tok="$(_account_cred_str "$f" accessToken 2>/dev/null)" || return 3
+  _account_token_ok "$tok" || return 3
+  exp="$(_account_cred_num "$f" expiresAt 2>/dev/null)" || return 3
+  now_ms=$(( ${_CLEAT_NOW_S:-$(date +%s)} * 1000 ))
+  [[ "$exp" -gt "$now_ms" ]] || return 3
+  out="$(_account_profile_curl "$tok")"
+  [[ "$out" == *"$nl"* ]] || return 3
+  code="${out##*$nl}"
+  [[ "$code" == "200" ]] || return 3
+  body="${out%$nl*}"
+  _account_profile_parse "$body" || return 3
+}
+
+# Does the store already hold the login in this snapshot? The same refresh
+# token is the same grant: a refresh that did not rotate it changes nothing the
+# store needs. An empty store token matches nothing.
+_account_staged_absorbed() {
+  local srt brt
+  srt="$(_account_cred_str "$2" refreshToken 2>/dev/null || true)"
+  brt="$(_account_cred_str "$1" refreshToken 2>/dev/null || true)"
+  [[ -n "$srt" && "$brt" == "$srt" ]]
+}
+
+# ── Generations of one grant ────────────────────────────────────────────────
+#
+# Claude rotates the refresh token on nearly every refresh, so two boxes pinned
+# to ONE account drift apart: box A refreshes, its harvest advances the store,
+# and the file box B still has staged is an older generation of that same
+# login. Holding it was wrong twice over. Every attach of the box that fell
+# behind warned about "a login this account does not have", kept one more copy
+# of a live refresh token (a copy nothing folded together, the dedupe needing a
+# uuid the staged path never has) and offered to adopt it as a second account.
+# So the store remembers the logins it has held, and a generation it has
+# already moved past is replaced in silence. Anything it does not recognise is
+# still held: another account's login is what that quarantine is for.
+#
+# Fingerprints, never tokens. meta is a host-only 0600 file, but a digest that
+# cannot be spent is the right thing to keep in a file whose whole job is to be
+# read. Fixed width and a fixed count, so the value stays well inside the clamp
+# _account_meta_clean puts on it.
+_ACCOUNT_SEEN_MAX=8
+_ACCOUNT_SEEN_WIDTH=16
+
+_account_rt_fingerprint() {
+  local rt="$1" fp
+  [[ -n "$rt" ]] || return 1
+  fp="$(printf '%s' "$rt" | _md5 2>/dev/null || true)"
+  # md5sum prints "<digest>  -", md5 -q prints the digest alone and the cksum
+  # fallback a number. The first field is the digest in all three.
+  set -- $fp
+  fp="${1:-}"
+  case "$fp" in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
+  printf '%s' "${fp:0:$_ACCOUNT_SEEN_WIDTH}"
+}
+
+_account_seen_has() {
+  local cur
+  [[ -n "$2" ]] || return 1
+  cur=" $(_account_meta_get "$1" seen_rt 2>/dev/null || true) "
+  case "$cur" in *" $2 "*) return 0 ;; esac
+  return 1
+}
+
+# Remember one, newest first, oldest off the end.
+_account_seen_add() {
+  local acct="$1" fp="$2" cur out t n=1
+  [[ -n "$fp" ]] || return 0
+  cur="$(_account_meta_get "$acct" seen_rt 2>/dev/null || true)"
+  out="$fp"
+  # Walked with parameter expansion rather than word splitting, so nothing the
+  # file holds is ever glob-expanded against the working directory.
+  while [[ -n "$cur" && $n -lt $_ACCOUNT_SEEN_MAX ]]; do
+    t="${cur%% *}"
+    case "$cur" in *' '*) cur="${cur#* }" ;; *) cur="" ;; esac
+    [[ -n "$t" && "$t" != "$fp" ]] || continue
+    out="$out $t"
+    n=$(( n + 1 ))
+  done
+  _account_meta_set "$acct" seen_rt "$out"
+}
+
+# Is the login in this snapshot a generation of the account's own grant that
+# the store has already moved past?
+_account_staged_superseded() {
+  local fp
+  fp="$(_account_rt_fingerprint "$(_account_cred_str "$2" refreshToken 2>/dev/null || true)" 2>/dev/null || true)"
+  _account_seen_has "$1" "$fp"
 }
 
 # ── Account metadata ────────────────────────────────────────────────────────
@@ -15073,7 +16806,9 @@ _account_meta_get() {
 
 _account_meta_set() {
   local acct="$1" key="$2" val="$3" f tmp kk vv wrote=0
-  _account_ensure_dir "$acct" || return 1
+  # Never creates the store, for the reason _account_write_cred gives. The usage
+  # poll records its numbers after a network wait of up to three seconds.
+  _account_exists "$acct" || return 1
   f="$(_account_meta_path "$acct")"
   [[ -L "$f" ]] && return 1
   val="$(_account_meta_clean "$val")"
@@ -15098,63 +16833,23 @@ _account_meta_set() {
   return 0
 }
 
-# A string field out of a JSON blob, WITHOUT jq. Deliberately not
-# _sessions_json_str: that one forbids whitespace after the colon because it
-# reads Claude Code's compact transcript writer byte for byte, and two mutation
-# entries depend on that. ~/.claude.json is PRETTY-PRINTED by the same vendor,
-# so the account reader has to allow the space the transcript reader refuses.
+# Record what the account's own credential says and when it was last used: the
+# plan (claudeAiOauth.subscriptionType) and last_used. Nothing else.
 #
-# Without this, a host with no jq (macOS base has none) captured no email and
-# no organisation for any account, so every row read "not used yet" for an
-# account with a live credential and the `cleat account rm` confirmation named
-# nothing but the directory.
-_account_json_str_ws() {
-  local blob="$1" key="$2" hit
-  hit="$(printf '%s' "$blob" | LC_ALL=C grep -aoE "\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"\\\\]|\\\\.)*\"" | tail -1)" || hit=""
-  [[ -n "$hit" ]] || return 1
-  hit="${hit#*\"${key}\"}"
-  hit="${hit#*\"}"
-  hit="${hit%\"}"
-  printf '%s' "$hit"
-}
-
-# Pull one string field out of a JSON blob. jq when it is there, the
-# whitespace-tolerant grep reader when it is not.
-_account_json_field() {
-  local blob="$1" key="$2" v
-  [[ -n "$blob" ]] || return 1
-  if command -v jq &>/dev/null; then
-    v="$(printf '%s' "$blob" | jq -r --arg k "$key" '.. | objects | select(has($k)) | .[$k] | select(type=="string")' 2>/dev/null | head -n1 || true)"
-    [[ -n "$v" && "$v" != "null" ]] && { printf '%s' "$v"; return 0; }
-    return 1
-  fi
-  v="$(_account_json_str_ws "$blob" "$key")" || return 1
-  _sessions_json_unesc "$v"
-}
-
-# Record who an account belongs to. The credential blob alone cannot name an
-# account, so the email and the organisation have to come from the per-project
-# store Claude Code writes after it fetches the profile. That is the ONLY way
-# the list can show a human anything but a directory name.
+# The email and the organisation are NOT read here. They used to come out of
+# the box's per-project claude.json, which holds whichever identity Claude last
+# ran as, in a file the box itself writes. A /login as someone else inside a
+# pinned box, a box pinned and never started, or a switch that raced an attach
+# stamped one account with another's email. The switch then printed it as fact.
+# The only places `who`, `org` and `uuid` are written now are a harvest the
+# server vouched for (_account_harvest_from) and an adopt of a held login.
 _account_capture_meta() {
-  local acct="$1" project_json="$2" cred v now
+  local acct="$1" cred v now
   [[ "$acct" != "$_ACCOUNT_DEFAULT" ]] || return 0
   _account_exists "$acct" || return 0
-  if [[ -f "$project_json" ]]; then
-    local blob
-    blob="$(head -c 262144 "$project_json" 2>/dev/null || true)"
-    if v="$(_account_json_field "$blob" emailAddress)"; then
-      _account_meta_set "$acct" who "$v" || true
-    fi
-    if v="$(_account_json_field "$blob" organizationName)"; then
-      _account_meta_set "$acct" org "$v" || true
-    fi
-  fi
   cred="$(_account_cred_path "$acct")"
   if [[ -s "$cred" ]]; then
-    local cblob
-    cblob="$(head -c 65536 "$cred" 2>/dev/null || true)"
-    if v="$(_account_json_field "$cblob" subscriptionType)"; then
+    if v="$(_account_cred_str "$cred" subscriptionType)" && [[ -n "$v" ]]; then
       _account_meta_set "$acct" plan "$v" || true
     fi
   fi
@@ -15170,40 +16865,27 @@ _account_capture_meta() {
 # (a 2026-05 credential on the maintainer's own machine has no such field), so
 # its absence renders as "ok" rather than as an invented expiry. An account that
 # hit invalid_grant writes EMPTY tokens back to disk, which is why a present
-# file is not the same as a working account.
+# file is not the same as a working account. Both fields are the Claude login's
+# own. A live MCP server entry beside a blanked login still reads signed out.
 _account_auth_state() {
-  local acct="$1" cred blob rt now_ms rte
+  local acct="$1" cred rt now_ms rte
   cred="$(_account_cred_path "$acct")"
   if [[ ! -s "$cred" ]]; then
     printf 'signed out'
     return 0
   fi
-  blob="$(head -c 65536 "$cred" 2>/dev/null || true)"
-  rt="$(_account_json_field "$blob" refreshToken 2>/dev/null || true)"
+  rt="$(_account_cred_str "$cred" refreshToken 2>/dev/null || true)"
   if [[ -z "$rt" ]]; then
     printf 'signed out'
     return 0
   fi
   now_ms=$(( ${_CLEAT_NOW_S:-$(date +%s)} * 1000 ))
-  rte="$(_account_json_num "$blob" refreshTokenExpiresAt)"
+  rte="$(_account_cred_num "$cred" refreshTokenExpiresAt)" || rte=0
   if [[ "$rte" -gt 0 ]] && [[ "$rte" -le "$now_ms" ]]; then
     printf 're-login'
     return 0
   fi
   printf 'ok'
-}
-
-# A numeric JSON field, 0 when absent. Kept separate from the string reader
-# because an unquoted number does not match the string pattern at all.
-_account_json_num() {
-  local blob="$1" key="$2" v
-  if command -v jq &>/dev/null; then
-    v="$(printf '%s' "$blob" | jq -r --arg k "$key" '.. | objects | select(has($k)) | .[$k] | select(type=="number")' 2>/dev/null | head -n1 || true)"
-  else
-    v="$(printf '%s' "$blob" | grep -aoE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" 2>/dev/null | head -n1 | grep -aoE '[0-9]+$' || true)"
-  fi
-  case "$v" in ''|*[!0-9]*) v=0 ;; esac
-  printf '%s' "$v"
 }
 
 # ── Usage, and the three things it must never do ────────────────────────────
@@ -15232,19 +16914,25 @@ _account_json_num() {
 # billing figures, which have no business in a picker.
 _ACCOUNT_USAGE_URL="https://api.anthropic.com/api/oauth/usage?skip_spend=1"
 
-# The token never reaches argv. `curl --config -` takes the header on stdin, so
-# it cannot appear in `ps` output on a shared host.
+# Every request this file sends to Anthropic goes through here. The curl config,
+# the bearer included, arrives on stdin, so a token never reaches argv and
+# cannot appear in `ps` output on a shared host. A failed request prints nothing
+# or a partial answer. Every caller reads that as "cannot tell".
+_account_curl() { curl --config - 2>/dev/null || true; }
+
 _account_usage_curl() {
   local tok="$1"
   printf 'silent\nshow-error\nmax-time = 3\nheader = "Authorization: Bearer %s"\nurl = "%s"\n' \
-    "$tok" "$_ACCOUNT_USAGE_URL" | curl --config - 2>/dev/null || true
+    "$tok" "$_ACCOUNT_USAGE_URL" | _account_curl
 }
 
+# The bearer for one account: claudeAiOauth.accessToken, never an MCP server's
+# token from the same file. Only a token that is safe in a curl config.
 _account_access_token() {
-  local blob
-  blob="$(head -c 65536 "$(_account_cred_path "$1")" 2>/dev/null || true)"
-  [[ -n "$blob" ]] || return 1
-  _account_json_field "$blob" accessToken
+  local tok
+  tok="$(_account_cred_str "$(_account_cred_path "$1")" accessToken)" || return 1
+  _account_token_ok "$tok" || return 1
+  printf '%s' "$tok"
 }
 
 # Refresh the stored snapshot for one account. Returns 1 and prints nothing
@@ -15386,23 +17074,36 @@ _account_trash_dir() {
   printf '%s' "$d"
 }
 
+# Held logins go on the same clock. The id is the epoch it was held at.
 _account_trash_sweep() {
-  local tdir now cutoff d base stamp
-  tdir="$(_account_trash_dir)" || return 0
-  [[ -d "$tdir" ]] || return 0
+  local tdir hdir now cutoff d base stamp
   now="$(date +%s 2>/dev/null || echo 0)"
   case "$now" in ''|*[!0-9]*|0) return 0 ;; esac
   cutoff=$(( now - _ACCOUNTS_TRASH_DAYS * 86400 ))
-  for d in "$tdir"/*; do
-    [[ -d "$d" ]] || continue
-    [[ -L "$d" ]] && continue
-    base="${d##*/}"
-    stamp="${base%%-*}"
-    case "$stamp" in ''|*[!0-9]*) continue ;; esac
-    _validate_account_name "${base#*-}" || continue
-    [[ "$stamp" -lt "$cutoff" ]] || continue
-    rm -rf "$d"
-  done
+  tdir="$(_account_trash_dir)" || tdir=""
+  if [[ -n "$tdir" && -d "$tdir" ]]; then
+    for d in "$tdir"/*; do
+      [[ -d "$d" ]] || continue
+      [[ -L "$d" ]] && continue
+      base="${d##*/}"
+      stamp="${base%%-*}"
+      case "$stamp" in ''|*[!0-9]*) continue ;; esac
+      _validate_account_name "${base#*-}" || continue
+      [[ "$stamp" -lt "$cutoff" ]] || continue
+      rm -rf "$d"
+    done
+  fi
+  hdir="$(_account_held_dir)" || hdir=""
+  if [[ -n "$hdir" && -d "$hdir" ]]; then
+    for d in "$hdir"/*; do
+      [[ -d "$d" && ! -L "$d" ]] || continue
+      base="${d##*/}"
+      _account_held_id_ok "$base" || continue
+      [[ "${base%%-*}" -lt "$cutoff" ]] || continue
+      rm -rf "$d"
+    done
+  fi
+  return 0
 }
 
 _account_trash() {
@@ -15420,7 +17121,9 @@ _account_trash() {
   return 0
 }
 
-_account_restore() {
+_account_restore() { _account_with_lock _account_restore_locked "$@"; }
+
+_account_restore_locked() {
   local acct="$1" tdir d base stamp found=""
   # A glob must never decide identity here. `"$tdir"/*-"$acct"` matched
   # `<stamp>-my-work` when restoring `work`, because a dash is legal inside an
@@ -15499,8 +17202,12 @@ _account_trash_count() {
 
 # Rename is a directory move plus a pin rewrite. The pins have to follow, or
 # every box pinned to the old name silently falls back to the shared store at
-# its next attach, which reads as "cleat logged me out".
-_account_rename() {
+# its next attach, which reads as "cleat logged me out". The move and the pin
+# rewrite are one hold of the account lock, or an attach that read the old pin
+# between them found no store and deleted the staged login.
+_account_rename() { _account_with_lock _account_rename_locked "$@"; }
+
+_account_rename_locked() {
   local old="$1" new="$2" b
   _account_exists "$old" || return 1
   _account_dir_ok "$old" || return 1
@@ -15509,7 +17216,9 @@ _account_rename() {
   mv "$CLEAT_ACCOUNTS_DIR/$old" "$CLEAT_ACCOUNTS_DIR/$new" 2>/dev/null || return 1
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
-    _box_account_write "$b" "$new" || true
+    # The key rides along, or a renamed account could no longer be removed
+    # cleanly: the remove finds each box's claude.json through it.
+    _box_account_write "$b" "$new" "$(_box_account_key "$b" || true)" || true
   done < <(_account_pinned_boxes "$old")
   return 0
 }
@@ -15543,6 +17252,17 @@ _print_auth_line() {
   return 0
 }
 
+# True when a Claude Code process is running inside the box right now. The same
+# three terms as the switch's live gate (the note there says why each one is
+# needed), kept in one place for the checks that have to run at write time.
+# An unreadable `docker top` on a running box counts as live.
+#
+# This is the one probe seam: when the per-session pid file lands, only this
+# function changes.
+_box_claude_live() {
+  _daemon_up && container_exists "$1" && is_running "$1" && _box_has_live_agent "$1"
+}
+
 # Drop the identity block from the box's per-project ~/.claude.json the moment
 # the pin moves.
 #
@@ -15559,25 +17279,111 @@ _print_auth_line() {
 # always sets. So without this a switch left the previous account name on
 # screen while the requests went to the new one.
 #
-# Written IN PLACE with `cat >`, never temp-and-mv: an atomic rename swaps the
-# inode out from under a running container. Same form the attached heal uses.
+# Written IN PLACE through _write_in_place, never temp-and-mv: an atomic rename
+# swaps the inode out from under a running container. Same writer the attached
+# heal uses. Returns 3, having written nothing, when a Claude is running in the
+# box: see _account_invalidate_identity_key.
 _account_invalidate_identity() {
-  local project="$1" box="$2" key f tmp
-  # jq-gated like every other reader of this file. Without it the box keeps a
-  # stale name until its next recreate, which is worth a line in the docs
-  # rather than a hand-rolled JSON edit.
-  command -v jq &>/dev/null || return 0
+  local project="$1" box="$2" cname="${3:-}" key
   [[ -n "$project" ]] || return 0
   key="$(_derive_project_session_key "$project" "$box")" || return 0
+  [[ -n "$cname" ]] || cname="$(container_name_for "$project" "$box")"
+  _account_invalidate_identity_key "$key" "$cname"
+}
+
+# The same, for a caller that knows the box only by the key recorded with its
+# pin (_box_account_key). `cleat account rm` unpins boxes in other projects and
+# has no project path for any of them. Split out rather than duplicated, so
+# every unpin reaches the file through one edit.
+#
+# Returns 3, having written nothing, when a Claude is running in the box. The
+# check is here rather than only at the top of the switch because a usage poll
+# with a three second timeout sits between the two. Deleting oauthAccount under
+# a running Claude Code makes it refuse every later save of that file (its
+# cache still holds the account while each re-read does not), so the edit waits
+# and the caller says what to run.
+_account_invalidate_identity_key() {
+  local key="$1" cname="${2:-}" f
+  _account_session_key_ok "$key" || return 0
   f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  if [[ -n "$cname" ]] && _box_claude_live "$cname"; then
+    return 3
+  fi
+  # A host with no jq borrows the box's, which needs the box running. When it
+  # is not, the file is flagged and the next launch clears it before Claude
+  # reads it (_claude_json_clear_stale_identity). A host with jq never flags.
+  if ! _claude_json_drop_identity "$f" "$cname"; then
+    : > "${f}.identity-stale" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Delete the identity keys from one per-project claude.json, in place.
+#
+# The host's jq when the host has one. When it does not, the BOX's own jq does
+# the transform: the image ships it, and here it is a pure stdin-to-stdout
+# filter, so the host still makes the only write and keeps the symlink refusal.
+# What comes back is trusted no further than what the box could already write
+# into its own mounted file, and it is written only while it still looks like a
+# JSON object.
+#
+# Returns 0 when the file carries no identity afterwards, or never carried one.
+# Returns 1 when it could not be removed: no jq on the host and no running box
+# to borrow one from, or a filter that failed. The caller flags the file and
+# the next launch finishes the job (_claude_json_clear_stale_identity).
+_claude_json_drop_identity() {
+  local f="$1" cname="${2:-}" tmp rc=0
+  local prog='del(.oauthAccount) | del(.cachedUsageUtilization)'
   [[ -f "$f" && -s "$f" ]] || return 0
   [[ -L "$f" ]] && return 0
   tmp="${f}.acct.$$"
-  if jq 'del(.oauthAccount) | del(.cachedUsageUtilization)' "$f" > "$tmp" 2>/dev/null \
-     && [[ -s "$tmp" ]] && jq -e 'type=="object"' "$tmp" >/dev/null 2>&1; then
-    cat "$tmp" > "$f" 2>/dev/null || true
+  if command -v jq &>/dev/null; then
+    if ! { jq "$prog" "$f" > "$tmp" 2>/dev/null \
+           && [[ -s "$tmp" ]] && jq -e 'type=="object"' "$tmp" >/dev/null 2>&1; }; then
+      rm -f "$tmp" 2>/dev/null
+      return 1
+    fi
+  else
+    # Nothing to delete is an answer, and a cheap one: a jq-less host whose
+    # file is already clean asks the box nothing and leaves no flag behind.
+    grep -qE '"(oauthAccount|cachedUsageUtilization)"' "$f" 2>/dev/null || return 0
+    { [[ -n "$cname" ]] && _daemon_up && is_running "$cname"; } || return 1
+    if ! { docker exec -i "$cname" jq "$prog" < "$f" > "$tmp" 2>/dev/null \
+           && _looks_like_json_object "$tmp"; }; then
+      rm -f "$tmp" 2>/dev/null
+      return 1
+    fi
   fi
+  _write_in_place "$tmp" "$f" || rc=1
   rm -f "$tmp" 2>/dev/null
+  return $rc
+}
+
+# The launch half of an identity change the host could not finish by itself:
+# no jq on the host, and no running box to borrow one from at the time. The
+# flag is written by _account_invalidate_identity_key and by the no-jq branch
+# of the builder. It sits next to the file on the HOST only, because the box
+# mounts the file and never its directory, and `cleat nuke` takes it with the
+# projects dir. It needs no lock: the write is idempotent and the clear is
+# re-checked before every launch.
+#
+# Never edits under a live agent. A config write racing the in-place copy puts
+# the old name straight back, and a delete under a running Claude Code makes it
+# refuse its own later saves of that file. The next launch tries again.
+_claude_json_clear_stale_identity() {
+  local cname="$1" f="$2" box="${3:-main}"
+  [[ -e "${f}.identity-stale" ]] || return 0
+  if ! _box_has_live_agent "$cname" && _claude_json_drop_identity "$f" "$cname"; then
+    rm -f "${f}.identity-stale" 2>/dev/null || true
+    return 0
+  fi
+  warn "${BOLD}${box}${RESET} still carries another account's name."
+  echo -e "    ${DIM}Claude may show it and send that account's organisation until it is cleared.${RESET}"
+  if command -v jq &>/dev/null; then
+    echo -e "    ${DIM}Cleat tries again before the next launch.${RESET}"
+  else
+    echo -e "    ${DIM}Cleat tries again before the next launch. Installing jq on the host avoids this.${RESET}"
+  fi
   return 0
 }
 
@@ -15644,31 +17450,88 @@ _account_apply_exec_env() {
   [[ "$acct" != "$_ACCOUNT_DEFAULT" ]] || return 0
   _account_box_ready "$cname" || ready=$?
   if [[ $ready -eq 1 ]]; then
-    warn "${BOLD}${cname}${RESET} has no account mount, so it cannot use ${BOLD}${acct}${RESET} yet."
-    echo -e "    ${DIM}Recreate it once: ${BOLD}cleat rm${RESET}${DIM} then start it again. This session uses your shared login.${RESET}"
+    # The recreate hint names the BOX. A bare `cleat rm` removes main, so on any
+    # named box the old hint sent the user to remove a different box than the
+    # one that needs recreating.
+    warn "Box ${BOLD}${_BOX:-main}${RESET} (${cname}) has no account mount, so it cannot use ${BOLD}${acct}${RESET} yet."
+    echo -e "    ${DIM}Recreate it once: ${BOLD}cleat rm ${_BOX:-main}${RESET}${DIM} then start it again. This session uses your shared login.${RESET}"
     return 1
   fi
-  _account_sync_in "$cname" || true
+  # A lock that cannot be had writes nothing. The box starts on whatever is
+  # already staged, which is the login it last ran with, and still gets the env
+  # var so that login is the one it reads.
+  local _si=0
+  _account_sync_in "$cname" || _si=$?
+  if [[ $_si -eq $_ACCOUNT_LOCK_BUSY ]]; then
+    warn "Another cleat command is changing accounts, so ${BOLD}${cname}${RESET} starts with the login it already has."
+  elif [[ $_si -ne 0 && $_ACCOUNT_STAGE_UNKEPT -eq 1 ]]; then
+    # Not staged over a login the store does not have, because it could not be
+    # kept first. Said every time, or the box runs as someone else in silence
+    # until the accounts dir is writable again.
+    warn "${BOLD}${cname}${RESET} starts with the login it already has: it could not be kept before staging ${BOLD}${acct}${RESET}."
+    echo -e "    ${DIM}Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+  fi
   CLAUDE_ENV+=(-e "CLAUDE_SECURESTORAGE_CONFIG_DIR=${_ACCOUNT_BOX_DIR}")
   return 0
+}
+
+# Every refusal to change the login under a live Claude session says this.
+#
+# The reason is NOT that Claude Code notices the swap and undoes it. The old
+# refusal said so ("noticed and undone", "disarms its auth watcher and writes
+# its own token back"), from a 2.1.267 read that was never run. On 2.1.270 the
+# store's mtime change only clears caches, and the next request goes out with
+# whatever token is there. Claude writes nothing back (77 lab runs). The guard
+# stays for what a running session keeps from its start:
+# - the store PATH, fixed per exec by CLAUDE_SECURESTORAGE_CONFIG_DIR. A session
+#   started on the shared login never sees a switch. One sent back to the
+#   shared login keeps reading the box store, which the unpin empties, so it is
+#   signed out.
+# - the account identity. A bare swap moves only the bearer. The account uuid,
+#   the /status email and the org header stay on the old account.
+# - a turn already running, which finishes on the old token.
+# - a refresh saved in the same instant as the swap, which can put the old token
+#   back for the next harvest to file under the new name.
+# A fresh start takes all of it. That is the path the guard leaves open.
+_account_live_refusal() {
+  error "$1"
+  echo -e "    ${DIM}Exit it first. Claude Code only takes a login change in full when it starts.${RESET}"
 }
 
 _account_do_switch() {
   local acct="$1" box="$2" cname="$3" project="$4" current ready=0
   if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
-    # The same live gate the named switches get. Going back to the shared login
-    # changes the credential under a running session exactly as much as any
-    # other switch does.
+    # The same live gate the named switches get, and a harder reason: a running
+    # session reads the box store, which the unpin empties, so it is signed out.
     if _daemon_up && container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
-      error "${BOLD}${box}${RESET} has a live Claude session."
-      echo -e "    ${DIM}Exit it first. Swapping the credential under a running session is noticed and undone.${RESET}"
+      _account_live_refusal "${BOLD}${box}${RESET} has a live Claude session."
       return 1
     fi
-    _account_sync_out "$cname" || true
+    # The harvest, the unpin and the delete are one hold of the account lock.
+    # The identity drop edits a file a running box binds, so it comes after.
+    if ! _account_lock; then
+      _account_busy_msg
+      return 1
+    fi
+    # The unpin deletes the staged file, so whatever the harvest does not take
+    # is held first, and a login that cannot be kept stops the switch.
+    if ! _account_release_staged_locked "$cname"; then
+      _account_unlock
+      error "Could not keep the login ${BOLD}${box}${RESET} holds."
+      echo -e "    ${DIM}Nothing was switched. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+      return 1
+    fi
     _box_account_remove "$cname"
     rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true
-    _account_invalidate_identity "$project" "$box" || true
+    _account_unlock
+    local _id_rc=0
+    _account_invalidate_identity "$project" "$box" "$cname" || _id_rc=$?
     success "${BOLD}${box}${RESET} is back on your shared login ${DIM}(~/.claude)${RESET}"
+    if [[ $_id_rc -eq 3 ]]; then
+      # This branch always invalidates, so running it again finishes the job.
+      warn "A Claude session started in ${BOLD}${box}${RESET} during the switch, so the account name it shows was left as it was."
+      echo -e "    ${DIM}Exit that session and run ${BOLD}cleat account default ${box}${RESET}${DIM} again.${RESET}"
+    fi
     echo -e "    ${DIM}Conversations are unchanged. Resuming one started on the other account keeps${RESET}"
     echo -e "    ${DIM}the local transcript and ${BOLD}--resume${RESET}${DIM}. Its server-side history stops being${RESET}"
     echo -e "    ${DIM}backfilled from here on.${RESET}"
@@ -15677,13 +17540,13 @@ _account_do_switch() {
   if ! _validate_account_name "$acct"; then
     error "Invalid account name: ${BOLD}${acct}${RESET}"
     echo -e "    ${DIM}Lowercase letters, digits, dash and underscore. Up to 31 characters, starting with a letter or a digit.${RESET}"
-    echo -e "    ${DIM}Reserved: list, rename, rm, delete, restore, trash, off, help and default.${RESET}"
+    echo -e "    ${DIM}Reserved: list, rename, rm, delete, restore, trash, held, adopt, off, help and default.${RESET}"
     echo -e "    ${DIM}${BOLD}default${RESET}${DIM} is the sentinel for your shared login: ${BOLD}cleat account default${RESET}${DIM} unpins a box.${RESET}"
     return 1
   fi
-  # Switching under a live agent is the one case Claude Code actively fights:
-  # it notices the credential file change, disarms its auth watcher and writes
-  # its own token back over the swap.
+  # Refused under a live agent. Not because Claude Code undoes the swap (it does
+  # not, see _account_live_refusal) but because a running session only takes
+  # part of a login change and nothing tells the user which part.
   # Three terms, and every one of them is load-bearing. _box_has_live_agent
   # answers "live" whenever it cannot read docker, which is the safe default
   # where it is used and the wrong one here twice over. With the daemon DOWN no
@@ -15694,66 +17557,94 @@ _account_do_switch() {
   # steady state: the idle sweep stops boxes by itself. The session gate has
   # carried is_running since the day it was written.
   if _daemon_up && container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
-    error "${BOLD}${box}${RESET} has a live Claude session."
-    echo -e "    ${DIM}Exit it first. Swapping the credential under a running session is noticed and undone.${RESET}"
+    _account_live_refusal "${BOLD}${box}${RESET} has a live Claude session."
     return 1
   fi
 
+  # From the pin read to the staging is one hold of the account lock. An attach
+  # or a session end in another terminal waits for it and then reads the pin
+  # again, instead of staging or harvesting against the account this switch is
+  # leaving. Every error return below releases it first.
+  if ! _account_lock; then
+    _account_busy_msg
+    return 1
+  fi
   current="$(_box_account_read "$cname")"
   # Harvest whatever the box refreshed for the account it is leaving, BEFORE
   # anything is repointed. Skipping this loses every refresh since the switch in.
-  _account_sync_out "$cname" || true
-  if [[ "$current" != "$_ACCOUNT_DEFAULT" ]]; then
-    # The identity half of the capture is gated on the box having ACTUALLY RUN
-    # as this account, which is exactly "a credential was staged for it".
-    #
-    # The per-project claude.json holds whatever identity Claude last wrote
-    # there, and a box that was pinned but never ran as the account (a box with
-    # no auth mount, or one pinned and never started) still holds the SHARED
-    # login's. Reading it unconditionally stamped a brand-new account with the
-    # maintainer's primary email and organisation, so the list named an account
-    # that had never been logged into. Found on a real Mac, 2026-09-12.
-    local _cur_staged="$(_account_box_auth_dir "$cname")/.credentials.json"
-    if [[ -s "$_cur_staged" ]]; then
-      _account_capture_meta "$current" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true
-    fi
-    _account_usage_fetch "$current" >/dev/null 2>&1 || true
+  # When the pin moves, the account's keys in the staged file are replaced below,
+  # so whatever the harvest does not take is held first (a login made in the box
+  # as someone else, a failed store write, or a login staged in a box that was
+  # never pinned). A login that cannot be kept stops the switch before anything
+  # moves. Nothing but a mkdir runs between this and the pin write, so it is the
+  # last harvest before the rename. The plan and usage reads come after the
+  # unlock.
+  if [[ "$current" == "$acct" ]]; then
+    _account_sync_out_locked "$cname" || true
+  elif ! _account_release_staged_locked "$cname"; then
+    _account_unlock
+    error "Could not keep the login ${BOLD}${box}${RESET} holds."
+    echo -e "    ${DIM}Nothing was switched. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+    return 1
   fi
 
-  # Drop the staged copy once it has been harvested, whenever the pin actually
-  # moves. This is load-bearing, not tidying.
-  #
-  # _account_sync_in is newest-wins by expiresAt, and that is only valid WITHIN
-  # one account. Across a switch the staged file belongs to the account being
-  # LEFT and is usually the FRESHER of the two, because the box refreshed it
-  # minutes ago while the account being switched to has been parked for hours.
-  # So sync_in would decline to overwrite it, the box would keep the old
-  # account's credential while pinned to the new one, and the next detach would
-  # harvest that credential INTO the new account's store and destroy its refresh
-  # token. Removing the staged file makes its expiry 0, so the incoming
-  # credential always wins.
+  # Whenever the pin actually moves, the incoming account always wins. Only its
+  # keys are replaced, by one rename, so the box's own MCP logins stay and there
+  # is never a moment with no credential file. See _account_sync_in_locked. The
+  # staging this replaced removed the staged file first: that erased the box's
+  # MCP logins and left about 25 ms in which a Claude the live gate missed read
+  # "Not logged in".
+  local fresh=0 stage_mode=""
   if [[ "$current" != "$acct" ]]; then
-    rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true
+    stage_mode=force
   fi
-
-  local fresh=0
   if ! _account_exists "$acct"; then
-    _account_ensure_dir "$acct" || { error "Could not create the account store."; return 1; }
+    _account_ensure_dir "$acct" || { _account_unlock; error "Could not create the account store."; return 1; }
     fresh=1
   fi
-  _box_account_write "$cname" "$acct" || { error "Could not pin the account to this box."; return 1; }
-  _account_sync_in "$cname" || { error "Could not stage the credential for this box."; return 1; }
-  # Capture for the account being switched TO as well, but deliberately with NO
-  # project file. That file still holds the OUTGOING account's oauthAccount, so
-  # passing it here stamped every incoming account with the previous login's
-  # email and organisation, and the list then named an account it had never
-  # seen. The plan comes out of the account's own credential blob and last_used
-  # from the clock, so both still land.
-  _account_capture_meta "$acct" "" || true
+  _box_account_write "$cname" "$acct" "$(_derive_project_session_key "$project" "$box")" \
+    || { _account_unlock; error "Could not pin the account to this box."; return 1; }
+  if ! _account_sync_in_locked "$cname" "$stage_mode"; then
+    # Nothing was removed, so the staged file still holds the login of the
+    # account being left. The pin goes back with it, or the next detach
+    # harvests that login INTO the account this switch was going to.
+    if [[ "$current" == "$_ACCOUNT_DEFAULT" ]]; then
+      _box_account_remove "$cname"
+    else
+      _box_account_write "$cname" "$current" "$(_derive_project_session_key "$project" "$box")" || true
+    fi
+    _account_unlock
+    # Re-selecting the account a box is already on stages over a login the
+    # store does not have only once it is held.
+    if [[ $_ACCOUNT_STAGE_UNKEPT -eq 1 ]]; then
+      error "Could not keep the login ${BOLD}${box}${RESET} holds."
+      echo -e "    ${DIM}Nothing was switched. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+    else
+      error "Could not stage the credential for this box."
+    fi
+    return 1
+  fi
+  _account_unlock
+
+  # Everything below reads the network, a project file a running box binds, or
+  # docker, so none of it runs under the lock. The usage poll in particular can
+  # take three seconds. Sitting between the harvest and the staging, it left a
+  # window where a refresh the box saved was deleted without being harvested.
+  # The plan and last_used for both accounts. Neither capture reads the box's
+  # project file: a file the box writes cannot say whose login it is, so it once
+  # named a brand-new account with the maintainer's primary email (found on a
+  # real Mac, 2026-09-12) and stamped each incoming account with the previous
+  # login's. Who an account is comes only from a harvest the server vouched for.
+  _account_capture_meta "$current" || true
+  _account_capture_meta "$acct" || true
+  if [[ "$current" != "$_ACCOUNT_DEFAULT" ]]; then
+    _account_usage_fetch "$current" >/dev/null 2>&1 || true
+  fi
   # The pin has moved, so whatever name the box is carrying is now the wrong
   # one. See _account_invalidate_identity: the start rebuild does not reach a
   # running box and the attached heal cannot fix identity.
-  [[ "$current" != "$acct" ]] && { _account_invalidate_identity "$project" "$box" || true; }
+  local _id_rc=0
+  [[ "$current" != "$acct" ]] && { _account_invalidate_identity "$project" "$box" "$cname" || _id_rc=$?; }
 
   # The pin is DELIBERATELY left in place on this refusal. It has to outlive
   # `cleat rm`, which is exactly the remedy printed below, and the attach path
@@ -15769,6 +17660,14 @@ _account_do_switch() {
   fi
 
   success "${BOLD}${box}${RESET} is now on account ${BOLD}${acct}${RESET}"
+  if [[ $_id_rc -eq 3 ]]; then
+    # Re-running this switch would NOT finish the job: the pin already reads
+    # the new account, so the invalidate is skipped. A stopped box is rebuilt
+    # at its next start and a pinned rebuild drops the name, so the stop is
+    # what reaches the file safely.
+    warn "A Claude session started in ${BOLD}${box}${RESET} during the switch, so the account name it shows was left as it was."
+    echo -e "    ${DIM}Exit that session and run ${BOLD}cleat stop ${box}${RESET}${DIM}. Its next start shows ${BOLD}${acct}${RESET}${DIM}.${RESET}"
+  fi
   if [[ $fresh -eq 1 || "$(_account_auth_state "$acct")" == "signed out" ]]; then
     echo -e "    ${DIM}It has no login yet. Start the box and run ${BOLD}/login${RESET}${DIM} once. It is remembered under this name.${RESET}"
   else
@@ -15799,13 +17698,33 @@ _account_do_rename() {
     error "There is already an account named ${BOLD}${new}${RESET}."
     return 1
   fi
-  if _account_rename "$old" "$new"; then
+  local rc=0
+  _account_rename "$old" "$new" || rc=$?
+  if [[ $rc -eq 0 ]]; then
     success "Renamed ${DIM}${old}${RESET} to ${BOLD}${new}${RESET}"
     echo -e "    ${DIM}Every box pinned to it follows.${RESET}"
     return 0
   fi
+  if [[ $rc -eq $_ACCOUNT_LOCK_BUSY ]]; then
+    _account_busy_msg
+    return 1
+  fi
   error "Could not rename ${BOLD}${old}${RESET}."
   return 1
+}
+
+# Refuse when any box pinned to ACCT has a live Claude session, having said
+# why. It asks docker, so it never runs under the account lock.
+_account_remove_live_gate() {
+  local acct="$1" b
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    if _daemon_up && container_exists "$b" && is_running "$b" && _box_has_live_agent "$b"; then
+      _account_live_refusal "A box pinned to ${BOLD}${acct}${RESET} has a live Claude session."
+      return 1
+    fi
+  done <<< "$(_account_pinned_boxes "$acct")"
+  return 0
 }
 
 _account_do_remove() {
@@ -15814,16 +17733,9 @@ _account_do_remove() {
     error "No account named ${BOLD}${acct}${RESET}."
     return 1
   fi
+  _account_remove_live_gate "$acct" || return 1
   pinned="$(_account_pinned_boxes "$acct")"
-  while IFS= read -r b; do
-    [[ -n "$b" ]] || continue
-    if _daemon_up && container_exists "$b" && is_running "$b" && _box_has_live_agent "$b"; then
-      error "A box pinned to ${BOLD}${acct}${RESET} has a live Claude session."
-      echo -e "    ${DIM}Exit it first.${RESET}"
-      return 1
-    fi
-    live=1
-  done <<< "$pinned"
+  [[ -n "$pinned" ]] && live=1
 
   warn "This removes the login stored as ${BOLD}${acct}${RESET}"
   local who
@@ -15851,31 +17763,79 @@ _account_do_remove() {
     esac
   fi
 
+  # The question can stay on screen for as long as the user likes, and a session
+  # started meanwhile would be signed out by the delete below. Ask again now,
+  # over the boxes pinned now, before the lock (docker never runs under it).
+  _account_remove_live_gate "$acct" || return 1
+
+  # The prompt is over, so the lock can be held. Everything read before it is
+  # read again: another terminal may have pinned a box to this account, renamed
+  # it or removed it while the question was on screen.
+  if ! _account_lock; then
+    _account_busy_msg
+    return 1
+  fi
+  if ! _account_exists "$acct"; then
+    _account_unlock
+    error "No account named ${BOLD}${acct}${RESET}."
+    return 1
+  fi
+  pinned="$(_account_pinned_boxes "$acct")"
+
   # Harvest what every pinned box refreshed for itself BEFORE the store moves.
-  # Afterwards the store path is gone, so a sync-out from there would RECREATE
-  # the account directory and make `restore` refuse. A session ended by SIGHUP
-  # never ran the session-end harvest, so this is the last chance.
+  # Afterwards the store path is gone, so a harvest from there is declined
+  # (_account_write_cred never creates a store) and the refresh stays behind. A
+  # session ended by SIGHUP never ran the session-end harvest, so this is the
+  # last chance. The staged files are deleted below, so what the harvest does
+  # not take is held, and a login that cannot be kept stops the remove.
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
-    _account_sync_out "$b" || true
+    if ! _account_release_staged_locked "$b"; then
+      _account_unlock
+      error "Could not keep the login ${BOLD}${b}${RESET} holds for ${BOLD}${acct}${RESET}."
+      echo -e "    ${DIM}Nothing was removed. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+      return 1
+    fi
   done <<< "$pinned"
 
   local rc=0
   _account_trash "$acct" || rc=$?
   if [[ $rc -eq 2 ]]; then
+    _account_unlock
     error "Refusing to remove: the account trash is not a plain directory."
     echo -e "    ${DIM}Nothing was moved. Check ${CLEAT_ACCOUNTS_DIR}/.trash${RESET}"
     return 1
   fi
   if [[ $rc -ne 0 ]]; then
+    _account_unlock
     error "Could not remove ${BOLD}${acct}${RESET}."
     return 1
   fi
+  local unpinned="" key tab
+  tab="$(printf '\t')"
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
+    # Read BEFORE the pin file goes, because that is where the key lives. The
+    # edit itself asks docker, so it waits until the lock is released.
+    key="$(_box_account_key "$b" || true)"
+    unpinned="${unpinned}${b}${tab}${key}
+"
     _box_account_remove "$b"
     rm -f "$(_account_box_auth_dir "$b")/.credentials.json" 2>/dev/null || true
   done <<< "$pinned"
+  _account_unlock
+  # The pin moved, so the name each box carries is the removed account's, the
+  # same as after a switch back to the shared login. A detached box that is
+  # still running is never rebuilt, and on a host whose own ~/.claude.json has
+  # no oauthAccount even a restart keeps that name and the sibling scan hands
+  # it to boxes in other projects. A pin written before keys were recorded has
+  # no key, and that box is fixed by its next switch.
+  while IFS="$tab" read -r b key; do
+    [[ -n "$b" ]] || continue
+    if [[ -n "$key" ]]; then
+      _account_invalidate_identity_key "$key" "$b" || true
+    fi
+  done <<< "$unpinned"
   success "Removed ${BOLD}${acct}${RESET} ${DIM}(recoverable for ${_ACCOUNTS_TRASH_DAYS} days)${RESET}"
   return 0
 }
@@ -15887,14 +17847,176 @@ _account_do_restore() {
     echo -e "    ${DIM}Nothing was overwritten.${RESET}"
     return 1
   fi
-  if _account_restore "$acct"; then
+  local rc=0
+  _account_restore "$acct" || rc=$?
+  if [[ $rc -eq 0 ]]; then
     success "Restored ${BOLD}${acct}${RESET}"
     echo -e "    ${DIM}Pin a box to it with ${BOLD}cleat account ${acct}${RESET}"
     return 0
   fi
+  if [[ $rc -eq $_ACCOUNT_LOCK_BUSY ]]; then
+    _account_busy_msg
+    return 1
+  fi
   error "No removed account named ${BOLD}${acct}${RESET}."
   echo -e "    ${DIM}Trash: ${CLEAT_ACCOUNTS_DIR}/.trash${RESET}"
   return 1
+}
+
+# `cleat account adopt <id> <name>`: save a held login as an account, the one
+# command that recovers what a wipe, a switch or a remove set aside. The name
+# is always explicit. A new name creates that account. An existing one is an
+# exchange: the login the store had is held first (replaced-by-adopt), so adopt
+# never deletes a login either. The entry goes only after the write.
+#
+# A box pinned to the name still has the old login staged. That copy is usually
+# newer than the one adopted. Swapping only the store file let the next session
+# end, attach or `cleat account` write it straight back. The adopted login then
+# existed nowhere, because its entry was already gone. So every pinned box is
+# released first, the way a switch releases it: its refresh reaches the store
+# (and so the copy held as replaced-by-adopt) or it is held itself. Its staged
+# copy goes only after the write, so the next attach stages the adopted login.
+# The caller refuses a live session on any of those boxes before the lock.
+#
+# A login the server verified as one person is never saved over an account the
+# server verified as another. Both uuids are only ever written from its answer,
+# so two known and different ones are two accounts. The adopt refuses (4).
+# Replacing an account with a different person's login is `cleat account rm`
+# first, then the adopt. An entry or an account with no uuid proves nothing
+# either way and is the user's call.
+#
+# Returns 0 saved, 1 no usable entry or name, 2 a write failed, 3 a pinned box
+# holds a login that could not be kept (named in _ACCOUNT_ADOPT_BOX), 4 the
+# login belongs to a different account than the name, or _ACCOUNT_LOCK_BUSY.
+# Nothing is written or deleted on any status but 0.
+_ACCOUNT_ADOPT_REPLACED=""
+_ACCOUNT_ADOPT_BOX=""
+_account_adopt() { _account_with_lock _account_adopt_locked "$@"; }
+
+_account_adopt_locked() {
+  local id="$1" name="$2" entry cred store created=0 k v pinned="" b huuid auuid
+  _ACCOUNT_ADOPT_REPLACED=""
+  _ACCOUNT_ADOPT_BOX=""
+  _validate_account_name "$name" || return 1
+  entry="$(_account_held_entry "$id")" || return 1
+  cred="$entry/.credentials.json"
+  _account_cred_keepable "$cred" || return 1
+  huuid="$(_account_meta_get_at "$entry" uuid 2>/dev/null || true)"
+  if _account_exists "$name"; then
+    auuid="$(_account_meta_get "$name" uuid 2>/dev/null || true)"
+    if [[ -n "$huuid" && -n "$auuid" && "$huuid" != "$auuid" ]]; then
+      return 4
+    fi
+  fi
+  pinned="$(_account_pinned_boxes "$name")"
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    if ! _account_release_staged_locked "$b"; then
+      _ACCOUNT_ADOPT_BOX="$b"
+      return 3
+    fi
+  done <<< "$pinned"
+  if _account_exists "$name"; then
+    store="$(_account_cred_path "$name")"
+    [[ -L "$store" ]] && return 2
+    # Held under the identity it was saved with, which is about to be replaced.
+    if [[ -f "$store" ]] && _account_cred_plausible "$store"; then
+      _account_hold "$store" "$name" "" replaced-by-adopt \
+        "$(_account_meta_get "$name" uuid 2>/dev/null || true)" \
+        "$(_account_meta_get "$name" who 2>/dev/null || true)" \
+        "$(_account_meta_get "$name" org 2>/dev/null || true)" || return 2
+      _ACCOUNT_ADOPT_REPLACED="replaced"
+    fi
+  else
+    _account_ensure_dir "$name" || return 2
+    created=1
+  fi
+  if ! _account_write_cred "$name" "$cred"; then
+    if [[ $created -eq 1 ]]; then
+      rmdir "$(_account_dir "$name")" 2>/dev/null || true
+    fi
+    return 2
+  fi
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    rm -f "$(_account_box_auth_dir "$b")/.credentials.json" 2>/dev/null || true
+  done <<< "$pinned"
+  # The identity is the adopted login's when the server vouched for it (the
+  # entry carries a uuid). One the entry does not carry is then cleared, never
+  # left naming the login that was replaced. An entry nobody verified proves
+  # nothing about whose it is, so it leaves an existing account's identity as
+  # it was. Clearing it reopened the first-use harvest on an account that had
+  # already been verified: with no uuid to compare, a /login as someone else in
+  # a pinned box was written over the adopted login. A wrong-person adopt now
+  # costs a held entry at its first rotated harvest, never a login.
+  if [[ -n "$huuid" || $created -eq 1 ]]; then
+    for k in uuid who org; do
+      v="$(_account_meta_get_at "$entry" "$k" 2>/dev/null || true)"
+      if [[ -n "$v" || $created -eq 0 ]]; then
+        _account_meta_set "$name" "$k" "$v" || true
+      fi
+    done
+  fi
+  rm -rf "$entry" 2>/dev/null || true
+  return 0
+}
+
+_account_do_adopt() {
+  local id="$1" name="$2" existed=0 rc=0
+  if ! _account_held_id_ok "$id"; then
+    error "Not a held login id: ${BOLD}$(_sessions_safe_str "$id")${RESET}"
+    echo -e "    ${DIM}Run ${BOLD}cleat account held${RESET}${DIM} to see them.${RESET}"
+    return 1
+  fi
+  if ! _validate_account_name "$name"; then
+    error "Invalid account name: ${BOLD}$(_sessions_safe_str "$name")${RESET}"
+    echo -e "    ${DIM}Lowercase letters, digits, dash and underscore. Up to 31 characters, starting with a letter or a digit.${RESET}"
+    return 1
+  fi
+  _account_exists "$name" && existed=1
+  # A running session on a box pinned to the name would lose its staged login
+  # under it. Asked before the lock, because it asks docker.
+  _account_remove_live_gate "$name" || return 1
+  _account_adopt "$id" "$name" || rc=$?
+  case "$rc" in
+    0)
+      if [[ $existed -eq 1 ]]; then
+        success "Saved held login ${BOLD}${id}${RESET} into ${BOLD}${name}${RESET}"
+      else
+        success "Saved held login ${BOLD}${id}${RESET} as the new account ${BOLD}${name}${RESET}"
+      fi
+      if [[ -n "$_ACCOUNT_ADOPT_REPLACED" ]]; then
+        echo -e "    ${DIM}The login ${name} had is held now. See it with ${BOLD}cleat account held${RESET}${DIM}.${RESET}"
+      fi
+      echo -e "    ${DIM}Pin a box to it with ${BOLD}cleat account ${name}${RESET}"
+      return 0 ;;
+    "$_ACCOUNT_LOCK_BUSY")
+      _account_busy_msg
+      return 1 ;;
+    1)
+      error "No held login ${BOLD}${id}${RESET} that can be saved."
+      echo -e "    ${DIM}Run ${BOLD}cleat account held${RESET}${DIM} to see them.${RESET}"
+      return 1 ;;
+    3)
+      error "Could not keep the login ${BOLD}${_ACCOUNT_ADOPT_BOX}${RESET} holds for ${BOLD}${name}${RESET}."
+      echo -e "    ${DIM}Nothing was saved. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+      return 1 ;;
+    4)
+      local hwho awho
+      hwho="$(_account_meta_get_at "$(_account_held_dir)/$id" who 2>/dev/null || true)"
+      awho="$(_account_meta_get "$name" who 2>/dev/null || true)"
+      error "Held login ${BOLD}${id}${RESET} belongs to a different account than ${BOLD}${name}${RESET}."
+      if [[ -n "$hwho" && -n "$awho" ]]; then
+        echo -e "    ${DIM}Anthropic says it is $(_sessions_safe_str "$hwho"). ${name} is $(_sessions_safe_str "$awho").${RESET}"
+      fi
+      echo -e "    ${DIM}Nothing was saved. Save it under a new name with ${BOLD}cleat account adopt ${id} <new-name>${RESET}${DIM}.${RESET}"
+      echo -e "    ${DIM}To replace ${name} with it, remove ${name} first with ${BOLD}cleat account rm ${name}${RESET}${DIM}.${RESET}"
+      return 1 ;;
+    *)
+      error "Could not save held login ${BOLD}${id}${RESET} as ${BOLD}${name}${RESET}."
+      echo -e "    ${DIM}The held login is still there. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+      return 1 ;;
+  esac
 }
 
 # ── The picker ──────────────────────────────────────────────────────────────
@@ -15922,6 +18044,8 @@ _ACCT_STORED=0
 # site buys nothing over a value set once per list screen.
 _ACCT_VIEW="live"
 _ACCT_TRASH_N=0
+# How many held logins, for the counter line. Precomputed per list screen.
+_ACCT_HELD_N=0
 # header (4) + the frame's four non-row lines + one for the shell prompt.
 _ACCOUNTS_CHROME_LINES=9
 # 4 of marker, 13 of name, 10 of state and something left for an email.
@@ -16171,6 +18295,11 @@ _accounts_frame() {
   elif [[ "${_ACCT_TRASH_N:-0}" -gt 0 ]]; then
     count="→ trash (${_ACCT_TRASH_N})"
   fi
+  # Held logins have no view of their own, so the line names the command.
+  if [[ "$_ACCT_VIEW" != "trash" && "${_ACCT_HELD_N:-0}" -gt 0 ]]; then
+    if [[ -n "$count" ]]; then count="${count}   "; fi
+    count="${count}held (${_ACCT_HELD_N}): cleat account held"
+  fi
   [[ ${#count} -gt $droom ]] && count="${count:0:$(( droom - 1 ))}…"
   buf="${buf}    ${DIM}${count}${RESET}\033[K\n"
   buf="${buf}    ${DIM}${d1}${RESET}\033[K\n"
@@ -16349,6 +18478,7 @@ _accounts_picker_tui() {
 
     _ACCT_VIEW="$view"
     _ACCT_TRASH_N="$(_account_trash_count)"
+    _ACCT_HELD_N="$(_account_held_count)"
     if [[ "$view" == "trash" ]]; then
       _accounts_load_trash_rows
     else
@@ -16525,6 +18655,7 @@ _accounts_picker_text() {
     if [[ "$tn" -gt 0 ]]; then
       echo -e "    ${DIM}${tn} in the trash. See them with ${BOLD}cleat account trash${RESET}${DIM}.${RESET}"
     fi
+    _account_held_line "    "
     return 0
   fi
   echo ""
@@ -16546,6 +18677,7 @@ _accounts_picker_text() {
   if [[ "$tn" -gt 0 ]]; then
     echo -e "  ${DIM}${tn} in the trash. See them with ${BOLD}cleat account trash${RESET}${DIM}.${RESET}"
   fi
+  _account_held_line "  "
   if ! command -v jq &>/dev/null; then
     echo -e "  ${DIM}Usage figures need ${BOLD}jq${RESET}${DIM} on the host, which is not installed, so they are not shown.${RESET}"
   fi
@@ -16575,6 +18707,66 @@ _accounts_trash_text() {
   return 0
 }
 
+# The pointer every plain list prints when something is held. $1 is the indent.
+_account_held_line() {
+  local hn
+  hn="$(_account_held_count)"
+  case "$hn" in ''|*[!0-9]*) hn=0 ;; esac
+  if [[ "$hn" -eq 1 ]]; then
+    echo -e "${1}${DIM}1 held login. See it with ${BOLD}cleat account held${RESET}${DIM}.${RESET}"
+  elif [[ "$hn" -gt 1 ]]; then
+    echo -e "${1}${DIM}${hn} held logins. See them with ${BOLD}cleat account held${RESET}${DIM}.${RESET}"
+  fi
+  return 0
+}
+
+# `cleat account held`. Each row says where the login was headed, which box it
+# came from, why it was held and how to save it.
+_accounts_held_text() {
+  local stamp id acct box reason who now n=0 where why
+  now="${_CLEAT_NOW_S:-$(date +%s)}"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  while IFS="$(printf '\t')" read -r stamp id acct box reason who; do
+    [[ -n "$id" ]] || continue
+    if [[ $n -eq 0 ]]; then
+      echo ""
+      echo -e "  ${BOLD}Held logins${RESET} ${DIM}(kept ${_ACCOUNTS_TRASH_DAYS} days)${RESET}"
+      echo ""
+    fi
+    n=$(( n + 1 ))
+    if [[ "$box" != "-" && "$acct" != "-" ]]; then
+      where="from box $(_sessions_safe_str "$box"), for account $(_sessions_safe_str "$acct")"
+    elif [[ "$box" != "-" ]]; then
+      where="from box $(_sessions_safe_str "$box"), which was not pinned to an account"
+    else
+      where="from account $(_sessions_safe_str "$acct")"
+    fi
+    case "$reason" in
+      unsaved)           why="its account did not save it" ;;
+      left-in-box)       why="found in the box's runtime dir" ;;
+      other-account)     why="it belongs to another account" ;;
+      replaced-by-adopt) why="replaced by cleat account adopt" ;;
+      replaced-by-harvest) why="replaced by the first login Anthropic verified for its account" ;;
+      journal)           why="set aside during a switch" ;;
+      *)                 why="$(_sessions_safe_str "$reason")" ;;
+    esac
+    echo -e "   ${BOLD}${id}${RESET}  ${DIM}held $(_age_from_delta $(( now - stamp )))${RESET}"
+    echo -e "      ${DIM}${where}${RESET}"
+    echo -e "      ${DIM}${why}${RESET}"
+    if [[ "$who" != "-" ]]; then
+      echo -e "      ${DIM}$(_sessions_safe_str "$who")${RESET}"
+    fi
+  done < <(_account_held_scan)
+  if [[ $n -eq 0 ]]; then
+    info "No held logins."
+    echo -e "    ${DIM}A login a box had that no account saved is kept here instead of deleted, for ${_ACCOUNTS_TRASH_DAYS} days.${RESET}"
+    return 0
+  fi
+  echo ""
+  echo -e "  ${DIM}Save one with ${BOLD}cleat account adopt <id> <name>${RESET}${DIM}. A new name creates that account.${RESET}"
+  return 0
+}
+
 # Refresh what the list can honestly show, for every account whose own access
 # token is still alive. Cheap in practice: the throttle and the liveness gate
 # make it a no-op for a parked account, which is most of them, and the parked
@@ -16591,7 +18783,7 @@ _accounts_refresh_usage() {
   return 0
 }
 
-# `cleat account [list|rename|rm|restore] [<name>] [box] [flags]`
+# `cleat account [list|rename|rm|restore|trash|held|adopt] [<name>] [box] [flags]`
 #
 # The subcommand word is reserved FIRST, then flags, then the name, and only
 # what is left goes to _set_box. `cmd_fork` carries the scar that made this the
@@ -16609,12 +18801,16 @@ cmd_account() {
       echo "       cleat account rm <name> [--yes]  Move it to the trash"
       echo "       cleat account restore <name>     Bring a removed one back"
       echo "       cleat account trash              List removed accounts"
+      echo "       cleat account held               List logins kept aside instead of deleted"
+      echo "       cleat account adopt <id> <name>  Save a held login as an account"
       return 0 ;;
     list)            sub="list"; shift ;;
     rename)          sub="rename"; shift ;;
     rm|delete)       sub="rm"; shift ;;
     restore)         sub="restore"; shift ;;
     trash)           sub="trash"; shift ;;
+    held)            sub="held"; shift ;;
+    adopt)           sub="adopt"; shift ;;
   esac
 
   local rest=()
@@ -16635,6 +18831,19 @@ cmd_account() {
       newname="${rest[1]:-}"
       if [[ -z "$name" || -z "$newname" ]]; then
         error "Which one, and to what? ${DIM}cleat account rename <old> <new>${RESET}"
+        return 1
+      fi
+      rest=("${rest[@]:2}") ;;
+    adopt)
+      name="${rest[0]:-}"
+      newname="${rest[1]:-}"
+      if [[ -z "$name" ]]; then
+        error "Which one? ${DIM}cleat account adopt <id> <name>${RESET}"
+        echo -e "    ${DIM}Run ${BOLD}cleat account held${RESET}${DIM} to see them.${RESET}"
+        return 1
+      fi
+      if [[ -z "$newname" ]]; then
+        error "Save it as which account? ${DIM}cleat account adopt <id> <name>${RESET}"
         return 1
       fi
       rest=("${rest[@]:2}") ;;
@@ -16663,8 +18872,15 @@ cmd_account() {
   # Housekeeping on every run, so the trash cannot grow without bound.
   _account_trash_sweep
   # And harvest anything the box refreshed for itself, before this run reads or
-  # writes a single stored credential.
-  _account_sync_out "$cname" || true
+  # writes a single stored credential. A lock that cannot be had stops every
+  # verb that changes something, rather than letting it wait a second time.
+  # The three read-only views still draw.
+  local _harvest=0
+  _account_sync_out "$cname" || _harvest=$?
+  if [[ $_harvest -eq $_ACCOUNT_LOCK_BUSY && "$sub" != "list" && "$sub" != "trash" && "$sub" != "held" ]]; then
+    _account_busy_msg
+    return 1
+  fi
 
   case "$sub" in
     rename)  _account_do_rename "$name" "$newname"; return $? ;;
@@ -16672,6 +18888,8 @@ cmd_account() {
     restore) _account_do_restore "$name"; return $? ;;
     list)    _accounts_refresh_usage; _accounts_picker_text "$_BOX" "$cname"; return 0 ;;
     trash)   _accounts_trash_text; return 0 ;;
+    held)    _accounts_held_text; return 0 ;;
+    adopt)   _account_do_adopt "$name" "$newname"; return $? ;;
   esac
 
   if [[ -n "$name" ]]; then
@@ -18829,7 +21047,7 @@ _kit_apply() {
   fi
 
   success "Kit ${BOLD}${kit}${RESET} enabled for box ${BOLD}${box}${RESET}."
-  if container_exists "$cname" && _box_has_live_agent "$cname"; then
+  if container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
     echo -e "    ${DIM}A session is live in this box. The kit applies from the next session.${RESET}"
   else
     echo -e "    ${DIM}Takes effect next session: ${BOLD}cleat${RESET}"

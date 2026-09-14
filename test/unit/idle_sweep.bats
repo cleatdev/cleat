@@ -5,12 +5,14 @@
 # running, still reserving its memory ceiling. A day of closed-terminal boxes
 # can over-commit the Docker VM. The sweep stops boxes that are PROVABLY safe to
 # stop, on every interactive start, and NEVER a box that is working unattended
-# (the "leave it running, walk away" promise): the liveness gate (no claude/node
+# (the "leave it running, walk away" promise): the liveness gate (no Claude
 # process) can only be false AFTER the terminal closed and claude exited.
 #
 # Safety design under test:
-#   - _box_has_live_agent: a claude/node process => skip (attached OR working).
-#       Fails SAFE: unreadable/empty `docker top` is treated as "live".
+#   - _box_has_live_agent: a Claude process (judged by its executable, never a
+#       substring, so a leftover node dev server is not one) => skip (attached
+#       OR working). Fails SAFE: unreadable/empty `docker top`, or one with no
+#       command column, is treated as "live".
 #   - grace window: only boxes idle past the window are eligible; unknown age
 #       (mtime 0) is skipped (never stop on an unknown clock).
 #   - self exclusion: never stops the box being launched.
@@ -29,7 +31,7 @@ teardown() { _common_teardown; }
 
 # ── _box_has_live_agent ──────────────────────────────────────────────────────
 
-@test "live_agent: TRUE when a claude/node process is in docker top" {
+@test "live_agent: TRUE when a claude process is in docker top" {
   docker() { [[ "$1" == "top" ]] && printf 'UID PID CMD\n501 1 bash\n501 2 node /home/coder/.local/share/claude/versions/2.1.195/cli.js\n'; return 0; }
   run _box_has_live_agent some-box
   assert_success
@@ -39,6 +41,89 @@ teardown() { _common_teardown; }
   docker() { [[ "$1" == "top" ]] && printf 'UID PID CMD\nroot 1 /sbin/docker-init -- /entrypoint.sh bash\nroot 2 su -s /bin/bash coder -c bash\n501 3 bash\n'; return 0; }
   run _box_has_live_agent some-box
   assert_failure
+}
+
+# Every shape a running Claude really takes must keep reading live. The first is
+# copied from /proc on a box running Claude Code 2.1.270 under exec_claude. The
+# daemon row is how Claude runs its background-agent daemon (process.execPath,
+# the versioned binary). The node rows are an npm install, shebang flags first.
+@test "live_agent: TRUE for every process shape a running Claude takes" {
+  local cmd
+  for cmd in \
+    'claude --dangerously-skip-permissions --continue' \
+    '/home/coder/.local/bin/claude -p summarise' \
+    '/home/coder/.local/share/claude/versions/2.1.270 daemon run --origin transient' \
+    'node --no-warnings --enable-source-maps /usr/local/bin/claude' \
+    '/usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js'; do
+    docker() { [[ "$1" == "top" ]] && printf 'UID PID PPID C STIME TTY TIME CMD\n501 1 0 0 09:14 ? 00:00:00 /sbin/docker-init -- /entrypoint.sh bash\n501 7 1 0 09:15 pts/0 00:00:03 %s\n' "$cmd"; return 0; }
+    run _box_has_live_agent some-box
+    assert_success
+  done
+}
+
+# The handoff this primitive has to serve stops claude and relaunches it from
+# the same session wrapper, whose `bash -c` script text names claude. Reading
+# that wrapper as Claude would make "Claude is gone" unprovable.
+@test "live_agent: FALSE once claude exited, even with cleat's session wrapper still up" {
+  docker() { [[ "$1" == "top" ]] && printf '%s\n' 'UID PID PPID C STIME TTY TIME CMD' \
+    '501 1 0 0 09:14 ? 00:00:00 /sbin/docker-init -- /entrypoint.sh bash' \
+    '501 9 0 0 09:15 pts/0 00:00:00 runuser -u coder -- bash -c ?      clip-daemon &?      claude "$@"?      _CLAUDE_RC=$?? _ --dangerously-skip-permissions' \
+    '501 10 9 0 09:15 pts/0 00:00:00 bash -c ?      clip-daemon &?      claude "$@"?      _CLAUDE_RC=$?? _ --dangerously-skip-permissions' \
+    '501 11 10 0 09:15 pts/0 00:00:00 /bin/bash /usr/local/bin/clip-daemon' \
+    '501 12 1 0 09:15 ? 00:00:00 [claude] <defunct>'; return 0; }
+  run _box_has_live_agent some-box
+  assert_failure
+}
+
+@test "live_agent: reads the COMMAND column of a busybox ps layout" {
+  docker() { [[ "$1" == "top" ]] && printf 'PID   USER     TIME  COMMAND\n    1 root      0:00 /sbin/docker-init -- /entrypoint.sh bash\n    7 501       0:04 node /workspace/node_modules/.bin/vite --host\n'; return 0; }
+  run _box_has_live_agent some-box
+  assert_failure
+  docker() { [[ "$1" == "top" ]] && printf 'PID   USER     TIME  COMMAND\n    1 root      0:00 /sbin/docker-init -- /entrypoint.sh bash\n    8 501       0:09 claude -p summarise\n'; return 0; }
+  run _box_has_live_agent some-box
+  assert_success
+}
+
+# Ragged and hostile rows. The bare `node` REPL is the bash 3.2 trap (a `for w
+# in "$@"` over no arguments reads as unbound under set -u). The short row, the
+# blank line and the tab-separated row are what a ps layout can hand back. The
+# lookalikes are a third-party CLI whose name starts with claude and a script
+# named claude.js, neither of which is Claude Code.
+@test "live_agent: FALSE for ragged rows, a bare node REPL and a claude lookalike" {
+  docker() { [[ "$1" == "top" ]] && printf '%s\n' \
+    'UID PID PPID C STIME TTY TIME CMD' \
+    '501 1 0 0 09:14 ? 00:00:00 /sbin/docker-init -- /entrypoint.sh bash' \
+    '501 2' \
+    '' \
+    '501 3 0 0 09:14 ? 00:00:00 node' \
+    '501 4 0 0 09:14 ? 00:00:00 node -e require("claude")' \
+    '501 5 0 0 09:14 ? 00:00:00 node --max-old-space-size=4096 dist/server.js' \
+    '501 6 0 0 09:14 ? 00:00:00 claude-monitor --watch' \
+    '501 7 0 0 09:14 ? 00:00:00 /opt/tools/claude.js --serve' \
+    '501 8 0 0 09:14 ? 00:00:00 [claude] <defunct>'; return 0; }
+  run _box_has_live_agent some-box
+  assert_failure
+}
+
+# The positive control for the row above: the SAME ragged table with one real
+# Claude appended must read live, so the test above proves narrowness and not
+# that the reader gave up on a ragged table.
+@test "live_agent: TRUE when a real claude sits below ragged rows" {
+  docker() { [[ "$1" == "top" ]] && printf '%s\n' \
+    'UID PID PPID C STIME TTY TIME CMD' \
+    '501 2' \
+    '' \
+    '501 3 0 0 09:14 ? 00:00:00 node' \
+    '501 6 0 0 09:14 ? 00:00:00 claude-monitor --watch' \
+    '501 9 0 0 09:15 pts/0 00:00:09 claude --dangerously-skip-permissions'; return 0; }
+  run _box_has_live_agent some-box
+  assert_success
+}
+
+@test "live_agent: SAFE (assumes live) when docker top has no command column" {
+  docker() { [[ "$1" == "top" ]] && printf 'PROCESS LIST\nnode /workspace/node_modules/.bin/vite --host\n'; return 0; }
+  run _box_has_live_agent some-box
+  assert_success
 }
 
 @test "live_agent: SAFE (assumes live) when docker top is unreadable" {

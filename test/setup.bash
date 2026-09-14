@@ -285,6 +285,16 @@ source_cli() {
   # body: host-local as `return 1` (the docker-cap socket tests), VM as `return 0`.
 }
 
+# A host with no jq. A function override is the reliable mocking level here
+# (testing rule 5): PATH surgery cannot hide jq from `command -v` without
+# rebuilding a minimal PATH that cmd_run would then be missing half of.
+_hide_jq() {
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "jq" ]; then return 1; fi
+    builtin command "$@"
+  }
+}
+
 # Enable the docker stub by prepending MOCK_BIN to PATH
 use_docker_stub() {
   export PATH="$MOCK_BIN:$PATH"
@@ -323,6 +333,12 @@ mock_docker_images() {
 
 mock_docker_inspect() {
   printf '%s\n' "$1" > "$DOCKER_MOCK_DIR/inspect_output"
+}
+
+# The `docker top` process table, header row first. With no file the stub prints
+# nothing, which _box_has_live_agent reads as "live" (its fail-safe).
+mock_docker_top() {
+  printf '%s\n' "$@" > "$DOCKER_MOCK_DIR/top_output"
 }
 
 # Register an image ref as "cached locally" so `docker image inspect <ref>`

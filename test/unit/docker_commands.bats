@@ -694,7 +694,7 @@ EOF
   assert_output --partial "not running"
 }
 
-@test "login: runs claude login as coder with full PATH" {
+@test "login: execs claude as coder with full PATH" {
   mkdir -p "$TEST_TEMP/project"
   local cname
   cname="$(container_name_for "$TEST_TEMP/project")"
@@ -702,11 +702,10 @@ EOF
 
   run cmd_login "$TEST_TEMP/project"
   assert_success
-  # v0.13.1: must wait for the UID remap before exec, so `claude login` never
-  # runs as the stale image uid and writes auth that the real uid can't own.
+  # v0.13.1: must wait for the UID remap before exec, so the login never runs
+  # as the stale image uid and writes auth that the real uid can't own. The
+  # exact subcommand is pinned by the v1.4.3 regression test.
   run assert_docker_exec_has "id -u coder"
-  assert_success
-  run assert_docker_exec_has "claude login"
   assert_success
   run assert_docker_exec_has "runuser -u coder"
   assert_success

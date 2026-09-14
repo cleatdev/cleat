@@ -101,6 +101,27 @@ cleat_bin_at() {
     "$bin" "$@"
 }
 
+# A PATH with every command except jq, for the real binary.
+#
+# The sourced tests hide jq with a `command` override, which a subprocess never
+# sees, and dropping the directory jq lives in would take the coreutils beside
+# it. So each PATH directory is mirrored as symlinks into one directory and the
+# jq link is dropped. Prints the mirror, or nothing when it could not be built.
+_smoke_nojq_path() {
+  local farm="$TEST_TEMP/nojq-bin" d oldifs="$IFS"
+  mkdir -p "$farm" || return 1
+  IFS=:
+  set -- $PATH
+  IFS="$oldifs"
+  for d in "$@"; do
+    [ -d "$d" ] || continue
+    ln -s "$d"/* "$farm"/ 2>/dev/null || true
+  done
+  rm -f "$farm/jq"
+  [ -x "$farm/sed" ] && [ ! -e "$farm/jq" ] || return 1
+  printf '%s' "$farm"
+}
+
 # ── Help and version ────────────────────────────────────────────────────────
 
 @test "smoke: cleat --help exits 0 under strict mode" {
@@ -377,6 +398,22 @@ STUB
   assert_output --partial "not running"
 }
 
+@test "smoke: cleat clean with the daemon down removes no box state and says so" {
+  # Every prune asks docker whether a box still exists, and a down daemon
+  # answers no for every box.
+  export DOCKER_EXIT_CODE=1
+  mkdir -p "$CLEAT_CONFIG_DIR/run/cleat-live-aaaa1111/settings" "$CLEAT_CONFIG_DIR/boxes"
+  printf 'a box that still exists\n' > "$CLEAT_CONFIG_DIR/boxes/cleat-live-aaaa1111"
+  run cleat_bin clean
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "Docker is not running"
+  run test -d "$CLEAT_CONFIG_DIR/run/cleat-live-aaaa1111/settings"
+  assert_success
+  run test -f "$CLEAT_CONFIG_DIR/boxes/cleat-live-aaaa1111"
+  assert_success
+}
+
 @test "smoke: cleat session with no sessions exits cleanly and says where it looked" {
   run cleat_bin_timeout 10 session
   assert_success
@@ -552,6 +589,85 @@ STUB
   assert_failure
 }
 
+@test "smoke: cleat account switch drops a stored identity under strict mode" {
+  # Strict-mode cover for the rc-3 plumbing: without the `local _id_rc=0` in
+  # each branch, the real binary dies with "_id_rc: unbound variable".
+  command -v jq >/dev/null || skip "needs jq"
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  local project key f
+  project="$(cli_call resolve_project "$TEST_TEMP/proj")"
+  key="$(cli_call _derive_project_session_key "$project" main)"
+  f="$CLEAT_CONFIG_DIR/projects/$key/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"x@example.com"},"userID":"abc"}\n' > "$f"
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 15 account work
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "is now on account"
+  run jq -r '.oauthAccount // "absent"' "$f"
+  assert_output "absent"
+  run jq -r '.userID' "$f"
+  assert_output "abc"
+}
+
+@test "smoke: cleat account switch on a host with no jq flags the box for the next launch" {
+  # The jq-less half of the identity drop. With the box down it cannot edit the
+  # file at all, so it leaves a flag next to it and the next launch clears it
+  # through the box own jq. All of that runs under set -euo pipefail here,
+  # which is where the sourced tests are blind.
+  command -v jq >/dev/null || skip "needs jq on the host to hide it from the binary"
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  local project key f nojq
+  project="$(cli_call resolve_project "$TEST_TEMP/proj")"
+  key="$(cli_call _derive_project_session_key "$project" main)"
+  f="$CLEAT_CONFIG_DIR/projects/$key/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"x@example.com"},"userID":"abc"}\n' > "$f"
+  nojq="$(_smoke_nojq_path)" || skip "could not mirror PATH without jq"
+  # The mirror goes to the BINARY only. Putting it on this shell PATH would
+  # leave bats running commands out of a directory the teardown deletes.
+  run _portable_timeout 15 env \
+    PATH="$MOCK_BIN:$nojq" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE="${DOCKER_EXIT_CODE:-0}" \
+    DOCKER_STUB_DAEMON_DOWN=1 \
+    "$CLI" account work
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "is now on account"
+  [ -e "${f}.identity-stale" ] || { echo "no flag was left for the next launch"; return 1; }
+  # Nothing was written into the file itself: a hand-rolled JSON edit is what
+  # the box own jq exists to avoid.
+  run jq -r '.oauthAccount.emailAddress' "$f"
+  assert_output "x@example.com"
+}
+
+@test "smoke: cleat account rm unpins a box and drops the name it carried" {
+  # The remove reaches the file through the key the pin carries, so this runs
+  # the whole pin-write, key-read and in-place edit under set -euo pipefail.
+  command -v jq >/dev/null || skip "needs jq"
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  run cleat_bin_timeout 15 account work
+  assert_success
+  local project key f
+  project="$(cli_call resolve_project "$TEST_TEMP/proj")"
+  key="$(cli_call _derive_project_session_key "$project" main)"
+  f="$CLEAT_CONFIG_DIR/projects/$key/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"work@example.com"},"userID":"abc"}\n' > "$f"
+  run cleat_bin_timeout 15 account rm work --yes
+  assert_success
+  refute_output --partial "unbound variable"
+  run jq -r '.oauthAccount // "absent"' "$f"
+  assert_output "absent"
+}
+
 @test "smoke: cleat account rm with no name asks which one" {
   run cleat_bin_timeout 10 account rm
   assert_failure
@@ -561,6 +677,278 @@ STUB
 @test "smoke: cleat account refuses a stray positional like every box-aware verb" {
   run cleat_bin_timeout 10 account work main extra
   assert_failure
+}
+
+@test "smoke: cleat account takes over a lock a dead command left, then switches and renames under strict mode" {
+  # The lock, its steal, the read-once snapshot, the harvest and the staging all
+  # run under set -euo pipefail here. The sourced unit tests strip strict mode.
+  local accts="$CLEAT_CONFIG_DIR/accounts" pins="$CLEAT_CONFIG_DIR/box-accounts"
+  mkdir -p "$accts/old" "$accts/.lock"
+  chmod 700 "$accts" "$accts/old"
+  # Expired, so the usage poll stays offline.
+  printf '{"claudeAiOauth":{"accessToken":"at-O1","refreshToken":"rt-O","expiresAt":1000,"subscriptionType":"max"}}\n' > "$accts/old/.credentials.json"
+  printf 'host %s pid 2147483646 at %s\n' "${HOSTNAME:-unknown}" "$(date +%s)" > "$accts/.lock/owner"
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 15 account old
+  assert_success
+  refute_output --partial "unbound variable"
+  run grep -rl "at-O1" "$CLEAT_CONFIG_DIR/run"
+  assert_success
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 15 account new
+  assert_success
+  refute_output --partial "unbound variable"
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 15 account rename old older
+  assert_success
+  refute_output --partial "unbound variable"
+  # Two lines now: the account, then the box's per-project key, which is how a
+  # remove finds the claude.json of a box in another project.
+  run cat "$pins"/*
+  assert_line --index 0 "new"
+  assert_line --index 1 --regexp '^[a-z0-9_-]+$'
+  run test -e "$accts/.lock"
+  assert_failure
+  run test -d "$accts/older"
+  assert_success
+}
+
+@test "smoke: cleat account default keeps a staged login its account does not have" {
+  # The release, the snapshot, the hold and its notice run under set -euo
+  # pipefail here. The staged login is a different one and not newer, which the
+  # harvest declines.
+  local accts="$CLEAT_CONFIG_DIR/accounts" pins="$CLEAT_CONFIG_DIR/box-accounts" f cn="" staged
+  run cleat_bin_timeout 15 account work
+  assert_success
+  for f in "$pins"/*; do cn="${f##*/}"; done
+  run test -n "$cn"
+  assert_success
+  # Expired both, so nothing reaches the network.
+  printf '{"claudeAiOauth":{"accessToken":"at-W1","refreshToken":"rt-W","expiresAt":2000,"subscriptionType":"max"}}\n' > "$accts/work/.credentials.json"
+  staged="$CLEAT_CONFIG_DIR/run/$cn/auth/.credentials.json"
+  mkdir -p "${staged%/*}"
+  printf '{"claudeAiOauth":{"accessToken":"at-B0","refreshToken":"rt-boxlogin","expiresAt":1000,"subscriptionType":"max"}}\n' > "$staged"
+  run cleat_bin_timeout 15 account default
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Kept a login from"
+  run test -e "$staged"
+  assert_failure
+  run grep -rl "rt-boxlogin" "$accts/.held"
+  assert_success
+  # Listed, then saved under a new name, in strict mode too.
+  local d id=""
+  for d in "$accts/.held"/*; do id="${d##*/}"; done
+  run cleat_bin_timeout 15 account held
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "$id"
+  # Saved into the account the box is pinned to again. The box's staged copy of
+  # the old login is released and dropped. The old login is held.
+  run cleat_bin_timeout 15 account work
+  assert_success
+  run grep -c "rt-W" "$staged"
+  assert_output "1"
+  run cleat_bin_timeout 15 account adopt "$id" work
+  assert_success
+  refute_output --partial "unbound variable"
+  run grep -c "rt-boxlogin" "$accts/work/.credentials.json"
+  assert_output "1"
+  run test -e "$staged"
+  assert_failure
+  # And the login it replaced, saved under a new name.
+  id=""
+  for d in "$accts/.held"/*; do id="${d##*/}"; done
+  run cleat_bin_timeout 15 account adopt "$id" saved
+  assert_success
+  refute_output --partial "unbound variable"
+  run grep -c "rt-W" "$accts/saved/.credentials.json"
+  assert_output "1"
+}
+
+@test "smoke: cleat account moves a box between two named logins under strict mode" {
+  # The forced staging, the key-scoped merge (the awk splitter) and the harvest's
+  # projection into the store run under set -euo pipefail here. Both logins are
+  # expired, so the usage poll stays offline.
+  local accts="$CLEAT_CONFIG_DIR/accounts" pins="$CLEAT_CONFIG_DIR/box-accounts" a f cn="" staged
+  mkdir -p "$accts"
+  chmod 700 "$accts"
+  for a in old new; do
+    mkdir -p "$accts/$a"
+    chmod 700 "$accts/$a"
+    printf '{"claudeAiOauth":{"accessToken":"at-%s","refreshToken":"%s-rt","expiresAt":1000,"subscriptionType":"max"}}\n' \
+      "$a" "$a" > "$accts/$a/.credentials.json"
+  done
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 15 account old
+  assert_success
+  refute_output --partial "unbound variable"
+  for f in "$pins"/*; do cn="${f##*/}"; done
+  run test -n "$cn"
+  assert_success
+  staged="$CLEAT_CONFIG_DIR/run/$cn/auth/.credentials.json"
+  # The box refreshed its login and signed into an MCP server of its own.
+  printf '{"mcpOAuth":{"s|1":{"accessToken":"MCP-box","expiresAt":1500}},"claudeAiOauth":{"accessToken":"at-old2","refreshToken":"old-rt","expiresAt":2000,"subscriptionType":"max"}}\n' \
+    > "$staged"
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 15 account new
+  assert_success
+  refute_output --partial "unbound variable"
+  run cat "$staged"
+  assert_output --partial "new-rt"
+  assert_output --partial "MCP-box"
+  refute_output --partial "old-rt"
+  run cat "$accts/old/.credentials.json"
+  assert_output --partial "at-old2"
+  refute_output --partial "MCP-box"
+}
+
+@test "smoke: cleat account held runs with nothing held" {
+  run cleat_bin_timeout 10 account held
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "No held logins"
+}
+
+@test "smoke: cleat account adopt with no id asks which one" {
+  run cleat_bin_timeout 10 account adopt
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "Which one"
+}
+
+# The renderer and the save, on the real binary. Both walk the held tree and
+# the save then removes the entry it took, all of it under set -euo pipefail.
+_smoke_plant_held() {
+  local hdir="$CLEAT_CONFIG_DIR/accounts/.held" entry
+  mkdir -p "$hdir"
+  chmod 700 "$CLEAT_CONFIG_DIR/accounts" "$hdir"
+  entry="$(mktemp -d "$hdir/$(date +%s)-XXXXXX")"
+  chmod 700 "$entry"
+  # Expired, so no path here reaches the network.
+  printf '{"claudeAiOauth":{"accessToken":"at-H1","refreshToken":"rt-held","expiresAt":1000,"subscriptionType":"max"}}\n' \
+    > "$entry/.credentials.json"
+  chmod 600 "$entry/.credentials.json"
+  printf 'acct\twork\nbox\tcleat-smoke-abcdef12\nreason\tunsaved\nuuid\t\nwho\theld@example.com\norg\t\n' \
+    > "$entry/meta"
+  chmod 600 "$entry/meta"
+  HELD_ID="${entry##*/}"
+}
+
+@test "smoke: cleat account held describes a held login" {
+  local HELD_ID=""
+  _smoke_plant_held
+  run cleat_bin_timeout 10 account held
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "$HELD_ID"
+  assert_output --partial "its account did not save it"
+  assert_output --partial "held@example.com"
+  assert_output --partial "cleat account adopt"
+}
+
+@test "smoke: cleat account adopt saves a held login as a new account" {
+  local HELD_ID="" store mode
+  _smoke_plant_held
+  store="$CLEAT_CONFIG_DIR/accounts/saved/.credentials.json"
+  run cleat_bin_timeout 15 account adopt "$HELD_ID" saved
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Saved held login"
+  assert_output --partial "saved"
+  run grep -c "rt-held" "$store"
+  assert_output "1"
+  mode="$(stat -c '%a' "$store" 2>/dev/null || stat -f '%Lp' "$store")"
+  assert_equal "$mode" "600"
+  # The entry it took is gone, and the list says so.
+  run test -e "$CLEAT_CONFIG_DIR/accounts/.held/$HELD_ID"
+  assert_failure
+  run cleat_bin_timeout 10 account held
+  assert_success
+  assert_output --partial "No held logins"
+  run cleat_bin_timeout 10 account list
+  assert_success
+  assert_output --partial "saved"
+}
+
+@test "smoke: cleat account holds a newer login the server says is another account's" {
+  # The identity check (the scoped readers, the profile request through curl's
+  # stdin config, the status line, the parse and the hold) runs under set -euo
+  # pipefail here. curl is a stub on PATH that answers for another account.
+  local accts="$CLEAT_CONFIG_DIR/accounts" pins="$CLEAT_CONFIG_DIR/box-accounts" f cn="" staged now d id=""
+  run cleat_bin_timeout 15 account work
+  assert_success
+  for f in "$pins"/*; do cn="${f##*/}"; done
+  run test -n "$cn"
+  assert_success
+  now="$(date +%s)"
+  # The store's token has expired, so the list's usage poll stays offline.
+  printf '{"claudeAiOauth":{"accessToken":"at-W1","refreshToken":"rt-W","expiresAt":%s,"subscriptionType":"max"}}\n' \
+    "$(( (now - 60) * 1000 ))" > "$accts/work/.credentials.json"
+  printf 'uuid\t11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa\nwho\twork@example.com\n' > "$accts/work/meta"
+  staged="$CLEAT_CONFIG_DIR/run/$cn/auth/.credentials.json"
+  mkdir -p "${staged%/*}"
+  printf '{"claudeAiOauth":{"accessToken":"at-B1","refreshToken":"rt-B","expiresAt":%s,"subscriptionType":"max"}}\n' \
+    "$(( (now + 3600) * 1000 ))" > "$staged"
+  mkdir -p "$TEST_TEMP/curlbin"
+  cat > "$TEST_TEMP/curlbin/curl" <<'CURL'
+#!/bin/sh
+cat > "${0%/*}/stdin"
+printf '{\n  "account": {"uuid": "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "email": "other@example.com"},\n  "organization": {"uuid": "org-2", "name": "Other Org", "cc_onboarding_flags": {}}\n}\n200'
+CURL
+  chmod +x "$TEST_TEMP/curlbin/curl"
+  PATH="$TEST_TEMP/curlbin:$PATH" run cleat_bin_timeout 20 account list
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "1 held login"
+  run cat "$TEST_TEMP/curlbin/stdin"
+  assert_output --partial "api/oauth/profile"
+  run grep -c "rt-W" "$accts/work/.credentials.json"
+  assert_output "1"
+  for d in "$accts/.held"/*; do id="${d##*/}"; done
+  run grep -c "rt-B" "$accts/.held/$id/.credentials.json"
+  assert_output "1"
+  run cleat_bin_timeout 15 account held
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "other@example.com"
+}
+
+# The live gate reads `docker top` through the array-and-slice column reader,
+# which only the real binary runs under `set -u`. A bare `${f[@]}` there would
+# die with "unbound variable" on the first blank row.
+@test "smoke: cleat account switches a box whose only leftover is a dev server" {
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  local project cn
+  project="$(cli_call resolve_project "$TEST_TEMP/proj")"
+  cn="$(_compute_cname "$project")"
+  mock_docker_ps "$cn"
+  mock_docker_ps_a "$cn"
+  mock_docker_inspect "/home/coder/.cleat-auth"
+  mock_docker_top \
+    'UID    PID   PPID  C  STIME  TTY  TIME      CMD' \
+    'root   1     0     0  09:14  ?    00:00:00  /sbin/docker-init -- /entrypoint.sh bash' \
+    '' \
+    'claude 91    1     0  09:40  ?    00:00:04  node /workspace/node_modules/.bin/vite --host'
+  run cleat_bin_timeout 15 account work
+  assert_success
+  refute_output --partial "unbound variable"
+  refute_output --partial "live Claude session"
+  assert_output --partial "is now on account"
+}
+
+@test "smoke: cleat account refuses a box with a real Claude in it" {
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  local project cn
+  project="$(cli_call resolve_project "$TEST_TEMP/proj")"
+  cn="$(_compute_cname "$project")"
+  mock_docker_ps "$cn"
+  mock_docker_ps_a "$cn"
+  mock_docker_inspect "/home/coder/.cleat-auth"
+  mock_docker_top \
+    'UID    PID   PPID  C  STIME  TTY   TIME      CMD' \
+    'claude 91    1     0  09:40  pts/0 00:00:09  claude --dangerously-skip-permissions --continue'
+  run cleat_bin_timeout 15 account work
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "has a live Claude session"
 }
 
 @test "smoke: cleat account appears in help" {
@@ -2227,4 +2615,55 @@ WRAP
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
   refute_output --partial "syntax error"
+}
+
+@test "smoke: cleat login on a pinned box harvests the new login under strict mode" {
+  # The pin read, the store override, the staging, the exec and the harvest all
+  # run under set -euo pipefail here. Store and staged share a refreshToken (the
+  # same grant, refreshed), so the harvest never reaches the network.
+  mkdir -p "$TEST_TEMP/project"
+  local cname now_ms
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf '%s\n' "/home/coder/.cleat-auth" > "$DOCKER_MOCK_DIR/inspect_output"
+  now_ms=$(( $(date +%s) * 1000 ))
+  mkdir -p "$CLEAT_CONFIG_DIR/box-accounts" "$CLEAT_CONFIG_DIR/accounts/work" \
+    "$CLEAT_CONFIG_DIR/run/$cname/auth"
+  printf 'work\n' > "$CLEAT_CONFIG_DIR/box-accounts/$cname"
+  printf '{"claudeAiOauth":{"accessToken":"a-old","refreshToken":"r-same","expiresAt":%s,"subscriptionType":"max"}}\n' \
+    "$(( now_ms + 3600000 ))" > "$CLEAT_CONFIG_DIR/accounts/work/.credentials.json"
+  # What `claude auth login` leaves in the relocated store: a newer credential.
+  printf '{"claudeAiOauth":{"accessToken":"a-new","refreshToken":"r-same","expiresAt":%s,"subscriptionType":"max"}}\n' \
+    "$(( now_ms + 28800000 ))" > "$CLEAT_CONFIG_DIR/run/$cname/auth/.credentials.json"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 20 login
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Auth saved to account"
+  run grep -c "a-new" "$CLEAT_CONFIG_DIR/accounts/work/.credentials.json"
+  assert_output "1"
+}
+
+@test "smoke: cleat resume names a saved conversation and its 1M model under strict mode" {
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  local cname key sdir id="11111111-1111-4111-8111-111111111111"
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  key="${cname#cleat-}"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  sdir="$HOME/.claude/projects/$key"
+  mkdir -p "$sdir"
+  printf '%s\n' \
+    '{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hi"},"entrypoint":"cli","sessionId":"'"$id"'"}' \
+    '{"parentUuid":"u1","isSidechain":false,"message":{"id":"m1","type":"message","role":"assistant","model":"claude-opus-5","content":[]},"type":"assistant","sessionId":"'"$id"'"}' \
+    '{"type":"cost-state","sessionId":"'"$id"'","modelUsage":{"claude-opus-5[1m]":{"inputTokens":12}}}' > "$sdir/$id.jsonl"
+
+  run cleat_bin_timeout 10 resume
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  run grep -F -- "--resume $id --model claude-opus-5[1m]" "$DOCKER_CALLS"
+  assert_success
 }

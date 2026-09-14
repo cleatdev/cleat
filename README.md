@@ -126,7 +126,7 @@ Cleat gives you the best of both worlds:
 - **Contained Claude home** -- a box sees only its own project's Claude history. The instruction surfaces your host `claude` obeys are read-only inside the cage
 - **Account switching** -- `cleat account` keeps two or more Claude logins under names and pins a box to one, so hitting the five-hour limit on one Max account is one command instead of a browser login. Conversations and project history are shared across the switch
 - **Session management** -- `cleat session` lists a box's Claude conversations with their real sizes, deletes the ones you are done with (which the Claude Code CLI itself cannot do for a single conversation) and keeps them restorable in a trash for 30 days
-- **Hook execution on host** -- your Claude Code hooks (global and project-level) run on the host, not in the container
+- **Hook execution on host** -- the hooks in your `~/.claude/settings.json` run on the host, not in the container. Hooks a project defines never run there
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser. Cleat checks the origin first, so the box cannot choose where your logged-in browser goes
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
 - **Configuration drift detection** -- notifies when config has changed since container creation
@@ -455,14 +455,21 @@ plugins on the host and every box sees them. Other projects stay invisible: `~/.
 every project you have ever run Claude Code on, so a box gets a generated
 directory containing only its own project's sessions. Its own session stays
 writable, so `--continue` and `--resume` work normally. `file-history`,
-`paste-cache`, `uploads`, `backups`, `shell-snapshots`, `sessions`, `tasks`,
-`jobs` and `hooks` each become an empty per-box directory. `hooks` is the one
+`paste-cache`, `uploads`, `backups`, `shell-snapshots`, `session-env`, `daemon`,
+`seed-admin`, `sessions`, `tasks`, `jobs` and `hooks` each become an empty
+per-box directory, created without group or other write. `hooks` is the one
 that matters most. It is also why these are generated empties rather than
 read-only views. The `hooks` capability runs your hook commands on the **host**
 and the usual way to write one names a script under `~/.claude/hooks/`, so a box
 able to write there could rewrite what your host runs. What a box can still
 reach is the project you mounted plus your Claude login, which it needs to
-authenticate.
+authenticate. Fifteen more instruction surfaces at the root of `~/.claude`
+(`rules/`, `workflows/`, `output-styles/`, `themes/`, `keybindings.json`,
+`loop.md`, `settings.local.json` and eight others) are read-only in a box too.
+Six of them show your own content, copied fresh on every create, start and
+resume. That copy takes directories and regular files only and follows no
+symlink, so a dotfile-repo symlink at one of those names is not seen in a box.
+The other nine are empty.
 The read-only copies
 dereference symlinks (a dotfile-repo `commands` dir shows up as real files in
 the box) while a symlink nested inside a skill is kept as a link, so a skill
@@ -620,6 +627,12 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `--fork` | Give the box its own copy of the project instead of the live tree (create time only) |
 | `fork [sub]` | Fork a box (`start`, `run`) or manage the copies (`list`, `path`, `rm`, `prune`, `refresh`) |
 
+#### Browser
+| Command | Description |
+|---|---|
+| `cleat browser origins` | List the origins a box may ask your host to open, including any you added and any entry ignored. `cleat browser` alone does the same |
+| `cleat browser allow <host>` | Add one origin for every box. Stored under `[browser]` in `~/.config/cleat/config` |
+
 #### Interact
 | Command | Description |
 |---|---|
@@ -752,7 +765,7 @@ cleat --cap ssh start
 | `git` | mount | Mounts `~/.gitconfig` (read-only). Commits inside the container use your host identity. |
 | `ssh` | mount | Mounts `~/.ssh` (read-only). SSH agent forwarding if `SSH_AUTH_SOCK` is set. |
 | `env` | mount | Auto-loads env vars from `~/.config/cleat/env` (global) and `.cleat.env` (project). |
-| `hooks` | mount | Runs your Claude Code hooks on the host (global and project-level). |
+| `hooks` | mount | Runs the hooks in `~/.claude/settings.json` on the host. Hooks from the project's own `.claude/settings*.json` never run there. |
 | `gh` | mount | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
 | `docker` | sandbox | Mounts `/var/run/docker.sock`. `docker`, `docker compose` and anything that talks to the daemon run against your host: sibling containers, zero overhead. **Sandbox-escaping. See security note below.** |
 | `unsafe-rm` | guard | Answers Claude Code's un-bypassable "dangerous rm" prompt so `rm`/`rmdir` run unattended. That prompt survives `--dangerously-skip-permissions` by design (an upstream circuit breaker). Cleat installs a `PermissionRequest` hook that answers whenever the command invokes `rm`/`rmdir` at the top level, so chained cleanups (`mkdir -p $S && rm -rf $S/*`) run unattended. A command that removes nothing is never answered. **This disarms a real guard**: `/workspace` and `~/.claude` are read-write host mounts. Global or `--cap` only, never a project `.cleat`. Default off, red warning every launch. |
@@ -1011,13 +1024,16 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
 ### Config files
 
 ```
-~/.config/cleat/config    ← global capabilities, [resources], [kits], [fork] dir
+~/.config/cleat/config    ← global capabilities, [resources], [kits], [fork] dir,
+                            [browser] origins added with cleat browser allow
 ~/.config/cleat/env       ← global env vars
 ~/.config/cleat/forks/    ← fork workspace copies (default root, moved by [fork] dir)
 <project>/.cleat          ← project capabilities (extends global), [resources], [setup],
                             [fork] exclude, plus any [box.<name>.<kind>] overrides
 <project>/.cleat.env      ← project-level env vars
 <project>/.cleat.<box>.env ← per-box env vars (falls back to .cleat.env)
+~/.config/cleat/state/hook-drops.log ← hook events the bridge refused (hooks cap)
+~/.config/cleat/state/hook-runs.log  ← hook events handed to your hooks (hooks cap)
 ```
 
 One project, one `.cleat`. Boxes scope their caps, resources, setup and fork
@@ -1057,13 +1073,15 @@ Docker's "What's next?" promo text and clipboard watcher cleanup messages are su
 
 ## Hooks
 
-When the `hooks` capability is enabled, your Claude Code hooks run on the host, exactly as if you weren't using a container. Hooks from all three settings locations are supported:
+When the `hooks` capability is enabled, the hooks in your `~/.claude/settings.json` run on the host, as if you weren't using a container. **That file is the only place a host hook comes from.** A project's own `.claude/settings.json` and `.claude/settings.local.json` live inside the read-write `/workspace` mount, so a command read from one would be a command the box can write. Their hooks do not run on the host. With the capability on, a project that defines some gets a note at session start saying so. Copy the ones you want into `~/.claude/settings.json`.
 
-- `~/.claude/settings.json` (global)
-- `.claude/settings.json` (project, committed)
-- `.claude/settings.local.json` (project, local)
+**This capability is the one place where the box's activity deliberately runs a command outside the cage.** That is the feature and it is your call, but enable it knowing the shape. The command runs on your host, as you, uncontained. The agent is what generates the events that trigger it, so it chooses when your hooks run and what is on their stdin. Every session that will run a host hook says so:
 
-**This capability is the one place where the box's activity deliberately runs a command outside the cage.** That is the feature and it is your call, but enable it knowing the shape. The command runs on your host, as you, uncontained. The agent is what generates the events that trigger it. Two consequences worth reading twice. A hook command that names a path in the repo (`$CLAUDE_PROJECT_DIR/.claude/hooks/format.sh`, `npm run hook`, `make lint`) resolves inside `/workspace`, which the agent edits as ordinary work. The two project settings files above are read from your working tree, so hooks the agent writes there are hooks your host will run. Point a hook you care about at a script outside the project. Treat the set of hooks you have enabled as the set of things the box can ask your host to do, at a time of its choosing.
+```
+  ! Host hooks enabled. The box chooses when they run and what is on their stdin.
+```
+
+A hook command that names a path in the repo (`$CLAUDE_PROJECT_DIR/.claude/hooks/format.sh`, `npm run hook`, `make lint`) resolves inside `/workspace`, which the agent edits as ordinary work. Point a hook you care about at a script outside the project. Treat the set of hooks you have enabled as the set of things the box can ask your host to do, at a time of its choosing.
 
 ```bash
 cleat config --enable hooks    # enable persistently
@@ -1073,10 +1091,14 @@ cleat --cap hooks start        # enable for one session
 ### How it works
 
 1. Cleat creates a settings overlay that replaces hook commands with an event forwarder inside the container
-2. Project-level hook settings are also overlaid to prevent double-execution
-3. A host-side bridge reads forwarded events and executes the original hook commands on the host
-4. Event JSON is piped to stdin, matchers are respected, 30s timeout per command
-5. Commands like `osascript`, local scripts and anything host-specific work transparently
+2. Project settings files that exist when the box is created get an overlay too, so their hooks do not run in the container either
+3. A host-side bridge reads forwarded events, looks the event up in `~/.claude/settings.json` and runs the matching commands on the host
+4. Before anything runs, the event is validated and its path fields are rewritten from `/workspace/...` to your real project path (the fork's copy for a fork box). A path has to land inside the project on disk, symlinks included. An event that fails a check is dropped and logged to `~/.config/cleat/state/hook-drops.log`. When the session ends it tells you how many were dropped. Every event handed to your hooks gets a row in `hook-runs.log` beside it
+5. Event JSON is piped to stdin and matchers are respected. The hook runs in the event's working directory, translated the same way. Each command is bounded per event (15s for PreToolUse and PostToolUse, 120s for Stop and SubagentStop, 30s for UserPromptSubmit and anything else), through `timeout`, `gtimeout` or `perl`. A host with none of the three runs it unbounded
+6. An edit to an existing hook's command applies from the next event with no restart. A hook for a new event type or a new matcher needs `cleat resume`, because the box forwards only the events its overlay names
+7. Commands like `osascript`, local scripts and anything host-specific work transparently
+
+Validation narrows what the box controls from any host path and any argv to any in-project path plus free text. It does not make `hooks` a boundary. A hook that pastes a field such as `message` or `prompt` into a shell or `osascript` still runs text the box chose. A hook that reads nothing from stdin is not affected by validation at all.
 
 ---
 
@@ -1084,18 +1106,22 @@ cleat --cap hooks start        # enable for one session
 
 When Claude Code or any tool inside the container calls `open` or `xdg-open` with a URL, Cleat can open it in your host browser. OAuth callbacks are proxied back to the container, so a login started inside a box completes without copy-paste. No capability needed.
 
-**Cleat checks the origin first.** A box that can aim your host browser anywhere is a box that can aim it at your own logged-in accounts, so the URL is opened only when its origin is on a list Cleat ships. Every login Cleat knows about is on that list by default and there is nothing to configure. Anything else is refused, printed in full for you to open by hand, with the one command that allows it next time:
+**Cleat checks the origin first.** A box that can aim your host browser anywhere is a box that can aim it at your own logged-in accounts, so the URL is opened only when its origin is on a list Cleat ships. Every login Cleat knows about is on that list by default and there is nothing to configure. A login at any other origin is refused and printed in full for you to open by hand when the session, `cleat shell` or `cleat login` ends, with the one command that allows it next time. By default a device-flow page or a plain link is never auto-opened, whatever its origin. You click the link the tool prints, so it is never reported as refused:
 
 ```bash
 cleat browser origins                  # what your sandbox is allowed to open
 cleat browser allow auth.example.com   # add one, for every box
 ```
 
+The full list, with the login each origin serves, is in the [browser origins table](https://cleat.sh/docs#browser-origins) on cleat.sh.
+
 The list can never be complete. That is arithmetic rather than a gap: an Atlassian site is your own site, a self-hosted GitLab or GitHub Enterprise is your own hostname, an MCP server names its own authorization host, one per server. You add those once. AWS is not shipped either: `aws sso login` opens `oidc.<region>.amazonaws.com`, one host per AWS region, so allow the region you use. The same goes for a login Cleat has not catalogued yet. Not every tool documents which page it opens. A few ask their own server for the address at login time, so it can move without the tool changing.
 
 An origin on the list can still redirect your browser somewhere else, because following a redirect is what browsers do. The list bounds the first hop, not the last one.
 
-**One click, one tab.** Your terminal already opens a clicked link itself, so the bridge defers plain links to it and opens only what the terminal will not: an OAuth authorize URL at an allowlisted origin. Off a terminal (a pipe, cron, `nohup`, `cleat login`) a plain link is deferred too, because nobody is watching the browser during an unattended run. Override with `CLEAT_BROWSER_BRIDGE=always`, which opens every URL the box picks at any origin, or `off`, which never auto-opens while the login callback proxy still runs.
+**One click, one tab.** Your terminal already opens a clicked link itself, so the bridge defers plain links to it and opens only what the terminal will not: an OAuth authorize URL at an allowlisted origin. Off a terminal (a pipe, cron, `nohup`, `cleat login`) a plain link is deferred too, because nobody is watching the browser during an unattended run. Override with `CLEAT_BROWSER_BRIDGE=always`, which opens every URL the box picks at any origin, or `off`, which never auto-opens while the login callback proxy still runs for a listed origin. `always` does not finish every login. The callback that brings a hands-free login back into the box still needs the origin on the list, so that kind of login at an unlisted origin opens its tab and then waits. `cleat browser allow` fixes that one. When the mode is `always` or `off`, the launch summary says so on a `Browser:` row, so a bypass set in a shell profile months ago is never invisible.
+
+**At most 6 opens a minute and 30 a session.** Every open is a real request from your host, so the bridge caps how often a box can cause one, in every mode including `always`. The minute is counted across every session, shell and login on the box. A URL past either cap is not opened. When the session, shell or login ends, Cleat says how many were held back and prints up to three of them to open by hand. No real login comes near the cap.
 
 **`CLEAT_BROWSER_ORIGINS`** appends to the shipped list for one shell, never replaces it:
 

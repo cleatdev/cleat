@@ -1006,27 +1006,32 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 
 @test "regression: hook bridge wraps execution in a timeout" {
-  # Retargeted from a literal `timeout 30` to a behavioural check on the
-  # resolver. The flat 30s became per-event, matching Claude Code's own values
-  # for its own hooks: a Stop hook that formats a large repo legitimately takes
-  # minutes, and a PreToolUse hook that takes 30 seconds has already wedged the
-  # turn. What this regression protects is unchanged, that a user hook is never
-  # run unwrapped, so a hung one cannot block the bridge.
-  local body
-  body="$(declare -f _execute_host_hooks)"
-  [[ -n "$body" ]] || { echo "_execute_host_hooks function not found"; return 1; }
-  echo "$body" | grep -qE 'timeout "\$_hto" bash -c' || {
-    echo "REGRESSION: hook bridge must wrap user hook execution in a timeout"
-    return 1
-  }
-  # And the resolver always answers with a positive number of seconds, for an
-  # event name it has never seen as much as for one it has.
+  # Retargeted twice. First from a literal `timeout 30` to the per-event
+  # resolver, when the flat 30s became Claude Code's own per-event values. Then
+  # from a grep for `timeout "$_hto"` to the behaviour itself, when the bound
+  # moved into _run_bounded so it also holds on a host with no timeout(1). What
+  # this regression protects is unchanged: a user hook is never run unwrapped,
+  # so a hung one cannot block the bridge.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  # The resolver always answers with a positive number of seconds, for an event
+  # name it has never seen as much as for one it has.
   local ev
   for ev in PreToolUse PostToolUse UserPromptSubmit Stop SubagentStop SomeFutureEvent; do
     local t; t="$(_hook_timeout_for "$ev")"
     case "$t" in ''|*[!0-9]*) echo "no timeout for $ev"; return 1 ;; esac
     [ "$t" -gt 0 ] || { echo "a zero timeout for $ev would run the hook unbounded"; return 1; }
   done
+  # And the hook is held to it. The hook never exits on its own.
+  local settings="$TEST_TEMP/host-settings.json" marker="$TEST_TEMP/wrapped-hook-started"
+  cat > "$settings" << EOF
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch $marker; exec sleep 15"}]}]}}
+EOF
+  _hook_timeout_for() { printf '2'; }
+  local t0=$SECONDS
+  _execute_host_hooks '{"hook_event_name":"Stop"}' "$settings" 3>&-
+  local took=$(( SECONDS - t0 ))
+  [ -f "$marker" ] || { echo "the hook never ran"; return 1; }
+  [ "$took" -le 9 ] || { echo "REGRESSION: a hook bounded at 2s ran for ${took}s"; return 1; }
 }
 
 @test "regression: hook bridge suppresses stdout and swallows errors" {
@@ -1044,12 +1049,23 @@ EOF
 }
 
 @test "regression: hook bridge has fallback when timeout command missing" {
-  local body
-  body="$(declare -f _execute_host_hooks)"
-  [[ -n "$body" ]] || { echo "_execute_host_hooks function not found"; return 1; }
-
-  echo "$body" | grep -q 'command -v timeout' || {
-    echo "REGRESSION: hook bridge must check for timeout availability"
+  # Retargeted from a grep for `command -v timeout` to the behaviour. A host
+  # with nothing to bound the hook with still runs it, bare, rather than drop
+  # it. The bound now tries gtimeout and perl before giving up, so the PATH here
+  # has none of the three.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  local farm="$TEST_TEMP/nobound" t p
+  mkdir -p "$farm"
+  for t in bash jq grep touch; do
+    p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$farm/$t"
+  done
+  local settings="$TEST_TEMP/host-settings.json" marker="$TEST_TEMP/unbounded-hook-ran"
+  cat > "$settings" << EOF
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch $marker"}]}]}}
+EOF
+  PATH="$farm" _execute_host_hooks '{"hook_event_name":"Stop"}' "$settings"
+  [ -f "$marker" ] || {
+    echo "REGRESSION: with no timeout, gtimeout or perl the hook must still run"
     return 1
   }
 }
@@ -1253,13 +1269,27 @@ EOF
   assert_failure
 }
 
-@test "regression containment: no docker run or exec carries --privileged" {
+@test "regression containment: the box's docker run never carries --privileged" {
   # Behavioural, not only textual: the run above would pass if the flag were
-  # assembled from pieces. This asserts on the recorded command line.
+  # assembled from pieces. This asserts on the recorded command line. It covers
+  # the create only, because cmd_run issues no docker exec: the test below
+  # covers the session.
   mock_docker_images "cleat"
   mock_docker_ps_a ""
   run cmd_run
   run docker_calls
+  assert_output --partial "docker run "
+  refute_output --partial "--privileged"
+}
+
+@test "regression containment: the session docker exec never carries --privileged" {
+  # The exec path, which the create test above never reached. exec -it runs
+  # Claude itself, so a flag assembled there voids the boundary for every
+  # session without a single docker run changing.
+  _host_open_cmd() { echo ""; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  run docker_calls
+  assert_output --partial "docker exec -it "
   refute_output --partial "--privileged"
 }
 
@@ -1273,8 +1303,9 @@ EOF
 @test "regression containment: every instruction surface is masked over the box's ~/.claude" {
   local want p
   for want in workflows routines rules output-styles themes cowork_plugins \
-              project-settings local-settings scheduled_tasks.json launch.json \
-              loop.md keybindings.json settings.local.json; do
+              project-settings local-settings local scheduled_tasks.json \
+              launch.json loop.md keybindings.json settings.local.json \
+              daemon.json; do
     local found=0
     for p in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
       [ "$p" = "$want" ] && found=1
@@ -1292,6 +1323,109 @@ EOF
   done
   return 0
 }
+
+@test "regression vnext: user-level rules and keybindings reach the box read-only instead of an empty mask" {
+  mkdir -p "$TEST_TEMP/project"
+  local CNAME
+  CNAME="$(container_name_for "$TEST_TEMP/project")"
+  # Claude Code 2.1.270 loads user rules, themes, workflows, output styles,
+  # keybindings.json and loop.md from the config home. Blanking them took the
+  # user's own config out of every box. The mask stays :ro, so the box reads
+  # them and still cannot write what the host's Claude Code loads.
+  mkdir -p "$HOME/.claude/rules/lang/deep" "$HOME/.claude/output-styles"
+  echo "Prefer bash 3.2." > "$HOME/.claude/rules/style.md"
+  echo "Nested rule." > "$HOME/.claude/rules/lang/deep/go.md"
+  echo "terse" > "$HOME/.claude/output-styles/terse.md"
+  printf '{"bindings":[{"context":"Chat","bindings":{"ctrl+k":null}}]}\n' > "$HOME/.claude/keybindings.json"
+  printf 'check the build\n' > "$HOME/.claude/loop.md"
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$CNAME" "${CNAME}/home/instr/rules:/home/coder/.claude/rules:ro"
+  assert_success
+  run assert_docker_run_has "$CNAME" "${CNAME}/home/instr/keybindings.json:/home/coder/.claude/keybindings.json:ro"
+  assert_success
+  local o="$CLEAT_RUN_DIR/$CNAME/home/instr"
+  cmp "$HOME/.claude/rules/style.md" "$o/rules/style.md"
+  cmp "$HOME/.claude/rules/lang/deep/go.md" "$o/rules/lang/deep/go.md"
+  cmp "$HOME/.claude/output-styles/terse.md" "$o/output-styles/terse.md"
+  cmp "$HOME/.claude/keybindings.json" "$o/keybindings.json"
+  cmp "$HOME/.claude/loop.md" "$o/loop.md"
+}
+
+
+@test "regression vnext: the box keybindings.json placeholder is one Claude Code's loader accepts" {
+  mkdir -p "$TEST_TEMP/project"
+  local CNAME
+  CNAME="$(container_name_for "$TEST_TEMP/project")"
+  # A bare `{}` is rejected with "keybindings.json must have a bindings array".
+  _generate_instr_overlay "$CNAME"
+  run cat "$CLEAT_RUN_DIR/$CNAME/home/instr/keybindings.json"
+  assert_output '{"bindings":[]}'
+}
+
+
+@test "regression vnext: session-env, daemon and seed-admin are per-box, never the host's" {
+  mkdir -p "$TEST_TEMP/project"
+  local CNAME
+  CNAME="$(container_name_for "$TEST_TEMP/project")"
+  # The host's own Claude Code runs the hook env files in session-env/<id>/,
+  # spawns exec jobs dropped in daemon/dispatch/ and runs git against what it
+  # stages in seed-admin/. None needs a capability to reach from the box.
+  mkdir -p "$HOME/.claude/session-env/host-session"
+  echo "HOST HOOK ENV" > "$HOME/.claude/session-env/host-session/sessionstart-hook-0.sh"
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local d
+  for d in session-env daemon seed-admin; do
+    run assert_docker_run_has "$CNAME" "$CNAME/home/$d:/home/coder/.claude/$d"
+    assert_success
+    run assert_docker_run_lacks "$CNAME" "$HOME/.claude/$d:/home/coder/.claude/$d"
+    assert_success
+  done
+  [ -z "$(ls -A "$CLEAT_RUN_DIR/$CNAME/home/session-env")" ] || { echo "the host session-env leaked into the box"; return 1; }
+}
+
+
+@test "regression vnext: the npm-local install and daemon.json are masked read-only" {
+  mkdir -p "$TEST_TEMP/project"
+  local CNAME
+  CNAME="$(container_name_for "$TEST_TEMP/project")"
+  # ~/.claude/local is the npm-local launcher the host's claude alias runs, and
+  # its updater runs npm in there. A box that could write it would own the next
+  # host launch.
+  mkdir -p "$HOME/.claude/local"
+  printf '#!/bin/sh\necho host claude\n' > "$HOME/.claude/local/claude"
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$CNAME" "${CNAME}/home/instr/local:/home/coder/.claude/local:ro"
+  assert_success
+  run assert_docker_run_has "$CNAME" "${CNAME}/home/instr/daemon.json:/home/coder/.claude/daemon.json:ro"
+  assert_success
+  [ -z "$(ls -A "$CLEAT_RUN_DIR/$CNAME/home/instr/local")" ] || { echo "the host launcher was copied into the box"; return 1; }
+  run cat "$HOME/.claude/local/claude"
+  assert_output --partial "echo host claude"
+}
+
+
+@test "regression vnext: a regular file where an instruction-surface dir belongs is refused before docker run" {
+  mkdir -p "$TEST_TEMP/project"
+  local CNAME
+  CNAME="$(container_name_for "$TEST_TEMP/project")"
+  # Skipping the wrong shape only moved the failure: the :ro bind was still
+  # emitted and docker run died with an opaque "not a directory".
+  : > "$HOME/.claude/rules"
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "rules is not a directory"
+  run grep -c "^docker run " "$DOCKER_CALLS"
+  assert_output "0"
+  [ -f "$HOME/.claude/rules" ] || { echo "the user's file was touched"; return 1; }
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Writing style: no em dashes anywhere. They read as AI-authored, so the project
@@ -3660,6 +3794,108 @@ EOF
   assert_output --partial "jq is not installed on the host"
 }
 
+@test "regression vnext: exec_claude hands a fork box's hook bridge the COPY, not the origin tree" {
+  # exec_claude used to pass cmd_run's `local _workspace`, which is gone by the
+  # time any caller reaches exec_claude. The real binary died on set -u (see the
+  # smoke test). With strict mode stripped the name expands empty and the
+  # watcher's default falls back to the project, so a fork box's host hooks
+  # were pointed at the ORIGIN working tree.
+  command -v jq >/dev/null 2>&1 || skip "the bridge branch needs jq on the host"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' > "$HOME/.claude/settings.json"
+  mkdir -p "$TEST_TEMP/project"
+  ACTIVE_CAPS=(hooks)
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  local cname="test-fork-bridge"
+  _fork_mark "$cname"
+  mkdir -p "$(_fork_dir "$cname")"
+  _host_open_cmd() { echo ""; }
+  local rec="$TEST_TEMP/bridge_ws"
+  # The bridge is spawned in the background and killed by the session cleanup,
+  # so record its workspace argument and hold exec_claude at the next step
+  # until the record exists. Bounded, so a bridge that never spawns fails
+  # rather than hangs.
+  _hook_bridge_watcher() { printf '%s\n' "$2" > "$rec.part" && mv "$rec.part" "$rec"; }
+  _wait_for_coder_remap() {
+    local i=0
+    while [ ! -f "$rec" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  }
+  run exec_claude "$cname" --dangerously-skip-permissions
+  [ -f "$rec" ] || { echo "the hook bridge was never spawned"; return 1; }
+  run cat "$rec"
+  assert_output "$(_fork_dir "$cname")"
+}
+
+# Start the real hook bridge from launch directory $1 for workspace $2, the way
+# exec_claude starts it from wherever cleat was run, append spool line $3, and
+# wait (bounded) for the host hook to write $TEST_TEMP/hook_out. The host hook
+# prints the file its event's tool_input.file_path names, as a Read or a
+# formatter hook would open it.
+_bridge_opens_from() {
+  local launch="$1" ws="$2" ev="$3" spool="$TEST_TEMP/events.jsonl" bpid i
+  mkdir -p "$HOME/.claude"
+  printf '{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"f=$(jq -r .tool_input.file_path); cat \\"$f\\" > %s/hook_out.part 2>/dev/null; mv %s/hook_out.part %s/hook_out"}]}]}}\n' \
+    "$TEST_TEMP" "$TEST_TEMP" "$TEST_TEMP" > "$HOME/.claude/settings.json"
+  : > "$spool"
+  ( cd "$launch" && _hook_bridge_watcher "$spool" "$ws" "box-a" ) >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  printf '%s\n' "$ev" >> "$spool"
+  for i in $(seq 1 12); do
+    [ -f "$TEST_TEMP/hook_out" ] && break
+    sleep 0.5
+  done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+}
+
+@test "regression vnext: a relative hook path is opened from the directory it was judged in" {
+  # The bridge judged a relative path field from the event's translated cwd but
+  # started the hook in its own working directory, the project root. With a
+  # real sub/evil/ and a planted evil -> ~/.ssh at the root, a Write event from
+  # cwd /workspace/sub naming evil/id_rsa passed the check and a PostToolUse
+  # hook copied the private key out.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  local ws="$TEST_TEMP/proj"
+  mkdir -p "$ws/sub/evil" "$TEST_TEMP/dot-ssh"
+  printf 'PRIVATE-KEY\n' > "$TEST_TEMP/dot-ssh/id_rsa"
+  printf 'IN-SUB\n' > "$ws/sub/evil/id_rsa"
+  ln -s "$TEST_TEMP/dot-ssh" "$ws/evil"
+  _bridge_opens_from "$ws" "$ws" '{"hook_event_name":"PostToolUse","transcript_path":"/t","cwd":"/workspace/sub","tool_name":"Write","tool_input":{"file_path":"evil/id_rsa","content":"x"}}'
+  [ -f "$TEST_TEMP/hook_out" ] || { echo "the hook never ran"; return 1; }
+  run cat "$TEST_TEMP/hook_out"
+  refute_output --partial "PRIVATE-KEY"
+  assert_output "IN-SUB"
+}
+
+@test "regression vnext: a fork box's hook runs in the copy, so a relative path opens the copy's file" {
+  # The same mismatch in a fork box: the relative value was judged inside the
+  # fork copy and opened from the ORIGIN tree, where cleat was launched.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  local origin="$TEST_TEMP/origin" fork="$TEST_TEMP/fork"
+  mkdir -p "$origin" "$fork/evil" "$TEST_TEMP/outside"
+  printf 'TOP-SECRET\n' > "$TEST_TEMP/outside/secret"
+  printf 'FORK-COPY\n' > "$fork/evil/secret"
+  ln -s "$TEST_TEMP/outside" "$origin/evil"
+  _RESOLVED_PROJECT="$origin"
+  _bridge_opens_from "$origin" "$fork" '{"hook_event_name":"PostToolUse","transcript_path":"/t","cwd":"/workspace","tool_name":"Read","tool_input":{"file_path":"evil/secret"}}'
+  [ -f "$TEST_TEMP/hook_out" ] || { echo "the hook never ran"; return 1; }
+  run cat "$TEST_TEMP/hook_out"
+  refute_output --partial "TOP-SECRET"
+  assert_output "FORK-COPY"
+}
+
+@test "regression vnext: a Grep over more files than the path-field ceiling keeps its event" {
+  # tool_response.filenames entries counted toward the 256 path fields, so a
+  # Grep with head_limit 0 or more than about 253 matches dropped the whole
+  # PostToolUse event, though a filenames entry is only ever nulled.
+  command -v jq >/dev/null 2>&1 || skip "needs jq"
+  local names
+  names="$(jq -cn '[range(0; 300) | "/workspace/f\(.)"]')"
+  run _hook_translate_event "{\"hook_event_name\":\"PostToolUse\",\"cwd\":\"/workspace\",\"tool_name\":\"Grep\",\"tool_input\":{\"pattern\":\"k\",\"output_mode\":\"files_with_matches\"},\"tool_response\":{\"filenames\":$names}}" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"/Users/you/proj/f299"'
+}
+
 @test "regression vnext: the session key is derived under a pinned C locale" {
   # _claude_session_key pins LC_ALL=C and explains why; _derive_project_session_key
   # did not, though it feeds the same class of path. Under a UTF-8 collation the
@@ -3685,4 +3921,125 @@ EOF
   # produced for this path.
   run _derive_project_session_key "/Users/marcin/Workspaces/cleat"
   assert_output "cleat-0f459ff8"
+}
+
+# ── browser refusal reporting, 2026-09-13 ───────────────────────────────────
+# The destination gate's refusal notice had four defects. cleat shell and
+# cleat login ran the watcher and never reported. The parse took the LAST
+# url= and origin= on the line. Plain links and loopback URLs were reported
+# with an allow line that could never make them open. And a URL carrying the
+# marker text forged a refusal naming any host the box liked.
+
+# Run the real watcher against one URL until it logs a decision. $1 = the URL,
+# $2 = host_opens_clicks. No container name, so no callback proxy.
+_vnext_watch_once() {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _browser_watcher "$dir" "true" "" "auto" "${2:-1}" >/dev/null 2>&1 &
+  local wpid=$! i=0
+  printf '%s' "$1" > "$dir/.browser-open"
+  while [ "$i" -lt 100 ]; do
+    grep -q "opening URL\|deferring URL\|$_BROWSER_BLOCKED_MARK" "$dir/.proxy-log" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+}
+
+# The interactive exec writes an authorize URL at an unlisted origin into the
+# bridge file, as a login inside the box does, and returns once the watcher
+# has refused it. A refusal from an earlier session is already in the log, so
+# the offset guard is under test too.
+_vnext_refuse_during_exec() {
+  _T_BW_CLIP="$1"
+  printf '[browser-watcher 09:00:00] %s origin=old.example.com url=https://old.example.com/oauth/authorize?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A45454%%2Fcb\n' \
+    "$_BROWSER_BLOCKED_MARK" > "$_T_BW_CLIP/.proxy-log"
+  docker() {
+    case "$*" in
+      "exec -it "*)
+        printf '%s' "https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback" > "$_T_BW_CLIP/.browser-open"
+        local i=0
+        while [ "$i" -lt 100 ]; do
+          grep -q "$_BROWSER_BLOCKED_MARK origin=auth.example.com" "$_T_BW_CLIP/.proxy-log" 2>/dev/null && break
+          sleep 0.1
+          i=$((i + 1))
+        done ;;
+    esac
+    command docker "$@"
+  }
+}
+
+@test "regression vnext: cleat shell reports a browser open the gate refused" {
+  # docs/cli.md promised the refusal is surfaced on the terminal when the
+  # session ends. Only exec_claude read the log, so a login run from a shell
+  # was refused with nothing on screen.
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  _vnext_refuse_during_exec "$clip"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "https://auth.example.com/oauth/authorize"
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "old.example.com"
+}
+
+@test "regression vnext: cleat login reports a browser open the gate refused" {
+  # cleat login promises the browser will open. When the gate refused the
+  # origin, nothing said why it did not.
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
+  _vnext_refuse_during_exec "$clip"
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "https://auth.example.com/oauth/authorize"
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "old.example.com"
+}
+
+@test "regression vnext: a refused login URL carrying return_url= and origin= is reported whole" {
+  # Driven through the real watcher, so the line parsed is the line written.
+  # `${l##*url=}` took the last url=, which was inside return_url=, and
+  # `${l##*origin=}` took a trailing origin= the query chose.
+  local u="https://auth.example.com/oauth/authorize?client_id=x&return_url=https://app.example.org/done&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback&origin=evil.example"
+  _vnext_watch_once "$u" 1
+  run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+  assert_output --partial "$u"
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "allow evil.example"
+  refute_output --partial "allow app.example.org"
+}
+
+@test "regression vnext: a plain link or a loopback URL is never reported as blocked" {
+  # Neither opens with its origin listed: a plain link defers even at a listed
+  # origin, and cleat browser allow refuses localhost. Both used to print an
+  # allow line, the second one a command the verb rejects.
+  local u
+  for u in "https://docs.python.org/3/library/" "http://localhost:3000/"; do
+    rm -rf "$TEST_TEMP/clip"
+    _vnext_watch_once "$u" 0
+    run cat "$TEST_TEMP/clip/.proxy-log"
+    assert_output --partial "deferring URL to terminal"
+    run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+    assert_output ""
+  done
+}
+
+@test "regression vnext: marker text inside a URL is never read as a refusal" {
+  # The box writes the URL and the watcher logs it on every branch. Searching
+  # the whole line for the marker let a deferred link at a listed origin forge
+  # a refusal naming a host of the box's choosing.
+  # The forged text is the whole shape the watcher writes, timestamp included,
+  # so only an anchor on the line's first byte tells the two apart.
+  _vnext_watch_once "https://github.com/x?a=[browser-watcher 00:00:00] ${_BROWSER_BLOCKED_MARK} origin=gh-login.evil.tld url=https://gh-login.evil.tld/" 1
+  run cat "$TEST_TEMP/clip/.proxy-log"
+  assert_output --partial "deferring URL to terminal"
+  run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+  assert_success
+  assert_output ""
 }

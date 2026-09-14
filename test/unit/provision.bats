@@ -1020,6 +1020,26 @@ _th_record_setup() {
   refute_output --partial "is ignored"
 }
 
+@test "warn_unknown_sections: a browser section in the global config is silent" {
+  # The global config is where browser origins live, so the section is known
+  # there. Reporting it as unknown would read as "cleat browser allow is broken".
+  printf '[browser]\norigin = auth.example.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  run resolve_caps "$PROJECT"
+  refute_output --partial "Unknown section"
+  refute_output --partial "is ignored"
+}
+
+@test "warn_unknown_sections: a browser section in a project .cleat says origins are global" {
+  # Not the generic "unknown" line. Someone who wrote this expected it to work,
+  # and an allowlist in a file the box edits would not be one.
+  printf '[browser]\norigin = auth.example.com\n' > "$PROJECT/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  run resolve_caps "$PROJECT"
+  assert_output --partial "Section [browser] in .cleat is ignored"
+  assert_output --partial "browser origins are global"
+  refute_output --partial "Unknown section [browser]"
+}
+
 @test "warn_unknown_sections: fires at most once per file per process" {
   printf '[foo]\nbar\n' > "$PROJECT/.cleat"
   export CLEAT_TRUST_PROJECT=1

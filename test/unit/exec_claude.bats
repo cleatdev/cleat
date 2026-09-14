@@ -273,6 +273,71 @@ teardown() { _common_teardown; }
   [ "$adv_line" -gt "$end_line" ] || { echo "advisory (line $adv_line) not after session-end (line $end_line)"; return 1; }
 }
 
+# ── session-end reports: browser refusals and hook drops ─────────────────────
+# Both reports read a byte window of a log from an offset exec_claude captures
+# before the session. The report functions are tested on their own in
+# browser_bridge.bats and hooks.bats. These pin the wiring: that exec_claude
+# calls them, and hands them the offset rather than the start of the file.
+#
+# The rows are written from inside the `docker exec -it` call, which is the
+# session itself. exec_claude issues other docker execs before it (the remap
+# wait, docker access), so keying on `exec` alone would write twice.
+
+@test "session end: a refusal written during the session is reported" {
+  _host_open_cmd() { echo ""; }
+  docker() {
+    if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
+      printf '[browser-watcher 10:00:00] %s origin=auth.example.com url=https://auth.example.com/oauth/authorize?redirect_uri=x\n' \
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+    fi
+    command docker "$@"
+  }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "cleat browser allow auth.example.com"
+}
+
+@test "session end: a refusal from an earlier session is not repeated" {
+  # Without the offset a refusal re-fires on every launch, the nag concept/21
+  # forbids. One refusal this session keeps the report on screen, so the test
+  # reads what it printed rather than a report that never ran.
+  _host_open_cmd() { echo ""; }
+  mkdir -p "$CLEAT_RUN_DIR/test-ctr/clip"
+  printf '[browser-watcher 09:00:00] %s origin=old.example.com url=https://old.example.com/oauth/authorize?redirect_uri=x\n' \
+    "$_BROWSER_BLOCKED_MARK" > "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+  docker() {
+    if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
+      printf '[browser-watcher 10:00:00] %s origin=new.example.com url=https://new.example.com/oauth/authorize?redirect_uri=x\n' \
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+    fi
+    command docker "$@"
+  }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "cleat browser allow new.example.com"
+  refute_output --partial "old.example.com"
+}
+
+@test "session end: a hook drop written during the session is reported, an earlier one is not" {
+  _host_open_cmd() { echo ""; }
+  # A drop row from a previous session of this same box, before the offset.
+  _hook_drop_log "path" '{"hook_event_name":"Stop"}' "test-ctr" 0
+  docker() {
+    if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
+      _hook_drop_log "path" '{"hook_event_name":"Stop"}' "test-ctr" 40
+    fi
+    command docker "$@"
+  }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  # The count sits between bold escapes, and BOLD itself carries a 1, so the
+  # escapes go first. A $'...' literal: BSD sed has no \x1b.
+  local plain
+  plain="$(printf '%s' "$output" | sed $'s/\033\\[[0-9;]*m//g')"
+  run printf '%s' "$plain"
+  assert_output --partial "Dropped 1 hook event from the box"
+}
+
 # ── attach heal (_refresh_attached_claude_json) ──────────────────────────────
 # The end-to-end heal (poisoned flag fixed in place, same inode) is pinned in
 # regressions.bats; these pin the guards around it.

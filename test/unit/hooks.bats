@@ -714,10 +714,16 @@ EOF
 
 # ── _cap_description ────────────────────────────────────────────────────
 
-@test "cap_description: hooks describes host hook execution" {
+@test "cap_description: hooks names the host settings file and not project hooks" {
+  # The bridge runs commands from ~/.claude/settings.json alone. The two project
+  # files sit inside the read-write /workspace mount and never supply a host
+  # command, so a description promising "(global + project)" tells the user a
+  # project hook will run on their host when it will not.
   run _cap_description hooks
   assert_output --partial "hooks"
   assert_output --partial "host"
+  assert_output --partial "~/.claude/settings.json"
+  refute_output --partial "project"
 }
 
 # ── config --list includes hooks ─────────────────────────────────────────
@@ -978,6 +984,64 @@ EOF
   run cat "$output"
   assert_output --partial '"hook_event_name":"PostToolUse"'
   assert_output --partial '"data":"hello"'
+}
+
+# A PATH holding only the named tools, so a test can take timeout(1) away the
+# way a stock macOS does. Anything a test needs by name must be listed.
+_hk_tool_farm() {
+  local farm="$1" t p; shift
+  mkdir -p "$farm"
+  for t in "$@"; do
+    p="$(command -v "$t" 2>/dev/null)" || continue
+    ln -sf "$p" "$farm/$t"
+  done
+}
+
+@test "_execute_host_hooks: the per-event bound holds on a host with no timeout(1)" {
+  # A stock macOS ships no timeout(1), and the hook ran bare there, so a hook
+  # given 2s ran for as long as it liked. perl's alarm is the fallback. The
+  # hook never exits on its own, so only the bound can end it in time.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  local farm="$TEST_TEMP/notimeout"
+  _hk_tool_farm "$farm" bash jq grep touch sleep perl
+  [ -x "$farm/perl" ] || skip "perl is not on this host"
+  local settings="$TEST_TEMP/host-settings.json" marker="$TEST_TEMP/bounded-hook-started"
+  cat > "$settings" << EOF
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"touch $marker; exec sleep 15"}]}]}}
+EOF
+  _hook_timeout_for() { printf '2'; }
+  local t0=$SECONDS
+  PATH="$farm" _execute_host_hooks '{"hook_event_name":"PreToolUse","tool_name":"Bash"}' "$settings" 3>&-
+  local took=$(( SECONDS - t0 ))
+  [ -f "$marker" ] || { echo "the hook never ran"; return 1; }
+  [ "$took" -le 9 ] || { echo "a hook bounded at 2s ran for ${took}s"; return 1; }
+}
+
+@test "_execute_host_hooks: the bound falls back to gtimeout when there is no timeout(1) or perl" {
+  # Homebrew's coreutils installs timeout(1) as gtimeout. The stand-in here
+  # records that it was chosen and bounds with perl by absolute path, so the
+  # PATH the helper searches has neither timeout nor perl on it.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  local real_perl; real_perl="$(command -v perl 2>/dev/null)" || skip "perl is not on this host"
+  local farm="$TEST_TEMP/gtimeoutonly"
+  _hk_tool_farm "$farm" bash jq grep touch sleep
+  cat > "$farm/gtimeout" << EOF
+#!$(command -v bash)
+: > "$TEST_TEMP/gtimeout.used"
+exec "$real_perl" -e 'alarm shift @ARGV; exec { \$ARGV[0] } @ARGV or exit 127' "\$@"
+EOF
+  chmod +x "$farm/gtimeout"
+  local settings="$TEST_TEMP/host-settings.json" marker="$TEST_TEMP/bounded-hook-started"
+  cat > "$settings" << EOF
+{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"touch $marker; exec sleep 15"}]}]}}
+EOF
+  _hook_timeout_for() { printf '2'; }
+  local t0=$SECONDS
+  PATH="$farm" _execute_host_hooks '{"hook_event_name":"PreToolUse","tool_name":"Bash"}' "$settings" 3>&-
+  local took=$(( SECONDS - t0 ))
+  [ -f "$marker" ] || { echo "the hook never ran"; return 1; }
+  [ -f "$TEST_TEMP/gtimeout.used" ] || { echo "gtimeout was not chosen"; return 1; }
+  [ "$took" -le 9 ] || { echo "a hook bounded at 2s ran for ${took}s"; return 1; }
 }
 
 # ── Hook bridge: process safety ───────────────────────────────────────────
@@ -1718,7 +1782,8 @@ _ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
     run _hook_translate_path "$bad" "/Users/you/proj"
     assert_failure
   done
-  # And the prefix requirement covers the rest.
+  # For an absolute field the prefix requirement covers the rest. A relative
+  # field has no prefix, so it restates them (the event-level test below).
   for bad in "~/secrets" '$HOME/x' '%PATH%' '`id`' '!!' '=x' "relative/path"; do
     run _hook_translate_path "$bad" "/Users/you/proj"
     assert_failure
@@ -1757,17 +1822,361 @@ _ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
 @test "hook payload: a sibling directory with the same prefix is not inside it" {
   run _hook_translate_path "/Users/you/proj-evil/x" "/Users/you/proj"
   assert_failure
+  # The on-disk check draws the same line for itself.
+  run _hook_path_inside "/Users/you/proj-evil/x" "/Users/you/proj"
+  assert_failure
 }
 
-@test "hook payload: no canonicalisation, so a symlinked project still works" {
+@test "hook payload: a file in a directory that does not exist yet still validates" {
   # The obvious design canonicalises both sides with `cd -P ... pwd -P`, which
-  # carries three macOS-first failures that would not reproduce here: a project
-  # reached through a symlink fails every compare, APFS is case-insensitive, and
-  # the canonicaliser needs the parent to EXIST so a PreToolUse for a new file
-  # in a new directory resolves to nothing. A literal prefix has none of them.
+  # needs the parent to EXIST, so a PreToolUse for a new file in a new directory
+  # resolves to nothing and a formatter silently stops firing for exactly the
+  # new-file case. The on-disk check walks up to the nearest existing ancestor.
   run _hook_translate_path "/workspace/src/new/dir/file.ts" "/Volumes/ext/Code/proj"
   assert_success
   assert_output "/Volumes/ext/Code/proj/src/new/dir/file.ts"
+}
+
+# A real workspace on disk, with a real directory beside it that the box must
+# not be able to reach. Echoes the workspace path.
+_ws_on_disk() {
+  mkdir -p "$TEST_TEMP/ws/src" "$TEST_TEMP/outside"
+  printf 'TOP-SECRET\n' > "$TEST_TEMP/outside/secret"
+  printf 'x\n' > "$TEST_TEMP/ws/src/a.ts"
+  printf '%s' "$TEST_TEMP/ws"
+}
+
+@test "hook payload: a symlink planted in the workspace cannot aim a path outside it" {
+  # F06. The workspace is mounted read-write, so the box can plant a link, and a
+  # prefix rewrite alone turned /workspace/evil/secret into a well-spelled
+  # in-project path that opens a host file: a Read hook exfiltrated TOP-SECRET
+  # and a Write hook formatted a file outside the workspace.
+  local ws; ws="$(_ws_on_disk)"
+  ln -s "$TEST_TEMP/outside" "$ws/evil"
+  ln -s ../outside "$ws/rel"
+  ln -s ../outside/secret "$ws/leaf"
+  run _hook_translate_path "/workspace/evil/secret" "$ws"
+  assert_failure
+  run _hook_translate_path "/workspace/rel/secret" "$ws"
+  assert_failure
+  run _hook_translate_path "/workspace/leaf" "$ws"
+  assert_failure
+  # A new file under the planted link lands outside too.
+  run _hook_translate_path "/workspace/evil/new-file" "$ws"
+  assert_failure
+  # The docker-cap spelling gets the same check.
+  run _hook_translate_path "$ws/evil/secret" "$ws"
+  assert_failure
+  # And the control: a real file and a new file inside still validate.
+  run _hook_translate_path "/workspace/src/a.ts" "$ws"
+  assert_success
+  assert_output "$ws/src/a.ts"
+  run _hook_translate_path "/workspace/src/brand/new.ts" "$ws"
+  assert_success
+  assert_output "$ws/src/brand/new.ts"
+}
+
+@test "hook payload: a dangling or looping symlink is refused, even one aimed inside" {
+  # Upstream's own rule: a component that is a symlink resolving to nothing is
+  # refused, because the box still chooses where it will point when the hook
+  # writes through it.
+  local ws; ws="$(_ws_on_disk)"
+  ln -s "$ws/not-there-yet" "$ws/dangling"
+  run _hook_translate_path "/workspace/dangling" "$ws"
+  assert_failure
+  # A loop must be refused, not spun on. Bounded by a watchdog so a regression
+  # fails here instead of hanging the suite.
+  ln -s b "$ws/a"
+  ln -s a "$ws/b"
+  local out="$TEST_TEMP/loop.out" pid i=0
+  ( if _hook_translate_path "/workspace/a/x" "$ws" >/dev/null 2>&1; then echo accepted; else echo refused; fi > "$out" ) &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    echo "a symlink loop hung the path check"; return 1
+  fi
+  wait "$pid" 2>/dev/null || true
+  run cat "$out"
+  assert_output "refused"
+}
+
+@test "hook payload: the on-disk walk never climbs a dot segment it could not resolve" {
+  # A missing tail is appended to the nearest existing directory as written, so
+  # a `..` in it would climb out of the workspace in the string while the
+  # string still starts with the workspace.
+  local ws; ws="$(_ws_on_disk)"
+  run _hook_physical_path "$ws/missing/../../outside/secret"
+  assert_failure
+  run _hook_physical_path "$ws/missing/./x"
+  assert_failure
+  _hook_physical_path "$ws/missing/x"
+  [ "$_HOOK_PHYS" = "$(cd -P "$ws" && pwd -P)/missing/x" ] || { echo "walk gave $_HOOK_PHYS"; return 1; }
+}
+
+@test "hook payload: a project reached through a symlink still validates on disk" {
+  # C3: resolve_project is logical, so the workspace Cleat hands the bridge can
+  # be ~/Code/proj while the files live under /Volumes/ext/Code/proj. The
+  # physical path never starts with that spelling. The same directory is found
+  # by device and inode instead, which also covers a different-case spelling of
+  # one directory on APFS. The hook still receives the project's own spelling.
+  mkdir -p "$TEST_TEMP/real/proj/src"
+  printf 'x\n' > "$TEST_TEMP/real/proj/src/a.ts"
+  ln -s "$TEST_TEMP/real" "$TEST_TEMP/Code"
+  local ws="$TEST_TEMP/Code/proj"
+  run _hook_translate_path "/workspace/src/a.ts" "$ws"
+  assert_success
+  assert_output "$ws/src/a.ts"
+  run _hook_translate_path "/workspace/src/new.ts" "$ws"
+  assert_success
+}
+
+@test "hook payload: a path walking more than the bound of missing components is refused" {
+  # Upstream walks at most 64 components or links for one path. Unbounded, a
+  # box-chosen value sets how long the bridge spends on it.
+  local ws; ws="$(_ws_on_disk)"
+  local deep="/workspace" i=0
+  while [ "$i" -lt 70 ]; do deep="$deep/d"; i=$((i + 1)); done
+  run _hook_translate_path "$deep" "$ws"
+  assert_failure
+  run _hook_translate_path "/workspace/d/d/d/d/d/d/d/d/d/d" "$ws"
+  assert_success
+}
+
+@test "hook payload: a tool_input nested past the walk depth is refused" {
+  # A path hidden deeper than the walk looks would otherwise pass unjudged.
+  local deep ok
+  deep="$(printf '[%.0s' $(seq 1 20))\"/etc/passwd\"$(printf ']%.0s' $(seq 1 20))"
+  run _hook_translate_event "$(_ev PreToolUse ",\"tool_input\":{\"a\":$deep}")" "/Users/you/proj"
+  assert_failure
+  ok="$(printf '[%.0s' $(seq 1 10))\"x\"$(printf ']%.0s' $(seq 1 10))"
+  run _hook_translate_event "$(_ev PreToolUse ",\"tool_input\":{\"a\":$ok}")" "/Users/you/proj"
+  assert_success
+}
+
+@test "hook payload: more path fields than upstream's ceiling drops the event" {
+  # Claude Code judges at most 256 paths for one event. Past that, the box
+  # would choose how long the bridge spends on one line. The cwd counts, so
+  # this event holds four.
+  _HOOK_PATHS_MAX=3
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"mcp__x__y","tool_input":{"paths":["/workspace/a","/workspace/b","/workspace/c"]}')" "/Users/you/proj"
+  assert_failure
+  _HOOK_PATHS_MAX=4
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"mcp__x__y","tool_input":{"paths":["/workspace/a","/workspace/b","/workspace/c"]}')" "/Users/you/proj"
+  assert_success
+}
+
+@test "hook payload: filenames past the list cap are nulled without being judged" {
+  # A megabyte of line lists some 200,000 names. Each judged entry walks the
+  # disk, so only the first _HOOK_LIST_MAX are judged and the rest are nulled.
+  _HOOK_LIST_MAX=2
+  eval "_tv_real() $(declare -f _hook_translate_value | tail -n +2)"
+  _hook_translate_value() { printf 'x\n' >> "$TEST_TEMP/judged"; _tv_real "$@"; }
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"Glob","tool_input":{"pattern":"*"},"tool_response":{"filenames":["/workspace/a","/workspace/b","/workspace/c","/etc/passwd"]}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"filenames":["/Users/you/proj/a","/Users/you/proj/b",null,null]'
+  run wc -l < "$TEST_TEMP/judged"
+  assert_output --regexp '^ *2$'
+  # The same cap holds for each tool_calls entry of a batch.
+  run _hook_translate_event "$(_ev PostToolBatch ',"tool_calls":[{"tool_name":"Glob","tool_input":{"pattern":"*"},"tool_response":{"filenames":["/workspace/a","/workspace/b","/etc/passwd"]}}]')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"filenames":["/Users/you/proj/a","/Users/you/proj/b",null]'
+}
+
+@test "hook payload: every path-shaped tool_input field is checked, not just file_path" {
+  # F08. Only four fields were translated, so Grep and Glob path, LSP filePath,
+  # an Agent cwd and every MCP tool's path argument reached the host hook as any
+  # absolute host path the box liked.
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Grep","tool_input":{"pattern":"k","path":"/Users/you/.ssh"}')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"LSP","tool_input":{"operation":"hover","filePath":"/Users/you/.zshrc"}')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Agent","tool_input":{"prompt":"x","cwd":"/etc"}')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"mcp__fs__read","tool_input":{"options":{"source_dir":"/etc"}}')" "/Users/you/proj"
+  assert_failure
+  # The control: the same fields inside the workspace are translated.
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Grep","tool_input":{"pattern":"/etc/passwd","path":"/workspace/src"}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"path":"/Users/you/proj/src"'
+  # A non-path key is free text and is left alone, however path-like.
+  assert_output --partial '"pattern":"/etc/passwd"'
+}
+
+@test "hook payload: each tool_calls entry of a batch is checked" {
+  run _hook_translate_event "$(_ev PostToolBatch ',"tool_calls":[{"tool_name":"Read","tool_input":{"file_path":"/workspace/a.ts"}},{"tool_name":"Write","tool_input":{"file_path":"/etc/passwd"}}]')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PostToolBatch ',"tool_calls":[{"tool_name":"Read","tool_input":{"file_path":"/workspace/a.ts"}}]')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"file_path":"/Users/you/proj/a.ts"'
+}
+
+@test "hook payload: a Read response's file.filePath outside the workspace drops the event" {
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"Read","tool_input":{"file_path":"/workspace/a.ts"},"tool_response":{"type":"text","file":{"filePath":"/etc/passwd","content":"x"}}')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"Read","tool_input":{"file_path":"/workspace/a.ts"},"tool_response":{"type":"text","file":{"filePath":"/workspace/a.ts","content":"x"}}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"filePath":"/Users/you/proj/a.ts"'
+}
+
+@test "hook payload: a response list entry that does not map is nulled, never passed on" {
+  # filenames[] and file.outputDir are informational, so one bad entry does not
+  # cost the user the whole event. It is not handed over either.
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"Glob","tool_input":{"pattern":"*"},"tool_response":{"filenames":["/workspace/a.ts","/etc/passwd"],"numFiles":2}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"filenames":["/Users/you/proj/a.ts",null]'
+  refute_output --partial "/etc/passwd"
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"Read","tool_response":{"file":{"filePath":"/workspace/a.pdf","outputDir":"/Users/you/.ssh"}}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"outputDir":null'
+  refute_output --partial ".ssh"
+}
+
+@test "hook payload: a relative path field is kept, and still has to land inside" {
+  # Grep and Glob accept a relative path. The value is kept as written and
+  # judged from the translated cwd, which is the directory the hook runs in.
+  local ws; ws="$(_ws_on_disk)"
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Grep","tool_input":{"pattern":"k","path":"./src"}')" "$ws"
+  assert_success
+  assert_output --partial '"path":"./src"'
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Grep","tool_input":{"pattern":"k","path":"../outside"}')" "$ws"
+  assert_failure
+  # The segment rules apply even where the value would land back inside.
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Grep","tool_input":{"pattern":"k","path":"src/../src"}')" "$ws"
+  assert_failure
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Grep","tool_input":{"pattern":"k","path":"src//a.ts"}')" "$ws"
+  assert_failure
+  # A relative value through a planted link escapes like an absolute one did.
+  ln -s "$TEST_TEMP/outside" "$ws/evil"
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"Grep","tool_input":{"pattern":"k","path":"evil/secret"}')" "$ws"
+  assert_failure
+}
+
+@test "hook payload: a relative path field is refused for a whole-value reject" {
+  # Property 4. An absolute field gets these for free from its prefix
+  # requirement. A relative field has no prefix, so without its own arms a
+  # Grep path of ~/.ssh or $HOME/x reached the hook as written, for a later
+  # consumer to expand.
+  local ws bad; ws="$(_ws_on_disk)"
+  for bad in "~/.ssh" '$HOME/x' '%PATH%' '`id`' '!x' '=x' " src" "src "; do
+    run _hook_translate_event "$(jq -cn --arg p "$bad" '{hook_event_name:"PreToolUse",cwd:"/workspace",tool_name:"Grep",tool_input:{pattern:"k",path:$p}}')" "$ws"
+    assert_failure
+  done
+  # The control: the same field, plainly relative and inside.
+  run _hook_translate_event "$(jq -cn '{hook_event_name:"PreToolUse",cwd:"/workspace",tool_name:"Grep",tool_input:{pattern:"k",path:"src"}}')" "$ws"
+  assert_success
+  assert_output --partial '"path":"src"'
+}
+
+@test "hook payload: a cwd that is not a directory here makes the workspace the hook's directory" {
+  # The hook runs in its event's cwd, so a cwd that cannot be entered would
+  # cost the event. Upstream falls back to its launch directory. Cleat falls
+  # back to the workspace and tells the hook so. Relative paths are judged there.
+  local ws; ws="$(_ws_on_disk)"
+  run _hook_translate_event "$(jq -cn '{hook_event_name:"Stop",cwd:"/workspace/gone"}')" "$ws"
+  assert_success
+  assert_output --partial "\"cwd\":\"$ws\""
+}
+
+@test "hook payload: an empty workspace judges nothing inside it" {
+  # With no workspace every absolute path started with the empty string, so a
+  # relative value on an event with no cwd was judged inside.
+  run _hook_translate_event '{"hook_event_name":"PreToolUse","tool_name":"Grep","tool_input":{"pattern":"k","path":"src"}}' ""
+  assert_failure
+}
+
+@test "hook payload: a URL field that holds a URL is not judged as a path" {
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"WebFetch","tool_input":{"url":"https://example.com/a:b","prompt":"x"}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"url":"https://example.com/a:b"'
+  # The same key holding a host path is a path.
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"mcp__x__get","tool_input":{"url":"/etc/passwd"}')" "/Users/you/proj"
+  assert_failure
+}
+
+@test "hook payload: container-only response fields are left as they are" {
+  # Bash rawOutputPath and persistedOutputPath and Agent outputFile name paths
+  # inside the box. No host hook can open them, and dropping on them would cost
+  # the user every PostToolUse hook for a long Bash command.
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"stdout":"","persistedOutputPath":"/home/coder/.claude/projects/-workspace/t/tool-results/x.txt"}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"persistedOutputPath":"/home/coder/.claude/projects/-workspace/t/tool-results/x.txt"'
+}
+
+@test "hook payload: a line holding two JSON values is refused" {
+  # F18. Every jq pass reads the first value of its input, so the first object
+  # was validated and the hook received both documents on stdin.
+  run _hook_translate_event '{"hook_event_name":"Stop","cwd":"/workspace"} {"x":1}' "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event '"x" {"hook_event_name":"Stop","cwd":"/workspace"}' "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event '{"hook_event_name":"Stop","cwd":"/workspace"}' "/Users/you/proj"
+  assert_success
+}
+
+# A UTF-8 locale, DISCOVERED rather than hardcoded: Linux ships C.utf8 and
+# macOS en_US.UTF-8, and a wrong name makes setlocale fall back to C silently,
+# which would compare C against C and pass no matter what the code does.
+_utf8_locale() {
+  locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true
+}
+
+@test "hook payload: a colon, a format character or a line separator is refused in any locale" {
+  # F19. Only empty, dot, backslash and [[:cntrl:]] were refused, and
+  # [[:cntrl:]] depends on the locale: U+2028 was accepted under C and refused
+  # under C.UTF-8, and U+202E, U+200B and U+FEFF were accepted under both.
+  local loc bad
+  local utf8; utf8="$(_utf8_locale)"
+  for loc in C $utf8; do
+    LC_ALL="$loc"
+    for bad in "/workspace/a:b" \
+      "$(printf '/workspace/a\342\200\256b')" \
+      "$(printf '/workspace/a\342\200\213b')" \
+      "$(printf '/workspace/a\357\273\277b')" \
+      "$(printf '/workspace/a\342\200\250b')" \
+      "$(printf '/workspace/a\342\200\251b')" \
+      "$(printf '/workspace/a\302\205b')"; do
+      run _hook_translate_path "$bad" "/Users/you/proj"
+      assert_failure
+    done
+    # The control: an accented name and a space are ordinary.
+    run _hook_translate_path "$(printf '/workspace/My Project/caf\303\251.ts')" "/Users/you/proj"
+    assert_success
+  done
+}
+
+@test "hook payload: the character rule never judges the host workspace path itself" {
+  # A host project folder may hold a colon. Only the part the box wrote is
+  # judged, or every event from such a project would drop.
+  run _hook_translate_path "/workspace/src/a.ts" "/Users/you/10:30 notes"
+  assert_success
+  assert_output "/Users/you/10:30 notes/src/a.ts"
+}
+
+@test "hook payload: agent_transcript_path becomes the sentinel too" {
+  # F35. The second transcript field names a container path exactly like the
+  # first, and nothing proved it was replaced.
+  run _hook_translate_event "$(_ev SubagentStop ',"agent_transcript_path":"/home/coder/.claude/projects/-workspace/agent-1.jsonl"')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"agent_transcript_path":"/cleat/transcript-is-inside-the-box"'
+  refute_output --partial "agent-1.jsonl"
+}
+
+@test "hook payload: every translated path field drops when it leaves the workspace" {
+  # F35. Only tool_input.file_path had a refusal test, so reverting the drop for
+  # cwd, notebook_path or tool_response.filePath left the suite green.
+  run _hook_translate_event '{"hook_event_name":"Stop","transcript_path":"/t","cwd":"/etc"}' "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PreToolUse ',"tool_name":"NotebookEdit","tool_input":{"notebook_path":"/etc/x.ipynb"}')" "/Users/you/proj"
+  assert_failure
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"Write","tool_response":{"filePath":"/etc/passwd"}')" "/Users/you/proj"
+  assert_failure
+  # The control: all three inside are translated.
+  run _hook_translate_event "$(_ev PostToolUse ',"tool_name":"NotebookEdit","tool_input":{"notebook_path":"/workspace/n.ipynb"},"tool_response":{"filePath":"/workspace/w.ts"}')" "/Users/you/proj"
+  assert_success
+  assert_output --partial '"cwd":"/Users/you/proj"'
+  assert_output --partial '"notebook_path":"/Users/you/proj/n.ipynb"'
+  assert_output --partial '"filePath":"/Users/you/proj/w.ts"'
 }
 
 @test "hook payload: the event name is bounded and charset-checked, never a roster" {
@@ -1788,11 +2197,24 @@ _ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
 @test "hook payload: an oversized line is dropped rather than processed" {
   # The spool is box-written, so the length of one event was the box's to
   # choose, and Cleat had no size cap anywhere in the bridge.
-  local big; big="$(printf 'a%.0s' $(seq 1 200))"
   run _hook_translate_event "$(_ev PreToolUse)" "/Users/you/proj"
   assert_success
   _HOOK_LINE_MAX=50
   run _hook_translate_event "$(_ev PreToolUse)" "/Users/you/proj"
+  assert_failure
+}
+
+@test "hook payload: the shipped line cap is 1044480 bytes, exactly" {
+  # Claude Code's own per-line cap for the same channel. The test above shrinks
+  # the cap to watch it work, so nothing pinned the value a real box meets. A
+  # line of exactly the cap passes and one byte more is dropped.
+  local base n pad
+  base="$(_ev PreToolUse ',"pad":""')"
+  n=$(( 1044480 - ${#base} ))
+  pad="$(printf '%*s' "$n" '' | tr ' ' a)"
+  run _hook_translate_event "$(_ev PreToolUse ",\"pad\":\"${pad}\"")" "/Users/you/proj"
+  assert_success
+  run _hook_translate_event "$(_ev PreToolUse ",\"pad\":\"${pad}a\"")" "/Users/you/proj"
   assert_failure
 }
 
@@ -1825,7 +2247,6 @@ _ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
   _RESOLVED_PROJECT="$TEST_TEMP/project"
   run _has_host_hooks
   assert_failure
-  [ ! -f "$TEST_TEMP/BOX-CHOSEN" ] || { echo "a box-authored command ran on the host"; return 1; }
 }
 
 @test "hook source: the host settings file is the one that runs" {
@@ -1846,6 +2267,33 @@ _ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
   run _hook_project_files_with_hooks
   assert_success
   assert_output --partial ".claude/settings.json"
+}
+
+@test "hook warning: a session that will run a host hook says what that means" {
+  # EGRESS-SPEC H4. The docker cap has had its amber line since it shipped. The
+  # hooks cap is the same class, a command outside the cage that the box's
+  # activity triggers, and a real `--cap hooks start` printed nothing about it.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run exec_claude "test-h4-on" --dangerously-skip-permissions
+  assert_output --partial "Host hooks enabled. The box chooses when they run and what is on their stdin."
+  # Amber, the way the docker line renders, not a plain warn.
+  assert_output --partial "214m! Host hooks enabled"
+}
+
+@test "hook warning: no host hook configured, no warning" {
+  # A cap with nothing to run executes nothing on the host, so the line would
+  # warn about a command that does not exist.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  : > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run exec_claude "test-h4-off" --dangerously-skip-permissions
+  refute_output --partial "Host hooks enabled"
 }
 
 # ── the matcher ─────────────────────────────────────────────────────────────
@@ -1897,14 +2345,67 @@ _ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
 
 @test "hook drops: the summary counts only this session" {
   local log="$TEST_TEMP/hook-drops.log"
-  printf 'ts\t%s\tpayload\told\n' "$_HOOK_DROP_MARK" > "$log"
+  printf 'ts\t%s\tjson\tbox-a\tmd5\t0\told\n' "$_HOOK_DROP_MARK" > "$log"
   local off; off="$(wc -c < "$log" | tr -d ' ')"
-  run _maybe_report_hook_drops "$log" "$off"
+  run _maybe_report_hook_drops "$log" "$off" "box-a"
   assert_output ""
-  printf 'ts\t%s\tpayload\tnew\n' "$_HOOK_DROP_MARK" >> "$log"
-  run _maybe_report_hook_drops "$log" "$off"
-  assert_output --partial "Dropped"
-  assert_output --partial "1"
+  printf 'ts\t%s\tjson\tbox-a\tmd5\t9\tnew\n' "$_HOOK_DROP_MARK" >> "$log"
+  run _maybe_report_hook_drops "$log" "$off" "box-a"
+  # The count sits between bold escapes, and BOLD itself carries a 1, so a bare
+  # "1" matched whatever the count was. The escapes go first, with a $'...'
+  # literal because BSD sed has no \x1b.
+  local plain
+  plain="$(printf '%s' "$output" | sed $'s/\033\\[[0-9;]*m//g')"
+  run printf '%s' "$plain"
+  assert_output --partial "Dropped 1 hook event from the box"
+}
+
+@test "hook drops: the summary counts only this box's drops" {
+  # F20. The log is per install and two boxes can run sessions at once, so a
+  # byte offset alone counted the other session's drops as this one's.
+  local log="$TEST_TEMP/hook-drops.log"
+  printf 'ts\t%s\tpath\tbox-a\tmd5\t0\tmine\n' "$_HOOK_DROP_MARK" > "$log"
+  printf 'ts\t%s\tpath\tbox-b\tmd5\t0\ttheirs\n' "$_HOOK_DROP_MARK" >> "$log"
+  printf 'ts\t%s\tpath\tbox-b\tmd5\t9\ttheirs\n' "$_HOOK_DROP_MARK" >> "$log"
+  run _maybe_report_hook_drops "$log" 0 "box-a"
+  assert_output --partial "hook event from the box"
+  refute_output --partial "hook events"
+}
+
+@test "hook drops: the summary blames a path only when every drop named one" {
+  # An oversized or malformed line did not name a path, and the notice said
+  # every drop had.
+  local log="$TEST_TEMP/hook-drops.log"
+  printf 'ts\t%s\tpath\tbox-a\tmd5\t0\tp\n' "$_HOOK_DROP_MARK" > "$log"
+  run _maybe_report_hook_drops "$log" 0 "box-a"
+  assert_output --partial "named a path this machine could not map"
+  printf 'ts\t%s\tsize\tbox-a\tmd5\t9\ts\n' "$_HOOK_DROP_MARK" >> "$log"
+  run _maybe_report_hook_drops "$log" 0 "box-a"
+  assert_output --partial "failed validation"
+  refute_output --partial "named a path"
+}
+
+@test "hook runs: a forged tool name cannot inject a log row or a terminal escape" {
+  _hook_run_log '{"hook_event_name":"PreToolUse","tool_name":"Write\nRAN-EVENT\tforged\u001b[2J"}' "line" "box-a" "0"
+  run cat "$CLEAT_STATE_DIR/hook-runs.log"
+  refute_output --partial $'\033[2J'
+  [ "$(grep -c RAN-EVENT "$CLEAT_STATE_DIR/hook-runs.log")" -eq 1 ] || {
+    echo "a forged tool name wrote a second log row"; return 1; }
+}
+
+@test "hook runs: the log is moved aside once it passes its cap" {
+  # It grows with every tool call, unlike the drop log, so it must not grow
+  # without bound.
+  _HOOK_RUN_LOG_MAX=200
+  _HOOK_RUN_LOG_EVERY=1
+  local i=0
+  while [ "$i" -lt 12 ]; do
+    _hook_run_log '{"hook_event_name":"Stop"}' "line $i" "box-a" "$i"
+    i=$((i + 1))
+  done
+  [ -f "$CLEAT_STATE_DIR/hook-runs.log.1" ] || { echo "the run log was never rotated"; return 1; }
+  local sz; sz="$(wc -c < "$CLEAT_STATE_DIR/hook-runs.log" | tr -d '[:space:]')"
+  [ "$sz" -le 400 ] || { echo "the run log grew past its cap: $sz bytes"; return 1; }
 }
 
 # ── cmd_login: browser bridge ───────────────────────────────────────────
@@ -2041,6 +2542,9 @@ _ev() {   # build one spool line. $1 = event name, rest = extra jq assignments
   cat > "$HOME/.claude/settings.json" <<EOF
 {"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"touch $TEST_TEMP/hook_ran"}]}]}}
 EOF
+  # The workspace exists, as a real one always does, so a hook that got past
+  # validation would have a directory to run in.
+  mkdir -p "$TEST_TEMP/project"
   local hooks_file="$TEST_TEMP/events.jsonl"
   : > "$hooks_file"
   _hook_bridge_watcher "$hooks_file" "$TEST_TEMP/project" >/dev/null 2>&1 &
@@ -2060,7 +2564,7 @@ EOF
   # The other half, and the one that stops the capability becoming a no-op with
   # a counter: a well-formed event carrying the REQUIRED transcript_path must
   # run, and the hook must see the host's own path rather than /workspace.
-  mkdir -p "$HOME/.claude"
+  mkdir -p "$HOME/.claude" "$TEST_TEMP/project"
   cat > "$HOME/.claude/settings.json" <<EOF
 {"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"cat > $TEST_TEMP/hook_stdin"}]}]}}
 EOF
@@ -2104,18 +2608,6 @@ EOF
   kill "$bpid" 2>/dev/null || true
   wait "$bpid" 2>/dev/null || true
   [ ! -f "$TEST_TEMP/BOX_CHOSE_THIS" ] || { echo "a command from a file inside /workspace ran on the host"; return 1; }
-}
-
-@test "hook bridge: the watcher is handed the WORKSPACE, not the resolved project" {
-  # In a fork box those differ, and translating to the project would point the
-  # user's host hook at the ORIGIN working tree from inside a fork box.
-  local body
-  body="$(declare -f exec_claude)"
-  [[ -n "$body" ]] || { echo "exec_claude not found"; return 1; }
-  echo "$body" | grep -qE '_hook_bridge_watcher "\$hooks_file" "\$_workspace"' || {
-    echo "the hook bridge is not handed \$_workspace, so a fork box would translate to the origin tree"
-    return 1
-  }
 }
 
 @test "hook bridge: an orphaned bridge exits without executing late events" {
@@ -2305,4 +2797,148 @@ EOF
   [ ! -L "$spool" ] || { echo "the swapped link survived"; return 1; }
   run cat "$TEST_TEMP/spool-target"
   assert_output "planted"
+}
+
+@test "hook bridge: a spool line is read no further than one byte past the cap" {
+  # F17. The cap was checked after `read -r line` had buffered the whole line,
+  # so the box chose how much host memory one line cost: 256 MB of line peaked
+  # the bridge at 1.7 GB.
+  _HOOK_LINE_MAX=64
+  local big; big="$(printf 'a%.0s' $(seq 1 300))"
+  printf '%s\n%s\n' "$big" '{"n":2}' \
+    | { while _hook_read_chunk; do printf '%s\n' "$_HOOK_CHUNK_LEN"; done; } > "$TEST_TEMP/chunks"
+  run cat "$TEST_TEMP/chunks"
+  assert_output "$(printf '65\n65\n65\n65\n40\n7')"
+}
+
+@test "hook bridge: the line cap counts bytes, not characters, under a UTF-8 locale" {
+  # A 95-byte line of 55 characters passed a 60-byte cap under C.UTF-8.
+  local utf8; utf8="$(_utf8_locale)"
+  [ -n "$utf8" ] || skip "no UTF-8 locale available on this host"
+  LC_ALL="$utf8"
+  _HOOK_LINE_MAX=64
+  local wide; wide="$(printf '\303\251%.0s' $(seq 1 40))"
+  run _hook_line_fits "$wide"
+  assert_failure
+  printf '%s\n' "$wide" | { _hook_read_chunk; printf '%s\n' "$_HOOK_CHUNK_LEN"; } > "$TEST_TEMP/len"
+  run cat "$TEST_TEMP/len"
+  assert_output "65"
+}
+
+# Run the real bridge for box-a over a spool, append $2 (already newline
+# terminated), and wait until the hook in the host settings has written
+# $TEST_TEMP/hook_stdin. $1 = what the spool holds before the bridge starts.
+# Both may end in a `_` that is dropped, so a caller's trailing newline survives
+# the command substitution that built it.
+_bridge_run_lines() {
+  local hooks_file="$TEST_TEMP/events.jsonl" bpid i
+  printf '%s' "${1%_}" > "$hooks_file"
+  _hook_bridge_watcher "$hooks_file" "$TEST_TEMP/project" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  printf '%s' "${2%_}" >> "$hooks_file"
+  for i in 1 2 3 4 5 6; do
+    [ -s "$TEST_TEMP/hook_stdin" ] && break
+    sleep 0.5
+  done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+}
+
+# A host settings file whose hook for event $1 appends its stdin to hook_stdin.
+_host_hook_appends() {
+  mkdir -p "$HOME/.claude" "$TEST_TEMP/project"
+  printf '{"hooks":{"%s":[{"hooks":[{"type":"command","command":"cat >> %s/hook_stdin"}]}]}}\n' \
+    "$1" "$TEST_TEMP" > "$HOME/.claude/settings.json"
+}
+
+@test "hook bridge: an oversized line is dropped once and the event after it still runs" {
+  _host_hook_appends Stop
+  _HOOK_LINE_MAX=256
+  local big; big="$(printf 'a%.0s' $(seq 1 2000))"
+  _bridge_run_lines "" "$(printf '{"hook_event_name":"Stop","pad":"%s"}\n{"hook_event_name":"Stop","n":2}\n_' "$big")"
+  run cat "$TEST_TEMP/hook_stdin"
+  assert_output --partial '"n":2'
+  refute_output --partial "aaaa"
+  run awk -F '\t' -v m="$_HOOK_DROP_MARK" '$2 == m { print $3 }' "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output "size"
+}
+
+@test "hook bridge: a spool rewritten while an oversized line is discarded runs its first event" {
+  # The discard of an oversized line is carried across polls, because one line
+  # can span two read windows. A spool that shrinks starts over, and the
+  # discard has to start over with it, or the first real event of the new
+  # spool is thrown away as the old line's tail with no drop row at all.
+  _host_hook_appends Stop
+  _HOOK_LINE_MAX=256
+  local hooks_file="$TEST_TEMP/events.jsonl" bpid i
+  : > "$hooks_file"
+  _hook_bridge_watcher "$hooks_file" "$TEST_TEMP/project" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  # No newline: the line is still going when the spool is replaced.
+  printf '{"hook_event_name":"Stop","pad":"%s' "$(printf 'a%.0s' $(seq 1 2000))" >> "$hooks_file"
+  for i in $(seq 1 20); do
+    [ -s "$CLEAT_STATE_DIR/hook-drops.log" ] && break
+    sleep 0.25
+  done
+  printf '{"hook_event_name":"Stop","n":2}\n' > "$hooks_file"
+  for i in $(seq 1 12); do
+    [ -s "$TEST_TEMP/hook_stdin" ] && break
+    sleep 0.5
+  done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run awk -F '\t' -v m="$_HOOK_DROP_MARK" '$2 == m { print $3 }' "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output "size"
+  run cat "$TEST_TEMP/hook_stdin"
+  assert_output --partial '"n":2'
+}
+
+@test "hook bridge: a hook directory that leaves the workspace before it is entered is refused" {
+  # The hook's directory was judged when the event was translated. The box can
+  # swap it for a link before the hook starts, so it is entered with cd -P and
+  # judged again from where it landed, never by name.
+  local ws; ws="$(_ws_on_disk)"
+  ln -s "$TEST_TEMP/outside" "$ws/swapped"
+  _enter_and_pwd() { _hook_enter_run_dir "$1" "$2" && pwd -P; }
+  run _enter_and_pwd "$ws/swapped" "$ws"
+  assert_failure
+  run _enter_and_pwd "$ws/src" "$ws"
+  assert_success
+  assert_output "$(cd -P "$ws/src" && pwd -P)"
+  # An empty directory is refused rather than left to `cd ""`, which bash 3.2
+  # treats as staying where the bridge already is.
+  _enter_from_ws() { cd "$ws" && _enter_and_pwd "" "$ws"; }
+  run _enter_from_ws
+  assert_failure
+}
+
+@test "hook drops: each row names its reason, box, spool line md5 and offset" {
+  # F20. Every drop was logged with the constant reason `payload` and nothing
+  # tying it to a box or to a line in the spool.
+  _host_hook_appends Stop
+  local l1='{"hook_event_name":"PreToolUse","tool_input":{"file_path":"/etc/passwd"}}'
+  local l2='{"hook_event_name":"bad name"}'
+  local l3='{"hook_event_name":"Stop"'
+  local l4='{"hook_event_name":"Stop"}'
+  _bridge_run_lines "" "$(printf '%s\n%s\n%s\n%s\n_' "$l1" "$l2" "$l3" "$l4")"
+  local h1 h2 h3
+  h1="$(printf '%s' "$l1" | _md5)"; h1="${h1%% *}"
+  h2="$(printf '%s' "$l2" | _md5)"; h2="${h2%% *}"
+  h3="$(printf '%s' "$l3" | _md5)"; h3="${h3%% *}"
+  run awk -F '\t' -v m="$_HOOK_DROP_MARK" '$2 == m { print $3, $4, $5, $6 }' "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output "$(printf 'path box-a %s 0\nname box-a %s %s\njson box-a %s %s' \
+    "$h1" "$h2" "$(( ${#l1} + 1 ))" "$h3" "$(( ${#l1} + ${#l2} + 2 ))")"
+}
+
+@test "hook runs: an event handed to the hooks is logged with its box, event, tool, md5 and offset" {
+  # F20. Only drops were recorded, so nothing could say which box event ran a
+  # hook.
+  _host_hook_appends PreToolUse
+  local l1='{"hook_event_name":"PreToolUse","tool_name":"Write","cwd":"/workspace","tool_input":{"file_path":"/workspace/a.ts"}}'
+  _bridge_run_lines "$(printf 'earlier\n_')" "$(printf '%s\n_' "$l1")"
+  local h1; h1="$(printf '%s' "$l1" | _md5)"; h1="${h1%% *}"
+  run awk -F '\t' -v m="$_HOOK_RUN_MARK" '$2 == m { print $3, $4, $5, $6, $7 }' "$CLEAT_STATE_DIR/hook-runs.log"
+  assert_output "box-a PreToolUse Write $h1 8"
 }

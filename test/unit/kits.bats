@@ -432,39 +432,241 @@ EOF
   done
 }
 
-@test "containment: the mask is an EMPTY overlay, never the host's own content" {
-  # A pass-through would hand the box the user's real instruction surfaces. None
-  # of these is read at the user level today, so passing content through would
-  # be inventing behaviour, and an empty mask turns a future vendor change into
-  # a missing feature the user reports rather than a host write primitive.
+@test "containment: a surface the box does not read stays an EMPTY overlay, never the host's content" {
+  # routines/ is on Claude Code's own deny list and no user-level read of it was
+  # found. Passing its content through would be inventing behaviour, and an
+  # empty mask turns a future vendor read into a missing feature the user
+  # reports rather than a host write primitive.
+  mkdir -p "$HOME/.claude/routines"
+  echo "HOST ROUTINE" > "$HOME/.claude/routines/nightly.md"
   mock_docker_images "cleat"
   run cmd_run "$TEST_TEMP/project"
   assert_success
-  run assert_docker_run_has "$CNAME" "${CNAME}/home/instr/rules:/home/coder/.claude/rules:ro"
+  run assert_docker_run_has "$CNAME" "${CNAME}/home/instr/routines:/home/coder/.claude/routines:ro"
   assert_success
-  [ -d "$CLEAT_RUN_DIR/$CNAME/home/instr/rules" ] || { echo "the overlay directory was never generated"; return 1; }
-  [ -z "$(ls -A "$CLEAT_RUN_DIR/$CNAME/home/instr/rules" 2>/dev/null)" ] || { echo "the mask overlay is not empty"; return 1; }
+  [ -d "$CLEAT_RUN_DIR/$CNAME/home/instr/routines" ] || { echo "the overlay directory was never generated"; return 1; }
+  [ -z "$(ls -A "$CLEAT_RUN_DIR/$CNAME/home/instr/routines" 2>/dev/null)" ] || { echo "the mask overlay is not empty"; return 1; }
+}
+
+@test "instruction masks: a host edit reaches the overlay in place, never by replacing the mount source" {
+  # The overlay is a bind source. A running container keeps the ORIGINAL inode,
+  # so a regeneration that replaced the directory or the file would leave the box
+  # reading the old copy until a recreate. The test holds the dir as its cwd and
+  # the file through a hard link, which keep the original inode exactly the way a
+  # bind mount does. A rule the user deletes must disappear too.
+  mkdir -p "$HOME/.claude/rules"
+  echo "v1" > "$HOME/.claude/rules/style.md"
+  echo "gone soon" > "$HOME/.claude/rules/old.md"
+  printf '{"bindings":[]}\n' > "$HOME/.claude/keybindings.json"
+  _generate_instr_overlay "$CNAME"
+  local o="$CLEAT_RUN_DIR/$CNAME/home/instr"
+  ln "$o/keybindings.json" "$TEST_TEMP/kb-held"
+
+  echo "v2" > "$HOME/.claude/rules/style.md"
+  rm -f "$HOME/.claude/rules/old.md"
+  printf '{"bindings":[{"context":"Chat","bindings":{}}]}\n' > "$HOME/.claude/keybindings.json"
+  cd "$o/rules"
+  _generate_instr_overlay "$CNAME"
+  run cat ./style.md
+  cd "$TEST_TEMP/project"
+  assert_output "v2"
+  [ ! -e "$o/rules/old.md" ] || { echo "a rule deleted on the host survived in the overlay"; return 1; }
+  cmp "$HOME/.claude/keybindings.json" "$TEST_TEMP/kb-held"
+}
+
+@test "instruction masks: cmd_start refreshes the copies" {
+  mkdir -p "$HOME/.claude/workflows"
+  echo "steps" > "$HOME/.claude/workflows/release.md"
+  mock_docker_images "cleat"
+  mock_docker_ps "$CNAME"
+  mock_docker_ps_a "$CNAME"
+  _container_has_kit_mounts() { return 0; }
+  _maybe_prompt_image_rebuild() { true; }
+  _maybe_prompt_init_recreate() { true; }
+  _maybe_prompt_claude_update() { true; }
+  exec_claude() { true; }
+  _print_summary_block() { true; }
+  show_first_run_tip() { true; }
+  run cmd_start
+  assert_success
+  cmp "$HOME/.claude/workflows/release.md" "$CLEAT_RUN_DIR/$CNAME/home/instr/workflows/release.md"
+}
+
+@test "instruction masks: cmd_resume refreshes the copies too" {
+  mkdir -p "$HOME/.claude/themes"
+  echo '{"name":"dusk"}' > "$HOME/.claude/themes/dusk.json"
+  mock_docker_images "cleat"
+  mock_docker_ps "$CNAME"
+  mock_docker_ps_a "$CNAME"
+  _container_has_kit_mounts() { return 0; }
+  _maybe_prompt_image_rebuild() { true; }
+  _maybe_prompt_init_recreate() { true; }
+  exec_claude() { true; }
+  _print_summary_block() { true; }
+  run cmd_resume
+  assert_success
+  cmp "$HOME/.claude/themes/dusk.json" "$CLEAT_RUN_DIR/$CNAME/home/instr/themes/dusk.json"
+}
+
+@test "instruction masks: the copy follows no symlink at any depth and keeps only files and dirs" {
+  # Every released box could write these surfaces on the host, so a planted
+  # `rules/x.md -> ~/.ssh/id_rsa` may already exist. Following it would load the
+  # key into the next box as a user rule. The top-level entry is not followed
+  # either, unlike commands/ and skills/.
+  mkdir -p "$TEST_TEMP/outside/dir" "$HOME/.claude/rules/sub" "$TEST_TEMP/dotfiles/themes"
+  echo "PRIVATE KEY BYTES" > "$TEST_TEMP/outside/id_rsa"
+  echo "PRIVATE KEY BYTES" > "$TEST_TEMP/outside/dir/inner"
+  echo "PRIVATE KEY BYTES" > "$TEST_TEMP/dotfiles/themes/t.json"
+  echo "PRIVATE KEY BYTES" > "$TEST_TEMP/dotfiles/kb.json"
+  echo "a real rule" > "$HOME/.claude/rules/real.md"
+  ln -s "$TEST_TEMP/outside/id_rsa" "$HOME/.claude/rules/key.md"
+  ln -s "$TEST_TEMP/outside/dir" "$HOME/.claude/rules/sub/linked"
+  mkfifo "$HOME/.claude/rules/pipe"
+  ln -s "$TEST_TEMP/dotfiles/themes" "$HOME/.claude/themes"
+  ln -s "$TEST_TEMP/dotfiles/kb.json" "$HOME/.claude/keybindings.json"
+  _generate_instr_overlay "$CNAME"
+  local o="$CLEAT_RUN_DIR/$CNAME/home/instr"
+  run cat "$o/rules/real.md"
+  assert_output "a real rule"
+  run grep -rl "PRIVATE KEY" "$o"
+  assert_failure
+  run find "$o" ! -type d ! -type f
+  assert_output ""
+  [ -z "$(ls -A "$o/themes")" ] || { echo "a symlinked themes dir was followed"; return 1; }
+  run cat "$o/keybindings.json"
+  assert_output '{"bindings":[]}'
 }
 
 @test "containment: the host targets are created inert, and an existing one is never replaced" {
   # VirtioFS refuses a nested mount whose target is missing inside the parent
-  # bind source, so every mask target has to exist on the host first. A JSON
-  # placeholder is `{}` rather than empty, because the reader that would choke
-  # on an invalid one is the user's OWN Claude Code.
+  # bind source, so every mask target has to exist on the host first. The
+  # placeholder is the one each file's reader takes as "nothing configured",
+  # because the reader that would choke on a wrong one is the user's OWN Claude
+  # Code: keybindings.json needs a bindings array, the rest take `{}`.
   printf '{"mine":true}\n' > "$HOME/.claude/launch.json"
   _ensure_kit_mask_targets
   [ -d "$HOME/.claude/rules" ] || { echo "a directory target was not created"; return 1; }
   run cat "$HOME/.claude/keybindings.json"
+  assert_output '{"bindings":[]}'
+  run cat "$HOME/.claude/daemon.json"
   assert_output "{}"
   run cat "$HOME/.claude/launch.json"
   assert_output --partial '"mine":true'
 }
 
-@test "containment: .config.json is never a mask target" {
-  # Masking creates an empty overlay on the HOST. Creating ~/.claude/.config.json
-  # there would destroy the user's global config.
+@test "containment: an earlier build's bare {} keybindings placeholder is repaired, a user's file is kept" {
+  printf '{}\n' > "$HOME/.claude/keybindings.json"
   _ensure_kit_mask_targets
-  [ ! -e "$HOME/.claude/.config.json" ] || { echo "cleat created ~/.claude/.config.json, which overwrites the user's global config"; return 1; }
+  run cat "$HOME/.claude/keybindings.json"
+  assert_output '{"bindings":[]}'
+  printf '{ "bindings": [] , "x": 1 }\n' > "$HOME/.claude/keybindings.json"
+  _ensure_kit_mask_targets
+  run cat "$HOME/.claude/keybindings.json"
+  assert_output '{ "bindings": [] , "x": 1 }'
+}
+
+@test "containment: a per-box state dir is never group or other writable, even under umask 002" {
+  # Claude Code refuses a seed-admin dir with group or other write, on the host
+  # and in the box alike. A umask of 002 is the default on many Linux hosts.
+  umask 002
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local p mode
+  for p in "$HOME/.claude/seed-admin" "$CLEAT_RUN_DIR/$CNAME/home/seed-admin"; do
+    [ -d "$p" ] || { echo "missing: $p"; return 1; }
+    mode="$(ls -ld "$p" | cut -c1-10)"
+    [ "${mode:5:1}" = "-" ] && [ "${mode:8:1}" = "-" ] || { echo "$p is $mode"; return 1; }
+  done
+}
+
+@test "containment: a directory where an instruction-surface file belongs is refused" {
+  mkdir -p "$HOME/.claude/keybindings.json"
+  run _ensure_kit_mask_targets
+  assert_failure
+  assert_output --partial "keybindings.json is a directory"
+  [ -d "$HOME/.claude/keybindings.json" ]
+}
+
+@test "containment: a broken symlink at an instruction-surface target is refused and kept" {
+  ln -s "$HOME/no-such-dotfile" "$HOME/.claude/loop.md"
+  run _ensure_kit_mask_targets
+  assert_failure
+  assert_output --partial "loop.md is a broken symlink"
+  [ -L "$HOME/.claude/loop.md" ]
+}
+
+@test "containment: a regular file where a per-box state dir belongs is refused" {
+  : > "$HOME/.claude/session-env"
+  run _ensure_kit_mask_targets
+  assert_failure
+  assert_output --partial "session-env is not a directory"
+}
+
+@test "containment: .config.json is never a mask target" {
+  # Masking creates an overlay whose target must exist on the HOST, and a
+  # ~/.claude/.config.json that exists is the file the host's Claude Code loads
+  # INSTEAD of the user's real global config.
+  _ensure_kit_mask_targets
+  [ ! -e "$HOME/.claude/.config.json" ] || { echo "cleat created ~/.claude/.config.json, which hijacks the user's global config"; return 1; }
+}
+
+# ── ~/.claude/.config.json: the host global config no mount can protect ─────
+#
+# Claude Code loads that file INSTEAD of ~/.claude.json when it exists and starts
+# every MCP server in it. A mount cannot close it (its host target would be the
+# very file that hijacks the config), so until the box-private ~/.claude lands
+# Cleat says so. Visibility, not a boundary.
+
+@test "host global config: cmd_start names a ~/.claude/.config.json that exists" {
+  printf '{"mcpServers":{"x":{"command":"true"}}}\n' > "$HOME/.claude/.config.json"
+  mock_docker_images "cleat"
+  mock_docker_ps "$CNAME"
+  mock_docker_ps_a "$CNAME"
+  _container_has_kit_mounts() { return 1; }
+  _maybe_note_missing_kit_masks() { true; }
+  _maybe_prompt_image_rebuild() { true; }
+  _maybe_prompt_init_recreate() { true; }
+  _maybe_prompt_claude_update() { true; }
+  exec_claude() { true; }
+  _print_summary_block() { true; }
+  show_first_run_tip() { true; }
+  run cmd_start
+  assert_success
+  assert_output --partial "~/.claude/.config.json"
+  assert_output --partial "starts every MCP server it lists"
+}
+
+@test "host global config: nothing is said when the file is absent" {
+  run _maybe_note_host_global_config
+  assert_success
+  assert_output ""
+}
+
+@test "host global config: a file that appears during a session is reported when it ends" {
+  # Neither Cleat nor Claude Code creates this file, so one that was not there
+  # when the session began is the unambiguous signal, and the end of the session
+  # is the last moment before the user is back at a shell running claude.
+  _host_open_cmd() { echo ""; }
+  _wait_for_coder_remap() { true; }
+  docker() {
+    case " $* " in
+      *" exec "*" runuser "*) printf '{"mcpServers":{}}\n' > "$HOME/.claude/.config.json" ;;
+    esac
+    command docker "$@"
+  }
+  run exec_claude "$CNAME" --dangerously-skip-permissions
+  assert_output --partial "appeared during this session"
+}
+
+@test "host global config: a file already there when the session began is not reported as new" {
+  printf '{}\n' > "$HOME/.claude/.config.json"
+  _host_open_cmd() { echo ""; }
+  _wait_for_coder_remap() { true; }
+  run exec_claude "$CNAME" --dangerously-skip-permissions
+  # The session really reached its end, where the check runs.
+  assert_output --partial "Session ended"
+  refute_output --partial "appeared during this session"
 }
 
 @test "kit: the commands mask is USER-level only; project commands stay writable via /workspace" {
@@ -811,7 +1013,7 @@ EOF
 /home/coder/.claude/skills
 /home/coder/.claude/plugins"
   local _p
-  for _p in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+  for _p in $_CLAUDE_PRIVATE_DIRS $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
     dests="$dests
 /home/coder/.claude/$_p"
   done
@@ -828,10 +1030,34 @@ EOF
   # signal an existing box gets, which is the deliberate trade: it tells, it
   # never forces.
   container_exists() { return 0; }
-  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/skills\n/home/coder/.claude/plugins'
+  local dests=$'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/skills\n/home/coder/.claude/plugins' _p
+  for _p in $_CLAUDE_PRIVATE_DIRS; do
+    dests="$dests
+/home/coder/.claude/$_p"
+  done
+  mock_docker_inspect "$dests"
   run _maybe_note_missing_kit_masks "$CNAME"
   assert_success
   assert_output --partial "predates the ~/.claude instruction-surface masks"
+}
+
+@test "kit: a box missing the per-box session-env, daemon and seed-admin dirs is told" {
+  # A box created before these joined _CLAUDE_PRIVATE_DIRS still writes the
+  # host's session-env and daemon dirs, which the host's own Claude Code runs
+  # content from. Bind mounts are baked at create, so the note is the only
+  # signal it gets. Every OTHER mount is present, so only the new dirs can fire.
+  container_exists() { return 0; }
+  local dests=$'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/skills\n/home/coder/.claude/plugins' _p
+  for _p in $_CLAUDE_PRIVATE_DIRS $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
+    case "$_p" in session-env|daemon|seed-admin) continue ;; esac
+    dests="$dests
+/home/coder/.claude/$_p"
+  done
+  mock_docker_inspect "$dests"
+  run _maybe_note_missing_kit_masks "$CNAME"
+  assert_success
+  assert_output --partial "predates the per-box ~/.claude state directories"
+  assert_output --partial "cleat rm && cleat"
 }
 
 @test "kit: a box missing the skills mask gets the recreate note" {
@@ -1517,6 +1743,78 @@ ssh"
   _generate_home_overlay "$CNAME" "/Users/someone/myproj" "key-abc"
   [ ! -L "$CLEAT_RUN_DIR/$CNAME/home/file-history" ]
   [ -d "$CLEAT_RUN_DIR/$CNAME/home/file-history" ]
+}
+
+# Audit every ~/.claude mount on the last recorded docker run for $1. Prints one
+# line per violation and nothing when the shape is clean. $2 is one more target,
+# relative to /home/coder/.claude, that may be writable (the docker cap's
+# host-path session key). Three rules:
+#   (a) the host's ~/.claude is mounted exactly once, at /home/coder/.claude
+#   (b) every writable target under /home/coder/.claude is on the allowlist
+#   (c) every writable source inside the host's ~/.claude is this project's own
+#       session dir or its history file
+_claude_home_mount_audit() {
+  local cname="$1" extra="${2:-}"
+  local line tok prev="" spec rest src dst opt rel roots=0
+  local key allow
+  key="$(_derive_project_session_key "$TEST_TEMP/project")"
+  allow=" settings.json history.jsonl projects/-workspace $_CLAUDE_PRIVATE_DIRS $extra "
+  line="$(grep "^docker run " "$DOCKER_CALLS" | grep "$cname" | tail -1)"
+  [ -n "$line" ] || { echo "no docker run recorded for $cname"; return 0; }
+  set -f
+  for tok in $line; do
+    if [ "$prev" = "-v" ]; then
+      spec="$tok"
+      src="${spec%%:*}"
+      rest="${spec#*:}"
+      dst="${rest%%:*}"
+      opt=""
+      [ "$rest" != "$dst" ] && opt="${rest#*:}"
+      if [ "$src" = "$HOME/.claude" ]; then
+        roots=$((roots + 1))
+        [ "$dst" = "/home/coder/.claude" ] || echo "the host ~/.claude is also mounted at $dst"
+      fi
+      if [ "$opt" != "ro" ]; then
+        case "$dst" in
+          /home/coder/.claude/*)
+            rel="${dst#/home/coder/.claude/}"
+            case "$allow" in *" $rel "*) ;; *) echo "writable target outside the allowlist: $rel" ;; esac ;;
+        esac
+        case "$src" in
+          "$HOME/.claude/projects/$key"|"$HOME/.claude/projects/$key/history.jsonl") ;;
+          "$HOME/.claude/"*) echo "writable source inside the host ~/.claude: ${src#$HOME/}" ;;
+        esac
+      fi
+    fi
+    prev="$tok"
+  done
+  set +f
+  [ "$roots" -eq 1 ] || echo "the host ~/.claude is mounted $roots times"
+  return 0
+}
+
+@test "containment: no writable mount under the box ~/.claude outside the allowlist" {
+  # The masks are a list of leaves. A second writable bind of the host's
+  # ~/.claude, or of anything inside it, sidesteps every one of them while
+  # every per-name test stays green, so the guard is over the whole mount shape.
+  mock_docker_images "cleat"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run _claude_home_mount_audit "$CNAME"
+  assert_output ""
+}
+
+@test "containment: the docker cap adds only its host-path session key to the writable allowlist" {
+  mock_docker_images "cleat"
+  _CLI_CAPS=(docker)
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local hostkey
+  hostkey="$(_claude_session_key "$TEST_TEMP/project")"
+  run assert_docker_run_has "$CNAME" ":/home/coder/.claude/projects/$hostkey"
+  assert_success
+  run _claude_home_mount_audit "$CNAME" "projects/$hostkey"
+  assert_output ""
 }
 
 @test "write_kits: an indented [kits] header is replaced, not duplicated" {

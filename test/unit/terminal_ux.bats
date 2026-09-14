@@ -336,6 +336,35 @@ MOCK
   refute_output --partial "Caps:"
 }
 
+@test "summary block: names the browser bridge when always turns the destination check off" {
+  # The mode was visible only through `cleat browser origins`, so a bypass set in
+  # a shell profile months ago launched every session with the gate off and
+  # nothing on screen saying so.
+  ACTIVE_CAPS=()
+  CLEAT_BROWSER_BRIDGE=always run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_output --partial "Browser:"
+  assert_output --partial "always"
+  assert_output --partial "(any origin the box picks, destination check off)"
+}
+
+@test "summary block: names the browser bridge when it is off" {
+  ACTIVE_CAPS=()
+  CLEAT_BROWSER_BRIDGE=off run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_output --partial "Browser:"
+  assert_output --partial "(nothing auto-opens, callback proxy still runs for an allowlisted origin)"
+}
+
+@test "summary block: the default bridge mode adds no row" {
+  # concept/21: the default launch stays quiet. A typo falls back to auto and is
+  # quiet with it, because auto is the mode actually in force.
+  ACTIVE_CAPS=()
+  unset CLEAT_BROWSER_BRIDGE
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "Browser:"
+  CLEAT_BROWSER_BRIDGE=alwayz run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "Browser:"
+}
+
 @test "summary block: omits Project line when project is empty" {
   ACTIVE_CAPS=()
   run _print_summary_block "cleat-test-12345678" ""

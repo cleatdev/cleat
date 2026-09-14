@@ -252,7 +252,7 @@ EOF
   # never clicks an auth URL, so the bridge and the callback proxy own it. That
   # rule is unchanged, but the call now carries a fourth argument: an auth URL
   # at a destination that is NOT on the allowlist opens nothing, which is what
-  # the gate exists for. The is_auth=1, dest=0 case has its own test above.
+  # the gate exists for. The is_auth=1, dest=0 case has its own test below.
   run _browser_should_open auto 1 1 1
   assert_success
 }
@@ -283,9 +283,10 @@ EOF
 }
 
 # ── _is_auth_url: OAuth URL classification ──────────────────────────────────
-# Auth means "carries a redirect_uri= query param", NOT "has a loopback
-# callback": Claude Code's code-paste login flow points redirect_uri at
-# console.anthropic.com and still must auto-open (the user cannot click a URL
+# Auth means an allowlisted origin plus a query redirect_uri that decodes to an
+# absolute http(s) URL, NOT "has a loopback callback": Claude Code's code-paste
+# login flow points redirect_uri at platform.claude.com (console.anthropic.com
+# in older releases) and still must auto-open (the user cannot click a URL
 # claude emits programmatically through the open shim).
 
 @test "auth url: loopback authorize URL classifies as auth" {
@@ -404,6 +405,20 @@ EOF
   done
 }
 
+@test "origin gate: the shipped list is exactly the catalogued set" {
+  # The test above loops over the list itself, so it proves the gate matches
+  # whatever the list holds. This pins what it holds: a dropped vendor stops
+  # auto-opening its login, and an added host widens what the box can open.
+  run bash -c 'printf "%s\n" $1 | LC_ALL=C sort' _ "$_BROWSER_ORIGINS"
+  assert_success
+  assert_output "$(printf '%s\n' \
+    accounts.google.com app.netlify.com app.planetscale.com app.pulumi.com \
+    app.terraform.io auth.openai.com claude.ai claude.com cli-auth.heroku.com \
+    console.anthropic.com dash.cloudflare.com github.com gitlab.com \
+    login.docker.com login.microsoftonline.com microsoft.com \
+    platform.claude.com sentry.io www.npmjs.com)"
+}
+
 @test "origin gate: a near miss is not a match" {
   # Exact membership, never a suffix: a *claude.ai pattern also matches
   # evilclaude.ai, which is how an origin allowlist usually fails.
@@ -439,6 +454,47 @@ EOF
   assert_failure
   run _bridge_host_is_local "172.32.0.1"
   assert_failure
+
+  # The env and config readers already drop a local host before it reaches the
+  # list, so the loop above cannot tell whether _bridge_dest_allowed's OWN
+  # loopback check does any work: the origin check would deny it anyway. That is
+  # the shape a mutation cannot see. Force the origin check to PASS, so the only
+  # thing that can still refuse a loopback or private host is the check inside
+  # _bridge_dest_allowed. Removing that line then OPENS the URL, which is the
+  # whole danger: an authenticated navigation into a service on the host.
+  _bridge_origin_allowed() { return 0; }
+  for h in localhost sub.localhost 127.0.0.1 127.1.2.3 0.0.0.0 \
+           169.254.169.254 10.1.2.3 192.168.1.1 172.16.0.1 172.31.255.1 \
+           printer.local 2130706433 0177.0.0.1; do
+    run _bridge_dest_allowed "http://${h}:8080/x"
+    assert_failure
+  done
+  # Control: a genuine public host with the origin check forced on still opens,
+  # so the loop fails for the right reason and not because the stub denies all.
+  run _bridge_dest_allowed "https://claude.ai/oauth"
+  assert_success
+}
+
+@test "origin gate: an IPv4 address written as one number, in hex or in octal is refused" {
+  # The loopback rule matched dotted text, and a browser does not. WHATWG URL
+  # parsing reads 2130706433, 0x7f000001, 0177.0.0.1 and 127.1 as 127.0.0.1,
+  # and 0 as 0.0.0.0, so each was an authenticated navigation into the host that
+  # the text test waved through.
+  local h
+  for h in 2130706433 0x7f000001 0177.0.0.1 127.1 0 0x7f.0.0.1; do
+    run cmd_browser allow "$h"
+    assert_failure
+  done
+  CLEAT_BROWSER_ORIGINS="2130706433 0x7f000001 0177.0.0.1 127.1 0 0x7f.0.0.1"
+  for h in 2130706433 0x7f000001 0177.0.0.1 127.1 0 0x7f.0.0.1; do
+    run _bridge_dest_allowed "http://${h}:8080/x"
+    assert_failure
+  done
+  # A plain dotted quad outside the ranges is still just a host the list decides.
+  run _bridge_host_is_local "8.8.8.8"
+  assert_failure
+  run _bridge_host_is_local "203.0.113.255"
+  assert_failure
 }
 
 @test "origin gate: a loopback redirect_uri VALUE still parses (hands-free login)" {
@@ -468,6 +524,34 @@ EOF
   done
 }
 
+@test "origins env: an upper-case scheme is a scheme and a non-http one is refused" {
+  # Only a lower-case http:// or https:// was recognised as a URL, so
+  # HTTPS://a.example.com was read as a bare host and its host came back as
+  # `https`, and ftp://b.example.com allowed a host called `ftp`. Same in the
+  # config file and in cleat browser allow.
+  CLEAT_BROWSER_ORIGINS="HTTPS://a.example.com ftp://b.example.com"
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[browser]\norigin = Http://c.example.com/\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _bridge_dest_allowed "https://a.example.com/x"
+  assert_success
+  run _bridge_dest_allowed "https://c.example.com/x"
+  assert_success
+  local h
+  for h in https http ftp b.example.com; do
+    run _bridge_dest_allowed "https://${h}/x"
+    assert_failure
+  done
+  run _bridge_origins_from_env bad
+  assert_output --partial "ftp://b.example.com"
+  run cmd_browser allow HTTPS://d.example.com
+  assert_success
+  assert_output --partial "d.example.com"
+  run cmd_browser allow ftp://e.example.com
+  assert_failure
+  run _bridge_dest_allowed "https://d.example.com/x"
+  assert_success
+}
+
 @test "origins env: a malformed entry is dropped, never treated as a wildcard" {
   CLEAT_BROWSER_ORIGINS="*.example.com  evil example.com@attacker.tld  ok.example.com"
   run _bridge_dest_allowed "https://anything.example.com/x"
@@ -479,6 +563,29 @@ EOF
   # And it is named, or it reads as "I allowed it and it still does not work".
   run _bridge_origins_from_env bad
   assert_output --partial "*.example.com"
+}
+
+@test "origins env: a wildcard entry is never expanded against the working directory" {
+  # The split was an unquoted `for e in $raw` with globbing on, and the watcher
+  # runs in the project folder, which the box writes. A file named
+  # `evil.tld#.example.com` turned `*.example.com` into an entry whose authority
+  # is evil.tld, and `*` alone allowed every file name in the folder.
+  mkdir -p "$TEST_TEMP/globcwd"
+  : > "$TEST_TEMP/globcwd/evil.tld#.example.com"
+  : > "$TEST_TEMP/globcwd/evil.example"
+  cd "$TEST_TEMP/globcwd"
+  CLEAT_BROWSER_ORIGINS="*.example.com *"
+  run _bridge_dest_allowed "https://evil.tld/x"
+  assert_failure
+  run _bridge_dest_allowed "https://evil.example/x"
+  assert_failure
+  run _bridge_origins_from_env bad
+  assert_output --partial "*.example.com"
+  # Globbing is back on for the caller once the split is done.
+  _bridge_origins_from_env ok > /dev/null
+  local seen=( "$TEST_TEMP/globcwd"/evil.* )
+  run printf '%s\n' "${#seen[@]}"
+  assert_output "2"
 }
 
 @test "origins env: an absurd value is ignored rather than walked per claim" {
@@ -493,10 +600,21 @@ EOF
   # /workspace/.cleat is a file the caged agent edits as ordinary work, so an
   # allowlist it can write is not an allowlist. The trust prompt does not save
   # it either: that prompt's subject line names capabilities.
+  #
+  # The project file has to sit where a regression would read it. Written to a
+  # directory nothing resolves, an ADDED project read passed this test. So the
+  # project is resolved (_RESOLVED_PROJECT) and is the working directory, and
+  # the global config exists, because its reader returns before any read when
+  # the file is missing.
   mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
   printf '[browser]\norigin = fromglobal.example.com\n' > "$CLEAT_GLOBAL_CONFIG"
   printf '[browser]\norigin = fromproject.example.com\n' > "$TEST_TEMP/.cleat"
+  cd "$TEST_TEMP"
+  _RESOLVED_PROJECT="$TEST_TEMP"
+  CLEAT_BROWSER_ORIGINS="fromenv.example.com"
   run _bridge_dest_allowed "https://fromglobal.example.com/x"
+  assert_success
+  run _bridge_dest_allowed "https://fromenv.example.com/x"
   assert_success
   run _bridge_dest_allowed "https://fromproject.example.com/x"
   assert_failure
@@ -518,6 +636,31 @@ EOF
   assert_output --partial "already allowed"
 }
 
+@test "origins config: cleat browser allow keeps every origin added before it" {
+  # The rewrite stored an existing line as everything after the word origin,
+  # " = host", and wrote it back behind a fresh "origin = ". Each allow added one
+  # more "= " to every earlier line, so only the newest origin still parsed. A
+  # comment or another key in the section came back as an origin too.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[browser]\n# added for the vpn login\nnote = keep me\norigin = seeded.example.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_browser allow a.example.com
+  assert_success
+  run cmd_browser allow b.example.com
+  assert_success
+  local h
+  for h in seeded.example.com a.example.com b.example.com; do
+    run _bridge_dest_allowed "https://${h}/x"
+    assert_success
+  done
+  run grep -c '= =' "$CLEAT_GLOBAL_CONFIG"
+  assert_output "0"
+  run cat "$CLEAT_GLOBAL_CONFIG"
+  assert_output --partial "# added for the vpn login"
+  assert_output --partial "note = keep me"
+  refute_output --partial "origin = note"
+  refute_output --partial "origin = #"
+}
+
 @test "origins config: cleat browser allow refuses a loopback host and a non-host" {
   run cmd_browser allow localhost
   assert_failure
@@ -525,6 +668,22 @@ EOF
   assert_failure
   run cmd_browser allow "not a host"
   assert_failure
+}
+
+@test "origins: a loopback or private entry is listed as ignored, never as accepted" {
+  # The gate never opens one, so showing it under the accepted origins reads as
+  # "I allowed it and it still does not work".
+  export CLEAT_BROWSER_ORIGINS="localhost auth.example.com"
+  run _bridge_origins_from_env ok
+  assert_output "auth.example.com"
+  run _bridge_origins_from_env bad
+  assert_output "localhost"
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[browser]\norigin = 127.0.0.1\norigin = sso.example.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _bridge_origins_from_config ok
+  assert_output "sso.example.com"
+  run _bridge_origins_from_config bad
+  assert_output "127.0.0.1"
 }
 
 @test "auth url: an allowlisted authorize URL still classifies as auth" {
@@ -537,6 +696,35 @@ EOF
   # only to \$BROWSER and never prints it, so deferring this one strands a login
   # with nothing on screen to recover from.
   run _is_auth_url "https://claude.ai/oauth/authorize?code=true&client_id=x&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=user"
+  assert_success
+}
+
+# The two shapes below are the URLs Claude Code 2.1.270 builds, copied from its
+# authorize-URL builder: CLAUDE_AI_AUTHORIZE_URL is claude.com/cai/oauth/authorize,
+# CONSOLE_AUTHORIZE_URL is platform.claude.com/oauth/authorize, and the manual
+# flow's redirect_uri is platform.claude.com/oauth/code/callback. Neither host
+# was on the shipped list, so the hands-free login was refused in every mode.
+
+@test "auth url: the claude.ai login Claude Code opens today, on claude.com" {
+  local loopback="https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback&scope=user%3Ainference+user%3Aprofile&code_challenge=abc&code_challenge_method=S256&state=xyz"
+  run _is_auth_url "$loopback"
+  assert_success
+  # And it earns the callback proxy, which is what makes the login hands-free.
+  run _extract_callback_port "$loopback"
+  assert_success
+  assert_output "45454"
+  run _is_auth_url "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=abc&code_challenge_method=S256&state=xyz"
+  assert_success
+}
+
+@test "auth url: the Console login Claude Code opens today, on platform.claude.com" {
+  local loopback="https://platform.claude.com/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A45455%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge=abc&code_challenge_method=S256&state=xyz"
+  run _is_auth_url "$loopback"
+  assert_success
+  run _extract_callback_port "$loopback"
+  assert_success
+  assert_output "45455"
+  run _is_auth_url "https://platform.claude.com/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key&code_challenge=abc&code_challenge_method=S256&state=xyz"
   assert_success
 }
 
@@ -573,6 +761,16 @@ EOF
   assert_failure
   run _is_auth_url "https://claude.ai/x?redirect_uri=javascript%3Aalert(1)"
   assert_failure
+}
+
+@test "auth url: a redirect_uri whose authority does not parse is not auth" {
+  # The decoded callback has to be a URL whose host parses, so userinfo in the
+  # redirect_uri does not make an allowlisted authorize URL auth.
+  run _is_auth_url "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Fuser%40evil.example%2Fcb"
+  assert_failure
+  # The control: the same URL with a plain loopback callback.
+  run _is_auth_url "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb"
+  assert_success
 }
 
 @test "auth url: redirect_uri in the PATH is still not auth" {
@@ -630,26 +828,40 @@ EOF
 }
 
 # Run the watcher against one URL and stop. $1 = the URL, $2 = bridge mode,
-# $3 = host_opens_clicks, $4 = container name (empty for no proxy).
+# $3 = host_opens_clicks, $4 = container name (empty for no proxy), $5 = the log
+# text that means the watcher is done with this URL (a grep basic regex).
+#
+# The wait ends on that text and never on a count of polls sized to the fast
+# case. A proxy that never binds spends the watcher's whole readiness loop
+# before its line is written, and a fixed count of polls lost that race on a
+# slow runner. The deadline is only a backstop.
 _bw_run_once() {
   local url="$1" mode="${2:-auto}" clicks="${3:-1}" cname="${4:-}"
+  local want="${5:-opening URL\|deferring URL\|BLOCKED-ORIGIN}"
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
   _bw_fake_open
   _browser_watcher "$dir" "$TEST_TEMP/fake_open" "$cname" "$mode" "$clicks" >/dev/null 2>&1 &
   local wpid=$!
   sleep 0.7
   printf '%s' "$url" > "$dir/.browser-open"
-  local i
-  for i in 1 2 3 4 5 6 7 8; do
-    grep -q "opening URL\|deferring URL\|BLOCKED-ORIGIN" "$dir/.proxy-log" 2>/dev/null && break
+  local i=0
+  while [ "$i" -lt 25 ]; do
+    grep -q "$want" "$dir/.proxy-log" 2>/dev/null && break
     sleep 0.4
+    i=$(( i + 1 ))
   done
   kill "$wpid" 2>/dev/null || true
   wait "$wpid" 2>/dev/null || true
 }
 
 @test "browser bridge: an unallowlisted origin is refused and never opened" {
-  _bw_run_once "https://evil.example.com/pwn?redirect_uri=x" auto 1 ""
+  # Retargeted: the fixture was https://evil.example.com/pwn?redirect_uri=x,
+  # which has no OAuth shape. The refusal marker is now written only for a URL
+  # that listing its origin would have opened, because the notice it feeds
+  # prints `cleat browser allow`, and for a plain link that command fixes
+  # nothing. The property this protected (an unlisted origin never opens and
+  # its refusal is logged with the origin) is unchanged, on a real authorize URL.
+  _bw_run_once "https://evil.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback" auto 1 ""
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "the bridge opened a destination the box chose"; return 1; }
   run cat "$TEST_TEMP/clip/.proxy-log"
   assert_output --partial "BLOCKED-ORIGIN"
@@ -740,15 +952,133 @@ _bw_run_once() {
   _extract_callback_port() { echo "1455"; return 0; }
   _auth_callback_proxy() { sleep 5; }    # starts, never touches the ready file
   _port_in_use() { return 1; }
-  _bw_run_once "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb" auto 1 "mybox"
+  # "deferring URL" is written after "never bound", so waiting for it cannot
+  # stop the watcher before the line this test reads.
+  _bw_run_once "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb" auto 1 "mybox" "deferring URL"
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "the browser opened before the callback listener existed"; return 1; }
   run cat "$TEST_TEMP/clip/.proxy-log"
   assert_output --partial "never bound"
 }
 
+@test "browser bridge: a device-flow page at a listed origin defers in auto" {
+  # The current contract, pinned so the docs stay honest: a listed origin is
+  # auto-opened only for an OAuth authorize URL. gh prints its device link and
+  # code, and the user opens the link by clicking it. Not the bridge.
+  run _bridge_dest_allowed "https://microsoft.com/devicelogin"
+  assert_success
+  run _is_auth_url "https://microsoft.com/devicelogin"
+  assert_failure
+  _bw_run_once "https://github.com/login/device" auto 0 ""
+  [ ! -f "$TEST_TEMP/opened.log" ] || { echo "auto mode opened a device-flow page; the docs say it does not"; return 1; }
+  run cat "$TEST_TEMP/clip/.proxy-log"
+  assert_output --partial "deferring URL to terminal"
+}
+
 @test "browser bridge: always is a full bypass, by design and documented" {
   _bw_run_once "https://evil.example.com/x" always 1 ""
   [ -f "$TEST_TEMP/opened.log" ] || { echo "always must keep opening every origin, or one wrong default entry is unrecoverable"; return 1; }
+}
+
+# ── the rate cap ────────────────────────────────────────────────────────────
+
+@test "rate cap: a seventh open inside a minute is refused, logged and the watcher keeps running" {
+  # Before the cap, 29 to 40 distinct URLs opened in 15 to 25 seconds with no
+  # line saying anything. always is the mode with no other gate in the way, and
+  # the cap holds there too: the bypass lifts the destination check, not this.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _bw_fake_open
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  local i j seen
+  for i in 1 2 3 4 5 6 7; do
+    printf 'https://x.example/rate/%s' "$i" > "$dir/.browser-open"
+    for j in 1 2 3 4 5 6 7 8 9 10; do
+      seen="$(grep -c "opening URL\|$_BROWSER_CAPPED_MARK" "$dir/.proxy-log" 2>/dev/null || true)"
+      [ "${seen:-0}" -ge "$i" ] && break
+      sleep 0.3
+    done
+  done
+  local alive=0; kill -0 "$wpid" 2>/dev/null && alive=1
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  [ "$alive" = 1 ] || { echo "the watcher stopped at the cap, so a later login would find nobody polling"; return 1; }
+  run wc -l < "$TEST_TEMP/opened.log"
+  [ "$(tr -d '[:space:]' <<< "$output")" = "6" ] || { echo "expected 6 opens inside the minute, got: $output"; cat "$dir/.proxy-log"; return 1; }
+  run grep "$_BROWSER_CAPPED_MARK" "$dir/.proxy-log"
+  assert_success
+  assert_output --partial "limit=6/min,30/session"
+  assert_output --partial "url=https://x.example/rate/7"
+  # The ledger is outside the bind mount. Inside it, the box could empty it
+  # between two opens and the minute cap would be a number in a comment.
+  [ -s "$TEST_TEMP/clipclaim/.opens" ] || { echo "the minute ledger is not in the claim dir"; return 1; }
+  [ ! -e "$dir/.opens" ] || { echo "the minute ledger landed inside the box's clip dir"; return 1; }
+}
+
+@test "rate cap: the watcher counts its own opens toward the session cap" {
+  # The helper refusing at thirty proves nothing unless the watcher hands it a
+  # count that grows. It is also the only cap left when the claim dir cannot be
+  # created outside the mount. Lowered here in the sourced shell, and the
+  # minute cap raised out of the way, so three URLs reach it.
+  _BROWSER_RATE_PER_SESSION=2
+  _BROWSER_RATE_PER_MIN=100
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  _bw_fake_open
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "" "always" "0" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  local i j seen
+  for i in 1 2 3; do
+    printf 'https://x.example/session/%s' "$i" > "$dir/.browser-open"
+    for j in 1 2 3 4 5 6 7 8 9 10; do
+      seen="$(grep -c "opening URL\|$_BROWSER_CAPPED_MARK" "$dir/.proxy-log" 2>/dev/null || true)"
+      [ "${seen:-0}" -ge "$i" ] && break
+      sleep 0.3
+    done
+  done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  run wc -l < "$TEST_TEMP/opened.log"
+  [ "$(tr -d '[:space:]' <<< "$output")" = "2" ] || { echo "expected 2 opens under a session cap of 2, got: $output"; cat "$dir/.proxy-log"; return 1; }
+  run grep "$_BROWSER_CAPPED_MARK" "$dir/.proxy-log"
+  assert_success
+  assert_output --partial "limit=100/min,2/session url=https://x.example/session/3"
+  # The line the watcher wrote is the line the report reads, so the marker
+  # cannot drift between the two.
+  run _maybe_report_capped_opens "$dir/.proxy-log" 0
+  assert_output --partial "Did not open"
+  assert_output --partial "https://x.example/session/3"
+  refute_output --partial "https://x.example/session/1"
+}
+
+@test "rate cap: thirty opens is the ceiling for one session" {
+  run _browser_rate_take "$TEST_TEMP/ledger" 29
+  assert_success
+  run _browser_rate_take "$TEST_TEMP/ledger-2" 30
+  assert_failure
+}
+
+@test "rate cap: an open older than the minute stops counting" {
+  # The cap is a window, not a lifetime ban: a login after the window works.
+  local now old i; now="$(date +%s)"; old=$(( now - 61 ))
+  : > "$TEST_TEMP/ledger"
+  for i in 1 2 3 4 5 6; do printf '%s\n' "$old" >> "$TEST_TEMP/ledger"; done
+  run _browser_rate_take "$TEST_TEMP/ledger" 0
+  assert_success
+  : > "$TEST_TEMP/ledger"
+  for i in 1 2 3 4 5 6; do printf '%s\n' "$now" >> "$TEST_TEMP/ledger"; done
+  run _browser_rate_take "$TEST_TEMP/ledger" 0
+  assert_failure
+}
+
+@test "rate cap: a malformed or future ledger entry neither counts nor breaks the count" {
+  local now; now="$(date +%s)"
+  printf '%s\n' "08" "abc" "$(( now + 3600 ))" "$(( now + 3600 ))" "$(( now + 3600 ))" \
+    "$(( now + 3600 ))" "$(( now + 3600 ))" "$(( now + 3600 ))" "99999999999999999999" > "$TEST_TEMP/ledger"
+  run _browser_rate_take "$TEST_TEMP/ledger" 0
+  assert_success
+  refute_output --partial "value too great"
+  refute_output --partial "syntax error"
 }
 
 # ── the denial report on the terminal ───────────────────────────────────────
@@ -792,6 +1122,78 @@ _bw_run_once() {
     "$_BROWSER_BLOCKED_MARK" > "$log"
   run _maybe_report_blocked_opens "$log" 0
   refute_output --partial $'\033[2J'
+}
+
+@test "blocked report: the allow line names the URL's own host, never the logged origin field" {
+  # The field is box-writable text. Control bytes in it must never reach the
+  # terminal, and it must never pick the host the allow line names.
+  local log="$TEST_TEMP/.proxy-log"
+  printf '[browser-watcher 10:00:00] %s origin=evil.example\033[2J url=https://auth.example.com/oauth/authorize?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A45454%%2Fcb\n' \
+    "$_BROWSER_BLOCKED_MARK" > "$log"
+  run _maybe_report_blocked_opens "$log" 0
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "evil.example"
+  refute_output --partial $'\033[2J'
+}
+
+@test "blocked report: a loopback login gets no allow line, because allow refuses it" {
+  local log="$TEST_TEMP/.proxy-log"
+  printf '[browser-watcher 10:00:00] %s origin=localhost url=http://localhost:8080/oauth/authorize?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A8080%%2Fcb\n' \
+    "$_BROWSER_BLOCKED_MARK" > "$log"
+  run _maybe_report_blocked_opens "$log" 0
+  assert_output --partial "http://localhost:8080/oauth/authorize"
+  assert_output --partial "never opens a loopback or private address"
+  refute_output --partial "cleat browser allow"
+}
+
+@test "capped report: names the URL the cap held back and how many" {
+  # Claude Code hands a loopback authorize URL only to $BROWSER, so a capped
+  # login used to look like a browser that never opened, with the URL in a
+  # log inside the box's own clip dir and nothing on the terminal.
+  local log="$TEST_TEMP/.proxy-log" i
+  : > "$log"
+  for i in 1 2 3 4; do
+    printf '[browser-watcher 10:00:0%s] %s limit=6/min,30/session url=https://claude.ai/oauth/authorize?n=%s\n' \
+      "$i" "$_BROWSER_CAPPED_MARK" "$i" >> "$log"
+  done
+  run _maybe_report_blocked_opens "$log" 0
+  assert_success
+  assert_output --partial "browser URLs from the box"
+  assert_output --partial "(rate cap: 6 a minute, 30 a session)"
+  assert_output --partial "https://claude.ai/oauth/authorize?n=1"
+  assert_output --partial "...and 1 more"
+  refute_output --partial "https://claude.ai/oauth/authorize?n=4"
+  # A capped open is not an origin refusal, so no allow line is offered.
+  refute_output --partial "cleat browser allow"
+}
+
+@test "capped report: only this session, never a previous one" {
+  # Without the offset a capped open from an earlier session re-fires on every
+  # run, which is the nag concept/21 forbids.
+  local log="$TEST_TEMP/.proxy-log"
+  printf '[browser-watcher 09:00:00] %s limit=6/min,30/session url=https://old.example.com/\n' \
+    "$_BROWSER_CAPPED_MARK" > "$log"
+  local off; off="$(wc -c < "$log" | tr -d ' ')"
+  printf '[browser-watcher 10:00:00] opening URL on host url=https://claude.ai/x\n' >> "$log"
+  run _maybe_report_capped_opens "$log" "$off"
+  assert_success
+  assert_output ""
+}
+
+@test "capped report: a forged line cannot inject terminal control bytes or a heading" {
+  # The box writes the proxy log, so the line is box-authored by construction.
+  # The limits printed come from the constants, never from the logged field.
+  local log="$TEST_TEMP/.proxy-log"
+  printf '[browser-watcher 10:00:00] %s limit=9999/min,9999/session url=https://a.example.com/\033[2Jwiped\n' \
+    "$_BROWSER_CAPPED_MARK" > "$log"
+  printf 'x[browser-watcher 10:00:00] %s limit=6/min,30/session url=https://unanchored.example/\n' \
+    "$_BROWSER_CAPPED_MARK" >> "$log"
+  run _maybe_report_capped_opens "$log" 0
+  assert_output --partial "https://a.example.com/"
+  assert_output --partial "(rate cap: 6 a minute, 30 a session)"
+  refute_output --partial $'\033[2J'
+  refute_output --partial "9999"
+  refute_output --partial "unanchored.example"
 }
 
 # ── stale debounce markers ──────────────────────────────────────────────────
@@ -1138,6 +1540,223 @@ EOF
   kill -TERM "$ppid" 2>/dev/null || true
   process_exited "$ppid" || { echo "proxy subshell survived TERM"; kill -9 "$ppid" 2>/dev/null; return 1; }
   process_exited "$pypid" || { echo "python backend was orphaned"; kill -9 "$pypid" 2>/dev/null; return 1; }
+}
+
+# ── Callback proxy readiness ─────────────────────────────────────────────────
+# The watcher opens nothing until the backend writes the ready file, so a
+# backend that stops writing it ends every hands-free login. Every watcher test
+# stubs the proxy to touch the file itself, which is why these two drive the
+# real backends. Neither connects to the port: TCP-LISTEN without fork accepts
+# a single connection, and that one belongs to the login. The wait is the
+# watcher's own, 20 polls of 0.1s.
+
+@test "callback proxy: the socat backend signals readiness once listening" {
+  mkdir -p "$TEST_TEMP/bin"
+  cat > "$TEST_TEMP/bin/socat" <<EOF
+#!/usr/bin/env bash
+echo "\$\$" > "$TEST_TEMP/socat.pid"
+exec sleep 30
+EOF
+  chmod +x "$TEST_TEMP/bin/socat"
+  local rf="$TEST_TEMP/ready-socat"
+  PATH="$TEST_TEMP/bin:$PATH" _auth_callback_proxy 45311 mybox "$TEST_TEMP/plog-rs" "$rf" 3>&- &
+  local ppid=$! i=0
+  while [ "$i" -lt 20 ]; do
+    [ -f "$rf" ] && break
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  local ready=0; [ -f "$rf" ] && ready=1
+  kill -TERM "$ppid" 2>/dev/null || true
+  process_exited "$ppid" || kill -9 "$ppid" 2>/dev/null || true
+  if [ -s "$TEST_TEMP/socat.pid" ]; then
+    process_exited "$(cat "$TEST_TEMP/socat.pid")" || kill -9 "$(cat "$TEST_TEMP/socat.pid")" 2>/dev/null || true
+  fi
+  [ "$ready" = 1 ] || { echo "the socat backend never wrote the readiness file, so the watcher would open nothing"; return 1; }
+}
+
+@test "callback proxy: the python backend signals readiness after a real bind" {
+  command -v python3 >/dev/null 2>&1 || skip "python3 is not on this host"
+  local farm="$TEST_TEMP/nosocat-ready"
+  _bb_tool_farm "$farm" bash date cat sleep seq python3
+  local port
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  local rf="$TEST_TEMP/ready-python"
+  PATH="$farm" _auth_callback_proxy "$port" mybox "$TEST_TEMP/plog-rp" "$rf" 3>&- &
+  local ppid=$! i=0
+  while [ "$i" -lt 20 ]; do
+    [ -f "$rf" ] && break
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  local ready=0; [ -f "$rf" ] && ready=1
+  kill -TERM "$ppid" 2>/dev/null || true
+  process_exited "$ppid" || kill -9 "$ppid" 2>/dev/null || true
+  [ "$ready" = 1 ] || { echo "the python backend never wrote the readiness file, so the watcher would open nothing"; return 1; }
+}
+
+# ── Hosts with no timeout(1), and both loopbacks ─────────────────────────────
+
+# A PATH holding only the named tools, so a test can take timeout(1) away the
+# way a stock macOS does. Anything a test needs by name must be listed.
+_bb_tool_farm() {
+  local farm="$1" t p; shift
+  mkdir -p "$farm"
+  for t in "$@"; do
+    p="$(command -v "$t" 2>/dev/null)" || continue
+    ln -sf "$p" "$farm/$t"
+  done
+}
+
+# A listener on one loopback, $1 = 4 or 6, that never accepts. It writes its
+# port to $2 once bound, or creates $2.nobind when that loopback does not exist.
+# fd 3 is closed so a straggler cannot hold bats open.
+_bb_loopback_listener() {
+  python3 - "$1" "$2" 3>&- <<'PY' &
+import os, socket, sys, time
+fam, out = sys.argv[1], sys.argv[2]
+try:
+    if fam == "6":
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s.bind(("::1", 0))
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+    s.listen(8)
+except OSError:
+    open(out + ".nobind", "w").close()
+    sys.exit(0)
+with open(out + ".tmp", "w") as f:
+    f.write(str(s.getsockname()[1]))
+os.rename(out + ".tmp", out)
+time.sleep(60)
+PY
+}
+
+@test "callback proxy: the socat wait stays bounded on a host with no timeout(1)" {
+  # A stock macOS ships no timeout(1), and the bound was written as
+  # `command -v timeout && ...`, so there the port the box named stayed bound
+  # until a connection came. perl's alarm is the fallback. The wait is 1s here
+  # and the stand-in socat never exits, so only the bound can end it.
+  local farm="$TEST_TEMP/notimeout"
+  _bb_tool_farm "$farm" bash date cat sleep seq perl
+  [ -x "$farm/perl" ] || skip "perl is not on this host"
+  cat > "$farm/socat" <<EOF
+#!$(command -v bash)
+echo "\$\$" > "$TEST_TEMP/socat.pid"
+exec sleep 30
+EOF
+  chmod +x "$farm/socat"
+  _ACP_WAIT_SECS=1
+  PATH="$farm" _auth_callback_proxy 45997 mybox "$TEST_TEMP/plog7" &
+  local ppid=$! i ended=0
+  for i in $(seq 1 40); do
+    kill -0 "$ppid" 2>/dev/null || { ended=1; break; }
+    sleep 0.25
+  done
+  if [ "$ended" = 0 ]; then
+    kill -TERM "$ppid" 2>/dev/null || true
+    process_exited "$ppid" || kill -9 "$ppid" 2>/dev/null || true
+    echo "the socat wait outlived its bound on a host with no timeout(1)"
+    return 1
+  fi
+  wait "$ppid" 2>/dev/null || true
+  [ -s "$TEST_TEMP/socat.pid" ] || { echo "the stand-in socat never started"; return 1; }
+  process_exited "$(cat "$TEST_TEMP/socat.pid")" || { echo "socat outlived the proxy"; return 1; }
+}
+
+@test "callback proxy: the python backend waits the same _ACP_WAIT_SECS as socat" {
+  # One value both backends read. The python leg had its own 300 written into
+  # the heredoc, so the two could drift apart without a test noticing.
+  command -v python3 >/dev/null 2>&1 || skip "python3 is not on this host"
+  local farm="$TEST_TEMP/nosocat7"
+  _bb_tool_farm "$farm" bash date cat sleep python3
+  local port
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  _ACP_WAIT_SECS=1
+  PATH="$farm" _auth_callback_proxy "$port" mybox "$TEST_TEMP/plog8" 3>&- &
+  local ppid=$! i ended=0
+  for i in $(seq 1 40); do
+    kill -0 "$ppid" 2>/dev/null || { ended=1; break; }
+    sleep 0.25
+  done
+  if [ "$ended" = 0 ]; then
+    kill -TERM "$ppid" 2>/dev/null || true
+    process_exited "$ppid" || kill -9 "$ppid" 2>/dev/null || true
+    echo "the python backend ignored _ACP_WAIT_SECS"
+    return 1
+  fi
+  run cat "$TEST_TEMP/plog8"
+  assert_output --partial "timeout waiting for callback (1s)"
+}
+
+@test "callback proxy: the socat wait is bounded at 300 seconds" {
+  # The value, not only the wiring. The tests above shrink the wait to 1s to
+  # watch it end, so nothing pinned how long a real login holds the port the box
+  # named. A stand-in timeout(1) records the bound it is handed, and a socat
+  # that exits at once ends the proxy without a wait.
+  mkdir -p "$TEST_TEMP/bin300"
+  cat > "$TEST_TEMP/bin300/timeout" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$1" >> "$TEST_TEMP/timeout.args"
+shift
+exec "\$@"
+EOF
+  cat > "$TEST_TEMP/bin300/socat" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$TEST_TEMP/bin300/timeout" "$TEST_TEMP/bin300/socat"
+  ( PATH="$TEST_TEMP/bin300:$PATH"; _auth_callback_proxy 45995 mybox "$TEST_TEMP/plog300" ) 3>&-
+  run cat "$TEST_TEMP/timeout.args"
+  assert_output "300"
+}
+
+@test "_port_in_use: a service on 127.0.0.1 holds the port, and the port is free once it goes" {
+  command -v python3 >/dev/null 2>&1 || skip "python3 is not on this host"
+  local out="$TEST_TEMP/lport4"
+  _bb_loopback_listener 4 "$out"
+  local lpid=$! i
+  for i in $(seq 1 40); do
+    [ -s "$out" ] || [ -e "$out.nobind" ] && break
+    sleep 0.1
+  done
+  [ -s "$out" ] || { kill "$lpid" 2>/dev/null; echo "the IPv4 listener never bound"; return 1; }
+  local port; port="$(cat "$out")"
+  run _port_in_use "$port"
+  kill "$lpid" 2>/dev/null || true
+  process_exited "$lpid" || kill -9 "$lpid" 2>/dev/null || true
+  wait "$lpid" 2>/dev/null || true
+  assert_success
+  run _port_in_use "$port"
+  assert_failure
+}
+
+@test "_port_in_use: a service on [::1] alone holds the port too" {
+  # The proxy binds 127.0.0.1, so an IPv6-only host service does not stop the
+  # bind. The browser then resolves localhost to ::1 first and lands on THAT
+  # service with the host's cookies. Probing 127.0.0.1 alone called it free.
+  # Covered on Linux here. bash 3.2's /dev/tcp with an IPv6 literal is proven
+  # only by the macOS CI leg.
+  command -v python3 >/dev/null 2>&1 || skip "python3 is not on this host"
+  local out="$TEST_TEMP/lport6"
+  _bb_loopback_listener 6 "$out"
+  local lpid=$! i
+  for i in $(seq 1 40); do
+    [ -s "$out" ] || [ -e "$out.nobind" ] && break
+    sleep 0.1
+  done
+  if [ -e "$out.nobind" ]; then
+    wait "$lpid" 2>/dev/null || true
+    skip "this host has no IPv6 loopback"
+  fi
+  [ -s "$out" ] || { kill "$lpid" 2>/dev/null; echo "the IPv6 listener never bound"; return 1; }
+  run _port_in_use "$(cat "$out")"
+  kill "$lpid" 2>/dev/null || true
+  process_exited "$lpid" || kill -9 "$lpid" 2>/dev/null || true
+  wait "$lpid" 2>/dev/null || true
+  assert_success
 }
 
 @test "proxy log: a FIFO planted mid-session is dropped and the watcher keeps running" {

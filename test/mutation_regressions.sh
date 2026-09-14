@@ -2520,8 +2520,10 @@ try "bugfix_codepaste_url_is_auth" "still auto-opens in an interactive session" 
 # real authorize URL). Retargeted: the function now cuts the fragment first and
 # matches on `$q` rather than `$1`, and the arms return nothing rather than 0.
 # The property is unchanged, and the code-paste URL is still what proves it.
+# Retargeted again: the arms live in _is_auth_url_shape, which _is_auth_url
+# calls after the origin check.
 cat > "$SED_TMP" << 'SED'
-/^_is_auth_url()/,/^}$/{
+/^_is_auth_url_shape()/,/^}$/{
   s@^    \*\\?redirect_uri=\*|\*\\&redirect_uri=\*) ;;$@    *\\?redirect_uri=*) ;;@
 }
 SED
@@ -6850,13 +6852,86 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_bridge_origins_append" "CLEAT_BROWSER_ORIGINS APPENDS, it never replaces" "$CLI" "$BROWSER_BRIDGE_BATS"
 
-# A malformed env entry is dropped, never treated as a wildcard.
+# A malformed env entry is dropped, never treated as a wildcard. Retargeted when
+# the three copied case blocks became _bridge_entry_host: the entry is used raw
+# instead of parsed.
 cat > "$SED_TMP" << 'SED'
 /^_bridge_origins_from_env()/,/^}$/{
-  s@^      \*)                  h="[$](_bridge_url_host "https://[$]e" 2>/dev/null)" || h="" ;;@      *)                  h="$e" ;;@
+  s@^    h="[$](_bridge_entry_host "[$]e" 2>/dev/null)" || h=""$@    h="$e"@
 }
 SED
 try "vnext_bridge_bad_entry_dropped" "a malformed entry is dropped, never treated as a wildcard" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# Claude Code 2.1.270 opens its claude.ai login on claude.com and its Console
+# login on platform.claude.com. Without either host the hands-free login is
+# refused in every mode. One mutation per host, each against its own test.
+cat > "$SED_TMP" << 'SED'
+/^_BROWSER_ORIGINS=/{
+  s@ claude[.]com platform[.]claude[.]com @ platform.claude.com @
+}
+SED
+try "vnext_bridge_origin_claude_com" "the claude.ai login Claude Code opens today" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_BROWSER_ORIGINS=/{
+  s@ platform[.]claude[.]com @ @
+}
+SED
+try "vnext_bridge_origin_platform_claude_com" "the Console login Claude Code opens today" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# cleat browser allow kept "everything after the word origin" for each existing
+# line, which is ` = host`, and wrote it back behind another `origin = `. Only
+# the newest origin survived.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origin_write()/,/^}$/{
+  s@^              existing+="[$]_v"[$]'\\n'$@              existing+="${_h#origin}"$'\\n'@
+}
+SED
+try "vnext_bridge_allow_keeps_earlier" "cleat browser allow keeps every origin added before it" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# CLEAT_BROWSER_ORIGINS is split with globbing off. The watcher runs in the
+# project folder the box writes, so `*.example.com` expanded against a planted
+# file name. The second mutation leaves globbing off for the caller.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_from_env()/,/^}$/{
+  s@^  set -f$@  :@
+}
+SED
+try "vnext_bridge_env_split_noglob" "a wildcard entry is never expanded against the working directory" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_from_env()/,/^}$/{
+  s@^  \[ "[$]_glob_off" = 1 \] || set +f$@  :@
+}
+SED
+try "vnext_bridge_env_split_glob_restored" "a wildcard entry is never expanded against the working directory" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# A host that ends in a number is an IPv4 address to a browser. 2130706433,
+# 0x7f000001 and 0177.0.0.1 are all 127.0.0.1, and the text ranges missed them.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_host_is_local()/,/^}$/{
+  s@^  _bridge_ipv4_noncanonical "[$]1" && return 0$@  :@
+}
+SED
+try "vnext_bridge_ipv4_noncanonical_refused" "an IPv4 address written as one number" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# Only a plain dotted quad falls through to the ranges. A label with a leading
+# zero is octal to a browser, so 0177.0.0.1 must not count as plain.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_ipv4_noncanonical()/,/^}$/{
+  s@^      \[0-9\]|\[1-9\]\[0-9\]|1\[0-9\]\[0-9\]|2\[0-4\]\[0-9\]|25\[0-5\]) ;;$@      [0-9]*) ;;@
+}
+SED
+try "vnext_bridge_ipv4_leading_zero" "an IPv4 address written as one number" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# An entry carrying :// is a URL whatever the case of its scheme. Matching only
+# a lower-case http(s) prefix made HTTPS://x a bare host named `https`.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_entry_host()/,/^}$/{
+  s@^    \*://\*) _bridge_url_host "[$]1" ;;$@    http://*|https://*) _bridge_url_host "$1" ;;@
+}
+SED
+try "vnext_bridge_entry_host_scheme_case" "an upper-case scheme is a scheme and a non-http one is refused" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 # Loopback and private space are refused on the authority that is OPENED. What
 # it removes is a cookie-bearing authenticated navigation into a host service.
@@ -6887,8 +6962,10 @@ try "vnext_bridge_auth_needs_origin" "an unallowlisted origin is never auth" "$C
 
 # The fragment is cut FIRST. A fragment is never sent to the server, so a
 # redirect_uri there is not part of an OAuth request.
+# Retargeted: the shape checks moved into _is_auth_url_shape, so the watcher
+# can ask whether a refused URL would have opened with its origin listed.
 cat > "$SED_TMP" << 'SED'
-/^_is_auth_url()/,/^}$/{
+/^_is_auth_url_shape()/,/^}$/{
   s@^  local q="[$]{url%%#\*}"$@  local q="$url"@
 }
 SED
@@ -6952,9 +7029,11 @@ try "vnext_bridge_bind_before_open" "a proxy that never binds opens nothing" "$C
 
 # The refusal carries a marker the foreground greps for. Without it the denial
 # exists only in a log inside the box's own clip dir, which the box can rewrite.
+# Retargeted: the read is an anchored pattern now rather than `grep -F`, so the
+# sed matches the line by its start. The property is unchanged.
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_blocked_opens()/,/^}$/{
-  s@^  lines="[$](tail -c "+[$](( off + 1 ))" "[$]log" 2>/dev/null | grep -F "[$]_BROWSER_BLOCKED_MARK" 2>/dev/null)" || return 0$@  lines="" || return 0@
+  s@^  lines="[$](tail -c .*$@  lines="" || return 0@
 }
 SED
 try "vnext_bridge_blocked_reported" "names the URL, the bare origin and the command that allows it" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -6984,6 +7063,110 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_bridge_claim_bounded" "the claim read is bounded" "$CLI" "$BROWSER_BRIDGE_BATS"
 
+# ── refusal reporting, 2026-09-13 ───────────────────────────────────────────
+
+# cleat shell runs the browser watcher, so a login from the shell can be
+# refused. Without the report the refusal lives only in the box's own log.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  /_maybe_report_blocked_opens "[$]_shell_clip_dir\/.proxy-log"/d
+}
+SED
+try "vnext_refusal_shell_reports" "cleat shell reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
+
+# cleat login promises the browser will open. A refused origin must say why not.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  /_maybe_report_blocked_opens "[$]_login_clip_dir\/.proxy-log"/d
+}
+SED
+try "vnext_refusal_login_reports" "cleat login reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
+
+# Only this shell's window of the log. Offset 0 re-reports a refusal from an
+# earlier session on every shell, which is the nag concept/21 forbids.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  s@ "[$]_shell_proxy_off"$@ 0@
+}
+SED
+try "vnext_refusal_shell_offset" "cleat shell reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  s@ "[$]_login_proxy_off"$@ 0@
+}
+SED
+try "vnext_refusal_login_offset" "cleat login reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
+
+# The URL is everything after the FIRST url=. The last one sat inside a
+# return_url= parameter and printed a truncated URL.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@^    url="[$]{rest#\* url=}"$@    url="${l##*url=}"@
+}
+SED
+try "vnext_refusal_first_url" "carrying return_url" "$CLI" "$REGRESSIONS"
+
+# Revert to the old origin read, the LAST origin= on the line: a trailing
+# origin= in the query names the host the allow line prints.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@^    origin="[$](_bridge_url_host "[$]url" 2>/dev/null)" || origin=""$@    origin="${l##*origin=}"; origin="${origin%% *}"@
+}
+SED
+try "vnext_refusal_first_origin" "carrying return_url" "$CLI" "$REGRESSIONS"
+
+# The origin is re-derived from the URL, never read from the box-writable
+# field, so the allow line always names the host of the URL printed above it.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@^    origin="[$](_bridge_url_host "[$]url" 2>/dev/null)" || origin=""$@    origin="${rest%% *}"@
+}
+SED
+try "vnext_refusal_origin_from_url" "never the logged origin field" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# Only a line the watcher shaped counts, anchored on its first byte. Unanchored,
+# a URL carrying the whole line shape forges a refusal naming any host.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@grep "^\[\[]browser-watcher@grep "[[]browser-watcher@
+}
+SED
+try "vnext_refusal_anchored" "marker text inside a URL is never read as a refusal" "$CLI" "$REGRESSIONS"
+
+# A refusal is recorded only for a URL listing its origin would have opened.
+# Without the shape check a plain link and a loopback URL printed an allow line
+# that could never make them open.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@ && _is_auth_url_shape "[$]_clean_url"; then$@; then@
+}
+SED
+try "vnext_refusal_auth_shape_only" "a plain link or a loopback URL is never reported as blocked" "$CLI" "$REGRESSIONS"
+
+# cleat browser allow refuses a loopback host, so the report never prints it.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@^    elif _bridge_host_is_local "[$]origin"; then$@    elif false; then@
+}
+SED
+try "vnext_refusal_loopback_no_allow" "a loopback login gets no allow line" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# A local host parses but never opens, so the listing puts it under ignored.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_from_env()/,/^}$/{
+  s@^    \[ -n "[$]h" \] && _bridge_host_is_local "[$]h" && h=""$@    :@
+}
+SED
+try "vnext_refusal_env_local_bad" "is listed as ignored, never as accepted" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_from_config()/,/^}$/{
+  s@^    \[ -n "[$]h" \] && _bridge_host_is_local "[$]h" && h=""$@    :@
+}
+SED
+try "vnext_refusal_config_local_bad" "is listed as ignored, never as accepted" "$CLI" "$BROWSER_BRIDGE_BATS"
+
 # ── channel 3: the ~/.claude root ───────────────────────────────────────────
 
 # Every instruction surface is mounted :ro. Without the mount the box creates a
@@ -7001,10 +7184,11 @@ SED
 try "vnext_instr_surfaces_readonly" "every instruction surface at the ~/.claude root is mounted read-only" "$CLI" "$KITS_BATS"
 
 # A JSON placeholder is `{}` and not an empty file: the reader that would choke
-# on an invalid one is the user's OWN Claude Code.
+# on an invalid one is the user's OWN Claude Code. The placeholder moved into
+# _claude_instr_placeholder, which both the host target and the overlay use.
 cat > "$SED_TMP" << 'SED'
-/^_ensure_kit_mask_targets()/,/^}$/{
-  s|\*.json) printf .{}\\n. > "[$]{HOME}/.claude/[$]_p" 2>/dev/null .. true ;;|*.json) : > "${HOME}/.claude/$_p" 2>/dev/null \|\| true ;;|
+/^_claude_instr_placeholder()/,/^}$/{
+  s@^    [*][.]json)           printf '{}\\n' ;;$@    *.json)           : ;;@
 }
 SED
 try "vnext_instr_json_placeholder" "the host targets are created inert" "$CLI" "$KITS_BATS"
@@ -7031,7 +7215,245 @@ try "vnext_instr_recreate_note" "a box missing the instruction-surface masks is 
 cat > "$SED_TMP" << 'SED'
 s@^  docker run -d \\$@  docker run -d --privileged \\@
 SED
-try "vnext_never_privileged" "no docker run or exec carries --privileged" "$CLI" "$REGRESSIONS"
+try "vnext_never_privileged" "docker run never carries" "$CLI" "$REGRESSIONS"
+
+# ── channel 3, batch 2: the rest of the vendor deny list ────────────────────
+
+# session-env/<id>/ holds hook env files the HOST's Claude Code runs ahead of its
+# next Bash command. Back on the shared host dir, a box drops one into a live
+# host session.
+cat > "$SED_TMP" << 'SED'
+s@^_CLAUDE_PRIVATE_DIRS="\(.*\) session-env \(.*\)"$@_CLAUDE_PRIVATE_DIRS="\1 \2"@
+SED
+try "vnext_ch3_private_session_env" "session-env, daemon and seed-admin are per-box" "$CLI" "$REGRESSIONS"
+
+# daemon/dispatch/ is watched by the host daemon, and an exec-mode job names a
+# command its worker spawns.
+cat > "$SED_TMP" << 'SED'
+s@^_CLAUDE_PRIVATE_DIRS="\(.*\) daemon \(.*\)"$@_CLAUDE_PRIVATE_DIRS="\1 \2"@
+SED
+try "vnext_ch3_private_daemon" "session-env, daemon and seed-admin are per-box" "$CLI" "$REGRESSIONS"
+
+# seed-admin/ is where the host stages git metadata and then runs git.
+cat > "$SED_TMP" << 'SED'
+s@^_CLAUDE_PRIVATE_DIRS="\(.*\) seed-admin \(.*\)"$@_CLAUDE_PRIVATE_DIRS="\1 \2"@
+SED
+try "vnext_ch3_private_seed_admin" "session-env, daemon and seed-admin are per-box" "$CLI" "$REGRESSIONS"
+
+# Claude Code refuses a group-writable seed-admin. Under umask 002 the host
+# target created for the mask would be one.
+cat > "$SED_TMP" << 'SED'
+/^_ensure_kit_mask_targets()/,/^}$/{
+  /^    chmod go-w "[$]{HOME}\/.claude\/[$]_p" 2>\/dev\/null || true$/d
+}
+SED
+try "vnext_ch3_private_dir_mode_host" "never group or other writable, even under umask 002" "$CLI" "$KITS_BATS"
+
+# And the same for the per-box overlay the box's own Claude Code checks.
+cat > "$SED_TMP" << 'SED'
+/^_generate_home_overlay()/,/^}$/{
+  /^    chmod go-w "[$]home_dir\/[$]_d" 2>\/dev\/null || true$/d
+}
+SED
+try "vnext_ch3_private_dir_mode_overlay" "never group or other writable, even under umask 002" "$CLI" "$KITS_BATS"
+
+# ~/.claude/local is the npm-local launcher the host's claude alias runs.
+cat > "$SED_TMP" << 'SED'
+s@^\(_CLAUDE_INSTR_DIRS=".*\) local"$@\1"@
+SED
+try "vnext_ch3_instr_local" "the npm-local install and daemon.json are masked read-only" "$CLI" "$REGRESSIONS"
+
+# daemon.json is the background daemon's worker config.
+cat > "$SED_TMP" << 'SED'
+s@^\(_CLAUDE_INSTR_FILES=".*\) daemon[.]json"$@\1"@
+SED
+try "vnext_ch3_instr_daemon_json" "the npm-local install and daemon.json are masked read-only" "$CLI" "$REGRESSIONS"
+
+# A box that predates session-env, daemon and seed-admin as per-box dirs is told.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_note_missing_kit_masks()/,/^}$/{
+  s@^    if ! printf .%s.n. "[$]dests" | grep -qx "/home/coder/.claude/[$]_priv"; then$@    if false; then@
+}
+SED
+try "vnext_ch3_private_recreate_note" "missing the per-box session-env, daemon and seed-admin dirs is told" "$CLI" "$KITS_BATS"
+
+# A box session's hook env files now live in the per-box dir, so a delete has
+# to take that copy too.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_delete_set()/,/^}$/{
+  /home\/session-env\//d
+}
+SED
+try "vnext_ch3_delete_box_session_env" "delete takes a box session" "$CLI" "$SESSIONS_BATS"
+
+# The user's own rules, themes, workflows and output styles reach the box as a
+# read-only copy. Drop the copy and they are blanked again.
+cat > "$SED_TMP" << 'SED'
+/^_generate_instr_overlay()/,/^}$/{
+  s@^    cp -R "[$]_src/[.]" "[$]_dst/" 2>/dev/null || true$@    :@
+}
+SED
+try "vnext_ch3_passthrough_dirs" "user-level rules and keybindings reach the box read-only" "$CLI" "$REGRESSIONS"
+
+# And keybindings.json and loop.md, the two file surfaces it reads.
+cat > "$SED_TMP" << 'SED'
+/^_generate_instr_overlay()/,/^}$/{
+  s@^      cat "[$]_src" > "[$]_dst" 2>/dev/null || true$@      _claude_instr_placeholder "$_i" > "$_dst"@
+}
+SED
+try "vnext_ch3_passthrough_files" "user-level rules and keybindings reach the box read-only" "$CLI" "$REGRESSIONS"
+
+# The overlay dir is a bind source. Replacing it strands a running box on the
+# old inode.
+cat > "$SED_TMP" << 'SED'
+/^_generate_instr_overlay()/,/^}$/{
+  s@^    mkdir -p "[$]_dst"$@    rm -rf "$_dst"; mkdir -p "$_dst"@
+}
+SED
+try "vnext_ch3_instr_dir_in_place" "a host edit reaches the overlay in place" "$CLI" "$KITS_BATS"
+
+# The same for a file surface.
+cat > "$SED_TMP" << 'SED'
+/^_generate_instr_overlay()/,/^}$/{
+  s@^      cat "[$]_src" > "[$]_dst" 2>/dev/null || true$@      rm -f "$_dst"; cat "$_src" > "$_dst"@
+}
+SED
+try "vnext_ch3_instr_file_in_place" "a host edit reaches the overlay in place" "$CLI" "$KITS_BATS"
+
+# The copies ride the start refresh.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /^    _generate_instr_overlay "[$]cname"$/d
+}
+SED
+try "vnext_ch3_instr_start_refresh" "cmd_start refreshes the copies" "$CLI" "$KITS_BATS"
+
+# And the resume refresh.
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  /^    _generate_instr_overlay "[$]cname"$/d
+}
+SED
+try "vnext_ch3_instr_resume_refresh" "cmd_resume refreshes the copies too" "$CLI" "$KITS_BATS"
+
+# A symlinked surface dir is not followed. A released box could have planted one.
+cat > "$SED_TMP" << 'SED'
+/^_generate_instr_overlay()/,/^}$/{
+  s@^    \[\[ -d "[$]_src" && ! -L "[$]_src" \]\] || continue$@    [[ -d "$_src" ]] || continue@
+}
+SED
+try "vnext_ch3_instr_dir_no_follow" "the copy follows no symlink at any depth" "$CLI" "$KITS_BATS"
+
+# Nested links, FIFOs and sockets are dropped from the copy.
+cat > "$SED_TMP" << 'SED'
+/^_generate_instr_overlay()/,/^}$/{
+  /^    find "[$]_dst" ! -type d ! -type f -exec rm -f {} + 2>\/dev\/null || true$/d
+}
+SED
+try "vnext_ch3_instr_prune_links" "the copy follows no symlink at any depth" "$CLI" "$KITS_BATS"
+
+# A symlinked file surface is not followed either.
+cat > "$SED_TMP" << 'SED'
+/^_generate_instr_overlay()/,/^}$/{
+  s@\[\[ -f "[$]_src" && ! -L "[$]_src" \]\]@[[ -f "$_src" ]]@
+}
+SED
+try "vnext_ch3_instr_file_no_follow" "the copy follows no symlink at any depth" "$CLI" "$KITS_BATS"
+
+# keybindings.json needs a bindings array. A bare `{}` is a parse_error to its
+# loader.
+cat > "$SED_TMP" << 'SED'
+/^_claude_instr_placeholder()/,/^}$/{
+  s@^    keybindings[.]json) printf '{"bindings":\[\]}\\n' ;;$@    keybindings.json) printf '{}\\n' ;;@
+}
+SED
+try "vnext_ch3_keybindings_placeholder" "keybindings.json placeholder is one Claude Code" "$CLI" "$REGRESSIONS"
+
+# The bare `{}` an earlier build wrote on the host is repaired.
+cat > "$SED_TMP" << 'SED'
+/^_ensure_kit_mask_targets()/,/^}$/{
+  s@^    _claude_instr_placeholder keybindings[.]json > "[$]_kb" 2>/dev/null || true$@    :@
+}
+SED
+try "vnext_ch3_keybindings_repair" "an earlier build" "$CLI" "$KITS_BATS"
+
+# A regular file at an instruction-surface dir target is refused. Skipped, it
+# still reached docker run as an opaque "not a directory".
+cat > "$SED_TMP" << 'SED'
+/^_ensure_kit_mask_targets()/,/^}$/{
+  s@^  for _t in [$]_CLAUDE_PRIVATE_DIRS [$]_CLAUDE_INSTR_DIRS; do$@  for _t in $_CLAUDE_PRIVATE_DIRS; do@
+}
+SED
+try "vnext_ch3_refuse_instr_dir_file" "a regular file where an instruction-surface dir belongs is refused" "$CLI" "$REGRESSIONS"
+
+# The same refusal covers the per-box state dirs.
+cat > "$SED_TMP" << 'SED'
+/^_ensure_kit_mask_targets()/,/^}$/{
+  s@^  for _t in [$]_CLAUDE_PRIVATE_DIRS [$]_CLAUDE_INSTR_DIRS; do$@  for _t in $_CLAUDE_INSTR_DIRS; do@
+}
+SED
+try "vnext_ch3_refuse_private_dir_file" "a regular file where a per-box state dir belongs is refused" "$CLI" "$KITS_BATS"
+
+# A directory at an instruction-surface FILE target is refused.
+cat > "$SED_TMP" << 'SED'
+/^_ensure_kit_mask_targets()/,/^}$/{
+  s@^  for _t in [$]_CLAUDE_INSTR_FILES; do$@  for _t in ; do@
+}
+SED
+try "vnext_ch3_refuse_instr_file_dir" "a directory where an instruction-surface file belongs is refused" "$CLI" "$KITS_BATS"
+
+# A broken symlink at an instruction-surface target is refused and kept.
+cat > "$SED_TMP" << 'SED'
+/^_ensure_kit_mask_targets()/,/^}$/{
+  s@^  for _t in [$]_CLAUDE_PRIVATE_DIRS [$]_CLAUDE_INSTR_DIRS [$]_CLAUDE_INSTR_FILES; do$@  for _t in ; do@
+}
+SED
+try "vnext_ch3_refuse_instr_broken_link" "a broken symlink at an instruction-surface target is refused" "$CLI" "$KITS_BATS"
+
+# The refusal has to stop cmd_run. Left to set -e, a caller in a conditional
+# would switch it off and docker run would go ahead.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^  _ensure_kit_mask_targets || exit 1$@  _ensure_kit_mask_targets@
+}
+SED
+try "vnext_ch3_cmd_run_stops_on_refusal" "a regular file where an instruction-surface dir belongs is refused" "$CLI" "$REGRESSIONS"
+
+# A second writable bind of the host's ~/.claude sidesteps every mask while every
+# per-name test stays green. The mount-shape guard is what sees it.
+cat > "$SED_TMP" << 'SED'
+s@^    -v "[$]{HOME}/.claude/plugins:/home/coder/.claude/plugins:ro"$@    -v "${HOME}/.claude/plugins:/home/coder/.claude/plugins:ro" -v "${HOME}/.claude:/home/coder/.claude/routines-new"@
+SED
+try "vnext_claude_root_alias_mount" "no writable mount under the box" "$CLI" "$KITS_BATS"
+
+# A writable source inside the host's ~/.claude that is not this project's own
+# session dir, here under the docker cap.
+cat > "$SED_TMP" << 'SED'
+s@^    mount_args+=(-v "[$]{project_session_dir}:/home/coder/.claude/projects/[$]{_host_project_key}")$@    mount_args+=(-v "${HOME}/.claude/projects:/home/coder/.claude/projects/${_host_project_key}")@
+SED
+try "vnext_ch3_foreign_rw_source" "the docker cap adds only its host-path session key" "$CLI" "$KITS_BATS"
+
+# ~/.claude/.config.json cannot be masked, so a host that has one is told.
+cat > "$SED_TMP" << 'SED'
+/^  _maybe_note_host_global_config$/d
+SED
+try "vnext_ch3_cfgjson_note" "cmd_start names a" "$CLI" "$KITS_BATS"
+
+# One that appears during a session is reported when it ends.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /^  _maybe_report_host_global_config_appeared "[$]_cfgjson_before"$/d
+}
+SED
+try "vnext_ch3_cfgjson_appeared" "a file that appears during a session is reported" "$CLI" "$KITS_BATS"
+
+# And only one that was NOT there when the session began.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _host_global_config_present && _cfgjson_before=1$@  :@
+}
+SED
+try "vnext_ch3_cfgjson_before" "a file already there when the session began" "$CLI" "$KITS_BATS"
 
 # ── the hook bridge: source, payload and matcher ────────────────────────────
 
@@ -7067,22 +7489,22 @@ try "vnext_hook_project_named" "a project file that defines hooks is named rathe
 # validating it instead of replacing it drops EVERY event and the capability
 # becomes a no-op with a counter. This is the one that is fatal if missed.
 cat > "$SED_TMP" << 'SED'
-s|.transcript_path = [$]sent|.transcript_path = .transcript_path|
+s|if has("transcript_path") then .transcript_path = [$]sent|if has("transcript_path") then .transcript_path = .transcript_path|
 SED
 try "vnext_hook_transcript_sentinel" "the required transcript_path becomes a sentinel" "$CLI" "$HOOKS_BATS"
 
 # A path outside the workspace drops the event. The default is refuse, and this
 # is the harm class that costs real money: a host path outside every mount.
 cat > "$SED_TMP" << 'SED'
-/^_hook_translate_event()/,/^}$/{
-  s@^    t_fp="[$](_hook_translate_path "[$]fp" "[$]ws")" || return 1$@    t_fp="$(_hook_translate_path "$fp" "$ws")" || t_fp=""@
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@^      else _hwalk(false; false; 0) | .c = (.c // "D")$@      else _hwalk(false; false; 0) | .c = (.c // "N")@
 }
 SED
 try "vnext_hook_outside_workspace_drops" "a path outside the workspace drops the event" "$CLI" "$HOOKS_BATS"
 
 # A traversal is refused rather than normalised away.
 cat > "$SED_TMP" << 'SED'
-/^_hook_translate_path()/,/^}$/{
+/^_hook_translate_path_to()/,/^}$/{
   s@^    \*//\*|\*/./\*|\*/../\*|\*/.|\*/..|.|..) return 1 ;;$@    __nomatch__) return 1 ;;@
 }
 SED
@@ -7090,7 +7512,7 @@ try "vnext_hook_traversal_refused" "a traversal that lands back inside is still 
 
 # The whole-value rejects, each a value some later consumer expands.
 cat > "$SED_TMP" << 'SED'
-/^_hook_translate_path()/,/^}$/{
+/^_hook_translate_path_to()/,/^}$/{
   s@^    \[\[:space:\]\]\*|\*\[\[:space:\]\]) return 1 ;;$@    __nomatch__) return 1 ;;@
 }
 SED
@@ -7099,26 +7521,39 @@ try "vnext_hook_value_rejects" "leading or trailing whitespace is refused even w
 # Translation targets the WORKSPACE. For a fork box that is the copy, and
 # targeting the project would point the user's host hook at the ORIGIN tree
 # from inside a fork box, cancelling the isolation the fork feature sells.
+# Drops the fork branch exec_claude computes the workspace with.
 cat > "$SED_TMP" << 'SED'
-/^    _hook_bridge_watcher "[$]hooks_file" "[$]_workspace" /{
-  s@"[$]_workspace"@"${_RESOLVED_PROJECT:-}"@
+/^exec_claude()/,/^}$/{
+  s@^      _hb_ws="[$](_fork_dir "[$]cname")"$@      :@
 }
 SED
-try "vnext_hook_fork_workspace" "the watcher is handed the WORKSPACE, not the resolved project" "$CLI" "$HOOKS_BATS"
+try "vnext_hook_fork_workspace" "hook bridge the COPY, not the origin tree" "$CLI" "$REGRESSIONS"
+
+# The bridge used to be handed cmd_run's `local _workspace`, which no caller of
+# exec_claude still has in scope. Under the real binary's set -u the spawn died
+# on "unbound variable", so the hooks cap was dead in every session. Only a
+# real-binary test sees it: the sourced suites strip strict mode.
+cat > "$SED_TMP" << 'SED'
+/^    _hook_bridge_watcher "[$]hooks_file" "[$]_hb_ws" /{
+  s@"[$]_hb_ws"@"$_workspace"@
+}
+SED
+try "vnext_hook_bridge_workspace_unbound" "cap hooks start runs a host hook through a live bridge" "$CLI" "$SMOKE_BATS"
 
 # A docker-cap box's events already carry host-absolute paths, and a
 # /workspace-prefix-only rule breaks every hook there.
 cat > "$SED_TMP" << 'SED'
-/^_hook_translate_path()/,/^}$/{
-  s@^    "[$]ws"/\*) printf .%s. "[$]p"; return 0 ;;$@    __nomatch__) return 0 ;;@
+/^_hook_translate_path_to()/,/^}$/{
+  s@^      "[$]ws"/\*) rest=.*$@      __nomatch__) ;;@
 }
 SED
 try "vnext_hook_host_absolute_ok" "a docker-cap box's host-absolute paths still validate" "$CLI" "$HOOKS_BATS"
 
-# A sibling directory sharing the prefix is not inside it.
+# A sibling directory sharing the prefix is not inside it. The on-disk check
+# owns that boundary: the translation's own prefix arm only picks the shape.
 cat > "$SED_TMP" << 'SED'
-/^_hook_translate_path()/,/^}$/{
-  s@^    "[$]ws"/\*) printf .%s. "[$]p"; return 0 ;;$@    "$ws"*) printf '%s' "$p"; return 0 ;;@
+/^_hook_phys_inside()/,/^}$/{
+  s@^    "[$]ws"|"[$]ws"/\*) return 0 ;;$@    "$ws"|"$ws"*) return 0 ;;@
 }
 SED
 try "vnext_hook_sibling_prefix" "a sibling directory with the same prefix is not inside it" "$CLI" "$HOOKS_BATS"
@@ -7134,8 +7569,8 @@ try "vnext_hook_event_charset" "the event name is bounded and charset-checked" "
 
 # One spool line is box-sized, and there was no size cap anywhere in the bridge.
 cat > "$SED_TMP" << 'SED'
-/^_hook_translate_event()/,/^}$/{
-  s@^  \[ "[$]{#line}" -le "[$]_HOOK_LINE_MAX" \] || return 1$@  :@
+/^_hook_translate_event_to()/,/^}$/{
+  s@^  _hook_line_fits "[$]line" || return 2$@  :@
 }
 SED
 try "vnext_hook_line_cap" "an oversized line is dropped rather than processed" "$CLI" "$HOOKS_BATS"
@@ -7188,10 +7623,860 @@ try "vnext_hook_drop_log_sanitized" "a forged event cannot inject a log line" "$
 # Validation runs BEFORE anything is dispatched, and a failure drops.
 cat > "$SED_TMP" << 'SED'
 /^_hook_bridge_watcher()/,/^}$/{
-  s@^        if ! _ev_out="[$](_hook_translate_event "[$]line" "[$]_hb_ws" 2>/dev/null)"; then$@        _ev_out="$line"; if false; then@
+  s@^        _hook_translate_event_to "[$]line" "[$]_hb_ws" 2>/dev/null || _ev_rc=[$]?$@        _HOOK_EV_OUT="$line" _HOOK_EV_DIR="$_hb_ws"@
 }
 SED
 try "vnext_hook_validate_before_dispatch" "an event naming a path outside the workspace never reaches a hook" "$CLI" "$HOOKS_BATS"
+
+# B6: at most six host opens a minute. Raising the constant lets the seventh
+# through, which is the exact count the watcher test drives.
+cat > "$SED_TMP" << 'SED'
+s/^_BROWSER_RATE_PER_MIN=6$/_BROWSER_RATE_PER_MIN=7/
+SED
+try "vnext_b6_rate_per_min" "a seventh open inside a minute is refused" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: and thirty a session.
+cat > "$SED_TMP" << 'SED'
+s/^_BROWSER_RATE_PER_SESSION=30$/_BROWSER_RATE_PER_SESSION=31/
+SED
+try "vnext_b6_rate_per_session" "thirty opens is the ceiling for one session" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: the minute is a window. A lifetime count would strand a later login.
+cat > "$SED_TMP" << 'SED'
+s/^_BROWSER_RATE_WINDOW_SECS=60$/_BROWSER_RATE_WINDOW_SECS=600/
+SED
+try "vnext_b6_rate_window" "an open older than the minute stops counting" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: the watcher consults the cap before it opens. Right constants in a helper
+# nobody calls are not a cap.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s/if _browser_rate_take "[$]_bw_ledger" "[$]_bw_opens"; then/if true; then/
+}
+SED
+try "vnext_b6_rate_wired" "a seventh open inside a minute is refused" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: the minute ledger lives outside the bind mount, or the box empties it.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s|_bw_ledger="[$]_bw_claim_dir/.opens"|_bw_ledger="$clip_dir/.opens"|
+}
+SED
+try "vnext_b6_ledger_outside_mount" "a seventh open inside a minute is refused" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: a leading-zero entry is refused before arithmetic reads it as octal.
+cat > "$SED_TMP" << 'SED'
+/^_browser_rate_take()/,/^}$/{
+  s/in ''|0[*]|/in ''|/
+}
+SED
+try "vnext_b6_ledger_octal" "a malformed or future ledger entry neither counts nor breaks the count" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: an entry from the future is dropped, or a stepped-back clock holds the
+# window shut for as long as the step.
+cat > "$SED_TMP" << 'SED'
+/^_browser_rate_take()/,/^}$/{
+  /\[ "[$]line" -le "[$]now" \] || continue/d
+}
+SED
+try "vnext_b6_ledger_future" "a malformed or future ledger entry neither counts nor breaks the count" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: the watcher's own open count reaches the helper and grows. Without the
+# increment the session cap never closes, and it is the only cap left when the
+# claim dir falls back into the mount.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  /_bw_opens=[$](( _bw_opens + 1 ))/d
+}
+SED
+try "vnext_b6_session_count_wired" "counts its own opens toward the session cap" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: and the count is what is passed, not a literal.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s/_browser_rate_take "[$]_bw_ledger" "[$]_bw_opens"/_browser_rate_take "$_bw_ledger" 0/
+}
+SED
+try "vnext_b6_session_count_passed" "counts its own opens toward the session cap" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: a capped open carries the marker the session-end report reads.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s/[$]{_BROWSER_CAPPED_MARK} limit=/rate cap reached limit=/
+}
+SED
+try "vnext_b6_capped_marker_written" "counts its own opens toward the session cap" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: every caller of the refusal report gets the capped opens too. Without the
+# call a capped login is a browser that never opened, with nothing on screen.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  /^  _maybe_report_capped_opens "[$]log" "[$]off"$/d
+}
+SED
+try "vnext_b6_capped_reported" "names the URL the cap held back and how many" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: only this session's capped opens.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_opens()/,/^}$/{
+  s@tail -c "+[$](( off + 1 ))" "[$]log"@cat "$log"@
+}
+SED
+try "vnext_b6_capped_this_session" "capped report: only this session" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: the logged URL is box-authored, so it is sanitized before it is printed.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_opens()/,/^}$/{
+  s@^    url="[$](_sanitize_repo_str "[$]url")"$@    :@
+}
+SED
+try "vnext_b6_capped_sanitized" "a forged line cannot inject terminal control bytes or a heading" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B6: only a line the watcher shaped counts, anchored on its first byte.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_opens()/,/^}$/{
+  s@grep "^\[\[]browser-watcher@grep "[[]browser-watcher@
+}
+SED
+try "vnext_b6_capped_anchored" "a forged line cannot inject terminal control bytes or a heading" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# B7: the launch summary names a bridge mode that turns the destination check off.
+cat > "$SED_TMP" << 'SED'
+/^_print_summary_block()/,/^}$/{
+  /always) echo -e .*Browser:/d
+}
+SED
+try "vnext_b7_summary_always" "names the browser bridge when always turns the destination check off" "$CLI" "$TERMINAL_UX_BATS"
+
+# B7: and off.
+cat > "$SED_TMP" << 'SED'
+/^_print_summary_block()/,/^}$/{
+  /off) *echo -e .*Browser:/d
+}
+SED
+try "vnext_b7_summary_off" "names the browser bridge when it is off" "$CLI" "$TERMINAL_UX_BATS"
+
+# H4: a session that runs a host hook prints the amber line the docker cap gets.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /warn_sandbox "Host hooks enabled/d
+}
+SED
+try "vnext_h4_host_hooks_warning" "a session that will run a host hook says what that means" "$CLI" "$HOOKS_BATS"
+
+# ── the hook bridge: on-disk containment, the full field set, the bounded read,
+# one JSON value, the character rule and the visibility logs (batch 6) ─────────
+
+# F06: the rewrite is checked where it lands on disk. Without it a link planted
+# in the read-write workspace aims a well-spelled path at any host file.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_path_to()/,/^}$/{
+  /^  _hook_path_inside "[$]out" "[$]ws" || return 1$/d
+}
+SED
+try "vnext_hook_symlink_containment" "a symlink planted in the workspace cannot aim a path outside it" "$CLI" "$HOOKS_BATS"
+
+# F06: a link that resolves to nothing is refused, as upstream refuses it.
+cat > "$SED_TMP" << 'SED'
+/^_hook_physical_path()/,/^}$/{
+  s@^      \[ -e "[$]p" \] || return 1$@      :@
+}
+SED
+try "vnext_hook_dangling_link_refused" "a dangling or looping symlink is refused" "$CLI" "$HOOKS_BATS"
+
+# F06: a project reached through a symlink is found by device and inode.
+cat > "$SED_TMP" << 'SED'
+/^_hook_phys_inside()/,/^}$/{
+  s@^    \[ "[$]a" -ef "[$]ws" \] && return 0$@    :@
+}
+SED
+try "vnext_hook_symlinked_project_ef" "a project reached through a symlink still validates on disk" "$CLI" "$HOOKS_BATS"
+
+# F06: the walk is bounded, as upstream bounds it.
+cat > "$SED_TMP" << 'SED'
+s/^_HOOK_WALK_MAX=64$/_HOOK_WALK_MAX=6400/
+SED
+try "vnext_hook_walk_bound" "more than the bound of missing components is refused" "$CLI" "$HOOKS_BATS"
+
+# F06: a dot segment in a missing tail is refused, never appended to a prefix.
+cat > "$SED_TMP" << 'SED'
+/^_hook_physical_path()/,/^}$/{
+  s@^    case "[$]base" in ''|.|..) return 1 ;; esac$@    :@
+}
+SED
+try "vnext_hook_walk_dot_segment" "never climbs a dot segment it could not resolve" "$CLI" "$HOOKS_BATS"
+
+# F08: every path-shaped tool_input string is a candidate, not four named fields.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@^      else _hwalk(false; false; 0) | .c = (.c // "D")$@      else empty@
+}
+SED
+try "vnext_hook_input_walk" "every path-shaped tool_input field is checked" "$CLI" "$HOOKS_BATS"
+
+# F08: each tool_calls entry of a PostToolBatch gets the same walk.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@^  (if (.tool_calls | type) == "array" then@  (if false then@
+}
+SED
+try "vnext_hook_tool_calls_walk" "each tool_calls entry of a batch is checked" "$CLI" "$HOOKS_BATS"
+
+# F08: a Read response's file.filePath drops the event, it is not nulled.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@{c: "D", p: \["file", "filePath"\]@{c: "N", p: ["file", "filePath"]@
+}
+SED
+try "vnext_hook_response_file_filepath" "filePath outside the workspace drops the event" "$CLI" "$HOOKS_BATS"
+
+# F08: a filenames entry that does not map is nulled rather than passed on.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@^  (if (.filenames | type) == "array" then@  (if false then@
+}
+SED
+try "vnext_hook_response_filenames_null" "a response list entry that does not map is nulled" "$CLI" "$HOOKS_BATS"
+
+# F08: and so is a file.outputDir.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@^  (if (.file | type) == "object" and (.file.outputDir | type) == "string" then@  (if false then@
+}
+SED
+try "vnext_hook_response_outputdir_null" "a response list entry that does not map is nulled" "$CLI" "$HOOKS_BATS"
+
+# F08: a relative value is kept but must still land inside from the cwd.
+cat > "$SED_TMP" << 'SED'
+/^_hook_relative_ok()/,/^}$/{
+  s@^  _hook_path_inside "[$]{base%/}[$]norm" "[$]ws"$@  true@
+}
+SED
+try "vnext_hook_relative_containment" "a relative path field is kept, and still has to land inside" "$CLI" "$HOOKS_BATS"
+
+# F08: and it keeps the segment rules even where it lands back inside.
+cat > "$SED_TMP" << 'SED'
+/^_hook_relative_ok()/,/^}$/{
+  s@^      ''|..) return 1 ;;$@      __nomatch__) return 1 ;;@
+}
+SED
+try "vnext_hook_relative_segments" "a relative path field is kept, and still has to land inside" "$CLI" "$HOOKS_BATS"
+
+# F08: a URL key holding a real URL is not judged as a path.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@(if [$]u and _hurl then empty else {p: \[[$]k\], v: .} end)@({p: [$k], v: .})@
+}
+SED
+try "vnext_hook_url_value_skipped" "a URL field that holds a URL is not judged as a path" "$CLI" "$HOOKS_BATS"
+
+# F08: nesting past the walk depth is refused, not left unjudged.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@^  elif [$]d > 16 then@  elif false then@
+}
+SED
+try "vnext_hook_depth_refused" "a tool_input nested past the walk depth is refused" "$CLI" "$HOOKS_BATS"
+
+# F08: at most upstream's 256 path fields are judged for one event.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_event_to()/,/^}$/{
+  s@^  \[ "[$]n" -le "[$]_HOOK_PATHS_MAX" \] || return 5$@  :@
+}
+SED
+try "vnext_hook_paths_ceiling" "more path fields than upstream" "$CLI" "$HOOKS_BATS"
+
+# F17: the read itself stops one byte past the cap.
+cat > "$SED_TMP" << 'SED'
+/^_hook_read_chunk()/,/^}$/{
+  s@read -r -n "[$](( _HOOK_LINE_MAX + 1 ))" _l@read -r _l@
+}
+SED
+try "vnext_hook_read_bounded" "read no further than one byte past the cap" "$CLI" "$HOOKS_BATS"
+
+# F17: and it counts bytes under a UTF-8 locale.
+cat > "$SED_TMP" << 'SED'
+/^_hook_read_chunk()/,/^}$/{
+  s@^  _c="[$](LC_ALL=C$@  _c="$(:@
+}
+SED
+try "vnext_hook_read_bytes" "counts bytes, not characters" "$CLI" "$HOOKS_BATS"
+
+# F17: so does the size check on a line handed to validation directly.
+cat > "$SED_TMP" << 'SED'
+/^_hook_line_fits() ($/,/^)$/{
+  s@^  LC_ALL=C$@  :@
+}
+SED
+try "vnext_hook_line_fits_bytes" "counts bytes, not characters" "$CLI" "$HOOKS_BATS"
+
+# F17: an oversized line is logged once and its tail is discarded, not read as
+# a line of its own.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^          _hb_skip=1$@          :@
+}
+SED
+try "vnext_hook_oversize_skip" "an oversized line is dropped once and the event after it still runs" "$CLI" "$HOOKS_BATS"
+
+# F18: the line holds exactly one JSON value, an object.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_event_to()/,/^}$/{
+  /jq -e -n '\[inputs\] | length == 1/d
+}
+SED
+try "vnext_hook_single_json_value" "a line holding two JSON values is refused" "$CLI" "$HOOKS_BATS"
+
+# F19: colon, format characters and line separators, judged by jq.
+cat > "$SED_TMP" << 'SED'
+/^_hook_segment_chars_ok()/,/^}$/{
+  s@^  \[ "[$](printf '%s' "[$]1" | jq -Rs .*$@  true@
+}
+SED
+try "vnext_hook_segment_chars_jq" "a colon, a format character or a line separator is refused in any locale" "$CLI" "$HOOKS_BATS"
+
+# F19: only the part the box wrote is judged by character.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_path_to()/,/^}$/{
+  s@_hook_segment_chars_ok "[$]rest" || return 1@_hook_segment_chars_ok "$out" || return 1@
+}
+SED
+try "vnext_hook_chars_rest_only" "never judges the host workspace path itself" "$CLI" "$HOOKS_BATS"
+
+# F20: each drop row names its own reason, not a constant.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@_hook_drop_log "[$](_hook_drop_reason "[$]_ev_rc")"@_hook_drop_log "payload"@
+}
+SED
+try "vnext_hook_drop_reason_logged" "each row names its reason, box, spool line md5 and offset" "$CLI" "$HOOKS_BATS"
+
+# F20: the box.
+cat > "$SED_TMP" << 'SED'
+/^_hook_drop_log()/,/^}$/{
+  s@^    "[$]cname" \\$@    "" \\@
+}
+SED
+try "vnext_hook_drop_box_logged" "each row names its reason, box, spool line md5 and offset" "$CLI" "$HOOKS_BATS"
+
+# F20: the md5 of the raw spool line.
+cat > "$SED_TMP" << 'SED'
+/^_hook_drop_log()/,/^}$/{
+  s@^    "[$](_hook_line_md5 "[$]line")" \\$@    "" \\@
+}
+SED
+try "vnext_hook_drop_md5_logged" "each row names its reason, box, spool line md5 and offset" "$CLI" "$HOOKS_BATS"
+
+# F20: the byte offset, which counts each line's newline.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@_hb_pos=[$](( _hb_pos + _HOOK_CHUNK_LEN + 1 ))@_hb_pos=$(( _hb_pos + _HOOK_CHUNK_LEN ))@
+}
+SED
+try "vnext_hook_drop_offset_logged" "each row names its reason, box, spool line md5 and offset" "$CLI" "$HOOKS_BATS"
+
+# F20: an event handed to the hooks is logged, not only a refused one.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  /^        _hook_run_log "[$]_HOOK_EV_OUT"/d
+}
+SED
+try "vnext_hook_run_logged" "an event handed to the hooks is logged" "$CLI" "$HOOKS_BATS"
+
+# F20: the run log's tool name is box-authored and sanitized.
+cat > "$SED_TMP" << 'SED'
+/^_hook_run_log()/,/^}$/{
+  s@^  tool="[$](_sanitize_repo_str "[$]{tool:0:64}")"$@  tool="${tool:0:64}"@
+}
+SED
+try "vnext_hook_run_log_sanitized" "a forged tool name cannot inject a log row" "$CLI" "$HOOKS_BATS"
+
+# F20: the run log grows with every tool call, so it is moved aside past a cap.
+cat > "$SED_TMP" << 'SED'
+/^_hook_run_log()/,/^}$/{
+  s@^      mv -f "[$]f" "[$]f.1" 2>/dev/null || true$@      :@
+}
+SED
+try "vnext_hook_run_log_rotated" "the log is moved aside once it passes its cap" "$CLI" "$HOOKS_BATS"
+
+# F20: the end-of-session summary counts this box's rows only.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  s@[$]2 == m && [$]4 == c {@$2 == m {@
+}
+SED
+try "vnext_hook_report_per_box" "the summary counts only this box" "$CLI" "$HOOKS_BATS"
+
+# F20: and blames a path only when every counted row is a path refusal.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  s@if ([$]3 == "path") p++@p++@
+}
+SED
+try "vnext_hook_report_path_wording" "the summary blames a path only when every drop named one" "$CLI" "$HOOKS_BATS"
+
+# F20: the real start path hands the bridge its box.
+cat > "$SED_TMP" << 'SED'
+s@_hook_bridge_watcher "[$]hooks_file" "[$]_hb_ws" "[$]cname" @_hook_bridge_watcher "$hooks_file" "$_hb_ws" @
+SED
+try "vnext_hook_bridge_given_box" "a hooks session reports this box" "$CLI" "$SMOKE_BATS"
+
+# F20: and asks the report for that box.
+cat > "$SED_TMP" << 'SED'
+s@_maybe_report_hook_drops "[$]_hook_drop_log_path" "[$]_hook_drop_off" "[$]cname"@_maybe_report_hook_drops "$_hook_drop_log_path" "$_hook_drop_off"@
+SED
+try "vnext_hook_report_given_box" "a hooks session reports this box" "$CLI" "$SMOKE_BATS"
+
+# F35: the second transcript field is replaced too.
+cat > "$SED_TMP" << 'SED'
+s|if has("agent_transcript_path") then .agent_transcript_path = [$]sent|if has("agent_transcript_path") then .agent_transcript_path = .agent_transcript_path|
+SED
+try "vnext_hook_agent_transcript_sentinel" "agent_transcript_path becomes the sentinel too" "$CLI" "$HOOKS_BATS"
+
+# F35: a cwd outside the workspace drops the event.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_event_to()/,/^}$/{
+  s@^        _hook_translate_path_to "[$]val" "[$]ws" || return 5$@        _hook_translate_path_to "$val" "$ws" || _HOOK_TP_OUT="$val"@
+}
+SED
+try "vnext_hook_cwd_outside_drops" "every translated path field drops when it leaves the workspace" "$CLI" "$HOOKS_BATS"
+
+# F35: so does a tool_input notebook_path.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@^      else _hwalk(false; false; 0) | .c = (.c // "D")$@      else _hwalk(false; false; 0) | .c = (.c // "N")@
+}
+SED
+try "vnext_hook_notebook_outside_drops" "every translated path field drops when it leaves the workspace" "$CLI" "$HOOKS_BATS"
+
+# F35: and a tool_response filePath.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@{c: "D", p: \["filePath"\]@{c: "N", p: ["filePath"]@
+}
+SED
+try "vnext_hook_response_filepath_outside_drops" "every translated path field drops when it leaves the workspace" "$CLI" "$HOOKS_BATS"
+
+# ── the hook bridge, second review of batch 6 ────────────────────────────────
+
+# R6-1: the hook runs in the directory its relative paths were judged from.
+# Without it the hook starts wherever cleat was launched, and a relative path
+# judged inside /workspace/sub opens through a link the box planted at the root.
+cat > "$SED_TMP" << 'SED'
+/^_execute_host_hook_bg()/,/^}$/{
+  s@^    if ! _hook_enter_run_dir "[$]run_dir" "[$]ws"; then$@    if false; then@
+}
+SED
+try "vnext_hook_run_from_cwd" "a relative hook path is opened from the directory it was judged in" "$CLI" "$REGRESSIONS"
+
+# R6-1: in a fork box that directory is the copy. Handing the hook the project,
+# the origin tree, is the C2 mistake again.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@_execute_host_hook_bg "[$]_HOOK_EV_OUT" "[$]_HOOK_EV_DIR"@_execute_host_hook_bg "$_HOOK_EV_OUT" "${_RESOLVED_PROJECT:-$_HOOK_EV_DIR}"@
+}
+SED
+try "vnext_hook_fork_run_from_copy" "hook runs in the copy, so a relative path opens the copy" "$CLI" "$REGRESSIONS"
+
+# R6-1: the directory is judged again from where cd -P landed, not by name.
+cat > "$SED_TMP" << 'SED'
+/^_hook_enter_run_dir()/,/^}$/{
+  s@^  _hook_phys_inside "[$]PWD" "[$]ws"$@  true@
+}
+SED
+try "vnext_hook_run_dir_recheck" "a hook directory that leaves the workspace before it is entered" "$CLI" "$HOOKS_BATS"
+
+# R6-1: a cwd that is not a directory here falls back to the workspace, which
+# is then both the hook's directory and the base for relative paths.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_event_to()/,/^}$/{
+  s@^        \[ -d "[$]base" \] || base="[$]ws"$@        :@
+}
+SED
+try "vnext_hook_cwd_missing_fallback" "a cwd that is not a directory here makes the workspace" "$CLI" "$HOOKS_BATS"
+
+# R6-1: an empty workspace is a prefix of every absolute path.
+cat > "$SED_TMP" << 'SED'
+/^_hook_phys_inside()/,/^}$/{
+  s@^  \[ -n "[$]a" \] && \[ -n "[$]ws" \] || return 1$@  :@
+}
+SED
+try "vnext_hook_empty_workspace" "an empty workspace judges nothing inside it" "$CLI" "$HOOKS_BATS"
+
+# R6-2: a relative path field has no prefix to require, so the upstream prefix
+# rejects are its only guard.
+cat > "$SED_TMP" << 'SED'
+/^_hook_relative_ok()/,/^}$/{
+  s@^    '~'\*|'[$]'\*|'%'\*|'`'\*|'!'\*|'='\*) return 1 ;;$@    __nomatch__) return 1 ;;@
+}
+SED
+try "vnext_hook_relative_value_rejects" "a relative path field is refused for a whole-value reject" "$CLI" "$HOOKS_BATS"
+
+# R6-2: and so is its leading or trailing whitespace arm.
+cat > "$SED_TMP" << 'SED'
+/^_hook_relative_ok()/,/^}$/{
+  s@^    \[\[:space:\]\]\*|\*\[\[:space:\]\]) return 1 ;;$@    __nomatch__) return 1 ;;@
+}
+SED
+try "vnext_hook_relative_whitespace" "a relative path field is refused for a whole-value reject" "$CLI" "$HOOKS_BATS"
+
+# R6-3: filenames entries are left out of the path-field ceiling.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_event_to()/,/^}$/{
+  s@(map(select(.c != "L")) | length | tostring)@(length | tostring)@
+}
+SED
+try "vnext_hook_list_uncounted" "a Grep over more files than the path-field ceiling keeps its event" "$CLI" "$REGRESSIONS"
+
+# R6-3: their cost is bounded instead. Only the first entries are judged.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@select((.value | type) == "string" and .key < [$]lmax)@select((.value | type) == "string")@
+}
+SED
+try "vnext_hook_list_cap_judged" "filenames past the list cap are nulled without being judged" "$CLI" "$HOOKS_BATS"
+
+# R6-3: and the rest are nulled, never passed on unjudged.
+cat > "$SED_TMP" << 'SED'
+/^_HOOK_JQ_CANDS=/,/^'$/{
+  s@if .key >= [$]lmax and@if false and@
+}
+SED
+try "vnext_hook_list_cap_nulled" "filenames past the list cap are nulled without being judged" "$CLI" "$HOOKS_BATS"
+
+# R6-3: in each tool_calls entry of a batch too.
+cat > "$SED_TMP" << 'SED'
+/^_hook_translate_event_to()/,/^}$/{
+  s@^      | (if (.tool_calls | type) == "array" then .tool_calls |= map(if type == "object" then _hlistcap else . end) else . end)$@      | .@
+}
+SED
+try "vnext_hook_list_cap_batch" "filenames past the list cap are nulled without being judged" "$CLI" "$HOOKS_BATS"
+
+# R6-4: a spool that shrinks resets a discard in progress.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^    \[ "[$]file_size" -lt "[$]byte_offset" \] && _hb_skip=0$@    :@
+}
+SED
+try "vnext_hook_oversize_skip_rewind" "a spool rewritten while an oversized line is discarded" "$CLI" "$HOOKS_BATS"
+
+# ── the host matrix: no timeout(1), and both loopbacks ──────────────────────
+
+# F26: a stock macOS has no timeout(1). perl's alarm is the arm that bounds it,
+# so without that arm the socat wait and the hook both run bare there. One
+# entry per call site, each against its own test.
+cat > "$SED_TMP" << 'SED'
+/^_bounded_argv()/,/^}$/{
+  /^  elif command -v perl >\/dev\/null 2>&1; then$/d
+  /^    _BOUNDED_ARGV=(perl -e /d
+}
+SED
+try "vnext_bounded_perl_arm_socat" "the socat wait stays bounded on a host with no timeout" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_bounded_argv()/,/^}$/{
+  /^  elif command -v perl >\/dev\/null 2>&1; then$/d
+  /^    _BOUNDED_ARGV=(perl -e /d
+}
+SED
+try "vnext_bounded_perl_arm_hook" "the per-event bound holds on a host with no timeout" "$CLI" "$HOOKS_BATS"
+
+# perl has to EXEC the command. Waiting on it as a child leaves the pid the
+# proxy holds on perl, so the alarm ends perl and orphans socat on the port.
+cat > "$SED_TMP" << 'SED'
+/^_bounded_argv()/,/^}$/{
+  s|exec { [$]ARGV\[0\] } @ARGV or exit 127|system { $ARGV[0] } @ARGV; exit 127|
+}
+SED
+try "vnext_bounded_perl_execs" "the socat wait stays bounded on a host with no timeout" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# Homebrew's coreutils names it gtimeout.
+cat > "$SED_TMP" << 'SED'
+/^_bounded_argv()/,/^}$/{
+  /^  elif command -v gtimeout >\/dev\/null 2>&1; then$/d
+  /^    _BOUNDED_ARGV=(gtimeout "[$]1")$/d
+}
+SED
+try "vnext_bounded_gtimeout_arm" "the bound falls back to gtimeout when there is no timeout" "$CLI" "$HOOKS_BATS"
+
+# The call sites. socat back to bare, and the hook back to bare.
+cat > "$SED_TMP" << 'SED'
+/^_auth_callback_proxy()/,/^}$/{
+  s@^      [$]{_BOUNDED_ARGV.*} socat "TCP-LISTEN@      socat "TCP-LISTEN@
+}
+SED
+try "vnext_bounded_socat_site" "the socat wait stays bounded on a host with no timeout" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_execute_host_hooks()/,/^}$/{
+  s@^        echo "[$]event_json" | _run_bounded "[$]_hto" bash -c "[$]cmd"@        echo "$event_json" | bash -c "$cmd"@
+}
+SED
+try "vnext_bounded_hook_site" "the per-event bound holds on a host with no timeout" "$CLI" "$HOOKS_BATS"
+
+# The two hook regressions that were source greps, now behaviour. The default
+# arm: the hook back to bare holds it past its bound on any host.
+cat > "$SED_TMP" << 'SED'
+/^_execute_host_hooks()/,/^}$/{
+  s@^        echo "[$]event_json" | _run_bounded "[$]_hto" bash -c "[$]cmd"@        echo "$event_json" | bash -c "$cmd"@
+}
+SED
+try "vnext_bounded_hook_default_arm" "hook bridge wraps execution in a timeout" "$CLI" "$REGRESSIONS"
+
+# A bound that only runs the hook when timeout(1) exists drops it everywhere
+# else. The hook must still run, bare, with nothing to bound it.
+cat > "$SED_TMP" << 'SED'
+/^_execute_host_hooks()/,/^}$/{
+  s@^        echo "[$]event_json" | _run_bounded "[$]_hto" bash -c "[$]cmd"@        command -v timeout >/dev/null 2>\&1 \&\& echo "$event_json" | timeout "$_hto" bash -c "$cmd"@
+}
+SED
+try "vnext_bounded_hook_runs_unbounded" "hook bridge has fallback when timeout command missing" "$CLI" "$REGRESSIONS"
+
+# One wait both backends read. The python leg had its own 300.
+if command -v python3 >/dev/null 2>&1; then
+cat > "$SED_TMP" << 'SED'
+/^_auth_callback_proxy()/,/^}$/{
+  s@^srv[.]settimeout(wait_secs)$@srv.settimeout(300)@
+}
+SED
+try "vnext_acp_wait_python_shared" "the python backend waits the same _ACP_WAIT_SECS as socat" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# F27: the busy-port probe asks both loopbacks. Registered only where the paired
+# test can run: a skipped test reads as a missed mutation.
+cat > "$SED_TMP" << 'SED'
+/^_port_in_use()/,/^}$/{
+  s@^  for _lo in 127[.]0[.]0[.]1 ::1; do$@  for _lo in ::1; do@
+}
+SED
+try "vnext_port_probe_ipv4_leg" "holds the port, and the port is free once it goes" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+if python3 -c 'import socket; socket.socket(socket.AF_INET6).bind(("::1", 0))' >/dev/null 2>&1; then
+cat > "$SED_TMP" << 'SED'
+/^_port_in_use()/,/^}$/{
+  s@^  for _lo in 127[.]0[.]0[.]1 ::1; do$@  for _lo in 127.0.0.1; do@
+}
+SED
+try "vnext_port_probe_ipv6_leg" "alone holds the port too" "$CLI" "$BROWSER_BRIDGE_BATS"
+fi
+fi
+
+# ── test quality: guards that had a test but no entry, or neither ───────────
+
+# The project .cleat is a file the caged agent edits, so an ADDED project read
+# is as bad as a replaced global one. Two shapes, one per way a regression
+# would find the file: the resolved project, and the working directory.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_effective()/,/^}$/{
+  s@^  _bridge_origins_from_config ok$@  _bridge_origins_from_config ok; _read_section_all_from_file "${_RESOLVED_PROJECT:-.}/.cleat" browser origin@
+}
+SED
+try "vnext_bridge_origins_no_project_read" "the GLOBAL config adds an origin" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_effective()/,/^}$/{
+  s@^  _bridge_origins_from_config ok$@  _bridge_origins_from_config ok; _read_section_all_from_file "$PWD/.cleat" browser origin@
+}
+SED
+try "vnext_bridge_origins_no_cwd_read" "the GLOBAL config adds an origin" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# [browser] is a known section in the global config, where origins live.
+cat > "$SED_TMP" << 'SED'
+/^_warn_unknown_cleat_sections()/,/^}$/{
+  /^          browser) continue ;;$/d
+}
+SED
+try "vnext_browser_section_known_global" "a browser section in the global config" "$CLI" "$PROVISION_BATS"
+
+# And in a project .cleat it says where origins go, not merely "unknown".
+cat > "$SED_TMP" << 'SED'
+/^_warn_unknown_cleat_sections()/,/^}$/{
+  s@^          browser)$@          __nobrowser__)@
+}
+SED
+try "vnext_browser_section_project_warns" "says origins are global" "$CLI" "$PROVISION_BATS"
+
+# The watcher opens nothing until a backend writes the ready file. One entry per
+# backend, each against the test that drives that backend for real.
+cat > "$SED_TMP" << 'SED'
+/^_auth_callback_proxy()/,/^}$/{
+  s@^        kill -0 "[$]_acp_child" 2>/dev/null && : > "[$]ready_file" 2>/dev/null || true$@        true@
+}
+SED
+try "vnext_proxy_ready_socat" "the socat backend signals readiness" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# The value a real login meets, not only the site that reads it.
+cat > "$SED_TMP" << 'SED'
+s@^_ACP_WAIT_SECS=300$@_ACP_WAIT_SECS=3000@
+SED
+try "vnext_acp_wait_300" "the socat wait is bounded at 300 seconds" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# The session calls both end-of-session reports and hands each the offset it
+# captured before the session, not the start of the file.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /^  _maybe_report_blocked_opens "[$]_CLIP_DIR\/.proxy-log" "[$]_proxy_log_off"$/d
+}
+SED
+try "vnext_session_end_reports_blocked" "a refusal written during the session is reported" "$CLI" "$EXEC_CLAUDE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /^  _maybe_report_hook_drops "[$]_hook_drop_log_path" /d
+}
+SED
+try "vnext_session_end_reports_hook_drops" "a hook drop written during the session" "$CLI" "$EXEC_CLAUDE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _proxy_log_off="[$](_cap_watcher_log "[$]_CLIP_DIR/.proxy-log")"$@  _proxy_log_off=0@
+}
+SED
+try "vnext_session_end_proxy_log_offset" "a refusal from an earlier session is not repeated" "$CLI" "$EXEC_CLAUDE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    _hook_drop_off="[$](wc -c < "[$]_hook_drop_log_path" .*$@    _hook_drop_off=0@
+}
+SED
+try "vnext_session_end_hook_drop_offset" "a hook drop written during the session" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# --privileged assembled on the session exec, where no text guard can see it.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s|^  docker exec -it "[$]{CLAUDE_ENV\[@\]}" \\$|  docker exec -it "--priv""ileged" "${CLAUDE_ENV[@]}" \\|
+}
+SED
+try "vnext_never_privileged_exec" "the session docker exec never carries" "$CLI" "$REGRESSIONS"
+
+# The shipped origin list is pinned in both directions: a host dropped and a
+# host added.
+cat > "$SED_TMP" << 'SED'
+s@^app[.]terraform[.]io sentry[.]io gitlab[.]com"$@app.terraform.io sentry.io"@
+SED
+try "vnext_bridge_list_pinned_drop" "the shipped list is exactly the catalogued set" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@^app[.]terraform[.]io sentry[.]io gitlab[.]com"$@app.terraform.io sentry.io gitlab.com login.example.com"@
+SED
+try "vnext_bridge_list_pinned_add" "the shipped list is exactly the catalogued set" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# The decoded redirect_uri has to parse, so userinfo there is not auth.
+cat > "$SED_TMP" << 'SED'
+/^_is_auth_url_shape()/,/^}$/{
+  s@^  _bridge_url_host "[$]dec" >/dev/null 2>&1 || return 1$@  :@
+}
+SED
+try "vnext_bridge_redirect_authority_parse" "whose authority does not parse" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# cleat browser allow refuses a loopback or private host.
+cat > "$SED_TMP" << 'SED'
+/^cmd_browser()/,/^}$/{
+  s@^  if _bridge_host_is_local "[$]host"; then$@  if false; then@
+}
+SED
+try "vnext_bridge_allow_refuses_local" "cleat browser allow refuses a loopback host" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# The refusal row itself. The reader and the shape check have entries, the
+# writer did not.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@^        elif \[ "[$]_dest_ok" != 1 \] && \[ "[$]bridge_mode" != "off" \] && _is_auth_url_shape "[$]_clean_url"; then$@        elif false; then@
+}
+SED
+try "vnext_bridge_blocked_writer" "an unallowlisted origin is refused and never opened" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# The shipped hook line cap, exactly: one byte more is dropped, the cap itself
+# passes.
+cat > "$SED_TMP" << 'SED'
+s@^_HOOK_LINE_MAX=1044480$@_HOOK_LINE_MAX=1048576@
+SED
+try "vnext_hook_line_cap_value_up" "the shipped line cap is" "$CLI" "$HOOKS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@^_HOOK_LINE_MAX=1044480$@_HOOK_LINE_MAX=1044479@
+SED
+try "vnext_hook_line_cap_value_down" "the shipped line cap is" "$CLI" "$HOOKS_BATS"
+
+# The drop summary prints the count it read. A bare "1" in the assertion
+# matched the bold escape, so any count passed.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  s@^  \[ "[$]n" -gt 0 \] || return 0$@  [ "$n" -gt 0 ] || return 0; n=7@
+}
+SED
+try "vnext_hook_drop_count" "the summary counts only this session" "$CLI" "$HOOKS_BATS"
+
+# And only this session's rows.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  s@tail -c "+[$](( off + 1 ))" "[$]log"@cat "$log"@
+}
+SED
+try "vnext_hook_drops_report_offset" "the summary counts only this session" "$CLI" "$HOOKS_BATS"
+
+# The character rule's control and backslash members, each alone.
+cat > "$SED_TMP" << 'SED'
+/^_hook_segment_chars_ok()/,/^}$/{
+  s@\\\\p{Cc}@@
+}
+SED
+try "vnext_hook_seg_cntrl" "a control character or a backslash is refused" "$CLI" "$HOOKS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_hook_segment_chars_ok()/,/^}$/{
+  s@\\\\\\\\:]@:]@
+}
+SED
+try "vnext_hook_seg_backslash" "a control character or a backslash is refused" "$CLI" "$HOOKS_BATS"
+
+# The regressions guard on the instruction-surface lists, which kits.bats cannot
+# give: it loops over the constant, so a shrunk list stays green there.
+cat > "$SED_TMP" << 'SED'
+s@^_CLAUDE_INSTR_DIRS="workflows routines rules output-styles themes @_CLAUDE_INSTR_DIRS="workflows routines rules output-styles @
+SED
+try "vnext_instr_dirs_no_shrink" "every instruction surface is masked over the box" "$CLI" "$REGRESSIONS"
+
+cat > "$SED_TMP" << 'SED'
+s@^\(_CLAUDE_INSTR_FILES="scheduled_tasks[.]json launch[.]json loop[.]md\) keybindings[.]json @\1 @
+SED
+try "vnext_instr_files_no_shrink" "every instruction surface is masked over the box" "$CLI" "$REGRESSIONS"
+
+# Registered only where python3 runs the paired tests: a skipped test reads as
+# a missed mutation.
+if command -v python3 >/dev/null 2>&1; then
+cat > "$SED_TMP" << 'SED'
+/^_auth_callback_proxy()/,/^}$/{
+  s@^        with open(ready_file, 'w') as f: f.write('1')$@        pass@
+}
+SED
+try "vnext_proxy_ready_python" "the python backend signals readiness" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# The probe in both directions against a real listener: never busy, and busy
+# on a port nothing holds.
+cat > "$SED_TMP" << 'SED'
+/^_port_in_use()/,/^}$/{
+  s@^    _run_bounded 2 bash -c "exec 9<>/dev/tcp/[$]{_lo}/[$]{port}" 2>/dev/null && return 0$@    :@
+}
+SED
+try "vnext_port_probe_never_busy" "holds the port, and the port is free once it goes" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_port_in_use()/,/^}$/{
+  s@^  return 1$@  return 0@
+}
+SED
+try "vnext_port_probe_closed_is_free" "holds the port, and the port is free once it goes" "$CLI" "$BROWSER_BRIDGE_BATS"
+fi
+
+# The hooks cap description promised "(global + project)" long after the bridge
+# stopped reading project settings files, so `cleat config` told the user a
+# project hook would run on their host. Restore the old wording.
+cat > "$SED_TMP" << 'SED'
+/^_cap_description()/,/^}$/{
+  s@^    hooks)  echo "Run the hooks in ~/[.]claude/settings[.]json on the host" ;;$@    hooks)  echo "Run your Claude Code hooks on the host (global + project)" ;;@
+}
+SED
+try "vnext_hooks_cap_description_host_file" "cap_description: hooks names the host settings file" "$CLI" "$HOOKS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

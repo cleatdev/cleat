@@ -695,6 +695,21 @@ _pass_gates() {
   assert_output --partial "doomed"
 }
 
+@test "sessions: delete takes a box session's per-box session-env with it" {
+  # session-env is a per-box private dir, because the host's own Claude Code
+  # runs the hook env files in it. A box session's copy therefore lives under
+  # the run dir, and a delete that looked only at the host path left it behind.
+  _pass_gates
+  _mk_session "$U1"
+  mkdir -p "$CLEAT_RUN_DIR/cleat-x/home/session-env/$U1"
+  echo "box env" > "$CLEAT_RUN_DIR/cleat-x/home/session-env/$U1/sessionstart-hook-0.sh"
+  run _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
+  assert_success
+  [ ! -e "$CLEAT_RUN_DIR/cleat-x/home/session-env/$U1" ] || { echo "the per-box session-env was left behind"; return 1; }
+  run grep -rl "box env" "$SDIR/.cleat-trash"
+  assert_success
+}
+
 @test "sessions: delete leaves the auto-memory and history.jsonl alone" {
   _pass_gates
   _mk_session "$U1"
@@ -1285,7 +1300,7 @@ _pass_gates() {
 }
 
 @test "sessions: trashed items outside the key dir do not collide with the sidecar" {
-  # Five of the nine delete-set paths end in a bare <uuid>. A flat basename made
+  # Six of the ten delete-set paths end in a bare <uuid>. A flat basename made
   # the first land as a directory and every later one get moved INSIDE it, so
   # the bytes were buried rather than trashed and restore could never find them.
   _pass_gates

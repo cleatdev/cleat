@@ -418,6 +418,30 @@ STUB
   assert_output --partial "Not a session id"
 }
 
+@test "smoke: cleat session rm --yes trashes a box session's per-box session-env under strict mode" {
+  # session-env joined the per-box private dirs, so the delete set gained a path
+  # under the run dir. Run on the real binary, where set -u would catch a name
+  # the sourced tests cannot see.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  local proj="$TEST_TEMP/project" uuid="0123abcd-1111-2222-3333-444455556666"
+  local key cname sdir envdir
+  key="project-$(echo -n "$proj" | _md5 | head -c 8)"
+  cname="$(_compute_cname "$proj")"
+  sdir="$HOME/.claude/projects/$key"
+  envdir="$CLEAT_CONFIG_DIR/run/$cname/home/session-env/$uuid"
+  mkdir -p "$sdir" "$envdir"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid" > "$sdir/$uuid.jsonl"
+  echo "box env" > "$envdir/sessionstart-hook-0.sh"
+  run cleat_bin_timeout 10 session rm "$uuid" --yes
+  refute_output --partial "unbound variable"
+  assert_success
+  [ ! -e "$envdir" ] || { echo "the per-box session-env survived: $output"; return 1; }
+  [ ! -e "$sdir/$uuid.jsonl" ] || { echo "the transcript was not trashed: $output"; return 1; }
+}
+
 @test "smoke: cleat session refuses an unknown flag" {
   run cleat_bin_timeout 10 session --wat
   assert_failure
@@ -469,6 +493,29 @@ STUB
   assert_output --partial "auth.example.com"
   run cleat_bin_timeout 10 browser allow "not a host"
   assert_failure
+}
+
+@test "smoke: cleat browser allow keeps earlier origins and origins splits without globbing" {
+  # The real binary under set -euo pipefail: a second allow rewrites the section
+  # the first one wrote, an upper-case scheme goes through the one entry parser,
+  # a numeric loopback is refused, and CLEAT_BROWSER_ORIGINS is split with
+  # globbing off from a folder where `*` would match a file.
+  run cleat_bin_timeout 10 browser allow first.example.com
+  assert_success
+  run cleat_bin_timeout 10 browser allow HTTPS://second.example.com
+  assert_success
+  run cleat_bin_timeout 10 browser allow 2130706433
+  assert_failure
+  mkdir -p "$TEST_TEMP/globcwd"
+  : > "$TEST_TEMP/globcwd/evil.example"
+  cd "$TEST_TEMP/globcwd"
+  CLEAT_BROWSER_ORIGINS="*" run cleat_bin_timeout 10 browser origins
+  assert_success
+  assert_output --partial "    first.example.com"
+  assert_output --partial "    second.example.com"
+  assert_output --partial "    claude.com"
+  assert_output --partial "    platform.claude.com"
+  refute_output --partial "evil.example"
 }
 
 @test "smoke: cleat browser needs no Docker daemon" {
@@ -925,6 +972,64 @@ STUB
   [[ -f "$HOME/.claude.json.bak" ]]
 }
 
+@test "smoke: cleat run copies the user's rules into the box overlay and drops every link under strict mode" {
+  # The instruction-surface pass-through runs cp, find and chmod on content the
+  # user controls. Strict mode on the real binary is where a failing one would
+  # take the whole launch down.
+  mkdir -p "$TEST_TEMP/project" "$HOME/.claude/rules/lang" "$TEST_TEMP/outside"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  echo "Prefer small diffs." > "$HOME/.claude/rules/lang/style.md"
+  echo "SECRET" > "$TEST_TEMP/outside/key"
+  ln -s "$TEST_TEMP/outside/key" "$HOME/.claude/rules/key.md"
+  mkfifo "$HOME/.claude/rules/pipe"
+  printf '{"bindings":[]}\n' > "$HOME/.claude/keybindings.json"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 run
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  local cname o
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  o="$CLEAT_CONFIG_DIR/run/$cname/home/instr"
+  run cat "$o/rules/lang/style.md"
+  assert_output "Prefer small diffs."
+  run find "$o" ! -type d ! -type f
+  assert_output ""
+  grep -q ":/home/coder/.claude/rules:ro" "$DOCKER_CALLS"
+}
+
+@test "smoke: cleat run stops before docker run on a wrong-type instruction-surface target" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  mkdir -p "$HOME/.claude/daemon.json"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 run
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "daemon.json is a directory"
+  run grep -c "^docker run " "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "smoke: cleat start names a host ~/.claude/.config.json under strict mode" {
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  printf '{"mcpServers":{}}\n' > "$HOME/.claude/.config.json"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 start
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  assert_output --partial "~/.claude/.config.json"
+}
+
 @test "smoke: cleat start fails cleanly when docker run errors" {
   mkdir -p "$TEST_TEMP/project"
   printf '' > "$DOCKER_MOCK_DIR/ps_output"
@@ -1295,6 +1400,179 @@ EOF
     cat "$DOCKER_CALLS"
     return 1
   }
+}
+
+@test "smoke: cleat --cap hooks start runs a host hook through a live bridge" {
+  # The bridge is spawned in exec_claude, AFTER cmd_run has returned, and it was
+  # handed cmd_run's `local _workspace`. Under the real binary's set -u the
+  # backgrounded spawn died on "unbound variable" before its log redirect, so the
+  # hooks cap forwarded nothing in every session while the sourced tests (strict
+  # mode stripped) stayed green. Proven end to end: the docker stub plays the
+  # box and appends Stop events until the user's host hook has run.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  mkdir -p "$TEST_TEMP/project/sub/src"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  local got="$TEST_TEMP/hook_stdin"
+  cat > "$HOME/.claude/settings.json" << EOF
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"{ pwd -P; cat; } > $got.part && mv $got.part $got"}]}]}}
+EOF
+  # Only the claude launch is intercepted. The bound keeps a dead bridge a
+  # failed assertion after ~15s, never a hung file.
+  local stub="$TEST_TEMP/hookstub"
+  mkdir -p "$stub"
+  cat > "$stub/docker" << EOF
+#!/usr/bin/env bash
+case " \$* " in
+  *" exec "*" runuser "*)
+    i=0
+    while [ ! -s "$got" ] && [ "\$i" -lt 60 ]; do
+      for d in "$XDG_CONFIG_HOME"/cleat/run/*/hooks; do
+        [ -d "\$d" ] && printf '%s\n' '{"hook_event_name":"Stop","cwd":"/workspace/sub","tool_input":{"path":"src"}}' >> "\$d/events.jsonl"
+      done
+      sleep 0.25
+      i=\$((i + 1))
+    done
+    ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+EOF
+  chmod +x "$stub/docker"
+
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env PATH="$stub:$MOCK_BIN:$PATH" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" DOCKER_EXIT_CODE=0 \
+    "$CLI" --cap hooks start
+  refute_output --partial "unbound variable"
+  refute_output --partial "jq is not installed"
+  [ -s "$got" ] || { echo "the host hook never ran, so the bridge was not alive"; echo "$output"; return 1; }
+  # A session that runs a host hook says so, on the real start path (H4).
+  assert_output --partial "Host hooks enabled. The box chooses when they run"
+  # A plain box translates /workspace/sub to the project's own sub folder, keeps
+  # the relative path it judged from there, and runs the hook in that folder.
+  run cat "$got"
+  assert_line --index 0 "$(cd -P "$TEST_TEMP/project/sub" && pwd -P)"
+  assert_output --partial "\"cwd\":\"$TEST_TEMP/project/sub\""
+  assert_output --partial '"path":"src"'
+}
+
+@test "smoke: a hooks session reports this box's dropped event and logs the one that ran" {
+  # The per-box drop report, the bounded spool read and the run log all run on
+  # the real start path, where set -u applies and the sourced suites cannot see
+  # an unbound name. The stub box appends one event naming a host path outside
+  # the workspace beside each Stop event, until the user's host hook has run.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  local got="$TEST_TEMP/hook_stdin"
+  cat > "$HOME/.claude/settings.json" << EOF
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cat > $got.part && mv $got.part $got"}]}]}}
+EOF
+  local stub="$TEST_TEMP/hookstub"
+  mkdir -p "$stub"
+  cat > "$stub/docker" << EOF
+#!/usr/bin/env bash
+case " \$* " in
+  *" exec "*" runuser "*)
+    i=0
+    while [ ! -s "$got" ] && [ "\$i" -lt 60 ]; do
+      for d in "$XDG_CONFIG_HOME"/cleat/run/*/hooks; do
+        [ -d "\$d" ] && printf '%s\n%s\n' '{"hook_event_name":"Stop","cwd":"/etc"}' \
+          '{"hook_event_name":"Stop","cwd":"/workspace"}' >> "\$d/events.jsonl"
+      done
+      sleep 0.25
+      i=\$((i + 1))
+    done
+    ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+EOF
+  chmod +x "$stub/docker"
+
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env PATH="$stub:$MOCK_BIN:$PATH" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" DOCKER_EXIT_CODE=0 \
+    "$CLI" --cap hooks start
+  refute_output --partial "unbound variable"
+  [ -s "$got" ] || { echo "the host hook never ran, so the bridge was not alive"; echo "$output"; return 1; }
+  assert_output --partial "hook event"
+  assert_output --partial "could not map to its own files"
+  run grep -c "RAN-EVENT" "$XDG_CONFIG_HOME/cleat/state/hook-runs.log"
+  assert_success
+}
+
+@test "smoke: a host hook still runs through a live bridge on a host with no timeout, gtimeout or perl" {
+  # The hook is bounded through an argv prefix, and with none of the three the
+  # prefix is an EMPTY array. bash 3.2 under set -u calls an empty "${a[@]}"
+  # unbound, which would kill the bridge's hook run on exactly the host the
+  # fallback exists for, while the sourced suites (strict mode stripped) stayed
+  # green. The PATH here is the test's own with those three taken out.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  local farm="$TEST_TEMP/nobound" d
+  mkdir -p "$farm"
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ -d "$d" ] && [ "$d" != "$MOCK_BIN" ] || continue
+    ln -s "$d"/* "$farm"/ 2>/dev/null || true
+  done < <(printf '%s\n' "$PATH" | tr ':' '\n')
+  rm -f "$farm/timeout" "$farm/gtimeout" "$farm/perl"
+  local got="$TEST_TEMP/hook_stdin"
+  cat > "$HOME/.claude/settings.json" << EOF
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cat > $got.part && mv $got.part $got"}]}]}}
+EOF
+  local stub="$TEST_TEMP/hookstub"
+  mkdir -p "$stub"
+  cat > "$stub/docker" << EOF
+#!/usr/bin/env bash
+case " \$* " in
+  *" exec "*" runuser "*)
+    i=0
+    while [ ! -s "$got" ] && [ "\$i" -lt 60 ]; do
+      for d in "$XDG_CONFIG_HOME"/cleat/run/*/hooks; do
+        [ -d "\$d" ] && printf '%s\n' '{"hook_event_name":"Stop","cwd":"/workspace"}' >> "\$d/events.jsonl"
+      done
+      sleep 0.25
+      i=\$((i + 1))
+    done
+    ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+EOF
+  chmod +x "$stub/docker"
+
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env PATH="$stub:$MOCK_BIN:$farm" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" DOCKER_EXIT_CODE=0 \
+    "$CLI" --cap hooks start
+  refute_output --partial "unbound variable"
+  [ -s "$got" ] || { echo "the host hook never ran, so the bridge was not alive"; echo "$output"; return 1; }
+  run cat "$got"
+  assert_output --partial '"hook_event_name":"Stop"'
+}
+
+@test "smoke: cleat start names a non-default browser bridge mode under strict mode" {
+  # B7: the launch summary names the bridge mode when it is not auto. The row
+  # reads CLEAT_BROWSER_BRIDGE on the real start path, where set -u applies.
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  cd "$TEST_TEMP/project"
+  export CLEAT_BROWSER_BRIDGE=always
+  run cleat_bin_timeout 5 start
+  unset CLEAT_BROWSER_BRIDGE
+  refute_output --partial "unbound variable"
+  assert_output --partial "Browser:"
+  assert_output --partial "destination check off"
 }
 
 # ── Config drift and version label ──────────────────────────────────────────
@@ -1831,6 +2109,111 @@ EOF
   assert_failure
   refute_output --partial "Starting Docker"
   refute_output --partial "unbound variable"
+}
+
+# Run `cleat <verb>` against a running stub box whose interactive exec does what
+# a login inside the box does: it hands the watcher an authorize URL at an
+# unlisted origin, then returns once the watcher has refused it. A wrapper
+# ahead of the stub in PATH, because cleat_bin puts the stub first. The binary
+# runs under its own set -euo pipefail, which is what a sourced test cannot see.
+_smoke_refused_open() {
+  local verb="$1"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  local clip="$XDG_CONFIG_HOME/cleat/run/$cname/clip"
+  cat > "$TEST_TEMP/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+  "exec -it "*)
+    printf '%s' 'https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback' > "$clip/.browser-open"
+    i=0
+    while [ "\$i" -lt 100 ]; do
+      grep -q 'BLOCKED-ORIGIN origin=auth.example.com' "$clip/.proxy-log" 2>/dev/null && break
+      sleep 0.1
+      i=\$((i + 1))
+    done ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+WRAP
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_TEMP/wrap/xdg-open"
+  chmod +x "$TEST_TEMP/wrap/docker" "$TEST_TEMP/wrap/xdg-open"
+  cd "$TEST_TEMP/project"
+  _portable_timeout 30 env \
+    PATH="$TEST_TEMP/wrap:$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE=0 \
+    "$CLI" "$verb"
+}
+
+@test "smoke: cleat shell reports a refused browser open under strict mode" {
+  run _smoke_refused_open shell
+  assert_success
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat login reports a refused browser open under strict mode" {
+  run _smoke_refused_open login
+  assert_success
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat shell reports a rate-capped browser open under strict mode" {
+  # The box's minute ledger already holds six fresh opens, so the next URL is
+  # held back by the cap and the report prints it when the shell ends. always
+  # mode, so no origin check stands in front of the cap.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  local clip="$XDG_CONFIG_HOME/cleat/run/$cname/clip"
+  local ledger="$XDG_CONFIG_HOME/cleat/run/$cname/clipclaim/.opens"
+  cat > "$TEST_TEMP/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+  "exec -it "*)
+    mkdir -p "\$(dirname "$ledger")"
+    now=\$(date +%s); : > "$ledger"
+    for k in 1 2 3 4 5 6; do echo "\$now" >> "$ledger"; done
+    printf '%s' 'https://docs.example.org/capped-page' > "$clip/.browser-open"
+    i=0
+    while [ "\$i" -lt 100 ]; do
+      grep -q 'RATE-CAPPED limit=' "$clip/.proxy-log" 2>/dev/null && break
+      sleep 0.1
+      i=\$((i + 1))
+    done ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+WRAP
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_TEMP/wrap/xdg-open"
+  chmod +x "$TEST_TEMP/wrap/docker" "$TEST_TEMP/wrap/xdg-open"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env \
+    PATH="$TEST_TEMP/wrap:$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE=0 \
+    CLEAT_BROWSER_BRIDGE=always \
+    "$CLI" shell
+  assert_success
+  assert_output --partial "Did not open"
+  assert_output --partial "https://docs.example.org/capped-page"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat browser origins lists a loopback entry as ignored under strict mode" {
+  CLEAT_BROWSER_ORIGINS="localhost auth.example.com" run cleat_bin_timeout 10 browser origins
+  assert_success
+  assert_output --partial "Ignored"
+  assert_output --partial "    auth.example.com"
 }
 
 @test "smoke: cleat login with no container runs the real binary without a strict-mode crash" {

@@ -451,7 +451,10 @@ on its own and can invoke it without you typing anything. Author those at
 project level (`.claude/agents/`, `.claude/commands/`, `.claude/skills/`)
 instead. Plugins you already have stay readable and usable in a box, but installing a
 new one from inside a box fails, because that directory is read-only. Install
-plugins on the host and every box sees them. Other projects stay invisible: `~/.claude/projects` holds a full transcript of
+plugins on the host and every box sees them. Those read-only copies dereference
+a top-level symlink (a dotfile-repo `commands` dir shows up as real files in the
+box) but keep a symlink nested inside a skill as a link, so a skill pointing at
+`~/.ssh` cannot pull real key bytes into the box. Other projects stay invisible: `~/.claude/projects` holds a full transcript of
 every project you have ever run Claude Code on, so a box gets a generated
 directory containing only its own project's sessions. Its own session stays
 writable, so `--continue` and `--resume` work normally. `file-history`,
@@ -467,13 +470,9 @@ authenticate. Fifteen more instruction surfaces at the root of `~/.claude`
 (`rules/`, `workflows/`, `output-styles/`, `themes/`, `keybindings.json`,
 `loop.md`, `settings.local.json` and eight others) are read-only in a box too.
 Six of them show your own content, copied fresh on every create, start and
-resume. That copy takes directories and regular files only and follows no
-symlink, so a dotfile-repo symlink at one of those names is not seen in a box.
-The other nine are empty.
-The read-only copies
-dereference symlinks (a dotfile-repo `commands` dir shows up as real files in
-the box) while a symlink nested inside a skill is kept as a link, so a skill
-pointing at `~/.ssh` cannot pull real key bytes into the box. A broken
+resume. That copy is stricter: it takes directories and regular files only and
+follows no symlink at all, not even a top-level one, so a dotfile-repo symlink at
+one of those names is not seen in a box. The other nine are empty. A broken
 symlink at one of the mask paths stops box create with a
 clear fix-or-remove error (your symlink is never deleted) and a box created
 before these masks existed prints a recreate note on every start until you
@@ -485,7 +484,7 @@ A Claude Max account has a five-hour window. With two of them the only way to mo
 
 ```bash
 cleat account work2      # pin this box to a login called work2
-# start the box and run /login once. That login is remembered under the name
+# start the box and run /login once (or run cleat login). That login is remembered under the name
 
 cleat account            # picker: switch, rename or remove, → for the trash
 cleat account work1      # back to the first one, no browser
@@ -494,15 +493,19 @@ cleat account default    # unpin: back to your shared ~/.claude login
 
 Only the login moves. Conversations, project history and settings are identical on both accounts, by construction rather than by copying: a switch relocates Claude Code's credential store for that box and nothing else. So you can hit a limit mid-conversation, switch, then carry on in the same conversation.
 
+Switch a box that has a Claude session running and the command hands it over instead of refusing. Cleat first shows what the handover costs: anything typed there but not sent, any background agent or monitor the box runs and a first reply on the new account that rereads the whole conversation without a prompt cache. It asks `Hand over?`, stops the session, moves the login and lets that terminal reopen the same conversation on the new account. `--yes` skips the question. `--now` also restarts a session that is mid-turn or sitting at a prompt, where its reply so far is lost. When the conversation reopens, Claude Code may show its own resume-from-summary question first, so answer that before you type anything.
+
 The pin is per box, because the limit is per account and you probably have several boxes open. One can move to the fresh account while the others keep draining the first. The picker's first row is always your shared `~/.claude` login, so a pin is never a one-way door.
 
 Removing a login is never an unlink: it goes to a trash kept for 30 days. `→` in the picker crosses to it and `←` comes back, the same two keys `cleat session` uses. Each row still says whose login it was and when it went. `⏎` puts it back. Remove your last account and the picker opens the trash rather than dropping you at a shell prompt, because that is the only place it can be got back from.
+
+A login a box had that no account could save is kept too, not deleted. It goes to a held area for 30 days, on the same clock as the trash. Cleat holds one when it cannot prove a refreshed login belongs to its account, when a `/login` inside the box signed in as a different account or when a login is left behind in a box you removed. `cleat account held` lists them with where each came from and why. `cleat account adopt <id> <name>` saves one as an account. A new name creates that account. An existing name takes the login in and holds that account's previous login in its place.
 
 A box created before this feature has no credential mount. Cleat says so and tells you to recreate it once with `cleat rm <box>`, rather than half working: without the mount, `/login` would write the store inside the container where `cleat rm` destroys it. Until you do, `cleat status` and the launch summary both call the pin not in effect rather than naming an account the box is not using. The recreate keeps your conversations, trust and env, which live on the host. It does not keep what you installed inside the box, so move that into a `[setup]` section first.
 
 Upgrading to a build that has this feature does nothing by itself: no image rebuild, no container recreate. A box picks up its credential mount the next time it is recreated for its own reasons.
 
-Claude Code refreshes its own token about every eight hours, inside the box. Every attach stages the stored login in and every detach takes the refreshed one back out, newest wins. `cleat rm`, every recreate and `cleat nuke` do that before they touch a run directory, so a refresh never sends you back to a browser.
+Claude Code refreshes its own token about every eight hours, inside the box. Every attach stages the stored login in and every detach takes the refreshed one back out, newest wins. `cleat rm`, every recreate and `cleat nuke` do that before they touch a run directory, so a refresh never sends you back to a browser. A `/login` run in a `cleat shell`, or `cleat login` itself, is saved to the pinned account the same way.
 
 Logins live in `~/.config/cleat/accounts`, not in `~/.claude`, which every box mounts read-write. Only the pinned account's credential is staged into that box, so a box can still see exactly one login.
 
@@ -559,7 +562,7 @@ Listing works with Docker down, which is usually when you want it.
 | Command | Description |
 |---|---|
 | `cleat` | Build + run + launch Claude Code (all-in-one) |
-| `cleat resume` | Resume the most recent session (recreates the container if `cleat rm` was run since: sessions persist on the host) |
+| `cleat resume` | Resume the most recent conversation not open in another terminal, keeping its 1M context (recreates the container if `cleat rm` was run since: sessions persist on the host) |
 
 #### Lifecycle
 | Command | Description |
@@ -638,20 +641,22 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 |---|---|
 | `cleat claude [box]` | Attach Claude Code to a running container |
 | `cleat shell [box]` | Open bash inside the container |
-| `cleat login [box]` | Authenticate with Anthropic (OAuth) |
+| `cleat login [box]` | Sign in to Anthropic by running `claude auth login`. A pinned box saves the login to its account |
 | `cleat logs [box]` | Tail container logs |
 
 #### Accounts
 | Command | Description |
 |---|---|
 | `cleat account` | Picker for this project's default box: switch, rename or remove a login |
-| `cleat account <name> [box]` | Pin a box to a named login, creating it if new |
+| `cleat account <name> [box]` | Pin a box to a named login, creating it if new. A live session in the box restarts on it (`--yes` skips the prompt, `--now` restarts mid-turn) |
 | `cleat account default [box]` | Unpin a box, back to your shared `~/.claude` login |
 | `cleat account list [box]` | Plain list of stored logins, marking the pinned one |
 | `cleat account rename <old> <new>` | Rename a stored login. Every box pinned to it follows |
 | `cleat account rm <name>` | Move a login to the trash, with `--yes` to skip the prompt |
 | `cleat account restore <name>` | Bring a removed login back (30 days) |
 | `cleat account trash` | List removed logins. The picker reaches the same list with `→` |
+| `cleat account held` | List logins kept aside instead of deleted (30 days) |
+| `cleat account adopt <id> <name>` | Save a held login as an account (a new name creates it) |
 
 #### Info
 | Command | Description |

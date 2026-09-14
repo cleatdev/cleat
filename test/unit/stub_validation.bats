@@ -392,3 +392,31 @@ _lock_lib() { printf '%s\n' "$PROJECT_ROOT/test/lib/testlock.sh"; }
   done
   [[ "$winners" -eq 0 ]] || { echo "both racers acquired the lock in $winners of 10 rounds"; return 1; }
 }
+
+# ── DOCKER_STUB_EXEC_SCRIPT (M3): the stub runs a script for `docker exec` ────
+
+@test "stub exec script receives the argv and prints its stdout" {
+  cat > "$TEST_TEMP/es.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'ARGV:%s\n' "$*"
+SH
+  chmod +x "$TEST_TEMP/es.sh"
+  export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/es.sh"
+  run docker exec mybox echo hello
+  assert_success
+  assert_output --partial "ARGV:exec mybox echo hello"
+}
+
+@test "stub exec script receives stdin and returns its exit code" {
+  cat > "$TEST_TEMP/es.sh" <<'SH'
+#!/usr/bin/env bash
+in="$(cat)"
+printf 'STDIN:%s\n' "$in"
+exit 42
+SH
+  chmod +x "$TEST_TEMP/es.sh"
+  export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/es.sh"
+  run bash -c 'printf "%s" "payload42" | docker exec mybox cat'
+  assert_output --partial "STDIN:payload42"
+  assert_equal "$status" 42
+}

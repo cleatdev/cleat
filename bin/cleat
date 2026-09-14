@@ -9029,6 +9029,505 @@ _maybe_run_setup() {
   return 0
 }
 
+# ── Live switch: state both terminals read ───────────────────────────────────
+# Host-only markers and tickets under $CLEAT_RUN_DIR/<cname> that a switch in
+# one terminal and an attach or relaunch in another read to stay in step. Only
+# the auth/ subdir of a box run dir is ever bind-mounted, so none of these paths
+# reaches inside the box: they carry no secret and the box cannot forge one. See
+# concept/44 and section 5.2 of the handover.
+
+# A per-attach id, lowercase hex so two ids never differ only by case on APFS.
+# The pid, the epoch and one 16-bit random word give 13 to 18 hex digits, always
+# inside _handoff_id_ok's 12-to-32 range. Terminal 1 stamps it into its attach
+# marker and its exec environment so a probe in terminal 2 can tie a live
+# session to the marker that owns it.
+_exec_claude_new_exec_id() {
+  printf '%x%x%04x' "$$" "$(date +%s)" "$RANDOM"
+}
+
+# True for a validated exec id: 12 to 32 lowercase hex digits, nothing else.
+_handoff_id_ok() {
+  case "${1:-}" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [[ ${#1} -ge 12 && ${#1} -le 32 ]]
+}
+
+# _handoff_marker_read FILE: read a .attached.<pid> marker and set _HM_KIND
+# (claude|shell) and _HM_EXEC. It accepts exactly `kind=claude exec=<id-or-empty>`
+# or `kind=shell`. Anything else, an older cleat's empty marker included, reads
+# as kind=shell, which fails closed for both the starting and the shell-open
+# checks. A symlink or odd node is never followed, it just reads as shell.
+_handoff_marker_read() {
+  local f="$1" line=""
+  _HM_KIND="shell"; _HM_EXEC=""
+  [[ -e "$f" ]] || return 1
+  if [[ -L "$f" || ! -f "$f" ]]; then
+    return 0
+  fi
+  IFS= read -r line 2>/dev/null < "$f" || true
+  line="${line:0:200}"
+  if [[ "$line" == "kind=shell" ]]; then
+    return 0
+  fi
+  case "$line" in
+    "kind=claude exec="*)
+      local id="${line#kind=claude exec=}"
+      if [[ -z "$id" ]] || _handoff_id_ok "$id"; then
+        _HM_KIND="claude"; _HM_EXEC="$id"
+        return 0
+      fi
+      ;;
+  esac
+  _HM_KIND="shell"; _HM_EXEC=""
+  return 0
+}
+
+# _handoff_marker_live_for_exec CNAME EXECID: true when a live .attached.<pid>
+# marker (its filename pid answers kill -0) reads kind=claude with that exec id.
+_handoff_marker_live_for_exec() {
+  local cname="$1" want="$2" rd m pid
+  [[ -n "$want" ]] || return 1
+  rd="$CLEAT_RUN_DIR/$cname"
+  for m in "$rd"/.attached.*; do
+    [[ -e "$m" ]] || continue
+    pid="${m##*/.attached.}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    _handoff_marker_read "$m" || continue
+    [[ "$_HM_KIND" == "claude" && "$_HM_EXEC" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+# _handoff_starting_markers CNAME [EXECID...]: print the pid of every live
+# kind=claude marker younger than _HANDOFF_STARTING_MAX_S whose exec id is not
+# one of the EXECIDs the caller already accounted for (an empty exec id matches
+# none, so it always counts as starting). Returns 0 when it printed at least one.
+# The offline switch passes no EXECIDs, so any such marker refuses there; the
+# live handoff passes its probe's ids so its own live sessions do not count.
+_handoff_starting_markers() {
+  local cname="$1"; shift
+  local rd m pid mt age now e skip found=0
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  rd="$CLEAT_RUN_DIR/$cname"
+  for m in "$rd"/.attached.*; do
+    [[ -e "$m" ]] || continue
+    pid="${m##*/.attached.}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    _handoff_marker_read "$m" || continue
+    [[ "$_HM_KIND" == "claude" ]] || continue
+    mt="$(_path_mtime "$m")"
+    age=$(( now - mt ))
+    [[ $age -ge 0 && $age -le $_HANDOFF_STARTING_MAX_S ]] || continue
+    skip=0
+    for e in "$@"; do
+      [[ -n "$_HM_EXEC" && "$_HM_EXEC" == "$e" ]] && { skip=1; break; }
+    done
+    [[ $skip -eq 1 ]] && continue
+    printf '%s\n' "$pid"
+    found=1
+  done
+  [[ $found -eq 1 ]]
+}
+
+# _handoff_shell_open CNAME: true when a live marker does not read as kind=claude
+# (a cleat shell, or any unparseable marker which fails closed to shell). No age
+# bound: a shell can sit open indefinitely.
+_handoff_shell_open() {
+  local cname="$1" rd m pid
+  rd="$CLEAT_RUN_DIR/$cname"
+  for m in "$rd"/.attached.*; do
+    [[ -e "$m" ]] || continue
+    pid="${m##*/.attached.}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    _handoff_marker_read "$m"
+    [[ "$_HM_KIND" == "claude" ]] && continue
+    return 0
+  done
+  return 1
+}
+
+_handoff_ticket_clear() { _HT_STATE=""; _HT_BY=""; _HT_AT=""; _HT_SID=""; _HT_TO=""; }
+
+# _handoff_ticket_read FILE: parse a .handoff.<execid> ticket and set _HT_STATE
+# _HT_BY _HT_AT _HT_SID _HT_TO. Requires a regular non-symlink file, v=1, a state
+# of requested or ready, a `by` that is a plausible pid (^[1-9][0-9]{0,9}$) other
+# than 1, an `at` of 1 to 12 digits no more than 5 s ahead of now, a UUID sid and
+# a `to` that validates or is the default sentinel. Anything else reads as absent
+# (return 1), so kill -0 never sees an unvalidated by such as 0 or a group.
+_handoff_ticket_read() {
+  local f="$1" k v ver="" now
+  _handoff_ticket_clear
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
+    case "$k" in
+      v)     ver="$v" ;;
+      state) _HT_STATE="$v" ;;
+      by)    _HT_BY="$v" ;;
+      at)    _HT_AT="$v" ;;
+      sid)   _HT_SID="$v" ;;
+      to)    _HT_TO="$v" ;;
+    esac
+  done < "$f"
+  [[ "$ver" == "1" ]] || { _handoff_ticket_clear; return 1; }
+  case "$_HT_STATE" in requested|ready) : ;; *) _handoff_ticket_clear; return 1 ;; esac
+  case "$_HT_BY" in ''|0*|*[!0-9]*) _handoff_ticket_clear; return 1 ;; esac
+  { [[ ${#_HT_BY} -le 10 && "$_HT_BY" != "1" ]]; } || { _handoff_ticket_clear; return 1; }
+  case "$_HT_AT" in ''|*[!0-9]*) _handoff_ticket_clear; return 1 ;; esac
+  [[ ${#_HT_AT} -le 12 ]] || { _handoff_ticket_clear; return 1; }
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  [[ $(( _HT_AT - now )) -le 5 ]] || { _handoff_ticket_clear; return 1; }
+  _sessions_is_uuid "$_HT_SID" || { _handoff_ticket_clear; return 1; }
+  if [[ "$_HT_TO" != "$_ACCOUNT_DEFAULT" ]] && ! _validate_account_name "$_HT_TO"; then
+    _handoff_ticket_clear; return 1
+  fi
+  return 0
+}
+
+# _handoff_ticket_write CNAME EXECID STATE SID TO: write one ticket atomically
+# (mktemp in the same dir, chmod 600, mv -f). by is this shell, at is now.
+_handoff_ticket_write() {
+  local cname="$1" execid="$2" state="$3" sid="$4" to="$5" rd tmp now
+  _handoff_id_ok "$execid" || return 1
+  case "$state" in requested|ready) : ;; *) return 1 ;; esac
+  rd="$CLEAT_RUN_DIR/$cname"
+  mkdir -p "$rd" 2>/dev/null || return 1
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  tmp="$(mktemp "$rd/.handoff-tmp.XXXXXX" 2>/dev/null)" || return 1
+  if ! {
+        printf 'v=1\n'
+        printf 'state=%s\n' "$state"
+        printf 'by=%s\n' "$$"
+        printf 'at=%s\n' "$now"
+        printf 'sid=%s\n' "$sid"
+        printf 'to=%s\n' "$to"
+      } > "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$rd/.handoff.$execid" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+  return 0
+}
+
+# _handoff_tickets_requested_live CNAME: true when a live-writer `requested`
+# ticket of the box exists (4.1 row 4, the attach gate's own half).
+_handoff_tickets_requested_live() {
+  local cname="$1" rd f now age
+  rd="$CLEAT_RUN_DIR/$cname"
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  for f in "$rd"/.handoff.*; do
+    [[ -e "$f" ]] || continue
+    _handoff_ticket_read "$f" || continue
+    age=$(( now - _HT_AT ))
+    [[ $age -ge 0 && $age -le $_HANDOFF_READY_MAX_AGE_S ]] || continue
+    [[ "$_HT_STATE" == "requested" ]] || continue
+    kill -0 "$_HT_BY" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# _handoff_tickets_pending CNAME: true when a ticket of the box is still holding
+# a reopen. A `requested` ticket is pending while its writer lives. A `ready`
+# ticket is pending while the marker with its exec id has a live pid and its sid
+# is not already back in the caller's live probe set (_HO_SID). A caller with no
+# probe (cleat account rm) has an empty _HO_SID, so any live `ready` ticket is
+# pending whatever its sid.
+_handoff_tickets_pending() {
+  local cname="$1" rd f now age execid s in_probe
+  rd="$CLEAT_RUN_DIR/$cname"
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  for f in "$rd"/.handoff.*; do
+    [[ -e "$f" ]] || continue
+    _handoff_ticket_read "$f" || continue
+    age=$(( now - _HT_AT ))
+    [[ $age -ge 0 && $age -le $_HANDOFF_READY_MAX_AGE_S ]] || continue
+    if [[ "$_HT_STATE" == "requested" ]]; then
+      kill -0 "$_HT_BY" 2>/dev/null && return 0
+      continue
+    fi
+    execid="${f##*/.handoff.}"
+    _handoff_marker_live_for_exec "$cname" "$execid" || continue
+    in_probe=0
+    for s in ${_HO_SID[@]+"${_HO_SID[@]}"}; do
+      [[ "$s" == "$_HT_SID" ]] && { in_probe=1; break; }
+    done
+    [[ $in_probe -eq 0 ]] && return 0
+  done
+  return 1
+}
+
+# _handoff_tickets_sweep CNAME: drop tickets that no longer parse, whose exec id
+# has no live marker, or whose `at` is out of the age bound. Run only under the
+# account lock, right before a ticket write.
+_handoff_tickets_sweep() {
+  local cname="$1" rd f now age execid
+  rd="$CLEAT_RUN_DIR/$cname"
+  [[ -d "$rd" ]] || return 0
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  for f in "$rd"/.handoff.*; do
+    [[ -e "$f" ]] || continue
+    if ! _handoff_ticket_read "$f"; then
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    age=$(( now - _HT_AT ))
+    if [[ $age -lt 0 || $age -gt $_HANDOFF_READY_MAX_AGE_S ]]; then
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    execid="${f##*/.handoff.}"
+    _handoff_marker_live_for_exec "$cname" "$execid" || rm -f "$f" 2>/dev/null || true
+  done
+  return 0
+}
+
+# _handoff_flag_identity_stale PROJECT BOX: touch the batch-11 stale-identity
+# flag beside the box's per-project claude.json (H9). Written before the pin
+# moves, so a relaunch that reads the new pin never reads the old account name.
+# Best effort: a box with no project dir yet has nothing to flag.
+_handoff_flag_identity_stale() {
+  local project="$1" box="$2" key f
+  [[ -n "$project" ]] || return 0
+  key="$(_derive_project_session_key "$project" "$box")" || return 0
+  _account_session_key_ok "$key" || return 0
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  : > "${f}.identity-stale" 2>/dev/null || true
+  return 0
+}
+
+# _account_attach_gate CNAME BOX CMDWORD: wait for a switch of this box to finish
+# before the caller reads the pin. Taking and releasing the account lock is the
+# whole gate: a switch holds it from its ticket write through the rename, so the
+# attach either runs first (and the switch then sees its marker) or waits and
+# reads the pin the switch left. Only when the lock stays busy past P2's wait AND
+# a requested ticket of THIS box has a live writer does it refuse: that is a
+# switch of this very box still running, where reading the pin now could land the
+# session on the login the switch is replacing. Busy for any other reason (another
+# box's switch, a nuke, an rm) is P2's fail-safe and the attach goes on.
+_account_attach_gate() {
+  local rc=0
+  _account_settle "$1" || rc=$?
+  if [[ $rc -eq $_ACCOUNT_LOCK_BUSY ]] && _handoff_tickets_requested_live "$1"; then
+    _handoff_say R-switching "$2" "$3"
+    return 1
+  fi
+  return 0
+}
+
+# ── Live switch: terminal 1 state and prepare (M3) ───────────────────────────
+# The helpers terminal 1's relaunch loop reaches: which argv shapes may be
+# reopened, the store-variable pair edit, the pin the exec really gets, the once
+# -per-exec prepare, the wait on terminal 2's ticket and the typeahead drain.
+# All host-only: none ships into a box.
+
+# True only for the exact argv shapes a relaunch can rebuild without dropping a
+# flag the user gave: --dangerously-skip-permissions alone, or followed by
+# --continue, --resume <uuid>, or --resume <uuid> --model <m> with m carrying
+# the [1m] suffix. Anything else is not relaunchable, so exec_claude stamps no
+# exec id and the session reads as R-foreign to a switch in another terminal.
+_exec_claude_argv_relaunchable() {
+  local re_uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  local re_model='^claude-[a-z0-9.-]+\[1m\]$'
+  [[ "${1:-}" == "--dangerously-skip-permissions" ]] || return 1
+  shift
+  [[ $# -ge 1 ]] || return 0
+  case "$1" in
+    --continue)
+      [[ $# -eq 1 ]] || return 1
+      return 0
+      ;;
+    --resume) : ;;
+    *) return 1 ;;
+  esac
+  shift
+  [[ $# -ge 1 ]] || return 1
+  [[ "$1" =~ $re_uuid ]] || return 1
+  shift
+  [[ $# -ge 1 ]] || return 0
+  [[ "$1" == "--model" ]] || return 1
+  shift
+  [[ $# -eq 1 ]] || return 1
+  [[ "$1" =~ $re_model ]] || return 1
+  return 0
+}
+
+# Drop the store variable from CLAUDE_ENV as a `-e VALUE` PAIR. Dropping only
+# the value would leave a bare `-e` that swallows the next argument. Called at
+# the top of every prepare so a re-prepare on a relaunch never leaves two
+# CLAUDE_SECURESTORAGE_CONFIG_DIR pairs (the applier appends a fresh one).
+_claude_env_drop_store() {
+  local i=0 n=${#CLAUDE_ENV[@]} out=()
+  while [[ $i -lt $n ]]; do
+    if [[ "${CLAUDE_ENV[$i]}" == "-e" && $(( i + 1 )) -lt $n \
+          && "${CLAUDE_ENV[$(( i + 1 ))]}" == CLAUDE_SECURESTORAGE_CONFIG_DIR=* ]]; then
+      i=$(( i + 2 )); continue
+    fi
+    out+=("${CLAUDE_ENV[$i]}"); i=$(( i + 1 ))
+  done
+  CLAUDE_ENV=("${out[@]+"${out[@]}"}")
+}
+
+# The account the exec REALLY runs as: default when CLAUDE_ENV carries no store
+# variable (a box with no mount runs on the shared login even when pinned), else
+# the box pin. So the seed and the T1 line follow the environment, not the pin.
+_claude_env_store_pin() {
+  local cname="$1" e
+  for e in "${CLAUDE_ENV[@]+"${CLAUDE_ENV[@]}"}"; do
+    case "$e" in CLAUDE_SECURESTORAGE_CONFIG_DIR=*) _box_account_read "$cname"; return 0 ;; esac
+  done
+  printf '%s' "$_ACCOUNT_DEFAULT"
+}
+
+# The account block that used to sit once above the watchers, now run right
+# before every exec (O3): drop any stale store pair, stage and pin the account
+# env, seed the macOS Keychain only for a shared-login run, heal the box's
+# claude.json (which also retries a switch's H9 identity flag). Sets _EC_PINNED
+# to the pin the exec gets, for the T1 reopen line.
+_exec_claude_prepare_account() {
+  local cname="$1"
+  _claude_env_drop_store
+  _account_apply_exec_env "$cname" || true
+  _EC_PINNED="$(_claude_env_store_pin "$cname")"
+  if [[ "$_EC_PINNED" == "$_ACCOUNT_DEFAULT" ]]; then
+    _seed_macos_credentials
+  fi
+  _refresh_attached_claude_json "$cname" "${_RESOLVED_PROJECT:-}" "${_BOX:-main}"
+  return 0
+}
+
+# Render an account name as it reads in a sentence: "account foo", or "your
+# shared login" for the default sentinel. Shared by the T lines here and the
+# _handoff_say catalogue.
+_handoff_acct_phrase() {
+  if [[ "$1" == "$_ACCOUNT_DEFAULT" ]]; then printf 'your shared login'; else printf 'account %s' "$1"; fi
+}
+
+# The T1/T1b reopen line, then T-limit, then the dialog hint. TO is the ticket's
+# account, FLAGS is the `L A` _handoff_tail_flags read from the transcript before
+# the relaunch. The pin is _EC_PINNED, set by the prepare this iteration, so it
+# names the login the relaunch really uses, never the ticket's target.
+# The resume-from-summary dialog is not suppressed (maintainer decision): it can
+# fire on any old, large conversation, not only at a usage limit, so the hint
+# prints on every relaunch. It reads `waiting`/`dialog open` and a typed
+# `continue` picks one of its options (1.9), so the user answers it first.
+_handoff_say_t1() {
+  local to="$1" flags="$2" pin="$_EC_PINNED" who="" phrase L A
+  phrase="$(_handoff_acct_phrase "$pin")"
+  if [[ "$pin" == "$to" ]]; then
+    if [[ "$pin" != "$_ACCOUNT_DEFAULT" ]]; then
+      who="$(_account_meta_get "$pin" who 2>/dev/null || true)"
+    fi
+    if [[ -n "$who" ]]; then
+      info "Reopening this conversation on ${phrase} ${DIM}(${who})${RESET}"
+    else
+      info "Reopening this conversation on ${phrase}"
+    fi
+  else
+    warn "The switch to $(_handoff_acct_phrase "$to") did not finish. Reopening this conversation on ${phrase}."
+  fi
+  set -- $flags
+  L="${1:-0}"; A="${2:-0}"
+  if [[ "$L" == "1" ]]; then
+    if [[ "$A" == "1" ]]; then
+      echo -e "    ${DIM}The usage limit lines in it are from before the restart. Nothing is scheduled.${RESET}"
+    else
+      echo -e "    ${DIM}The usage limit lines in it are from before the restart.${RESET}"
+    fi
+  fi
+  echo -e "    ${DIM}If it shows a question first, answer that before you type continue.${RESET}"
+}
+
+# Wait, in the CURRENT shell, for terminal 2's ticket to reach `ready`. Never
+# call in $(...): a subshell resets the flag trap. Sets _HANDOFF_T1_STATE
+# (ready|interrupted|unfinished) and, through the caller's _ec_to, the ticket's
+# target. Prints T0 once while the ticket reads `requested` with a live writer.
+# A dead writer, a vanished, malformed, too-old ticket, a failed sid or 60 s all
+# end the wait as unfinished. A raised _EC_INT (the flag trap) ends it as
+# interrupted. Keeps the flag trap in place so Ctrl-C still stops the wait.
+_handoff_t1_await() {
+  local t="$1" start said=0 now
+  trap '_EC_INT=1' INT TERM HUP
+  start=$SECONDS
+  while :; do
+    if [[ "$_EC_INT" == "1" ]]; then _HANDOFF_T1_STATE=interrupted; break; fi
+    if ! _handoff_ticket_read "$t"; then _HANDOFF_T1_STATE=unfinished; break; fi
+    _ec_to="$_HT_TO"
+    now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+    if [[ $(( now - _HT_AT )) -gt $_HANDOFF_READY_MAX_AGE_S ]]; then _HANDOFF_T1_STATE=unfinished; break; fi
+    case "$_HT_STATE" in
+      ready) _HANDOFF_T1_STATE=ready; break ;;
+      requested)
+        if ! kill -0 "$_HT_BY" 2>/dev/null; then _HANDOFF_T1_STATE=unfinished; break; fi
+        if [[ $said -eq 0 ]]; then said=1; _handoff_say T0 "$_HT_TO"; fi
+        ;;
+    esac
+    if [[ $(( SECONDS - start )) -ge $_HANDOFF_T1_WAIT_S ]]; then _HANDOFF_T1_STATE=unfinished; break; fi
+    _handoff_t1_pause || true
+  done
+  return 0
+}
+
+# Throw away what was typed during the wait. Neither Linux n_tty nor the BSD tty
+# flushes pending input when docker's raw mode turns ICANON off, so a stray
+# `continue` typed before the relaunch would otherwise be sent at once. Never
+# `read -t 0`.
+_handoff_drain_typeahead() {
+  _is_interactive || return 0
+  local saved
+  saved="$(stty -g </dev/tty 2>/dev/null)" || return 0
+  { stty -icanon min 0 time 0 && dd bs=4096 count=64 of=/dev/null 2>/dev/null; } </dev/tty 2>/dev/null || true
+  stty "$saved" </dev/tty 2>/dev/null || true
+  return 0
+}
+
+# The session ids of the box that are reopening after a switch: every ticket
+# that parses, is within the age bound and whose exec id has a live kind=claude
+# marker. cmd_resume adds these to its live set so it never reopens a
+# conversation terminal 1 is about to relaunch (5.7).
+_handoff_reopening_sids() {
+  local cname="$1" rd f now age execid
+  rd="$CLEAT_RUN_DIR/$cname"
+  [[ -d "$rd" ]] || return 0
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  for f in "$rd"/.handoff.*; do
+    [[ -e "$f" ]] || continue
+    _handoff_ticket_read "$f" || continue
+    age=$(( now - _HT_AT ))
+    [[ $age -ge 0 && $age -le $_HANDOFF_READY_MAX_AGE_S ]] || continue
+    execid="${f##*/.handoff.}"
+    _handoff_marker_live_for_exec "$cname" "$execid" || continue
+    printf '%s\n' "$_HT_SID"
+  done
+  return 0
+}
+
+# `L A` for a transcript tail: L=1 when the last conversation record is the 429
+# rate-limit error, A=1 when an armed auto-continue record followed it. Read by
+# terminal 1 after the kill and before the relaunch appends its own records.
+_HANDOFF_TAIL_WINDOW=262144
+_handoff_tail_flags() {
+  local f="$1"
+  [[ -f "$f" && ! -L "$f" ]] || { printf '0 0'; return 0; }
+  tail -c "$_HANDOFF_TAIL_WINDOW" "$f" 2>/dev/null | LC_ALL=C awk '
+    BEGIN { L=0; A=0 }
+    /"isSidechain":true/ { next }
+    /"type":"assistant"/ || /"type":"user"/ {
+      if (index($0,"\"error\":\"rate_limit\"") && index($0,"\"isApiErrorMessage\":true")) { L=1; A=0 }
+      else { L=0; A=0 }
+      next
+    }
+    /"type":"system"/ {
+      if (L==1 && index($0,"\"subtype\":\"informational\"") && index($0,"continuing automatically")) { A=1 }
+      next
+    }
+    END { printf "%d %d", L, A }
+  '
+}
+
 exec_claude() {
   local cname="$1"
   shift
@@ -9047,32 +9546,18 @@ exec_claude() {
   # process. Fail-soft.
   touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
 
-  # Named accounts (`cleat account`). Staging happens on every attach, not only
-  # at switch time, because the stored credential may have been refreshed by
-  # ANOTHER box since this one last ran.
-  #
-  # CLAUDE_ENV is a plain `-e` array consumed by the `docker exec` below, so
-  # this is recreate-free and applies per exec, which is the right granularity
-  # for a per-box pin.
-  local _pinned_account
-  _pinned_account="$(_box_account_read "$cname")"
-  _account_apply_exec_env "$cname" || _pinned_account="$_ACCOUNT_DEFAULT"
-
-  # On macOS, bridge the host Keychain's OAuth token into the box before Claude
-  # launches (the ~/.claude mount is live, so a write here is visible inside the
-  # running container). No-op off macOS or once the box already has a token.
-  #
-  # Skipped for a pinned box. The seed compares token EXPIRY and never identity,
-  # so on a Mac it would quietly restore the Keychain's account about eight
-  # hours after a switch. The env var above already means a pinned box never
-  # reads ~/.claude/.credentials.json, so this is belt and braces.
-  if [[ "$_pinned_account" == "$_ACCOUNT_DEFAULT" ]]; then
-    _seed_macos_credentials
+  # A per-attach exec id and a content-bearing marker, written before any
+  # account read (5.6). Only an interactive session running one of the
+  # relaunchable argv shapes gets an id: a switch in another terminal ties a
+  # live Claude to its marker by that id and reopens only what it can rebuild.
+  # The attach gate and the account block that used to sit here move into the
+  # loop below (O3), so they re-run before every relaunch, on the login
+  # terminal 2 has just staged.
+  local _ec_id="" _ec_marker="$CLEAT_RUN_DIR/${cname}/.attached.$$"
+  if _is_interactive && _exec_claude_argv_relaunchable "$@"; then
+    _ec_id="$(_exec_claude_new_exec_id)"
   fi
-
-  # Heal a logged-out or identity-less ~/.claude.json in the RUNNING box before
-  # Claude launches (in-place, liveness-gated; see _refresh_attached_claude_json).
-  _refresh_attached_claude_json "$cname" "${_RESOLVED_PROJECT:-}" "${_BOX:-main}"
+  printf 'kind=claude exec=%s\n' "$_ec_id" > "$_ec_marker" 2>/dev/null || true
 
   _cleanup_session() {
     # Kill clipboard watcher
@@ -9300,87 +9785,187 @@ exec_claude() {
   # Host-side docker errors ('exec failed' during fork lockup, daemon resets)
   # go to a temp file and surface on failure instead of vanishing.
   local _exec_err="/tmp/cleat-exec-err.$$"
-  docker exec -it "${CLAUDE_ENV[@]}" \
-    "${_heap_env[@]+"${_heap_env[@]}"}" \
-    "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" "$cname" \
-    runuser -u coder -- bash -c '
-      clip-daemon &
-      _MY_CLIP_DAEMON=$!
-      for i in 1 2 3 4 5; do [ -S "${CLEAT_CLIP_DIR:-/tmp/cleat-run-$(id -u)}/clip.sock" ] && break; sleep 0.1; done
-      claude "$@"
-      _CLAUDE_RC=$?
-      kill "$_MY_CLIP_DAEMON" 2>/dev/null
-      wait "$_MY_CLIP_DAEMON" 2>/dev/null
-      exit "$_CLAUDE_RC"
-    ' _ "$@" 2>"$_exec_err" || rc=$?
 
+  # ── The relaunch loop (5.6) ──────────────────────────────────────────────
+  # One iteration is one `docker exec` running claude, plus the account prepare
+  # right before it (O3) and, on a relaunch, the T1 reopen line. When claude
+  # exits 143 AND terminal 2 left a ticket, this waits out the switch and
+  # relaunches `claude --resume <sid>` on the account that switch pinned. An
+  # unticketed session (no exec id) runs exactly one iteration and behaves as
+  # before. The flag trap covers the gate, prepare, the T line and the drain;
+  # the cleanup trap is re-armed right before each exec so a Ctrl-C there ends
+  # cleanly with the watchers still torn down once, at the final exit.
+  local _ec_note="" _ec_ticket="$CLEAT_RUN_DIR/${cname}/.handoff.${_ec_id}" _ec_used="" _ec_to=""
+  local _ec_relaunch=0 _ec_sid _ec_sdir _ec_model _ec_flags="" _EC_PINNED="" _HANDOFF_T1_STATE=""
+  local _EC_INT=0 _ec_extra
+  local _EC_ARGS=("$@")
+  while :; do
+    rc=0
+    trap '_EC_INT=1' INT TERM HUP
+    touch "$_ec_marker" 2>/dev/null || true
+    if ! _account_attach_gate "$cname" "${_BOX:-main}" cleat; then _ec_note=switching; break; fi
+    _exec_claude_prepare_account "$cname" || true
+    if [[ $_ec_relaunch -eq 1 ]]; then
+      _handoff_say_t1 "$_ec_to" "$_ec_flags"
+      _handoff_drain_typeahead
+    fi
+    if [[ "$_EC_INT" == "1" ]]; then
+      if [[ $_ec_relaunch -eq 1 ]]; then _ec_note=interrupted; else _ec_note=cancelled; fi
+      break
+    fi
+    trap _cleanup_session EXIT INT TERM HUP
+    _ec_extra=()
+    if [[ -n "$_ec_id" ]]; then _ec_extra=(-e "CLEAT_EXEC_ID=${_ec_id}"); fi
+    docker exec -it "${CLAUDE_ENV[@]}" \
+      "${_heap_env[@]+"${_heap_env[@]}"}" \
+      "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
+      "${_ec_extra[@]+"${_ec_extra[@]}"}" "$cname" \
+      runuser -u coder -- bash -c '
+        clip-daemon &
+        _MY_CLIP_DAEMON=$!
+        for i in 1 2 3 4 5; do [ -S "${CLEAT_CLIP_DIR:-/tmp/cleat-run-$(id -u)}/clip.sock" ] && break; sleep 0.1; done
+        claude "$@"
+        _CLAUDE_RC=$?
+        kill "$_MY_CLIP_DAEMON" 2>/dev/null
+        wait "$_MY_CLIP_DAEMON" 2>/dev/null
+        exit "$_CLAUDE_RC"
+      ' _ "${_EC_ARGS[@]+"${_EC_ARGS[@]}"}" 2>"$_exec_err" || rc=$?
+
+    # No exec id means no relaunch is possible: one exec, exactly as before.
+    if [[ -z "$_ec_id" ]]; then break; fi
+    # Drop the ticket this relaunch already served, matched on by AND at, once
+    # its exec returns. Until then that ticket keeps the reopen pending (5.2).
+    if [[ -n "$_ec_used" ]] && _handoff_ticket_read "$_ec_ticket" \
+         && [[ "${_HT_BY}:${_HT_AT}" == "$_ec_used" ]]; then
+      rm -f "$_ec_ticket" 2>/dev/null || true
+    fi
+    # A ticket explains an exit only when the exit code is 143. A session the
+    # user quit never reopens by itself, and an unticketed 143 reports as today.
+    if [[ $rc -ne 143 ]] || ! _handoff_ticket_read "$_ec_ticket"; then break; fi
+    _restore_terminal
+    _handoff_t1_await "$_ec_ticket"
+    case "$_HANDOFF_T1_STATE" in
+      ready) : ;;
+      interrupted) _ec_note=interrupted; break ;;
+      *) _ec_note=unfinished; break ;;
+    esac
+    _ec_used="${_HT_BY}:${_HT_AT}"
+    touch "$_ec_marker" 2>/dev/null || true
+    if ! is_running "$cname"; then _ec_note=boxstopped; break; fi
+    _ec_sid="$_HT_SID"
+    _ec_sdir="$(_sessions_key_dir "${_RESOLVED_PROJECT:-}" "${_BOX:-main}")" || _ec_sdir=""
+    if [[ -z "$_ec_sdir" ]] || ! _sessions_path_under_key "$_ec_sdir/$_ec_sid.jsonl" "$_ec_sdir" \
+         || [[ ! -f "$_ec_sdir/$_ec_sid.jsonl" || -L "$_ec_sdir/$_ec_sid.jsonl" ]]; then
+      _ec_note=unfinished; break
+    fi
+    # Never --continue: it would open the newest conversation, which right after
+    # the SIGTERM is a sibling session, not this one (R-a). Name the sid.
+    _EC_ARGS=(--dangerously-skip-permissions --resume "$_ec_sid")
+    _ec_model=""
+    if ! _resume_model_configured "${_RESOLVED_PROJECT:-}"; then
+      _ec_model="$(_resume_model_carry "$_ec_sdir/$_ec_sid.jsonl")"
+    fi
+    if [[ -n "$_ec_model" ]]; then _EC_ARGS+=(--model "$_ec_model"); fi
+    _ec_flags="$(_handoff_tail_flags "$_ec_sdir/$_ec_sid.jsonl")"
+    _ec_relaunch=1
+  done
+
+  # ── The final exit, once, restore-first (5.6) ────────────────────────────
+  # The teardown, harvest and reporting run exactly once, only after the loop
+  # ends for good. The order below preserves the pre-loop behaviour: the silent
+  # harvest right after the terminal is back, then the clean-exit reclaim and
+  # its message, then the busy and held notices (their last line sat above the
+  # cursor the reclaim erased, so they stay after it).
   _cleanup_session
+  rm -f "$_ec_marker" 2>/dev/null || true
+  [[ -n "$_ec_id" ]] && rm -f "$_ec_ticket" 2>/dev/null || true
   trap - EXIT INT TERM HUP
   _restore_terminal
 
   # Harvest a token the box refreshed for itself. Without this every refresh
-  # after a switch is lost and the account is back at /login, which is the exact
-  # pain this feature removes. A lock that cannot be had writes nothing, and that
-  # is said once the reclaim below has run (see
-  # _maybe_report_account_harvest_busy), never over Claude's screen.
-  #
-  # AFTER the terminal is back, never before it. A rotated refresh token sends
-  # this through one bounded profile request, and on a black-holed route, a
-  # captive portal or a VPN that dropped, that request waits out its whole
-  # max-time. Run ahead of the restore it held the terminal in Claude's raw
-  # mode for those seconds, with nothing on screen to say why. It prints
+  # after a switch is lost and the account is back at /login. A lock that cannot
+  # be had writes nothing, said below rather than over Claude's screen. AFTER
+  # the terminal is back: a rotated token can wait out a whole bounded profile
+  # request on a black-holed route, and it must not do so in raw mode. It prints
   # nothing itself, so it cannot lose a line to the reclaim below.
+  #
+  # On a switching or cancelled exit no docker exec ran on this box this process
+  # (the gate refused before the session, or the user quit during prepare), so
+  # there is nothing this session refreshed to harvest. A switch in the other
+  # terminal owns the harvest of the outgoing account and is holding the account
+  # lock, so calling _account_sync_out here would only return _ACCOUNT_LOCK_BUSY
+  # and print a "was not saved" line that contradicts the "Nothing was changed"
+  # refusal printed just above.
   local _harvest=0
-  _account_sync_out "$cname" || _harvest=$?
+  case "$_ec_note" in
+    switching|cancelled) : ;;
+    *) _account_sync_out "$cname" || _harvest=$? ;;
+  esac
 
-  if [[ $rc -eq 0 ]]; then
-    # Reclaim claude's leftover trailing line (cursor up, erase it), drop back
-    # down, then clear the line success is about to write on. Without that final
-    # \033[2K, success() prints from column 0 without erasing to end-of-line, so
-    # stale bytes a heavily-used terminal left on that row survive past the
-    # message (observed: a stray hash tail after "cleat resume"). TTY-gated so
-    # no escapes ever reach a pipe.
-    _is_tty && printf '\033[A\033[2K\r\n\033[2K'
-    success "Session ended. Resume with: ${BOLD}cleat resume${RESET}"
-  elif [[ $rc -ne 130 ]]; then
-    warn "Claude exited with code $rc"
-    [[ -s "$_exec_err" ]] && error "${DIM}$(cat "$_exec_err")${RESET}"
-    _maybe_explain_oom "$cname" "$rc" "${_mem_bytes:-}"
-  fi
+  # The rc and note lines. `Claude exited with code 143` is hidden only when a
+  # ticket gave the exit a note. For a wait that did not reopen, settle out any
+  # switch still holding the lock and read the pin, so the T line names where
+  # the box really landed (5.3), never the ticket's target.
+  case "$_ec_note" in
+    "")
+      if [[ $rc -eq 0 ]]; then
+        # Reclaim claude's leftover trailing line (cursor up, erase it), drop
+        # back down, then clear the line success writes on. TTY-gated so no
+        # escapes reach a pipe.
+        _is_tty && printf '\033[A\033[2K\r\n\033[2K'
+        success "Session ended. Resume with: ${BOLD}cleat resume${RESET}"
+      elif [[ $rc -ne 130 ]]; then
+        warn "Claude exited with code $rc"
+        [[ -s "$_exec_err" ]] && error "${DIM}$(cat "$_exec_err")${RESET}"
+        _maybe_explain_oom "$cname" "$rc" "${_mem_bytes:-}"
+      fi
+      ;;
+    cancelled|switching) : ;;
+    unfinished|interrupted)
+      local _ec_pin=""
+      _account_settle "$cname" || true
+      _ec_pin="$(_box_account_read "$cname")"
+      if [[ -n "$_ec_to" && "$_ec_pin" == "$_ec_to" ]]; then
+        _handoff_say T-landed "${_BOX:-main}" "$_ec_pin"
+      elif [[ "$_ec_note" == "unfinished" ]]; then
+        _handoff_say T-unfinished "$_ec_pin"
+      else
+        _handoff_say T-interrupted "$_ec_pin"
+      fi
+      ;;
+    boxstopped) _handoff_say T-boxstopped ;;
+  esac
 
-  # The harvest that could not take the account lock. After the rc==0 reclaim
+  # The harvest that could not take the account lock. After the reclaim above,
   # for the same reason as the fork advisory below: printed before it, its last
-  # line sat directly above the cursor and the reclaim's `\033[A\033[2K` erased
-  # it on every clean exit at a terminal.
+  # line sat directly above the cursor and the reclaim erased it.
   _maybe_report_account_harvest_busy "$_harvest"
-  # The session ended on a login the server says is another account's, so it
-  # was held rather than saved over the pinned one. Said after the reclaim for
-  # the same reason. Said every time too: the box keeps running on that login
-  # until the next switch. Nothing else on screen says so.
+  # The session ended on a login the server says is another account's, so it was
+  # held rather than saved over the pinned one. Said every time: the box keeps
+  # running on that login until the next switch.
   if [[ $_harvest -eq 2 ]]; then
     _account_held_notice "$cname"
   fi
   # If the host ran out of process slots this session (watcher logged fork
-  # errors), explain it once. Placed AFTER the rc==0 reclaim: on success that
-  # reclaim does `\033[A\033[2K` to erase claude's leftover line, and running
-  # this first would put the advisory's last (most actionable) line directly
-  # above the cursor, where the reclaim would wipe it. Independent of rc: the box
-  # session usually SUCCEEDS while the host-side watchers are the ones that could
-  # not fork.
+  # errors), explain it once. Placed AFTER the rc==0 reclaim, so the reclaim
+  # does not wipe the advisory's last, most actionable line. Independent of rc:
+  # the box session usually SUCCEEDS while the host-side watchers could not fork.
   _maybe_explain_fork_exhaustion "$_watcher_log" "$_watcher_log_off"
-  # And the destination gate's refusals. Same placement and the same reason: a
-  # denial that lives only in a log inside the box is undiagnosable from the
-  # field, and this is the line that makes a strict list usable rather than
-  # merely safe.
+  # And the destination gate's refusals. Same placement and the same reason.
   _maybe_report_blocked_opens "$_CLIP_DIR/.proxy-log" "$_proxy_log_off"
   # And the hook events the bridge refused. Same rule: only when non-zero.
   _maybe_report_hook_drops "$_hook_drop_log_path" "$_hook_drop_off" "$cname"
   # And a host global config file that was not there when the session began.
-  # Neither Cleat nor Claude Code creates one, so this is the one moment the
-  # signal is unambiguous, and it lands before the user is back at a shell
-  # where they might run claude.
   _maybe_report_host_global_config_appeared "$_cfgjson_before"
   rm -f "$_exec_err"
+  # The attach gate refused (a switch of this box holds the lock, R-switching
+  # already printed): fail like the pre-loop gate did, so the caller stops. Any
+  # other ending returns 0, unchanged: the wrapper already propagated claude's
+  # own exit status inside the box.
+  if [[ "$_ec_note" == "switching" ]]; then
+    return 1
+  fi
+  return 0
 }
 
 # When a session dies from memory pressure, name it and say what to do: an
@@ -11447,6 +12032,14 @@ cmd_resume() {
   local _resume_args=(--continue)
   _sdir="$(_sessions_key_dir "$project" "$box")" || _sdir=""
   [[ "$_was_running" == "1" ]] && _live="$(_box_live_session_ids "$cname")"
+  # Add the sid of any conversation terminal 1 is reopening after an account
+  # switch (5.7): right after the SIGTERM it is the newest transcript, so
+  # without this cleat resume here would open it and two processes would append
+  # to one file. Skipping it opens that terminal's own conversation instead.
+  local _reopening
+  _reopening="$(_handoff_reopening_sids "$cname")"
+  [[ -n "$_reopening" ]] && _live="${_live}
+${_reopening}"
   _sid="$(_resume_pick_session "$_sdir" "$_live")"
   if [[ -n "$_sid" ]]; then
     _resume_args=(--resume "$_sid")
@@ -11575,9 +12168,27 @@ cmd_shell() {
   mkdir -p "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
   touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
   local _attach_marker="$CLEAT_RUN_DIR/${cname}/.attached.$$"
-  : > "$_attach_marker" 2>/dev/null || true
+  # kind=shell: a switch of this box in another terminal reads this marker and
+  # refuses a move between the shared login and an account (R-shell-open), because
+  # a claude the user starts in this shell keeps whatever login the shell opened
+  # with. The filename still carries the pid, so _box_has_attached_session and the
+  # idle sweep read it exactly as before (they never read the content).
+  printf 'kind=shell\n' > "$_attach_marker" 2>/dev/null || true
   # shellcheck disable=SC2064
   trap "rm -f '$_attach_marker' 2>/dev/null || true" EXIT INT TERM HUP
+
+  # Wait for a switch of this box to finish before the shell reads the pin, the
+  # same gate every attach takes. A refusal removes the marker, tears the browser
+  # watcher back down and changes nothing.
+  if ! _account_attach_gate "$cname" "$box" "cleat shell"; then
+    rm -f "$_attach_marker" 2>/dev/null || true
+    if [ -n "$_shell_bw_pid" ]; then
+      kill "$_shell_bw_pid" 2>/dev/null || true
+      wait "$_shell_bw_pid" 2>/dev/null || true
+    fi
+    _browser_teardown_bridge "$_shell_clip_dir"
+    return 1
+  fi
 
   # A shell is a place people run `claude`, so it gets the same store the
   # session would have had.
@@ -13833,7 +14444,55 @@ _resume_model_carry() {
   m="${line#*\"model\":\"}"; m="${m%%\"*}"
   case "$m" in claude-*) ;; *) return 0 ;; esac
   case "$m" in *[!a-z0-9.-]*) return 0 ;; esac
-  case "$blob" in *"\"${m}[1m]\":"*) printf '%s[1m]' "$m" ;; esac
+  case "$blob" in *"\"${m}[1m]\":"*) printf '%s[1m]' "$m"; return 0 ;; esac
+  # H7: a conversation too large for the standard window must have run with 1M,
+  # even when no [1m] usage key was written. At a usage limit the last assistant
+  # record is the synthetic rate-limit error with zero usage, so the [1m] key
+  # can be absent from a 1M conversation. The SIZE is the proof: a standard
+  # window (200,000 tokens) cannot hold more than that, so a larger last real
+  # usage means 1M. Provisional with R-context (O2). See _resume_last_usage_tokens.
+  local usage sum
+  usage="$(_resume_last_usage_tokens "$f")"
+  case "$usage" in
+    *"$(printf '\t')"*) sum="${usage##*$(printf '\t')}" ;;
+    *) return 0 ;;
+  esac
+  case "$sum" in ''|*[!0-9]*) return 0 ;; esac
+  [[ $sum -gt $_HANDOFF_STD_WINDOW_TOKENS ]] && printf '%s[1m]' "$m"
+  return 0
+}
+
+# The model and the summed context of the last real assistant turn, `<model>\t
+# <sum>`, or nothing. Reads the last `"type":"assistant"` record in the carry
+# window that is not a sidechain, not an API-error record and carries a
+# `"model":"claude-..."` value (so the synthetic rate-limit record never
+# matches). The sum is its input_tokens plus both cache token counts, each key
+# taken with its leading quote so input_tokens is not read out of
+# cache_read_input_tokens. Nothing when any of the three is absent. H7 reads it
+# for the 1M size rule; cmd_resume shares it.
+_resume_last_usage_tokens() {
+  local f="$1" blob line m rest it cr cc sum tab
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  tab="$(printf '\t')"
+  blob="$(tail -c "$_RESUME_CARRY_WINDOW" "$f" 2>/dev/null || true)"
+  line="$(printf '%s\n' "$blob" \
+          | LC_ALL=C grep -a '"type":"assistant"' \
+          | LC_ALL=C grep -av '"isSidechain":true' \
+          | LC_ALL=C grep -av '"isApiErrorMessage":true' \
+          | LC_ALL=C grep -a '"model":"claude-' \
+          | tail -n 1)" || line=""
+  [[ -n "$line" ]] || return 0
+  m="${line#*\"model\":\"}"; m="${m%%\"*}"
+  case "$m" in claude-*) ;; *) return 0 ;; esac
+  case "$m" in *[!a-z0-9.-]*) return 0 ;; esac
+  rest="${line#*\"input_tokens\":}"; [[ "$rest" != "$line" ]] || return 0
+  it="${rest%%[!0-9]*}"; [[ -n "$it" ]] || return 0
+  rest="${line#*\"cache_read_input_tokens\":}"; [[ "$rest" != "$line" ]] || return 0
+  cr="${rest%%[!0-9]*}"; [[ -n "$cr" ]] || return 0
+  rest="${line#*\"cache_creation_input_tokens\":}"; [[ "$rest" != "$line" ]] || return 0
+  cc="${rest%%[!0-9]*}"; [[ -n "$cc" ]] || return 0
+  sum=$(( it + cr + cc ))
+  printf '%s%s%s' "$m" "$tab" "$sum"
   return 0
 }
 
@@ -15370,8 +16029,11 @@ _account_pinned_boxes() {
 # One lock rather than one per box, because rename and remove rewrite every
 # box's pin and two boxes pinned to one account share its store. With a single
 # lock no ordering between locks can invert. Holds are short: file operations
-# plus at most one bounded profile request per harvest. Prompts, docker calls,
-# the usage poll and identity invalidation never run under it. A `_locked`
+# plus at most one bounded profile request per harvest. Prompts, the usage poll
+# and identity invalidation never run under it. Docker never runs under it with
+# ONE exception: the live switch's terminate exec (_handoff_docker_exec, bounded
+# 22 s), which must hold the lock so the box's login cannot change under the
+# stop. A `_locked`
 # suffix means the caller already holds it, and those bodies call only other
 # `_locked` bodies. It is reentrant within one shell, so a body that calls a
 # locking wrapper by mistake nests instead of waiting on itself until the
@@ -15528,6 +16190,35 @@ _account_unlock() {
   return 0
 }
 
+# True only while this shell still holds the account lock: the on-disk owner
+# record equals the one _account_lock wrote, the same test _account_unlock uses.
+# The live switch reads this after the terminate exec, because that exec can
+# outrun P2's wait and an age-bound steal could have handed the lock to another
+# command meanwhile. It must never write the store or the pin once it reads
+# false. A record-less or stolen lock reads false.
+_account_lock_owned() {
+  local lock owner=""
+  [[ -n "$_ACCOUNT_LOCK_OWNER" ]] || return 1
+  lock="$(_account_lock_path)"
+  [[ -d "$lock" && ! -L "$lock" ]] || return 1
+  IFS= read -r owner 2>/dev/null < "$lock/owner" || true
+  [[ "$owner" == "$_ACCOUNT_LOCK_OWNER" ]] || return 1
+  return 0
+}
+
+# Take the account lock and release it at once, nothing in between. It is the
+# attach side's way to wait out a switch: if a switch holds the lock this blocks
+# up to P2's wait, then either the lock frees (return 0, the caller reads the pin
+# the switch left) or the wait runs out (return _ACCOUNT_LOCK_BUSY, the caller's
+# gate decides). A box that never used accounts has no accounts dir and skips the
+# lock, so the gate is a true no-op there.
+_account_settle() {
+  [[ -d "$CLEAT_ACCOUNTS_DIR" ]] || return 0
+  _account_lock || return $?
+  _account_unlock
+  return 0
+}
+
 # Run FUNCTION ARGS under the lock and return its status, or _ACCOUNT_LOCK_BUSY
 # without running it.
 _account_with_lock() {
@@ -15554,6 +16245,34 @@ _account_busy_msg() {
 # only path that reads an UNTRUSTED one is the harvest out of a directory the
 # box mounts read-write, where the next step is a `cat` and a shell variable.
 _ACCOUNT_CRED_MAX_BYTES=65536
+
+# ── Live account switch: constants ──────────────────────────────────────────
+# The restart-and-resume handoff. None is read from the environment. Times are
+# whole seconds because the in-box verb counts seconds; token counts are
+# Claude Code 2.1.270's standard-window figures. See concept/44.
+_HANDOFF_PROBE_TIMEOUT_S=8         # bound on the read-only probe of the box
+_HANDOFF_EXEC_TIMEOUT_S=22         # bound on the terminate exec (lock + kill wait, +start)
+_HANDOFF_T1_WAIT_S=60             # terminal 1's wait for the switch to finish
+_HANDOFF_STARTING_MAX_S=120       # a live-but-unprobed Claude younger than this is "starting"
+_HANDOFF_READY_MAX_AGE_S=120      # the one ticket age bound
+_HANDOFF_CONFIRM_WAIT_S=20        # terminal 2's wait for the reopen to confirm
+_HANDOFF_OUT_MAX_BYTES=65536      # cap on the terminate exec's captured output
+_HANDOFF_STD_WINDOW_TOKENS=200000 # the standard context window
+_HANDOFF_VERIFIED_CLAUDE="2.1.270" # the Claude Code the handoff was checked against, space-separated
+_HANDOFF_COMPACT_BUFFER_TOKENS=13000 # auto-compact fires this far below the window
+_HB_LOCK_WAIT_S=8                 # the in-box verb's wait for Claude's refresh lock
+_HB_KILL_WAIT_S=8                 # the in-box verb's wait for a signalled Claude to exit
+_HB_CLAUDE_LOCK_STALE_S=60        # Claude's own proper-lockfile stale bound, shipped into the box
+
+# The three seams the switch shells out through. Each is one line so a test can
+# override it with a fast or a deterministic stand-in, and every caller runs it
+# with `|| true` so an override that returns non-zero never trips strict mode.
+# The in-box verb's own waits are arguments, never these, so nothing here ships
+# into the box.
+_handoff_now() { date +%s; }
+_handoff_exec_pause() { sleep 0.1; }
+_handoff_t1_pause() { sleep 0.1; }
+
 _account_cred_sane_size() {
   local sz
   [[ -f "$1" ]] || return 1
@@ -17314,6 +18033,11 @@ _account_invalidate_identity_key() {
   # reads it (_claude_json_clear_stale_identity). A host with jq never flags.
   if ! _claude_json_drop_identity "$f" "$cname"; then
     : > "${f}.identity-stale" 2>/dev/null || true
+  else
+    # The drop finished, so an H9 flag a switch wrote before the pin moved has
+    # done its job. Clear it, or the next launch would rebuild identity again for
+    # no reason. A deferred drop (the branch above) keeps the flag for that retry.
+    rm -f "${f}.identity-stale" 2>/dev/null || true
   fi
   return 0
 }
@@ -17475,6 +18199,573 @@ _account_apply_exec_env() {
   return 0
 }
 
+
+# ── Live switch: the half that runs inside the box ─────────────────────────
+# These _hb_* functions are the ONLY code cleat runs inside a box during a live
+# account switch. They are shipped as text (declare -f, see _handoff_box_script)
+# and run under `bash -c` with `runuser -u coder`, stdin closed. They print a
+# strict tab-separated grammar on stdout and never a byte of any credential, an
+# environ value beyond the words the grammar maps, or a session-file string
+# other than a validated session id. They reference no host global: paths and
+# waits arrive as arguments. probe is read-only. terminate signals only the
+# targets it was handed, never with SIGKILL, and only ever touches Claude's
+# refresh lock it took itself. Both are portable to bash 3.2; terminate uses
+# GNU `stat -c` and `touch -c`, which the box always has.
+
+# state <starttime>: read <PROC>/<PID>/stat and print `live <starttime>`,
+# `exited` (state Z or X) or `gone` (no such process or unreadable). <PROC>/<PID>
+# may be a symlink (proc views in the tests), so this never refuses one. The
+# comm field is in parens and can hold spaces or parens, so the fields are taken
+# from after the LAST ") ": state is then word 1 and the start time word 20
+# (field 22 of the whole line).
+_hb_proc_state() {
+  local proc="$1" pid="$2" raw rest state start
+  raw="$(head -c 4096 "$proc/$pid/stat" 2>/dev/null)" || { printf 'gone'; return 0; }
+  [[ -n "$raw" ]] || { printf 'gone'; return 0; }
+  rest="${raw##*) }"
+  [[ "$rest" != "$raw" ]] || { printf 'gone'; return 0; }
+  set -- $rest
+  state="${1:-}"
+  start="${20:-}"
+  case "$state" in
+    Z|X) printf 'exited'; return 0 ;;
+  esac
+  case "$start" in
+    ''|*[!0-9]*) printf 'gone'; return 0 ;;
+  esac
+  printf 'live %s' "$start"
+  return 0
+}
+
+# `<count> <value>` of NAME= in <PROC>/<PID>/environ (NUL-separated), or the bare
+# word `unreadable`. A directory at the environ path, or a path that cannot be
+# read, is `unreadable`, never a count of 0. When NAME appears more than once the
+# count says so and the caller decides; the last value is kept but the caller of
+# a duplicated key never reads it.
+_hb_env_value() {
+  local proc="$1" pid="$2" name="$3" f w cnt=0 val=""
+  f="$proc/$pid/environ"
+  if [[ -d "$f" ]] || [[ ! -r "$f" ]]; then printf 'unreadable'; return 0; fi
+  while IFS= read -r -d '' w || [[ -n "$w" ]]; do
+    case "$w" in
+      "$name="*) cnt=$(( cnt + 1 )); val="${w#*=}" ;;
+    esac
+  done < "$f"
+  printf '%s %s' "$cnt" "$val"
+  return 0
+}
+
+# The CLEAT_EXEC_ID of a process, mapped to the grammar: a 12-32 hex id, or
+# `none` (absent), `many` (two or more), `bad` (one that is not hex) or
+# `unreadable` (the environ could not be read). An unreadable environ is never
+# `none`: a switch must not treat "cannot tell" as "no session marker".
+_hb_execid() {
+  local proc="$1" pid="$2" raw cnt val
+  local re_hex='^[0-9a-f]{12,32}$'
+  raw="$(_hb_env_value "$proc" "$pid" CLEAT_EXEC_ID)"
+  if [[ "$raw" == unreadable ]]; then printf 'unreadable'; return 0; fi
+  cnt="${raw%% *}"; val="${raw#* }"
+  case "$cnt" in
+    0) printf 'none'; return 0 ;;
+    1) if [[ "$val" =~ $re_hex ]]; then printf '%s' "$val"; else printf 'bad'; fi; return 0 ;;
+    *) printf 'many'; return 0 ;;
+  esac
+}
+
+# One `claude` record for a live session file, or return 1 (the file is stale,
+# nothing printed). Live means <PROC>/<PID>/stat is `live` AND its start time
+# equals the file's procStart string: a pid reused after a container restart is
+# a different process with a different start time, so the old file is skipped.
+# status, waitingFor, kind and sessionId are read only after that, each mapped
+# to a fixed word (an unknown one fails to `unknown`/`other`/`none`).
+_hb_session_record() {
+  local home="$1" proc="$2" pid="$3" f="$4"
+  local st start blob ps status waiting kind sid execid store sraw scnt sval
+  local re_uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  st="$(_hb_proc_state "$proc" "$pid")"
+  case "$st" in
+    live\ *) start="${st#live }" ;;
+    *) return 1 ;;
+  esac
+  blob="$(head -c 262144 "$f" 2>/dev/null)"
+  ps="$(_json_flat_str "$blob" procStart 2>/dev/null || true)"
+  [[ -n "$ps" && "$ps" == "$start" ]] || return 1
+  status="$(_json_flat_str "$blob" status 2>/dev/null || true)"
+  case "$status" in
+    busy|shell|idle|waiting) ;;
+    *) status=unknown ;;
+  esac
+  waiting="$(_json_flat_str "$blob" waitingFor 2>/dev/null || true)"
+  case "$waiting" in
+    "permission prompt") waiting=permission-prompt ;;
+    "input needed") waiting=input-needed ;;
+    "worker request") waiting=worker-request ;;
+    "dialog open") waiting=dialog-open ;;
+    "sandbox request") waiting=sandbox-request ;;
+    "") waiting=none ;;
+    *) waiting=other ;;
+  esac
+  kind="$(_json_flat_str "$blob" kind 2>/dev/null || true)"
+  case "$kind" in
+    interactive|bg|daemon|daemon-worker) ;;
+    *) kind=unknown ;;
+  esac
+  sid="$(_json_flat_str "$blob" sessionId 2>/dev/null || true)"
+  [[ "$sid" =~ $re_uuid ]] || sid=none
+  execid="$(_hb_execid "$proc" "$pid")"
+  sraw="$(_hb_env_value "$proc" "$pid" CLAUDE_SECURESTORAGE_CONFIG_DIR)"
+  if [[ "$sraw" == unreadable ]]; then
+    store=unreadable
+  else
+    scnt="${sraw%% *}"; sval="${sraw#* }"
+    case "$scnt" in
+      0) store=default ;;
+      1) if [[ "$sval" == "$home/.cleat-auth" ]]; then store=named; else store=other; fi ;;
+      *) store=other ;;
+    esac
+  fi
+  printf 'claude\t%s %s %s %s %s %s %s %s\n' \
+    "$pid" "$start" "$status" "$waiting" "$kind" "$execid" "$store" "$sid"
+  return 0
+}
+
+# Walk <PROC>/<digits>. Print `orphan <pid>` for a process _is_claude_argv
+# accepts whose pid is not in SKIPPIDS (the caller skips every pid it already
+# accounted for as a live session or a target), and `shell <execid>` for a
+# process one of whose argv words holds `shell-snapshots` (Claude's tool/bash
+# shell). Empty cmdlines and skipped pids are ignored. The executable decides:
+# a `claude` word in an argument (a ripgrep pattern, a dev server) is never a
+# session, which _is_claude_argv enforces.
+_hb_scan() {
+  local home="$1" proc="$2" skip="$3"
+  local d pid w words execid found_shell
+  for d in "$proc"/[0-9]*; do
+    [[ -e "$d" || -L "$d" ]] || continue
+    pid="${d##*/}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    case " $skip " in *" $pid "*) continue ;; esac
+    [[ -r "$d/cmdline" ]] || continue
+    words=()
+    while IFS= read -r -d '' w || [[ -n "$w" ]]; do
+      words+=("$w")
+    done < "$d/cmdline"
+    [[ ${#words[@]} -gt 0 ]] || continue
+    if _is_claude_argv "${words[@]}"; then
+      printf 'orphan\t%s\n' "$pid"
+    fi
+    found_shell=0
+    for w in "${words[@]}"; do
+      case "$w" in
+        *shell-snapshots*) found_shell=1; break ;;
+      esac
+    done
+    if [[ $found_shell -eq 1 ]]; then
+      execid="$(_hb_execid "$proc" "$pid")"
+      printf 'shell\t%s\n' "$execid"
+    fi
+  done
+  return 0
+}
+
+# Argument validation for both verbs, kept in one place so a bad call is refused
+# before either verb touches the box. probe wants two absolute directories.
+# terminate wants HOME PROC STORE LOCKWAIT KILLWAIT N and then exactly 5N more,
+# each target a pid, a procstart, a UUID sid, a hex execid and an EXPECT word.
+_hb_args_ok() {
+  local verb="$1"; shift
+  local re_uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  local re_pid='^[1-9][0-9]{0,9}$'
+  local re_ps='^[0-9]{1,20}$'
+  local re_hex='^[0-9a-f]{12,32}$'
+  local re_wait='^[0-9]{1,2}$'
+  local re_n='^[1-9]$'
+  case "$verb" in
+    probe)
+      [[ $# -eq 2 ]] || return 1
+      [[ "$1" == /* && -d "$1" ]] || return 1
+      [[ "$2" == /* && -d "$2" ]] || return 1
+      return 0
+      ;;
+    terminate)
+      [[ $# -ge 6 ]] || return 1
+      local home="$1" proc="$2" store="$3" lockwait="$4" killwait="$5" n="$6"
+      shift 6
+      [[ "$home" == /* && -d "$home" ]] || return 1
+      [[ "$proc" == /* && -d "$proc" ]] || return 1
+      case "$store" in named|default) ;; *) return 1 ;; esac
+      [[ "$lockwait" =~ $re_wait ]] || return 1
+      [[ "$killwait" =~ $re_wait ]] || return 1
+      [[ "$n" =~ $re_n ]] || return 1
+      [[ $# -eq $(( 5 * n )) ]] || return 1
+      while [[ $# -ge 5 ]]; do
+        [[ "$1" =~ $re_pid ]] || return 1
+        [[ "$2" =~ $re_ps ]] || return 1
+        [[ "$3" =~ $re_uuid ]] || return 1
+        [[ "$4" =~ $re_hex ]] || return 1
+        case "$5" in idle|limitq|now) ;; *) return 1 ;; esac
+        shift 5
+      done
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# probe HOME PROC: report every live session and every stray Claude/shell. Read
+# only. Output: `hb 1`, `args ok|bad`, one `claude` per live session, `orphan`
+# and `shell` lines for the rest, `end ok`.
+_hb_probe() {
+  trap '' PIPE
+  set -u
+  export LC_ALL=C
+  printf 'hb\t1\n'
+  if _hb_args_ok probe "$@"; then
+    printf 'args\tok\n'
+  else
+    printf 'args\tbad\n'
+    printf 'end\tabort\n'
+    return 0
+  fi
+  local home="$1" proc="$2" f base pid livepids=""
+  for f in "$home"/.claude/sessions/[0-9]*.json; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    base="${f##*/}"; pid="${base%.json}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if _hb_session_record "$home" "$proc" "$pid" "$f"; then
+      livepids="$livepids $pid"
+    fi
+  done
+  _hb_scan "$home" "$proc" "$livepids"
+  printf 'end\tok\n'
+  return 0
+}
+
+# Take Claude's own refresh lock (a proper-lockfile directory). Poll every 0.1s
+# up to WAIT seconds. A symlink or non-directory at the path stops at once (a
+# lock cleat must not fight). An existing dir older than STALE is Claude's own
+# to reclaim: re-read its mtime and, only if it is STILL that old, rmdir it
+# non-recursively and retry the mkdir. A younger, touched dir (Claude holding
+# and refreshing every 2s) is never removed. Sets _HB_OWN_LOCK on success.
+_hb_lock_take() {
+  local lock="$1" wait="$2" stale="$3" start now mt
+  start=$SECONDS
+  while :; do
+    if [[ -L "$lock" ]]; then return 1; fi
+    if [[ -e "$lock" && ! -d "$lock" ]]; then return 1; fi
+    if mkdir "$lock" 2>/dev/null; then
+      _HB_OWN_LOCK="$lock"
+      return 0
+    fi
+    if [[ -d "$lock" ]]; then
+      now="$(date +%s)"
+      mt="$(stat -c %Y "$lock" 2>/dev/null || echo 0)"
+      case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+      if [[ $(( now - mt )) -gt $stale ]]; then
+        mt="$(stat -c %Y "$lock" 2>/dev/null || echo 0)"
+        case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+        now="$(date +%s)"
+        if [[ $(( now - mt )) -gt $stale ]]; then
+          rmdir "$lock" 2>/dev/null || true
+          if mkdir "$lock" 2>/dev/null; then _HB_OWN_LOCK="$lock"; return 0; fi
+        fi
+      fi
+    fi
+    if [[ $(( SECONDS - start )) -ge $wait ]]; then return 1; fi
+    sleep 0.1
+  done
+}
+
+# Release only a lock this run created. Run from the EXIT/TERM/INT/HUP traps and
+# again at a clean finish. Never touches a lock dir the run did not make (that
+# would be Claude's, and proper-lockfile aborts a refresh whose lock mtime it
+# did not write).
+_hb_cleanup() {
+  if [[ -n "${_HB_OWN_LOCK:-}" ]]; then
+    rmdir "$_HB_OWN_LOCK" 2>/dev/null || true
+    _HB_OWN_LOCK=""
+  fi
+}
+
+# Under the lock, re-verify every target still matches its snapshot and that no
+# new session, orphan or unexpected shell appeared. Reads the _HBT_* target
+# arrays, sets _HBT_LIVE[i] to 1 (still there) or 0 (already gone), and returns
+# 0 (nothing changed) or 1 (something changed). A live process whose session
+# file vanished, a mismatched start time, sid or exec id, or a status the
+# target's EXPECT does not allow all count as changed. A gone target is recorded
+# and is NOT a failure. Then the outside scan runs with every target skipped:
+# any orphan or any shell that does not belong to a `now` target is a change.
+_hb_recheck() {
+  local home="$1" proc="$2"
+  local i pid ps sid execid expect f st start blob fsid fexec status waiting
+  local skip="" changed=0 scanout typ rest ok j
+  i=0
+  while [[ $i -lt $_HBT_N ]]; do
+    pid="${_HBT_PID[$i]}"; ps="${_HBT_PS[$i]}"; sid="${_HBT_SID[$i]}"
+    execid="${_HBT_EXEC[$i]}"; expect="${_HBT_EXPECT[$i]}"
+    f="$home/.claude/sessions/$pid.json"
+    st="$(_hb_proc_state "$proc" "$pid")"
+    case "$st" in
+      live\ *) start="${st#live }" ;;
+      *) _HBT_LIVE[$i]=0; skip="$skip $pid"; i=$(( i + 1 )); continue ;;
+    esac
+    [[ -f "$f" && ! -L "$f" ]] || changed=1
+    [[ "$start" == "$ps" ]] || changed=1
+    blob="$(head -c 262144 "$f" 2>/dev/null)"
+    fsid="$(_json_flat_str "$blob" sessionId 2>/dev/null || true)"
+    [[ "$fsid" == "$sid" ]] || changed=1
+    fexec="$(_hb_execid "$proc" "$pid")"
+    [[ "$fexec" == "$execid" ]] || changed=1
+    status="$(_json_flat_str "$blob" status 2>/dev/null || true)"
+    case "$status" in busy|shell|idle|waiting) ;; *) status=unknown ;; esac
+    waiting="$(_json_flat_str "$blob" waitingFor 2>/dev/null || true)"
+    case "$expect" in
+      idle) [[ "$status" == idle ]] || changed=1 ;;
+      limitq)
+        case "$status" in
+          idle) ;;
+          waiting) [[ "$waiting" == "dialog open" ]] || changed=1 ;;
+          *) changed=1 ;;
+        esac
+        ;;
+      now) case "$status" in idle|busy|waiting) ;; *) changed=1 ;; esac ;;
+    esac
+    _HBT_LIVE[$i]=1; skip="$skip $pid"; i=$(( i + 1 ))
+  done
+  scanout="$(_hb_scan "$home" "$proc" "$skip")"
+  while IFS=$'\t' read -r typ rest; do
+    case "$typ" in
+      orphan) changed=1 ;;
+      shell)
+        ok=0; j=0
+        while [[ $j -lt $_HBT_N ]]; do
+          if [[ "${_HBT_EXPECT[$j]}" == now && "${_HBT_EXEC[$j]}" == "$rest" ]]; then ok=1; break; fi
+          j=$(( j + 1 ))
+        done
+        [[ $ok -eq 1 ]] || changed=1
+        ;;
+    esac
+  done <<HB_RECHECK_SCAN
+$scanout
+HB_RECHECK_SCAN
+  [[ $changed -eq 0 ]]
+}
+
+# terminate HOME PROC STORE LOCKWAIT KILLWAIT N [PID PROCSTART SID EXECID EXPECT]...
+# Stop exactly the target sessions while holding Claude's refresh lock for their
+# store, so no token refresh of that store can start or be discarded across the
+# signal. SIGTERM only, never SIGKILL. Output order: hb, args, lock, recheck,
+# one pid per target, scan, end.
+_hb_terminate() {
+  trap '' PIPE
+  set -u
+  export LC_ALL=C
+  printf 'hb\t1\n'
+  if _hb_args_ok terminate "$@"; then
+    printf 'args\tok\n'
+  else
+    printf 'args\tbad\n'
+    printf 'end\tabort\n'
+    return 0
+  fi
+  local home="$1" proc="$2" store="$3" lockwait="$4" killwait="$5" n="$6"
+  shift 6
+  _HBT_N="$n"
+  _HBT_PID=(); _HBT_PS=(); _HBT_SID=(); _HBT_EXEC=(); _HBT_EXPECT=(); _HBT_LIVE=()
+  local i=0
+  while [[ $# -ge 5 ]]; do
+    _HBT_PID[$i]="$1"; _HBT_PS[$i]="$2"; _HBT_SID[$i]="$3"; _HBT_EXEC[$i]="$4"; _HBT_EXPECT[$i]="$5"
+    _HBT_LIVE[$i]=1
+    shift 5; i=$(( i + 1 ))
+  done
+
+  _HB_OWN_LOCK=""
+  trap _hb_cleanup EXIT
+  trap '_hb_cleanup; exit 143' TERM
+  trap '_hb_cleanup; exit 130' INT
+  trap '_hb_cleanup; exit 129' HUP
+
+  local lock
+  if [[ "$store" == named ]]; then
+    lock="$home/.cleat-auth/.oauth_refresh.lock"
+  else
+    lock="$home/.claude/.oauth_refresh.lock"
+  fi
+  if _hb_lock_take "$lock" "$lockwait" "$_HB_CLAUDE_LOCK_STALE_S"; then
+    printf 'lock\tok\n'
+  else
+    printf 'lock\ttimeout\n'
+    printf 'end\tabort\n'
+    return 0
+  fi
+
+  if _hb_recheck "$home" "$proc"; then
+    printf 'recheck\tok\n'
+  else
+    printf 'recheck\tchanged\n'
+    printf 'end\tabort\n'
+    return 0
+  fi
+
+  local i2 all_gone=1 result=()
+  i2=0
+  while [[ $i2 -lt $_HBT_N ]]; do
+    if [[ "${_HBT_LIVE[$i2]}" == 1 ]]; then all_gone=0; result[$i2]=alive; else result[$i2]=gone; fi
+    i2=$(( i2 + 1 ))
+  done
+
+  if [[ $all_gone -eq 0 ]]; then
+    i2=0
+    while [[ $i2 -lt $_HBT_N ]]; do
+      if [[ "${_HBT_LIVE[$i2]}" == 1 ]]; then
+        kill -TERM "${_HBT_PID[$i2]}" 2>/dev/null || true
+      fi
+      i2=$(( i2 + 1 ))
+    done
+    local kstart lastsec nowsec st2 start2 remaining
+    kstart=$SECONDS; lastsec=$SECONDS
+    remaining=1
+    while [[ $remaining -eq 1 ]]; do
+      remaining=0
+      i2=0
+      while [[ $i2 -lt $_HBT_N ]]; do
+        if [[ "${result[$i2]}" == alive ]]; then
+          st2="$(_hb_proc_state "$proc" "${_HBT_PID[$i2]}")"
+          case "$st2" in
+            exited|gone) result[$i2]=exited ;;
+            live\ *)
+              start2="${st2#live }"
+              if [[ "$start2" != "${_HBT_PS[$i2]}" ]]; then result[$i2]=exited; else remaining=1; fi
+              ;;
+          esac
+        fi
+        i2=$(( i2 + 1 ))
+      done
+      [[ $remaining -eq 1 ]] || break
+      if [[ $(( SECONDS - kstart )) -ge $killwait ]]; then break; fi
+      nowsec=$SECONDS
+      if [[ "$nowsec" != "$lastsec" ]]; then
+        touch -c -- "$_HB_OWN_LOCK" 2>/dev/null || true
+        lastsec=$nowsec
+      fi
+      sleep 0.02
+    done
+  fi
+
+  local any_alive=0
+  i2=0
+  while [[ $i2 -lt $_HBT_N ]]; do
+    printf 'pid\t%s %s\n' "${_HBT_PID[$i2]}" "${result[$i2]}"
+    [[ "${result[$i2]}" == alive ]] && any_alive=1
+    i2=$(( i2 + 1 ))
+  done
+  if [[ $any_alive -eq 1 ]]; then
+    printf 'end\tabort\n'
+    return 0
+  fi
+
+  local fscan fchanged=0 ftyp frest f base pid st start blob ps
+  fscan="$(_hb_scan "$home" "$proc" "")"
+  while IFS=$'\t' read -r ftyp frest; do
+    case "$ftyp" in
+      orphan) fchanged=1 ;;
+    esac
+  done <<HB_FINAL_SCAN
+$fscan
+HB_FINAL_SCAN
+  for f in "$home"/.claude/sessions/[0-9]*.json; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    base="${f##*/}"; pid="${base%.json}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    st="$(_hb_proc_state "$proc" "$pid")"
+    case "$st" in live\ *) start="${st#live }" ;; *) continue ;; esac
+    blob="$(head -c 262144 "$f" 2>/dev/null)"
+    ps="$(_json_flat_str "$blob" procStart 2>/dev/null || true)"
+    [[ "$ps" == "$start" ]] && fchanged=1
+  done
+  if [[ $fchanged -eq 1 ]]; then
+    printf 'scan\tchanged\n'
+    printf 'end\tabort\n'
+    return 0
+  fi
+
+  rmdir "$_HB_OWN_LOCK" 2>/dev/null || true
+  _HB_OWN_LOCK=""
+  printf 'scan\tok\n'
+  printf 'end\tok\n'
+  return 0
+}
+
+# The entry point the shipped closure calls with the box's argv (the first word
+# is the verb). An unknown verb prints the abort grammar so the host rejects it
+# rather than reading a truncated success.
+_hb_main() {
+  local verb="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    probe)     _hb_probe "$@" ;;
+    terminate) _hb_terminate "$@" ;;
+    *)
+      printf 'hb\t1\n'
+      printf 'args\tbad\n'
+      printf 'end\tabort\n'
+      ;;
+  esac
+}
+
+# ── Live switch: terminal 2 ────────────────────────────────────────────────
+# The half that runs on the host in the terminal that typed `cleat account`.
+# (M1 ships only the bounded exec; the rest of terminal 2 lands with the switch
+# body.)
+
+# Render the in-box half as a self-contained script: the stale-bound constant,
+# then every function the verbs reach, then the entry-point call. Returns
+# non-zero when any listed name is unset, so a caller never ships a half script.
+# References no host global, so it runs the same under `env -i`.
+_handoff_box_script() {
+  declare -p _HB_CLAUDE_LOCK_STALE_S || return 1
+  declare -f _json_flat_str _sessions_json_unesc _is_claude_argv \
+             _hb_main _hb_args_ok _hb_probe _hb_terminate _hb_proc_state \
+             _hb_scan _hb_env_value _hb_execid _hb_session_record _hb_recheck \
+             _hb_lock_take _hb_cleanup || return 1
+  printf '%s\n' '_hb_main "$@"'
+}
+
+# Run one box verb bounded on every host, including the ones with no timeout(1).
+# The docker client runs as a background job; a poll loop stops it when it
+# outlives BOUND seconds or writes more than _HANDOFF_OUT_MAX_BYTES to OUT. Only
+# the docker CLIENT is ever SIGKILLed here, never anything inside the box. The
+# captured output goes to OUT; the caller reads at most _HANDOFF_OUT_MAX_BYTES
+# of it after this returns. rc 124 means the bound stopped it.
+_handoff_docker_exec() {
+  local cname="$1" bound="$2" out="$3" script dpid rc=0 start n=0 size stopped=0
+  shift 3
+  script="$(_handoff_box_script)" || return 70
+  : > "$out" || return 70
+  docker exec "$cname" runuser -u coder -- bash -c "$script" cleat-hb "$@" \
+    </dev/null >"$out" 2>/dev/null 3>&- &
+  dpid=$!
+  start=$SECONDS
+  while kill -0 "$dpid" 2>/dev/null; do
+    n=$(( n + 1 ))
+    if [[ $(( SECONDS - start )) -ge $bound ]]; then stopped=1; break; fi
+    if [[ $(( n % 10 )) -eq 0 ]]; then
+      size="$(wc -c <"$out" 2>/dev/null | tr -d '[:space:]')"
+      case "$size" in ''|*[!0-9]*) size=0 ;; esac
+      if [[ $size -gt $_HANDOFF_OUT_MAX_BYTES ]]; then stopped=1; break; fi
+    fi
+    _handoff_exec_pause || true
+  done
+  if [[ $stopped -eq 1 ]]; then
+    kill -TERM "$dpid" 2>/dev/null || true
+    n=0
+    while kill -0 "$dpid" 2>/dev/null && [[ $n -lt 20 ]]; do _handoff_exec_pause || true; n=$(( n + 1 )); done
+    kill -KILL "$dpid" 2>/dev/null || true
+  fi
+  wait "$dpid" 2>/dev/null || rc=$?
+  if [[ $stopped -eq 1 ]]; then rc=124; fi
+  return "$rc"
+}
+
 # Every refusal to change the login under a live Claude session says this.
 #
 # The reason is NOT that Claude Code notices the swap and undoes it. The old
@@ -17493,26 +18784,1017 @@ _account_apply_exec_env() {
 # - a refresh saved in the same instant as the swap, which can put the old token
 #   back for the next harvest to file under the new name.
 # A fresh start takes all of it. That is the path the guard leaves open.
+# Print one piece of live-switch copy by id, colours through the shared helpers,
+# so every user-visible refusal and status of the handoff lives in one place and
+# the golden-file test can diff it. This milestone defines the ids the offline
+# switch, the attach gate and the account-rm refusal use. Terminal 2 adds the
+# rest of the catalogue here (section 3.2 of the handover, concept/44).
+_handoff_say() {
+  local id="$1"; shift
+  case "$id" in
+    R-switching)
+      # $1 box, $2 the command to retry (cleat | cleat shell)
+      error "${BOLD}${1}${RESET} is switching accounts in another terminal."
+      echo -e "    ${DIM}Nothing was changed. Run ${BOLD}${2}${RESET}${DIM} again in a moment.${RESET}"
+      ;;
+    R-starting)
+      error "A Claude session is starting in ${BOLD}${1}${RESET} in another terminal."
+      echo -e "    ${DIM}Nothing was changed. Run this again once it is up.${RESET}"
+      ;;
+    R-shell-open)
+      error "${BOLD}${1}${RESET} has a cleat shell open in another terminal."
+      echo -e "    ${DIM}A claude started there keeps the login the shell opened with. Exit it, then run this again.${RESET}"
+      echo -e "    ${DIM}Nothing was changed.${RESET}"
+      ;;
+    R-reopening)
+      error "${BOLD}${1}${RESET} is still reopening a session from an earlier switch."
+      echo -e "    ${DIM}Nothing was changed. Run this again in a moment.${RESET}"
+      ;;
+    T0)
+      # $1 the account the other terminal is switching to (or the default sentinel)
+      info "The other terminal is switching this box to $(_handoff_acct_phrase "$1"). This conversation reopens here when that finishes."
+      echo -e "    ${DIM}Wait here before you type. Ctrl-C stops waiting.${RESET}"
+      ;;
+    T-unfinished)
+      # $1 the pin the box really landed on
+      warn "The account switch did not finish. This box is on $(_handoff_acct_phrase "$1")."
+      echo -e "    ${DIM}Resume with: ${BOLD}cleat resume${RESET}"
+      ;;
+    T-interrupted)
+      # $1 the pin the box really landed on
+      warn "Stopped waiting for the account switch. This box is on $(_handoff_acct_phrase "$1")."
+      echo -e "    ${DIM}Resume with: ${BOLD}cleat resume${RESET}"
+      ;;
+    T-landed)
+      # $1 box, $2 the pin it landed on
+      warn "${BOLD}${1}${RESET} is now on $(_handoff_acct_phrase "$2"). This conversation did not reopen."
+      echo -e "    ${DIM}Resume with: ${BOLD}cleat resume${RESET}"
+      ;;
+    T-boxstopped)
+      warn "The box stopped during the account switch."
+      echo -e "    ${DIM}Resume with: ${BOLD}cleat resume${RESET}"
+      ;;
+  esac
+}
+
+# ── Live handoff: terminal 2 host helpers ──────────────────────────────────
+# Everything the terminal that typed `cleat account <b>` runs to hand a live
+# session over: probe the box, classify what it found against section 3.2 of
+# the handover, disclose what is lost, ask, then under the account lock stop the
+# session in the box (the ONE docker call the lock allows), move the login the
+# offline switch's way and leave a ticket the other terminal reopens from. The
+# copy printers keep every user-visible line in one place so the golden-file
+# test can diff them and the site mockups can copy them.
+
+# The account name as it reads bare in a sentence ("b", "your shared login"),
+# and its possessive ("b's", "that login's"). _handoff_acct_phrase (defined with
+# the T lines) gives the "account b" form the result headers use.
+_handoff_acct_bare() {
+  if [[ "$1" == "$_ACCOUNT_DEFAULT" ]]; then printf 'your shared login'; else printf '%s' "$1"; fi
+}
+_handoff_acct_poss() {
+  if [[ "$1" == "$_ACCOUNT_DEFAULT" ]]; then printf 'that login'\''s'; else printf '%s'\''s' "$1"; fi
+}
+
+# A pause between the two staged-file verifies, a seam a test overrides to run
+# without real time.
+_handoff_settle_pause() { sleep 0.1 2>/dev/null || true; }
+
+# The settings-file half of _resume_model_configured, split out so terminal 2
+# can ask "is a model set" without resolve_env_args (which needs resolve_caps,
+# which may prompt). True when any settings file this project reads names a
+# model. The env half stays in _resume_model_configured.
+_resume_model_in_settings() {
+  local project="$1" f blob re='"(model|ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_[A-Z]+_MODEL)"[[:space:]]*:'
+  for f in "${HOME}/.claude/settings.json" "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    blob="$(head -c "$_RESUME_CARRY_WINDOW" "$f" 2>/dev/null || true)"
+    [[ "$blob" =~ $re ]] && return 0
+  done
+  return 1
+}
+
+# The conversation size of a transcript: the token sum of its last real
+# assistant turn, or nothing when it cannot be read. Reuses the tested
+# _resume_last_usage_tokens (model TAB tokens), taking the token count.
+_handoff_context_tokens() {
+  local f="$1" out
+  out="$(_resume_last_usage_tokens "$f" 2>/dev/null || true)"
+  case "$out" in
+    *"$(printf '\t')"*) printf '%s' "${out#*$'\t'}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The last permission-mode record's value, printed only when it is one cleat
+# knows. Feeds D9. Nothing for bypassPermissions, an absent record or anything
+# unrecognised (D9 is silent then).
+_handoff_last_permission_mode() {
+  local f="$1"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  tail -c 1048576 "$f" 2>/dev/null | LC_ALL=C awk '
+    /"type":"permission-mode"/ {
+      if (match($0, /"permissionMode":"[^"]*"/)) {
+        v = substr($0, RSTART+18, RLENGTH-19)
+        last = v
+      }
+    }
+    END {
+      if (last=="plan"||last=="acceptEdits"||last=="default"||last=="auto"||last=="dontAsk"||last=="bypassPermissions") print last
+    }
+  '
+}
+
+# Print the exec id of every live kind=claude marker that no probe record and no
+# live ticket explains and whose marker is younger than the starting bound: a
+# session coming up in another terminal that the probe cannot see yet (row 8a).
+# Reads _HO_EXEC (the probe's ids). A cmd_shell marker (empty exec) is never
+# printed.
+_handoff_marker_orphans() {
+  local cname="$1" rd m pid mt age now e skip tf
+  now="$(_handoff_now)"; case "$now" in ''|*[!0-9]*) now="$(date +%s)" ;; esac
+  rd="$CLEAT_RUN_DIR/$cname"
+  for m in "$rd"/.attached.*; do
+    [[ -e "$m" ]] || continue
+    pid="${m##*/.attached.}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    _handoff_marker_read "$m" || continue
+    [[ "$_HM_KIND" == claude && -n "$_HM_EXEC" ]] || continue
+    skip=0
+    for e in ${_HO_EXEC[@]+"${_HO_EXEC[@]}"}; do
+      [[ "$e" == "$_HM_EXEC" ]] && { skip=1; break; }
+    done
+    [[ $skip -eq 1 ]] && continue
+    tf="$rd/.handoff.$_HM_EXEC"
+    _handoff_ticket_read "$tf" && continue
+    mt="$(_path_mtime "$m")"; age=$(( now - mt ))
+    [[ $age -ge 0 && $age -le $_HANDOFF_STARTING_MAX_S ]] || continue
+    printf '%s\n' "$_HM_EXEC"
+  done
+}
+
+# Run the in-box read-only probe (bound), parse it into the _HO_* arrays. rc 1
+# when the exec failed, timed out or any line failed the grammar (the caller
+# turns that into R5).
+_handoff_probe() {
+  local cname="$1" out rc=0 prc=0
+  out="$(mktemp "${TMPDIR:-/tmp}/cleat-hprobe.XXXXXX" 2>/dev/null)" || return 1
+  _handoff_docker_exec "$cname" "$_HANDOFF_PROBE_TIMEOUT_S" "$out" probe /home/coder /proc || rc=$?
+  if [[ $rc -ne 0 ]]; then rm -f "$out" 2>/dev/null || true; return 1; fi
+  _handoff_parse_probe "$out" || prc=$?
+  rm -f "$out" 2>/dev/null || true
+  return "$prc"
+}
+
+# Parse a probe capture. Sets _HO_PID _HO_PS _HO_STATUS _HO_WAIT _HO_KIND
+# _HO_EXEC _HO_STORE _HO_SID (indexed, one per live session), _HO_ORPHANS (pids)
+# and _HO_SHELLS (exec ids). Refuses (rc 1) on args bad, an aborted end, a
+# malformed line or a missing hb/args/end.
+_handoff_parse_probe() {
+  local out="$1" typ rest hb=0 argsok=0 endok=0 n
+  _HO_PID=(); _HO_PS=(); _HO_STATUS=(); _HO_WAIT=(); _HO_KIND=(); _HO_EXEC=(); _HO_STORE=(); _HO_SID=(); _HO_VER=()
+  _HO_ORPHANS=""; _HO_SHELLS=""
+  [[ -f "$out" ]] || return 1
+  while IFS="$(printf '\t')" read -r typ rest || [[ -n "$typ" ]]; do
+    [[ -z "$typ" && -z "$rest" ]] && continue
+    case "$typ" in
+      hb) [[ "$rest" == 1 ]] && hb=1 ;;
+      args) [[ "$rest" == ok ]] && argsok=1; [[ "$rest" == bad ]] && return 1 ;;
+      end) [[ "$rest" == ok ]] && endok=1; [[ "$rest" == abort ]] && return 1 ;;
+      claude)
+        set -- $rest
+        [[ $# -eq 8 ]] || return 1
+        n=${#_HO_PID[@]}
+        _HO_PID[$n]="$1"; _HO_PS[$n]="$2"; _HO_STATUS[$n]="$3"; _HO_WAIT[$n]="$4"
+        _HO_KIND[$n]="$5"; _HO_EXEC[$n]="$6"; _HO_STORE[$n]="$7"; _HO_SID[$n]="$8"; _HO_VER[$n]=""
+        ;;
+      orphan) _HO_ORPHANS="$_HO_ORPHANS $rest" ;;
+      shell)  _HO_SHELLS="$_HO_SHELLS $rest" ;;
+      *) return 1 ;;
+    esac
+  done < "$out"
+  [[ $hb -eq 1 && $argsok -eq 1 && $endok -eq 1 ]] || return 1
+  return 0
+}
+
+# Parse a terminate capture. Sets _PT_ARGS _PT_LOCK _PT_RECHECK _PT_SCAN _PT_END
+# and the space-delimited pid sets _PT_EXITED _PT_ALIVE _PT_GONE plus
+# _PT_ANY_ALIVE. rc 1 when the exec was refused or garbled (no hb, no end).
+_parse_terminate() {
+  local out="$1" typ rest hb=0 p st
+  _PT_ARGS=""; _PT_LOCK=""; _PT_RECHECK=""; _PT_SCAN=""; _PT_END=""
+  _PT_EXITED=" "; _PT_ALIVE=" "; _PT_GONE=" "; _PT_ANY_ALIVE=0
+  [[ -f "$out" ]] || return 1
+  while IFS="$(printf '\t')" read -r typ rest || [[ -n "$typ" ]]; do
+    [[ -z "$typ" && -z "$rest" ]] && continue
+    case "$typ" in
+      hb) [[ "$rest" == 1 ]] && hb=1 ;;
+      args) _PT_ARGS="$rest" ;;
+      lock) _PT_LOCK="$rest" ;;
+      recheck) _PT_RECHECK="$rest" ;;
+      scan) _PT_SCAN="$rest" ;;
+      end) _PT_END="$rest" ;;
+      pid)
+        set -- $rest; p="$1"; st="${2:-}"
+        case "$st" in
+          exited) _PT_EXITED="$_PT_EXITED$p " ;;
+          alive)  _PT_ALIVE="$_PT_ALIVE$p "; _PT_ANY_ALIVE=1 ;;
+          gone)   _PT_GONE="$_PT_GONE$p " ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$out"
+  [[ $hb -eq 1 && ( "$_PT_ARGS" == ok || "$_PT_ARGS" == bad ) && -n "$_PT_END" ]] || return 1
+  return 0
+}
+
+# A stable signature of the probe's live sessions, so a re-probe under the lock
+# can prove nothing about them changed while the question was open.
+_handoff_probe_signature() {
+  local i=0
+  while [[ $i -lt ${#_HO_PID[@]} ]]; do
+    printf '%s|%s|%s|%s|%s|%s\n' \
+      "${_HO_PID[$i]}" "${_HO_PS[$i]}" "${_HO_SID[$i]}" "${_HO_EXEC[$i]}" "${_HO_STORE[$i]}" "${_HO_STATUS[$i]}"
+    i=$(( i + 1 ))
+  done
+  printf 'orphans:%s shells:%s\n' "$_HO_ORPHANS" "$_HO_SHELLS"
+}
+
+# True when SID has a real, non-symlink transcript under the project+box key
+# dir. Row 15 leans on it: a session cleat cannot resume is refused.
+_handoff_sid_has_transcript() {
+  local sdir="$1" sid="$2"
+  [[ -n "$sdir" ]] || return 1
+  _sessions_path_under_key "$sdir/$sid.jsonl" "$sdir" || return 1
+  [[ -f "$sdir/$sid.jsonl" && ! -L "$sdir/$sid.jsonl" ]]
+}
+
+# True when a shell line (a background command or monitor the probe reported) is
+# acceptable to restart. A shell line is only acceptable when it belongs to a
+# busy target that --now is restarting: its exec id equals that target's, so
+# stopping the session stops the command and the box recheck's now exemption
+# already covers it. A line tied to an idle target, an unreadable, many or bad
+# id, or no target at all is not acceptable and must refuse. Reads the classify
+# globals _HO_STATUS and _HO_EXEC. rc 0 acceptable, 1 refuse.
+_handoff_shell_line_ok() {
+  local sline="$1" now="$2" n="$3" i=0
+  [[ "$now" == 1 ]] || return 1
+  while [[ $i -lt $n ]]; do
+    [[ "${_HO_STATUS[$i]}" == busy && "$sline" == "${_HO_EXEC[$i]}" ]] && return 0
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+# Apply rows 8a to 22 of the decision table to the parsed probe. Sets
+# _HO_VERDICT (ok, quiet, or a refusal id), _HO_N and, when ok, the per-target
+# _HO_EXPECT, _HO_LIMIT, _HO_AUTOCONT, _HO_MODE arrays and _HO_TARGET_PLAN. Fails
+# closed: anything it does not recognise is a refusal, never a switch.
+_handoff_classify() {
+  local cname="$1" now="$2" project="$3" acct="$4"
+  local i j N="${#_HO_PID[@]}" sdir pinstore tfile L A sid state sline
+  _HO_VERDICT=ok; _HO_N=0
+  _HO_EXPECT=(); _HO_LIMIT=(); _HO_AUTOCONT=(); _HO_MODE=(); _HO_TARGET_PLAN=""
+  # Row 8a: a live marker with no probe record and no ticket is a session still
+  # coming up, which the probe cannot see yet.
+  if [[ -n "$(_handoff_marker_orphans "$cname")" ]]; then _HO_VERDICT=R22; return 0; fi
+  # Row 8: a quiet box (a live non-claude process only).
+  if [[ $N -eq 0 && -z "${_HO_ORPHANS// }" && -z "${_HO_SHELLS// }" ]]; then _HO_VERDICT=quiet; _HO_N=0; return 0; fi
+  # Row 9: any orphan claude process.
+  [[ -n "${_HO_ORPHANS// }" ]] && { _HO_VERDICT=R4; return 0; }
+  # Row 10: a kind other than interactive.
+  i=0; while [[ $i -lt $N ]]; do [[ "${_HO_KIND[$i]}" == interactive ]] || { _HO_VERDICT=R4; return 0; }; i=$(( i + 1 )); done
+  # Row 11: an exec id cleat cannot tie to one live session.
+  i=0; while [[ $i -lt $N ]]; do
+    case "${_HO_EXEC[$i]}" in none|many|unreadable|bad) _HO_VERDICT=R4; return 0 ;; esac
+    _handoff_id_ok "${_HO_EXEC[$i]}" || { _HO_VERDICT=R4; return 0; }
+    i=$(( i + 1 ))
+  done
+  # Row 12: two records sharing one exec id.
+  i=0; while [[ $i -lt $N ]]; do j=$(( i + 1 )); while [[ $j -lt $N ]]; do [[ "${_HO_EXEC[$i]}" == "${_HO_EXEC[$j]}" ]] && { _HO_VERDICT=R4; return 0; }; j=$(( j + 1 )); done; i=$(( i + 1 )); done
+  # Row 13: an exec id with no live attach marker.
+  i=0; while [[ $i -lt $N ]]; do _handoff_marker_live_for_exec "$cname" "${_HO_EXEC[$i]}" || { _HO_VERDICT=R4; return 0; }; i=$(( i + 1 )); done
+  # Row 14: a store that does not match the pin.
+  pinstore=default; [[ "$(_box_account_read "$cname")" != "$_ACCOUNT_DEFAULT" ]] && pinstore=named
+  i=0; while [[ $i -lt $N ]]; do [[ "${_HO_STORE[$i]}" == "$pinstore" ]] || { _HO_VERDICT=R4; return 0; }; i=$(( i + 1 )); done
+  # Row 15: a sid that is not a UUID with a real transcript in this project.
+  sdir="$(_sessions_key_dir "$project" "${_BOX:-main}")" || sdir=""
+  i=0; while [[ $i -lt $N ]]; do
+    sid="${_HO_SID[$i]}"
+    { [[ "$sid" != none ]] && _sessions_is_uuid "$sid"; } || { _HO_VERDICT=R4; return 0; }
+    _handoff_sid_has_transcript "$sdir" "$sid" || { _HO_VERDICT=R4; return 0; }
+    i=$(( i + 1 ))
+  done
+  # Row 16: a status cleat does not know (fail closed on anything unexpected).
+  i=0; while [[ $i -lt $N ]]; do
+    case "${_HO_STATUS[$i]}" in busy|shell|idle|waiting) : ;; *) _HO_VERDICT=R5; return 0 ;; esac
+    i=$(( i + 1 ))
+  done
+  # Per-target limit, auto-continue and last permission mode, read from the
+  # transcript before any kill. Rows 18 to 22 below read these.
+  i=0; while [[ $i -lt $N ]]; do
+    tfile="$sdir/${_HO_SID[$i]}.jsonl"
+    set -- $(_handoff_tail_flags "$tfile"); L="${1:-0}"; A="${2:-0}"
+    _HO_LIMIT[$i]="$L"; _HO_AUTOCONT[$i]="$A"
+    _HO_MODE[$i]="$(_handoff_last_permission_mode "$tfile")"
+    i=$(( i + 1 ))
+  done
+  # Row 19: a turn in flight, without --now. Evaluated before the shell row so a
+  # busy session offers --now (R-busy) instead of the shell refusal, and so a
+  # busy target's own background command can be let through by --now below.
+  if [[ "$now" != 1 ]]; then
+    i=0; while [[ $i -lt $N ]]; do [[ "${_HO_STATUS[$i]}" == busy ]] && { _HO_VERDICT=R1; return 0; }; i=$(( i + 1 )); done
+  fi
+  # A background shell command or monitor. A shell status is never busy so it
+  # always refuses. A shell line (a background command's process) is let through
+  # only when it belongs to a busy target that --now is restarting, so stopping
+  # the session stops the command and the box recheck's now exemption covers it.
+  # Any other shell line refuses. Without --now row 19 already took every busy
+  # target, so every shell line refuses here.
+  # Row 18: background shell (a shell line, then a shell status).
+  for sline in $_HO_SHELLS; do _handoff_shell_line_ok "$sline" "$now" "$N" || { _HO_VERDICT=R3; return 0; }; done
+  i=0; while [[ $i -lt $N ]]; do [[ "${_HO_STATUS[$i]}" == shell ]] && { _HO_VERDICT=R3; return 0; }; i=$(( i + 1 )); done
+  # Row 20: a question that is not the usage-limit dialog, without --now. The
+  # limit question is dialog-open with the transcript confirming a rate limit.
+  if [[ "$now" != 1 ]]; then
+    i=0; while [[ $i -lt $N ]]; do
+      if [[ "${_HO_STATUS[$i]}" == waiting ]]; then
+        local lq=no
+        [[ "${_HO_WAIT[$i]}" == dialog-open && "${_HO_LIMIT[$i]}" == 1 ]] && lq=yes
+        if [[ "$lq" == yes ]]; then :; else
+          if [[ "${_HO_WAIT[$i]}" == permission-prompt ]]; then _HO_VERDICT=R2p; else _HO_VERDICT=R2q; fi
+          return 0
+        fi
+      fi
+      i=$(( i + 1 ))
+    done
+  fi
+  # Row 21: a named target with no working login.
+  if [[ "$acct" != "$_ACCOUNT_DEFAULT" ]]; then
+    if ! _account_exists "$acct"; then _HO_VERDICT=R6; return 0; fi
+    state="$(_account_auth_state "$acct")"
+    if [[ "$state" == "signed out" || "$state" == "re-login" ]]; then _HO_VERDICT=R6; return 0; fi
+  fi
+  # Row 22 (R-context): a conversation in the compaction band with no sign of
+  # 1M context. The band's floor is one auto-compact buffer below the standard
+  # window (STD_WINDOW - COMPACT_BUFFER = 187000), the size at which reopening
+  # in the standard window would compact the conversation into a summary. A last
+  # real usage at or above the floor with an empty model carry means cleat cannot
+  # prove 1M ran, so it refuses. A size above the window is already covered: H7
+  # gives _resume_model_carry a non-empty <model>[1m], so the guard below is
+  # false and the reopen carries 1M instead of refusing.
+  local ctx_floor=$(( _HANDOFF_STD_WINDOW_TOKENS - _HANDOFF_COMPACT_BUFFER_TOKENS ))
+  i=0; while [[ $i -lt $N ]]; do
+    tfile="$sdir/${_HO_SID[$i]}.jsonl"
+    if ! _resume_model_in_settings "$project" && [[ -z "$(_resume_model_carry "$tfile")" ]]; then
+      local ctx; ctx="$(_handoff_context_tokens "$tfile" 2>/dev/null || true)"
+      if [[ -n "$ctx" ]]; then case "$ctx" in *[!0-9]*) : ;; *) [[ "$ctx" -ge $ctx_floor ]] && { _HO_VERDICT=R7; return 0; } ;; esac; fi
+    fi
+    i=$(( i + 1 ))
+  done
+  # Per-target expect for the terminate exec.
+  i=0; while [[ $i -lt $N ]]; do
+    if [[ "${_HO_STATUS[$i]}" == waiting && "${_HO_WAIT[$i]}" == dialog-open && "${_HO_LIMIT[$i]}" == 1 ]]; then _HO_EXPECT[$i]=limitq
+    elif [[ "$now" == 1 && ( "${_HO_STATUS[$i]}" == busy || "${_HO_STATUS[$i]}" == waiting ) ]]; then _HO_EXPECT[$i]=now
+    else _HO_EXPECT[$i]=idle; fi
+    i=$(( i + 1 ))
+  done
+  if [[ "$acct" != "$_ACCOUNT_DEFAULT" ]]; then
+    _HO_TARGET_PLAN="$(_account_cred_str "$(_account_cred_path "$acct")" subscriptionType 2>/dev/null || true)"
+  fi
+  _HO_VERDICT=ok; _HO_N=$N
+}
+
+# The staged login the switch just wrote, verified on the host's own disk: a
+# named target must leave a claudeAiOauth object staged, the shared login must
+# leave none. rc 1 on a mismatch or a file that exists but cannot be read.
+_handoff_verify_staged() {
+  local cname="$1" acct="$2" staged obj
+  staged="$(_account_box_auth_dir "$cname")/.credentials.json"
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    [[ ! -e "$staged" ]] && return 0
+    [[ -f "$staged" && ! -L "$staged" ]] || return 1
+    obj="$(head -c "$_ACCOUNT_CRED_MAX_BYTES" "$staged" 2>/dev/null | _json_flat_object claudeAiOauth)"
+    [[ -z "$obj" ]]
+    return $?
+  fi
+  [[ -f "$staged" && ! -L "$staged" ]] || return 1
+  obj="$(head -c "$_ACCOUNT_CRED_MAX_BYTES" "$staged" 2>/dev/null | _json_flat_object claudeAiOauth)"
+  [[ -n "$obj" ]]
+}
+
+# Write a ready ticket for every target the terminate exec reported as EXITED
+# or still ALIVE. An exited target reopens on TO. A survivor (still alive after
+# the kill wait) reopens too (4.4 row 27): its ticket is written so its own
+# terminal 1 reopens it on TO once it finally stops, within the ticket age
+# bound. A gone or never-signalled target ended on its own or was never touched,
+# so its ticket is removed: neither reopens. On every branch that reaches here
+# except a landed switch the survivor set is empty (row 27 returns first), so TO
+# is the old login and only the exited targets have a ticket to write.
+# TO is the account the relaunch should read the pin for.
+_handoff_write_ready() {
+  local cname="$1" toacct="$2" i=0
+  while [[ $i -lt ${#_HO_PID[@]} ]]; do
+    case "$_PT_EXITED$_PT_ALIVE" in
+      *" ${_HO_PID[$i]} "*) _handoff_ticket_write "$cname" "${_HO_EXEC[$i]}" ready "${_HO_SID[$i]}" "$toacct" || true ;;
+      *) rm -f "$CLEAT_RUN_DIR/$cname/.handoff.${_HO_EXEC[$i]}" 2>/dev/null || true ;;
+    esac
+    i=$(( i + 1 ))
+  done
+}
+
+# Remove the tickets this run wrote, by exec id.
+_handoff_tickets_remove() {
+  local cname="$1"; shift
+  local rd="$CLEAT_RUN_DIR/$cname" e
+  for e in "$@"; do
+    _handoff_id_ok "$e" && rm -f "$rd/.handoff.$e" 2>/dev/null || true
+  done
+}
+
+# The confirm question and its yes rule. Without --now an empty answer is yes
+# ([Y/n]); with --now the default flips to no ([y/N]). EOF (_ask_yn returns n)
+# is always no.
+_handoff_question_prompt() {
+  local n="$1" now="$2" q d
+  if [[ $n -ge 3 ]]; then q="Hand all ${n} over?"; elif [[ $n -eq 2 ]]; then q="Hand both over?"; else q="Hand over?"; fi
+  if [[ "$now" == 1 ]]; then d="[y/N] "; else d="[Y/n] "; fi
+  printf '%s %s' "$q" "$d"
+}
+_handoff_yn_yes() {
+  local reply="$1" now="$2"
+  case "$reply" in [Yy]|[Yy][Ee][Ss]) return 0 ;; esac
+  [[ -z "$reply" && "$now" != 1 ]] && return 0
+  return 1
+}
+
+# ── Live handoff: the copy catalogue (section 3.2) ──────────────────────────
+
+# The disclosure (D1 to D10). Printed whenever N >= 1, before anything changes,
+# with or without --yes and with or without a terminal. Reads the _HO_* arrays
+# the classify set. BOX ACCT.
+_handoff_say_disclosure() {
+  local box="$1" acct="$2" n="${_HO_N:-0}" i state bare poss
+  bare="$(_handoff_acct_bare "$acct")"; poss="$(_handoff_acct_poss "$acct")"
+  _HANDOFF_DISCLOSED=1
+  # D1 / D1m
+  if [[ $n -ge 2 ]]; then
+    warn "${BOLD}${box}${RESET} has ${n} live Claude sessions in other terminals."
+  else
+    if [[ "${_HO_LIMIT[0]:-0}" == 1 ]]; then state="at its usage limit"
+    else case "${_HO_STATUS[0]:-idle}" in
+        busy) state="in the middle of a turn" ;;
+        waiting) state="waiting for an answer" ;;
+        *) state="idle" ;;
+      esac
+    fi
+    warn "${BOLD}${box}${RESET} has a live Claude session in another terminal (${state})."
+  fi
+  # D2 / D2m
+  if [[ $n -ge 3 ]]; then
+    echo -e "    ${DIM}Handing all ${n} over to ${bare} restarts each in its own terminal and reopens its own conversation.${RESET}"
+  elif [[ $n -eq 2 ]]; then
+    echo -e "    ${DIM}Handing both over to ${bare} restarts each in its own terminal and reopens its own conversation.${RESET}"
+  else
+    echo -e "    ${DIM}Handing it over to ${bare} restarts it there and reopens the same conversation.${RESET}"
+  fi
+  # D3
+  if [[ $n -ge 2 ]]; then
+    echo -e "    ${DIM}Anything typed in them but not sent is lost.${RESET}"
+  else
+    echo -e "    ${DIM}Anything typed there but not sent is lost.${RESET}"
+  fi
+  # D4
+  if [[ $n -ge 2 ]]; then
+    echo -e "    ${DIM}Any background agent or monitor they run in this box stops with them.${RESET}"
+  else
+    echo -e "    ${DIM}Any background agent or monitor it runs in this box stops with it.${RESET}"
+  fi
+  # D5 / D6, only with --now
+  if [[ "${_HO_NOW_FLAG:-0}" == 1 ]]; then
+    local any_busy=0 any_perm=0 any_q=0
+    i=0; while [[ $i -lt $n ]]; do
+      case "${_HO_STATUS[$i]:-}" in
+        busy) any_busy=1 ;;
+        waiting)
+          if [[ "${_HO_LIMIT[$i]:-0}" != 1 ]]; then
+            if [[ "${_HO_WAIT[$i]:-}" == permission-prompt ]]; then any_perm=1; else any_q=1; fi
+          fi
+          ;;
+      esac
+      i=$(( i + 1 ))
+    done
+    [[ $any_busy -eq 1 ]] && echo -e "    ${DIM}Its reply so far and any running tool are lost. It can start a turn by itself when it reopens.${RESET}"
+    [[ $any_perm -eq 1 ]] && echo -e "    ${DIM}The tool it is asking about does not run.${RESET}"
+    [[ $any_q -eq 1 ]] && echo -e "    ${DIM}The question it is showing closes unanswered.${RESET}"
+  fi
+  # D7
+  if [[ $n -ge 2 ]]; then
+    echo -e "    ${DIM}The first reply on ${bare} in each may read its whole conversation again without a prompt cache. That can use a large share of ${poss} usage.${RESET}"
+  else
+    echo -e "    ${DIM}The first reply on ${bare} may read the whole conversation again without a prompt cache. That can use a large share of ${poss} usage.${RESET}"
+  fi
+  # D8
+  if [[ "$_HO_TARGET_PLAN" == pro ]]; then
+    echo -e "    ${DIM}${bare} is on a Pro plan. cleat cannot tell whether that plan keeps 1M context.${RESET}"
+  fi
+  # D9: per session, its last permission mode
+  i=0; while [[ $i -lt $n ]]; do
+    case "${_HO_MODE[$i]:-}" in
+      plan|acceptEdits|auto|dontAsk) echo -e "    ${DIM}It was in ${_HO_MODE[$i]} mode. Check its mode there after it reopens.${RESET}" ;;
+    esac
+    i=$(( i + 1 ))
+  done
+  # D10: a Claude Code version cleat has not checked this handoff against
+  i=0; while [[ $i -lt $n ]]; do
+    local v="${_HO_VER[$i]:-}"
+    if [[ -n "$v" ]]; then
+      case " $_HANDOFF_VERIFIED_CLAUDE " in
+        *" $v "*) : ;;
+        *) echo -e "    ${DIM}cleat has checked this handoff with Claude Code ${_HANDOFF_VERIFIED_CLAUDE}. This box runs ${v}.${RESET}" ;;
+      esac
+    fi
+    i=$(( i + 1 ))
+  done
+}
+
+# A refusal by id. ID BOX X, where X is the account the line names (the target
+# for R1 to R7, R15, R16, R18, R22, the old pin for R12). R4, R5, R5i and R17
+# print through _account_live_refusal at the call site.
+_handoff_say_refusal() {
+  local id="$1" box="$2" x="${3:-}"
+  case "$id" in
+    R1)
+      error "${BOLD}${box}${RESET} is in the middle of a turn in another terminal."
+      echo -e "    ${DIM}Wait for it to finish, then run this again. To restart it now, add --now: its reply so far and any running tool are lost.${RESET}"
+      echo -e "    ${DIM}Nothing was changed.${RESET}"
+      ;;
+    R2p)
+      error "${BOLD}${box}${RESET} is waiting for an answer in another terminal."
+      echo -e "    ${DIM}Answer it there, then run this again. To restart it now, add --now: the tool it is asking about does not run.${RESET}"
+      echo -e "    ${DIM}Nothing was changed.${RESET}"
+      ;;
+    R2q)
+      error "${BOLD}${box}${RESET} is waiting for an answer in another terminal."
+      echo -e "    ${DIM}Answer it there, then run this again. To restart it now, add --now: the question there closes unanswered.${RESET}"
+      echo -e "    ${DIM}Nothing was changed.${RESET}"
+      ;;
+    R3)
+      error "${BOLD}${box}${RESET} has background shell commands running in another terminal."
+      echo -e "    ${DIM}A restart would stop them and start a new turn on $(_handoff_acct_bare "$x") by itself. Let them finish, then run this again.${RESET}"
+      echo -e "    ${DIM}Nothing was changed.${RESET}"
+      ;;
+    R6)
+      error "${BOLD}${x}${RESET} has no working login, so the session in the other terminal would reopen signed out."
+      echo -e "    ${DIM}Exit it there. Then run ${BOLD}cleat account ${x}${RESET}${DIM}, ${BOLD}cleat login${RESET}${DIM} and ${BOLD}cleat resume${RESET}${DIM}.${RESET}"
+      echo -e "    ${DIM}Nothing was changed.${RESET}"
+      ;;
+    R7)
+      error "${BOLD}${box}${RESET}'s conversation is larger than a standard context window."
+      echo -e "    ${DIM}cleat found no sign it ran with 1M context, so it would reopen without it and could compact or fail.${RESET}"
+      echo -e "    ${DIM}Set the model it ran on, with [1m], in ${BOLD}~/.claude/settings.json${RESET}${DIM} and run this again. Nothing was changed.${RESET}"
+      ;;
+    R9)
+      error "The Claude session in ${BOLD}${box}${RESET} changed while you were answering."
+      echo -e "    ${DIM}Nothing was changed. Run this again to see what it is doing now.${RESET}"
+      ;;
+    R11)
+      error "Claude Code in ${BOLD}${box}${RESET} is still refreshing its login."
+      echo -e "    ${DIM}Nothing was changed. Try again in a moment.${RESET}"
+      ;;
+    R12)
+      error "The Claude session in ${BOLD}${box}${RESET} did not stop within ${_HB_KILL_WAIT_S} seconds, so ${BOLD}${box}${RESET} stays on $(_handoff_acct_phrase "$x")."
+      echo -e "    ${DIM}It reopens there on $(_handoff_acct_bare "$x") once it stops. Nothing was switched.${RESET}"
+      ;;
+    R13)
+      error "A Claude session started in ${BOLD}${box}${RESET} during the switch."
+      echo -e "    ${DIM}Nothing was changed. Run this again.${RESET}"
+      ;;
+    R14)
+      error "${BOLD}${box}${RESET} still holds a login from an earlier switch that could not be saved."
+      echo -e "    ${DIM}Nothing was changed. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+      ;;
+    R15)
+      info "${BOLD}${box}${RESET} is already on $(_handoff_acct_phrase "$x")."
+      ;;
+    R16)
+      error "cleat could not read the login stored as ${BOLD}${x}${RESET}."
+      echo -e "    ${DIM}Nothing was changed. Check it with ${BOLD}cleat account list${RESET}${DIM}.${RESET}"
+      ;;
+    R18)
+      error "${BOLD}${box}${RESET} is still reopening a session from an earlier switch."
+      echo -e "    ${DIM}Nothing was changed. Run this again in a moment.${RESET}"
+      ;;
+    R19)
+      error "An earlier account switch in ${BOLD}${box}${RESET} is still finishing."
+      echo -e "    ${DIM}Nothing was changed. Run this again in a minute.${RESET}"
+      ;;
+    R20)
+      error "The clock in ${BOLD}${box}${RESET} is behind this computer's clock, so cleat cannot time the switch safely."
+      echo -e "    ${DIM}Nothing was changed. Restart Docker, then run this again.${RESET}"
+      ;;
+    R21)
+      error "The switch in ${BOLD}${box}${RESET} took too long to start."
+      echo -e "    ${DIM}Nothing was changed. Try again in a moment.${RESET}"
+      ;;
+    R22)
+      error "A Claude session is starting in ${BOLD}${box}${RESET} in another terminal."
+      echo -e "    ${DIM}Nothing was changed. Run this again once it is up.${RESET}"
+      ;;
+  esac
+}
+
+# A result line by id. ID BOX X (X is the target for S1/S3, the old pin for Q2).
+_handoff_say_result() {
+  local id="$1" box="$2" x="${3:-}" n="${4:-1}"
+  case "$id" in
+    S1)  success "${BOLD}${box}${RESET} is now on account ${BOLD}${x}${RESET}" ;;
+    S1d) success "${BOLD}${box}${RESET} is back on your shared login ${DIM}(~/.claude)${RESET}" ;;
+    S3)  echo -e "    ${DIM}The session in the other terminal is reopening on $(_handoff_acct_bare "$x").${RESET}" ;;
+    S3m) echo -e "    ${DIM}The ${n} sessions in other terminals are reopening on $(_handoff_acct_bare "$x").${RESET}" ;;
+    S4r) echo -e "    ${DIM}It has no login yet. Run ${BOLD}cleat login${RESET}${DIM} to sign in. It is remembered under this name.${RESET}" ;;
+    Q2)  info "Kept. ${BOLD}${box}${RESET} stays on $(_handoff_acct_phrase "$x")." ;;
+  esac
+}
+
+# A warning after the signal, by id. The targets were stopped, so these are not
+# refusals. ID BOX OLD [ACCT|HELDID].
+_handoff_say_warn() {
+  local id="$1" box="$2" old="${3:-}" extra="${4:-}"
+  case "$id" in
+    W1)
+      warn "A new Claude session started in ${BOLD}${box}${RESET} during the switch, so ${BOLD}${box}${RESET} stays on $(_handoff_acct_phrase "$old")."
+      echo -e "    ${DIM}The session in the other terminal is reopening on $(_handoff_acct_bare "$old").${RESET}"
+      ;;
+    W2)
+      error "cleat could not confirm the new login in ${BOLD}${box}${RESET}, so it stays on $(_handoff_acct_phrase "$old")."
+      echo -e "    ${DIM}The session in the other terminal is reopening on $(_handoff_acct_bare "$old").${RESET}"
+      ;;
+    W3)
+      warn "The switch in ${BOLD}${box}${RESET} did not report back. The new login is in place, so ${BOLD}${box}${RESET} is now on account ${BOLD}${extra}${RESET}."
+      ;;
+    W4)
+      error "The switch in ${BOLD}${box}${RESET} did not report back. ${BOLD}${box}${RESET} stays on $(_handoff_acct_phrase "$old")."
+      ;;
+    W34second)
+      echo -e "    ${DIM}The session in the other terminal did not reopen. Run ${BOLD}cleat resume${RESET}${DIM} there.${RESET}"
+      ;;
+    W5)
+      warn "The login ${BOLD}${old}${RESET} had in ${BOLD}${box}${RESET} could not be saved."
+      echo -e "    ${DIM}It stays in ${box}'s auth folder until the next session there ends. The box can read it until then.${RESET}"
+      ;;
+    W6)
+      warn "${BOLD}${box}${RESET} could not clear account ${BOLD}${old}${RESET}'s name before the restart."
+      echo -e "    ${DIM}The session in the other terminal tries again before it reopens and warns there if that fails too.${RESET}"
+      ;;
+    W7)
+      warn "The switch in ${BOLD}${box}${RESET} ran out of time, so ${BOLD}${box}${RESET} stays on $(_handoff_acct_phrase "$old")."
+      echo -e "    ${DIM}The session in the other terminal is reopening on $(_handoff_acct_bare "$old").${RESET}"
+      ;;
+    W10)
+      warn "Another cleat command took over while ${BOLD}${box}${RESET} was switching."
+      echo -e "    ${DIM}cleat left the switch for the next session start to finish. See where ${box} is with ${BOLD}cleat account list${RESET}${DIM}.${RESET}"
+      ;;
+    W11)
+      warn "The login ${BOLD}${old}${RESET} had in ${BOLD}${box}${RESET} could not be checked, so cleat kept it aside as held login ${BOLD}${extra}${RESET}."
+      echo -e "    ${DIM}See it with ${BOLD}cleat account held${RESET}${DIM}. Bring it back with ${BOLD}cleat account adopt ${extra} ${old}${RESET}${DIM}.${RESET}"
+      ;;
+  esac
+}
+
+# A confirmation line by id, printed once the other terminal has reopened (or
+# not). ID ACCT [N] [C|OLD]. The confirmation wait that drives these lands in a
+# later milestone; the copy lives here now for the golden file and the mockups.
+_handoff_say_confirm() {
+  local id="$1" acct="${2:-}" n="${3:-1}" c="${4:-0}"
+  local bare; bare="$(_handoff_acct_bare "$acct")"
+  case "$id" in
+    C1)  echo -e "    ${DIM}It reopened on ${bare}. Type continue there.${RESET}" ;;
+    C1b) echo -e "    ${DIM}It reopened on ${bare}.${RESET}" ;;
+    C2)  echo -e "    ${DIM}The usage limit lines there are from before the restart. Nothing is scheduled.${RESET}" ;;
+    C2b) echo -e "    ${DIM}The usage limit lines there are from before the restart.${RESET}" ;;
+    C3)  echo -e "    ${DIM}It reopened on ${bare} and is showing a question first. Answer it there before you type anything.${RESET}" ;;
+    C4)  echo -e "    ${DIM}It reopened on ${bare} and started a turn by itself. Check it there before you type.${RESET}" ;;
+    C5)  echo -e "    ${DIM}All ${n} reopened on ${bare}. Type continue in each.${RESET}" ;;
+    C6)  echo -e "    ${DIM}${c} of ${n} reopened on ${bare}. Check the other terminals.${RESET}" ;;
+    C7)  warn "The other terminal has not reopened the session after ${_HANDOFF_CONFIRM_WAIT_S} seconds. Check it there." ;;
+    C8)  echo -e "    ${DIM}The session in the other terminal had already ended. Resume it there with ${BOLD}cleat resume${RESET}${DIM}.${RESET}" ;;
+    C9)  echo -e "    ${DIM}Stopped waiting. Check the other terminal.${RESET}" ;;
+    W6b)
+      warn "The reopened session may still show account ${BOLD}${c}${RESET}'s name."
+      echo -e "    ${DIM}Claude Code may send that account's organization until it is cleared. cleat tries again before the next launch.${RESET}"
+      ;;
+  esac
+}
+
+# ── Live handoff: terminal 2 ────────────────────────────────────────────────
+# _account_handoff ACCT BOX CNAME PROJECT ASSUME_YES NOW: hand a running box's
+# live Claude session over to ACCT by restart and resume. Called by
+# _account_do_switch when the box is up, mounted and has a live agent. Every
+# refusal changes nothing and returns 1 (R15 returns 0). On a landed switch it
+# moves the pin the offline switch's way, leaves a ready ticket the other
+# terminal reopens from and returns 0.
+_account_handoff() {
+  local acct="$1" box="$2" cname="$3" project="$4" assume_yes="${5:-0}" now="${6:-0}"
+  local old key i N execids="" sig_before old2 swrc=0
+  old="$(_box_account_read "$cname")"
+  key="$(_derive_project_session_key "$project" "$box" 2>/dev/null || true)"
+
+  # Row 4: already on the target.
+  if [[ "$acct" == "$old" ]]; then _handoff_say_refusal R15 "$box" "$acct"; return 0; fi
+  # Row 5: a ticket of this box is still reopening.
+  _HO_SID=()
+  if _handoff_tickets_pending "$cname"; then _handoff_say_refusal R18 "$box" "$acct"; return 1; fi
+  # Row 6/7: probe.
+  if ! _handoff_probe "$cname"; then
+    _account_live_refusal "cleat could not tell what the Claude session in ${BOLD}${box}${RESET} is doing."
+    return 1
+  fi
+  # Rows 8a to 22.
+  _HO_NOW_FLAG="$now"; _HANDOFF_DISCLOSED=0
+  _handoff_classify "$cname" "$now" "$project" "$acct"
+  case "$_HO_VERDICT" in
+    R1|R2p|R2q|R7|R22|R6) _handoff_say_refusal "$_HO_VERDICT" "$box" "$acct"; return 1 ;;
+    R3) _handoff_say_refusal R3 "$box" "$acct"; return 1 ;;
+    R4)
+      _account_live_refusal "${BOLD}${box}${RESET} has a Claude session that cleat cannot reopen."
+      echo -e "    ${DIM}Sessions started by hand in cleat shell, by an older cleat, by cleat login or without a terminal are not restarted for you.${RESET}"
+      return 1 ;;
+    R5)
+      _account_live_refusal "cleat could not tell what the Claude session in ${BOLD}${box}${RESET} is doing."
+      return 1 ;;
+    ok|quiet) : ;;
+    *) _account_live_refusal "cleat could not tell what the Claude session in ${BOLD}${box}${RESET} is doing."; return 1 ;;
+  esac
+  N="$_HO_N"
+  sig_before="$(_handoff_probe_signature)"
+
+  # Disclose what is lost, then ask. Both before anything changes (row 23 to 25).
+  if [[ $N -ge 1 ]]; then
+    _handoff_say_disclosure "$box" "$acct"
+    if [[ "$assume_yes" != 1 ]]; then
+      if ! _is_interactive; then
+        if [[ $N -ge 2 ]]; then
+          echo -e "    ${DIM}Nothing was changed. Re-run with ${BOLD}--yes${RESET}${DIM} to hand them over without a question.${RESET}"
+        else
+          echo -e "    ${DIM}Nothing was changed. Re-run with ${BOLD}--yes${RESET}${DIM} to hand it over without a question.${RESET}"
+        fi
+        return 1
+      fi
+      local _ans=""
+      _ask_yn _ans "$(_handoff_question_prompt "$N" "$now")"
+      if ! _handoff_yn_yes "$_ans" "$now"; then _handoff_say_result Q2 "$box" "$old"; return 0; fi
+    fi
+  fi
+
+  # From here every wait is bounded, so a Ctrl-C is ignored rather than left to
+  # abandon a half-finished switch with the box's Claude already stopped.
+  #
+  # DEVIATION from the v2 design (handover section 13, which replaced this with a
+  # flag trap): an ignored INT is inherited by children and makes a BLOCKING read
+  # unkillable. That is safe here only because this critical section takes no
+  # unbounded blocking read: every credential and transcript read under this trap
+  # is guarded by `[[ -f && ! -L ]]` (a FIFO swapped in at a staged path fails
+  # `-f` and is skipped, never blocked on) or is SECONDS-bounded, and the one
+  # docker call runs under _handoff_docker_exec's own timeout. INVARIANT: do not
+  # add any unbounded, non-`-f`-guarded read (a bare `read`, `cat` of a path that
+  # could be a FIFO, or a `<` redirect from one) between here and the matching
+  # `trap - INT`, or a Ctrl-C could wedge the switch. If one is ever needed,
+  # restore the section-13 flag trap (`trap '_HO_INT=1' INT HUP TERM`) instead.
+  trap '' INT
+
+  local rc_lock=0
+  _account_lock || rc_lock=$?
+  if [[ $rc_lock -ne 0 ]]; then trap - INT; _account_busy_msg; return 1; fi
+
+  # Row 28: re-read the pin, so a switch that landed while the question was open
+  # is never overwritten. Then re-check for a reopen already in flight.
+  old2="$(_box_account_read "$cname")"
+  if [[ "$old2" != "$old" ]]; then _account_unlock; trap - INT; _handoff_say_refusal R9 "$box" "$acct"; return 1; fi
+  if _handoff_tickets_pending "$cname"; then _account_unlock; trap - INT; _handoff_say_refusal R18 "$box" "$acct"; return 1; fi
+
+  # Rows 29 to 30: re-probe under the lock and prove the sessions are unchanged.
+  if ! _handoff_probe "$cname"; then _account_unlock; trap - INT; _handoff_say_refusal R5 "$box" "$acct"; return 1; fi
+  _handoff_classify "$cname" "$now" "$project" "$acct"
+  if [[ "$_HO_VERDICT" != ok && "$_HO_VERDICT" != quiet ]] || [[ "$(_handoff_probe_signature)" != "$sig_before" ]]; then
+    _account_unlock; trap - INT; _handoff_say_refusal R9 "$box" "$acct"; return 1
+  fi
+  N="$_HO_N"
+
+  # 4.3 row 19, under the lock and BEFORE the terminate exec: a cleat shell open
+  # in another terminal during a move between the shared login and a named
+  # account. A claude typed in that shell keeps the login the shell opened with,
+  # so a restart would leave the box half switched. Refuse here rather than stop
+  # the live session first and hit the same check inside _account_switch_locked
+  # only after the terminate. classify cannot see this: its marker check reads
+  # kind=claude markers, and a cleat shell marker is kind=shell.
+  if { { [[ "$old" == "$_ACCOUNT_DEFAULT" ]] && [[ "$acct" != "$_ACCOUNT_DEFAULT" ]]; } \
+       || { [[ "$old" != "$_ACCOUNT_DEFAULT" ]] && [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; }; } \
+     && _handoff_shell_open "$cname"; then
+    _account_unlock; trap - INT; _handoff_say R-shell-open "$box"; return 1
+  fi
+
+  # A quiet box (a live non-claude process only): no session to stop, so the
+  # offline switch body does the whole move.
+  if [[ $N -eq 0 ]]; then
+    _account_unlock
+    trap - INT
+    _HANDOFF_SWITCH_EXECIDS=""
+    _account_switch_locked "$acct" "$box" "$cname" "$project" || return 1
+    _account_switch_meta "$acct" "$box" "$cname" "$project" "$_SWITCH_CURRENT"
+    _account_switch_identity "$acct" "$box" "$cname" "$project" "$_SWITCH_CURRENT"
+    if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then _handoff_say_result S1d "$box"; else _handoff_say_result S1 "$box" "$acct"; fi
+    return 0
+  fi
+
+  # Rows 32 to 34: write a requested ticket per target BEFORE the signalling
+  # exec, so the other terminal reads "switching" and never relaunches on the
+  # login this switch is about to replace. Then confirm the lock is still ours.
+  _handoff_tickets_sweep "$cname"
+  i=0; while [[ $i -lt $N ]]; do
+    _handoff_ticket_write "$cname" "${_HO_EXEC[$i]}" requested "${_HO_SID[$i]}" "$acct" || true
+    execids="$execids ${_HO_EXEC[$i]}"
+    i=$(( i + 1 ))
+  done
+  if ! _account_lock_owned; then
+    _handoff_tickets_remove "$cname" $execids
+    _account_unlock; trap - INT; _handoff_say_warn W10 "$box"; return 1
+  fi
+
+  # Row 35: stop the box's session. The single docker call the lock permits.
+  local store=default; [[ "$old" != "$_ACCOUNT_DEFAULT" ]] && store=named
+  local termout; termout="$(mktemp "${TMPDIR:-/tmp}/cleat-hterm.XXXXXX" 2>/dev/null)" || {
+    _handoff_tickets_remove "$cname" $execids; _account_unlock; trap - INT
+    _handoff_say_refusal R5 "$box" "$acct"; return 1; }
+  local targv=() trc=0
+  i=0; while [[ $i -lt $N ]]; do
+    targv+=( "${_HO_PID[$i]}" "${_HO_PS[$i]}" "${_HO_SID[$i]}" "${_HO_EXEC[$i]}" "${_HO_EXPECT[$i]}" )
+    i=$(( i + 1 ))
+  done
+  _handoff_docker_exec "$cname" "$_HANDOFF_EXEC_TIMEOUT_S" "$termout" \
+    terminate /home/coder /proc "$store" "$_HB_LOCK_WAIT_S" "$_HB_KILL_WAIT_S" "$N" "${targv[@]}" || trc=$?
+
+  # An age-bound steal could have handed the lock to another command during a
+  # slow exec, so re-confirm before any write.
+  if ! _account_lock_owned; then
+    rm -f "$termout" 2>/dev/null || true
+    _handoff_tickets_remove "$cname" $execids
+    _account_unlock; trap - INT; _handoff_say_warn W10 "$box"; return 1
+  fi
+  local perc=0
+  _parse_terminate "$termout" || perc=$?
+  rm -f "$termout" 2>/dev/null || true
+
+  # A failed, timed-out or garbled exec staged nothing, so the box stays on old.
+  if [[ $trc -ne 0 || $perc -ne 0 ]]; then
+    _handoff_tickets_remove "$cname" $execids
+    _account_unlock; trap - INT
+    _handoff_say_warn W4 "$box" "$old"; _handoff_say_warn W34second "$box"
+    return 1
+  fi
+  case "$_PT_ARGS" in bad) _handoff_tickets_remove "$cname" $execids; _account_unlock; trap - INT; _handoff_say_refusal R5 "$box" "$acct"; return 1 ;; esac
+  case "$_PT_LOCK" in timeout) _handoff_tickets_remove "$cname" $execids; _account_unlock; trap - INT; _handoff_say_refusal R11 "$box"; return 1 ;; esac
+  case "$_PT_RECHECK" in changed) _handoff_tickets_remove "$cname" $execids; _account_unlock; trap - INT; _handoff_say_refusal R9 "$box" "$acct"; return 1 ;; esac
+  # A survivor: nothing was stopped for it, so the pin never moves. Every exited
+  # target and the survivor itself get a ready ticket for the old login (4.4 row
+  # 27), so each reopens there, the survivor once it finally stops within the
+  # ticket age bound.
+  if [[ "$_PT_ANY_ALIVE" == 1 ]]; then
+    _handoff_write_ready "$cname" "$old"
+    _account_unlock; trap - INT
+    _handoff_say_refusal R12 "$box" "$old"
+    return 1
+  fi
+  if [[ "$_PT_SCAN" == changed ]]; then
+    _handoff_write_ready "$cname" "$old"
+    _account_unlock; trap - INT
+    _handoff_say_warn W1 "$box" "$old"
+    return 1
+  fi
+  if [[ "$_PT_END" != ok ]]; then
+    _handoff_tickets_remove "$cname" $execids
+    _account_unlock; trap - INT
+    _handoff_say_warn W4 "$box" "$old"; _handoff_say_warn W34second "$box"
+    return 1
+  fi
+
+  # Every target stopped cleanly: move the login the offline switch's way, with
+  # this run's exec ids passed so its starting-marker guard skips our own live
+  # attach markers.
+  _HANDOFF_SWITCH_EXECIDS="$execids"
+  _account_switch_locked "$acct" "$box" "$cname" "$project" || swrc=$?
+  _HANDOFF_SWITCH_EXECIDS=""
+  if [[ $swrc -ne 0 ]]; then
+    _handoff_write_ready "$cname" "$old"
+    _account_unlock; trap - INT
+    return 1
+  fi
+  if ! _account_lock_owned; then _account_unlock; trap - INT; _handoff_say_warn W10 "$box"; return 1; fi
+  _account_switch_identity "$acct" "$box" "$cname" "$project" "$_SWITCH_CURRENT"
+  local _id_rc=$_SWITCH_ID_RC
+
+  # Host-verify the staged login, settle, verify again. A revert rolls back.
+  if ! _handoff_verify_staged "$cname" "$acct"; then
+    _handoff_settle_pause
+    if ! _handoff_verify_staged "$cname" "$acct"; then
+      _account_release_staged_locked "$cname" 2>/dev/null || true
+      if [[ "$old" == "$_ACCOUNT_DEFAULT" ]]; then _box_account_remove "$cname"; else _box_account_write "$cname" "$old" "$key" || true; fi
+      _handoff_write_ready "$cname" "$old"
+      _account_unlock; trap - INT
+      _handoff_say_warn W2 "$box" "$old"
+      return 1
+    fi
+  fi
+
+  # Ready tickets, written AFTER the pin moved and BEFORE the meta capture: only
+  # the sessions that exited reopen. They reopen on the new login.
+  _handoff_write_ready "$cname" "$acct"
+  _account_unlock
+  trap - INT
+
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    _handoff_say_result S1d "$box"
+  else
+    _handoff_say_result S1 "$box" "$acct"
+    local who=""
+    if [[ "$_SWITCH_FRESH" == 1 || "$(_account_auth_state "$acct")" == "signed out" ]]; then
+      _handoff_say_result S4r "$box"
+    else
+      who="$(_account_meta_get "$acct" who 2>/dev/null || true)"
+      [[ -n "$who" ]] && echo -e "    ${DIM}$(_sessions_safe_title "$who")${RESET}"
+    fi
+  fi
+  [[ $_id_rc -eq 3 ]] && _handoff_say_warn W6 "$box" "$old"
+  if [[ $N -ge 2 ]]; then _handoff_say_result S3m "$box" "$acct" "$N"; else _handoff_say_result S3 "$box" "$acct"; fi
+
+  _account_capture_meta "$acct" || true
+  [[ "$old" != "$_ACCOUNT_DEFAULT" ]] && { _account_usage_fetch "$old" >/dev/null 2>&1 || true; }
+  return 0
+}
+
 _account_live_refusal() {
   error "$1"
   echo -e "    ${DIM}Exit it first. Claude Code only takes a login change in full when it starts.${RESET}"
 }
 
-_account_do_switch() {
-  local acct="$1" box="$2" cname="$3" project="$4" current ready=0
+# Set by the three phase functions below for the steps the gate runs after the
+# lock is dropped: the account left (empty on the shared branch), whether the
+# target store was created here, and the identity-drop return (3 means a live
+# Claude was left to finish the drop itself).
+_SWITCH_CURRENT=""
+_SWITCH_FRESH=0
+_SWITCH_ID_RC=0
+
+# The file operations of a switch, run as one hold of the account lock. It is
+# the seam the live switch reuses: after it has stopped the box's Claude
+# session, the handoff stages the new login through this same body. It harvests
+# whatever the box refreshed for the account it is leaving, then either moves
+# the pin and stages the incoming login (named) or unpins and drops the staged
+# file (shared login). Prints its own error and returns 1 on any failure, having
+# released the lock. On success it sets _SWITCH_CURRENT (the account left, empty
+# for the shared branch) and _SWITCH_FRESH (1 when the target store was created
+# here). Nothing that reads the network, a project file or docker runs here: the
+# gate does that after the unlock.
+_account_switch_locked() {
+  local acct="$1" box="$2" cname="$3" project="$4" current fresh=0 stage_mode=""
+  _SWITCH_CURRENT=""
+  _SWITCH_FRESH=0
+  # From the pin read to the staging is one hold of the account lock. An attach
+  # or a session end in another terminal waits for it and then reads the pin
+  # again, instead of staging or harvesting against the account this switch is
+  # leaving. Every error return below releases it first.
+  if ! _account_lock; then
+    _account_busy_msg
+    return 1
+  fi
+  # 4.3 rows 18 and 19, under this lock. A session coming up in another terminal
+  # (R-starting) or a cleat shell open across a move between the shared login and
+  # an account (R-shell-open) would each take only part of the login change, so
+  # the switch refuses and changes nothing. The live handoff runs these ahead of
+  # its terminate exec too; here they guard the offline switch, which has no
+  # probe records, so any live claude marker counts as starting.
+  # _HANDOFF_SWITCH_EXECIDS is empty offline and holds the live path's probe ids.
+  current="$(_box_account_read "$cname")"
+  if [[ -n "$(_handoff_starting_markers "$cname" ${_HANDOFF_SWITCH_EXECIDS:-})" ]]; then
+    _account_unlock
+    _handoff_say R-starting "$box"
+    return 1
+  fi
+  if { { [[ "$current" == "$_ACCOUNT_DEFAULT" ]] && [[ "$acct" != "$_ACCOUNT_DEFAULT" ]]; } \
+       || { [[ "$current" != "$_ACCOUNT_DEFAULT" ]] && [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; }; } \
+     && _handoff_shell_open "$cname"; then
+    _account_unlock
+    _handoff_say R-shell-open "$box"
+    return 1
+  fi
+  # H9: flag the box's identity stale BEFORE the pin moves, so a relaunch that
+  # reads the new pin can never read the old account name. Batch 11 clears the
+  # flag once identity is rebuilt (or _account_switch_identity does, after a
+  # drop that returns 0). A live drop returns 3 and leaves the flag for the box.
+  _handoff_flag_identity_stale "$project" "$box"
   if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
-    # The same live gate the named switches get, and a harder reason: a running
-    # session reads the box store, which the unpin empties, so it is signed out.
-    if _daemon_up && container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
-      _account_live_refusal "${BOLD}${box}${RESET} has a live Claude session."
-      return 1
-    fi
-    # The harvest, the unpin and the delete are one hold of the account lock.
-    # The identity drop edits a file a running box binds, so it comes after.
-    if ! _account_lock; then
-      _account_busy_msg
-      return 1
-    fi
     # The unpin deletes the staged file, so whatever the harvest does not take
     # is held first, and a login that cannot be kept stops the switch.
     if ! _account_release_staged_locked "$cname"; then
@@ -17524,8 +19806,127 @@ _account_do_switch() {
     _box_account_remove "$cname"
     rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true
     _account_unlock
-    local _id_rc=0
+    return 0
+  fi
+  current="$(_box_account_read "$cname")"
+  _SWITCH_CURRENT="$current"
+  # Harvest whatever the box refreshed for the account it is leaving, BEFORE
+  # anything is repointed. Skipping this loses every refresh since the switch in.
+  # When the pin moves, the account's keys in the staged file are replaced below,
+  # so whatever the harvest does not take is held first (a login made in the box
+  # as someone else, a failed store write, or a login staged in a box that was
+  # never pinned). A login that cannot be kept stops the switch before anything
+  # moves. Nothing but a mkdir runs between this and the pin write, so it is the
+  # last harvest before the rename. The plan and usage reads come after the
+  # unlock.
+  if [[ "$current" == "$acct" ]]; then
+    _account_sync_out_locked "$cname" || true
+  elif ! _account_release_staged_locked "$cname"; then
+    _account_unlock
+    error "Could not keep the login ${BOLD}${box}${RESET} holds."
+    echo -e "    ${DIM}Nothing was switched. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+    return 1
+  fi
+
+  # Whenever the pin actually moves, the incoming account always wins. Only its
+  # keys are replaced, by one rename, so the box's own MCP logins stay and there
+  # is never a moment with no credential file. See _account_sync_in_locked. The
+  # staging this replaced removed the staged file first: that erased the box's
+  # MCP logins and left about 25 ms in which a Claude the live gate missed read
+  # "Not logged in".
+  if [[ "$current" != "$acct" ]]; then
+    stage_mode=force
+  fi
+  if ! _account_exists "$acct"; then
+    _account_ensure_dir "$acct" || { _account_unlock; error "Could not create the account store."; return 1; }
+    fresh=1
+  fi
+  _SWITCH_FRESH=$fresh
+  _box_account_write "$cname" "$acct" "$(_derive_project_session_key "$project" "$box")" \
+    || { _account_unlock; error "Could not pin the account to this box."; return 1; }
+  if ! _account_sync_in_locked "$cname" "$stage_mode"; then
+    # Nothing was removed, so the staged file still holds the login of the
+    # account being left. The pin goes back with it, or the next detach
+    # harvests that login INTO the account this switch was going to.
+    if [[ "$current" == "$_ACCOUNT_DEFAULT" ]]; then
+      _box_account_remove "$cname"
+    else
+      _box_account_write "$cname" "$current" "$(_derive_project_session_key "$project" "$box")" || true
+    fi
+    _account_unlock
+    # Re-selecting the account a box is already on stages over a login the
+    # store does not have only once it is held.
+    if [[ $_ACCOUNT_STAGE_UNKEPT -eq 1 ]]; then
+      error "Could not keep the login ${BOLD}${box}${RESET} holds."
+      echo -e "    ${DIM}Nothing was switched. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+    else
+      error "Could not stage the credential for this box."
+    fi
+    return 1
+  fi
+  _account_unlock
+  return 0
+}
+
+# The plan and last_used for both accounts, plus the outgoing account's usage.
+# Runs AFTER the unlock: it reads the network and the usage poll in particular
+# can take three seconds. Sitting between the harvest and the staging, it left a
+# window where a refresh the box saved was deleted without being harvested.
+# Neither capture reads the box's project file: a file the box writes cannot say
+# whose login it is, so it once named a brand-new account with the maintainer's
+# primary email (found on a real Mac, 2026-09-12) and stamped each incoming
+# account with the previous login's. Who an account is comes only from a harvest
+# the server vouched for.
+_account_switch_meta() {
+  local acct="$1" box="$2" cname="$3" project="$4" current="$5"
+  _account_capture_meta "$current" || true
+  _account_capture_meta "$acct" || true
+  if [[ "$current" != "$_ACCOUNT_DEFAULT" ]]; then
+    _account_usage_fetch "$current" >/dev/null 2>&1 || true
+  fi
+}
+
+# Drop the account name the box is carrying in its per-project claude.json, so
+# the box rebuilds identity for the account just pinned. The start rebuild does
+# not reach a running box and the attached heal cannot fix identity, so the
+# switch does it itself. Runs after the unlock: it edits a file a running box
+# binds. Sets _SWITCH_ID_RC to 3 when a Claude was live and the drop was left
+# for the box to finish, else 0.
+_account_switch_identity() {
+  local acct="$1" box="$2" cname="$3" project="$4" current="$5"
+  local _id_rc=0
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    # This branch always invalidates: the unpin empties the box store, so the
+    # name it shows has to be dropped whatever it was.
     _account_invalidate_identity "$project" "$box" "$cname" || _id_rc=$?
+    _SWITCH_ID_RC=$_id_rc
+    return 0
+  fi
+  [[ "$current" != "$acct" ]] && { _account_invalidate_identity "$project" "$box" "$cname" || _id_rc=$?; }
+  _SWITCH_ID_RC=$_id_rc
+}
+
+_account_do_switch() {
+  local acct="$1" box="$2" cname="$3" project="$4" assume_yes="${5:-0}" now="${6:-0}"
+  if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
+    # A running box with the account mount and a live session is handed over by
+    # restart and resume (_account_handoff), which stops the session, unpins,
+    # then leaves the other terminal to reopen. Without the mount the switch
+    # cannot take effect, so a live session there is refused as before: a bare
+    # unpin would empty the box store and sign the running session out.
+    if _daemon_up && container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
+      if _account_box_ready "$cname"; then
+        _account_handoff "$acct" "$box" "$cname" "$project" "$assume_yes" "$now"
+        return $?
+      fi
+      _account_live_refusal "${BOLD}${box}${RESET} has a live Claude session."
+      return 1
+    fi
+    # The harvest, the unpin and the delete are one hold of the account lock.
+    # The identity drop edits a file a running box binds, so it comes after.
+    _account_switch_locked "$acct" "$box" "$cname" "$project" || return 1
+    _account_switch_identity "$acct" "$box" "$cname" "$project" "$_SWITCH_CURRENT"
+    local _id_rc=$_SWITCH_ID_RC
     success "${BOLD}${box}${RESET} is back on your shared login ${DIM}(~/.claude)${RESET}"
     if [[ $_id_rc -eq 3 ]]; then
       # This branch always invalidates, so running it again finishes the job.
@@ -17556,95 +19957,29 @@ _account_do_switch() {
   # without is_running every stopped box read as live. That is the normal
   # steady state: the idle sweep stops boxes by itself. The session gate has
   # carried is_running since the day it was written.
+  #
+  # A running box WITH the account mount is not refused: it is handed over by
+  # restart and resume. _account_handoff stops the session in the box, moves the
+  # login this same body would, and leaves the other terminal to reopen it.
+  # Without the mount a live session is still refused (the pin cannot take
+  # effect until a recreate anyway).
   if _daemon_up && container_exists "$cname" && is_running "$cname" && _box_has_live_agent "$cname"; then
+    if _account_box_ready "$cname"; then
+      _account_handoff "$acct" "$box" "$cname" "$project" "$assume_yes" "$now"
+      return $?
+    fi
     _account_live_refusal "${BOLD}${box}${RESET} has a live Claude session."
     return 1
   fi
 
-  # From the pin read to the staging is one hold of the account lock. An attach
-  # or a session end in another terminal waits for it and then reads the pin
-  # again, instead of staging or harvesting against the account this switch is
-  # leaving. Every error return below releases it first.
-  if ! _account_lock; then
-    _account_busy_msg
-    return 1
-  fi
-  current="$(_box_account_read "$cname")"
-  # Harvest whatever the box refreshed for the account it is leaving, BEFORE
-  # anything is repointed. Skipping this loses every refresh since the switch in.
-  # When the pin moves, the account's keys in the staged file are replaced below,
-  # so whatever the harvest does not take is held first (a login made in the box
-  # as someone else, a failed store write, or a login staged in a box that was
-  # never pinned). A login that cannot be kept stops the switch before anything
-  # moves. Nothing but a mkdir runs between this and the pin write, so it is the
-  # last harvest before the rename. The plan and usage reads come after the
-  # unlock.
-  if [[ "$current" == "$acct" ]]; then
-    _account_sync_out_locked "$cname" || true
-  elif ! _account_release_staged_locked "$cname"; then
-    _account_unlock
-    error "Could not keep the login ${BOLD}${box}${RESET} holds."
-    echo -e "    ${DIM}Nothing was switched. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
-    return 1
-  fi
-
-  # Whenever the pin actually moves, the incoming account always wins. Only its
-  # keys are replaced, by one rename, so the box's own MCP logins stay and there
-  # is never a moment with no credential file. See _account_sync_in_locked. The
-  # staging this replaced removed the staged file first: that erased the box's
-  # MCP logins and left about 25 ms in which a Claude the live gate missed read
-  # "Not logged in".
-  local fresh=0 stage_mode=""
-  if [[ "$current" != "$acct" ]]; then
-    stage_mode=force
-  fi
-  if ! _account_exists "$acct"; then
-    _account_ensure_dir "$acct" || { _account_unlock; error "Could not create the account store."; return 1; }
-    fresh=1
-  fi
-  _box_account_write "$cname" "$acct" "$(_derive_project_session_key "$project" "$box")" \
-    || { _account_unlock; error "Could not pin the account to this box."; return 1; }
-  if ! _account_sync_in_locked "$cname" "$stage_mode"; then
-    # Nothing was removed, so the staged file still holds the login of the
-    # account being left. The pin goes back with it, or the next detach
-    # harvests that login INTO the account this switch was going to.
-    if [[ "$current" == "$_ACCOUNT_DEFAULT" ]]; then
-      _box_account_remove "$cname"
-    else
-      _box_account_write "$cname" "$current" "$(_derive_project_session_key "$project" "$box")" || true
-    fi
-    _account_unlock
-    # Re-selecting the account a box is already on stages over a login the
-    # store does not have only once it is held.
-    if [[ $_ACCOUNT_STAGE_UNKEPT -eq 1 ]]; then
-      error "Could not keep the login ${BOLD}${box}${RESET} holds."
-      echo -e "    ${DIM}Nothing was switched. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
-    else
-      error "Could not stage the credential for this box."
-    fi
-    return 1
-  fi
-  _account_unlock
-
-  # Everything below reads the network, a project file a running box binds, or
-  # docker, so none of it runs under the lock. The usage poll in particular can
-  # take three seconds. Sitting between the harvest and the staging, it left a
-  # window where a refresh the box saved was deleted without being harvested.
-  # The plan and last_used for both accounts. Neither capture reads the box's
-  # project file: a file the box writes cannot say whose login it is, so it once
-  # named a brand-new account with the maintainer's primary email (found on a
-  # real Mac, 2026-09-12) and stamped each incoming account with the previous
-  # login's. Who an account is comes only from a harvest the server vouched for.
-  _account_capture_meta "$current" || true
-  _account_capture_meta "$acct" || true
-  if [[ "$current" != "$_ACCOUNT_DEFAULT" ]]; then
-    _account_usage_fetch "$current" >/dev/null 2>&1 || true
-  fi
-  # The pin has moved, so whatever name the box is carrying is now the wrong
-  # one. See _account_invalidate_identity: the start rebuild does not reach a
-  # running box and the attached heal cannot fix identity.
-  local _id_rc=0
-  [[ "$current" != "$acct" ]] && { _account_invalidate_identity "$project" "$box" "$cname" || _id_rc=$?; }
+  # One hold of the account lock from the pin read through the staging, then the
+  # network reads (meta and usage) and the identity drop, both after the unlock.
+  # See _account_switch_locked, _account_switch_meta and _account_switch_identity.
+  _account_switch_locked "$acct" "$box" "$cname" "$project" || return 1
+  local current="$_SWITCH_CURRENT" fresh="$_SWITCH_FRESH" ready=0
+  _account_switch_meta "$acct" "$box" "$cname" "$project" "$current"
+  _account_switch_identity "$acct" "$box" "$cname" "$project" "$current"
+  local _id_rc=$_SWITCH_ID_RC
 
   # The pin is DELIBERATELY left in place on this refusal. It has to outlive
   # `cleat rm`, which is exactly the remedy printed below, and the attach path
@@ -17736,6 +20071,19 @@ _account_do_remove() {
   _account_remove_live_gate "$acct" || return 1
   pinned="$(_account_pinned_boxes "$acct")"
   [[ -n "$pinned" ]] && live=1
+
+  # A box mid-handoff still has a ticket its own terminal will consume to reopen
+  # the conversation on this account. Removing the account now would unpin it out
+  # from under that reopen, so refuse while any pinned box is still reopening. rm
+  # has no probe, so a ready ticket with a live marker counts as pending whatever
+  # its sid (5.2). Changes nothing.
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    if _handoff_tickets_pending "$b"; then
+      _handoff_say R-reopening "$b"
+      return 1
+    fi
+  done <<< "$pinned"
 
   warn "This removes the login stored as ${BOLD}${acct}${RESET}"
   local who
@@ -18401,7 +20749,7 @@ _accounts_action_tui() {
         printf '\033[2K'
         echo ""
         case "$cursor" in
-          0) _account_do_switch "$acct" "$box" "$cname" "$project" || true ;;
+          0) _account_do_switch "$acct" "$box" "$cname" "$project" 0 0 || true ;;
           1|2)
             if [[ "$acct" == "$_ACCOUNT_DEFAULT" ]]; then
               info "Your shared login is not a stored account, so there is nothing to rename or remove."
@@ -18790,11 +21138,14 @@ _accounts_refresh_usage() {
 # house rule: _set_box takes exactly one positional and validates it as a box
 # name, so handing it anything else fails with a confusing message.
 cmd_account() {
-  local sub="switch" name="" newname="" assume_yes=0
+  local sub="switch" name="" newname="" assume_yes=0 now=0
   case "${1:-}" in
     --help|-h)
       echo "Usage: cleat account                    Interactive picker for this project's default box"
       echo "       cleat account <name> [box]       Pin a box to a named login, creating it if new"
+      echo "                                        A live session in that box restarts on it and reopens its conversation"
+      echo "       cleat account <name> --yes       Restart a live session without asking (anything typed there but not sent is lost)"
+      echo "       cleat account <name> --now       Restart it even mid-turn or at a question (its reply so far is lost)"
       echo "       cleat account default [box]      Unpin a box, back to your shared ~/.claude login"
       echo "       cleat account list [box]         Plain list, marking the pinned one"
       echo "       cleat account rename <old> <new> Rename a stored login"
@@ -18817,13 +21168,20 @@ cmd_account() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes|-y) assume_yes=1; shift ;;
+      --now) now=1; shift ;;
       -*)
         error "Unknown flag: ${BOLD}${1}${RESET}"
-        echo -e "    ${DIM}cleat account takes --yes.${RESET}"
+        echo -e "    ${DIM}cleat account takes --yes and --now.${RESET}"
         return 1 ;;
       *) rest=("${rest[@]+"${rest[@]}"}" "$1"); shift ;;
     esac
   done
+
+  # --now restarts a live session mid-turn. It only means anything for a switch.
+  if [[ $now -eq 1 && "$sub" != "switch" ]]; then
+    error "--now only applies when switching a box."
+    return 1
+  fi
 
   case "$sub" in
     rename)
@@ -18893,7 +21251,7 @@ cmd_account() {
   esac
 
   if [[ -n "$name" ]]; then
-    _account_do_switch "$name" "$_BOX" "$cname" "$project"
+    _account_do_switch "$name" "$_BOX" "$cname" "$project" "$assume_yes" "$now"
     return $?
   fi
 

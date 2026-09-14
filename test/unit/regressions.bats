@@ -16,6 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 load "../setup"
+load "../lib/handoff_helpers"
 
 setup() {
   _common_setup
@@ -41,6 +42,7 @@ teardown() {
   rm -rf $CLEAT_RUN_DIR/cleat-project-*/settings 2>/dev/null || true
   rm -rf $CLEAT_RUN_DIR/cleat-project-*/hooks 2>/dev/null || true
   rm -rf $CLEAT_RUN_DIR/cleat-project-*/clip 2>/dev/null || true
+  hb_teardown_pids 2>/dev/null || true
   _common_teardown
 }
 
@@ -6189,4 +6191,159 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   assert_success
   run cat "$TEST_TEMP/order"
   assert_output "$(printf 'restore\nharvest')"
+}
+
+# vnext: the live account switch holds Claude's OWN refresh lock across the
+# SIGTERM, so no token refresh of the outgoing store can start (and be lost to
+# Claude's 2000 ms shutdown cap) during the stop. The fake Claude records, at
+# the instant it takes the signal, whether the lock dir was held. See concept/44.
+@test "regression vnext: a handoff holds the outgoing refresh lock across the signal" {
+  hb_require_linux
+  hb_reset_pids
+  local BH="$TEST_TEMP/box" PV="$TEST_TEMP/pv"
+  mkdir -p "$BH/.claude/sessions" "$PV"
+  local SID="d7b73579-1111-2222-3333-444455556666" EXECID="deadbeef1234cafe"
+  local lockrec="$TEST_TEMP/lockrec"
+  HB_LOCK="$BH/.claude/.oauth_refresh.lock" HB_LOCKREC="$lockrec" \
+    hb_spawn_claude exits "$SID" "$EXECID" idle
+  local t1="$HB_PID" r1="$HB_RS"
+  hb_proc_view "$PV"
+  run hb_run_box terminate "$BH" "$PV" default 8 8 1 "$t1" "$r1" "$SID" "$EXECID" idle
+  assert_success
+  assert_line "end	ok"
+  assert_equal "$(cat "$lockrec" 2>/dev/null)" "yes"
+}
+
+# vnext: a Claude that starts AFTER the kill (a background command's session, a
+# hand-started one) must abort the switch at the final scan, never be staged
+# over. The fake Claude's SIGTERM trap starts a fresh marked claude; the verb's
+# final scan under the lock must see it and abort. See concept/44.
+@test "regression vnext: a handoff never stages over a Claude that started after the kill" {
+  hb_require_linux
+  hb_reset_pids
+  local BH="$TEST_TEMP/box" PV="$TEST_TEMP/pv"
+  mkdir -p "$BH/.claude/sessions" "$PV"
+  local SID="d7b73579-1111-2222-3333-444455556666" EXECID="deadbeef1234cafe"
+  HB_PROC_VIEW="$PV" hb_spawn_claude spawns "$SID" "$EXECID" idle
+  local t1="$HB_PID" r1="$HB_RS"
+  hb_proc_view "$PV"
+  run hb_run_box terminate "$BH" "$PV" default 8 8 1 "$t1" "$r1" "$SID" "$EXECID" idle
+  assert_success
+  assert_line "pid	$t1 exited"
+  assert_line "scan	changed"
+  assert_line "end	abort"
+  refute_line "end	ok"
+}
+
+@test "regression vnext: every attach and shell waits for the account lock before it reads the pin" {
+  # attack 1.1, the default-pin gap: a box on the shared login read its pin with
+  # NO lock, so an attach or a shell racing a shared-to-named switch read the old
+  # pin after the switch had checked its markers but before it moved the pin, and
+  # ran on the shared login while the switch staged the named one. The fix is one
+  # account-lock take-and-release (_account_attach_gate) before the pin read in
+  # both exec_claude and cmd_shell. This proves the gate's lock op runs before the
+  # pin is ever read; _account_settle itself waits the lock out (test 67 proves
+  # the busy path). Instrument the two functions and check the order.
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work"; chmod 700 "$CLEAT_ACCOUNTS_DIR/work"
+  printf '{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1789003600000,"subscriptionType":"max"}}\n' > "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  chmod 600 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  _host_clip_cmd() { echo ""; }
+  _host_open_cmd() { echo ""; }
+
+  eval "$(declare -f _account_settle | sed '1s/_account_settle/_orig_settle/')"
+  _account_settle() { echo "settle" >> "$TEST_TEMP/order"; _orig_settle "$@"; }
+  eval "$(declare -f _box_account_read | sed '1s/_box_account_read/_orig_bar/')"
+  _box_account_read() { echo "read:$1" >> "$TEST_TEMP/order"; _orig_bar "$@"; }
+
+  _order_gate_first() {   # FILE CNAME: the first settle precedes the first pin read
+    local f="$1" cn="$2" s r
+    s="$(grep -n '^settle$' "$f" | head -1 | cut -d: -f1)"
+    r="$(grep -n "^read:${cn}$" "$f" | head -1 | cut -d: -f1)"
+    [ -n "$s" ] || { echo "the gate never took the account lock"; return 1; }
+    [ -n "$r" ] || { echo "the pin was never read"; return 1; }
+    [ "$s" -lt "$r" ] || { echo "the pin was read (line $r) before the gate (line $s)"; return 1; }
+  }
+
+  # exec_claude
+  local ecn="cleat-race-ec"
+  mkdir -p "$CLEAT_RUN_DIR/$ecn"
+  printf '%s\n' "work" > "$CLEAT_BOX_ACCOUNTS_DIR/$ecn"
+  : > "$TEST_TEMP/order"
+  run exec_claude "$ecn" --dangerously-skip-permissions
+  _order_gate_first "$TEST_TEMP/order" "$ecn" || fail "exec_claude read the pin before the account gate"
+
+  # cmd_shell
+  mkdir -p "$TEST_TEMP/project"
+  local scn; scn="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$scn"
+  printf '%s\n' "work" > "$CLEAT_BOX_ACCOUNTS_DIR/$scn"
+  : > "$TEST_TEMP/order"
+  run cmd_shell "$TEST_TEMP/project"
+  _order_gate_first "$TEST_TEMP/order" "$scn" || fail "cmd_shell read the pin before the account gate"
+}
+
+# vnext: a live account switch relaunches with `--resume <sid>`, NEVER
+# `--continue`. Right after the SIGTERM the reopening conversation is the newest
+# transcript, so --continue would open a sibling session and two processes would
+# append to one file (x3 c3). See concept/44 5.6.
+_rl_exec_fixture() {
+  cat > "$TEST_TEMP/exec.sh" <<'SH'
+#!/usr/bin/env bash
+flat="$(printf '%s ' "$@" | tr '\n' ' ')"
+case "$flat" in *clip-daemon*) : ;; *) exit 0 ;; esac
+n=$(cat "$HB_EXEC_COUNT" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$HB_EXEC_COUNT"
+printf '%s\n' "$flat" >> "$HB_EXEC_ARGV"
+[ -n "${HB_ORDER:-}" ] && printf 'exec\n' >> "$HB_ORDER"
+id=""; for a in "$@"; do case "$a" in CLEAT_EXEC_ID=*) id="${a#CLEAT_EXEC_ID=}";; esac; done
+line=$(sed -n "${n}p" "$HB_PLAN" 2>/dev/null); set -- $line
+code="${1:-0}"; action="${2:-}"
+if [ "$action" = ready ] && [ -n "$id" ]; then
+  { printf 'v=1\n'; printf 'state=ready\n'; printf 'by=%s\n' "$HB_TICKET_BY"; \
+    printf 'at=%s\n' "$(date +%s)"; printf 'sid=%s\n' "$HB_TICKET_SID"; printf 'to=default\n'; } > "$HB_RUN_DIR/.handoff.$id"
+fi
+exit "$code"
+SH
+  chmod +x "$TEST_TEMP/exec.sh"; export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/exec.sh"
+}
+
+_rl_regression_setup() {
+  CN="cleat-rlr-01"; SID="d7b73579-1111-2222-3333-444455556666"
+  _RESOLVED_PROJECT="$TEST_TEMP/proj"; _BOX=main; mkdir -p "$_RESOLVED_PROJECT"
+  SDIR="$(_sessions_key_dir "$_RESOLVED_PROJECT" main)"; mkdir -p "$SDIR"
+  printf '{"type":"user","message":{"role":"user"},"parentUuid":null}\n' > "$SDIR/$SID.jsonl"
+  HB_RUN_DIR="$CLEAT_RUN_DIR/$CN"; mkdir -p "$HB_RUN_DIR"
+  export HB_EXEC_COUNT="$TEST_TEMP/ec" HB_EXEC_ARGV="$TEST_TEMP/eargv" HB_PLAN="$TEST_TEMP/plan"
+  export HB_RUN_DIR HB_TICKET_BY="$$" HB_TICKET_SID="$SID"
+  : > "$HB_EXEC_ARGV"; rm -f "$HB_EXEC_COUNT"
+  mock_docker_ps "$CN"
+  _is_interactive() { return 0; }
+  _rl_exec_fixture
+}
+
+@test "regression vnext: a handoff relaunch never reopens another conversation of the same box" {
+  _rl_regression_setup
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run sed -n '2p' "$HB_EXEC_ARGV"
+  assert_output --partial "--resume $SID"
+  refute_output --partial "--continue"
+}
+
+@test "regression vnext: session end cleanup and harvest never run between a handoff signal and the relaunch" {
+  _rl_regression_setup
+  export HB_ORDER="$TEST_TEMP/order"; : > "$HB_ORDER"
+  _account_sync_out() { echo harvest >> "$HB_ORDER"; return 0; }
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  # The harvest runs once, after BOTH execs: never between the signal and the
+  # relaunch. Order is exactly exec, exec, harvest.
+  run cat "$HB_ORDER"
+  assert_output "$(printf 'exec\nexec\nharvest')"
 }

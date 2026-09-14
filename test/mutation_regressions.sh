@@ -47,6 +47,7 @@ WHATS_NEW_BATS="$REPO_ROOT/test/unit/whats_new.bats"
 INSTALL_NOTICE_BATS="$REPO_ROOT/test/unit/install_notice.bats"
 CAPABILITIES_BATS="$REPO_ROOT/test/unit/capabilities.bats"
 EXEC_CLAUDE_BATS="$REPO_ROOT/test/unit/exec_claude.bats"
+HANDOFF_BATS="$REPO_ROOT/test/unit/handoff.bats"
 INIT_RECREATE_BATS="$REPO_ROOT/test/unit/init_recreate_check.bats"
 ARCH_BATS="$REPO_ROOT/test/unit/arch.bats"
 RESOURCES_BATS="$REPO_ROOT/test/unit/resources.bats"
@@ -6205,9 +6206,12 @@ try "vnext_sessions_narrow_on_redraw" "a window narrowed during an action leaves
 
 # The whole feature IS this env var. Without it a pinned box reads the shared
 # store and the switch is a no-op that reports success.
+# Retargeted for M3: the account block moved from exec_claude into
+# _exec_claude_prepare_account (O3), so the applier call is now `|| true`.
+# Protected before: the store-env application in exec_claude's account block.
 cat > "$SED_TMP" << 'SED'
-/^exec_claude()/,/^}$/{
-  s@^  _account_apply_exec_env "[$]cname" .. _pinned_account="[$]_ACCOUNT_DEFAULT"$@  :@
+/^_exec_claude_prepare_account()/,/^}$/{
+  s@^  _account_apply_exec_env "[$]cname" || true$@  :@
 }
 SED
 try "vnext_account_env_var" "a pinned box gets the credential store env var" "$CLI" "$ACCOUNTS_BATS"
@@ -6223,8 +6227,11 @@ try "vnext_account_default_sets_nothing" "an unpinned box gets no credential sto
 
 # The macOS seed compares token EXPIRY and never identity, so leaving it armed
 # for a pinned box restores the Keychain's account about eight hours later.
+# Retargeted for M3: the seed guard moved into _exec_claude_prepare_account (O3)
+# and keys on _EC_PINNED (the login the exec really gets), not _pinned_account.
+# Protected before: the seed's default-only guard in exec_claude's account block.
 cat > "$SED_TMP" << 'SED'
-s/^  if \[\[ "[$]_pinned_account" == "[$]_ACCOUNT_DEFAULT" \]\]; then$/  if true; then/
+s/^  if \[\[ "[$]_EC_PINNED" == "[$]_ACCOUNT_DEFAULT" \]\]; then$/  if true; then/
 SED
 try "vnext_account_seed_skipped" "a pinned box skips the macOS Keychain seed" "$CLI" "$ACCOUNTS_BATS"
 
@@ -6272,7 +6279,7 @@ try "vnext_account_stage_newest_wins" "staging never overwrites a newer credenti
 # the box), so the switch's own drop is the one thing that keeps the account
 # being LEFT out of the new account's store.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s@^  if \[\[ "[$]current" != "[$]acct" \]\]; then$@  if false; then@
 }
 SED
@@ -6405,7 +6412,7 @@ try "vnext_session_verb_aliases" "the plural and the short form still reach the 
 # drop the staged file (the account being LEFT, usually the fresher one) stayed
 # put and was later harvested into the account just switched TO.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s@^  if \[\[ "[$]current" != "[$]acct" \]\]; then$@  if false; then@
 }
 SED
@@ -6418,7 +6425,7 @@ cat > "$SED_TMP" << 'SED'
 /^_account_capture_meta()/,/^}$/{
   s#^  _account_exists "[$]acct" .. return 0$#  _account_exists "$acct" || return 0; [[ -f "${2:-}" ]] \&\& _account_meta_set "$acct" who "$(grep -o '"emailAddress":"[^"]*"' "$2" | cut -d'"' -f4)"#
 }
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_meta()/,/^}$/{
   s#^  _account_capture_meta "[$]acct" .. true$#  _account_capture_meta "$acct" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true#
 }
 SED
@@ -6748,14 +6755,14 @@ try "vnext_account_create_path_identity" "a box CREATED while pinned is not stam
 # because profileFetchedAt lives inside that object. The start rebuild never
 # reaches a RUNNING box, so the switch has to invalidate it itself.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_identity()/,/^}$/{
   s@^  \[\[ "[$]current" != "[$]acct" \]\] && { _account_invalidate_identity "[$]project" "[$]box" "[$]cname" || _id_rc=[$]?; }$@  :@
 }
 SED
 try "vnext_account_switch_invalidates_identity" "switching drops the identity the box is carrying" "$CLI" "$ACCOUNTS_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_identity()/,/^}$/{
   s@^    _account_invalidate_identity "[$]project" "[$]box" "[$]cname" || _id_rc=[$]?$@    :@
 }
 SED
@@ -6833,7 +6840,7 @@ try "vnext_account_remove_invalidates_identity" "removing an account drops the i
 # The pin's second line is the only link from a container name back to the
 # per-project file the box binds.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s@^  _box_account_write "[$]cname" "[$]acct" "[$](_derive_project_session_key "[$]project" "[$]box")" @  _box_account_write "$cname" "$acct" @
 }
 SED
@@ -6867,7 +6874,7 @@ try "vnext_account_sibling_skips_pinned" "inherits a pinned sibling"
 # The rc-3 notice reads a variable that is only set when the delete was
 # actually skipped, so both branches have to declare it.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_identity()/,/^}$/{
   s@^  local _id_rc=0$@  :@
 }
 SED
@@ -6896,8 +6903,18 @@ SED
 try "vnext_account_nojq_builder_flags" "a box created pinned on a jq-less host does not launch with the host account"
 
 # A stopped box cannot be asked for its jq, so the switch leaves the job for
-# the launch instead of dropping it.
+# the launch instead of dropping it. Retargeted with the live-switch work: the
+# switch now flags identity in TWO places on this jq-less path. H9 added
+# _handoff_flag_identity_stale, which runs first under the lock before the pin
+# moves, and _account_invalidate_identity_key still writes the flag when the
+# drop cannot finish. Removing either alone leaves the other to carry the flag,
+# so both must go to reproduce the pre-fix bug where the launch never clears the
+# old account name. (The invalidate-key line is the sole writer on the account
+# rm path, where H9 does not run; that path is guarded by its own entries.)
 cat > "$SED_TMP" << 'SED'
+/^_account_switch_locked()/,/^}$/{
+  /_handoff_flag_identity_stale "[$]project" "[$]box"/d
+}
 /^_account_invalidate_identity_key()/,/^}$/{
   s@^    : > "[$]{f}.identity-stale" 2>/dev/null || true$@    :@
 }
@@ -7094,7 +7111,7 @@ try "vnext_account_lock_attach" "an attach cannot stage the old account"
 # vnext: the switch holds the lock from its pin read to the staging, or a
 # session-end harvest writes an older generation over the one it harvested.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s/^  if ! _account_lock; then$/  if false; then/
 }
 SED
@@ -7103,7 +7120,7 @@ try "vnext_account_lock_switch" "a session-end harvest cannot write the new acco
 # The hold runs on through the unpin, the pin write and the staging. Let go
 # after the harvest and an attach stages the old account under the new pin.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s/^  elif ! _account_release_staged_locked "[$]cname"; then$/  elif ! { _account_release_staged_locked "$cname" \&\& _account_unlock; }; then/
   s/^  _account_unlock$/  :/
 }
@@ -7118,6 +7135,16 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_account_lock_harvest" "a session-end harvest cannot write the new account"
+
+# vnext: the live switch writes the store only while it still owns the lock. If
+# the ownership check does not compare the on-disk owner with the record this
+# shell wrote, a lock stolen by another command still reads as ours.
+cat > "$SED_TMP" << 'SED'
+/^_account_lock_owned()/,/^}$/{
+  s/^  \[\[ "[$]owner" == "[$]_ACCOUNT_LOCK_OWNER" \]\] || return 1$/  :/
+}
+SED
+try "vnext_account_lock_owned" "lock ownership reads true only while this shell still holds it" "$CLI" "$ACCOUNTS_BATS"
 
 # vnext: rename moves the store before it rewrites the pins, so an attach in
 # between found no store and deleted the staged login.
@@ -7415,7 +7442,7 @@ try "vnext_account_rm_rereads_pins" "a box pinned while rm waits at its prompt i
 # vnext: the usage poll (up to 3 s) ran between the switch's harvest and its
 # staging. Put it back before the harvest.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s@^  elif ! _account_release_staged_locked "[$]cname"; then$@  elif ! { _account_usage_fetch "$current" >/dev/null 2>\&1; _account_release_staged_locked "$cname"; }; then@
 }
 SED
@@ -7522,14 +7549,14 @@ SED
 try "vnext_account_release_holds" "switching accounts keeps a refreshed login whose harvest failed"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s/^  elif ! _account_release_staged_locked "[$]cname"; then$/  elif ! { _account_sync_out_locked "$cname" || true; }; then/
 }
 SED
 try "vnext_account_switch_releases" "switching accounts keeps a refreshed login whose harvest failed"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s/^    if ! _account_release_staged_locked "[$]cname"; then$/    if ! { _account_sync_out_locked "$cname" || true; }; then/
 }
 SED
@@ -7821,7 +7848,7 @@ SED
 try "vnext_account_attach_unkept_warns" "an attach that cannot keep the login it would replace" "$CLI" "$ACCOUNTS_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s/^    if \[\[ [$]_ACCOUNT_STAGE_UNKEPT -eq 1 \]\]; then$/    if false; then/
 }
 SED
@@ -7922,7 +7949,7 @@ cat > "$SED_TMP" << 'SED'
 /^_account_capture_meta()/,/^}$/{
   s#^  _account_exists "[$]acct" .. return 0$#  _account_exists "$acct" || return 0; [[ -f "${2:-}" ]] \&\& _account_meta_set "$acct" who "$(grep -o '"emailAddress":"[^"]*"' "$2" | cut -d'"' -f4)"#
 }
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_meta()/,/^}$/{
   s#^  _account_capture_meta "[$]current" .. true$#  _account_capture_meta "$current" "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$project" "$box")/claude.json" || true#
 }
 SED
@@ -8042,7 +8069,7 @@ try "vnext_account_adopt_unverified_keeps_identity" "a login nobody verified ado
 # answered "Not logged in" into it. The same removal erased the box's own MCP
 # login, so the one mutation is tried against both tests.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s@^  if ! _account_sync_in_locked "[$]cname" "[$]stage_mode"; then$@  rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true; if ! _account_sync_in_locked "$cname" "$stage_mode"; then@
 }
 SED
@@ -8052,14 +8079,14 @@ try "vnext_account_switch_no_file_gap_mcp" "switching a box to another account k
 # Nothing is removed before the staging, so a staging that fails leaves the old
 # login in place and the pin has to go back with it.
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s/^      _box_account_write "[$]cname" "[$]current" .*$/      :/
 }
 SED
 try "vnext_account_switch_failed_stage_repins" "a switch that cannot stage puts the pin back on the account it left" "$CLI" "$ACCOUNTS_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_account_do_switch()/,/^}$/{
+/^_account_switch_locked()/,/^}$/{
   s/^      _box_account_remove "[$]cname"$/      :/
 }
 SED
@@ -9706,9 +9733,11 @@ SED
 try "vnext_session_end_hook_drop_offset" "a hook drop written during the session" "$CLI" "$EXEC_CLAUDE_BATS"
 
 # --privileged assembled on the session exec, where no text guard can see it.
+# Retargeted for M3: the session docker exec now sits inside the relaunch loop,
+# so it carries four leading spaces instead of two. Same line, same guard.
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
-  s|^  docker exec -it "[$]{CLAUDE_ENV\[@\]}" \\$|  docker exec -it "--priv""ileged" "${CLAUDE_ENV[@]}" \\|
+  s|^    docker exec -it "[$]{CLAUDE_ENV\[@\]}" \\$|    docker exec -it "--priv""ileged" "${CLAUDE_ENV[@]}" \\|
 }
 SED
 try "vnext_never_privileged_exec" "the session docker exec never carries" "$CLI" "$REGRESSIONS"
@@ -10100,6 +10129,658 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_session_end_harvest_after_restore" "the session-end harvest runs only after the terminal is back" "$CLI" "$REGRESSIONS"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: the live account switch, the in-box half (probe and terminate) and the
+# bounded exec. Anchors point at the function that actually holds the code, not
+# the handover's advisory column: the procstart compare lives in
+# _hb_session_record, and the two REG entries anchor _hb_terminate. See
+# concept/44 and test/unit/handoff.bats.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# probe must skip a session file whose process start time no longer matches.
+cat > "$SED_TMP" << 'SED'
+/^_hb_session_record()/,/^}$/{
+  s@\[\[ -n "[$]ps" && "[$]ps" == "[$]start" \]\] || return 1@[[ -n "$ps" ]] || return 1@
+}
+SED
+try "vnext_handoff_probe_procstart" "start time does not match" "$CLI" "$HANDOFF_BATS"
+
+# probe judges a process by its executable, never by a claude word in its args.
+cat > "$SED_TMP" << 'SED'
+/^_hb_scan()/,/^}$/{
+  s#if _is_claude_argv "[$]{words\[@\]}"; then#if printf "%s" "${words[*]}" | grep -q claude; then#
+}
+SED
+try "vnext_handoff_probe_argv_rule" "by executable and never by a claude word" "$CLI" "$HANDOFF_BATS"
+
+# an unreadable environment reads as unreadable, never as zero entries (none).
+cat > "$SED_TMP" << 'SED'
+/^_hb_env_value()/,/^}$/{
+  s@if \[\[ -d "[$]f" \]\] || \[\[ ! -r "[$]f" \]\]; then printf 'unreadable'; return 0; fi@if [[ -d "$f" ]] || [[ ! -r "$f" ]]; then printf '0 '; return 0; fi@
+}
+SED
+try "vnext_handoff_probe_environ_unreadable" "unreadable environment" "$CLI" "$HANDOFF_BATS"
+
+# probe reports the shell-snapshot processes of a session.
+cat > "$SED_TMP" << 'SED'
+/^_hb_scan()/,/^}$/{
+  s@if \[\[ [$]found_shell -eq 1 \]\]; then@if false; then@
+}
+SED
+try "vnext_handoff_probe_shell_line" "shell snapshot process under the exec id" "$CLI" "$HANDOFF_BATS"
+
+# terminate refuses malformed arguments before it touches anything.
+cat > "$SED_TMP" << 'SED'
+/^_hb_args_ok()/,/^}$/{
+  s@  local verb="[$]1"; shift@  local verb="$1"; shift; return 0@
+}
+SED
+try "vnext_handoff_terminate_args" "malformed arguments" "$CLI" "$HANDOFF_BATS"
+
+# terminate holds Claude's refresh lock across the signal (REG: R-b).
+cat > "$SED_TMP" << 'SED'
+/^_hb_terminate()/,/^}$/{
+  s@if _hb_lock_take "[$]lock" "[$]lockwait" "[$]_HB_CLAUDE_LOCK_STALE_S"; then@if true; then@
+}
+SED
+try "vnext_handoff_refresh_lock_hold" "holds the outgoing refresh lock across the signal" "$CLI" "$REGRESSIONS"
+
+# a refresh lock is reclaimed only when it is older than Claude's stale bound.
+cat > "$SED_TMP" << 'SED'
+/^_hb_lock_take()/,/^}$/{
+  s@if \[\[ [$](( now - mt )) -gt [$]stale \]\]; then@if true; then@
+}
+SED
+try "vnext_handoff_refresh_lock_stale_rule" "older than the Claude stale bound" "$CLI" "$HANDOFF_BATS"
+
+# the recheck's outside scan aborts on any new session, orphan or stray shell.
+cat > "$SED_TMP" << 'SED'
+/^_hb_recheck()/,/^}$/{
+  s@scanout="[$](_hb_scan "[$]home" "[$]proc" "[$]skip")"@scanout=""@
+}
+SED
+try "vnext_handoff_outside_scan" "a status changed or a session opened" "$CLI" "$HANDOFF_BATS"
+
+# the box recheck exempts a busy --now target's own background shell line: break
+# the exemption and the now leg's recheck aborts instead of passing.
+cat > "$SED_TMP" << 'SED'
+/^_hb_recheck()/,/^}$/{
+  s@"[$]{_HBT_EXPECT\[[$]j\]}" == now@"${_HBT_EXPECT[$j]}" == xnow@
+}
+SED
+try "vnext_handoff_recheck_now_shell_exempt" "only when the expect is now" "$CLI" "$HANDOFF_BATS"
+
+# the final scan under the lock aborts over a Claude that started after the kill (REG: R-c).
+cat > "$SED_TMP" << 'SED'
+/^_hb_terminate()/,/^}$/{
+  s@  if \[\[ [$]fchanged -eq 1 \]\]; then@  if false; then@
+}
+SED
+try "vnext_handoff_final_scan" "never stages over a Claude that started after the kill" "$CLI" "$REGRESSIONS"
+
+# a target that outlives the kill wait is never SIGKILLed.
+cat > "$SED_TMP" << 'SED'
+/^_hb_terminate()/,/^}$/{
+  s@kill -TERM@kill -KILL@
+}
+SED
+try "vnext_handoff_never_sigkill" "ignores SIGTERM" "$CLI" "$HANDOFF_BATS"
+
+# the lock is released on every exit of the verb. The EXIT trap is the observable
+# cleanup for the abort paths, which return without an explicit rmdir (the signal
+# traps add bash 3.2 coverage, where EXIT does not fire on a signal, and the exit
+# codes; on bash 5 EXIT masks them, so the harness catches this via the EXIT trap).
+cat > "$SED_TMP" << 'SED'
+/^_hb_terminate()/,/^}$/{
+  /trap _hb_cleanup EXIT/d
+}
+SED
+try "vnext_handoff_lock_release_on_term" "releases its lock on abort on success and on TERM" "$CLI" "$HANDOFF_BATS"
+
+# the bounded exec stops a docker client that outlives its timeout.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_docker_exec()/,/^}$/{
+  /if \[\[ [$](( SECONDS - start )) -ge [$]bound \]\]; then stopped=1; break; fi/d
+}
+SED
+try "vnext_handoff_exec_bound" "docker outlives the timeout" "$CLI" "$HANDOFF_BATS"
+
+# the bounded exec stops a runaway output at the byte cap.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_docker_exec()/,/^}$/{
+  s@if \[\[ [$]size -gt [$]_HANDOFF_OUT_MAX_BYTES \]\]; then stopped=1; break; fi@if false; then stopped=1; break; fi@
+}
+SED
+try "vnext_handoff_exec_output_cap" "runaway output at the byte cap" "$CLI" "$HANDOFF_BATS"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vnext: the live switch host state, the attach gate, the offline-path refusals
+# and the H9 flag order (M2). See test/unit/handoff.bats, the R-e regression and
+# the account-rm test in accounts.bats. Anchors point at the function that holds
+# the code.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# the attach gate refuses only when a requested ticket of this box is still live.
+cat > "$SED_TMP" << 'SED'
+/^_account_attach_gate()/,/^}$/{
+  s@_handoff_tickets_requested_live "[$]1"@false@
+}
+SED
+try "vnext_handoff_gate_requested_live" "an attach refuses while this box is switching" "$CLI" "$HANDOFF_BATS"
+
+# exec_claude takes the account gate before it reads the pin (the default-pin gap).
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@if ! _account_attach_gate "[$]cname" "[$]{_BOX:-main}" cleat; then@if false; then@
+}
+SED
+try "vnext_handoff_exec_gate_before_pin" "waits for the account lock before it reads the pin" "$CLI" "$REGRESSIONS"
+
+# cmd_shell takes the account gate before it reads the pin, too.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  s@if ! _account_attach_gate "[$]cname" "[$]box" "cleat shell"; then@if false; then@
+}
+SED
+try "vnext_handoff_shell_gate_before_pin" "waits for the account lock before it reads the pin" "$CLI" "$REGRESSIONS"
+
+# the offline switch refuses under its lock while a session is still starting.
+cat > "$SED_TMP" << 'SED'
+/^_account_switch_locked()/,/^}$/{
+  s@_handoff_starting_markers "[$]cname"@false@
+}
+SED
+try "vnext_handoff_offline_starting" "a session in another terminal is still starting" "$CLI" "$HANDOFF_BATS"
+
+# "starting" is bounded by age: a stale kind=claude marker (a crashed session
+# whose pid was reused, or one that never cleaned up) is NOT a session coming
+# up, so it must not block the switch. Removing the age check makes the 200 s
+# marker in the "still starting" test count as starting and refuse.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_starting_markers()/,/^}$/{
+  /\[\[ [$]age -ge 0 && [$]age -le [$]_HANDOFF_STARTING_MAX_S \]\] || continue/d
+}
+SED
+try "vnext_handoff_starting_age_bound" "a session in another terminal is still starting" "$CLI" "$HANDOFF_BATS"
+
+# the offline switch refuses a shared<->named move while a cleat shell is open.
+cat > "$SED_TMP" << 'SED'
+/^_account_switch_locked()/,/^}$/{
+  s@_handoff_shell_open "[$]cname"@false@
+}
+SED
+try "vnext_handoff_offline_shellopen" "while a cleat shell is open" "$CLI" "$HANDOFF_BATS"
+
+# H9: the identity flag is written before the pin moves.
+cat > "$SED_TMP" << 'SED'
+/^_account_switch_locked()/,/^}$/{
+  /_handoff_flag_identity_stale "[$]project" "[$]box"/d
+}
+SED
+try "vnext_handoff_h9_flag_before_pin" "writes the identity flag before the pin moves" "$CLI" "$HANDOFF_BATS"
+
+# the identity drop clears the flag it satisfied (only in _account_invalidate_identity_key).
+cat > "$SED_TMP" << 'SED'
+/^_account_invalidate_identity_key()/,/^}$/{
+  s@rm -f "[$]{f}.identity-stale" 2>/dev/null || true@:@
+}
+SED
+try "vnext_handoff_h9_flag_clear" "writes the identity flag before the pin moves" "$CLI" "$HANDOFF_BATS"
+
+# cleat account rm refuses while a pinned box is reopening a session.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s@if _handoff_tickets_pending "[$]b"; then@if false; then@
+}
+SED
+try "vnext_handoff_rm_reopening" "a pinned box is reopening a session" "$CLI" "$ACCOUNTS_BATS"
+
+# a live ready ticket whose session is already back in the caller's probe set
+# is NOT still reopening: the exclusion stops a fresh switch refusing a reopen
+# that already finished. Drop the probe-set check so a completed reopen still
+# reads as pending.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_tickets_pending()/,/^}$/{
+  s@\[\[ [$]in_probe -eq 0 \]\] && return 0@return 0@
+}
+SED
+try "vnext_handoff_pending_sid_live" "excludes one already back in the probe set" "$CLI" "$HANDOFF_BATS"
+
+# a ticket by=1 is rejected, so kill -0 never targets init or a process group.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_ticket_read()/,/^}$/{
+  s@"[$]_HT_BY" != "1"@1@
+}
+SED
+try "vnext_handoff_ticket_by_not_one" "rejects a malformed ticket" "$CLI" "$HANDOFF_BATS"
+
+# an exec id shorter than 12 hex is refused (marker and ticket id validation).
+cat > "$SED_TMP" << 'SED'
+/^_handoff_id_ok()/,/^}$/{
+  s@-ge 12@-ge 0@
+}
+SED
+try "vnext_handoff_id_len" "handoff id ok accepts 12 to 32" "$CLI" "$HANDOFF_BATS"
+
+# an invalid exec id in a marker fails closed to shell, never claude.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_marker_read()/,/^}$/{
+  s@_handoff_id_ok "[$]id"@true@
+}
+SED
+try "vnext_handoff_marker_failclosed" "marker read parses claude and shell" "$CLI" "$HANDOFF_BATS"
+
+# ── M3: terminal 1 relaunch loop, resume carry, cmd_resume pick ──────────────
+
+# H7: a conversation past the standard window is 1M even with no [1m] key. Break
+# the size threshold so the size evidence never fires.
+cat > "$SED_TMP" << 'SED'
+/^_resume_model_carry()/,/^}$/{
+  s@-gt [$]_HANDOFF_STD_WINDOW_TOKENS@-gt 999999999999@
+}
+SED
+try "vnext_handoff_carry_size" "conversation size as 1M evidence" "$CLI" "$HANDOFF_BATS"
+
+# The size reader must skip the synthetic rate-limit record and API-error
+# records. Drop both skips so the synthetic last record is read (and rejected).
+cat > "$SED_TMP" << 'SED'
+/^_resume_last_usage_tokens()/,/^}$/{
+  /isApiErrorMessage/d
+  /"model":"claude-/d
+}
+SED
+try "vnext_handoff_carry_skips_synthetic" "skips synthetic and API error records" "$CLI" "$HANDOFF_BATS"
+
+# A relaunch names the session id, never --continue (a sibling conversation).
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@_EC_ARGS=(--dangerously-skip-permissions --resume "[$]_ec_sid")@_EC_ARGS=(--dangerously-skip-permissions --continue)@
+}
+SED
+try "vnext_handoff_resume_not_continue" "never reopens another conversation of the same box" "$CLI" "$REGRESSIONS"
+
+# Only exit 143 with a ticket reopens: break the rc gate so any exit reopens.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@\[\[ [$]rc -ne 143 \]\]@false@
+}
+SED
+try "vnext_handoff_rc_gate" "ignores a ready ticket when Claude exited on its own" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# A dead requested-ticket writer ends the wait at once. Drop the check so it
+# keeps waiting (and prints the T0 line the immediate end suppresses).
+cat > "$SED_TMP" << 'SED'
+/^_handoff_t1_await()/,/^}$/{
+  s@if ! kill -0 "[$]_HT_BY" 2>/dev/null; then _HANDOFF_T1_STATE=unfinished; break; fi@:@
+}
+SED
+try "vnext_handoff_dead_writer" "requested ticket writer died" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# T0 prints once while the ticket reads requested. Drop the print.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_t1_await()/,/^}$/{
+  s@if \[\[ [$]said -eq 0 \]\]; then said=1; _handoff_say T0 "[$]_HT_TO"; fi@:@
+}
+SED
+try "vnext_handoff_t0_line" "waiting while the ticket reads requested" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# Typeahead is drained before a relaunch. Drop the call.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /_handoff_drain_typeahead$/d
+}
+SED
+try "vnext_handoff_drain" "drains typeahead" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The store variable drops as a -e PAIR. Skip one element, leaving a bare -e.
+cat > "$SED_TMP" << 'SED'
+/^_claude_env_drop_store()/,/^}$/{
+  s@i=$(( i + 2 )); continue@i=$(( i + 1 )); continue@
+}
+SED
+try "vnext_handoff_env_pair" "store variable and its e flag as a pair" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The macOS seed runs only for a shared-login exec. Drop the guard.
+cat > "$SED_TMP" << 'SED'
+/^_exec_claude_prepare_account()/,/^}$/{
+  s@if \[\[ "[$]_EC_PINNED" == "[$]_ACCOUNT_DEFAULT" \]\]; then@if true; then@
+}
+SED
+try "vnext_handoff_seed_default_only" "seed only before a relaunch onto the shared" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# Cleanup and harvest run only at the final exit, never between the signal and
+# the relaunch. Add a per-iteration harvest so it runs between the two execs.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@ 2>"[$]_exec_err" || rc=[$]?$@ 2>"$_exec_err" || rc=$?; _account_sync_out "$cname" || true@
+}
+SED
+try "vnext_handoff_cleanup_final_only" "cleanup and harvest never run between" "$CLI" "$REGRESSIONS"
+
+# Code 143 is hidden only when a ticket explains it. Hide it always.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@elif \[\[ [$]rc -ne 130 \]\]; then@elif [[ $rc -ne 130 \&\& $rc -ne 143 ]]; then@
+}
+SED
+try "vnext_handoff_rc143_ticket_only" "hides code 143 only when a ticket explains it" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# An exec id is stamped only for the fixed relaunchable argv shapes. Accept any.
+cat > "$SED_TMP" << 'SED'
+/^_exec_claude_argv_relaunchable()/,/^}$/{
+  s@^  \[\[ "[$]{1:-}" == "--dangerously-skip-permissions" \]\] || return 1$@  return 0@
+}
+SED
+try "vnext_handoff_fixed_argv" "fixed argument shapes" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The exec id is placed AFTER the user env args, so a .cleat.env cannot forge
+# it. Emit it before CLAUDE_ENV (and thus before the user env args).
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s#^    docker exec -it "[$]{CLAUDE_ENV\[@\]}" \\$#    docker exec -it "${_ec_extra[@]+"${_ec_extra[@]}"}" "${CLAUDE_ENV[@]}" \\#
+}
+SED
+try "vnext_handoff_exec_id_after_env" "fixed argument shapes" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The wait re-arms the flag trap so Ctrl-C sets the flag (not cleanup). Drop it.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_t1_await()/,/^}$/{
+  /trap ._EC_INT=1. INT TERM HUP/d
+}
+SED
+try "vnext_handoff_wait_flag_trap" "stopped waiting line" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The terminal is restored before the final harvest (the harvest can wait on a
+# network call). Move the harvest ahead of the restore: add one before the
+# restore and neutralise the real one, which lives in the note-guarded case arm.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _restore_terminal$@  _account_sync_out "$cname" || _harvest=$?; _restore_terminal@
+  s@^    \*) _account_sync_out "[$]cname" || _harvest=[$]? ;;$@    *) : ;;@
+}
+SED
+try "vnext_handoff_restore_before_harvest" "restores the terminal before the final harvest" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The reopen prints the resume-from-summary dialog hint on every relaunch, so a
+# typed continue is not eaten by the dialog (O1 declined, not suppressed). Drop
+# the hint line.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_say_t1()/,/^}$/{
+  /answer that before you type continue/d
+}
+SED
+try "vnext_handoff_dialog_hint_on_relaunch" "resume dialog hint and never suppresses" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The consumed ticket is matched on by AND at before removal. Match anything.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@\[\[ "[$]{_HT_BY}:[$]{_HT_AT}" == "[$]_ec_used" \]\]@true@
+}
+SED
+try "vnext_handoff_consumed_ticket" "consumed ticket when the relaunched session returns" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# T-landed fires when the settled pin equals the ticket's target. Drop it.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@if \[\[ -n "[$]_ec_to" && "[$]_ec_pin" == "[$]_ec_to" \]\]; then@if false; then@
+}
+SED
+try "vnext_handoff_t_landed" "names the account it landed on" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# A ready ticket on a stopped box ends with T-boxstopped. Drop the check.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@if ! is_running "[$]cname"; then _ec_note=boxstopped; break; fi@:@
+}
+SED
+try "vnext_handoff_box_stopped" "box stopped line when the box is gone" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# cmd_resume adds the reopening sids to its live set. Drop them.
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  s@_reopening="[$](_handoff_reopening_sids "[$]cname")"@_reopening=""@
+}
+SED
+try "vnext_handoff_resume_pick_pending" "skips a conversation that is reopening" "$CLI" "$START_RESUME_BATS"
+
+
+# ── M4: terminal 2 classification, copy and orchestration ────────────────────
+
+# Row 9: an orphan Claude process refuses.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /Row 9: any orphan/{n;d}
+}
+SED
+try "vnext_handoff_refuses_orphan" "refuses an orphan Claude process" "$CLI" "$HANDOFF_BATS"
+
+# Row 10: a kind other than interactive refuses.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /Row 10: a kind other/{n;d}
+}
+SED
+try "vnext_handoff_kind" "non interactive session kind" "$CLI" "$HANDOFF_BATS"
+
+# Row 12: two records sharing one exec id refuse.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /Row 12: two records/{n;d}
+}
+SED
+try "vnext_handoff_duplicate_id" "sharing an exec id" "$CLI" "$HANDOFF_BATS"
+
+# Row 13: an exec id with no live attach marker refuses.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /Row 13: an exec id/{n;d}
+}
+SED
+try "vnext_handoff_marker" "no exec id or a dead marker" "$CLI" "$HANDOFF_BATS"
+
+# Row 14: a store that does not match the pin refuses.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /Row 14: a store that/{n;n;d}
+}
+SED
+try "vnext_handoff_store" "store that does not match the pin" "$CLI" "$HANDOFF_BATS"
+
+# Row 15: a sid with no transcript in this project refuses.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  s@_handoff_sid_has_transcript "[$]sdir" "[$]sid"@true@
+}
+SED
+try "vnext_handoff_sid" "session id without a transcript" "$CLI" "$HANDOFF_BATS"
+
+# Row 16: a status cleat does not know refuses (fail closed).
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  s@busy|shell|idle|waiting) : ;; [*]) _HO_VERDICT=R5; return 0@busy|shell|idle|waiting) : ;; *) :@
+}
+SED
+try "vnext_handoff_unknown_status" "refuses an unknown status" "$CLI" "$HANDOFF_BATS"
+
+# Row 18: a shell line refuses (the for loop right after the Row 18 comment).
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /Row 18: background shell/{n;d}
+}
+SED
+try "vnext_handoff_shell_line_refuses" "refuses background shell commands even with now" "$CLI" "$HANDOFF_BATS"
+
+# Row 18: a shell status refuses (the while loop two lines after the comment).
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /Row 18: background shell/{n;n;d}
+}
+SED
+try "vnext_handoff_shell_status_refuses" "refuses a session with a shell status" "$CLI" "$HANDOFF_BATS"
+
+# Row 18 exception (spec 4.2 row 9): a busy target's own shell line is let
+# through by --now, so the box recheck's now exemption covers it. Neutering the
+# helper to always refuse means the busy --now session no longer passes.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_shell_line_ok()/,/^}$/{
+  s@local sline="[$]1" now="[$]2" n="[$]3" i=0@local sline="[$]1" now="[$]2" n="[$]3" i=0; return 1@
+}
+SED
+try "vnext_handoff_now_shell_exception" "background shell line through with now" "$CLI" "$HANDOFF_BATS"
+
+# Row 19: a turn in flight refuses without --now.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  s@== busy ]] && { _HO_VERDICT=R1; return 0; }@== busy ]] \&\& { :; }@
+}
+SED
+try "vnext_handoff_busy" "refuses a turn in flight" "$CLI" "$HANDOFF_BATS"
+
+# Row 20: a non-permission question gets its own reason (R2q, not R2p).
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  s@_HO_VERDICT=R2q@_HO_VERDICT=R2p@
+}
+SED
+try "vnext_handoff_question" "non permission question" "$CLI" "$HANDOFF_BATS"
+
+# Row 20: a dialog is the limit question only when the transcript confirms it.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  s@dialog-open &&.*== 1 \]\] && lq=yes@dialog-open ]] \&\& lq=yes@
+}
+SED
+try "vnext_handoff_limit_tail_required" "weekly limit question through only when the transcript confirms" "$CLI" "$HANDOFF_BATS"
+
+# Row 22: a conversation in the compaction band with no 1M evidence refuses.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  s@_HO_VERDICT=R7@_HO_VERDICT=xR7@
+}
+SED
+try "vnext_handoff_context_band" "in the compaction band with no 1M" "$CLI" "$HANDOFF_BATS"
+
+# D9: the disclosure names the permission mode a session was in.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_say_disclosure()/,/^}$/{
+  /plan|acceptEdits|auto|dontAsk)/d
+}
+SED
+try "vnext_handoff_permission_mode_line" "names the permission mode a session was in" "$CLI" "$HANDOFF_BATS"
+
+# The disclosure prints before the box exec.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  /_handoff_say_disclosure "[$]box" "[$]acct"/d
+}
+SED
+try "vnext_handoff_disclosure_before_act" "cost lines before it acts" "$CLI" "$HANDOFF_BATS"
+
+# The account lock is taken after the question, never before.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@_handoff_say_disclosure "[$]box" "[$]acct"@_account_lock || true; _handoff_say_disclosure "$box" "$acct"@
+}
+SED
+try "vnext_handoff_lock_after_question" "takes the account lock after the question" "$CLI" "$HANDOFF_BATS"
+
+# The pin is re-read under the lock, so a switch that raced the question is not lost.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@"[$]old2" != "[$]old"@1 -eq 2@
+}
+SED
+try "vnext_handoff_pin_reread" "the pin changed during the question" "$CLI" "$HANDOFF_BATS"
+
+# Row 19 on the live path: an open cleat shell refuses before the terminate exec.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@_handoff_shell_open "[$]cname"@false@
+}
+SED
+try "vnext_handoff_live_shellopen_before_terminate" "cleat shell open before it signals" "$CLI" "$HANDOFF_BATS"
+
+# The requested tickets are written before the signalling exec.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  /_handoff_ticket_write.*requested/d
+}
+SED
+try "vnext_handoff_tickets_before_markers" "requested tickets before the signalling exec" "$CLI" "$HANDOFF_BATS"
+
+# Every write after a docker call is guarded by _account_lock_owned.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@if ! _account_lock_owned; then@if false; then@
+}
+SED
+try "vnext_handoff_lock_owned" "another command took the account lock over" "$CLI" "$HANDOFF_BATS"
+
+# The pin only moves when the terminate ended ok.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@"[$]_PT_END" != ok@1 -eq 2@
+}
+SED
+try "vnext_handoff_stage_needs_end_ok" "never moves the pin when terminate did not end ok" "$CLI" "$HANDOFF_BATS"
+
+# A survivor keeps the box on the old login, and the exited targets reopen there.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  /_handoff_write_ready "[$]cname" "[$]old"/d
+}
+SED
+try "vnext_handoff_survivor_ready" "one target survives" "$CLI" "$HANDOFF_BATS"
+
+# Ctrl-C is ignored from the lock through the exec (the trap is set).
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@trap '' INT@:@
+}
+SED
+try "vnext_handoff_int_before_exec" "ignores Ctrl-C from the lock through the exec" "$CLI" "$HANDOFF_BATS"
+
+# Ctrl-C is not restored before the exec (the ignore holds).
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@trap '' INT@trap - INT@
+}
+SED
+try "vnext_handoff_int_during_exec" "ignores Ctrl-C from the lock through the exec" "$CLI" "$HANDOFF_BATS"
+
+# The ready ticket is written before the meta capture.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  /_handoff_write_ready "[$]cname" "[$]acct"/d
+}
+SED
+try "vnext_handoff_ready_before_meta" "ready ticket before it captures meta" "$CLI" "$HANDOFF_BATS"
+
+# Only the exited or surviving sessions get a ready ticket, never a gone one.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_write_ready()/,/^}$/{
+  s@case "[$]_PT_EXITED[$]_PT_ALIVE" in@case "$_PT_EXITED$_PT_ALIVE$_PT_GONE" in@
+}
+SED
+try "vnext_handoff_reopening_only_exited" "reopens only the sessions that stopped" "$CLI" "$HANDOFF_BATS"
+
+# A switching or cancelled exit ran no session on this box, so the final exit
+# must not harvest: doing so returns _ACCOUNT_LOCK_BUSY (the switch holds the
+# lock) and prints a "was not saved" line contradicting "Nothing was changed".
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    switching|cancelled) : ;;$@    switching|cancelled) _account_sync_out "$cname" || _harvest=$? ;;@
+}
+SED
+try "vnext_handoff_switching_no_harvest" "switching and the account lock stays busy" "$CLI" "$HANDOFF_BATS"
+
+# The router sends a running mounted box with a live agent to the live switch.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_switch()/,/^}$/{
+  s@if _account_box_ready "[$]cname"; then@if false; then@
+}
+SED
+try "vnext_handoff_route_live_mounted" "routes the switch to the live handoff" "$CLI" "$ACCOUNTS_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

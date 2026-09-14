@@ -494,3 +494,282 @@ _held_other_account() {
   assert_output "0"
   [ ! -p "$log" ] || { echo "the FIFO survived, the next >> would block forever"; return 1; }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live account switch: terminal 1's relaunch loop (M3, tests 51 to 67).
+# Each drives the real loop through the docker stub's DOCKER_STUB_EXEC_SCRIPT,
+# which returns a chosen exit code per exec and can leave a handoff ticket, so
+# the reopen path runs end to end with no daemon. See concept/44.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Write the per-exec fixture script the stub runs. It logs each exec's argv,
+# extracts CLEAT_EXEC_ID from the argv, optionally writes a ticket (ready|req)
+# and exits the code from the plan (line N controls exec N).
+rl_exec_script() {
+  cat > "$TEST_TEMP/exec.sh" <<'SH'
+#!/usr/bin/env bash
+# Only the claude session exec matters here (it runs the clip-daemon wrapper).
+# Every other docker exec (the coder-remap probe, the docker-access check) is a
+# no-op exit 0, exactly as the plain stub would answer it.
+flat="$(printf '%s ' "$@" | tr '\n' ' ')"
+case "$flat" in *clip-daemon*) : ;; *) exit 0 ;; esac
+n=$(cat "$HB_EXEC_COUNT" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$HB_EXEC_COUNT"
+printf '%s\n' "$flat" >> "$HB_EXEC_ARGV"
+id=""
+for a in "$@"; do case "$a" in CLEAT_EXEC_ID=*) id="${a#CLEAT_EXEC_ID=}";; esac; done
+printf '%s\n' "$id" >> "$HB_EXEC_IDS"
+line=$(sed -n "${n}p" "$HB_PLAN" 2>/dev/null)
+set -- $line
+code="${1:-0}"; action="${2:-}"; byval="${3:-$HB_TICKET_BY}"
+st=""
+case "$action" in ready) st=ready ;; req) st=requested ;; esac
+if [ -n "$st" ] && [ -n "$id" ]; then
+  { printf 'v=1\n'; printf 'state=%s\n' "$st"; printf 'by=%s\n' "$byval"; \
+    printf 'at=%s\n' "$(date +%s)"; printf 'sid=%s\n' "$HB_TICKET_SID"; \
+    printf 'to=%s\n' "$HB_TICKET_TO"; } > "$HB_RUN_DIR/.handoff.$id"
+fi
+exit "$code"
+SH
+  chmod +x "$TEST_TEMP/exec.sh"
+  export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/exec.sh"
+}
+
+# Common relaunch scaffolding: an interactive relaunchable session, a running
+# box, a real transcript for the resume sid, and the fixture wired up.
+rl_setup() {
+  CN="cleat-rl-01"
+  SID="d7b73579-1111-2222-3333-444455556666"
+  _RESOLVED_PROJECT="$TEST_TEMP/proj"; _BOX=main
+  mkdir -p "$_RESOLVED_PROJECT"
+  SDIR="$(_sessions_key_dir "$_RESOLVED_PROJECT" main)"; mkdir -p "$SDIR"
+  printf '{"type":"user","message":{"role":"user"},"parentUuid":null}\n' > "$SDIR/$SID.jsonl"
+  HB_RUN_DIR="$CLEAT_RUN_DIR/$CN"; mkdir -p "$HB_RUN_DIR"
+  export HB_EXEC_COUNT="$TEST_TEMP/ec" HB_EXEC_ARGV="$TEST_TEMP/eargv" HB_EXEC_IDS="$TEST_TEMP/eids"
+  export HB_PLAN="$TEST_TEMP/plan" HB_RUN_DIR HB_TICKET_BY="$$" HB_TICKET_SID="$SID" HB_TICKET_TO="default"
+  : > "$HB_EXEC_ARGV"; : > "$HB_EXEC_IDS"; rm -f "$HB_EXEC_COUNT"
+  mock_docker_ps "$CN"
+  _is_interactive() { return 0; }
+  _account_sync_out() { echo "harvest" >> "$TEST_TEMP/order"; return 0; }
+  rl_exec_script
+}
+
+# A pid that is certainly dead (spawned then reaped): a ticket writer that died.
+rl_dead_pid() { local p; sleep 0.01 & p=$!; wait "$p" 2>/dev/null || true; echo "$p"; }
+
+@test "relaunch with a ready ticket passes exactly the skip permissions flag and the resume id" {
+  rl_setup
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run cat "$HB_EXEC_COUNT"; assert_output "2"
+  run sed -n '2p' "$TEST_TEMP/eargv"
+  assert_output --partial "--dangerously-skip-permissions"
+  assert_output --partial "--resume $SID"
+  refute_output --partial "--continue"
+}
+
+@test "relaunch ignores a ready ticket when Claude exited on its own" {
+  rl_setup
+  # Exit 0 with a ready ticket present must NOT relaunch: only 143 does.
+  printf '0 ready\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run cat "$HB_EXEC_COUNT"; assert_output "1"
+  refute_output --partial "--resume"
+}
+
+@test "relaunch does not reopen when the requested ticket writer died and still harvests" {
+  rl_setup
+  HB_TICKET_BY="$(rl_dead_pid)"
+  _HANDOFF_T1_WAIT_S=1   # bound the wait when the dead-writer check is mutated out
+  printf '143 req\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  # A dead writer ends the wait at once: no T0 waiting line, no relaunch. This
+  # refute must sit right after the exec, before another run overwrites $output.
+  refute_output --partial "switching this box to"
+  run cat "$HB_EXEC_COUNT"; assert_output "1"
+  run grep -c '^harvest' "$TEST_TEMP/order"
+  assert_output "1"
+}
+
+@test "relaunch says it is waiting while the ticket reads requested" {
+  rl_setup
+  _HANDOFF_T1_WAIT_S=1
+  _handoff_t1_pause() { sleep 0.2; }
+  printf '143 req\n' > "$HB_PLAN"   # requested with a live writer ($$), never ready
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  # T0 prints exactly once across the whole wait.
+  run grep -c "switching this box to" <<<"$output"
+  assert_output "1"
+}
+
+@test "relaunch drains typeahead before the relaunch" {
+  rl_setup
+  _handoff_drain_typeahead() { echo drain >> "$TEST_TEMP/drain"; }
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run cat "$TEST_TEMP/drain"; assert_output "drain"
+}
+
+@test "relaunch drops the store variable and its e flag as a pair" {
+  source_cli
+  CLAUDE_ENV=(-e HOME=/home/coder -e CLAUDE_SECURESTORAGE_CONFIG_DIR=/x -e PATH=/bin)
+  _claude_env_drop_store
+  run printf '%s\n' "${CLAUDE_ENV[*]}"
+  assert_output "-e HOME=/home/coder -e PATH=/bin"
+}
+
+@test "relaunch runs the macOS seed only before a relaunch onto the shared login" {
+  rl_setup
+  _seed_macos_credentials() { echo seed >> "$TEST_TEMP/seed"; }
+  _account_apply_exec_env() { :; }
+  # A pinned box (store pin is a named account): the seed must NOT run.
+  _claude_env_store_pin() { printf work; }
+  printf '0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run test -f "$TEST_TEMP/seed"; assert_failure
+  # The shared login (default pin): the seed runs.
+  rm -f "$TEST_TEMP/seed"
+  _claude_env_store_pin() { printf '%s' "$_ACCOUNT_DEFAULT"; }
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run cat "$TEST_TEMP/seed"; assert_output "seed"
+}
+
+@test "relaunch keeps watchers across the relaunch and tears them down once at the end" {
+  rl_setup
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run cat "$HB_EXEC_COUNT"; assert_output "2"
+  # The harvest (part of the single final teardown) runs exactly once, not per
+  # iteration: the watchers stayed up across the relaunch.
+  run grep -c '^harvest' "$TEST_TEMP/order"
+  assert_output "1"
+}
+
+@test "relaunch hides code 143 only when a ticket explains it" {
+  rl_setup
+  # 143 with a ticket: reopen, clean end, no exit-code line.
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  refute_output --partial "exited with code 143"
+  assert_output --partial "Session ended"
+  # 143 with no ticket: reported as today.
+  rm -f "$HB_EXEC_COUNT" "$HB_RUN_DIR"/.handoff.*
+  printf '143\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_output --partial "Claude exited with code 143"
+}
+
+@test "relaunch sets an exec id only for the fixed argument shapes on a terminal and after the user env args" {
+  rl_setup
+  _RESOLVED_ENV_ARGS=(-e FOO=bar)
+  printf '0\n0\n0\n' > "$HB_PLAN"
+  # Relaunchable + interactive: an exec id, placed AFTER the user env args.
+  run exec_claude "$CN" --dangerously-skip-permissions
+  run sed -n '1p' "$TEST_TEMP/eargv"
+  assert_output --partial "CLEAT_EXEC_ID="
+  local line; line="$(sed -n '1p' "$TEST_TEMP/eargv")"
+  run bash -c '[[ "${1%%CLEAT_EXEC_ID*}" == *"FOO=bar"* ]]' _ "$line"
+  assert_success
+  # A non-relaunchable argv shape: no exec id.
+  : > "$TEST_TEMP/eargv"; rm -f "$HB_EXEC_COUNT"
+  run exec_claude "$CN" --dangerously-skip-permissions --verbose
+  run sed -n '1p' "$TEST_TEMP/eargv"
+  refute_output --partial "CLEAT_EXEC_ID="
+  # Not a terminal: no exec id even for a relaunchable shape.
+  : > "$TEST_TEMP/eargv"; rm -f "$HB_EXEC_COUNT"
+  _is_interactive() { return 1; }
+  run exec_claude "$CN" --dangerously-skip-permissions
+  run sed -n '1p' "$TEST_TEMP/eargv"
+  refute_output --partial "CLEAT_EXEC_ID="
+}
+
+@test "relaunch ends with the stopped waiting line on Ctrl C during the wait" {
+  rl_setup
+  HB_TICKET_TO="work"
+  _HANDOFF_T1_WAIT_S=1
+  _handoff_t1_pause() {
+    if [[ ! -f "$TEST_TEMP/killed" ]]; then : > "$TEST_TEMP/killed"; sh -c 'kill -INT $PPID'; fi
+    sleep 0.05
+  }
+  printf '143 req\n' > "$HB_PLAN"   # requested with a live writer, interrupted before ready
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_output --partial "Stopped waiting for the account switch"
+  run cat "$HB_EXEC_COUNT"; assert_output "1"
+}
+
+@test "relaunch restores the terminal before the final harvest" {
+  rl_setup
+  _restore_terminal() { echo restore >> "$TEST_TEMP/order2"; }
+  _account_sync_out() { echo harvest >> "$TEST_TEMP/order2"; return 0; }
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  # The FINAL restore is the last one; the final harvest follows it.
+  run bash -c 'tail -2 "$1"' _ "$TEST_TEMP/order2"
+  assert_output "$(printf 'restore\nharvest')"
+}
+
+@test "relaunch prints the resume dialog hint and never suppresses the dialog" {
+  rl_setup
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  # The reopen prints a one-line hint so a typed continue is not eaten by the
+  # resume-from-summary dialog if it fires (O1 declined, the dialog is not
+  # suppressed).
+  assert_output --partial "answer that before you type continue"
+  # That means the threshold variable never rides on any exec (original or
+  # relaunch): the dialog is left free to fire.
+  run grep -c -- "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES" "$TEST_TEMP/eargv"
+  assert_output "0"
+}
+
+@test "relaunch ignores its consumed ticket when the relaunched session returns" {
+  rl_setup
+  # Same by and at: the relaunch's exec returns 0, the ticket is consumed, one
+  # relaunch only.
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run cat "$HB_EXEC_COUNT"; assert_output "2"
+  # A new pair (different by) written on the relaunch: a fresh switch, wait again.
+  rm -f "$HB_EXEC_COUNT" "$HB_RUN_DIR"/.handoff.*
+  printf '143 ready\n143 ready 99999\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run cat "$HB_EXEC_COUNT"; assert_output "3"
+}
+
+@test "relaunch names the account it landed on when the wait ends unfinished" {
+  rl_setup
+  HB_TICKET_BY="$(rl_dead_pid)"
+  # to == the settled pin (both the shared login): T-landed.
+  HB_TICKET_TO="default"
+  printf '143 req\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_output --partial "This conversation did not reopen"
+  refute_output --partial "The account switch did not finish"
+  # to != the settled pin: T-unfinished.
+  rm -f "$HB_EXEC_COUNT" "$HB_RUN_DIR"/.handoff.*
+  HB_TICKET_TO="work"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_output --partial "The account switch did not finish"
+  refute_output --partial "This conversation did not reopen"
+}
+
+@test "relaunch ends with the box stopped line when the box is gone" {
+  rl_setup
+  is_running() { return 1; }
+  printf '143 ready\n0\n' > "$HB_PLAN"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_output --partial "The box stopped during the account switch"
+  run cat "$HB_EXEC_COUNT"; assert_output "1"
+}

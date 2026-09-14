@@ -1,0 +1,113 @@
+# disclosure, one idle session
+  ! main has a live Claude session in another terminal (idle).
+    Handing it over to b restarts it there and reopens the same conversation.
+    Anything typed there but not sent is lost.
+    Any background agent or monitor it runs in this box stops with it.
+    The first reply on b may read the whole conversation again without a prompt cache. That can use a large share of b's usage.
+# disclosure, at a usage limit, with now, a busy and a plan mode and pro and an old version
+  ! main has a live Claude session in another terminal (at its usage limit).
+    Handing it over to b restarts it there and reopens the same conversation.
+    Anything typed there but not sent is lost.
+    Any background agent or monitor it runs in this box stops with it.
+    Its reply so far and any running tool are lost. It can start a turn by itself when it reopens.
+    The first reply on b may read the whole conversation again without a prompt cache. That can use a large share of b's usage.
+    b is on a Pro plan. cleat cannot tell whether that plan keeps 1M context.
+    It was in plan mode. Check its mode there after it reopens.
+    cleat has checked this handoff with Claude Code 2.1.270. This box runs 2.1.999.
+# disclosure, two sessions
+  ! main has 2 live Claude sessions in other terminals.
+    Handing both over to b restarts each in its own terminal and reopens its own conversation.
+    Anything typed in them but not sent is lost.
+    Any background agent or monitor they run in this box stops with them.
+    The first reply on b in each may read its whole conversation again without a prompt cache. That can use a large share of b's usage.
+# refusals
+  ✖ main is in the middle of a turn in another terminal.
+    Wait for it to finish, then run this again. To restart it now, add --now: its reply so far and any running tool are lost.
+    Nothing was changed.
+  ✖ main is waiting for an answer in another terminal.
+    Answer it there, then run this again. To restart it now, add --now: the tool it is asking about does not run.
+    Nothing was changed.
+  ✖ main is waiting for an answer in another terminal.
+    Answer it there, then run this again. To restart it now, add --now: the question there closes unanswered.
+    Nothing was changed.
+  ✖ main has background shell commands running in another terminal.
+    A restart would stop them and start a new turn on b by itself. Let them finish, then run this again.
+    Nothing was changed.
+  ✖ b has no working login, so the session in the other terminal would reopen signed out.
+    Exit it there. Then run cleat account b, cleat login and cleat resume.
+    Nothing was changed.
+  ✖ main's conversation is larger than a standard context window.
+    cleat found no sign it ran with 1M context, so it would reopen without it and could compact or fail.
+    Set the model it ran on, with [1m], in ~/.claude/settings.json and run this again. Nothing was changed.
+  ✖ The Claude session in main changed while you were answering.
+    Nothing was changed. Run this again to see what it is doing now.
+  ✖ Claude Code in main is still refreshing its login.
+    Nothing was changed. Try again in a moment.
+  ✖ The Claude session in main did not stop within 8 seconds, so main stays on account b.
+    It reopens there on b once it stops. Nothing was switched.
+  ✖ A Claude session started in main during the switch.
+    Nothing was changed. Run this again.
+  ✖ main still holds a login from an earlier switch that could not be saved.
+    Nothing was changed. Check that /home/you/.config/cleat/accounts is writable.
+  ✖ cleat could not read the login stored as b.
+    Nothing was changed. Check it with cleat account list.
+  ✖ main is still reopening a session from an earlier switch.
+    Nothing was changed. Run this again in a moment.
+  ✖ An earlier account switch in main is still finishing.
+    Nothing was changed. Run this again in a minute.
+  ✖ The clock in main is behind this computer's clock, so cleat cannot time the switch safely.
+    Nothing was changed. Restart Docker, then run this again.
+  ✖ The switch in main took too long to start.
+    Nothing was changed. Try again in a moment.
+  ✖ A Claude session is starting in main in another terminal.
+    Nothing was changed. Run this again once it is up.
+  ▸ main is already on account b.
+# results
+  ✔ main is now on account b
+  ✔ main is back on your shared login (~/.claude)
+    The session in the other terminal is reopening on b.
+    The 2 sessions in other terminals are reopening on b.
+    It has no login yet. Run cleat login to sign in. It is remembered under this name.
+  ▸ Kept. main stays on account a.
+# warnings
+  ! A new Claude session started in main during the switch, so main stays on account a.
+    The session in the other terminal is reopening on a.
+  ✖ cleat could not confirm the new login in main, so it stays on account a.
+    The session in the other terminal is reopening on a.
+  ! The switch in main did not report back. The new login is in place, so main is now on account b.
+  ✖ The switch in main did not report back. main stays on account a.
+    The session in the other terminal did not reopen. Run cleat resume there.
+  ! The login a had in main could not be saved.
+    It stays in main's auth folder until the next session there ends. The box can read it until then.
+  ! main could not clear account a's name before the restart.
+    The session in the other terminal tries again before it reopens and warns there if that fails too.
+  ! The switch in main ran out of time, so main stays on account a.
+    The session in the other terminal is reopening on a.
+  ! Another cleat command took over while main was switching.
+    cleat left the switch for the next session start to finish. See where main is with cleat account list.
+  ! The login a had in main could not be checked, so cleat kept it aside as held login held-01.
+    See it with cleat account held. Bring it back with cleat account adopt held-01 a.
+# confirmations
+    It reopened on b. Type continue there.
+    It reopened on b.
+    The usage limit lines there are from before the restart. Nothing is scheduled.
+    The usage limit lines there are from before the restart.
+    It reopened on b and is showing a question first. Answer it there before you type anything.
+    It reopened on b and started a turn by itself. Check it there before you type.
+    The session in the other terminal had already ended. Resume it there with cleat resume.
+    Stopped waiting. Check the other terminal.
+    All 2 reopened on b. Type continue in each.
+    1 of 3 reopened on b. Check the other terminals.
+  ! The other terminal has not reopened the session after 20 seconds. Check it there.
+  ! The reopened session may still show account a's name.
+    Claude Code may send that account's organization until it is cleared. cleat tries again before the next launch.
+# shared-login phrasings
+  ! main has 2 live Claude sessions in other terminals.
+    Handing both over to your shared login restarts each in its own terminal and reopens its own conversation.
+    Anything typed in them but not sent is lost.
+    Any background agent or monitor they run in this box stops with them.
+    The first reply on your shared login in each may read its whole conversation again without a prompt cache. That can use a large share of that login's usage.
+  ✔ main is back on your shared login (~/.claude)
+    The session in the other terminal is reopening on your shared login.
+  ! A new Claude session started in main during the switch, so main stays on your shared login.
+    The session in the other terminal is reopening on your shared login.

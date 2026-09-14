@@ -485,3 +485,33 @@ _rs_conv() {
   assert_success
   assert_output "$_rs_mine"
 }
+
+@test "resume pick skips a conversation that is reopening after an account switch" {
+  # Terminal 1 is reopening $_rs_mine (the newest) after a live account switch:
+  # a live kind=claude marker plus a valid handoff ticket naming its sid. cleat
+  # resume in a second terminal must NOT open it (two writers on one transcript);
+  # it opens the older $_rs_other instead. See _handoff_reopening_sids (5.7).
+  mkdir -p "$TEST_TEMP/project"
+  local cname sdir execid
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  is_running() { return 1; }
+  mock_docker_ps_a "$cname"
+  mkdir -p "$CLEAT_RUN_DIR/${cname}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${cname}/settings/settings.json"
+  sdir="$(_sessions_key_dir "$TEST_TEMP/project" main)"
+  _rs_conv "$sdir" "$_rs_other" claude-sonnet-5 claude-sonnet-5
+  touch -t 202601010000 "$sdir/$_rs_other.jsonl"
+  _rs_conv "$sdir" "$_rs_mine" claude-sonnet-5 claude-sonnet-5   # newest
+
+  # Mark $_rs_mine as reopening: a live marker and a ticket for its sid.
+  execid="deadbeef1234cafe"
+  printf 'kind=claude exec=%s\n' "$execid" > "$CLEAT_RUN_DIR/${cname}/.attached.$$"
+  _handoff_ticket_write "$cname" "$execid" ready "$_rs_mine" default
+
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_exec_has "--dangerously-skip-permissions --resume $_rs_other"
+  assert_success
+  run grep -F -- "--resume $_rs_mine" "$DOCKER_CALLS"
+  assert_failure
+}

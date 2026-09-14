@@ -933,7 +933,29 @@ CURL
   assert_output --partial "is now on account"
 }
 
-@test "smoke: cleat account refuses a box with a real Claude in it" {
+@test "smoke: cleat account refuses a live box that has no account mount" {
+  # No account mount: a switch cannot take effect, so a live session is refused
+  # rather than handed over (the live switch needs the mount).
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  local project cn
+  project="$(cli_call resolve_project "$TEST_TEMP/proj")"
+  cn="$(_compute_cname "$project")"
+  mock_docker_ps "$cn"
+  mock_docker_ps_a "$cn"
+  mock_docker_top \
+    'UID    PID   PPID  C  STIME  TTY   TIME      CMD' \
+    'claude 91    1     0  09:40  pts/0 00:00:09  claude --dangerously-skip-permissions --continue'
+  run cleat_bin_timeout 15 account work
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "has a live Claude session"
+}
+
+@test "smoke: cleat account hands a live mounted box to the switch and refuses safely on an unreadable probe" {
+  # A running, mounted box with a live agent routes to the live switch. The
+  # docker stub's exec is a no-op, so the probe reads nothing and the switch
+  # refuses without crashing under strict mode.
   mkdir -p "$TEST_TEMP/proj"
   cd "$TEST_TEMP/proj"
   local project cn
@@ -948,7 +970,21 @@ CURL
   run cleat_bin_timeout 15 account work
   assert_failure
   refute_output --partial "unbound variable"
-  assert_output --partial "has a live Claude session"
+  assert_output --partial "could not tell what the Claude session"
+}
+
+@test "smoke: cleat account rejects --now on a non-switch verb" {
+  run cleat_bin_timeout 10 account list --now
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "--now only applies when switching a box"
+}
+
+@test "smoke: cleat account help names the live-switch flags" {
+  run cleat_bin_timeout 10 account --help
+  assert_success
+  assert_output --partial "--now"
+  assert_output --partial "restarts on it and reopens its conversation"
 }
 
 @test "smoke: cleat account appears in help" {
@@ -2666,4 +2702,72 @@ WRAP
   refute_output --partial "syntax error"
   run grep -F -- "--resume $id --model claude-opus-5[1m]" "$DOCKER_CALLS"
   assert_success
+}
+
+# Resolve a project the way the CLI does and print "CNAME<TAB>SDIR". Sources a
+# strict-mode-stripped copy in a subshell (main() is guarded behind a
+# BASH_SOURCE check, so sourcing runs no command).
+_smoke_resolve() {
+  local proj="$1"
+  sed 's/^set -euo pipefail$/ /' "$CLI" > "$TEST_TEMP/cli-src.sh"
+  env HOME="$HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" bash -c '
+    cd "$3" || exit 1
+    source "$1" >/dev/null 2>&1 || true
+    p="$(resolve_project "")"
+    printf "%s\t%s" "$(container_name_for "$p" main)" "$(_sessions_key_dir "$p" main)"
+  ' _ "$TEST_TEMP/cli-src.sh" "$proj" "$proj"
+}
+
+@test "smoke: cleat relaunches once on a ready switch ticket under strict mode" {
+  # The relaunch loop, on the REAL binary under set -euo pipefail and a pty (so
+  # the session is interactive and relaunchable). The exec fixture returns 143
+  # with a ready ticket the first time and 0 the second, so the loop reopens
+  # once. See concept/44 5.6.
+  command -v script >/dev/null 2>&1 || skip "no script(1) for a pty (handover 9.2)"
+  script -qec true /dev/null >/dev/null 2>&1 || skip "script(1) -qec form unavailable"
+
+  mkdir -p "$TEST_TEMP/project"
+  local cname sdir sid resolved
+  sid="d7b73579-1111-2222-3333-444455556666"
+  resolved="$(_smoke_resolve "$TEST_TEMP/project")"
+  cname="${resolved%%$'\t'*}"; sdir="${resolved#*$'\t'}"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  mkdir -p "$sdir"
+  printf '{"type":"user","message":{"role":"user"},"parentUuid":null}\n' > "$sdir/$sid.jsonl"
+
+  local rundir="$XDG_CONFIG_HOME/cleat/run/$cname"
+  mkdir -p "$rundir"
+  cat > "$TEST_TEMP/exec.sh" <<SH
+#!/usr/bin/env bash
+flat="\$(printf '%s ' "\$@" | tr '\n' ' ')"
+case "\$flat" in *clip-daemon*) : ;; *) exit 0 ;; esac
+n=\$(cat "$TEST_TEMP/n" 2>/dev/null || echo 0); n=\$((n+1)); printf '%s' "\$n" > "$TEST_TEMP/n"
+id=""; for a in "\$@"; do case "\$a" in CLEAT_EXEC_ID=*) id="\${a#CLEAT_EXEC_ID=}";; esac; done
+if [ "\$n" -eq 1 ] && [ -n "\$id" ]; then
+  { printf 'v=1\n'; printf 'state=ready\n'; printf 'by=%s\n' "\$PPID"; printf 'at=%s\n' "\$(date +%s)"; printf 'sid=%s\n' "$sid"; printf 'to=default\n'; } > "$rundir/.handoff.\$id"
+  exit 143
+fi
+exit 0
+SH
+  chmod +x "$TEST_TEMP/exec.sh"
+
+  local cmd
+  cmd="cd '$TEST_TEMP/project' && env PATH='$MOCK_BIN:$PATH' HOME='$HOME' XDG_CONFIG_HOME='$XDG_CONFIG_HOME' DOCKER_CALLS='$DOCKER_CALLS' DOCKER_MOCK_DIR='$DOCKER_MOCK_DIR' DOCKER_STUB_EXEC_SCRIPT='$TEST_TEMP/exec.sh' CLEAT_TRUST_PROJECT=1 '$CLI' claude"
+  run script -qec "$cmd" /dev/null
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  # The real binary prints the dialog hint on the reopen (O1 declined).
+  assert_output --partial "answer that before you type continue"
+  # Two session execs: the original and the reopen.
+  run grep -c "docker exec -it" "$DOCKER_CALLS"
+  assert_output "2"
+  # The reopen carries the resume id exactly once.
+  run grep -c -- "--resume $sid" "$DOCKER_CALLS"
+  assert_output "1"
+  # O1 declined: the resume-from-summary dialog is not suppressed, so no
+  # threshold variable is ever injected on any exec.
+  run cat "$DOCKER_CALLS"
+  refute_output --partial "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES"
 }

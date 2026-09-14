@@ -216,6 +216,17 @@ case "$1" in
     # behaviour (empty output, which _box_has_live_agent reads as "live").
     _mock "top_output"
     ;;
+  exec)
+    # DOCKER_STUB_EXEC_SCRIPT: run the named script with the FULL docker argv
+    # (starting at `exec`) and this stub's stdin, print its stdout, and return
+    # its exit code. This lets a test drive exec_claude's relaunch loop and the
+    # login exec end to end without a real daemon. Absent, `docker exec` stays a
+    # no-op that exits 0 (the historic behaviour), so nothing else changes.
+    if [[ -n "${DOCKER_STUB_EXEC_SCRIPT:-}" ]]; then
+      "$DOCKER_STUB_EXEC_SCRIPT" "$@"
+      exit $?
+    fi
+    ;;
   run)
     # Validate bind mounts in strict / virtiofs modes. This must happen
     # BEFORE we emit DOCKER_STDERR / exit so the strict errors take priority.
@@ -229,7 +240,7 @@ case "$1" in
     # used. Anything else (e.g. `docker image rm`) falls through to exit 0.
     [[ "${2:-}" == "inspect" ]] && _handle_image_inspect "${@:3}"
     ;;
-  build|start|stop|rm|exec|logs|rmi|builder)
+  build|start|stop|rm|logs|rmi|builder)
     ;;
   commit)
     # Tests that need a commit to fail (e.g. upgrade-claude commit failure)

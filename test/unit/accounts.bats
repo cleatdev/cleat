@@ -2516,6 +2516,22 @@ _lock_absent() {   # $1 = what just ran
   assert_success
 }
 
+@test "account: lock ownership reads true only while this shell still holds it" {
+  # The live switch writes the store only while it owns the lock. Before it takes
+  # the lock, ownership is false. After it takes the lock, true. If an age-bound
+  # steal by another command replaces the owner record, ownership must go false
+  # again so the switch never writes over a login another command is staging.
+  run _account_lock_owned
+  assert_failure
+  _account_lock
+  run _account_lock_owned
+  assert_success
+  printf 'host %s pid 2147483646 at %s\n' "${HOSTNAME:-unknown}" "$(date +%s)" > "$(_lock_dir)/owner"
+  run _account_lock_owned
+  assert_failure
+  _account_unlock
+}
+
 @test "account: something this CLI did not create at the lock path is never cleared or waited on" {
   # Only a directory is ever made there. A symlink is refused at once, even one
   # old enough to read as abandoned, rather than followed, removed or polled.
@@ -3827,4 +3843,82 @@ _login_box() {
   assert_output --partial "another cleat command is changing accounts"
   assert_output --partial "saved when the next session ends"
   refute_output --partial "Auth saved"
+}
+
+@test "account rm refuses while a pinned box is reopening a session" {
+  # A box mid-handoff still has a ticket its own terminal will consume to reopen
+  # the conversation on this account. Removing the account now would unpin it out
+  # from under that reopen, so rm refuses and changes nothing.
+  _mk_account work
+  _box_account_write "$CN" work
+  local sid="d7b73579-1111-2222-3333-444455556666"
+  _handoff_ticket_write "$CN" "deadbeef1234cafe" requested "$sid" work
+  run _account_do_remove work 1
+  assert_failure
+  assert_output --partial "is still reopening a session from an earlier switch"
+  [ -d "$CLEAT_ACCOUNTS_DIR/work" ] || fail "the account was removed while a box was reopening"
+}
+
+# ── the live switch routing (M4) ────────────────────────────────────────────
+
+@test "account: a running mounted box with a live session routes the switch to the live handoff" {
+  _mk_account work
+  _box_account_write "$CN" old; _mk_account old
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _box_has_live_agent() { return 0; }
+  _account_box_ready() { return 0; }
+  # The handoff itself is exercised in handoff.bats; here we prove the router
+  # reaches it, with the flags passed through.
+  _account_handoff() { echo "ROUTED $1 $2 $5 $6"; return 0; }
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj" 1 1
+  assert_success
+  assert_output "ROUTED work main 1 1"
+}
+
+@test "account: a live box with no account mount is refused, never handed over" {
+  _mk_account work
+  _box_account_write "$CN" old; _mk_account old
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _box_has_live_agent() { return 0; }
+  _account_box_ready() { return 1; }
+  _account_handoff() { echo "SHOULD-NOT-ROUTE"; return 0; }
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj" 0 0
+  assert_failure
+  assert_output --partial "has a live Claude session"
+  refute_output --partial "SHOULD-NOT-ROUTE"
+  run _box_account_read "$CN"; assert_output "old"
+}
+
+@test "account: a running mounted box with no live session keeps the offline switch" {
+  _mk_account work
+  _box_account_write "$CN" old; _mk_account old
+  mkdir -p "$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _box_has_live_agent() { return 1; }
+  _account_box_ready() { return 0; }
+  _account_handoff() { echo "SHOULD-NOT-ROUTE"; return 0; }
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  refute_output --partial "SHOULD-NOT-ROUTE"
+  assert_output --partial "is now on account"
+  run _box_account_read "$CN"; assert_output "work"
+}
+
+@test "account: default unpin of a running mounted box with a live session routes to the handoff" {
+  _box_account_write "$CN" old; _mk_account old
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _box_has_live_agent() { return 0; }
+  _account_box_ready() { return 0; }
+  _account_handoff() { echo "ROUTED $1 $2"; return 0; }
+  run _account_do_switch default main "$CN" "$TEST_TEMP/proj" 0 1
+  assert_success
+  assert_output "ROUTED default main"
 }

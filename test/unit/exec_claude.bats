@@ -717,19 +717,27 @@ rl_dead_pid() { local p; sleep 0.01 & p=$!; wait "$p" 2>/dev/null || true; echo 
   assert_output "$(printf 'restore\nharvest')"
 }
 
-@test "relaunch prints the resume dialog hint and never suppresses the dialog" {
+@test "relaunch suppresses the resume dialog on the reopen only" {
   rl_setup
   printf '143 ready\n0\n' > "$HB_PLAN"
   run exec_claude "$CN" --dangerously-skip-permissions
   assert_success
-  # The reopen prints a one-line hint so a typed continue is not eaten by the
-  # resume-from-summary dialog if it fires (O1 declined, the dialog is not
-  # suppressed).
-  assert_output --partial "answer that before you type continue"
-  # That means the threshold variable never rides on any exec (original or
-  # relaunch): the dialog is left free to fire.
-  run grep -c -- "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES" "$TEST_TEMP/eargv"
-  assert_output "0"
+  # The reopen is transparent: no question in the way, so no hint to answer one.
+  refute_output --partial "answer that before you type continue"
+  # Line 1 is the original exec. An ordinary launch keeps Claude Code's own
+  # resume behaviour, so neither threshold rides on it.
+  run sed -n '1p' "$TEST_TEMP/eargv"
+  refute_output --partial "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES"
+  refute_output --partial "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD"
+  # Line 2 is the reopen. Both thresholds, each of which suppresses the dialog
+  # on its own, at values no real session reaches.
+  run sed -n '2p' "$TEST_TEMP/eargv"
+  assert_output --partial "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=$_HANDOFF_RESUME_THRESHOLD_MIN"
+  assert_output --partial "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=$_HANDOFF_RESUME_TOKEN_THRESHOLD"
+  run test "$_HANDOFF_RESUME_THRESHOLD_MIN" -ge 5256000
+  assert_success
+  run test "$_HANDOFF_RESUME_TOKEN_THRESHOLD" -ge 1000000000
+  assert_success
 }
 
 @test "relaunch ignores its consumed ticket when the relaunched session returns" {

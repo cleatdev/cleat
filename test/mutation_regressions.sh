@@ -10501,15 +10501,40 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_handoff_restore_before_harvest" "restores the terminal before the final harvest" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# The reopen prints the resume-from-summary dialog hint on every relaunch, so a
-# typed continue is not eaten by the dialog (O1 declined, not suppressed). Drop
-# the hint line.
+# The reopen after a switch suppresses Claude Code's resume-from-summary dialog,
+# so a typed continue lands in the conversation instead of picking an option.
+# Drop the minutes threshold from the reopen.
 cat > "$SED_TMP" << 'SED'
-/^_handoff_say_t1()/,/^}$/{
-  /answer that before you type continue/d
+/^exec_claude()/,/^}$/{
+  s@^      _ec_extra+=(-e "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=[$][{]_HANDOFF_RESUME_THRESHOLD_MIN[}]")$@      :@
 }
 SED
-try "vnext_handoff_dialog_hint_on_relaunch" "resume dialog hint and never suppresses" "$CLI" "$EXEC_CLAUDE_BATS"
+try "vnext_handoff_dialog_minutes_on_reopen" "suppresses the resume dialog on the reopen only" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The token threshold is set too, so a rename of either variable still leaves
+# the reopen transparent. Drop it.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^      _ec_extra+=(-e "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=[$][{]_HANDOFF_RESUME_TOKEN_THRESHOLD[}]")$@      :@
+}
+SED
+try "vnext_handoff_dialog_tokens_on_reopen" "suppresses the resume dialog on the reopen only" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# Only the reopen. An ordinary launch keeps Claude Code's own resume behaviour.
+# Ride the minutes threshold on every exec.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    _ec_extra=()$@    _ec_extra=(-e "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${_HANDOFF_RESUME_THRESHOLD_MIN}")@
+  s@_ec_extra=(-e "CLEAT_EXEC_ID=[$][{]_ec_id[}]")@_ec_extra+=(-e "CLEAT_EXEC_ID=${_ec_id}")@
+}
+SED
+try "vnext_handoff_dialog_reopen_only" "suppresses the resume dialog on the reopen only" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# A small threshold does not suppress anything: the dialog's own default is 70.
+cat > "$SED_TMP" << 'SED'
+s@^_HANDOFF_RESUME_THRESHOLD_MIN=5256000 @_HANDOFF_RESUME_THRESHOLD_MIN=70 @
+SED
+try "vnext_handoff_dialog_minutes_large" "suppresses the resume dialog on the reopen only" "$CLI" "$EXEC_CLAUDE_BATS"
 
 # The consumed ticket is matched on by AND at before removal. Match anything.
 cat > "$SED_TMP" << 'SED'

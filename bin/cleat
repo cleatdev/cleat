@@ -9406,14 +9406,11 @@ _handoff_acct_phrase() {
   if [[ "$1" == "$_ACCOUNT_DEFAULT" ]]; then printf 'your shared login'; else printf 'account %s' "$1"; fi
 }
 
-# The T1/T1b reopen line, then T-limit, then the dialog hint. TO is the ticket's
-# account, FLAGS is the `L A` _handoff_tail_flags read from the transcript before
-# the relaunch. The pin is _EC_PINNED, set by the prepare this iteration, so it
-# names the login the relaunch really uses, never the ticket's target.
-# The resume-from-summary dialog is not suppressed (maintainer decision): it can
-# fire on any old, large conversation, not only at a usage limit, so the hint
-# prints on every relaunch. It reads `waiting`/`dialog open` and a typed
-# `continue` picks one of its options (1.9), so the user answers it first.
+# The T1/T1b reopen line, then T-limit. TO is the ticket's account, FLAGS is the
+# `L A` _handoff_tail_flags read from the transcript before the relaunch. The pin
+# is _EC_PINNED, set by the prepare this iteration, so it names the login the
+# relaunch really uses, never the ticket's target. No dialog hint: the reopen
+# suppresses the resume-from-summary dialog (_HANDOFF_RESUME_THRESHOLD_MIN).
 _handoff_say_t1() {
   local to="$1" flags="$2" pin="$_EC_PINNED" who="" phrase L A
   phrase="$(_handoff_acct_phrase "$pin")"
@@ -9438,7 +9435,6 @@ _handoff_say_t1() {
       echo -e "    ${DIM}The usage limit lines in it are from before the restart.${RESET}"
     fi
   fi
-  echo -e "    ${DIM}If it shows a question first, answer that before you type continue.${RESET}"
 }
 
 # Wait, in the CURRENT shell, for terminal 2's ticket to reach `ready`. Never
@@ -9816,6 +9812,13 @@ exec_claude() {
     trap _cleanup_session EXIT INT TERM HUP
     _ec_extra=()
     if [[ -n "$_ec_id" ]]; then _ec_extra=(-e "CLEAT_EXEC_ID=${_ec_id}"); fi
+    # The reopen after a switch lands on the same conversation with no question
+    # in the way. Never on the first launch, so an ordinary `cleat` keeps Claude
+    # Code's own behaviour.
+    if [[ $_ec_relaunch -eq 1 ]]; then
+      _ec_extra+=(-e "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${_HANDOFF_RESUME_THRESHOLD_MIN}")
+      _ec_extra+=(-e "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=${_HANDOFF_RESUME_TOKEN_THRESHOLD}")
+    fi
     docker exec -it "${CLAUDE_ENV[@]}" \
       "${_heap_env[@]+"${_heap_env[@]}"}" \
       "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
@@ -16260,6 +16263,15 @@ _HANDOFF_OUT_MAX_BYTES=65536      # cap on the terminate exec's captured output
 _HANDOFF_STD_WINDOW_TOKENS=200000 # the standard context window
 _HANDOFF_VERIFIED_CLAUDE="2.1.270" # the Claude Code the handoff was checked against, space-separated
 _HANDOFF_COMPACT_BUFFER_TOKENS=13000 # auto-compact fires this far below the window
+# Claude Code's resume-from-summary dialog, on the handoff reopen only. It fires
+# when a flag is on, the last message is older than
+# CLAUDE_CODE_RESUME_THRESHOLD_MINUTES (default 70) AND the conversation is past
+# CLAUDE_CODE_RESUME_TOKEN_THRESHOLD (default 100000). That is exactly the
+# at-limit case, and a typed `continue` then picks one of its options. Either
+# variable alone suppresses it (measured on 2.1.270 with the flag seeded), so
+# both are set: a rename of one still leaves the reopen transparent.
+_HANDOFF_RESUME_THRESHOLD_MIN=5256000        # ten years
+_HANDOFF_RESUME_TOKEN_THRESHOLD=2000000000   # past any real context window
 _HB_LOCK_WAIT_S=8                 # the in-box verb's wait for Claude's refresh lock
 _HB_KILL_WAIT_S=8                 # the in-box verb's wait for a signalled Claude to exit
 _HB_CLAUDE_LOCK_STALE_S=60        # Claude's own proper-lockfile stale bound, shipped into the box

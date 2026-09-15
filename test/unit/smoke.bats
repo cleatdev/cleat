@@ -2758,16 +2758,24 @@ SH
   run script -qec "$cmd" /dev/null
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
-  # The real binary prints the dialog hint on the reopen (O1 declined).
-  assert_output --partial "answer that before you type continue"
+  # The reopen is transparent, so the real binary prints no dialog hint.
+  refute_output --partial "answer that before you type continue"
   # Two session execs: the original and the reopen.
   run grep -c "docker exec -it" "$DOCKER_CALLS"
   assert_output "2"
   # The reopen carries the resume id exactly once.
   run grep -c -- "--resume $sid" "$DOCKER_CALLS"
   assert_output "1"
-  # O1 declined: the resume-from-summary dialog is not suppressed, so no
-  # threshold variable is ever injected on any exec.
-  run cat "$DOCKER_CALLS"
-  refute_output --partial "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES"
+  # Both dialog thresholds ride on the reopen and on nothing else.
+  run grep -c -- "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c -- "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=" "$DOCKER_CALLS"
+  assert_output "1"
+  # And that one exec is the reopen: the variable is recorded after the second
+  # session exec starts (the stub writes each call across several lines).
+  local second var
+  second="$(grep -n "docker exec -it" "$DOCKER_CALLS" | sed -n '2p' | cut -d: -f1)"
+  var="$(grep -n -- "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  run test "${var:-0}" -ge "${second:-999999}"
+  assert_success
 }

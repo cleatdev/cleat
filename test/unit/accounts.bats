@@ -957,6 +957,20 @@ _mk_trashed() {
   assert_output --partial "cleat rm"
 }
 
+@test "account: the recreate remedy for a box without the account mount is a real command" {
+  # It printed `cleat rm main then cleat main`, and `cleat main` is not a
+  # command: the binary answers "Unknown command: main" with rc 1.
+  _mk_account work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  _box_has_live_agent() { return 1; }
+  docker() { case "$1" in exec) return 1 ;; *) return 0 ;; esac; }
+  run _account_do_switch work main "$CN" "$TEST_TEMP/proj"
+  assert_failure
+  assert_output --partial "cleat start main"
+  refute_output --regexp "then [^ ]*cleat [^ ]*main"
+}
+
 @test "account: removing an account unpins the boxes that used it" {
   _pass_gates
   _is_interactive() { return 0; }
@@ -1980,6 +1994,25 @@ _acct_keys() {
   assert_success
   assert_output --partial "work"
   refute_output --partial "shared"
+}
+
+@test "account: a pinned box without the account mount says its auth is shared" {
+  # The pin stays on a box that predates the account mount, but the exec runs
+  # it on the shared login. The launch line read the pin and printed a green
+  # "Auth from account work" above a session on the shared login.
+  _mk_account work
+  _box_account_write "$CN" work
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  mock_docker_inspect $'/workspace\n/home/coder/.claude'
+  run _print_auth_line "$CN"
+  assert_success
+  assert_output --partial "Auth shared"
+  refute_output --partial "Auth from account"
+  # With the mount the pin is in effect.
+  mock_docker_inspect $'/workspace\n/home/coder/.claude\n/home/coder/.cleat-auth'
+  run _print_auth_line "$CN"
+  assert_output --partial "Auth from account"
 }
 
 @test "account: an unpinned box still says its auth is shared" {
@@ -3612,6 +3645,72 @@ _mcp_member() {
   assert_failure
 }
 
+# The unpin, account rm and account adopt each ended a box's use of a login by
+# deleting the whole staged file, which signed the box out of the MCP servers it
+# logged into for itself. A switch between two named accounts kept them. All
+# three now take the account's keys out and leave the rest.
+_mcp_staged_fixture() {
+  _pass_gates
+  _account_usage_fetch() { return 1; }
+  STAGED="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _mk_account work 1789003600000 work-token
+  _box_account_write "$CN" work
+  mkdir -p "${STAGED%/*}"
+  printf '{%s,"claudeAiOauth":{"accessToken":"a-token","refreshToken":"work-token","expiresAt":1789003600000}}\n' \
+    "$(_mcp_member own)" > "$STAGED"
+}
+
+@test "account: unpinning keeps the box's own MCP login in the staged file" {
+  _mcp_staged_fixture
+  run _account_do_switch default main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run _box_account_read "$CN"
+  assert_output "default"
+  run cat "$STAGED"
+  assert_output --partial "MCP-own"
+  refute_output --partial "claudeAiOauth"
+  run _mode_of "$STAGED"
+  assert_output "600"
+}
+
+@test "account: account rm keeps the unpinned box's own MCP login in the staged file" {
+  _mcp_staged_fixture
+  _is_interactive() { return 0; }
+  _ask_yn() { printf -v "$1" '%s' 'y'; }
+  run _account_do_remove work 1
+  assert_success
+  run _box_account_read "$CN"
+  assert_output "default"
+  run cat "$STAGED"
+  assert_output --partial "MCP-own"
+  refute_output --partial "claudeAiOauth"
+}
+
+@test "account: account adopt keeps a pinned box's own MCP login in the staged file" {
+  _mcp_staged_fixture
+  _mk_held adopted-token 1789025200000 "" left-in-box
+  run _account_do_adopt "$HELD_ID" work
+  assert_success
+  run cat "$STAGED"
+  assert_output --partial "MCP-own"
+  refute_output --partial "claudeAiOauth"
+  run grep -c adopted-token "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  assert_output "1"
+}
+
+@test "account: an unpin removes a staged file that holds nothing but the account's login" {
+  _pass_gates
+  _account_usage_fetch() { return 1; }
+  _mk_account work 1789003600000 work-token
+  _box_account_write "$CN" work
+  mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
+  cp "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  run _account_do_switch default main "$CN" "$TEST_TEMP/proj"
+  assert_success
+  run test -e "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  assert_failure
+}
+
 @test "account: staging by key writes the same bytes with and without jq" {
   # jq is optional on the host. A Mac without it and a Linux host with it must
   # harvest and stage the same bytes from the same input.
@@ -3845,6 +3944,56 @@ _login_box() {
   refute_output --partial "Auth saved"
 }
 
+# An accounts directory that cannot take the lock at all (a sudo run left it
+# root-owned, a read-only mount, a full disk) was reported at three sites as
+# another cleat command changing accounts, with a promise of a later save that
+# can never happen. The failure is simulated the way EACCES, EROFS and ENOSPC
+# look to the lock: mkdir fails and leaves nothing at the path.
+_unwritable_lock() {
+  local lock; lock="$(_account_lock_path)"
+  eval "mkdir() { [[ \"\$1\" == '$lock' ]] && return 1; command mkdir \"\$@\"; }"
+}
+
+@test "account: cleat login names an unwritable accounts directory, not another command" {
+  _mk_account work 1000 old-token
+  _login_box ""
+  _box_account_write "$_LB_CN" work
+  _account_sync_out() { _ACCOUNT_LOCK_UNWRITABLE=1; return "$_ACCOUNT_LOCK_BUSY"; }
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Cleat cannot write to the accounts directory"
+  assert_output --partial "Check that $CLEAT_ACCOUNTS_DIR is writable."
+  refute_output --partial "another cleat command"
+  refute_output --partial "saved when the next session ends"
+}
+
+@test "account: an attach names an unwritable accounts directory, not another command" {
+  _mk_account work
+  _box_account_write "$CN" work
+  _account_box_ready() { return 0; }
+  _unwritable_lock
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$CN"
+  assert_success
+  assert_output --partial "Cleat cannot write to the accounts directory"
+  assert_output --partial "Check that $CLEAT_ACCOUNTS_DIR is writable."
+  refute_output --partial "Another cleat command"
+}
+
+@test "account: a run-dir wipe names an unwritable accounts directory, not another command" {
+  _mk_account work
+  _box_account_write "$CN" work
+  _mk_staged "$CN"
+  _unwritable_lock
+  run _account_wipe_run_dir "$CN"
+  assert_success
+  assert_output --partial "Cleat cannot write to the accounts directory"
+  assert_output --partial "Check that $CLEAT_ACCOUNTS_DIR is writable."
+  refute_output --partial "another cleat command"
+  run test -f "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  assert_success
+}
+
 @test "account rm refuses while a pinned box is reopening a session" {
   # A box mid-handoff still has a ticket its own terminal will consume to reopen
   # the conversation on this account. Removing the account now would unpin it out
@@ -3857,6 +4006,29 @@ _login_box() {
   assert_failure
   assert_output --partial "is still reopening a session from an earlier switch"
   [ -d "$CLEAT_ACCOUNTS_DIR/work" ] || fail "the account was removed while a box was reopening"
+}
+
+@test "account rm refuses while a pinned box has a cleat shell open" {
+  # The unpin is a move from an account to the shared login, which the switch
+  # refuses with a cleat shell open (a claude started there keeps the login the
+  # shell opened with). rm unpinned the box anyway.
+  _pass_gates
+  _mk_account work
+  _box_account_write "$CN" work
+  mkdir -p "$CLEAT_RUN_DIR/$CN"
+  printf 'kind=shell\n' > "$CLEAT_RUN_DIR/$CN/.attached.$$"
+  run _account_do_remove work 1
+  assert_failure
+  assert_output --partial "has a cleat shell open in another terminal"
+  [ -d "$CLEAT_ACCOUNTS_DIR/work" ] || fail "the account was removed with a shell open"
+  run _box_account_read "$CN"
+  assert_output "work"
+  run test -e "$CLEAT_ACCOUNTS_DIR/.lock"
+  assert_failure
+  # Once the shell has gone, the remove goes through.
+  rm -f "$CLEAT_RUN_DIR/$CN/.attached.$$"
+  run _account_do_remove work 1
+  assert_success
 }
 
 # ── the live switch routing (M4) ────────────────────────────────────────────

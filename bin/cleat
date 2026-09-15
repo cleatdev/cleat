@@ -583,17 +583,38 @@ _validate_box_name() {
 # differently from one run to the next (a locale change between two `cleat`
 # invocations is enough), and a key that moves orphans the project's whole
 # session history and its .claude.json store. Byte-identical for every ASCII
-# basename, so no existing user is re-keyed by adding the pin.
+# basename. A non-ASCII basename that v1.4.3 keyed under a UTF-8 locale keeps
+# that key while its session directory exists and the C key's does not.
+#
+# The legacy lookup tries the caller's own locale first (what v1.4.3 ran), then
+# C.UTF-8, then en_US.UTF-8. A locale the host does not have makes tr and sed
+# fall back to C, so that candidate equals the C key and is skipped. Only an
+# existing real directory adopts a legacy key: a symlink never does.
 _derive_project_session_key() {
   local project="$1"
   local box="${2:-}"
-  local _basename _hash key
+  local _basename _hash key _suffix="" _legacy _loc
   _basename="$(basename "$project" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g')"
   _hash="$(echo -n "$project" | _md5 | head -c 8)"
-  key="${_basename}-${_hash}"
   if [[ -n "$box" && "$box" != "main" ]]; then
-    key="${key}-${box}"
+    _suffix="-${box}"
   fi
+  if [[ ! -d "${HOME}/.claude/projects/${_basename}-${_hash}${_suffix}" ]] \
+     && printf '%s' "$(basename "$project")" | LC_ALL=C grep -q '[^[:print:]]' 2>/dev/null; then
+    for _loc in "" C.UTF-8 en_US.UTF-8; do
+      if [[ -z "$_loc" ]]; then
+        _legacy="$(basename "$project" 2>/dev/null | tr '[:upper:]' '[:lower:]' 2>/dev/null | sed 's/[^a-z0-9-]/-/g' 2>/dev/null)"
+      else
+        _legacy="$(basename "$project" 2>/dev/null | LC_ALL="$_loc" tr '[:upper:]' '[:lower:]' 2>/dev/null | LC_ALL="$_loc" sed 's/[^a-z0-9-]/-/g' 2>/dev/null)"
+      fi
+      [[ -n "$_legacy" && "$_legacy" != "$_basename" ]] || continue
+      if [[ -d "${HOME}/.claude/projects/${_legacy}-${_hash}${_suffix}" && ! -L "${HOME}/.claude/projects/${_legacy}-${_hash}${_suffix}" ]]; then
+        _basename="$_legacy"
+        break
+      fi
+    done
+  fi
+  key="${_basename}-${_hash}${_suffix}"
   echo "$key"
 }
 
@@ -2889,12 +2910,12 @@ PROVISIONING_NOTES_EOF
 _kit_description() {
   case "$1" in
     plan-big-execute-small)
-      echo "Run your session on Fable 5: it plans and reviews while worker and scout subagents (Sonnet 5 by default) execute and explore, each in its own context window so the main session stays lean. Flagship judgment on the plan and every review, the mechanical bulk billed at the worker model's rate, so heavy work burns your rate limit far slower. Adapted from Anthropic's coordinator-pattern cookbook."
+      echo "Run your session on Fable 5.1: it plans and reviews while worker and scout subagents (Sonnet 5 by default) execute and explore, each in its own context window so the main session stays lean. Flagship judgment on the plan and every review, the mechanical bulk billed at the worker model's rate, so heavy work burns your rate limit far slower. Adapted from Anthropic's coordinator-pattern cookbook."
       ;;
   esac
 }
 
-# Post-enable nudge, per kit. The flagship pairing names Fable 5 as the
+# Post-enable nudge, per kit. The flagship pairing names Fable 5.1 as the
 # planner, but the kit never touches the session model (concept/34): the
 # user's knob is /model inside the session, so name it at the moment they
 # are about to start one. Claude Code saves /model as the default for new
@@ -2914,7 +2935,7 @@ _kit_reference_line() {
 _kit_post_enable_hint() {
   case "$1" in
     plan-big-execute-small)
-      echo -e "    ${DIM}The planner is your session's model: pick Fable 5 with ${RESET}${BOLD}/model${RESET}${DIM} in-session (it sticks for new sessions).${RESET}"
+      echo -e "    ${DIM}The planner is your session's model: pick Fable 5.1 with ${RESET}${BOLD}/model${RESET}${DIM} in-session (it sticks for new sessions).${RESET}"
       ;;
   esac
 }
@@ -3087,11 +3108,17 @@ _maybe_note_missing_kit_masks() {
   # is the only signal an existing box gets, which is the deliberate trade: it
   # tells, it never forces.
   local _instr
+  # The remedy names the box. A bare `cleat rm` removes main without a prompt,
+  # so telling a named box to run `cleat rm && cleat` removed the wrong one.
+  local _b="${_BOX:-main}" _fix="cleat rm && cleat"
+  if [[ "$_b" != main ]]; then
+    _fix="cleat rm ${_b} && cleat start ${_b}"
+  fi
   for d in /home/coder/.claude/CLAUDE.md /home/coder/.claude/agents \
            /home/coder/.claude/commands /home/coder/.claude/skills \
            /home/coder/.claude/plugins; do
     if ! printf '%s\n' "$dests" | grep -qx "$d"; then
-      info "This box predates the read-only ~/.claude masks. Recreate to enable them: ${BOLD}cleat rm && cleat${RESET}"
+      info "This box predates the read-only ~/.claude masks. Recreate to enable them: ${BOLD}${_fix}${RESET}"
       return 0
     fi
   done
@@ -3101,13 +3128,13 @@ _maybe_note_missing_kit_masks() {
   local _priv
   for _priv in $_CLAUDE_PRIVATE_DIRS; do
     if ! printf '%s\n' "$dests" | grep -qx "/home/coder/.claude/$_priv"; then
-      info "This box predates the per-box ~/.claude state directories. Recreate to enable them: ${BOLD}cleat rm && cleat${RESET}"
+      info "This box predates the per-box ~/.claude state directories. Recreate to enable them: ${BOLD}${_fix}${RESET}"
       return 0
     fi
   done
   for _instr in $_CLAUDE_INSTR_DIRS $_CLAUDE_INSTR_FILES; do
     if ! printf '%s\n' "$dests" | grep -qx "/home/coder/.claude/$_instr"; then
-      info "This box predates the ~/.claude instruction-surface masks. Recreate to enable them: ${BOLD}cleat rm && cleat${RESET}"
+      info "This box predates the ~/.claude instruction-surface masks. Recreate to enable them: ${BOLD}${_fix}${RESET}"
       return 0
     fi
   done
@@ -3511,8 +3538,13 @@ _CLAUDE_PRIVATE_DIRS="file-history paste-cache uploads backups shell-snapshots s
 # masks, and policy-limits.json with its two signature sidecars is left writable
 # on purpose (concept/41 records why). The tail of that list (remote-settings
 # and its consent files, state, shares, mcp-skill-archives,
-# mcp-discovery-cache) has NOT been reviewed. remote-settings.json is a cached
-# managed-settings file, so concept/41 names it as open rather than inert.
+# mcp-discovery-cache, bridge-spawn, .cc-writes) has NOT been reviewed.
+# remote-settings.json is a cached managed-settings file, so concept/41 names it
+# as open rather than inert. bridge-spawn holds the MCP config the host's own
+# remote-control bridge hands a spawned session, and Claude Code refuses a spawn
+# root that is not exactly 0700, so it cannot join the go-w private dirs above
+# as they stand. .cc-writes is the host writer's rename staging dir, which a
+# mount would break with EXDEV.
 #
 # The root itself is NOT made read-only, and that is a measured decision rather
 # than a missing step. Token refresh CREATES files at the root
@@ -4647,6 +4679,9 @@ _resolve_setup_trust() {
 # at most once per file per process (no assoc arrays, bash 3.2: a
 # pipe-delimited accumulator string).
 _WARNED_SECTIONS_FILES=""
+# Project cap files whose unsafe-rm has already been reported this run (see
+# resolve_caps). Same once-per-file shape as the section warning above.
+_WARNED_UNSAFE_RM_FILES=""
 
 # Scan a config file for `[...]` section headers and warn about any this
 # CLI version doesn't recognize, so a future or misspelled section degrades
@@ -4766,7 +4801,15 @@ resolve_caps() {
       # even a trusted one: strip it here so the only sources are the user's global
       # config and the --cap flag. Say so, because a silent drop reads as a bug.
       if printf '%s\n' "$_raw_project_caps" | grep -qx 'unsafe-rm'; then
-        warn "Ignoring ${BOLD}unsafe-rm${RESET} from the project .cleat: it disarms the delete-safety guard and is accepted only from your global config or ${BOLD}--cap${RESET}."
+        # Said once per file per run: a launch resolves caps more than once, and
+        # the warning printed twice. The strip below stays unconditional.
+        case "$_WARNED_UNSAFE_RM_FILES" in
+          *"|$caps_file|"*) ;;
+          *)
+            _WARNED_UNSAFE_RM_FILES="${_WARNED_UNSAFE_RM_FILES}|$caps_file|"
+            warn "Ignoring ${BOLD}unsafe-rm${RESET} from the project .cleat: it disarms the delete-safety guard and is accepted only from your global config or ${BOLD}--cap${RESET}."
+            ;;
+        esac
         _raw_project_caps="$(printf '%s\n' "$_raw_project_caps" | grep -vx 'unsafe-rm' || true)"
       fi
       if [[ -n "$_raw_project_caps" ]]; then
@@ -6782,6 +6825,26 @@ EOF
   return 1
 }
 
+# Exact host membership in the PERSISTENT list: the shipped defaults and the
+# global config, never the env var. `cleat browser allow` asks this and not
+# _bridge_origin_allowed, because a host that is only in CLEAT_BROWSER_ORIGINS
+# for this shell read as "already allowed" and nothing was written, so the
+# allow was gone the moment the variable was.
+_bridge_origin_persisted() {
+  local host="$1" entry
+  [ -n "$host" ] || return 1
+  for entry in $_BROWSER_ORIGINS; do
+    [ "$host" = "$entry" ] && return 0
+  done
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    [ "$host" = "$entry" ] && return 0
+  done <<EOF
+$(_bridge_origins_from_config ok)
+EOF
+  return 1
+}
+
 # True when a host is an IPv4 address in a form the loopback ranges cannot judge.
 # Those ranges are dotted text, and a browser is not. WHATWG URL parsing treats a
 # host whose LAST label is a number (all digits, or 0x and hex digits) as an IPv4
@@ -7746,8 +7809,10 @@ cmd_browser() {
       echo "       cleat browser allow <origin> Add one origin, for every box"
       echo ""
       echo "  The box can ask your host to open a URL, which is how a login inside"
-      echo "  a box reaches your browser. Cleat opens it only when the origin is on"
-      echo "  this list. Anything else is refused and printed for you to open by hand."
+      echo "  a box reaches your browser."
+      echo "  Cleat opens a login page only when its origin is on this list."
+      echo "  A login anywhere else is refused and printed when the session ends."
+      echo "  Other links are left for you to click."
       return 0 ;;
     origins|list|ls) shift 2>/dev/null || true; _browser_origins_print; return 0 ;;
     allow) ;;
@@ -7775,7 +7840,7 @@ cmd_browser() {
     echo -e "    ${DIM}Cleat never opens one: it would be an authenticated navigation into a service on your own machine, at an address the box chose.${RESET}"
     return 1
   fi
-  if _bridge_origin_allowed "$host"; then
+  if _bridge_origin_persisted "$host"; then
     info "${BOLD}${host}${RESET} is already allowed."
     return 0
   fi
@@ -9295,6 +9360,10 @@ _handoff_flag_identity_stale() {
   key="$(_derive_project_session_key "$project" "$box")" || return 0
   _account_session_key_ok "$key" || return 0
   f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  # The directory check comes first because a failed redirect reports itself
+  # before `2>/dev/null` applies: a never-started box printed a raw bash error
+  # above the switch's own success line.
+  [[ -d "${f%/*}" ]] || return 0
   : > "${f}.identity-stale" 2>/dev/null || true
   return 0
 }
@@ -9417,6 +9486,9 @@ _handoff_say_t1() {
   if [[ "$pin" == "$to" ]]; then
     if [[ "$pin" != "$_ACCOUNT_DEFAULT" ]]; then
       who="$(_account_meta_get "$pin" who 2>/dev/null || true)"
+      # Rendered through echo -e like every other print of the stored name, so
+      # control bytes are dropped and backslashes doubled first.
+      who="$(_sessions_safe_str "$who")"
     fi
     if [[ -n "$who" ]]; then
       info "Reopening this conversation on ${phrase} ${DIM}(${who})${RESET}"
@@ -11130,12 +11202,11 @@ _upgrade_claude_image() {
 # This is a SINGLE SOURCE OF TRUTH: cmd_run injects it into the box's settings
 # overlay via jq, and the unit tests run it directly against sample event JSON.
 # It runs INSIDE the box (python3 ships in the image). It reads the hook event on
-# stdin and answers "allow" ONLY when every top-level segment of the Bash command
-# is rm/rmdir/cd/blank, and refuses outright when the command contains command
-# substitution. So `rm -rf $S/*` and `cd $S && rm -rf *` are auto-allowed, while
-# `curl x | sh; rm -rf $S/*` is NOT (the curl segment fails the check and the
-# prompt still fires). It never emits "deny", so a non-rm command it does not
-# recognise leaves the permission flow untouched.
+# stdin and answers "allow" when any top-level segment of the Bash command invokes
+# rm or rmdir, so chained cleanups are allowed whatever sits beside the rm. A
+# removal only inside a substitution (`echo $(rm -rf x)`) does not count. A
+# command with no top-level removal gets no answer. It never emits "deny", so a
+# command it does not answer leaves the permission flow untouched.
 _unsafe_rm_hook_program() {
   cat <<'URM_PY'
 import sys, json, re, shlex
@@ -11530,8 +11601,18 @@ cmd_run() {
       # honour that here on both arms rather than copying. This is the create
       # path, the only one of the three that MOUNTS: resume and shell/claude are
       # both guarded at the block level and skip when jq is absent.
+      #
+      # Only a file that could define hooks gets the empty settings. One with no
+      # `hooks` text anywhere and no `\u` escape (which could spell the key) is
+      # passed through as v1.4.3 did, so its permissions, env and model still
+      # reach the box. A false positive keeps the empty settings, never a leak.
       if ! command -v jq >/dev/null 2>&1; then
-        echo '{}' > "$settings_overlay_dir/$_overlay_name"
+        if LC_ALL=C grep -q -e hooks -e '\\u' "$pf" 2>/dev/null; then
+          echo '{}' > "$settings_overlay_dir/$_overlay_name"
+          warn "Project .claude/${_base} defines hooks and jq is not installed on the host, so the box gets empty project settings. Install jq to pass the rest through."
+        else
+          cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        fi
       elif cap_is_active hooks; then
         # Replace hook commands with event forwarder
         if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
@@ -11764,6 +11845,83 @@ cmd_run() {
   _maybe_run_setup "$cname" "$project" "${_BOX:-main}" || true
 }
 
+# Re-create the nested mount targets inside the base ~/.claude bind source
+# before `docker start` of a stopped box. The same preparation cmd_run does
+# at create, for the same VirtioFS rule: a nested bind whose target has gone
+# missing inside the parent bind source fails the start. Targets vanish
+# between sessions for ordinary reasons (a host `claude install` removes
+# ~/.claude/local, and a user cleans out launch.json), and these are not
+# bind sources, so _container_bind_sources_present cannot see them. A pre-kit
+# box has no masks, so it gets only the three base targets.
+_ensure_host_mount_targets() {
+  local cname="$1"
+  mkdir -p "${HOME}/.claude/projects/-workspace"
+  touch "${HOME}/.claude/history.jsonl"
+  [[ -f "${HOME}/.claude/settings.json" ]] || echo '{}' > "${HOME}/.claude/settings.json"
+  if _container_has_kit_mounts "$cname"; then
+    _ensure_kit_mask_targets || exit 1
+  fi
+}
+
+# Refresh the settings overlays from the host files (the user may have changed
+# hooks between sessions) and re-inject or drop the unsafe-rm hook to match the
+# caps resolved for THIS launch. cmd_resume and cmd_start both call it: only
+# cmd_run and cmd_resume used to write settings.json, so a plain `cleat` after a
+# declined or non-TTY cap drift kept a stale unsafe-rm hook in the overlay while
+# the startup output showed no red guard line. Needs ACTIVE_CAPS resolved.
+_refresh_settings_overlays() {
+  local cname="$1" project="$2"
+  local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
+  if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null; then
+    # Global settings overlay
+    if [[ -f "${HOME}/.claude/settings.json" ]]; then
+      if cap_is_active hooks; then
+        jq '
+          if .hooks then
+            .hooks |= with_entries(.value |= [.[] |
+              .hooks = [.hooks[] | select(.type == "command") |
+                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+              ]
+            ])
+          else . end
+        ' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
+      else
+        jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
+      fi
+      # This refresh REWRITES settings.json from the host file, which drops the
+      # unsafe-rm hook cmd_run injected at create. Without re-injecting here the
+      # cap silently stops working after a resume and the delete prompt returns.
+      if cap_is_active unsafe-rm && [[ -s "$settings_overlay_dir/settings.json" ]]; then
+        _inject_unsafe_rm_hook "$settings_overlay_dir/settings.json"
+      fi
+    fi
+    # Project-level settings overlays (only when .claude/ exists)
+    if cap_is_active hooks && [[ -d "$project/.claude" ]]; then
+      local pf
+      for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+        local _base _overlay_name
+        _base="$(basename "$pf")"
+        _overlay_name="project-$_base"
+        if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
+          jq '
+            if .hooks then
+              .hooks |= with_entries(.value |= [.[] |
+                .hooks = [.hooks[] | select(.type == "command") |
+                  .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
+                ]
+              ])
+            else . end
+          ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        elif [[ -f "$pf" ]]; then
+          cp "$pf" "$settings_overlay_dir/$_overlay_name"
+        else
+          echo '{}' > "$settings_overlay_dir/$_overlay_name"
+        fi
+      done
+    fi
+  fi
+}
+
 cmd_start() {
   local project box
   project="$(resolve_project "${1:-}")"
@@ -11802,6 +11960,10 @@ cmd_start() {
   _maybe_note_missing_kit_masks "$cname"
   _maybe_note_host_global_config
 
+  # Settings overlays follow the caps resolved for this launch, so a declined
+  # drift cannot leave a stale unsafe-rm hook behind (see the helper).
+  _refresh_settings_overlays "$cname" "$project"
+
   # Start container if not running (restart stopped ones)
   if ! is_running "$cname"; then
     if container_exists "$cname"; then
@@ -11817,6 +11979,8 @@ cmd_start() {
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
       else
+        # Nested mount targets first: a vanished one fails `docker start`.
+        _ensure_host_mount_targets "$cname"
         # Restarting a stopped container: image already exists
         success "Image ready ${RESET}${DIM}(cached)"
         # Fold host-side changes and logins from other boxes into this box's
@@ -11915,56 +12079,7 @@ cmd_resume() {
   _maybe_note_missing_kit_masks "$cname"
   _maybe_note_host_global_config
 
-  # Refresh settings overlays (user may have changed hooks between stop/resume)
-  local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
-  if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null; then
-    # Global settings overlay
-    if [[ -f "${HOME}/.claude/settings.json" ]]; then
-      if cap_is_active hooks; then
-        jq '
-          if .hooks then
-            .hooks |= with_entries(.value |= [.[] |
-              .hooks = [.hooks[] | select(.type == "command") |
-                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
-              ]
-            ])
-          else . end
-        ' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
-      else
-        jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
-      fi
-      # This refresh REWRITES settings.json from the host file, which drops the
-      # unsafe-rm hook cmd_run injected at create. Without re-injecting here the
-      # cap silently stops working after a resume and the delete prompt returns.
-      if cap_is_active unsafe-rm && [[ -s "$settings_overlay_dir/settings.json" ]]; then
-        _inject_unsafe_rm_hook "$settings_overlay_dir/settings.json"
-      fi
-    fi
-    # Project-level settings overlays (only when .claude/ exists)
-    if cap_is_active hooks && [[ -d "$project/.claude" ]]; then
-      local pf
-      for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
-        local _base _overlay_name
-        _base="$(basename "$pf")"
-        _overlay_name="project-$_base"
-        if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
-          jq '
-            if .hooks then
-              .hooks |= with_entries(.value |= [.[] |
-                .hooks = [.hooks[] | select(.type == "command") |
-                  .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
-                ]
-              ])
-            else . end
-          ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
-        elif [[ -f "$pf" ]]; then
-          cp "$pf" "$settings_overlay_dir/$_overlay_name"
-        else
-          echo '{}' > "$settings_overlay_dir/$_overlay_name"
-        fi
-      done
-    fi
-  fi
+  _refresh_settings_overlays "$cname" "$project"
 
   # Only a box that was already up can hold a live Claude in another terminal.
   # One this command starts or recreates has none, so it skips the probe.
@@ -11985,6 +12100,8 @@ cmd_resume() {
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
       else
+        # Nested mount targets first, as in cmd_start.
+        _ensure_host_mount_targets "$cname"
         # Same stopped-container refresh as cmd_start: fold in host changes and
         # logins from other boxes before the bind source is re-resolved.
         _refresh_project_claude_json "$project" "$box"
@@ -12328,6 +12445,11 @@ cmd_login() {
     success "Auth saved to account ${BOLD}${_login_acct}${RESET}."
   elif [[ $_login_harvest -eq 2 ]]; then
     _account_held_notice "$cname" "You signed in as another account"
+  elif [[ $_login_harvest -eq $_ACCOUNT_LOCK_BUSY && "${_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 ]]; then
+    # Not a concurrent command: the directory cannot take the lock at all, so a
+    # later session end cannot save it either. Same split as _account_busy_msg.
+    warn "Signed in, but the login was not saved to ${BOLD}${_login_acct}${RESET}: Cleat cannot write to the accounts directory."
+    echo -e "    ${DIM}It stays in the box. Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
   elif [[ $_login_harvest -eq $_ACCOUNT_LOCK_BUSY ]]; then
     warn "Signed in, but the login was not saved to ${BOLD}${_login_acct}${RESET}: another cleat command is changing accounts."
     echo -e "    ${DIM}It stays in the box and is saved when the next session ends.${RESET}"
@@ -14366,13 +14488,18 @@ for f in "$d"/*.json; do
   printf "%s\n" "$j" | sed -n "s/.*\"sessionId\"[[:space:]]*:[[:space:]]*\"\([0-9a-f-]*\)\".*/\1/p" | head -n 1
 done'
 
+# Seconds the resume live-session probe may take before it counts as no answer.
+_RESUME_PROBE_BOUND_S=8
+
 # Session ids held by a live Claude Code process in a RUNNING box, one per
 # line. A probe that cannot answer prints nothing, which is today's behaviour
 # (nothing excluded), never a refusal.
 _box_live_session_ids() {
-  local cname="$1" out="" line _to=""
-  command -v timeout >/dev/null 2>&1 && _to="timeout 8"
-  out="$($_to docker exec "$cname" runuser -u coder -- sh -c "$_RESUME_LIVE_PROBE" _ \
+  local cname="$1" out="" line
+  # Bounded through _run_bounded, which falls back to gtimeout and then perl. A
+  # stock Mac has no timeout(1), and the bare `timeout 8` form ran the probe
+  # unbounded there, so a wedged daemon hung `cleat resume`.
+  out="$(_run_bounded "$_RESUME_PROBE_BOUND_S" docker exec "$cname" runuser -u coder -- sh -c "$_RESUME_LIVE_PROBE" _ \
         /home/coder/.claude/sessions /proc 2>/dev/null)" || out=""
   while IFS= read -r line; do
     _sessions_is_uuid "$line" && printf '%s\n' "$line"
@@ -16032,11 +16159,13 @@ _account_pinned_boxes() {
 # One lock rather than one per box, because rename and remove rewrite every
 # box's pin and two boxes pinned to one account share its store. With a single
 # lock no ordering between locks can invert. Holds are short: file operations
-# plus at most one bounded profile request per harvest. Prompts, the usage poll
-# and identity invalidation never run under it. Docker never runs under it with
-# ONE exception: the live switch's terminate exec (_handoff_docker_exec, bounded
-# 22 s), which must hold the lock so the box's login cannot change under the
-# stop. A `_locked`
+# plus at most one bounded profile request per harvest. Prompts and the usage
+# poll never run under it. Identity invalidation and docker stay outside it with
+# one exception, the live switch (_account_handoff), which holds the lock from
+# its re-check through the reopen tickets so the box's login cannot change under
+# the stop. Under it that switch runs a bounded re-probe (_handoff_probe, 8 s),
+# the terminate exec (_handoff_docker_exec, bounded 22 s) and the identity drop
+# (_account_switch_identity, whose running-box check asks docker). A `_locked`
 # suffix means the caller already holds it, and those bodies call only other
 # `_locked` bodies. It is reentrant within one shell, so a body that calls a
 # locking wrapper by mistake nests instead of waiting on itself until the
@@ -16853,6 +16982,30 @@ _account_held_has() {
 
 _account_box_auth_dir() { printf '%s' "$CLEAT_RUN_DIR/$1/auth"; }
 
+# Sign a box's staged credential out of its account and nothing else: the
+# account's keys go, the box's own members (the MCP server logins it signed into
+# for itself) stay. The unpin, `cleat account rm` and `cleat account adopt` all
+# end a box's use of a login this way, the same shape the switch to an account
+# with no login writes. They used to delete the whole file, which signed the box
+# out of every MCP server too. Whatever cannot be read once into a host-private
+# copy (a link, a pipe, past the size cap), or cannot be written back, is
+# removed outright as before: the account's login must not stay staged. A file
+# left with nothing in it goes. Runs under the account lock.
+_account_strip_staged() {
+  local box_cred snap=""
+  box_cred="$(_account_box_auth_dir "$1")/.credentials.json"
+  if [[ -f "$box_cred" && ! -L "$box_cred" ]] && snap="$(_account_snapshot_cred "$box_cred")"; then
+    if [[ "$(_account_cred_merge "$snap" "" 2>/dev/null || true)" != "{}" ]] \
+       && _account_write_file_0600 "" "$box_cred" "$snap"; then
+      rm -f "$snap" 2>/dev/null || true
+      return 0
+    fi
+    rm -f "$snap" 2>/dev/null || true
+  fi
+  rm -f "$box_cred" 2>/dev/null || true
+  return 0
+}
+
 # Every place that removes a box's run dir goes through here. The staged
 # credential lives in that dir, and Claude Code refreshes it in place about
 # every eight hours, so a wipe that does not harvest first throws away a token
@@ -16885,7 +17038,12 @@ _account_wipe_run_dir() {
   # first, which needs no lock (exactly as for a box that is not pinned), and one
   # that cannot be kept keeps the whole directory.
   if ! _account_lock; then
-    warn "Kept the staged login for ${BOLD}${cname}${RESET}: another cleat command is changing accounts."
+    if [[ "${_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 ]]; then
+      warn "Kept the staged login for ${BOLD}${cname}${RESET}: Cleat cannot write to the accounts directory."
+      echo -e "    ${DIM}Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+    else
+      warn "Kept the staged login for ${BOLD}${cname}${RESET}: another cleat command is changing accounts."
+    fi
     _account_hold_run_extras "$cname" || return 0
     _account_wipe_keep_auth "$cname"
     return 0
@@ -17974,7 +18132,10 @@ _account_rename_locked() {
 # because the pin file is hand-editable.
 _print_auth_line() {
   local acct
-  acct="$(_box_account_read "${1:-}")"
+  # The account IN EFFECT, not the pin. A box that predates the account mount
+  # keeps its pin but runs on the shared login (the exec warns so), and reading
+  # the pin here printed a green "Auth from account" for a login it was not on.
+  acct="$(_account_effective "${1:-}" 2>/dev/null)" || acct="$_ACCOUNT_DEFAULT"
   if [[ -n "${1:-}" && "$acct" != "$_ACCOUNT_DEFAULT" ]]; then
     printf '  %b✔%b Auth from account %b%s%b\n' "$GREEN" "$RESET" "$BLUE" "$acct" "$RESET"
   else
@@ -18198,7 +18359,10 @@ _account_apply_exec_env() {
   # var so that login is the one it reads.
   local _si=0
   _account_sync_in "$cname" || _si=$?
-  if [[ $_si -eq $_ACCOUNT_LOCK_BUSY ]]; then
+  if [[ $_si -eq $_ACCOUNT_LOCK_BUSY && "${_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 ]]; then
+    warn "Cleat cannot write to the accounts directory, so ${BOLD}${cname}${RESET} starts with the login it already has."
+    echo -e "    ${DIM}Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
+  elif [[ $_si -eq $_ACCOUNT_LOCK_BUSY ]]; then
     warn "Another cleat command is changing accounts, so ${BOLD}${cname}${RESET} starts with the login it already has."
   elif [[ $_si -ne 0 && $_ACCOUNT_STAGE_UNKEPT -eq 1 ]]; then
     # Not staged over a login the store does not have, because it could not be
@@ -19501,6 +19665,11 @@ _handoff_say_confirm() {
   esac
 }
 
+# The live switch's Ctrl-C trap: record the signal, never ignore it. One line of
+# its own so a test runs exactly this. See the comment where _account_handoff
+# sets it.
+_handoff_int_flag_trap() { trap '_HO_INT=1' INT; }
+
 # ── Live handoff: terminal 2 ────────────────────────────────────────────────
 # _account_handoff ACCT BOX CNAME PROJECT ASSUME_YES NOW: hand a running box's
 # live Claude session over to ACCT by restart and resume. Called by
@@ -19516,14 +19685,17 @@ _account_handoff() {
 
   # Row 4: already on the target.
   if [[ "$acct" == "$old" ]]; then _handoff_say_refusal R15 "$box" "$acct"; return 0; fi
-  # Row 5: a ticket of this box is still reopening.
   _HO_SID=()
-  if _handoff_tickets_pending "$cname"; then _handoff_say_refusal R18 "$box" "$acct"; return 1; fi
   # Row 6/7: probe.
   if ! _handoff_probe "$cname"; then
     _account_live_refusal "cleat could not tell what the Claude session in ${BOLD}${box}${RESET} is doing."
     return 1
   fi
+  # Row 5: a ticket of this box is still reopening. Checked AFTER the probe: a
+  # ready ticket whose session is already back in the probe's live set has
+  # finished reopening, and with the live set still empty every such ticket read
+  # as pending, so a second switch within the ticket's age window was refused.
+  if _handoff_tickets_pending "$cname"; then _handoff_say_refusal R18 "$box" "$acct"; return 1; fi
   # Rows 8a to 22.
   _HO_NOW_FLAG="$now"; _HANDOFF_DISCLOSED=0
   _handoff_classify "$cname" "$now" "$project" "$acct"
@@ -19561,21 +19733,19 @@ _account_handoff() {
     fi
   fi
 
-  # From here every wait is bounded, so a Ctrl-C is ignored rather than left to
-  # abandon a half-finished switch with the box's Claude already stopped.
-  #
-  # DEVIATION from the v2 design (handover section 13, which replaced this with a
-  # flag trap): an ignored INT is inherited by children and makes a BLOCKING read
-  # unkillable. That is safe here only because this critical section takes no
-  # unbounded blocking read: every credential and transcript read under this trap
-  # is guarded by `[[ -f && ! -L ]]` (a FIFO swapped in at a staged path fails
-  # `-f` and is skipped, never blocked on) or is SECONDS-bounded, and the one
-  # docker call runs under _handoff_docker_exec's own timeout. INVARIANT: do not
-  # add any unbounded, non-`-f`-guarded read (a bare `read`, `cat` of a path that
-  # could be a FIFO, or a `<` redirect from one) between here and the matching
-  # `trap - INT`, or a Ctrl-C could wedge the switch. If one is ever needed,
-  # restore the section-13 flag trap (`trap '_HO_INT=1' INT HUP TERM`) instead.
-  trap '' INT
+  # From here a Ctrl-C does not abandon the switch: the shell records it and
+  # carries on, so a half-finished switch never leaves the box's Claude stopped
+  # with the pin unmoved. A FLAG trap, never an ignore. An ignored INT is
+  # inherited by every child and makes a blocking open unkillable, and the
+  # `[[ -f && ! -L ]]` guards in front of the credential reads are
+  # check-then-open: a FIFO the box swaps in after the check still blocks
+  # _account_snapshot_cred, under the account lock. A trapped signal resets to
+  # the default in children, so a Ctrl-C kills that blocked read and the switch
+  # reaches its existing failure path. The terminate exec runs as an async job,
+  # which a non-interactive shell starts with INT ignored under either trap.
+  # INT only, so every `trap - INT` below restores exactly what this set.
+  _HO_INT=0
+  _handoff_int_flag_trap
 
   local rc_lock=0
   _account_lock || rc_lock=$?
@@ -19816,7 +19986,7 @@ _account_switch_locked() {
       return 1
     fi
     _box_account_remove "$cname"
-    rm -f "$(_account_box_auth_dir "$cname")/.credentials.json" 2>/dev/null || true
+    _account_strip_staged "$cname"
     _account_unlock
     return 0
   fi
@@ -19901,9 +20071,11 @@ _account_switch_meta() {
 # Drop the account name the box is carrying in its per-project claude.json, so
 # the box rebuilds identity for the account just pinned. The start rebuild does
 # not reach a running box and the attached heal cannot fix identity, so the
-# switch does it itself. Runs after the unlock: it edits a file a running box
-# binds. Sets _SWITCH_ID_RC to 3 when a Claude was live and the drop was left
-# for the box to finish, else 0.
+# switch does it itself. The offline switch runs it after the unlock, because it
+# edits a file a running box binds. The live switch (_account_handoff) runs it
+# before its unlock, while it still holds the lock through the reopen tickets.
+# Sets _SWITCH_ID_RC to 3 when a Claude was live and the drop was left for the
+# box to finish, else 0.
 _account_switch_identity() {
   local acct="$1" box="$2" cname="$3" project="$4" current="$5"
   local _id_rc=0
@@ -20000,7 +20172,7 @@ _account_do_switch() {
   _account_box_ready "$cname" || ready=$?
   if [[ $ready -eq 1 ]]; then
     warn "${BOLD}${box}${RESET} predates the account mount, so the switch cannot take effect yet."
-    echo -e "    ${DIM}Pinned anyway. Recreate the box once: ${BOLD}cleat rm ${box}${RESET}${DIM} then ${BOLD}cleat ${box}${RESET}${DIM}, and it takes effect.${RESET}"
+    echo -e "    ${DIM}Pinned anyway. Recreate the box once: ${BOLD}cleat rm ${box}${RESET}${DIM} then ${BOLD}cleat start ${box}${RESET}${DIM}, and it takes effect.${RESET}"
     echo -e "    ${DIM}Conversations, trust and env are on the host and survive. Anything installed${RESET}"
     echo -e "    ${DIM}INSIDE the box does not, so put it in ${BOLD}[setup]${RESET}${DIM} first if you have any.${RESET}"
     return 1
@@ -20142,6 +20314,19 @@ _account_do_remove() {
   fi
   pinned="$(_account_pinned_boxes "$acct")"
 
+  # A cleat shell open on a pinned box: a claude started there keeps the login the
+  # shell opened with, so the unpin below would leave that box half moved. The
+  # switch refuses the same move (R-shell-open), and so does this, under the lock
+  # and over the boxes pinned now, before anything is harvested or moved.
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    if _handoff_shell_open "$b"; then
+      _account_unlock
+      _handoff_say R-shell-open "$b"
+      return 1
+    fi
+  done <<< "$pinned"
+
   # Harvest what every pinned box refreshed for itself BEFORE the store moves.
   # Afterwards the store path is gone, so a harvest from there is declined
   # (_account_write_cred never creates a store) and the refresh stays behind. A
@@ -20181,7 +20366,7 @@ _account_do_remove() {
     unpinned="${unpinned}${b}${tab}${key}
 "
     _box_account_remove "$b"
-    rm -f "$(_account_box_auth_dir "$b")/.credentials.json" 2>/dev/null || true
+    _account_strip_staged "$b"
   done <<< "$pinned"
   _account_unlock
   # The pin moved, so the name each box carries is the removed account's, the
@@ -20299,7 +20484,7 @@ _account_adopt_locked() {
   fi
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
-    rm -f "$(_account_box_auth_dir "$b")/.credentials.json" 2>/dev/null || true
+    _account_strip_staged "$b"
   done <<< "$pinned"
   # The identity is the adopted login's when the server vouched for it (the
   # entry carries a uuid). One the entry does not carry is then cleared, never
@@ -21985,6 +22170,14 @@ _config_editor_save() {
 
   local final_caps=() cap
   for cap in "${KNOWN_CAPS[@]}"; do
+    # A project-scope save never writes unsafe-rm, which resolve_caps strips from
+    # a project .cleat. Same rule as `cleat config --project --enable unsafe-rm`.
+    if [[ "$cap" == unsafe-rm && "$scope" == project ]]; then
+      case ",${toggled}," in
+        *,"$cap",*) warn "Not saving ${BOLD}unsafe-rm${RESET} to ${config_file}: it is accepted only from your global config or ${BOLD}--cap${RESET}." ;;
+      esac
+      continue
+    fi
     case ",${toggled}," in *,"$cap",*) final_caps+=("$cap") ;; esac
   done
   local mem_w="$mem" cpu_w="$cpus"
@@ -22185,7 +22378,12 @@ _generate_project_cleat() {
 _config_generate_project() {
   local project="$1" memory="$2" cpus="$3"
   shift 3
-  local caps=("$@")
+  # Never unsafe-rm: resolve_caps strips it from a project .cleat, so stamping it
+  # into the committed file would promise a cap no clone ever gets.
+  local caps=() _gc
+  for _gc in "$@"; do
+    case "$_gc" in unsafe-rm) ;; *) caps+=("$_gc") ;; esac
+  done
   local target="${project}/.cleat"
 
   case "$project" in
@@ -22589,6 +22787,15 @@ cmd_config() {
     if ! $valid; then
       error "Unknown capability: ${BOLD}${cap_name}${RESET}"
       echo -e "    ${DIM}Available: ${KNOWN_CAPS[*]}${RESET}"
+      exit 1
+    fi
+
+    # resolve_caps strips unsafe-rm from every project .cleat (the caged agent can
+    # write that file), so writing it there reported success for a cap that never
+    # applies. Refuse before anything is written. --box also sets scope=project.
+    if [[ "$action" == "enable" && "$cap_name" == "unsafe-rm" && "$scope" == "project" ]]; then
+      error "unsafe-rm is accepted only from your global config or --cap."
+      echo -e "    ${DIM}Enable it globally instead: ${RESET}${BOLD}cleat config --enable unsafe-rm${RESET}"
       exit 1
     fi
 

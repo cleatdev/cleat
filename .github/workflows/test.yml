@@ -47,7 +47,7 @@ jobs:
   test-linux:
     name: test (ubuntu, bash 5.x)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,7 +74,7 @@ jobs:
   test-linux-2204:
     name: test (ubuntu 22.04, bash 5.1)
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,10 +95,15 @@ jobs:
   # runs the two in parallel, which cuts total wall clock rather than adding to
   # it. The harness must never run concurrently with another copy of itself: it
   # mutates bin/cleat in place and restores from a backup on exit.
+  #
+  # Cap sized from a measured run: the last green CI run spent 1343 s on 582
+  # mutations (about 2.3 s each). The registry now holds about 1290 entries,
+  # which at that rate is roughly 50 minutes, so the old 25-minute cap would
+  # cancel the job mid-flight. 75 leaves headroom for a slow runner.
   mutation-linux:
     name: mutation (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
@@ -191,7 +196,7 @@ jobs:
           cat "$RUNNER_TEMP/fork-gnu.log"; exit "$rc"
 
   # NOTE: there is deliberately no macOS mutation-harness job. The harness gates
-  # on Linux (mutation-linux, GNU sed, 568/568). Running it on macOS additionally
+  # on Linux (mutation-linux, GNU sed, all entries). Running it on macOS additionally
   # requires every mutation sed to be BSD-sed portable, and a completed macOS run
   # (2026-08-21, once the suite/harness were split so it no longer timed out
   # mid-flight) surfaced ~8 pre-existing seds that catch on GNU but miss/skip on

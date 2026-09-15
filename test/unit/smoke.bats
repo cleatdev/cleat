@@ -611,6 +611,20 @@ STUB
   assert_output "abc"
 }
 
+@test "smoke: cleat account on a never-started box prints no raw bash error" {
+  # The stale-identity flag is written beside the box's per-project claude.json,
+  # which a box that never started does not have. The redirect failed and bash
+  # printed "line N: ...identity-stale: No such file or directory" above the
+  # success line, because a failed redirect reports before 2>/dev/null applies.
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  DOCKER_STUB_DAEMON_DOWN=1 run cleat_bin_timeout 15 account work
+  assert_success
+  assert_output --partial "is now on account"
+  refute_output --partial "No such file"
+  refute_output --partial "identity-stale"
+}
+
 @test "smoke: cleat account switch on a host with no jq flags the box for the next launch" {
   # The jq-less half of the identity drop. With the box down it cannot edit the
   # file at all, so it leaves a flag next to it and the next launch clears it

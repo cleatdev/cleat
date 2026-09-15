@@ -149,7 +149,15 @@ jobs:
 
       - name: Verify manifest covers both architectures
         run: |
-          docker buildx imagetools inspect "$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}" | tee /tmp/manifest
+          # GHCR is read-after-write lagged: the v1.4.3 publish failed here with
+          # "not found" although the manifest had been pushed, and a re-run went
+          # green. Retry for about a minute before judging the manifest.
+          REF="$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}"
+          for i in 1 2 3 4 5 6; do
+            docker buildx imagetools inspect "$REF" > /tmp/manifest && break
+            sleep 10
+          done
+          cat /tmp/manifest
           grep -q 'linux/amd64' /tmp/manifest
           grep -q 'linux/arm64' /tmp/manifest
 
@@ -161,8 +169,12 @@ jobs:
           # note at the top of this file). Inspect the per-arch image configs and
           # fail the publish loudly if either label is missing, so a wiring
           # regression can never ship an image the CLI would mis-classify.
-          docker buildx imagetools inspect \
-            "$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}" \
-            --format '{{ json .Image }}' | tee /tmp/configs
+          # Same read-after-write retry as the manifest check above.
+          REF="$REGISTRY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}"
+          for i in 1 2 3 4 5 6; do
+            docker buildx imagetools inspect "$REF" --format '{{ json .Image }}' > /tmp/configs && break
+            sleep 10
+          done
+          cat /tmp/configs
           grep -q 'sh.cleat.image-spec' /tmp/configs
           grep -q 'sh.cleat.version' /tmp/configs

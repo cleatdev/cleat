@@ -7265,7 +7265,7 @@ try "vnext_account_lock_symlink" "something this CLI did not create at the lock 
 # A wipe that cannot take the lock keeps the staged credential.
 cat > "$SED_TMP" << 'SED'
 /^_account_wipe_run_dir()/,/^}$/{
-  s/^    warn "Kept the staged login for .*/    rm -rf "${CLEAT_RUN_DIR:?}\/${cname}" 2>\/dev\/null || true/
+  s/^      warn "Kept the staged login for .*another cleat command.*/      rm -rf "${CLEAT_RUN_DIR:?}\/${cname}" 2>\/dev\/null || true/
 }
 SED
 try "vnext_account_wipe_busy_keeps" "a wipe that cannot take the account lock keeps the staged credential" "$CLI" "$ACCOUNTS_BATS"
@@ -7333,7 +7333,7 @@ try "vnext_account_restore_busy_says" "rename and restore that cannot take the a
 # And an attach that cannot take it says the box starts on the login it has.
 cat > "$SED_TMP" << 'SED'
 /^_account_apply_exec_env()/,/^}$/{
-  s/^  if \[\[ [$]_si -eq [$]_ACCOUNT_LOCK_BUSY \]\]; then$/  if false; then/
+  s/^  elif \[\[ [$]_si -eq [$]_ACCOUNT_LOCK_BUSY \]\]; then$/  elif false; then/
 }
 SED
 try "vnext_account_attach_busy_says" "a session that cannot take the account lock touches neither" "$CLI" "$ACCOUNTS_BATS"
@@ -7779,10 +7779,11 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_adopt_releases_pinned" "a login adopted into an account a box is pinned to survives the next harvest"
 
-# ...and its staged copy goes once the adopted login is written.
+# ...and its staged copy is signed out of the account once the adopted login is
+# written (the box's own MCP logins stay, see _account_strip_staged).
 cat > "$SED_TMP" << 'SED'
 /^_account_adopt_locked()/,/^}$/{
-  s/^    rm -f "[$](_account_box_auth_dir "[$]b")\/.credentials.json" 2>\/dev\/null .. true$/    :/
+  s/^    _account_strip_staged "[$]b"$/    :/
 }
 SED
 try "vnext_account_adopt_unstages_pinned" "a login adopted into an account a box is pinned to survives the next harvest"
@@ -10757,21 +10758,21 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_handoff_survivor_ready" "one target survives" "$CLI" "$HANDOFF_BATS"
 
-# Ctrl-C is ignored from the lock through the exec (the trap is set).
+# Ctrl-C is recorded from the lock through the exec (the trap is set).
 cat > "$SED_TMP" << 'SED'
 /^_account_handoff()/,/^}$/{
-  s@trap '' INT@:@
+  s@^  _handoff_int_flag_trap$@  :@
 }
 SED
-try "vnext_handoff_int_before_exec" "ignores Ctrl-C from the lock through the exec" "$CLI" "$HANDOFF_BATS"
+try "vnext_handoff_int_before_exec" "records Ctrl-C from the lock through the exec" "$CLI" "$HANDOFF_BATS"
 
-# Ctrl-C is not restored before the exec (the ignore holds).
+# Ctrl-C is not restored before the exec (the flag trap holds).
 cat > "$SED_TMP" << 'SED'
-/^_account_handoff()/,/^}$/{
-  s@trap '' INT@trap - INT@
+/^_handoff_int_flag_trap()/{
+  s@trap '_HO_INT=1' INT@trap - INT@
 }
 SED
-try "vnext_handoff_int_during_exec" "ignores Ctrl-C from the lock through the exec" "$CLI" "$HANDOFF_BATS"
+try "vnext_handoff_int_during_exec" "records Ctrl-C from the lock through the exec" "$CLI" "$HANDOFF_BATS"
 
 # The ready ticket is written before the meta capture.
 cat > "$SED_TMP" << 'SED'
@@ -10806,6 +10807,241 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_handoff_route_live_mounted" "routes the switch to the live handoff" "$CLI" "$ACCOUNTS_BATS"
+
+# ── v1.5.0 release fixes ───────────────────────────────────────────────────
+
+# v1.5.0: a non-ASCII project folder keeps the key v1.4.3 gave it under a UTF-8
+# locale while that session directory exists. Dropping the adoption re-keys it.
+cat > "$SED_TMP" << 'SED'
+/^_derive_project_session_key()/,/^}$/{
+  /_basename="[$]_legacy"/d
+}
+SED
+try "v150_session_key_legacy_adopt" "keeps its pre-pin session key on upgrade"
+
+# v1.5.0: a symlink in the projects store is never adopted as the legacy key.
+cat > "$SED_TMP" << 'SED'
+/^_derive_project_session_key()/,/^}$/{
+  s/ && ! -L "[$][{]HOME[}]\/[.]claude\/projects\/[$][{]_legacy[}]-[$][{]_hash[}][$][{]_suffix[}]"//
+}
+SED
+try "v150_session_key_legacy_no_symlink" "symlinked legacy session directory is never adopted"
+
+# v1.5.0: cmd_start refreshes the settings overlays, so a declined drift cannot
+# leave the unsafe-rm hook live with no red guard line.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /_refresh_settings_overlays "[$]cname" "[$]project"/d
+}
+SED
+try "v150_start_refreshes_settings_overlay" "plain cleat drops a stale unsafe-rm hook"
+
+# v1.5.0: a stopped box re-creates its nested mount targets before docker start.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /_ensure_host_mount_targets "[$]cname"/d
+}
+SED
+try "v150_start_mount_targets" "cmd_start re-creates vanished mount targets"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  /_ensure_host_mount_targets "[$]cname"/d
+}
+SED
+try "v150_resume_mount_targets" "cmd_resume re-creates vanished mount targets"
+
+# v1.5.0: unpin, account rm and account adopt sign the staged file out of the
+# account only, keeping the box's own MCP logins. Back to deleting the file.
+cat > "$SED_TMP" << 'SED'
+/^_account_strip_staged()/,/^}$/{
+  s/^  if \[\[ -f "[$]box_cred" && ! -L "[$]box_cred" \]\] && snap=.*; then$/  if false; then/
+}
+SED
+try "v150_account_strip_keeps_mcp" "own MCP login in the staged file" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_switch_locked()/,/^}$/{
+  s/^    _account_strip_staged "[$]cname"$/    rm -f "$(_account_box_auth_dir "$cname")\/.credentials.json"/
+}
+SED
+try "v150_account_unpin_keeps_mcp" "unpinning keeps the box's own MCP login" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s/^    _account_strip_staged "[$]b"$/    rm -f "$(_account_box_auth_dir "$b")\/.credentials.json"/
+}
+SED
+try "v150_account_rm_keeps_mcp" "account rm keeps the unpinned box's own MCP login" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_adopt_locked()/,/^}$/{
+  s/^    _account_strip_staged "[$]b"$/    rm -f "$(_account_box_auth_dir "$b")\/.credentials.json"/
+}
+SED
+try "v150_account_adopt_keeps_mcp" "account adopt keeps a pinned box's own MCP login" "$CLI" "$ACCOUNTS_BATS"
+
+# v1.5.0: the stale-identity flag is skipped when its directory does not exist,
+# so no raw redirect error prints above the switch's success line.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_flag_identity_stale()/,/^}$/{
+  /^  \[\[ -d "[$][{]f%\/[*][}]" \]\] || return 0$/d
+}
+SED
+try "v150_identity_stale_flag_needs_dir" "flagging a stale identity on a never-started box prints nothing"
+
+# v1.5.0: the reopening check runs after the first probe, so a ticket whose
+# session is already back in the live set does not refuse a second switch.
+cat > "$SED_TMP" << 'SED'
+/^_account_handoff()/,/^}$/{
+  s@^  # Row 6/7: probe[.]$@  if _handoff_tickets_pending "$cname"; then _handoff_say_refusal R18 "$box" "$acct"; return 1; fi@
+}
+SED
+try "v150_handoff_pending_after_probe" "second switch through once the reopened session is back" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.0: the live switch traps Ctrl-C as a flag, never an ignore, so a child
+# blocked on a FIFO the box swapped in dies on Ctrl-C instead of holding the lock.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_int_flag_trap()/{
+  s@trap '_HO_INT=1' INT@trap '' INT@
+}
+SED
+try "v150_handoff_int_flag_not_ignore" "Ctrl-C trap still kills a child blocked on a FIFO" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.0: a jq-less host passes a hook-free project settings file through. Every
+# file becoming {} again loses its permissions, env and model.
+cat > "$SED_TMP" << 'SED'
+s@^        if LC_ALL=C grep -q -e hooks -e '[\]\\u' "[$]pf" 2>/dev/null; then$@        if true; then@
+SED
+try "v150_jqless_hookfree_passthrough" "jq-less host passes a hook-free project settings file through"
+
+# v1.5.0: a hooks key spelled with a JSON escape still counts as hooks.
+cat > "$SED_TMP" << 'SED'
+s@^        if LC_ALL=C grep -q -e hooks -e '[\]\\u' "[$]pf" 2>/dev/null; then$@        if LC_ALL=C grep -q -e hooks "$pf" 2>/dev/null; then@
+SED
+try "v150_jqless_escaped_hooks_key" "jq-less host warns when a project settings file with hooks is emptied"
+
+# v1.5.0: the pre-mask recreate note names a named box, so `cleat rm` never
+# removes main by following it.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_note_missing_kit_masks()/,/^}$/{
+  s@^    _fix="cleat rm [$][{]_b[}] && cleat start [$][{]_b[}]"$@    :@
+}
+SED
+try "v150_mask_note_names_box" "pre-mask recreate note names the box"
+
+# v1.5.0: the account-mount remedy prints `cleat start <box>`, never the
+# non-command `cleat <box>`.
+cat > "$SED_TMP" << 'SED'
+s@then [$][{]BOLD[}]cleat start [$][{]box[}][$][{]RESET[}][$][{]DIM[}], and it takes effect[.]@then ${BOLD}cleat ${box}${RESET}${DIM}, and it takes effect.@
+SED
+try "v150_account_mount_remedy_start" "recreate remedy for a box without the account mount is a real command" "$CLI" "$ACCOUNTS_BATS"
+
+# v1.5.0: the launch auth line reports the account in effect, not the pin.
+cat > "$SED_TMP" << 'SED'
+/^_print_auth_line()/,/^}$/{
+  s@acct="[$](_account_effective "[$][{]1:-[}]" 2>/dev/null)" || acct="[$]_ACCOUNT_DEFAULT"@acct="$(_box_account_read "${1:-}")"@
+}
+SED
+try "v150_auth_line_effective_account" "pinned box without the account mount says its auth is shared" "$CLI" "$ACCOUNTS_BATS"
+
+# v1.5.0: `cleat config --project --enable unsafe-rm` is refused, never reported
+# as enabled for a cap resolve_caps strips.
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s@^    if \[\[ "[$]action" == "enable" && "[$]cap_name" == "unsafe-rm" && "[$]scope" == "project" \]\]; then$@    if false; then@
+}
+SED
+try "v150_config_project_unsafe_rm_refused" "unsafe-rm is refused for a project or a box" "$CLI" "$CONFIG_BATS"
+
+# v1.5.0: generate never stamps unsafe-rm into a project .cleat.
+cat > "$SED_TMP" << 'SED'
+/^_config_generate_project()/,/^}$/{
+  s@case "[$]_gc" in unsafe-rm) ;; [*]) caps+=("[$]_gc") ;; esac@caps+=("$_gc")@
+}
+SED
+try "v150_config_generate_drops_unsafe_rm" "unsafe-rm is never stamped into a project" "$CLI" "$CONFIG_BATS"
+
+# v1.5.0: a project-scope editor save drops unsafe-rm.
+cat > "$SED_TMP" << 'SED'
+/^_config_editor_save()/,/^}$/{
+  s@^    if \[\[ "[$]cap" == unsafe-rm && "[$]scope" == project \]\]; then$@    if false; then@
+}
+SED
+try "v150_config_editor_save_drops_unsafe_rm" "project-scope save drops unsafe-rm" "$CLI" "$CONFIG_BATS"
+
+# v1.5.0: the resume live-session probe is bounded on a host with no timeout(1).
+cat > "$SED_TMP" << 'SED'
+/^_box_live_session_ids()/,/^}$/{
+  s@out="[$](_run_bounded "[$]_RESUME_PROBE_BOUND_S" docker exec@out="$($(command -v timeout >/dev/null 2>\&1 \&\& echo timeout 8) docker exec@
+}
+SED
+try "v150_resume_probe_bounded_without_timeout" "stalled box answer is bounded on a host with no timeout" "$CLI" "$START_RESUME_BATS"
+
+# v1.5.0: `cleat browser allow` persists a host that is only in the env var.
+cat > "$SED_TMP" << 'SED'
+/^cmd_browser()/,/^}$/{
+  s@if _bridge_origin_persisted "[$]host"; then@if _bridge_origin_allowed "$host"; then@
+}
+SED
+try "v150_browser_allow_persists_env_host" "persists a host that is only in the env var" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# v1.5.0: the project unsafe-rm warning prints once per file per run.
+cat > "$SED_TMP" << 'SED'
+/^resolve_caps()/,/^}$/{
+  s@^          [*]"|[$]caps_file|"[*]) ;;$@          *"|$caps_file|NEVER"*) ;;@
+}
+SED
+try "v150_project_unsafe_rm_warn_once" "project unsafe-rm warning prints once per launch" "$CLI" "$CAPABILITIES_BATS"
+
+# v1.5.0: the reopen line escapes the stored account name before echo -e.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_say_t1()/,/^}$/{
+  /^      who="[$](_sessions_safe_str "[$]who")"$/d
+}
+SED
+try "v150_reopen_line_escapes_who" "reopen line renders a stored account name without interpreting escapes" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.0: `cleat account rm` refuses while a pinned box has a cleat shell open,
+# the same move the switch refuses.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s@^    if _handoff_shell_open "[$]b"; then$@    if false; then@
+}
+SED
+try "v150_account_rm_refuses_shell_open" "account rm refuses while a pinned box has a cleat shell open" "$CLI" "$ACCOUNTS_BATS"
+
+# v1.5.0: an unwritable accounts directory is named as such, never reported as
+# another cleat command, at the login, the attach and the run-dir wipe.
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  s@^  elif \[\[ [$]_login_harvest -eq [$]_ACCOUNT_LOCK_BUSY && "[$]{_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 \]\]; then$@  elif false; then@
+}
+SED
+try "v150_unwritable_accounts_login_message" "cleat login names an unwritable accounts directory" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s@^  if \[\[ [$]_si -eq [$]_ACCOUNT_LOCK_BUSY && "[$]{_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 \]\]; then$@  if false; then@
+}
+SED
+try "v150_unwritable_accounts_attach_message" "an attach names an unwritable accounts directory" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_account_wipe_run_dir()/,/^}$/{
+  s@^    if \[\[ "[$]{_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 \]\]; then$@    if false; then@
+}
+SED
+try "v150_unwritable_accounts_wipe_message" "a run-dir wipe names an unwritable accounts directory" "$CLI" "$ACCOUNTS_BATS"
+
+# The settings refresh is skipped on a host with no jq (retargeted from a source
+# grep when the refresh moved into _refresh_settings_overlays).
+cat > "$SED_TMP" << 'SED'
+/^_refresh_settings_overlays()/,/^}$/{
+  s@^  if \[\[ -d "[$]settings_overlay_dir" \]\] && command -v jq &>/dev/null; then$@  if [[ -d "$settings_overlay_dir" ]]; then@
+}
+SED
+try "v150_settings_refresh_guards_jq" "hook bridge noop when jq unavailable"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

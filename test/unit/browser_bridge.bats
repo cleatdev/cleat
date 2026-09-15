@@ -636,6 +636,27 @@ EOF
   assert_output --partial "already allowed"
 }
 
+@test "origins config: cleat browser allow persists a host that is only in the env var" {
+  # A host set for this shell through CLEAT_BROWSER_ORIGINS read as "already
+  # allowed" and nothing was written, so the allow vanished with the variable.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  CLEAT_BROWSER_ORIGINS="envonly.example.com"
+  run cmd_browser allow envonly.example.com
+  assert_success
+  refute_output --partial "already allowed"
+  run cat "$CLEAT_GLOBAL_CONFIG"
+  assert_output --partial "[browser]"
+  assert_output --partial "origin = envonly.example.com"
+  # A shipped origin is still already allowed and writes nothing.
+  : > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_browser allow claude.ai
+  assert_success
+  assert_output --partial "already allowed"
+  run cat "$CLEAT_GLOBAL_CONFIG"
+  assert_output ""
+}
+
 @test "origins config: cleat browser allow keeps every origin added before it" {
   # The rewrite stored an existing line as everything after the word origin,
   # " = host", and wrote it back behind a fresh "origin = ". Each allow added one

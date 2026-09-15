@@ -1565,6 +1565,20 @@ EOF
   assert_output --partial "unsafe-rm"
 }
 
+@test "resolve_caps: the project unsafe-rm warning prints once per launch" {
+  # A launch resolves caps more than once (cmd_start and the drift check), and
+  # the warning printed on each. The strip must still happen every time.
+  mkdir -p "$TEST_TEMP/project"
+  printf '[caps]\nunsafe-rm\n' > "$TEST_TEMP/project/.cleat"
+  _BOX="main"
+  resolve_caps "$TEST_TEMP/project" > "$TEST_TEMP/rc1" 2>&1
+  resolve_caps "$TEST_TEMP/project" > "$TEST_TEMP/rc2" 2>&1
+  run grep -c "Ignoring" "$TEST_TEMP/rc1" "$TEST_TEMP/rc2"
+  assert_line "$TEST_TEMP/rc1:1"
+  assert_line "$TEST_TEMP/rc2:0"
+  run cap_is_active unsafe-rm; assert_failure
+}
+
 # ── unsafe-rm hook program (the in-box PermissionRequest detector) ───────────
 
 _urm_decide() { printf '%s' "$1" | python3 -c "$(_unsafe_rm_hook_program)"; }

@@ -528,7 +528,7 @@ EOF
   assert_output --partial "bind failed, retrying"
 }
 
-@test "regression vnext: the callback proxy actually forwards, it is not an EXEC no-op" {
+@test "regression v1.5.0: the callback proxy actually forwards, it is not an EXEC no-op" {
   # socat's EXEC address strips the quotes and splits on whitespace without a
   # shell, so `EXEC:sh -c '...'` ran `docker` with no arguments and every
   # callback came back EMPTY on any host that HAS socat. Hosts without it took
@@ -1117,26 +1117,35 @@ EOF
 }
 
 @test "regression fallback: hook bridge noop when jq unavailable" {
-  # With jq absent from PATH, cmd_resume should not crash trying to
-  # refresh settings overlays. The guard is `command -v jq` at the
-  # callsite.
-  local empty_path="$TEST_TEMP/nojq-bin"
-  mkdir -p "$empty_path"
-  # Only seed the essentials, no jq
-  ln -s "$(command -v bash)" "$empty_path/bash"
-  ln -s "$(command -v sed)" "$empty_path/sed"
-  ln -s "$(command -v mkdir)" "$empty_path/mkdir"
-  ln -s "$(command -v grep)" "$empty_path/grep"
-  ln -s "$(command -v wc)" "$empty_path/wc"
+  # With jq absent, a resume or a plain start must not crash trying to refresh
+  # the settings overlays, and must not half-run the refresh either. Retargeted
+  # from a grep of cmd_resume's body when the refresh moved into
+  # _refresh_settings_overlays (shared with cmd_start): the guard is proved by
+  # behaviour now. Unguarded, the real jq on this host rewrites the overlay from
+  # the host file, so an untouched overlay is the proof.
+  command -v jq >/dev/null 2>&1 || skip "needs jq on the host to hide it from the CLI"
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project" "$HOME/.claude"
+  echo '{"model":"host-now"}' > "$HOME/.claude/settings.json"
+  local cname overlay
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  overlay="$CLEAT_RUN_DIR/${cname}/settings"
+  mkdir -p "$overlay"
+  echo '{"model":"at-create"}' > "$overlay/settings.json"
+  mock_docker_ps "$cname"
+  mock_docker_ps_a "$cname"
+  exec_claude() { return 0; }
+  _hide_jq
 
-  # We can't easily exec cleat without full PATH, so we just verify the
-  # guard exists in the function body.
-  local body
-  body="$(declare -f cmd_resume)"
-  echo "$body" | grep -q 'command -v jq' || {
-    echo "REGRESSION: cmd_resume must guard jq usage with command -v"
-    return 1
-  }
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  run cat "$overlay/settings.json"
+  assert_output '{"model":"at-create"}'
+
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  run cat "$overlay/settings.json"
+  assert_output '{"model":"at-create"}'
 }
 
 @test "regression fallback: cmd_run guards jq usage in settings overlay" {
@@ -1326,7 +1335,7 @@ EOF
   return 0
 }
 
-@test "regression vnext: user-level rules and keybindings reach the box read-only instead of an empty mask" {
+@test "regression v1.5.0: user-level rules and keybindings reach the box read-only instead of an empty mask" {
   mkdir -p "$TEST_TEMP/project"
   local CNAME
   CNAME="$(container_name_for "$TEST_TEMP/project")"
@@ -1356,7 +1365,7 @@ EOF
 }
 
 
-@test "regression vnext: the box keybindings.json placeholder is one Claude Code's loader accepts" {
+@test "regression v1.5.0: the box keybindings.json placeholder is one Claude Code's loader accepts" {
   mkdir -p "$TEST_TEMP/project"
   local CNAME
   CNAME="$(container_name_for "$TEST_TEMP/project")"
@@ -1367,7 +1376,7 @@ EOF
 }
 
 
-@test "regression vnext: session-env, daemon and seed-admin are per-box, never the host's" {
+@test "regression v1.5.0: session-env, daemon and seed-admin are per-box, never the host's" {
   mkdir -p "$TEST_TEMP/project"
   local CNAME
   CNAME="$(container_name_for "$TEST_TEMP/project")"
@@ -1390,7 +1399,7 @@ EOF
 }
 
 
-@test "regression vnext: the npm-local install and daemon.json are masked read-only" {
+@test "regression v1.5.0: the npm-local install and daemon.json are masked read-only" {
   mkdir -p "$TEST_TEMP/project"
   local CNAME
   CNAME="$(container_name_for "$TEST_TEMP/project")"
@@ -1412,7 +1421,7 @@ EOF
 }
 
 
-@test "regression vnext: a regular file where an instruction-surface dir belongs is refused before docker run" {
+@test "regression v1.5.0: a regular file where an instruction-surface dir belongs is refused before docker run" {
   mkdir -p "$TEST_TEMP/project"
   local CNAME
   CNAME="$(container_name_for "$TEST_TEMP/project")"
@@ -3519,14 +3528,14 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: the clip dir is bind-mounted read-write into the box, and the browser
+# v1.5.0: the clip dir is bind-mounted read-write into the box, and the browser
 # watcher appended the claimed URL to .proxy-log with a plain `>>`, which
 # FOLLOWS a symlink. A caged process could therefore point that path at any
 # file the host user can write and, because a URL carrying a newline still
 # passed the http(s) prefix test, write whole lines of its choosing into it.
 # A shell rc file made that host code execution.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: browser bridge cannot append to a host file through a planted proxy log symlink" {
+@test "regression v1.5.0: browser bridge cannot append to a host file through a planted proxy log symlink" {
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
   printf 'echo original\n' > "$TEST_TEMP/fake-rc"
 
@@ -3547,7 +3556,7 @@ EOF
     echo "REGRESSION: the planted symlink survived"; return 1; }
 }
 
-@test "regression vnext: cap watcher log does not truncate a host file through a symlink" {
+@test "regression v1.5.0: cap watcher log does not truncate a host file through a symlink" {
   local target="$TEST_TEMP/precious-log"
   head -c 1200000 /dev/zero | tr '\0' 'q' > "$target"
   ln -s "$target" "$TEST_TEMP/.watcher-log"
@@ -3558,7 +3567,7 @@ EOF
     echo "REGRESSION: the link target was truncated to $sz bytes"; return 1; }
 }
 
-@test "regression vnext: a symlink at the host-ready sentinel is replaced, never touched through" {
+@test "regression v1.5.0: a symlink at the host-ready sentinel is replaced, never touched through" {
   local clip_dir="$TEST_TEMP/clip-hr"; mkdir -p "$clip_dir"
   local target="$TEST_TEMP/hr-target-must-not-exist"
   ln -s "$target" "$clip_dir/.host-ready"
@@ -3574,7 +3583,7 @@ EOF
     echo "REGRESSION: touch followed the planted link and created the target"; return 1; }
 }
 
-@test "regression vnext: the python callback proxy does not co-bind an occupied loopback port" {
+@test "regression v1.5.0: the python callback proxy does not co-bind an occupied loopback port" {
   # SO_REUSEPORT let a box-named port co-bind a live host service that also set
   # it, taking a share of that service's connections. The backend must fail its
   # bind and retry instead.
@@ -3602,7 +3611,7 @@ PYSRV
   assert_output --partial "bind attempt 1 failed"
 }
 
-@test "regression vnext: a busy package manager is named instead of a bare Install failed" {
+@test "regression v1.5.0: a busy package manager is named instead of a bare Install failed" {
   # A fresh cloud image runs its own updater on first boot, holding the dpkg
   # lock, so get.docker.com dies with "Could not get lock
   # /var/lib/dpkg/lock-frontend". cleat printed a bare "Install failed" and the
@@ -3640,7 +3649,7 @@ SUDO
   assert_output --partial "apt-get is already running"
 }
 
-@test "regression vnext: a docker install failure with no busy manager still hands over the manual command" {
+@test "regression v1.5.0: a docker install failure with no busy manager still hands over the manual command" {
   # The plain failure path called error() and exited without ever printing
   # _docker_install_hint, so a reader whose install failed for any other reason
   # was left with no next step at all.
@@ -3674,7 +3683,7 @@ SUDO
   refute_output --partial "the package manager is busy"
 }
 
-@test "regression vnext: the package-manager probe matches a command name, never a path or argument" {
+@test "regression v1.5.0: the package-manager probe matches a command name, never a path or argument" {
   # Matching the full command line would fire on anything mentioning apt, which
   # on the failure path means blaming a lock that was never held. The ps
   # fallback (a minimal image with no procps pgrep) must compare basenames only.
@@ -3724,7 +3733,7 @@ PS3
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: docs/cli.md promises "Without jq on the host the box falls back to
+# v1.5.0: docs/cli.md promises "Without jq on the host the box falls back to
 # empty settings". Both arms of the create-time project overlay fell through to
 # a verbatim `cp` instead, mounting the user's real host hook commands into the
 # box, where Claude Code ran them in the container and osascript and every other
@@ -3737,7 +3746,7 @@ PS3
 # _hide_jq (a host with no jq) lives in test/setup.bash, shared with the
 # credential tests.
 
-@test "regression vnext: a jq-less host gets empty project settings, not the real hook commands" {
+@test "regression v1.5.0: a jq-less host gets empty project settings, not the real hook commands" {
   mock_docker_images "cleat"
   cat > "$CLEAT_GLOBAL_CONFIG" << 'EOF'
 [caps]
@@ -3761,7 +3770,7 @@ EOF
   assert_output --partial "{}"
 }
 
-@test "regression vnext: a jq-less host gets empty project settings with the hooks cap off too" {
+@test "regression v1.5.0: a jq-less host gets empty project settings with the hooks cap off too" {
   mock_docker_images "cleat"
   : > "$CLEAT_GLOBAL_CONFIG"
   mkdir -p "$TEST_TEMP/project/.claude"
@@ -3782,14 +3791,14 @@ EOF
   assert_output --partial "{}"
 }
 
-@test "regression vnext: the hooks cap says so on a host with no jq instead of forwarding nothing in silence" {
+@test "regression v1.5.0: the hooks cap says so on a host with no jq instead of forwarding nothing in silence" {
   ACTIVE_CAPS=(hooks)
   _hide_jq
   run exec_claude "test-ctr" --dangerously-skip-permissions
   assert_output --partial "jq is not installed on the host"
 }
 
-@test "regression vnext: exec_claude hands a fork box's hook bridge the COPY, not the origin tree" {
+@test "regression v1.5.0: exec_claude hands a fork box's hook bridge the COPY, not the origin tree" {
   # exec_claude used to pass cmd_run's `local _workspace`, which is gone by the
   # time any caller reaches exec_claude. The real binary died on set -u (see the
   # smoke test). With strict mode stripped the name expands empty and the
@@ -3843,7 +3852,7 @@ _bridge_opens_from() {
   wait "$bpid" 2>/dev/null || true
 }
 
-@test "regression vnext: a relative hook path is opened from the directory it was judged in" {
+@test "regression v1.5.0: a relative hook path is opened from the directory it was judged in" {
   # The bridge judged a relative path field from the event's translated cwd but
   # started the hook in its own working directory, the project root. With a
   # real sub/evil/ and a planted evil -> ~/.ssh at the root, a Write event from
@@ -3862,7 +3871,7 @@ _bridge_opens_from() {
   assert_output "IN-SUB"
 }
 
-@test "regression vnext: a fork box's hook runs in the copy, so a relative path opens the copy's file" {
+@test "regression v1.5.0: a fork box's hook runs in the copy, so a relative path opens the copy's file" {
   # The same mismatch in a fork box: the relative value was judged inside the
   # fork copy and opened from the ORIGIN tree, where cleat was launched.
   command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
@@ -3879,7 +3888,7 @@ _bridge_opens_from() {
   assert_output "FORK-COPY"
 }
 
-@test "regression vnext: a Grep over more files than the path-field ceiling keeps its event" {
+@test "regression v1.5.0: a Grep over more files than the path-field ceiling keeps its event" {
   # tool_response.filenames entries counted toward the 256 path fields, so a
   # Grep with head_limit 0 or more than about 253 matches dropped the whole
   # PostToolUse event, though a filenames entry is only ever nulled.
@@ -3891,7 +3900,7 @@ _bridge_opens_from() {
   assert_output --partial '"/Users/you/proj/f299"'
 }
 
-@test "regression vnext: the session key is derived under a pinned C locale" {
+@test "regression v1.5.0: the session key is derived under a pinned C locale" {
   # _claude_session_key pins LC_ALL=C and explains why; _derive_project_session_key
   # did not, though it feeds the same class of path. Under a UTF-8 collation the
   # A-Z range in its sed can match outside the letters it means, so the same
@@ -3911,7 +3920,7 @@ _bridge_opens_from() {
   [ "$ascii" = "$utf8" ]
 }
 
-@test "regression vnext: an ASCII project keys byte-identically to the pre-pin form" {
+@test "regression v1.5.0: an ASCII project keys byte-identically to the pre-pin form" {
   # The pin must not re-key anybody. This is the exact string the old code
   # produced for this path.
   run _derive_project_session_key "/Users/marcin/Workspaces/cleat"
@@ -3964,7 +3973,7 @@ _vnext_refuse_during_exec() {
   }
 }
 
-@test "regression vnext: cleat shell reports a browser open the gate refused" {
+@test "regression v1.5.0: cleat shell reports a browser open the gate refused" {
   # docs/cli.md promised the refusal is surfaced on the terminal when the
   # session ends. Only exec_claude read the log, so a login run from a shell
   # was refused with nothing on screen.
@@ -3981,7 +3990,7 @@ _vnext_refuse_during_exec() {
   refute_output --partial "old.example.com"
 }
 
-@test "regression vnext: cleat login reports a browser open the gate refused" {
+@test "regression v1.5.0: cleat login reports a browser open the gate refused" {
   # cleat login promises the browser will open. When the gate refused the
   # origin, nothing said why it did not.
   mkdir -p "$TEST_TEMP/project"
@@ -3997,7 +4006,7 @@ _vnext_refuse_during_exec() {
   refute_output --partial "old.example.com"
 }
 
-@test "regression vnext: a refused login URL carrying return_url= and origin= is reported whole" {
+@test "regression v1.5.0: a refused login URL carrying return_url= and origin= is reported whole" {
   # Driven through the real watcher, so the line parsed is the line written.
   # `${l##*url=}` took the last url=, which was inside return_url=, and
   # `${l##*origin=}` took a trailing origin= the query chose.
@@ -4010,7 +4019,7 @@ _vnext_refuse_during_exec() {
   refute_output --partial "allow app.example.org"
 }
 
-@test "regression vnext: a plain link or a loopback URL is never reported as blocked" {
+@test "regression v1.5.0: a plain link or a loopback URL is never reported as blocked" {
   # Neither opens with its origin listed: a plain link defers even at a listed
   # origin, and cleat browser allow refuses localhost. Both used to print an
   # allow line, the second one a command the verb rejects.
@@ -4025,7 +4034,7 @@ _vnext_refuse_during_exec() {
   done
 }
 
-@test "regression vnext: marker text inside a URL is never read as a refusal" {
+@test "regression v1.5.0: marker text inside a URL is never read as a refusal" {
   # The box writes the URL and the watcher logs it on every branch. Searching
   # the whole line for the marker let a deferred link at a listed origin forge
   # a refusal naming a host of the box's choosing.
@@ -4040,7 +4049,7 @@ _vnext_refuse_during_exec() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext and v1.4.3: _oauth_expires_at took the LAST "expiresAt" anywhere in a
+# v1.5.0 and v1.4.3: _oauth_expires_at took the LAST "expiresAt" anywhere in a
 # credential file. Claude Code 2.1.270 keeps MCP OAuth tokens in the same file
 # under mcpOAuth, each with its own expiresAt. It writes that key after
 # claudeAiOauth once an MCP login follows a Claude login. Every newest-wins
@@ -4059,7 +4068,7 @@ _mcp_cred_blob() {   # $1 = access-token tag, $2 = claudeAiOauth.expiresAt, $3 =
   printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-%s","refreshToken":"sk-ant-ort01-SAME","expiresAt":%s,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"},"mcpOAuth":{"labmcp|cda6d80a97111f6e":{"serverName":"labmcp","serverUrl":"http://127.0.0.1:36963/mcp","accessToken":"FAKE-MCP-at","discoveryState":{"authorizationServerUrl":"http://127.0.0.1:36963","oauthMetadataFound":true},"clientId":"lab-mcp-client","refreshToken":"FAKE-MCP-rt","expiresAt":%s,"scope":"read"}}}' "$1" "$2" "$3"
 }
 
-@test "regression vnext: account newest-wins reads the Claude login expiry, not an MCP entry written after it" {
+@test "regression v1.5.0: account newest-wins reads the Claude login expiry, not an MCP entry written after it" {
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
   CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
@@ -4170,7 +4179,7 @@ _mcp_cred_blob() {   # $1 = access-token tag, $2 = claudeAiOauth.expiresAt, $3 =
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: the credential readers were not scoped to the Claude login. With jq
+# v1.5.0: the credential readers were not scoped to the Claude login. With jq
 # they took the first accessToken or refreshToken anywhere in the file and
 # without jq the last. Claude Code 2.1.270 keeps each MCP server's OAuth tokens
 # in the same file under mcpOAuth. It writes that key BEFORE claudeAiOauth when
@@ -4180,7 +4189,7 @@ _mcp_cred_blob() {   # $1 = access-token tag, $2 = claudeAiOauth.expiresAt, $3 =
 # beside a live MCP entry read as plausible and was harvested over the account's
 # only good credential, with no trash and no undo.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: the usage poll sends the account's own bearer, never a coresident MCP token" {
+@test "regression v1.5.0: the usage poll sends the account's own bearer, never a coresident MCP token" {
   command -v jq >/dev/null || skip "the usage poll needs jq"
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   mkdir -p "$CLEAT_ACCOUNTS_DIR"
@@ -4210,7 +4219,7 @@ _mcp_cred_blob() {   # $1 = access-token tag, $2 = claudeAiOauth.expiresAt, $3 =
   done
 }
 
-@test "regression vnext: a jq-less host does not harvest a blanked login over a good store" {
+@test "regression v1.5.0: a jq-less host does not harvest a blanked login over a good store" {
   _hide_jq
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
@@ -4246,7 +4255,7 @@ _mcp_cred_blob() {   # $1 = access-token tag, $2 = claudeAiOauth.expiresAt, $3 =
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: nothing serialised the account code across cleat processes. Every
+# v1.5.0: nothing serialised the account code across cleat processes. Every
 # account path read a pin, a store and a staged credential, decided and wrote,
 # and two terminals interleaved. An attach that had read pin a staged a's login
 # over the b a concurrent switch had just staged (5 in 100 natural runs), so the
@@ -4325,7 +4334,7 @@ _acct_race_joined() {
   wait "$_ACCT_RACE_PID"
 }
 
-@test "regression vnext: an attach cannot stage the old account after a concurrent switch pinned the new one" {
+@test "regression v1.5.0: an attach cannot stage the old account after a concurrent switch pinned the new one" {
   _acct_race_setup
   local CN="cleat-race-abcdef12" staged
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -4343,7 +4352,7 @@ _acct_race_joined() {
   assert_output --partial '"accessToken":"at-B0"'
 }
 
-@test "regression vnext: an attach during the unpin and staging of a switch waits, then stages the new account" {
+@test "regression v1.5.0: an attach during the unpin and staging of a switch waits, then stages the new account" {
   # The other half of the switch's hold. The switch has harvested and is about
   # to pin b and stage it. A switch that let go of the lock after its harvest
   # let the attach read pin a and decide to stage a's newer login. Once that
@@ -4383,7 +4392,7 @@ _acct_race_joined() {
   assert_output --partial '"accessToken":"at-B0"'
 }
 
-@test "regression vnext: a session-end harvest cannot write the new account into the old account's store" {
+@test "regression v1.5.0: a session-end harvest cannot write the new account into the old account's store" {
   # The harvest decided on a's refreshed login, a switch then harvested, pinned b
   # and staged b, and the harvest wrote the staged file as it was by then: b's
   # credential into a's store. The box refreshing again inside that window is
@@ -4416,7 +4425,7 @@ _acct_race_joined() {
   assert_output --partial '"accessToken":"at-B0"'
 }
 
-@test "regression vnext: an attach during a rename stages from the renamed store" {
+@test "regression v1.5.0: an attach during a rename stages from the renamed store" {
   # The rename moves the store before it rewrites the pins. An attach that read
   # the pin in between found no store and removed the box's credential (16 of 63
   # in the band). The store also holds a newer refresh than the box, the way
@@ -4437,7 +4446,7 @@ _acct_race_joined() {
   assert_output --partial '"accessToken":"at-A2"'
 }
 
-@test "regression vnext: a box pinned while its account is being removed is never left on a store that is gone" {
+@test "regression v1.5.0: a box pinned while its account is being removed is never left on a store that is gone" {
   # remove read the pinned boxes, a switch then pinned another box to the same
   # account and the trash took the store from under it. That box's next attach
   # found no store and deleted its staged login.
@@ -4455,7 +4464,7 @@ _acct_race_joined() {
   assert_success
 }
 
-@test "regression vnext: a harvest writes only the bytes it checked, never what the box swaps in afterwards" {
+@test "regression v1.5.0: a harvest writes only the bytes it checked, never what the box swaps in afterwards" {
   # The harvest read the staged path for the expiry, again for the token check
   # and again for the copy. Claude blanks both tokens in that file on
   # invalid_grant, and a blank that landed after the check went over the
@@ -4501,7 +4510,7 @@ _acct_race_joined() {
   done
 }
 
-@test "regression vnext: a switch that cannot take the account lock changes nothing" {
+@test "regression v1.5.0: a switch that cannot take the account lock changes nothing" {
   # A timeout must never fall through to an unlocked write or delete.
   _acct_race_setup
   local CN="cleat-race-abcdef12" staged
@@ -4524,7 +4533,7 @@ _acct_race_joined() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: the live-session refusal gave a reason Claude Code 2.1.270 does not
+# v1.5.0: the live-session refusal gave a reason Claude Code 2.1.270 does not
 # have. The switch said "Swapping the credential under a running session is
 # noticed and undone", from a 2.1.267 read that was never run, and the remove
 # gave no reason at all. On 2.1.270 the store's mtime change only clears caches:
@@ -4533,7 +4542,7 @@ _acct_race_joined() {
 # store path, the account identity and any turn in flight from its start. All
 # three refusals now say that.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: a live-session refusal never claims Claude Code undoes the swap" {
+@test "regression v1.5.0: a live-session refusal never claims Claude Code undoes the swap" {
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
   CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
@@ -4567,12 +4576,12 @@ _acct_race_joined() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: account rm asked whether a pinned box had a live session only BEFORE
+# v1.5.0: account rm asked whether a pinned box had a live session only BEFORE
 # its "Remove it? [y/N]" question, which can stay on screen indefinitely. A
 # session started while it waited had its staged login deleted after the yes,
 # and Claude printed "Not logged in" into it.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: account rm asks again whether a session is live after its question" {
+@test "regression v1.5.0: account rm asks again whether a session is live after its question" {
   _acct_race_setup
   local cn="cleat-proj-abcdef12" staged
   staged="$CLEAT_RUN_DIR/$cn/auth/.credentials.json"
@@ -4599,12 +4608,12 @@ _acct_race_joined() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: a switch polled the outgoing account's usage (up to 3 s of curl)
+# v1.5.0: a switch polled the outgoing account's usage (up to 3 s of curl)
 # between its harvest and the staging of the incoming login. A refresh the box
 # saved in that window was deleted by the staging without ever being harvested.
 # The poll now runs after the staging and outside the account lock.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: a switch finishes staging before it waits on the usage API" {
+@test "regression v1.5.0: a switch finishes staging before it waits on the usage API" {
   _acct_race_setup
   local CN="cleat-race-abcdef12" staged
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -4633,7 +4642,7 @@ _acct_race_joined() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: writers that created an account, and an attach that deleted a login.
+# v1.5.0: writers that created an account, and an attach that deleted a login.
 #
 # The harvest and the metadata writer both began with a mkdir -p of the store,
 # so one that finished after `cleat account rm` in another terminal put the
@@ -4646,7 +4655,7 @@ _acct_race_joined() {
 # next attach threw the login away and the Claude still running on it printed
 # "Not logged in". The attach harvests instead and stages nothing back.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: a session-end harvest that loses the race with account rm does not recreate the account" {
+@test "regression v1.5.0: a session-end harvest that loses the race with account rm does not recreate the account" {
   _acct_race_setup
   local CN="cleat-race-abcdef12"
   # With the store gone the harvest no longer sees the same grant, so the server
@@ -4677,7 +4686,7 @@ _acct_race_joined() {
   assert_output --partial '"accessToken":"at-A1"'
 }
 
-@test "regression vnext: an unharvested login in a pinned box survives the next attach while its account store is empty" {
+@test "regression v1.5.0: an unharvested login in a pinned box survives the next attach while its account store is empty" {
   _acct_race_setup
   _account_box_ready() { return 0; }
   local mode cn staged store
@@ -4732,7 +4741,7 @@ _acct_race_joined() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: every deleter trusted a declined harvest.
+# v1.5.0: every deleter trusted a declined harvest.
 #
 # The harvest returned 0 both when the store already held the staged login and
 # when it simply declined a file that was not newer. `cleat rm`, both switches,
@@ -4759,7 +4768,7 @@ _held_declined_pair() {
   _box_account_write "$1" work
 }
 
-@test "regression vnext: cleat rm keeps a staged login its account store does not have" {
+@test "regression v1.5.0: cleat rm keeps a staged login its account store does not have" {
   _acct_race_setup
   local mode proj cn
   for mode in jq nojq; do
@@ -4786,7 +4795,7 @@ _held_declined_pair() {
   unset -f command
 }
 
-@test "regression vnext: switching accounts keeps a refreshed login whose harvest failed" {
+@test "regression v1.5.0: switching accounts keeps a refreshed login whose harvest failed" {
   _acct_race_setup
   local CN="cleat-held-abcdef12" staged
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -4805,7 +4814,7 @@ _held_declined_pair() {
   assert_output --partial '"accessToken":"at-O0"'
 }
 
-@test "regression vnext: going back to the shared login keeps a staged login its account does not have" {
+@test "regression v1.5.0: going back to the shared login keeps a staged login its account does not have" {
   _acct_race_setup
   local CN="cleat-held-abcdef12"
   _held_declined_pair "$CN" W B
@@ -4817,7 +4826,7 @@ _held_declined_pair() {
   assert_success
 }
 
-@test "regression vnext: removing an account keeps a staged login it does not have" {
+@test "regression v1.5.0: removing an account keeps a staged login it does not have" {
   _acct_race_setup
   local CN="cleat-held-abcdef12"
   _held_declined_pair "$CN" W B
@@ -4831,7 +4840,7 @@ _held_declined_pair() {
   assert_success
 }
 
-@test "regression vnext: nuke keeps a staged login its account does not have" {
+@test "regression v1.5.0: nuke keeps a staged login its account does not have" {
   _acct_race_setup
   local CN="cleat-held-abcdef12"
   _held_declined_pair "$CN" W B
@@ -4844,7 +4853,7 @@ _held_declined_pair() {
   assert_success
 }
 
-@test "regression vnext: a credential journal left in a box auth dir is kept when cleat rm wipes the run dir" {
+@test "regression v1.5.0: a credential journal left in a box auth dir is kept when cleat rm wipes the run dir" {
   _acct_race_setup
   local leg proj cn
   _acct_race_cred "$CLEAT_ACCOUNTS_DIR/b/.credentials.json" B 0 1789025200000
@@ -4876,7 +4885,7 @@ _held_declined_pair() {
   assert_failure
 }
 
-@test "regression vnext: cleat nuke keeps a credential journal from a box that is not pinned" {
+@test "regression v1.5.0: cleat nuke keeps a credential journal from a box that is not pinned" {
   _acct_race_setup
   local CN="cleat-held-abcdef12"
   _acct_race_cred "$CLEAT_RUN_DIR/$CN/.prev.1789000000" A 1 1789028800000
@@ -4892,7 +4901,7 @@ _held_declined_pair() {
   assert_success
 }
 
-@test "regression vnext: a wipe that cannot keep a credential journal deletes nothing" {
+@test "regression v1.5.0: a wipe that cannot keep a credential journal deletes nothing" {
   _acct_race_setup
   local cn
   # Something that is not a directory where the held logins go.
@@ -4917,7 +4926,7 @@ _held_declined_pair() {
   assert_failure
 }
 
-@test "regression vnext: an attach keeps a login the store does not have before staging over it" {
+@test "regression v1.5.0: an attach keeps a login the store does not have before staging over it" {
   _acct_race_setup
   local CN="cleat-held-abcdef12"
   _held_declined_pair "$CN" W B
@@ -4934,7 +4943,7 @@ _held_declined_pair() {
 # pinned to that account still had the old login staged, fresher than the one
 # adopted. The next session end wrote it straight back. The held entry was
 # already gone, so the adopted login existed nowhere.
-@test "regression vnext: a login adopted into an account a box is pinned to survives the next harvest" {
+@test "regression v1.5.0: a login adopted into an account a box is pinned to survives the next harvest" {
   _acct_race_setup
   local CN="cleat-held-abcdef12" mode staged
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -4966,7 +4975,7 @@ _held_declined_pair() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: a harvest had no identity check.
+# v1.5.0: a harvest had no identity check.
 #
 # The session-end harvest wrote a staged login over the pinned account's store
 # on "newer and plausible" alone. The staged file sits in a directory the box
@@ -4994,7 +5003,7 @@ _acct_ident_profile() {
   _account_profile_curl() { printf '%s\n200' "$_ACCT_IDENT_BODY"; }
 }
 
-@test "regression vnext: a login for another account is never harvested over the pinned credential" {
+@test "regression v1.5.0: a login for another account is never harvested over the pinned credential" {
   _acct_race_setup
   local mode cn store
   for mode in jq nojq; do
@@ -5021,7 +5030,7 @@ _acct_ident_profile() {
   unset -f command
 }
 
-@test "regression vnext: first use never records a login whose email differs from the one the account shows" {
+@test "regression v1.5.0: first use never records a login whose email differs from the one the account shows" {
   _acct_race_setup
   local CN="cleat-ident-abcdef12" store
   store="$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
@@ -5056,7 +5065,7 @@ _acct_ident_profile() {
 # with no copy anywhere, so a /login as someone else still replaced the only
 # credential. The store's own login is held first now, and a store login that
 # cannot be kept stops the write.
-@test "regression vnext: a first verified harvest holds the login it writes over" {
+@test "regression v1.5.0: a first verified harvest holds the login it writes over" {
   _acct_race_setup
   local CN="cleat-ident-abcdef12" store staged
   store="$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
@@ -5098,7 +5107,7 @@ _acct_ident_profile() {
 # server had already verified. If refresh tokens do not rotate the uuid was
 # never recorded again, and any later /login as someone else in a box pinned to
 # that account went through the first-use harvest and over the adopted login.
-@test "regression vnext: a login nobody verified adopted back into its account keeps the account verified" {
+@test "regression v1.5.0: a login nobody verified adopted back into its account keeps the account verified" {
   _acct_race_setup
   local CN="cleat-ident-abcdef12" staged d id=""
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -5135,7 +5144,7 @@ _acct_ident_profile() {
   assert_output "work@lab.invalid"
 }
 
-@test "regression vnext: a harvest the server cannot vouch for writes nothing and deletes nothing" {
+@test "regression v1.5.0: a harvest the server cannot vouch for writes nothing and deletes nothing" {
   _acct_race_setup
   local CN="cleat-ident-abcdef12" store staged code
   store="$CLEAT_ACCOUNTS_DIR/a/.credentials.json"
@@ -5167,7 +5176,7 @@ _acct_ident_profile() {
   done
 }
 
-@test "regression vnext: switching away holds a staged login nobody could verify instead of deleting it" {
+@test "regression v1.5.0: switching away holds a staged login nobody could verify instead of deleting it" {
   _acct_race_setup
   local CN="cleat-ident-abcdef12" staged
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -5188,7 +5197,7 @@ _acct_ident_profile() {
   assert_output --partial '"accessToken":"at-O0"'
 }
 
-@test "regression vnext: switching away never stamps the account with the email in the box project file" {
+@test "regression v1.5.0: switching away never stamps the account with the email in the box project file" {
   _acct_race_setup
   local CN="cleat-ident-abcdef12" key
   _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 0 1789025200000
@@ -5211,7 +5220,7 @@ _acct_ident_profile() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: a switch staged the incoming login by removing the staged file and
+# v1.5.0: a switch staged the incoming login by removing the staged file and
 # renaming the new one in later. For about 25 ms the box had no credential file,
 # and a Claude the live gate missed answered "Not logged in" into that moment.
 # Both staging directions also copied the WHOLE file. Claude Code keeps an MCP
@@ -5233,7 +5242,7 @@ _acct_key_mcp() {
   printf '"mcpOAuth":{"linear|0123456789abcdef":{"serverName":"linear","serverUrl":"https://mcp.linear.app/mcp","accessToken":"FAKE-MCP-%s","refreshToken":"FAKE-MCP-R-%s","expiresAt":1789002000000,"scope":"read"}}' "$1" "$1"
 }
 
-@test "regression vnext: a switch never leaves the box without a credential file even for a moment" {
+@test "regression v1.5.0: a switch never leaves the box without a credential file even for a moment" {
   _acct_race_setup
   local CN="cleat-gap-abcdef12" staged f
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -5260,7 +5269,7 @@ _acct_key_mcp() {
   assert_output --partial '"accessToken":"at-N0"'
 }
 
-@test "regression vnext: an MCP server login made inside a pinned box survives the next attach" {
+@test "regression v1.5.0: an MCP server login made inside a pinned box survives the next attach" {
   _acct_race_setup
   local CN="cleat-mcp-abcdef12" staged store
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -5291,7 +5300,7 @@ _acct_key_mcp() {
   refute_output --partial '"accessToken":"at-W0"'
 }
 
-@test "regression vnext: one box's MCP login never reaches the account store or another box" {
+@test "regression v1.5.0: one box's MCP login never reaches the account store or another box" {
   _acct_race_setup
   local one="cleat-one-abcdef12" two="cleat-two-abcdef12" store
   store="$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
@@ -5317,7 +5326,7 @@ _acct_key_mcp() {
   refute_output --partial "FAKE-MCP-one"
 }
 
-@test "regression vnext: switching a box to another account keeps its own MCP login" {
+@test "regression v1.5.0: switching a box to another account keeps its own MCP login" {
   _acct_race_setup
   local CN="cleat-mcp-abcdef12" staged
   staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
@@ -5373,7 +5382,7 @@ _acct_key_mcp() {
 # file into place, which is exactly the window, and does what Claude does with
 # an unparseable file on a bind mount.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: the identity delete never empties claude.json under a reading Claude" {
+@test "regression v1.5.0: the identity delete never empties claude.json under a reading Claude" {
   command -v jq >/dev/null || skip "needs jq"
   CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
   local key f cached
@@ -5419,7 +5428,7 @@ _acct_key_mcp() {
 # (tengu_config_auth_loss_prevented, 4 of 4 against 2.1.270). The delete asks
 # again right before it writes, and the switch says how to finish the job.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: a Claude that starts during an account switch keeps its identity file untouched" {
+@test "regression v1.5.0: a Claude that starts during an account switch keeps its identity file untouched" {
   command -v jq >/dev/null || skip "needs jq"
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
@@ -5535,7 +5544,7 @@ _acct_key_mcp() {
 # oauthAccount, the stopped-box rebuild kept it too. The pin now carries the
 # box's per-project key on a second line.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: removing an account drops the identity its pinned boxes carry" {
+@test "regression v1.5.0: removing an account drops the identity its pinned boxes carry" {
   command -v jq >/dev/null || skip "needs jq"
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
@@ -5592,7 +5601,7 @@ _acct_key_mcp() {
 # whose it is, so the newest pinned sibling stamped every shared-login box with
 # the other person's email. concept/44 claimed this guard existed. It did not.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: an unpinned box never inherits a pinned sibling's account name" {
+@test "regression v1.5.0: an unpinned box never inherits a pinned sibling's account name" {
   command -v jq >/dev/null || skip "needs jq"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
   CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
@@ -5712,13 +5721,13 @@ _b13_pinned_login_box() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext: the browser destination gate shipped without the hosts Claude Code
+# v1.5.0: the browser destination gate shipped without the hosts Claude Code
 # 2.1.270 actually authorizes at (claude.com and platform.claude.com). The gate
 # refused the one login Cleat ships a bridge FOR, so the watcher never opened
 # the URL and never started the callback proxy, and every login fell back to
 # pasting a code by hand while `cleat login` promised the browser would open.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: the Claude authorize URL opens through the browser bridge" {
+@test "regression v1.5.0: the Claude authorize URL opens through the browser bridge" {
   local u
   u="https://claude.com/cai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A40701%2Fcallback"
   run _bridge_dest_allowed "$u"
@@ -5866,7 +5875,7 @@ _b17_top_after_claude_exited() {
   [ ! -s "$TEST_TEMP/stopped" ]
 }
 
-@test "regression vnext: cleat account switches a box whose only node process is a dev server" {
+@test "regression v1.5.0: cleat account switches a box whose only node process is a dev server" {
   CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
   CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
   CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
@@ -5924,7 +5933,7 @@ _b17_top_after_claude_exited() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vnext (unreleased account switching): on a host with no jq a pinned box kept
+# v1.5.0 (account switching): on a host with no jq a pinned box kept
 # or gained the wrong identity. _account_invalidate_identity returned at once
 # without jq, and the builder's no-jq branch kept the persisted copy or copied
 # the host file whole, so the box launched carrying the previous account's (or
@@ -5974,7 +5983,7 @@ _b12_box_running() {
 }
 _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_F"; }
 
-@test "regression vnext: a jq-less host clears the old account from a box switched while stopped" {
+@test "regression v1.5.0: a jq-less host clears the old account from a box switched while stopped" {
   _b12_setup
   _b12_box_stopped
   _account_ensure_dir a
@@ -6000,7 +6009,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   assert_output "abc"
 }
 
-@test "regression vnext: a jq-less host clears the old account at the switch when the box is running" {
+@test "regression v1.5.0: a jq-less host clears the old account at the switch when the box is running" {
   _b12_setup
   _b12_box_running
   _account_ensure_dir a
@@ -6017,7 +6026,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   [ "$before" = "$after" ] || { echo "inode changed under a running box"; return 1; }
 }
 
-@test "regression vnext: a box created pinned on a jq-less host does not launch with the host account" {
+@test "regression v1.5.0: a box created pinned on a jq-less host does not launch with the host account" {
   _b12_setup
   _account_ensure_dir work
   _box_account_write "$_B12_CN" work "$_B12_KEY"
@@ -6032,7 +6041,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   assert_output "abc"
 }
 
-@test "regression vnext: a jq-less host clears the named account from a stopped box put back on the shared login" {
+@test "regression v1.5.0: a jq-less host clears the named account from a stopped box put back on the shared login" {
   _b12_setup
   _b12_box_stopped
   _account_ensure_dir a
@@ -6051,7 +6060,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   assert_output "absent"
 }
 
-@test "regression vnext: the jq-less identity clear never edits the file under a live Claude" {
+@test "regression v1.5.0: the jq-less identity clear never edits the file under a live Claude" {
   # A config write racing the in-place copy puts the old name straight back,
   # and a delete under a live Claude Code freezes its own later saves of that
   # file. The next launch tries again.
@@ -6086,7 +6095,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
 # the box that fell behind did it again, so the copies piled up. The same hold
 # fired from the release path on `cleat account default` and on a re-pin.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: a box staged on a generation its account already replaced is not held" {
+@test "regression v1.5.0: a box staged on a generation its account already replaced is not held" {
   _acct_race_setup
   local mode acct a b c store staged_a staged_b staged_c
   for mode in jq nojq; do
@@ -6137,7 +6146,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
 # per session (attach and session end), and the line at the end of it named
 # another cleat command and asked for a retry that could never work.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: a lock that cannot be made fails at once and names the directory" {
+@test "regression v1.5.0: a lock that cannot be made fails at once and names the directory" {
   _acct_race_setup
   local rc=0 lock
   _ACCOUNT_LOCK_WAIT_S=20
@@ -6184,7 +6193,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
 # so a black-holed route, a captive portal or a dropped VPN left the terminal
 # in Claude's raw mode for the whole timeout with nothing on screen saying why.
 # ─────────────────────────────────────────────────────────────────────────────
-@test "regression vnext: the session-end harvest runs only after the terminal is back" {
+@test "regression v1.5.0: the session-end harvest runs only after the terminal is back" {
   _account_sync_out() { echo harvest >> "$TEST_TEMP/order"; return 0; }
   _restore_terminal() { echo restore >> "$TEST_TEMP/order"; }
   run exec_claude "test-ctr" --dangerously-skip-permissions
@@ -6193,11 +6202,11 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   assert_output "$(printf 'restore\nharvest')"
 }
 
-# vnext: the live account switch holds Claude's OWN refresh lock across the
+# v1.5.0: the live account switch holds Claude's OWN refresh lock across the
 # SIGTERM, so no token refresh of the outgoing store can start (and be lost to
 # Claude's 2000 ms shutdown cap) during the stop. The fake Claude records, at
 # the instant it takes the signal, whether the lock dir was held. See concept/44.
-@test "regression vnext: a handoff holds the outgoing refresh lock across the signal" {
+@test "regression v1.5.0: a handoff holds the outgoing refresh lock across the signal" {
   hb_require_linux
   hb_reset_pids
   local BH="$TEST_TEMP/box" PV="$TEST_TEMP/pv"
@@ -6214,11 +6223,11 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   assert_equal "$(cat "$lockrec" 2>/dev/null)" "yes"
 }
 
-# vnext: a Claude that starts AFTER the kill (a background command's session, a
+# v1.5.0: a Claude that starts AFTER the kill (a background command's session, a
 # hand-started one) must abort the switch at the final scan, never be staged
 # over. The fake Claude's SIGTERM trap starts a fresh marked claude; the verb's
 # final scan under the lock must see it and abort. See concept/44.
-@test "regression vnext: a handoff never stages over a Claude that started after the kill" {
+@test "regression v1.5.0: a handoff never stages over a Claude that started after the kill" {
   hb_require_linux
   hb_reset_pids
   local BH="$TEST_TEMP/box" PV="$TEST_TEMP/pv"
@@ -6235,7 +6244,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   refute_line "end	ok"
 }
 
-@test "regression vnext: every attach and shell waits for the account lock before it reads the pin" {
+@test "regression v1.5.0: every attach and shell waits for the account lock before it reads the pin" {
   # attack 1.1, the default-pin gap: a box on the shared login read its pin with
   # NO lock, so an attach or a shell racing a shared-to-named switch read the old
   # pin after the switch had checked its markers but before it moved the pin, and
@@ -6287,7 +6296,7 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   _order_gate_first "$TEST_TEMP/order" "$scn" || fail "cmd_shell read the pin before the account gate"
 }
 
-# vnext: a live account switch relaunches with `--resume <sid>`, NEVER
+# v1.5.0: a live account switch relaunches with `--resume <sid>`, NEVER
 # `--continue`. Right after the SIGTERM the reopening conversation is the newest
 # transcript, so --continue would open a sibling session and two processes would
 # append to one file (x3 c3). See concept/44 5.6.
@@ -6325,7 +6334,7 @@ _rl_regression_setup() {
   _rl_exec_fixture
 }
 
-@test "regression vnext: a handoff relaunch never reopens another conversation of the same box" {
+@test "regression v1.5.0: a handoff relaunch never reopens another conversation of the same box" {
   _rl_regression_setup
   printf '143 ready\n0\n' > "$HB_PLAN"
   run exec_claude "$CN" --dangerously-skip-permissions
@@ -6335,7 +6344,7 @@ _rl_regression_setup() {
   refute_output --partial "--continue"
 }
 
-@test "regression vnext: session end cleanup and harvest never run between a handoff signal and the relaunch" {
+@test "regression v1.5.0: session end cleanup and harvest never run between a handoff signal and the relaunch" {
   _rl_regression_setup
   export HB_ORDER="$TEST_TEMP/order"; : > "$HB_ORDER"
   _account_sync_out() { echo harvest >> "$HB_ORDER"; return 0; }
@@ -6346,4 +6355,262 @@ _rl_regression_setup() {
   # relaunch. Order is exactly exec, exec, harvest.
   run cat "$HB_ORDER"
   assert_output "$(printf 'exec\nexec\nharvest')"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.0: pinning LC_ALL=C in _derive_project_session_key re-keyed every
+# non-ASCII project folder. v1.4.3 ran tr and sed in the caller's locale, so a
+# UTF-8 shell keyed /x/café one way and the pinned form keys it another, and the
+# project's whole session history and .claude.json store went missing on
+# upgrade. The C key stays the default, but a legacy key whose session directory
+# exists (and the C key's does not) is kept.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.0: a non-ASCII project keeps its pre-pin session key on upgrade" {
+  local proj="/x/café" hash ckey legacy="" loc cand
+  hash="$(echo -n "$proj" | _md5 | head -c 8)"
+  ckey="$(basename "$proj" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g')"
+  for loc in C.UTF-8 en_US.UTF-8; do
+    cand="$(basename "$proj" | LC_ALL="$loc" tr '[:upper:]' '[:lower:]' 2>/dev/null | LC_ALL="$loc" sed 's/[^a-z0-9-]/-/g' 2>/dev/null)"
+    if [ -n "$cand" ] && [ "$cand" != "$ckey" ]; then legacy="$cand"; break; fi
+  done
+  [ -n "$legacy" ] || skip "no usable UTF-8 locale on this host"
+
+  # No legacy directory: the C key.
+  LC_ALL=C run _derive_project_session_key "$proj"
+  assert_output "${ckey}-${hash}"
+
+  # A v1.4.3 session directory under the UTF-8 key: that key is kept.
+  mkdir -p "$HOME/.claude/projects/${legacy}-${hash}"
+  LC_ALL=C run _derive_project_session_key "$proj"
+  assert_output "${legacy}-${hash}"
+
+  # A named box looks for its own suffixed directory.
+  LC_ALL=C run _derive_project_session_key "$proj" az
+  assert_output "${ckey}-${hash}-az"
+  mkdir -p "$HOME/.claude/projects/${legacy}-${hash}-az"
+  LC_ALL=C run _derive_project_session_key "$proj" az
+  assert_output "${legacy}-${hash}-az"
+
+  # Once the C key's own directory exists, it wins.
+  mkdir -p "$HOME/.claude/projects/${ckey}-${hash}"
+  LC_ALL=C run _derive_project_session_key "$proj"
+  assert_output "${ckey}-${hash}"
+}
+
+@test "regression v1.5.0: a symlinked legacy session directory is never adopted as the key" {
+  local proj="/x/café" hash ckey legacy="" loc cand
+  hash="$(echo -n "$proj" | _md5 | head -c 8)"
+  ckey="$(basename "$proj" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g')"
+  for loc in C.UTF-8 en_US.UTF-8; do
+    cand="$(basename "$proj" | LC_ALL="$loc" tr '[:upper:]' '[:lower:]' 2>/dev/null | LC_ALL="$loc" sed 's/[^a-z0-9-]/-/g' 2>/dev/null)"
+    if [ -n "$cand" ] && [ "$cand" != "$ckey" ]; then legacy="$cand"; break; fi
+  done
+  [ -n "$legacy" ] || skip "no usable UTF-8 locale on this host"
+  mkdir -p "$HOME/.claude/projects" "$TEST_TEMP/elsewhere"
+  ln -s "$TEST_TEMP/elsewhere" "$HOME/.claude/projects/${legacy}-${hash}"
+  LC_ALL=C run _derive_project_session_key "$proj"
+  assert_output "${ckey}-${hash}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.0: only cmd_run and cmd_resume wrote the box settings overlay. A plain
+# `cleat` (cmd_start) after a declined or non-TTY cap drift launched with
+# ACTIVE_CAPS empty, so no red guard line printed, while the overlay still held
+# the unsafe-rm PermissionRequest hook from the create. cmd_start now refreshes
+# the overlays to match the caps of this launch.
+# ─────────────────────────────────────────────────────────────────────────────
+_urm_start_fixture() {
+  command -v jq >/dev/null 2>&1 || skip "needs jq"
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project" "$HOME/.claude"
+  echo '{"model":"opus"}' > "$HOME/.claude/settings.json"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  OVL="$CLEAT_RUN_DIR/${CN}/settings"
+  mkdir -p "$OVL"
+  echo '{"model":"opus"}' > "$OVL/settings.json"
+  _inject_unsafe_rm_hook "$OVL/settings.json"
+  mock_docker_ps "$CN"
+  mock_docker_ps_a "$CN"
+  exec_claude() { return 0; }
+}
+
+@test "regression v1.5.0: plain cleat drops a stale unsafe-rm hook when the cap is not active" {
+  _urm_start_fixture
+  run jq -r '.hooks.PermissionRequest[0].matcher' "$OVL/settings.json"
+  assert_output "Bash"
+  cmd_start "$TEST_TEMP/project" >/dev/null 2>&1
+  run jq -r '.hooks.PermissionRequest // "none"' "$OVL/settings.json"
+  assert_output "none"
+  run jq -r '.model' "$OVL/settings.json"
+  assert_output "opus"
+}
+
+@test "regression v1.5.0: plain cleat keeps the unsafe-rm hook when the cap is active" {
+  _urm_start_fixture
+  _CLI_CAPS=(unsafe-rm)
+  cmd_start "$TEST_TEMP/project" >/dev/null 2>&1
+  run jq -r '.hooks.PermissionRequest[0].matcher' "$OVL/settings.json"
+  assert_output "Bash"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.0: the nested mount targets inside ~/.claude (history.jsonl, the
+# settings mask, the kit, private and instruction-surface masks) were only
+# re-created by cmd_run. A stopped box went straight to `docker start`, so a
+# target that vanished between sessions (a host `claude install` removes
+# ~/.claude/local) failed the start on VirtioFS. Both start paths now prepare
+# the targets first.
+# ─────────────────────────────────────────────────────────────────────────────
+_mount_targets_fixture() {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  mkdir -p "$CLEAT_RUN_DIR/${CN}/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/${CN}/settings/settings.json"
+  mock_docker_ps_a "$CN"
+  is_running() { return 1; }
+  _container_has_kit_mounts() { return 0; }
+  exec_claude() { return 0; }
+  export MT_SEEN="$TEST_TEMP/targets-at-start"
+  : > "$MT_SEEN"
+  docker() {
+    if [[ "${1:-}" == start ]]; then
+      local t
+      for t in launch.json local history.jsonl settings.json projects/-workspace CLAUDE.md; do
+        [[ -e "$HOME/.claude/$t" ]] && echo "$t" >> "$MT_SEEN"
+      done
+    fi
+    command docker "$@"
+  }
+  mkdir -p "$HOME/.claude"
+  [[ ! -e "$HOME/.claude/launch.json" && ! -e "$HOME/.claude/local" ]]
+}
+
+@test "regression v1.5.0: cmd_start re-creates vanished mount targets before docker start" {
+  _mount_targets_fixture
+  cmd_start "$TEST_TEMP/project" >/dev/null 2>&1 || true
+  run grep -c "^docker start $CN" "$DOCKER_CALLS"
+  assert_output "1"
+  run cat "$MT_SEEN"
+  assert_line "launch.json"
+  assert_line "local"
+  assert_line "history.jsonl"
+  assert_line "settings.json"
+  assert_line "projects/-workspace"
+  assert_line "CLAUDE.md"
+}
+
+@test "regression v1.5.0: cmd_resume re-creates vanished mount targets before docker start" {
+  _mount_targets_fixture
+  cmd_resume "$TEST_TEMP/project" >/dev/null 2>&1 || true
+  run grep -c "^docker start $CN" "$DOCKER_CALLS"
+  assert_output "1"
+  run cat "$MT_SEEN"
+  assert_line "launch.json"
+  assert_line "local"
+  assert_line "history.jsonl"
+  assert_line "settings.json"
+  assert_line "projects/-workspace"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.0: `cleat account <name>` on a box that never started printed a raw
+# "line N: .../claude.json.identity-stale: No such file or directory" above the
+# success line. The stale-identity flag lives beside the per-project claude.json,
+# which has no directory yet, and a failed redirect reports itself before its
+# own 2>/dev/null applies. Strict-mode cover is in smoke.bats.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.0: flagging a stale identity on a never-started box prints nothing" {
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/projects-store"
+  mkdir -p "$TEST_TEMP/proj"
+  run _handoff_flag_identity_stale "$TEST_TEMP/proj" main
+  assert_success
+  assert_output ""
+  # With the directory there, the flag is written as before.
+  local key
+  key="$(_derive_project_session_key "$TEST_TEMP/proj" main)"
+  mkdir -p "$CLEAT_PROJECTS_DIR/$key"
+  run _handoff_flag_identity_stale "$TEST_TEMP/proj" main
+  assert_success
+  run test -e "$CLEAT_PROJECTS_DIR/$key/claude.json.identity-stale"
+  assert_success
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.0: on a host with no jq every project .claude/settings*.json was mounted
+# as `{}`, including a file with no hooks at all, so its permissions, env and
+# model silently vanished from the box. v1.4.3 passed such a file through. Only
+# a file that could define hooks now gets the empty settings, with a warning.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.0: a jq-less host passes a hook-free project settings file through unchanged" {
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  printf '{"permissions":{"allow":["Bash(npm test)"]},"env":{"FOO":"bar"},"model":"opus"}\n' \
+    > "$TEST_TEMP/project/.claude/settings.json"
+  _hide_jq
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "defines hooks and jq is not installed"
+  local overlay="$CLEAT_RUN_DIR/${cname}/settings/project-settings.json"
+  run cmp "$TEST_TEMP/project/.claude/settings.json" "$overlay"
+  assert_success
+}
+
+@test "regression v1.5.0: a jq-less host warns when a project settings file with hooks is emptied" {
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  # The key spelled with a JSON escape still counts as hooks.
+  printf '{"\\u0068ooks":{"Stop":[]}}\n' \
+    > "$TEST_TEMP/project/.claude/settings.local.json"
+  _hide_jq
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Project .claude/settings.local.json defines hooks and jq is not installed on the host"
+  run cat "$CLEAT_RUN_DIR/${cname}/settings/project-settings.local.json"
+  assert_output "{}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.0: the recreate note for a box that predates the ~/.claude masks told
+# every box to run `cleat rm && cleat`. A bare `cleat rm` removes main without a
+# prompt, so a named box followed the advice and destroyed the wrong box. v1.5.0
+# makes the note fire for every pre-1.5.0 box on every start.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.0: the pre-mask recreate note names the box it is about" {
+  container_exists() { return 0; }
+  local cn="cleat-proj-12345678-az" base _p dests
+  base=$'/home/coder/.claude/CLAUDE.md\n/home/coder/.claude/agents\n/home/coder/.claude/commands\n/home/coder/.claude/skills\n/home/coder/.claude/plugins'
+  _BOX=az
+
+  # Missing a kit mask.
+  mock_docker_inspect $'/home/coder/.claude/CLAUDE.md'
+  run _maybe_note_missing_kit_masks "$cn"
+  assert_output --partial "predates the read-only ~/.claude masks"
+  assert_output --partial "cleat rm az && cleat start az"
+  refute_output --partial "cleat rm && cleat"
+
+  # Missing the per-box private dirs.
+  mock_docker_inspect "$base"
+  run _maybe_note_missing_kit_masks "$cn"
+  assert_output --partial "predates the per-box ~/.claude state directories"
+  assert_output --partial "cleat rm az && cleat start az"
+
+  # Missing the instruction-surface masks (a v1.4.3 box).
+  dests="$base"
+  for _p in $_CLAUDE_PRIVATE_DIRS; do dests="$dests"$'\n'"/home/coder/.claude/$_p"; done
+  mock_docker_inspect "$dests"
+  run _maybe_note_missing_kit_masks "$cn"
+  assert_output --partial "predates the ~/.claude instruction-surface masks"
+  assert_output --partial "cleat rm az && cleat start az"
+
+  # main keeps the short form.
+  _BOX=main
+  run _maybe_note_missing_kit_masks "$cn"
+  assert_output --partial "cleat rm && cleat"
 }

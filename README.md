@@ -116,11 +116,11 @@ Cleat gives you the best of both worlds:
 - **Session persistence** -- stop and resume sessions without losing context, each project's history is isolated
 - **Safe for unattended use** -- let Claude work overnight without risking your system
 - **Zero file permission issues** -- container user matches your host UID/GID automatically
-- **Shared auth** -- log in once, all containers use the same credentials
+- **Shared auth** -- log in once and every box uses the same credentials, unless you pin a box to a named login with `cleat account`
 - **Clipboard support** -- `pbcopy`, `xclip` and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
 - **Image paste (ctrl+v)** -- paste a screenshot from your host clipboard straight into Claude Code inside a box. No install, no capability, images only (clipboard text never crosses this channel)
 - **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq and socat
-- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`) and host Docker daemon for testing dockerized apps (`--cap docker`). All disabled by default
+- **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), host Docker daemon for testing dockerized apps (`--cap docker`) and a guard that answers Claude Code's dangerous-rm prompt (`--cap unsafe-rm`). All disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
 - **Forked workspaces** -- `--fork` gives a box its own copy of the project, so several agents can work in parallel without touching your tree
 - **Contained Claude home** -- a box sees only its own project's Claude history. The instruction surfaces your host `claude` obeys are read-only inside the cage
@@ -132,7 +132,7 @@ Cleat gives you the best of both worlds:
 - **Configuration drift detection** -- notifies when config has changed since container creation
 - **Clean terminal output** -- braille spinners for slow operations, suppressed Docker noise, canonical startup/exit sequences
 - **Auto-upgrade notifications** -- checks for updates every 10 minutes and notifies you before launching Claude
-- **Release highlights** -- a one-time, non-blocking note on the first run after an update tells you the new version's headline feature
+- **Release highlights** -- a short, non-blocking note on the first few runs after an update tells you the new version's headline feature
 
 ---
 
@@ -227,7 +227,7 @@ cleat start          # start the container
 cleat login          # opens a browser URL to sign in
 ```
 
-Credentials are saved to `~/.claude` on your host and shared across all containers automatically. Log in once, every container picks it up: whether you signed in on the host or inside any box, the next box you start or create carries the login. On macOS, where Claude keeps its login in the **Keychain** rather than a file, Cleat bridges that token into the box for you on launch.
+Credentials are saved to `~/.claude` on your host and shared across all containers automatically. Log in once, every container picks it up: whether you signed in on the host or inside an unpinned box, the next box you start or create carries the login. A login inside a box pinned with `cleat account` is saved to that account instead. On macOS, where Claude keeps its login in the **Keychain** rather than a file, Cleat bridges that token into the box for you on launch.
 
 ### 2. Use it
 
@@ -332,7 +332,8 @@ cleat start feat-b --fork    # another one, independent
 
 Run it a few times and you have several agents on the same project, each in its
 own container working on its own files. They still share what every box shares:
-your Claude login and the host `~/.claude/plugins`.
+your Claude login (unless a box is pinned with `cleat account`) and the host
+`~/.claude/plugins`.
 
 A box's workspace is fixed when the container is created, so the flag only does
 something at create time. Passing `--fork` to a box that already exists as a
@@ -415,7 +416,7 @@ subagents) that you enable for one box with one command. The flagship kit,
 `plan-big-execute-small`, adapts the coordinator pattern from
 [Anthropic's cookbook](https://github.com/anthropics/claude-cookbooks/blob/main/managed_agents/CMA_plan_big_execute_small.ipynb)
 (big models for planning, small models for execution):
-run your session on Fable 5 (set once with `/model` inside the session) and
+run your session on Fable 5.1 (set once with `/model` inside the session) and
 it plans and reviews while `worker` and `scout` subagents (Sonnet 5 by
 default) execute and explore, each in its own context window so the main
 session stays lean. Flagship judgment on the plan
@@ -438,8 +439,9 @@ marked, after a `Cleat box notes` section every box carries with the
 clipboard-bridge rules. Its content stays off the host: kits live in generated
 mask files mounted into the box, nothing kit-related lands in your `~/.claude`
 and native `claude` never sees them. (Creating a box does seed inert placeholders there
-when missing, an empty `CLAUDE.md` and empty `agents`/`commands`/`skills`/`plugins`
-dirs: mount targets, not content.) Different boxes can run different kits on the
+when missing: an empty `CLAUDE.md`, empty directories for every masked or per-box path,
+an empty `loop.md`, `{"bindings":[]}` for `keybindings.json` and `{}` for the other
+masked JSON files. Mount targets, not content.) Different boxes can run different kits on the
 same repo. Kits contain instructions and subagents only, no hooks and no settings.
 Whatever they steer the agent to do happens inside the cage. As a
 hardening side effect, your five user-level instruction surfaces
@@ -475,8 +477,9 @@ follows no symlink at all, not even a top-level one, so a dotfile-repo symlink a
 one of those names is not seen in a box. The other nine are empty. A broken
 symlink at one of the mask paths stops box create with a
 clear fix-or-remove error (your symlink is never deleted) and a box created
-before these masks existed prints a recreate note on every start until you
-run `cleat rm && cleat`.
+before these masks existed prints a recreate note on every start with the
+command for that box: `cleat rm && cleat` for the default box,
+`cleat rm <box> && cleat start <box>` for a named one.
 
 ### Accounts: two Claude logins, one command to switch
 
@@ -493,7 +496,7 @@ cleat account default    # unpin: back to your shared ~/.claude login
 
 Only the login moves. Conversations, project history and settings are identical on both accounts, by construction rather than by copying: a switch relocates Claude Code's credential store for that box and nothing else. So you can hit a limit mid-conversation, switch, then carry on in the same conversation.
 
-Switch a box that has a Claude session running and the command hands it over instead of refusing. Cleat first shows what the handover costs: anything typed there but not sent, any background agent or monitor the box runs and a first reply on the new account that rereads the whole conversation without a prompt cache. It asks `Hand over?`, stops the session, moves the login and lets that terminal reopen the same conversation on the new account. `--yes` skips the question. `--now` also restarts a session that is mid-turn or sitting at a prompt, where its reply so far is lost. The conversation reopens straight into the chat with no resume question in the way, so you type continue there.
+Switch a box that has a Claude session running and the command hands it over. Cleat first shows what the handover costs: anything typed there but not sent, any background agent or monitor the box runs and a first reply on the new account that rereads the whole conversation without a prompt cache. It asks `Hand over?`, stops the session, moves the login and lets that terminal reopen the same conversation on the new account. `--yes` skips the question. `--now` also restarts a session that is mid-turn or waiting for an answer. A reply in progress is lost and a pending question closes unanswered. The conversation reopens straight into the chat with no resume question in the way, so you type continue there.
 
 The pin is per box, because the limit is per account and you probably have several boxes open. One can move to the fresh account while the others keep draining the first. The picker's first row is always your shared `~/.claude` login, so a pin is never a one-way door.
 
@@ -507,7 +510,7 @@ Upgrading to a build that has this feature does nothing by itself: no image rebu
 
 Claude Code refreshes its own token about every eight hours, inside the box. Every attach stages the stored login in and every detach takes the refreshed one back out, newest wins. `cleat rm`, every recreate and `cleat nuke` do that before they touch a run directory, so a refresh never sends you back to a browser. A `/login` run in a `cleat shell`, or `cleat login` itself, is saved to the pinned account the same way.
 
-Logins live in `~/.config/cleat/accounts`, not in `~/.claude`, which every box mounts read-write. Only the pinned account's credential is staged into that box, so a box can still see exactly one login.
+Logins live in `~/.config/cleat/accounts`, not in `~/.claude`, so no box can read the account store. Only the pinned account's login is staged into a pinned box. Your shared login in `~/.claude` is still mounted into every box, so a pinned box can also read that one when it exists.
 
 The list shows usage when it can back it up: live while that account's own access token is alive, a timestamped snapshot when it is not. Once a reset time has passed it says the window reset rather than showing a stale percentage. It never refreshes a parked login to draw a bar, because the refresh can rotate the token.
 
@@ -842,8 +845,9 @@ The post-launch summary and `cleat status` group active caps by behavior:
 
 - **mount** (green): `git`, `ssh`, `env`, `hooks`, `gh`. Bind-mount auth/identity, no install.
 - **sandbox** (amber): `docker`. Mounts the host socket, breaks isolation.
+- **guard** (red): `unsafe-rm`. Disables the box's delete-safety prompt.
 
-When only one category is active the line collapses to a single coloured row. With caps in both categories, the renderer prints a labeled block: same UI on the landing page mockups so the CLI and the marketing copy stay in lockstep.
+When only one mount or sandbox category is active the line collapses to a single coloured row. A guard cap always renders in the labeled block, as do caps that span categories. The landing page mockups use the same UI so the CLI and the marketing copy stay in lockstep.
 
 ### Workspace trust: project `.cleat` approval
 

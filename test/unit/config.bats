@@ -282,6 +282,31 @@ EOF
   assert_output "git"
 }
 
+@test "config --enable: unsafe-rm is refused for a project or a box and nothing is written" {
+  # resolve_caps strips unsafe-rm from every project .cleat. The direct mode
+  # printed "unsafe-rm enabled" and wrote [caps] unsafe-rm for a cap the next
+  # launch ignores with a warning.
+  local d="$TEST_TEMP/urm-proj"
+  mkdir -p "$d"
+  cd "$d"
+  run cmd_config --project --enable unsafe-rm
+  assert_failure
+  assert_output --partial "unsafe-rm is accepted only from your global config or --cap"
+  assert_output --partial "cleat config --enable unsafe-rm"
+  refute_output --partial "unsafe-rm enabled"
+  [[ ! -e "$d/.cleat" ]]
+  run cmd_config az --enable unsafe-rm
+  assert_failure
+  [[ ! -e "$d/.cleat" ]]
+  # The global config still takes it, and a project can still disable it.
+  run cmd_config --enable unsafe-rm
+  assert_success
+  run _read_caps_from_file "$CLEAT_GLOBAL_CONFIG"
+  assert_output "unsafe-rm"
+  run cmd_config --project --disable unsafe-rm
+  assert_success
+}
+
 @test "config --enable: enables multiple caps sequentially" {
   cmd_config --enable git
   cmd_config --enable env
@@ -984,6 +1009,36 @@ EOF
   assert_output "git"
   run _read_resource_from_file "$d/.cleat" memory
   assert_output "4g"
+}
+
+@test "generate confirm: unsafe-rm is never stamped into a project .cleat" {
+  local d="$TEST_TEMP/urm-gen"
+  mkdir -p "$d"
+  run _config_generate_project "$d" "" "" git unsafe-rm <<< "y"
+  assert_success
+  run _read_caps_from_file "$d/.cleat"
+  assert_output "git"
+  # unsafe-rm alone leaves nothing to write.
+  local e="$TEST_TEMP/urm-gen-only"
+  mkdir -p "$e"
+  run _config_generate_project "$e" "" "" unsafe-rm
+  assert_output --partial "Nothing to write"
+  [[ ! -f "$e/.cleat" ]]
+}
+
+@test "editor save: a project-scope save drops unsafe-rm and says so" {
+  local d="$TEST_TEMP/urm-edit"
+  mkdir -p "$d"
+  run _config_editor_save "$d/.cleat" project "$d" "git,unsafe-rm" default default 0 0
+  assert_success
+  assert_output --partial "it is accepted only from your global config"
+  run _read_caps_from_file "$d/.cleat"
+  assert_output "git"
+  # A global save keeps it.
+  run _config_editor_save "$CLEAT_GLOBAL_CONFIG" global "" "git,unsafe-rm" default default 0 0
+  assert_success
+  run _read_caps_from_file "$CLEAT_GLOBAL_CONFIG"
+  assert_line "unsafe-rm"
 }
 
 # ── _config_load_resource (the custom-pin derivation the TUI relies on) ─────

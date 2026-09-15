@@ -486,6 +486,27 @@ _rs_conv() {
   assert_output "$_rs_mine"
 }
 
+@test "resume probe: a stalled box answer is bounded on a host with no timeout(1)" {
+  # A stock Mac has no timeout or gtimeout. The probe only bounded itself when
+  # `timeout` was on PATH, so a wedged docker exec hung cleat resume for as long
+  # as it stalled. perl is on every Mac, and _run_bounded falls back to it.
+  command -v perl >/dev/null 2>&1 || skip "needs perl for the fallback bound"
+  command() {
+    if [ "$1" = "-v" ] && { [ "$2" = "timeout" ] || [ "$2" = "gtimeout" ]; }; then return 1; fi
+    builtin command "$@"
+  }
+  mkdir -p "$TEST_TEMP/fakebin"
+  printf '#!/bin/sh\nexec sleep 15\n' > "$TEST_TEMP/fakebin/docker"
+  chmod +x "$TEST_TEMP/fakebin/docker"
+  _RESUME_PROBE_BOUND_S=1
+  local t0=$SECONDS took
+  PATH="$TEST_TEMP/fakebin:$PATH" run _box_live_session_ids cleat-x
+  took=$(( SECONDS - t0 ))
+  assert_success
+  assert_output ""
+  [ "$took" -le 10 ] || { echo "a probe bounded at 1s took ${took}s"; return 1; }
+}
+
 @test "resume pick skips a conversation that is reopening after an account switch" {
   # Terminal 1 is reopening $_rs_mine (the newest) after a live account switch:
   # a live kind=claude marker plus a valid handoff ticket naming its sid. cleat

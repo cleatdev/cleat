@@ -1238,7 +1238,7 @@ EOF
   assert_output --partial "applies from the next session"
   # The post-enable nudge names the mechanism for the named pairing: the kit
   # never touches the session model, /model inside the session does.
-  assert_output --partial "pick Fable 5 with"
+  assert_output --partial "pick Fable 5.1 with"
 }
 
 @test "kit: enable on an existing mounted box regenerates the overlay immediately (F34)" {

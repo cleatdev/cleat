@@ -874,6 +874,46 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   [ ! -e "$CLEAT_ACCOUNTS_DIR/.lock" ]
 }
 
+@test "handoff reopen line renders a stored account name without interpreting escapes" {
+  # The reopen line printed the stored name through echo -e unescaped. A name
+  # carrying a backslash escape became a real ESC sequence (here, clear screen)
+  # on the terminal. Every other print of the name escapes it first.
+  _m2_mk_account work
+  printf 'who\ta\\033[2Jb@example.com\n' > "$CLEAT_ACCOUNTS_DIR/work/meta"
+  _EC_PINNED=work
+  run _handoff_say_t1 work "0 0"
+  assert_success
+  assert_output --partial "Reopening this conversation on account work"
+  assert_output --partial "b@example.com"
+  run bash -c 'printf "%s" "$1" | LC_ALL=C grep -c "$(printf "\033")"' _ "$output"
+  assert_output "0"
+}
+
+@test "handoff lets a second switch through once the reopened session is back in the probe" {
+  # A ready ticket from the first switch stays on disk for its age window. The
+  # reopening check ran BEFORE the probe, with the live set empty, so the ticket
+  # read as pending even though its session had already reopened, and a second
+  # switch within the window was refused as still reopening.
+  t2_prep; t2_named_box
+  _handoff_ticket_write "$CN" "$EXECID" ready "$SID" old
+  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  run _account_handoff work main "$CN" "$T2_PROJ" 1 0
+  refute_output --partial "still reopening"
+  assert_success
+  assert_output --partial "is now on account work"
+}
+
+@test "handoff still refuses while a ready ticket's session has not come back" {
+  t2_prep; t2_named_box
+  _handoff_ticket_write "$CN" "$EXECID" ready "$SID" old
+  # The probe reports a different conversation: the ticket's is still reopening.
+  t2_exec "$(t2_rec 4242 5551 idle none named "$EXECID" "aaaaaaaa-1111-2222-3333-444455556666")" "$(t2_term_ok)"
+  run _account_handoff work main "$CN" "$T2_PROJ" 1 0
+  assert_failure
+  assert_output --partial "still reopening a session from an earlier switch"
+  run _box_account_read "$CN"; assert_output "old"
+}
+
 @test "handoff writes requested tickets before the signalling exec and ready only after the pin moved" {
   t2_prep; t2_named_box
   T2_TICKET_AT_TERM=""
@@ -1067,7 +1107,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   run _box_account_read "$CN"; assert_output "old"
 }
 
-@test "handoff ignores Ctrl-C from the lock through the exec" {
+@test "handoff records Ctrl-C from the lock through the exec" {
   t2_prep; t2_named_box
   T2_PROBE="$(printf 'hb\t1\nargs\tok\n%s\nend\tok\n' "$(t2_rec 4242 5551 idle none named)")"
   T2_TERM="$(t2_term_ok)"
@@ -1082,7 +1122,44 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   run _account_handoff work main "$CN" "$T2_PROJ" 1 0
   assert_success
   run cat "$TEST_TEMP/inttrap"
-  assert_output --partial "''"
+  assert_output --partial "_HO_INT=1"
+}
+
+@test "handoff Ctrl-C trap still kills a child blocked on a FIFO" {
+  # The switch used to IGNORE INT from the lock through the exec. An ignored
+  # signal is inherited, so a credential read blocked on a FIFO the box swapped
+  # in after the -f check survived Ctrl-C and held the account lock. The flag
+  # trap resets to the default in children, so the blocked read dies.
+  #
+  # Run in a fresh bash whose INT disposition perl resets to the default: a
+  # non-interactive shell cannot trap a signal that was ignored when it started,
+  # and a test runner may start this test that way.
+  command -v perl >/dev/null 2>&1 || skip "needs perl to reset the INT disposition"
+  command -v mkfifo >/dev/null 2>&1 || skip "needs mkfifo"
+  local d="$TEST_TEMP/fifo-int"; mkdir -p "$d"
+  mkfifo "$d/fifo"
+  cat > "$d/helper.sh" <<'SH'
+#!/bin/sh
+d="$1"; n=0
+while [ ! -s "$d/pid" ] && [ $n -lt 100 ]; do sleep 0.05; n=$((n+1)); done
+sleep 0.2
+kill -INT "$(cat "$d/pid")" 2>/dev/null
+sleep 2
+# Failsafe: release the reader, so a child that ignored the signal ends with 0.
+: > "$d/fifo" &
+sleep 1
+kill $! 2>/dev/null
+SH
+  chmod +x "$d/helper.sh"
+  run perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' bash -c "
+    $(declare -f _handoff_int_flag_trap)
+    _handoff_int_flag_trap
+    '$d/helper.sh' '$d' &
+    sh -c 'echo \$\$ > \"\$1/pid\"; exec cat \"\$1/fifo\"' _ '$d'
+    echo \"rc=\$?\"
+    wait
+  "
+  assert_output --partial "rc=130"
 }
 
 @test "handoff writes the ready ticket before it captures meta" {

@@ -1150,19 +1150,19 @@ try "v0.15.0_highlight_bounded_cap" "first 3 launches" "$CLI" "$WHATS_NEW_BATS"
 # milestone the highlight's editorial version equals VERSION, so the old
 # hardcoded-vs-${VERSION} distinction is unobservable; this instead guards that
 # the copy literally says the right version. Corrupt the version in the headline:
-# the "fresh install" test (which pins "New in v1.4.0") then fails.
+# the "fresh install" test (which pins "New in v1.5.0") then fails.
 cat > "$SED_TMP" << 'SED'
-s/New in v1.4.0/New in v9.9.9/
+s/New in v1.5.0/New in v9.9.9/
 SED
 try "v0.15.0_highlight_label_frozen" "fresh install" "$CLI" "$WHATS_NEW_BATS"
 
-# v1.4.0: the release highlight also announces the Homebrew channel. Corrupt the
-# Homebrew support line so the "fresh install" test's Homebrew assertion fails,
-# proving the brew line is actually guarded rather than only present.
+# The release highlight announces the live account switch, the line a user at a
+# usage limit needs. Corrupt it so the "fresh install" test's assertion fails,
+# proving the line is guarded rather than only present.
 cat > "$SED_TMP" << 'SED'
-s/Homebrew is now a first-class install/Homebrew support landed/
+/^_maybe_show_release_highlight()/,/^}$/ s/Out of usage mid-run?/Out of tokens?/
 SED
-try "v1.4.0_highlight_brew_line" "fresh install" "$CLI" "$WHATS_NEW_BATS"
+try "vnext_highlight_account_switch_line" "fresh install" "$CLI" "$WHATS_NEW_BATS"
 
 # v1.4.1: the on-start second-install notice. All three seds are range-scoped to
 # the function body so they cannot touch the byte-identical status Install block
@@ -1994,7 +1994,7 @@ try "bugfix_highlight_changelog_line" "version-anchored changelog link" "$CLI" "
 # That changelog link must deep-link to this release's section (#v1.2.0),
 # not the bare page. Strip the anchor: the "version-anchored" test fails.
 cat > "$SED_TMP" << 'SED'
-s|cleat.sh/changelog#v1.4.0|cleat.sh/changelog|
+s|cleat.sh/changelog#v1.5.0|cleat.sh/changelog|
 SED
 try "bugfix_highlight_changelog_anchor" "version-anchored changelog link" "$CLI" "$WHATS_NEW_BATS"
 

@@ -28,14 +28,15 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
-  assert_output --partial "New in v1.4.0"
-  # "Forks", "image paste" and "Homebrew" each carry the cyan accent, so they are
-  # wrapped in color codes; assert the accent words plus the plain-text support
-  # lines, which proves all three headline features are actually advertised.
-  assert_output --partial "Forks"
-  assert_output --partial "image paste"
-  assert_output --partial "Several agents on one repo"
-  assert_output --partial "Homebrew is now a first-class install"
+  assert_output --partial "New in v1.5.0"
+  # "Accounts" and "sessions" each carry the cyan accent, so they are wrapped in
+  # color codes; assert the accent words plus the plain-text support lines, which
+  # proves both headline features and the live switch are actually advertised.
+  assert_output --partial "Accounts"
+  assert_output --partial "sessions"
+  assert_output --partial "conversations one at a time"
+  assert_output --partial "Pin a box to a named Claude login"
+  assert_output --partial "Out of usage mid-run?"
   run cat "$LAST_SEEN_VERSION_FILE"
   assert_output "$VERSION 1"
 }
@@ -44,9 +45,9 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   run _maybe_show_release_highlight
   assert_success
-  # Anchored to this release's section (#v1.4.0), not the bare changelog page:
+  # Anchored to this release's section (#v1.5.0), not the bare changelog page:
   # the /changelog page IDs each release by its version.
-  assert_output --partial "cleat.sh/changelog#v1.4.0"
+  assert_output --partial "cleat.sh/changelog#v1.5.0"
 }
 
 @test "whats-new: the changelog link is a clickable OSC 8 hyperlink in supporting terminals" {
@@ -55,7 +56,7 @@ teardown() { _common_teardown; }
   run _maybe_show_release_highlight
   assert_success
   # OSC 8 link target is the full https URL (the visible label can be the short form).
-  assert_output --partial "$(printf '\033]8;;https://cleat.sh/changelog#v1.4.0\033\\')"
+  assert_output --partial "$(printf '\033]8;;https://cleat.sh/changelog#v1.5.0\033\\')"
 }
 
 @test "whats-new: the changelog link sits on its own line, not crammed onto the prose" {
@@ -65,9 +66,9 @@ teardown() { _common_teardown; }
   _is_tty() { return 0; }
   local out cl_line; out="$(_maybe_show_release_highlight)"
   cl_line="$(printf '%s\n' "$out" | grep -F 'cleat.sh/changelog')"
-  printf '%s' "$cl_line" | grep -qF "New in v1.4.0" \
+  printf '%s' "$cl_line" | grep -qF "New in v1.5.0" \
     && { echo "changelog crammed onto the headline line"; return 1; } || true
-  printf '%s' "$cl_line" | grep -qF "just like normal" \
+  printf '%s' "$cl_line" | grep -qF "one at a time" \
     && { echo "changelog crammed onto a support line"; return 1; } || true
 }
 

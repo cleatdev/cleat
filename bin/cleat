@@ -10596,12 +10596,12 @@ _maybe_show_release_highlight() {
   # v0.16.1). We still own our OWN trailing blank below, so the bring-up that
   # follows needs none.
   [[ "${_ONSTART_GAP_OPEN:-0}" == "1" ]] || echo ""
-  info "${BOLD}New in v1.4.0${RESET}. ${CYAN}Forks${RESET}, ${CYAN}image paste${RESET} and ${CYAN}Homebrew${RESET}."
-  echo -e "    ${DIM}Several agents on one repo, each in its own copy: ${RESET}${BOLD}cleat fork start${RESET}"
-  echo -e "    ${DIM}Paste a screenshot into a caged Claude with ${RESET}${BOLD}ctrl+v${RESET}${DIM}, just like normal.${RESET}"
-  echo -e "    ${DIM}Homebrew is now a first-class install: a keg self-updates with ${RESET}${BOLD}cleat update${RESET}${DIM}.${RESET}"
+  info "${BOLD}New in v1.5.0${RESET}. ${CYAN}Accounts${RESET} and ${CYAN}sessions${RESET}."
+  echo -e "    ${DIM}Manage a box's conversations one at a time, delete or restore from a trash: ${RESET}${BOLD}cleat session${RESET}${DIM} (Claude Code cannot delete just one).${RESET}"
+  echo -e "    ${DIM}Pin a box to a named Claude login, held apart from your others and restorable from a trash of its own: ${RESET}${BOLD}cleat account${RESET}"
+  echo -e "    ${DIM}Out of usage mid-run? Run ${RESET}${BOLD}cleat account <name>${RESET}${DIM} in another terminal. The session restarts on the other login and reopens the same conversation. Type ${RESET}${BOLD}continue${RESET}${DIM}.${RESET}"
   # A clickable, version-anchored changelog link. The /changelog page IDs each
-  # release `id="vX.Y.Z"` (changelog.astro), so #v1.4.0 deep-links to the 1.4.0
+  # release `id="vX.Y.Z"` (changelog.astro), so #v1.5.0 deep-links to the 1.5.0
   # release; _hyperlink makes it a real OSC 8 link where supported (clean short
   # text), else a bare clickable URL. Blue + underline reads as a link either
   # way. Keep the anchor version in lockstep with the "New in vX.Y.Z" label above.
@@ -10611,7 +10611,7 @@ _maybe_show_release_highlight() {
   # %s passes the already-rendered link through untouched.
   printf '    %bChangelog:%b %b%b%s%b\n' \
     "$DIM" "$RESET" "$BLUE" "$UNDERLINE" \
-    "$(_hyperlink "https://cleat.sh/changelog#v1.4.0" "cleat.sh/changelog#v1.4.0")" "$RESET"
+    "$(_hyperlink "https://cleat.sh/changelog#v1.5.0" "cleat.sh/changelog#v1.5.0")" "$RESET"
   # Trailing blank: the highlight owns its own separation from whatever follows
   # (the bring-up, or the "Docker tuned"/swap line that runs after it), so flag
   # the gap open. Without this, a post-upgrade start with a well-sized VM (pressure

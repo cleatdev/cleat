@@ -2284,6 +2284,32 @@ _utf8_locale() {
   assert_output --partial "214m! Host hooks enabled"
 }
 
+@test "hook warning: the advisory survives the session-end reclaim" {
+  # The reclaim at a clean exit is cursor-up plus erase, meant for claude's
+  # leftover line. Every caller prints a blank line before exec_claude, so that
+  # blank is what it should eat. The advisory printed after it, became the last
+  # line and was erased: it showed for the length of the session, then vanished
+  # from the scrollback the moment claude exited. Found on a Mac, 2026-09-18.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run exec_claude "test-h4-keep" --dangerously-skip-permissions
+  assert_output --partial "Host hooks enabled"
+  local LF=$'\n'
+  # A blank line sits between the pre-launch notices and the session output, so
+  # the reclaim erases the blank and the advisory stays in the scrollback.
+  # Asserted on $output rather than on `lines`, because bats drops empty
+  # elements from that array, which is exactly what hid this.
+  [[ "$output" == *"$LF$LF"* ]]
+  local tail_after_blank="${output##*"$LF$LF"}"
+  case "$tail_after_blank" in
+    *"Session ended"*) : ;;
+    *) printf 'no blank line before the session output\n' >&2; return 1 ;;
+  esac
+}
+
 @test "hook warning: no host hook configured, no warning" {
   # A cap with nothing to run executes nothing on the host, so the line would
   # warn about a command that does not exist.

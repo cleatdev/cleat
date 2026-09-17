@@ -9767,6 +9767,9 @@ exec_claude() {
   fi
 
   # Start host-side hook bridge if user has hooks and hooks cap is active
+  # _ec_pre_notice: did anything print between the caller's blank line and the
+  # launch? See the reclaim invariant below.
+  local _ec_pre_notice=0
   local hooks_file="$CLEAT_RUN_DIR/${cname}/hooks/events.jsonl"
   # _has_host_hooks parses settings with jq, so on a host without jq it cannot
   # answer and returns "no hooks". That is indistinguishable from a real "no
@@ -9776,6 +9779,7 @@ exec_claude() {
   # account and git), so this is a reachable configuration, not a hypothetical.
   if cap_is_active hooks 2>/dev/null && ! command -v jq >/dev/null 2>&1; then
     warn "hooks cap is on but jq is not installed on the host, so no hooks are forwarded. Install jq to enable them."
+    _ec_pre_notice=1
   elif cap_is_active hooks 2>/dev/null && _has_host_hooks 2>/dev/null; then
     # Say what enabling it means, on every session that will actually run a host
     # hook (EGRESS-SPEC H4). The same amber line the docker cap gets, because it
@@ -9785,6 +9789,7 @@ exec_claude() {
     # print it. A cap with no host hooks configured runs nothing, so it stays
     # quiet rather than warn about a command that does not exist.
     warn_sandbox "Host hooks enabled. The box chooses when they run and what is on their stdin."
+    _ec_pre_notice=1
     # Terminal-safety redirect (see the clipboard watcher). The bridge runs hook
     # commands `>/dev/null 2>&1` and its `( _execute_host_hooks ) &` children
     # inherit these fds, so both the bridge and its children keep fork spew off
@@ -9818,8 +9823,18 @@ exec_claude() {
       warn "This project defines hooks in its own ${BOLD}.claude/settings*.json${RESET}. They do not run on the host."
       echo -e "    ${DIM}Those files live in the directory the agent edits, so a command read from one is a command the box can write.${RESET}"
       echo -e "    ${DIM}Copy the ones you want into ${BOLD}~/.claude/settings.json${RESET}${DIM} and they run.${RESET}"
+      _ec_pre_notice=1
     fi
   fi
+
+  # Every caller prints a blank line before this function, so the last line on
+  # screen when Claude takes over is blank, and the session-end reclaim below
+  # (cursor up, erase) eats that blank. An advisory printed HERE became the last
+  # line instead, so the reclaim erased it: the amber "Host hooks enabled" line
+  # appeared for the length of the session and was gone from the scrollback the
+  # moment Claude exited cleanly. Found on the maintainer's Mac, 2026-09-18.
+  # One blank line restores the invariant for every notice in this window.
+  [[ $_ec_pre_notice -eq 0 ]] || echo ""
 
   trap _cleanup_session EXIT INT TERM HUP
 

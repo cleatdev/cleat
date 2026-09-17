@@ -11092,6 +11092,13 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v150_attach_stamps_last_used" "an attach stamps the account as used" "$CLI" "$ACCOUNTS_BATS"
+
+# The blank line that keeps a pre-launch advisory out of the session-end
+# reclaim's way. Without it the amber hooks line is erased on a clean exit.
+cat > "$SED_TMP" << 'SED'
+s@^  \[\[ [$]_ec_pre_notice -eq 0 \]\] || echo ""$@  :@
+SED
+try "v150_advisory_survives_reclaim" "the advisory survives the session-end reclaim" "$CLI" "$HOOKS_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

@@ -11083,6 +11083,15 @@ cat > "$SED_TMP" << 'SED'
 s@^  _maybe_report_account_harvest_refused "[$]_harvest" "[$]cname"$@  :@
 SED
 try "v150_harvest_refused_wired" "session end reports a refused harvest" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# An attach is a use. Without the stamp the list showed the hour of the last
+# switch, so a session that had just ended read "last used 22h ago".
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s@^  \[\[ [$]_si -ne 0 \]\] || _account_capture_meta "[$]acct" || true$@  :@
+}
+SED
+try "v150_attach_stamps_last_used" "an attach stamps the account as used" "$CLI" "$ACCOUNTS_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

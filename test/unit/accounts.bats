@@ -4127,3 +4127,32 @@ _unwritable_lock() {
   run _maybe_report_account_harvest_refused 1 "$CN"
   assert_output ""
 }
+
+@test "account: an attach stamps the account as used" {
+  # Only a switch stamped last_used, so an account a box ran on all day still
+  # showed the hour of the last switch. A session that ended a minute ago read
+  # "last used 22h ago" in the list.
+  _mk_account work
+  _box_account_write "$CN" work
+  _account_meta_set work last_used 1000
+  mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
+  _account_box_ready() { return 0; }
+  _account_sync_in() { return 0; }
+  date() { printf '1789400000\n'; }
+
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$CN"
+  assert_success
+  run _account_meta_get work last_used
+  assert_output "1789400000"
+
+  # A staging that did not take leaves it alone: the box keeps the login it
+  # already has, which may be another account's.
+  _account_meta_set work last_used 1000
+  _account_sync_in() { return 1; }
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$CN"
+  run _account_meta_get work last_used
+  assert_output "1000"
+  unset -f date
+}

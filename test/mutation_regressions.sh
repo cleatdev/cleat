@@ -11099,6 +11099,21 @@ cat > "$SED_TMP" << 'SED'
 s@^  \[\[ [$]_ec_pre_notice -eq 0 \]\] || echo ""$@  :@
 SED
 try "v150_advisory_survives_reclaim" "the advisory survives the session-end reclaim" "$CLI" "$HOOKS_BATS"
+
+# The bridge waits for the spool as long as the session lives. The old 30s
+# bound meant a first tool call later than half a minute got no host hooks.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^  while \[\[ ! -f "[$]hooks_file" \]\]; do$@  _hb_waited=0; while [[ ! -f "$hooks_file" ]] \&\& [[ $_hb_waited -lt 30 ]]; do _hb_waited=$((_hb_waited + 1));@
+}
+SED
+try "v150_bridge_waits_for_spool" "waits for a spool that arrives late" "$CLI" "$HOOKS_BATS"
+
+# And the spool is created before claude starts, so nothing depends on the box.
+cat > "$SED_TMP" << 'SED'
+s@^      ( umask 077; : > "[$]hooks_file" ) 2>/dev/null || true$@      :@
+SED
+try "v150_bridge_spool_precreated" "the hook spool exists before claude starts" "$CLI" "$HOOKS_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

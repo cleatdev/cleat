@@ -7978,16 +7978,22 @@ _hook_bridge_watcher() {
   trap '_hook_bridge_cleanup; exit 0' TERM INT HUP
   trap '_hook_bridge_cleanup' EXIT
 
-  # Wait for hooks file to appear
-  local waited=0
-  while [[ ! -f "$hooks_file" ]] && [[ $waited -lt 30 ]]; do
+  # Wait for the spool to appear, for as long as the session lives.
+  #
+  # This used to give up after 30 seconds, and the spool only comes into
+  # existence when the box fires its FIRST hook event. A session where the user
+  # reads the screen and types a prompt before the agent's first tool call is
+  # past 30s, so the bridge had already exited and the whole session ran with no
+  # host hooks and no message. That is how the cap looked dead on a real Mac
+  # (2026-09-18). The session's own lifetime is the only honest bound here: the
+  # parent check below ends the wait the moment cleat goes away.
+  while [[ ! -f "$hooks_file" ]]; do
     kill -0 "$_hb_parent" 2>/dev/null || return 0
     # Checked HERE as well as after the loop: a link to a character device or
     # a fifo is not a regular file, so `[[ ! -f ]]` stays true and the bridge
-    # would sit out the full 30s wait before ever reaching the guard below.
+    # would wait for a spool that will never be regular.
     _drop_unless_regular "$hooks_file"
     sleep 1
-    waited=$((waited + 1))
   done
   # The spool sits in a directory the box mounts read-write. A symlink here is
   # never the forwarder's, which only ever appends to a regular file, and
@@ -9805,6 +9811,17 @@ exec_claude() {
     local _hb_ws="${_RESOLVED_PROJECT:-}"
     if _box_is_fork "$cname"; then
       _hb_ws="$(_fork_dir "$cname")"
+    fi
+    # The spool, created here rather than waited for. The box makes it on its
+    # first forwarded event, so the bridge otherwise spends the start of every
+    # session waiting for a file that may be minutes away. Never through a link:
+    # the directory is mounted read-write into the box, so a link planted there
+    # would have this truncate whatever host file it points at. A path that is
+    # anything other than absent is left exactly as it is, and the watcher's own
+    # _drop_unless_regular decides what to do with it.
+    if [[ ! -e "$hooks_file" && ! -L "$hooks_file" ]]; then
+      mkdir -p "${hooks_file%/*}" 2>/dev/null || true
+      ( umask 077; : > "$hooks_file" ) 2>/dev/null || true
     fi
     _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
     _HOOK_BRIDGE_PID=$!

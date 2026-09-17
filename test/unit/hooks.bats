@@ -2968,3 +2968,60 @@ _host_hook_appends() {
   run awk -F '\t' -v m="$_HOOK_RUN_MARK" '$2 == m { print $3, $4, $5, $6, $7 }' "$CLEAT_STATE_DIR/hook-runs.log"
   assert_output "box-a PreToolUse Write $h1 8"
 }
+
+@test "_hook_bridge_watcher: waits for a spool that arrives late" {
+  # It gave up after 30 seconds, and the spool only exists once the box fires
+  # its FIRST event. A user who reads the screen and types a prompt is past
+  # that, so the bridge had exited and the whole session ran with no host hooks
+  # and no message. Found on a real Mac, 2026-09-18. The sleep stub makes the
+  # wait long without making the test slow.
+  mkdir -p "$TEST_TEMP/late"
+  local hooks_file="$TEST_TEMP/late/events.jsonl"
+  local processed="$TEST_TEMP/late-processed"
+  _execute_host_hook_bg() { echo "$1" >> "$processed"; }
+  _RESOLVED_PROJECT="$TEST_TEMP"
+  mkdir -p "${HOME}/.claude"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' \
+    > "${HOME}/.claude/settings.json"
+
+  # 120 waits, four times the old bound, each one cheap.
+  sleep() { command sleep 0.005; }
+  ( _hook_bridge_watcher "$hooks_file" ) &
+  local pid=$!
+  command sleep 0.5
+  # The spool appears empty first, exactly as the box creates it, then carries
+  # its first event.
+  : > "$hooks_file"
+  command sleep 0.5
+  echo '{"hook_event_name":"Stop","_cleat_ts":"late1"}' >> "$hooks_file"
+  command sleep 1.5
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+  unset -f sleep
+
+  [[ -f "$processed" ]] || { echo "the bridge gave up before the spool arrived"; return 1; }
+  grep -q "late1" "$processed" || { echo "the late event was never forwarded"; return 1; }
+}
+
+@test "exec_claude: the hook spool exists before claude starts" {
+  # Nothing should depend on the box creating it first.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run exec_claude "test-spool" --dangerously-skip-permissions
+  assert_success
+  run test -f "$CLEAT_RUN_DIR/test-spool/hooks/events.jsonl"
+  assert_success
+
+  # A link planted by the box is never followed: the host file it points at
+  # keeps its contents and the spool is not created through it.
+  local victim="$TEST_TEMP/victim.txt"
+  printf 'KEEP\n' > "$victim"
+  rm -f "$CLEAT_RUN_DIR/test-spool2/hooks/events.jsonl" 2>/dev/null || true
+  mkdir -p "$CLEAT_RUN_DIR/test-spool2/hooks"
+  ln -s "$victim" "$CLEAT_RUN_DIR/test-spool2/hooks/events.jsonl"
+  run exec_claude "test-spool2" --dangerously-skip-permissions
+  run cat "$victim"
+  assert_output "KEEP"
+}

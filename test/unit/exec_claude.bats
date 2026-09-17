@@ -381,6 +381,26 @@ _held_other_account() {
   assert_success
 }
 
+@test "session end reports a refused harvest" {
+  # A refusal printed nothing, so a login that was never saved read as saved.
+  # That is how a Mac could run v1.5.0 for a week with an account the list kept
+  # calling "signed out".
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work" "$CLEAT_RUN_DIR/test-ctr/auth"
+  printf '{"claudeAiOauth":{"accessToken":"at-A","refreshToken":"rt-A","expiresAt":1789028800000}}\n' \
+    > "$CLEAT_RUN_DIR/test-ctr/auth/.credentials.json"
+  _box_account_write test-ctr work
+  _account_sync_out() { return 1; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "was not saved to"
+  assert_output --partial "work"
+  # A harvest that took says nothing.
+  _account_sync_out() { return 0; }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  refute_output --partial "was not saved to"
+}
+
 @test "session end stays quiet when the harvest had nothing to hold" {
   _held_other_account
   local rc

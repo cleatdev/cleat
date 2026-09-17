@@ -4094,3 +4094,36 @@ _unwritable_lock() {
   assert_success
   assert_output "ROUTED default main"
 }
+
+@test "account: a refused harvest at session end says the login was not saved" {
+  # Silence read as saved. On a Mac before the inode fix every harvest refused,
+  # the account kept saying "signed out" and nothing ever said why.
+  _mk_account work
+  _mk_staged "$CN"
+  _box_account_write "$CN" work
+
+  run _maybe_report_account_harvest_refused 1 "$CN"
+  assert_success
+  assert_output --partial "was not saved to"
+  assert_output --partial "work"
+  assert_output --partial "cleat account list"
+
+  # A harvest that took, one held as another account's and one the server could
+  # not vouch for right now each have their own line or their own silence.
+  for _rc in 0 2 3 "$_ACCOUNT_LOCK_BUSY"; do
+    run _maybe_report_account_harvest_refused "$_rc" "$CN"
+    assert_success
+    assert_output ""
+  done
+
+  # An unpinned box has no account to save to, so it stays quiet.
+  _box_account_write "$CN" "$_ACCOUNT_DEFAULT"
+  run _maybe_report_account_harvest_refused 1 "$CN"
+  assert_output ""
+
+  # So does a pinned box with nothing staged to save.
+  _box_account_write "$CN" work
+  rm -f "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  run _maybe_report_account_harvest_refused 1 "$CN"
+  assert_output ""
+}

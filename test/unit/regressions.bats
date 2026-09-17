@@ -6614,3 +6614,55 @@ _mount_targets_fixture() {
   run _maybe_note_missing_kit_masks "$cn"
   assert_output --partial "cleat rm && cleat"
 }
+
+@test "regression v1.5.0: a snapshot is taken where -ef and the inode disagree" {
+  # macOS /dev/fd/N is a devfs node. Its inode is the file's, its device is
+  # devfs, so `-ef` (device AND inode) never matched there. Every account
+  # harvest on a Mac refused: `cleat login` into a pinned box left the login in
+  # the box, the account read "signed out" and the next attach staged over it.
+  # Linux could not see it, because there /dev/fd/N is a symlink stat follows.
+  local src="$TEST_TEMP/staged.json" other="$TEST_TEMP/other.json"
+  printf '{"a":1}\n' > "$src"
+  printf '{"b":2}\n' > "$other"
+  # A host that answers "same inode" for a pair `-ef` calls different files.
+  # That disagreement is the Darwin case, and only an inode reader survives it.
+  ls() { printf '424242 %s\n' "${!#}"; }
+  exec 7<"$other"
+  run _fd_holds_path 7 "$src"
+  exec 7<&-
+  unset -f ls
+  assert_success
+}
+
+@test "regression v1.5.0: a snapshot still refuses a descriptor on another file" {
+  # The inode reader must keep the guarantee -ef was there for: the descriptor
+  # the copy is read from has to be the file the path names, or a swap between
+  # the check and the open reads a host file into the account store.
+  local src="$TEST_TEMP/staged2.json" other="$TEST_TEMP/other2.json"
+  printf '{"a":1}\n' > "$src"
+  printf '{"b":2}\n' > "$other"
+  exec 7<"$other"
+  run _fd_holds_path 7 "$src"
+  exec 7<&-
+  assert_failure
+
+  # The same file matches, so the refusal above is the swap and not the reader.
+  exec 7<"$src"
+  run _fd_holds_path 7 "$src"
+  exec 7<&-
+  assert_success
+}
+
+@test "regression v1.5.0: a snapshot refuses a symlinked path and a missing one" {
+  # -L is checked after the open, so a link swapped in and left there is caught
+  # even though the descriptor is already held.
+  local src="$TEST_TEMP/staged3.json" link="$TEST_TEMP/link3.json"
+  printf '{"a":1}\n' > "$src"
+  ln -s "$src" "$link"
+  exec 7<"$src"
+  run _fd_holds_path 7 "$link"
+  assert_failure
+  run _fd_holds_path 7 "$TEST_TEMP/not-there.json"
+  exec 7<&-
+  assert_failure
+}

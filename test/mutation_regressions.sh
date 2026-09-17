@@ -7383,11 +7383,13 @@ SED
 try "vnext_account_pin_dir_mode" "the pin directory is not readable by other users" "$CLI" "$ACCOUNTS_BATS"
 
 # The snapshot opens the file once and checks again that the path is not a
-# symlink. Without the second check a symlink swapped in after the first one
-# has the host read the file it points at.
+# symlink. Without that second check a symlink swapped in after the first one
+# has the host read the file it points at. Retargeted when the check moved into
+# _fd_holds_path (the -ef reader never matched on macOS, see
+# v150_snapshot_inode_not_ef).
 cat > "$SED_TMP" << 'SED'
 /^_account_snapshot_cred()/,/^}$/{
-  s/^         \[\[ ! -L "[$]src" && "[$]src" -ef \/dev\/fd\/3 \]\] .. exit 1$/         [[ "$src" -ef \/dev\/fd\/3 ]] || exit 1/
+  s@^         _fd_holds_path 3 "[$]src" || exit 1$@         : || exit 1@
 }
 SED
 try "vnext_account_snapshot_relink" "a snapshot refuses a symlink swapped in after the regular-file check" "$CLI" "$ACCOUNTS_BATS"
@@ -11042,6 +11044,45 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v150_settings_refresh_guards_jq" "hook bridge noop when jq unavailable"
+
+# The Darwin blocker: /dev/fd/N is a devfs node there, so `-ef` (device AND
+# inode) never matched and every harvest on a Mac refused. Reverting the inode
+# reader to -ef, dropping the -L dereference that makes one reader answer alike
+# on both platforms, and dropping the symlink refusal.
+cat > "$SED_TMP" << 'SED'
+/^_fd_holds_path()/,/^}$/{
+  s@^  \[\[ "[$]a" == "[$]b" \]\]$@  [[ "$path" -ef "/dev/fd/$fd" ]]@
+}
+SED
+try "v150_snapshot_inode_not_ef" "a snapshot is taken where -ef and the inode disagree"
+
+cat > "$SED_TMP" << 'SED'
+/^_fd_holds_path()/,/^}$/{
+  s@ls -Ldi "/dev/fd/[$]fd"@ls -di "/dev/fd/$fd"@
+}
+SED
+try "v150_snapshot_fd_deref" "a snapshot still refuses a descriptor on another file"
+
+cat > "$SED_TMP" << 'SED'
+/^_fd_holds_path()/,/^}$/{
+  s@^  \[\[ ! -L "[$]path" \]\] || return 1$@  :@
+}
+SED
+try "v150_snapshot_symlink_path" "a snapshot refuses a symlinked path and a missing one"
+
+# The refused-harvest advisory: without it a refusal at a session end is silent
+# and reads as saved.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_account_harvest_refused()/,/^}$/{
+  s@^  \[\[ "[$]rc" -eq 1 \]\] || return 0$@  [[ "$rc" -eq 99 ]] || return 0@
+}
+SED
+try "v150_harvest_refused_notice" "a refused harvest at session end says the login was not saved" "$CLI" "$ACCOUNTS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@^  _maybe_report_account_harvest_refused "[$]_harvest" "[$]cname"$@  :@
+SED
+try "v150_harvest_refused_wired" "session end reports a refused harvest" "$CLI" "$EXEC_CLAUDE_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

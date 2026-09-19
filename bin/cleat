@@ -17434,14 +17434,44 @@ _account_sync_in_locked() {
     se="$(_json_flat_num "$sobj" expiresAt 2>/dev/null || true)"
     case "$be" in ''|*[!0-9]*) be=0 ;; esac
     case "$se" in ''|*[!0-9]*) se=0 ;; esac
-    [[ "$se" -gt "$be" ]] || { [[ "$se" -eq "$be" ]] && [[ "$bobj" != "$sobj" ]]; } || { rm -f "$snap" 2>/dev/null; return 0; }
+    # Identity first, expiry second. "Newest wins" alone handed a pinned box to
+    # a stranger: a /login made inside the box as someone else refreshes to an
+    # expiry hours past whatever the store holds, so the attach kept it, printed
+    # that the pin had taken and the session ran, and billed, as the other
+    # account. The harvest has always refused that login on the way OUT. It is
+    # the same question on the way IN, so it is the same answer that decides.
+    # Found on a real Mac, 2026-09-19.
+    local _held_by_harvest=0 _hrc=0
+    if [[ "$se" -gt "$be" ]] || { [[ "$se" -eq "$be" ]] && [[ "$bobj" != "$sobj" ]]; }; then
+      : # The store is ahead. Hold what the box has, below, then stage.
+    elif _account_staged_absorbed "$snap" "$store_cred"; then
+      # The store's own grant, refreshed in the box. Nothing to decide, and a
+      # rewrite would move the file under a session already reading it.
+      rm -f "$snap" 2>/dev/null
+      return 0
+    else
+      # Newer, but not provably this account's. The gated harvest asks the
+      # server whose it is: 0 writes it (this account refreshed it, and the
+      # store is now current), 2 holds a stranger's, 3 cannot say right now.
+      _account_harvest_from "$acct" "$cname" "$snap" || _hrc=$?
+      if [[ $_hrc -eq 0 ]]; then
+        rm -f "$snap" 2>/dev/null
+        return 0
+      fi
+      [[ $_hrc -eq 2 ]] && _held_by_harvest=1
+      # 2 and 3 both stage the account's own login over it: the pin is what the
+      # user asked for, and a login the server would not vouch for is not it.
+      sobj="$(_account_cred_login "$store_cred")"
+      [[ -n "$sobj" ]] || { rm -f "$snap" 2>/dev/null; return 0; }
+    fi
     # Not newer is not the same login. A /login made in the box as someone else,
     # while a sibling box on this account saved a fresher refresh, is overwritten
     # here, so it is held first. Nothing is staged over a login that could not be
     # kept, and the box starts on what it has. A generation of this account's own
     # grant that the store has moved past is only this box falling behind a
     # sibling on the same account, so it is staged over without a word.
-    if _account_cred_keepable "$snap" && ! _account_staged_absorbed "$snap" "$store_cred" \
+    if [[ $_held_by_harvest -eq 0 ]] && _account_cred_keepable "$snap" \
+       && ! _account_staged_absorbed "$snap" "$store_cred" \
        && ! _account_staged_superseded "$acct" "$snap"; then
       if ! _account_hold_box "$snap" "$acct" "$cname" unsaved; then
         rm -f "$snap" 2>/dev/null || true

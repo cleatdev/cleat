@@ -286,10 +286,17 @@ _profile_says() {
   _mk_account work 1000
   _box_account_write "$CN" work
   _mk_staged "$CN" 1789003600000
+  ln "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" "$TEST_TEMP/store.link"
   run _account_sync_in "$CN"
   assert_success
   run grep -c 1789003600000 "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
   assert_output "1"
+  # The same grant, refreshed in the box, is recognised from the bytes alone.
+  # An attach writes nothing: not the box's file, which a live session holds
+  # open, and not the store, which a sibling box on this account may be
+  # reading. The session end is what carries the refresh back.
+  run test "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" -ef "$TEST_TEMP/store.link"
+  assert_success
 }
 
 @test "account: the default sentinel stages nothing at all" {
@@ -4155,4 +4162,56 @@ _unwritable_lock() {
   run _account_meta_get work last_used
   assert_output "1000"
   unset -f date
+}
+
+@test "account: an attach refuses a newer login that belongs to another account" {
+  # "Newest wins" alone handed a pinned box to a stranger. A /login made inside
+  # the box as someone else refreshes to an expiry hours past the store's, so
+  # the attach kept it, said the pin had taken, and the session ran and billed
+  # as the other account. Found on a real Mac, 2026-09-19.
+  local staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _mk_account work 1789003600000 work-token
+  _box_account_write "$CN" work
+  mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
+  _cred_blob 1789999999000 stranger-token > "$staged"
+  # The server says it is someone else.
+  _account_meta_set work uuid 11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+  _account_cred_identity() { printf '22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb\tother@example.com\tOther Org\n'; }
+
+  run _account_sync_in "$CN"
+  assert_success
+  # The box now runs on the account it is pinned to.
+  run cat "$staged"
+  assert_output --partial "work-token"
+  refute_output --partial "stranger-token"
+  # And the stranger's login is kept, not destroyed.
+  run bash -c 'grep -rl "stranger-token" "$1"/.held 2>/dev/null | head -1' _ "$CLEAT_ACCOUNTS_DIR"
+  assert_success
+  assert_output --partial ".held"
+}
+
+@test "account: an attach keeps a newer login the server says is this account" {
+  # The common case the expiry rule exists for: the box refreshed this
+  # account's own login and rotated its refresh token, so the bytes no longer
+  # match the store. The box keeps it, and the store is brought up to date.
+  local staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _mk_account work 1789003600000 work-token
+  _box_account_write "$CN" work
+  mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
+  _cred_blob 1789999999000 rotated-token > "$staged"
+  _account_meta_set work uuid 11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+  _account_cred_identity() { printf '11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa\tme@example.com\tMy Org\n'; }
+  ln "$staged" "$TEST_TEMP/staged-keep.link"
+
+  run _account_sync_in "$CN"
+  assert_success
+  run cat "$staged"
+  assert_output --partial "rotated-token"
+  # Same inode: the file a live session already has open is not rewritten
+  # underneath it just to put back bytes it already holds.
+  run test "$staged" -ef "$TEST_TEMP/staged-keep.link"
+  assert_success
+  # The store caught up, so a later attach has it too.
+  run cat "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  assert_output --partial "rotated-token"
 }

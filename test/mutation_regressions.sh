@@ -6269,7 +6269,7 @@ try "vnext_account_harvest_newest_wins" "harvesting never replaces a newer store
 
 cat > "$SED_TMP" << 'SED'
 /^_account_sync_in_locked()/,/^}$/{
-  s/^    \[\[ "[$]se" -gt "[$]be" \]\] .*return 0; }$/    :/
+  s@^    elif _account_staged_absorbed "[$]snap" "[$]store_cred"; then$@    elif false; then@
 }
 SED
 try "vnext_account_stage_newest_wins" "staging never overwrites a newer credential the box refreshed" "$CLI" "$ACCOUNTS_BATS"
@@ -6408,15 +6408,19 @@ try "vnext_session_verb_aliases" "the plural and the short form still reach the 
 # SILENT when it breaks: a login that disappears, a token written where anyone
 # can read it, a percentage shown as current when it is hours old.
 
-# THE critical one. Newest-wins is only valid WITHIN an account, so without the
-# drop the staged file (the account being LEFT, usually the fresher one) stayed
-# put and was later harvested into the account just switched TO.
+# A switch stages in force mode. Newest-wins is only valid WITHIN an account,
+# so without force the staged file (the account being LEFT, usually the fresher
+# one) stayed put and was later harvested into the account just switched TO.
+# Since the attach path checks identity too (v150_attach_identity_before_expiry)
+# that half is now caught twice over, so this entry rides on what force ALONE
+# still does: replace a staged path the box planted, which a plain attach
+# deliberately refuses to overwrite blind.
 cat > "$SED_TMP" << 'SED'
 /^_account_switch_locked()/,/^}$/{
   s@^  if \[\[ "[$]current" != "[$]acct" \]\]; then$@  if false; then@
 }
 SED
-try "vnext_account_switch_swaps_credential" "switching stages the incoming credential even when" "$CLI" "$ACCOUNTS_BATS"
+try "vnext_account_switch_swaps_credential" "switching replaces a symlink the box planted" "$CLI" "$ACCOUNTS_BATS"
 
 # The identity of the account being switched TO must not come from a project
 # file that still holds the OUTGOING account. The capture reads no project file
@@ -7695,7 +7699,7 @@ try "vnext_journal_wipe_deletes_nothing_unpinned" "a wipe that cannot keep a cre
 # and let the `&& ...` continuation ride, which disables the whole hold branch.
 cat > "$SED_TMP" << 'SED'
 /^_account_sync_in_locked()/,/^}$/{
-  s@^    if _account_cred_keepable "[$]snap" && ! _account_staged_absorbed "[$]snap" "[$]store_cred" \\@    if false \\@
+  s@^    if \[\[ [$]_held_by_harvest -eq 0 \]\] && _account_cred_keepable "[$]snap" \\@    if false \\@
 }
 SED
 try "vnext_account_attach_holds_unabsorbed" "an attach keeps a login the store does not have"
@@ -11114,6 +11118,24 @@ cat > "$SED_TMP" << 'SED'
 s@^      ( umask 077; : > "[$]hooks_file" ) 2>/dev/null || true$@      :@
 SED
 try "v150_bridge_spool_precreated" "the hook spool exists before claude starts" "$CLI" "$HOOKS_BATS"
+
+# Identity before expiry at an attach. The old rule kept whatever expired last,
+# so a stranger's login made inside the box won and the session billed to it.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^      _account_harvest_from "[$]acct" "[$]cname" "[$]snap" || _hrc=[$]?$@      _hrc=0@
+}
+SED
+try "v150_attach_identity_before_expiry" "an attach refuses a newer login that belongs to another account" "$CLI" "$ACCOUNTS_BATS"
+
+# And the account's own refreshed login still wins, with the store brought up
+# to date rather than the box being pushed back onto an older token.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^      if \[\[ [$]_hrc -eq 0 \]\]; then$@      if false; then@
+}
+SED
+try "v150_attach_keeps_own_refresh" "an attach keeps a newer login the server says is this account" "$CLI" "$ACCOUNTS_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

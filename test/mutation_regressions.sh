@@ -11136,6 +11136,15 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v150_attach_keeps_own_refresh" "an attach keeps a newer login the server says is this account" "$CLI" "$ACCOUNTS_BATS"
+
+# A staged login the box did not last run on takes the cached identity with it.
+# Without the flag Claude shows the old account and sends its organisation.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^  \[\[ "[$](_account_cred_login "[$]snap")" == "[$]sobj" \]\] || _ACCOUNT_STAGED_NEW_LOGIN=1$@  :@
+}
+SED
+try "v150_attach_flags_stale_identity" "an attach that stages a different login flags the cached identity" "$CLI" "$ACCOUNTS_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

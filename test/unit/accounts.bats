@@ -4215,3 +4215,36 @@ _unwritable_lock() {
   run cat "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
   assert_output --partial "rotated-token"
 }
+
+@test "account: an attach that stages a different login flags the cached identity" {
+  # Only the credential moved, so Claude kept showing the name it had cached in
+  # the box's claude.json and kept sending that account's organisation. On a
+  # real Mac /status named the account whose login had just been held while the
+  # box ran on the pinned one. Found 2026-09-20.
+  _mk_account work 1789003600000 work-token
+  _box_account_write "$CN" work
+  mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
+  _cred_blob 1789000100000 other-token > "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _RESOLVED_PROJECT="$TEST_TEMP/proj"
+  local key f
+  key="$(_derive_project_session_key "$_RESOLVED_PROJECT" main)"
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"someone@example.com"}}\n' > "$f"
+  _account_box_ready() { return 0; }
+
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$CN"
+  assert_success
+  run test -e "${f}.identity-stale"
+  assert_success
+
+  # The same login staged again is not an identity change, so nothing is
+  # flagged and no launch spends work clearing what is already right.
+  rm -f "${f}.identity-stale"
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$CN"
+  assert_success
+  run test -e "${f}.identity-stale"
+  assert_failure
+}

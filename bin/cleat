@@ -17480,6 +17480,13 @@ _account_sync_in_locked() {
       fi
     fi
   fi
+  # The box is about to run as a different login than the one it last had, so
+  # the identity Claude cached in this box's claude.json (oauthAccount, and the
+  # organisation it sends with it) is the wrong account's now. A switch flags
+  # that for the launch to drop. An attach moved only the credential, so Claude
+  # kept showing the old name: on a real Mac (2026-09-20) /status named the
+  # account whose login had just been held while the box ran on the pinned one.
+  [[ "$(_account_cred_login "$snap")" == "$sobj" ]] || _ACCOUNT_STAGED_NEW_LOGIN=1
   _account_write_file_0600 "$store_cred" "$box_cred" "$snap" || rc=1
   [[ -z "$snap" ]] || rm -f "$snap" 2>/dev/null || true
   return "$rc"
@@ -18465,7 +18472,13 @@ _account_apply_exec_env() {
   # already staged, which is the login it last ran with, and still gets the env
   # var so that login is the one it reads.
   local _si=0
+  _ACCOUNT_STAGED_NEW_LOGIN=0
   _account_sync_in "$cname" || _si=$?
+  # A staged login that is not the one the box last ran on takes the cached
+  # identity with it. The launch clears the flag a few lines later, before
+  # Claude reads the file (_refresh_attached_claude_json).
+  [[ ${_ACCOUNT_STAGED_NEW_LOGIN:-0} -eq 0 ]] \
+    || _handoff_flag_identity_stale "${_RESOLVED_PROJECT:-}" "${_BOX:-main}"
   if [[ $_si -eq $_ACCOUNT_LOCK_BUSY && "${_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 ]]; then
     warn "Cleat cannot write to the accounts directory, so ${BOLD}${cname}${RESET} starts with the login it already has."
     echo -e "    ${DIM}Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"

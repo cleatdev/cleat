@@ -4368,3 +4368,21 @@ _unwritable_lock() {
   run test -e "${f}.identity-stale"
   assert_failure
 }
+
+@test "account: the reset clock ignores a file named like the epoch" {
+  # `date -r` is an epoch on BSD and a FILE on GNU, and the fallback only fires
+  # when the first form printed nothing. In a directory holding a file whose
+  # name is that epoch, GNU date printed that file's mtime and exited 0, so the
+  # picker showed an arbitrary time as the reset instant. cleat is normally run
+  # from the project root, which the box mounts read-write.
+  local e=1789900000
+  local truth
+  truth="$(date -r "$e" +%H:%M 2>/dev/null || date -d "@$e" +%H:%M 2>/dev/null)"
+  cd "$TEST_TEMP"
+  touch -t 202001010101 "$e"
+
+  run _account_clock "$e"
+  assert_success
+  assert_output "$truth"
+  refute_output "01:01"
+}

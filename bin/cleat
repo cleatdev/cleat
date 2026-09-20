@@ -18232,7 +18232,15 @@ _account_usage_render() {
 # ISO parser could.
 _account_clock() {
   local e="$1" out
-  out="$(date -r "$e" +%H:%M 2>/dev/null || true)"
+  # From /, not from the caller's directory. `date -r` is an epoch on BSD and a
+  # FILE on GNU, and the fallback below only fires when the first form produced
+  # nothing: in a directory holding a file whose name is that epoch, GNU date
+  # prints THAT FILE'S mtime and exits 0, so the picker showed an arbitrary
+  # clock time as the reset instant. cleat is normally run from the project
+  # root, which the box mounts read-write. At / there is nothing to stat and
+  # the GNU branch fires as intended. $e is digits-only by the time it gets
+  # here (2026-09-20).
+  out="$( (cd / && date -r "$e" +%H:%M) 2>/dev/null || true)"
   [[ -n "$out" ]] || out="$(date -d "@$e" +%H:%M 2>/dev/null || true)"
   case "$out" in ''|*[!0-9:]*) return 1 ;; esac
   printf '%s' "$out"

@@ -11294,6 +11294,14 @@ s@try ([$]t | test([$]m)) catch false@($t == $m)@
 SED
 try "v150_matcher_one_engine" "the same pattern matches on macOS and on Linux" "$CLI" "$HOOKS_BATS"
 
+# `date -r` is an epoch on BSD and a FILE on GNU, so the probe runs from /.
+cat > "$SED_TMP" << 'SED'
+/^_account_clock()/,/^}$/{
+  s@^  out="[$]( (cd / && date -r "[$]e" +%H:%M) 2>/dev/null || true)"$@  out="$(date -r "$e" +%H:%M 2>/dev/null || true)"@
+}
+SED
+try "v150_clock_probe_from_root" "the reset clock ignores a file named like the epoch" "$CLI" "$ACCOUNTS_BATS"
+
 # A staged login the box did not last run on takes the cached identity with it.
 # Without the flag Claude shows the old account and sends its organisation.
 cat > "$SED_TMP" << 'SED'

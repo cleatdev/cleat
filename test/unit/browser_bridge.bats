@@ -1826,3 +1826,20 @@ EOF
   run wc -l < "$TEST_TEMP/opened.arg"
   [ "$(tr -d '[:space:]' <<< "$output")" = "0" ] || { echo "a newline reached the opener"; return 1; }
 }
+
+@test "browser bridge: a login deferred for a busy callback port is reported" {
+  # The only refusal with no marker and no report. cleat login opened nothing
+  # and said nothing, which reads as a command that did nothing at all.
+  local log="$TEST_TEMP/.proxy-log"
+  printf '[browser-watcher 12:00:01] %s deferring URL to terminal (callback port unavailable) url=https://claude.com/cai/oauth/authorize?code=true\n' \
+    "$_BROWSER_NOBIND_MARK" > "$log"
+
+  run _maybe_report_blocked_opens "$log" 0
+  assert_output --partial "callback port it needs was busy"
+  assert_output --partial "https://claude.com/cai/oauth/authorize"
+
+  # Nothing to say when no URL was deferred that way.
+  printf '[browser-watcher 12:00:02] opening URL on host (mode=auto auth=1 dest=1) url=https://claude.com/x\n' > "$log"
+  run _maybe_report_blocked_opens "$log" 0
+  refute_output --partial "callback port it needs was busy"
+}

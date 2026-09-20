@@ -138,6 +138,11 @@ KNOWN_CAPS=(git ssh env hooks gh docker unsafe-rm)
 # Session-scoped state (populated by parse_global_flags / cmd_run / cmd_resume)
 _CLI_CAPS=()
 _RESOLVED_PROJECT=""
+# Did anything print since the caller's blank line? The clean-exit reclaim
+# (cursor up, erase) is meant for claude's leftover line, so the last line on
+# screen when claude takes over has to be blank or the reclaim eats a notice.
+# Set by every printer in that window, cleared when the blank is emitted.
+_EC_SAID=0
 # The active box: a named per-project sandbox (see concept/20-boxes.md).
 # Default "main" = the legacy suffix-less container. Set by the dispatch via
 # _set_box for box-aware verbs; stays "main" for everything else.
@@ -377,7 +382,14 @@ _term_rows() {
 # This text is model-written and lives in a file the box can write, so it is
 # untrusted in the same sense a repo file is. Sanitize at every render site.
 _sessions_safe_str() {
-  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | sed 's/\\/\\\\/g'
+  # No sed, and no locale to get wrong. BSD sed under a UTF-8 LC_CTYPE refuses
+  # a byte sequence that is not valid UTF-8 and exits non-zero, so one bad byte
+  # in a model-written session title killed the whole picker on a Mac. The
+  # backslash doubling is a parameter expansion now, which also drops a fork
+  # per rendered row.
+  local v
+  v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177')"
+  printf '%s' "${v//\\/\\\\}"
 }
 
 # True when the terminal is known to render OSC 8 hyperlinks (and we're on a
@@ -547,7 +559,12 @@ container_name_for() {
   if [[ -n "$box" && "$box" != "main" ]]; then
     suffix="-${box}"
   fi
-  dir_name="$(basename "$project_path" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  # LC_ALL=C on both stages, exactly as _derive_project_session_key pins them.
+  # Without it, tr and sed fold and substitute by the CALLER's locale, so a
+  # project whose name has non-ASCII characters hashed to one container name
+  # under LANG=C and another under a UTF-8 locale: the same directory got two
+  # boxes, and the second one looked like a fresh project.
+  dir_name="$(basename "$project_path" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g')"
   # Keep the full name under Docker's 63-char limit:
   #   "cleat-" (6) + dir + "-" (1) + hash8 (8) + suffix = 15 + dir + |suffix|.
   # Budget the remaining room (48 minus the suffix length) for dir_name.
@@ -7456,6 +7473,13 @@ _BROWSER_RATE_WINDOW_SECS=60
 # is one. Without the report a capped login looked like a browser that never
 # opened, because Claude Code hands a loopback authorize URL only to $BROWSER.
 _BROWSER_CAPPED_MARK="RATE-CAPPED"
+# And the third reason a URL is not opened: the callback port could not be held
+# on the host, so opening the page would send the browser somewhere the box
+# cannot receive. That one had no marker, so `cleat login` printed nothing at
+# all and the user was left with a command that appeared to do nothing
+# (2026-09-20). Same shape as the other two so the same session-end reader can
+# find it.
+_BROWSER_NOBIND_MARK="CALLBACK-UNAVAILABLE"
 # Returns 0 and records the open when it fits under both caps, 1 when a cap is
 # reached. $1 is the ledger path, empty when the claim dir could not be created
 # outside the mount (then only the session cap applies, because a ledger the box
@@ -7758,7 +7782,7 @@ _browser_watcher() {
         # loopback login would be unrecoverable by hand. Same trust domain as
         # the bridge file (the box's own run dir), so no new exposure.
         if [ "$_bind_failed" = 1 ]; then
-          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (callback port unavailable) url=$_clean_url" >> "$clip_dir/.proxy-log"
+          echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_NOBIND_MARK} deferring URL to terminal (callback port unavailable) url=$_clean_url" >> "$clip_dir/.proxy-log"
         elif _browser_should_open "$bridge_mode" "$host_opens_clicks" "$_is_auth" "$_dest_ok"; then
           # Every mode, always included: the bypass lifts the destination gate,
           # not the ceiling on how often the host is made to open something.
@@ -7898,6 +7922,9 @@ _browser_origins_print() {
 # The settings overlay replaces hook commands with an event forwarder inside
 # the container; this bridge reads those events and runs the real commands.
 _HOOK_BRIDGE_PID=""
+# The marker this session owns, removed with its bridge. Empty when another
+# terminal's bridge is the one serving this box.
+_HOOK_BRIDGE_MARK=""
 _HOOK_BRIDGE_CHILDREN=()
 # Ceiling on hooks executing at once. The spool is written by the CAGED side,
 # so its line count is attacker-influenced; this is what stops it becoming a
@@ -8068,10 +8095,21 @@ _hook_bridge_watcher() {
           continue
         fi
         _hook_run_log "$_HOOK_EV_OUT" "$line" "$_hb_cname" "$_hb_lpos"
-        _execute_host_hook_bg "$_HOOK_EV_OUT" "$_HOOK_EV_DIR" "$_hb_ws" "${settings_files[@]}"
+        # The +"..." form, because bash 3.2 (macOS) treats an EMPTY array under
+        # `set -u` as unbound and exits. settings_files is empty whenever
+        # ~/.claude/settings.json was not -s when the watcher started, which is
+        # every box whose host settings file is absent or empty: the bridge
+        # then died on its first forwarded event, on a Mac only.
+        _execute_host_hook_bg "$_HOOK_EV_OUT" "$_HOOK_EV_DIR" "$_hb_ws" "${settings_files[@]+"${settings_files[@]}"}"
       done < <(tail -c +"$_start" "$hooks_file" 2>/dev/null | head -c "$_count")
 
-      byte_offset=$file_size
+      # Past the bytes CONSUMED as whole lines, not past everything the window
+      # covered. The box appends with `cat >>`, so a poll can land between the
+      # bytes of one event: jumping to the window's end swallowed that line's
+      # tail, and the next poll read the remainder as a fresh line, which is
+      # not JSON, so the event was lost AND logged as a bad line the box
+      # supposedly wrote. _hb_pos tracks what the reader actually took.
+      byte_offset=$_hb_pos
     fi
     sleep 0.5
   done
@@ -8195,7 +8233,7 @@ _execute_host_hook_bg() {
         "$(_sanitize_repo_str "${run_dir:0:200}")" >&2
       exit 0
     fi
-    _execute_host_hooks "$event_json" "${settings_files[@]}"
+    _execute_host_hooks "$event_json" "${settings_files[@]+"${settings_files[@]}"}"
   ) &
   _HOOK_BRIDGE_CHILDREN+=("$!")
   set +m 2>/dev/null || true
@@ -8295,6 +8333,13 @@ _HOOK_RUN_MARK="RAN-EVENT"
 _HOOK_RUN_LOG_MAX=1048576
 _HOOK_RUN_LOG_EVERY=64
 _HOOK_RUN_LOG_N=0
+# The drops log grows on the box's schedule, not the user's: every malformed or
+# oversized event it forwards writes a row. The run log has been capped since it
+# shipped and this one was not, so a box in a loop could fill the host's state
+# directory. Same cap, same stride, and the session's read offset is reset when
+# it rotates so the end-of-session report never reads a rotated file from a
+# stale offset (2026-09-20).
+_HOOK_DROP_LOG_N=0
 
 # Which spool values are paths, as jq definitions shared by the two passes of
 # _hook_translate_event: one lists the candidates, the other writes the
@@ -8789,8 +8834,24 @@ _hook_drop_log() {
   # lines rather than one nested expansion: the collapse stops a forged payload
   # writing its own extra log rows, the sanitize strips the control bytes, and
   # each is separately mutable.
+  _HOOK_DROP_LOG_N=$(( _HOOK_DROP_LOG_N + 1 ))
+  if [ $(( (_HOOK_DROP_LOG_N - 1) % _HOOK_RUN_LOG_EVERY )) -eq 0 ] && [ -f "$f" ]; then
+    local _dsz
+    _dsz="$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')"
+    case "$_dsz" in ''|*[!0-9]*) _dsz=0 ;; esac
+    if [ "$_dsz" -gt "$_HOOK_RUN_LOG_MAX" ]; then
+      mv -f "$f" "$f.1" 2>/dev/null || true
+      # The session-end report reads from a byte offset into this file. After a
+      # rotation that offset points past the end of a new, shorter file, so it
+      # is reset here or the report goes silent for the rest of the session.
+      _hook_drop_off=0
+    fi
+  fi
   local _safe
-  _safe="$(printf '%s' "${line:0:200}" | tr '\n\r\t' '   ')"
+  # LC_ALL=C: the line is box-authored, so it can hold any byte, and BSD tr
+  # under a UTF-8 locale fails on an invalid sequence. That killed the drop log
+  # and, with it, the forwarding pass that was writing it.
+  _safe="$(printf '%s' "${line:0:200}" | LC_ALL=C tr '\n\r\t' '   ')"
   _safe="$(_sanitize_repo_str "$_safe")"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" \
@@ -8884,7 +8945,7 @@ _execute_host_hooks() {
   # --arg is also plain more correct: the dot form mis-parses a legitimate event
   # name containing a dot or a dash.
   local settings
-  for settings in "${settings_files[@]}"; do
+  for settings in "${settings_files[@]+"${settings_files[@]}"}"; do
     local hook_entries
     hook_entries="$(jq -c --arg ev "$event_name" '.hooks[$ev] // [] | .[]' "$settings" 2>/dev/null)" || continue
     [[ -n "$hook_entries" ]] || continue
@@ -8906,7 +8967,16 @@ _execute_host_hooks() {
         case "$tool_name" in
           *$'\n'*|*$'\r'*) continue ;;
         esac
-        printf '%s' "$tool_name" | grep -qE "$matcher" 2>/dev/null || continue
+        # jq's engine, not grep's. GNU grep -E quietly accepts the PCRE-isms
+        # Claude Code's own matchers use (\b, \w, \s, \d), and BSD grep does
+        # not, so a matcher written against the docs fired on Linux and was
+        # skipped on a Mac with nothing printed either way. jq is already
+        # required for this bridge, its Oniguruma engine is the same binary's
+        # on both platforms, and it is far closer to the JS RegExp the matcher
+        # was written for. A matcher jq cannot compile matches nothing, which
+        # is what grep did with a bad pattern too.
+        jq -n --arg t "$tool_name" --arg m "$matcher" \
+          'try ($t | test($m)) catch false' 2>/dev/null | grep -q true || continue
       fi
 
       # Execute each command hook in the entry
@@ -9487,6 +9557,8 @@ _handoff_acct_phrase() {
 # relaunch really uses, never the ticket's target. No dialog hint: the reopen
 # suppresses the resume-from-summary dialog (_HANDOFF_RESUME_THRESHOLD_MIN).
 _handoff_say_t1() {
+  # Prints in the window before the relaunch exec, so it marks it too.
+  _EC_SAID=1
   local to="$1" flags="$2" pin="$_EC_PINNED" who="" phrase L A
   phrase="$(_handoff_acct_phrase "$pin")"
   if [[ "$pin" == "$to" ]]; then
@@ -9664,6 +9736,10 @@ exec_claude() {
       _CLIPIMG_WATCHER_PID=""
     fi
     # Kill hook bridge: its EXIT/TERM trap kills child hook processes
+    if [ -n "${_HOOK_BRIDGE_MARK:-}" ]; then
+      rm -f "$_HOOK_BRIDGE_MARK" 2>/dev/null || true
+      _HOOK_BRIDGE_MARK=""
+    fi
     if [ -n "${_HOOK_BRIDGE_PID:-}" ]; then
       kill "$_HOOK_BRIDGE_PID" 2>/dev/null || true
       wait "$_HOOK_BRIDGE_PID" 2>/dev/null || true
@@ -9819,13 +9895,24 @@ exec_claude() {
     # would have this truncate whatever host file it points at. A path that is
     # anything other than absent is left exactly as it is, and the watcher's own
     # _drop_unless_regular decides what to do with it.
-    if [[ ! -e "$hooks_file" && ! -L "$hooks_file" ]]; then
-      mkdir -p "${hooks_file%/*}" 2>/dev/null || true
-      ( umask 077; : > "$hooks_file" ) 2>/dev/null || true
+    mkdir -p "${hooks_file%/*}" 2>/dev/null || true
+    # noclobber, not a test-then-write. The box mounts this directory
+    # read-write, so a link planted between the check and the redirect would
+    # have this truncate whatever host file it points at. `set -C` opens with
+    # O_CREAT|O_EXCL, which refuses an existing path and a symlink alike, so
+    # there is no window and an existing spool is never touched.
+    ( set -C; umask 077; : > "$hooks_file" ) 2>/dev/null || true
+    if _box_hook_bridge_live "$cname"; then
+      # Another terminal on this box already forwards this spool. A second
+      # bridge would run every host hook a second time.
+      _HOOK_BRIDGE_PID=""
+    else
+      ( umask 077; : > "${hooks_file%/*}/.bridge.$$" ) 2>/dev/null || true
+      _HOOK_BRIDGE_MARK="${hooks_file%/*}/.bridge.$$"
+      _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+      _HOOK_BRIDGE_PID=$!
+      disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
     fi
-    _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
-    _HOOK_BRIDGE_PID=$!
-    disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
   fi
   # A project that defines hooks in its own settings files gets one line saying
   # they will not run on the host. Silence here would read as "my hooks broke".
@@ -9851,7 +9938,7 @@ exec_claude() {
   # appeared for the length of the session and was gone from the scrollback the
   # moment Claude exited cleanly. Found on the maintainer's Mac, 2026-09-18.
   # One blank line restores the invariant for every notice in this window.
-  [[ $_ec_pre_notice -eq 0 ]] || echo ""
+  [[ $_ec_pre_notice -eq 0 ]] || _EC_SAID=1
 
   trap _cleanup_session EXIT INT TERM HUP
 
@@ -9923,6 +10010,13 @@ exec_claude() {
       _ec_extra+=(-e "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${_HANDOFF_RESUME_THRESHOLD_MIN}")
       _ec_extra+=(-e "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=${_HANDOFF_RESUME_TOKEN_THRESHOLD}")
     fi
+    # The invariant, at the last possible moment: everything that prints in
+    # this window (the pre-launch advisories, the account and identity lines
+    # from the prepare, the relaunch's own T1 line) marks itself, and the blank
+    # goes out just before claude takes the screen. Emitted here rather than
+    # before the loop because the prepare runs INSIDE it, so a notice from the
+    # second pass was the last line again and the reclaim erased it.
+    [[ ${_EC_SAID:-0} -eq 0 ]] || { echo ""; _EC_SAID=0; }
     docker exec -it "${CLAUDE_ENV[@]}" \
       "${_heap_env[@]+"${_heap_env[@]}"}" \
       "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
@@ -10236,12 +10330,46 @@ _maybe_report_account_harvest_refused() {
 # return_url= or origin= parameter printed a truncated URL and allowed a host
 # the query chose. The origin is re-derived from the URL rather than read from
 # the logged field, so the allow line always names the host of the URL above it.
+# The deferral nobody could see: the callback port could not be held on the
+# host, so the URL was written to the log and the command printed nothing. On a
+# `cleat login` that reads as "it did nothing at all". One line, with the URL,
+# because the URL is the only way to finish that login by hand.
+_maybe_report_nobind_opens() {
+  local log="$1" off="${2:-0}" lines n=0 l url shown=0
+  [ -f "$log" ] || return 0
+  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_NOBIND_MARK} " 2>/dev/null)" || return 0
+  [ -n "$lines" ] || return 0
+  n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
+  n="$(printf '%s' "$n" | tr -d '[:space:]')"
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  echo ""
+  if [ "$n" -eq 1 ]; then
+    warn "Did not open ${BOLD}1${RESET} browser URL: the callback port it needs was busy on this host."
+  else
+    warn "Did not open ${BOLD}${n}${RESET} browser URLs: the callback port each needs was busy on this host."
+  fi
+  echo -e "    ${DIM}Opening it would have sent the browser to whatever holds that port. Finish it by hand if you still want to:${RESET}"
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    url="${l#*url=}"
+    [ -n "$url" ] || continue
+    echo -e "    ${DIM}${url}${RESET}"
+    shown=$(( shown + 1 ))
+    [ "$shown" -ge 3 ] && break
+  done <<EOF
+$lines
+EOF
+  return 0
+}
+
 _maybe_report_blocked_opens() {
   local log="$1" off="${2:-0}" lines n=0 l rest origin url shown=0
   [ -f "$log" ] || return 0
-  # A capped open is the other refusal the bridge makes, and it is reported
-  # from here so every caller of this report gets both.
+  # A capped open is another refusal the bridge makes, and it is reported from
+  # here so every caller of this report gets all three.
   _maybe_report_capped_opens "$log" "$off"
+  _maybe_report_nobind_opens "$log" "$off"
   lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_BLOCKED_MARK} origin=[^ ]* url=" 2>/dev/null)" || return 0
   [ -n "$lines" ] || return 0
   n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
@@ -11930,8 +12058,14 @@ _refresh_settings_overlays() {
   if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null; then
     # Global settings overlay
     if [[ -f "${HOME}/.claude/settings.json" ]]; then
+      # Into a variable, then written only if jq produced something. A redirect
+      # truncates its target BEFORE jq runs, so a host settings.json with a
+      # stray comma left the box with a zero-byte overlay: hook forwarding off
+      # and the unsafe-rm guard gone, both without a word. The create path has
+      # always written through a variable. This one now matches it.
+      local _rso=""
       if cap_is_active hooks; then
-        jq '
+        _rso="$(jq '
           if .hooks then
             .hooks |= with_entries(.value |= [.[] |
               .hooks = [.hooks[] | select(.type == "command") |
@@ -11939,9 +12073,16 @@ _refresh_settings_overlays() {
               ]
             ])
           else . end
-        ' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
+        ' "${HOME}/.claude/settings.json" 2>/dev/null)" || _rso=""
       else
-        jq 'del(.hooks)' "${HOME}/.claude/settings.json" > "$settings_overlay_dir/settings.json" 2>/dev/null || true
+        _rso="$(jq 'del(.hooks)' "${HOME}/.claude/settings.json" 2>/dev/null)" || _rso=""
+      fi
+      if [[ -n "$_rso" ]]; then
+        printf '%s\n' "$_rso" > "$settings_overlay_dir/settings.json"
+      else
+        warn "Could not read ${BOLD}~/.claude/settings.json${RESET}, so ${BOLD}${cname}${RESET} keeps the settings it already had."
+        echo -e "    ${DIM}Check that the file is valid JSON. Host hooks and the unsafe-rm guard follow it.${RESET}"
+        _EC_SAID=1
       fi
       # This refresh REWRITES settings.json from the host file, which drops the
       # unsafe-rm hook cmd_run injected at create. Without re-injecting here the
@@ -12292,6 +12433,11 @@ cmd_shell() {
   local project box
   project="$(resolve_project "${1:-}")"
   box="${_BOX:-main}"
+  # Both verbs stage the pinned account into the box, so both can change which
+  # login it holds. The flag that tells the next launch to drop Claude's cached
+  # identity is written from the resolved project, and these two never set it,
+  # so a shell or a login left the box naming the account it used to be on.
+  _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project" "$box")"
   _fork_preflight "$cname"
@@ -12402,6 +12548,8 @@ cmd_login() {
   local project box
   project="$(resolve_project "${1:-}")"
   box="${_BOX:-main}"
+  # See cmd_shell: the identity flag is written from the resolved project.
+  _RESOLVED_PROJECT="$project"
   local cname
   cname="$(container_name_for "$project" "$box")"
   _fork_preflight "$cname"
@@ -12543,31 +12691,12 @@ cmd_claude() {
   _maybe_note_host_global_config
   _maybe_run_setup "$cname" "$project" "$box" || true
 
-  # Refresh project-level settings overlays (hooks may have changed)
-  local settings_overlay_dir="$CLEAT_RUN_DIR/${cname}/settings"
-  if [[ -d "$settings_overlay_dir" ]] && command -v jq &>/dev/null && cap_is_active hooks && [[ -d "$project/.claude" ]]; then
-    local pf
-    for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
-      local _base _overlay_name
-      _base="$(basename "$pf")"
-      _overlay_name="project-$_base"
-      if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
-        jq '
-          if .hooks then
-            .hooks |= with_entries(.value |= [.[] |
-              .hooks = [.hooks[] | select(.type == "command") |
-                .command = "cat >> /var/log/cleat/events.jsonl" | .async = true
-              ]
-            ])
-          else . end
-        ' "$pf" > "$settings_overlay_dir/$_overlay_name" 2>/dev/null || cp "$pf" "$settings_overlay_dir/$_overlay_name"
-      elif [[ -f "$pf" ]]; then
-        cp "$pf" "$settings_overlay_dir/$_overlay_name"
-      else
-        echo '{}' > "$settings_overlay_dir/$_overlay_name"
-      fi
-    done
-  fi
+  # Both halves, through the one function that also re-injects the unsafe-rm
+  # hook. This verb used to refresh the PROJECT overlays only, inlined, so a
+  # host hook added since the box was created was never forwarded to a session
+  # started with `cleat claude`, and the guard the caps resolved for this
+  # launch did not match what the box had.
+  _refresh_settings_overlays "$cname" "$project"
 
   if cap_is_active docker; then
     warn_sandbox "Docker socket mounted. Container can create host-level processes"
@@ -13255,6 +13384,27 @@ _print_docker_vm_fix() {
 # the in-container process list cannot distinguish from a detached box). Each
 # marker is named for the claiming PID, so one left by a killed session is
 # ignored and swept away rather than pinning the box forever.
+# Is another terminal already running the host hook bridge for this box? One
+# marker per bridge, named by the cleat pid that owns it, exactly like the
+# attached-session markers beside it. Two terminals on one box each started a
+# bridge, both tailed the same spool, and every host hook ran TWICE per event:
+# a hook that writes, commits or notifies did it twice with nothing to say why
+# (2026-09-20). A marker whose pid is gone is removed on sight.
+_box_hook_bridge_live() {
+  local m pid found=1
+  for m in "$CLEAT_RUN_DIR/$1"/hooks/.bridge.*; do
+    [[ -f "$m" ]] || continue
+    pid="${m##*/.bridge.}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if kill -0 "$pid" 2>/dev/null; then
+      found=0
+    else
+      rm -f "$m" 2>/dev/null || true
+    fi
+  done
+  return $found
+}
+
 _box_has_attached_session() {
   local m pid found=1
   for m in "$CLEAT_RUN_DIR/$1"/.attached.*; do
@@ -14954,8 +15104,13 @@ _sessions_rename_write() {
   # Stamp the mtime so it can be put back. `touch -r` is POSIX and identical on
   # BSD and GNU, unlike `date -r` / `date -d`, and it costs nothing next to
   # copying a 118 MB file to preserve its timestamp.
-  stamp="${sdir}/.cleat-mtime.$$"
-  touch -r "$f" "$stamp" 2>/dev/null || stamp=""
+  # mktemp, not a $$-named path. This directory is the box's own session tree,
+  # mounted read-write, so a predictable name is one the box can pre-create as
+  # a symlink to any host file the user can write: `touch -r` would then stamp
+  # that file, and the restore below would stamp it again. mktemp refuses an
+  # existing path, link or FIFO included, and creates at 0600.
+  stamp="$(mktemp "${sdir}/.cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""
+  [[ -z "$stamp" ]] || touch -r "$f" "$stamp" 2>/dev/null || { rm -f "$stamp" 2>/dev/null; stamp=""; }
 
   # A record appended after a file that does not end in a newline would join the
   # last line and corrupt both. Command substitution strips trailing newlines,
@@ -14975,8 +15130,10 @@ _sessions_rename_write() {
   # sees a partial file.
   mkdir -p "${sdir}/${uuid}" 2>/dev/null || true
   if [[ -d "${sdir}/${uuid}" ]]; then
-    tmp="${sdir}/${uuid}/.custom-title.json.$$"
-    if printf '{"customTitle":"%s"}\n' "$title" > "$tmp" 2>/dev/null; then
+    # Same reason as the stamp above: the box can plant a link at a name it can
+    # predict, and this one is written through.
+    tmp="$(mktemp "${sdir}/${uuid}/.custom-title.json.XXXXXX" 2>/dev/null)" || tmp=""
+    if [[ -n "$tmp" ]] && printf '{"customTitle":"%s"}\n' "$title" > "$tmp" 2>/dev/null; then
       mv "$tmp" "${sdir}/${uuid}/custom-title.json" 2>/dev/null || rm -f "$tmp"
     else
       rm -f "$tmp" 2>/dev/null || true
@@ -16836,8 +16993,14 @@ _account_cred_keepable() {
 _account_keepable_snapshot() {
   local f="$1" snap
   [[ -f "$f" && ! -L "$f" ]] || return 1
-  _account_cred_sane_size "$f" || return 1
+  # Plausibility first, size second. Both read only the first
+  # _ACCOUNT_CRED_MAX_BYTES, so the order is free, and the order is what
+  # matters: a real login in a file the box had grown past the cap answered 1,
+  # which every caller reads as junk and deletes. 2 means "cannot copy it, so
+  # keep it where it is", which is the honest answer for a login nothing can
+  # hold (2026-09-20).
   _account_cred_plausible "$f" || return 1
+  _account_cred_sane_size "$f" || return 2
   snap="$(_account_snapshot_cred "$f")" || return 2
   if ! _account_cred_keepable "$snap"; then
     rm -f "$snap" 2>/dev/null || true
@@ -17458,9 +17621,21 @@ _account_sync_in_locked() {
         rm -f "$snap" 2>/dev/null
         return 0
       fi
-      [[ $_hrc -eq 2 ]] && _held_by_harvest=1
-      # 2 and 3 both stage the account's own login over it: the pin is what the
-      # user asked for, and a login the server would not vouch for is not it.
+      if [[ $_hrc -ne 2 ]]; then
+        # 3: the server could not say whose this is, right now. Offline, a slow
+        # answer past the 3s bound, a 401. Leaving it is the same answer the
+        # harvest gives for that status, and it is the safe one: Claude rotates
+        # the refresh token on nearly every refresh, so staging the store's copy
+        # over a login this box refreshed rolls it back to a grant that is
+        # already spent, and does it on EVERY attach while the host cannot
+        # reach the API. A login that really is another account's is caught the
+        # next time the server can be asked, on an attach or at a session end.
+        rm -f "$snap" 2>/dev/null
+        return 0
+      fi
+      _held_by_harvest=1
+      # 2: proven to be another account's and now held, so the pinned account's
+      # own login goes in. The pin is what the user asked for.
       sobj="$(_account_cred_login "$store_cred")"
       [[ -n "$sobj" ]] || { rm -f "$snap" 2>/dev/null; return 0; }
     fi
@@ -18313,6 +18488,12 @@ _account_invalidate_identity_key() {
   _account_session_key_ok "$key" || return 0
   f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
   if [[ -n "$cname" ]] && _box_claude_live "$cname"; then
+    # Deferred, not dropped: a live Claude holds that file open. Flag it so the
+    # next launch retries, or the account's name outlives the account. `cleat
+    # account rm` swallows this status, so without the flag the removed
+    # account's email stayed in an unpinned box with nothing left to retry it
+    # (2026-09-20).
+    : > "${f}.identity-stale" 2>/dev/null || true
     return 3
   fi
   # A host with no jq borrows the box's, which needs the box running. When it
@@ -18388,6 +18569,7 @@ _claude_json_clear_stale_identity() {
     rm -f "${f}.identity-stale" 2>/dev/null || true
     return 0
   fi
+  _EC_SAID=1
   warn "${BOLD}${box}${RESET} still carries another account's name."
   echo -e "    ${DIM}Claude may show it and send that account's organisation until it is cleared.${RESET}"
   if command -v jq &>/dev/null; then
@@ -18464,6 +18646,7 @@ _account_apply_exec_env() {
     # The recreate hint names the BOX. A bare `cleat rm` removes main, so on any
     # named box the old hint sent the user to remove a different box than the
     # one that needs recreating.
+    _EC_SAID=1
     warn "Box ${BOLD}${_BOX:-main}${RESET} (${cname}) has no account mount, so it cannot use ${BOLD}${acct}${RESET} yet."
     echo -e "    ${DIM}Recreate it once: ${BOLD}cleat rm ${_BOX:-main}${RESET}${DIM} then start it again. This session uses your shared login.${RESET}"
     return 1
@@ -18480,14 +18663,24 @@ _account_apply_exec_env() {
   [[ ${_ACCOUNT_STAGED_NEW_LOGIN:-0} -eq 0 ]] \
     || _handoff_flag_identity_stale "${_RESOLVED_PROJECT:-}" "${_BOX:-main}"
   if [[ $_si -eq $_ACCOUNT_LOCK_BUSY && "${_ACCOUNT_LOCK_UNWRITABLE:-0}" -eq 1 ]]; then
+    _EC_SAID=1
     warn "Cleat cannot write to the accounts directory, so ${BOLD}${cname}${RESET} starts with the login it already has."
     echo -e "    ${DIM}Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
   elif [[ $_si -eq $_ACCOUNT_LOCK_BUSY ]]; then
+    _EC_SAID=1
     warn "Another cleat command is changing accounts, so ${BOLD}${cname}${RESET} starts with the login it already has."
+  elif [[ $_si -ne 0 && ${_ACCOUNT_STAGE_UNKEPT:-0} -ne 1 && $_si -ne $_ACCOUNT_LOCK_BUSY ]]; then
+    # Every other staging failure was silent, and the summary still printed an
+    # Account row naming the pin, so the box ran the whole session on whatever
+    # login it happened to hold with nothing on screen to say so.
+    _EC_SAID=1
+    warn "${BOLD}${cname}${RESET} starts with the login it already has: ${BOLD}${acct}${RESET} could not be staged."
+    echo -e "    ${DIM}See what the account holds with ${BOLD}cleat account list${RESET}${DIM}.${RESET}"
   elif [[ $_si -ne 0 && $_ACCOUNT_STAGE_UNKEPT -eq 1 ]]; then
     # Not staged over a login the store does not have, because it could not be
     # kept first. Said every time, or the box runs as someone else in silence
     # until the accounts dir is writable again.
+    _EC_SAID=1
     warn "${BOLD}${cname}${RESET} starts with the login it already has: it could not be kept before staging ${BOLD}${acct}${RESET}."
     echo -e "    ${DIM}Check that ${CLEAT_ACCOUNTS_DIR} is writable.${RESET}"
   fi
@@ -18649,7 +18842,23 @@ _hb_session_record() {
 # path inside the shipped text cannot bring the self-match back.
 _hb_scan() {
   local home="$1" proc="$2" skip="$3"
-  local d pid w words execid found_shell
+  local d pid w words execid found_shell joined selfcmd=""
+  # The script is shipped to the box as TEXT ON ARGV, so its own command line
+  # carries every literal this scan matches on, the shell-snapshot path below
+  # included, and the scan found ITSELF: the probe reported a background shell
+  # on every run and the terminate recheck reported a change, so every live
+  # switch on every box refused. Pids are not enough. Every `$( )` in this
+  # script forks a shell that inherits the same argv under a NEW pid, so a scan
+  # run inside a command substitution saw its own fork with $$ and $PPID both
+  # skipped. Argv is what identifies the script and every fork of it, so that
+  # is what is compared (2026-09-20).
+  skip="$skip $$ ${PPID:-}"
+  if [[ -r "$proc/$$/cmdline" ]]; then
+    selfcmd=""
+    while IFS= read -r -d '' w || [[ -n "$w" ]]; do
+      selfcmd="$selfcmd$w"$'\001'
+    done < "$proc/$$/cmdline"
+  fi
   for d in "$proc"/[0-9]*; do
     [[ -e "$d" || -L "$d" ]] || continue
     pid="${d##*/}"
@@ -18661,6 +18870,25 @@ _hb_scan() {
       words+=("$w")
     done < "$d/cmdline"
     [[ ${#words[@]} -gt 0 ]] || continue
+    # Any process of this script, whichever verb it is running. cleat launches
+    # it as `bash -c "$script" cleat-hb <verb> ...`, so that word is in the argv
+    # of the bash, of every `$( )` fork of it, and of the `runuser` parent, and
+    # no Claude tool shell carries it. Pids cannot do this job: a sibling exec
+    # from another terminal, or one left behind when a bound killed the docker
+    # client, is neither this pid, this parent, nor argv-identical to this one,
+    # and it carries the same shell-snapshot literal, so the scan reported it as
+    # a background shell and the switch refused (2026-09-20).
+    for w in "${words[@]}"; do
+      [[ "$w" == cleat-hb ]] || continue
+      continue 2
+    done
+    # Belt to that brace: an argv-identical fork, for any future launch that
+    # reaches this scan without the marker.
+    if [[ -n "$selfcmd" ]]; then
+      joined=""
+      for w in "${words[@]}"; do joined="$joined$w"$'\001'; done
+      [[ "$joined" != "$selfcmd" ]] || continue
+    fi
     if _is_claude_argv "${words[@]}"; then
       printf 'orphan\t%s\n' "$pid"
     fi
@@ -18746,8 +18974,7 @@ _hb_probe() {
       livepids="$livepids $pid"
     fi
   done
-  # This shell and whatever launched it: see _hb_scan's note on the self-match.
-  _hb_scan "$home" "$proc" "$livepids $$ ${PPID:-}"
+  _hb_scan "$home" "$proc" "$livepids"
   printf 'end\tok\n'
   return 0
 }
@@ -19864,6 +20091,12 @@ _account_handoff() {
         return 1
       fi
       local _ans=""
+      # Whatever was typed before this question existed is not an answer to it.
+      # The account picker leaves an Enter in the buffer, and _ask_yn defaults
+      # to yes here, so that stray keystroke silently handed over a running
+      # session: Claude was stopped and restarted with nobody having answered.
+      # The drain is _is_interactive-gated and a no-op without a tty.
+      _handoff_drain_typeahead
       _ask_yn _ans "$(_handoff_question_prompt "$N" "$now")"
       if ! _handoff_yn_yes "$_ans" "$now"; then _handoff_say_result Q2 "$box" "$old"; return 0; fi
     fi

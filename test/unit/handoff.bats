@@ -148,6 +148,86 @@ teardown() { hb_teardown_pids; _common_teardown; }
   assert_line "shell	aaaa1111bbbb"
 }
 
+@test "box terminate recheck never sees its own shell as a change" {
+  # The probe was fixed first and the terminate recheck was not, so the switch
+  # stopped saying "background shell commands running" and started saying "the
+  # session changed while you were answering" instead. Every live switch still
+  # refused. The skip belongs to the scan, which all three callers share.
+  hb_fake_snapshot_proc "$PV" "$$" "CLEAT_EXEC_ID=eeee4444ffff"
+  run _hb_scan "$BH" "$PV" ""
+  assert_success
+  refute_output --partial "eeee4444ffff"
+  refute_output --partial "shell	"
+
+  # A real tool shell is still reported. Its argv is its own, never a copy of
+  # the scanning script's, which is what tells a fork apart from a tool shell.
+  mkdir -p "$PV/941"
+  printf '%s (bash) R%s 90000 0 0 0\n' 941 "$mid" > "$PV/941/stat"
+  printf 'bash\0--rcfile\0/home/coder/.claude/shell-snapshots/snapshot-bash-9-xyz.sh\0-c\0sleep 600\0' > "$PV/941/cmdline"
+  printf 'CLEAT_EXEC_ID=ffff5555aaaa\0' > "$PV/941/environ"
+  run _hb_scan "$BH" "$PV" ""
+  assert_success
+  assert_line "shell	ffff5555aaaa"
+}
+
+@test "box scan ignores a sibling run of the script and its runuser parent" {
+  # cleat launches the box script as `bash -c "$script" cleat-hb <verb>`, so a
+  # SECOND exec from another terminal, and the runuser that started it, both
+  # carry the shipped text without being this pid, this parent, or argv-equal
+  # to this scan. They matched the shell-snapshot literal in that text, so the
+  # scan called them background shells and the switch refused. The pre-lock
+  # probe runs before the account lock on purpose, so two terminals switching
+  # one box overlap by design, and a bound that kills the docker client leaves
+  # an in-box verb behind to poison the next run.
+  local mid="" i
+  for i in $(seq 1 18); do mid="$mid 0"; done
+  # A sibling probe's bash, a different verb, and its runuser parent.
+  mkdir -p "$PV/961" "$PV/962"
+  printf '%s (bash) R%s 90000 0 0 0\n' 961 "$mid" > "$PV/961/stat"
+  printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0cleat-hb\0terminate\0/home/coder\0/proc\0' > "$PV/961/cmdline"
+  : > "$PV/961/environ"
+  printf '%s (bash) R%s 90000 0 0 0\n' 962 "$mid" > "$PV/962/stat"
+  printf 'runuser\0-u\0coder\0--\0bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0cleat-hb\0probe\0/home/coder\0/proc\0' > "$PV/962/cmdline"
+  : > "$PV/962/environ"
+
+  run _hb_scan "$BH" "$PV" ""
+  assert_success
+  refute_output --partial "shell	"
+  refute_output --partial "orphan	"
+
+  # A real tool shell still is one.
+  mkdir -p "$PV/963"
+  printf '%s (bash) R%s 90000 0 0 0\n' 963 "$mid" > "$PV/963/stat"
+  printf 'bash\0--rcfile\0/home/coder/.claude/shell-snapshots/snapshot-bash-3-q.sh\0-c\0sleep 900\0' > "$PV/963/cmdline"
+  printf 'CLEAT_EXEC_ID=bbbb6666cccc\0' > "$PV/963/environ"
+  run _hb_scan "$BH" "$PV" ""
+  assert_success
+  assert_line "shell	bbbb6666cccc"
+}
+
+@test "box scan ignores a fork of the script itself" {
+  # Every command substitution in the shipped script forks a shell that
+  # inherits the same argv under a new pid, so the scan saw its own fork with
+  # $$ and $PPID both skipped and reported a background shell. That refused
+  # every live switch. Argv identifies the script and every fork of it.
+  local mid="" i
+  for i in $(seq 1 18); do mid="$mid 0"; done
+  # This shell's own argv, as the box script's would be.
+  mkdir -p "$PV/$$"
+  printf '%s (bash) R%s 90000 0 0 0\n' "$$" "$mid" > "$PV/$$/stat"
+  printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0' > "$PV/$$/cmdline"
+  : > "$PV/$$/environ"
+  # The fork: another pid, byte-identical argv.
+  mkdir -p "$PV/951"
+  printf '%s (bash) R%s 90000 0 0 0\n' 951 "$mid" > "$PV/951/stat"
+  printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0' > "$PV/951/cmdline"
+  : > "$PV/951/environ"
+
+  run _hb_scan "$BH" "$PV" ""
+  assert_success
+  refute_output --partial "shell	"
+}
+
 @test "box probe never reports its own shell or the one that launched it" {
   # Belt to the pattern's braces: a path-shaped mention inside the shipped text
   # would otherwise bring the self-match back.
@@ -1306,4 +1386,28 @@ hb_render_copy() {
   t2_exec "$(printf 'claude\t4242 5551 idle none bg %s named %s' "$EXECID" "$SID")"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
+}
+
+@test "handoff: a keystroke typed before the question is not an answer to it" {
+  # The account picker leaves an Enter in the buffer and this question defaults
+  # to yes, so a stray keystroke handed over a running session with nobody
+  # having answered: Claude was stopped and restarted under the user.
+  local order="$TEST_TEMP/ask-order"
+  : > "$order"
+  _handoff_drain_typeahead() { echo "drain" >> "$order"; }
+  _ask_yn() { echo "ask" >> "$order"; eval "$1=n"; }
+  _is_interactive() { return 0; }
+  # Enough of the probe for the question to be reached, and nothing past it.
+  _handoff_probe() { _HO_PID=(101); _HO_PS=(1); _HO_SID=(11111111-1111-4111-8111-111111111111); _HO_EXEC=(aaaaaaaaaaaa); _HO_STORE=(named); _HO_STATUS=(idle); return 0; }
+  _handoff_classify() { _HO_VERDICT=ok; _HO_N=1; _HO_EXPECT=(idle); _HO_TARGET_PLAN=""; }
+  _handoff_say_disclosure() { echo "disclose" >> "$order"; }
+  _handoff_say_result() { :; }
+  _handoff_question_prompt() { echo "Hand over?"; }
+
+  run _account_handoff "$CN" main work "$TEST_TEMP/proj" 0 0
+  # The order is what matters: disclose, drain, then ask.
+  run cat "$order"
+  assert_line --index 0 "disclose"
+  assert_line --index 1 "drain"
+  assert_line --index 2 "ask"
 }

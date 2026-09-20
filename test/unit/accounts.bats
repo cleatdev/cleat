@@ -4248,3 +4248,123 @@ _unwritable_lock() {
   run test -e "${f}.identity-stale"
   assert_failure
 }
+
+@test "account: an attach the server cannot vouch for keeps the login the box has" {
+  # Claude rotates the refresh token on nearly every refresh, so staging the
+  # store's copy over a login this box refreshed rolls it back to a grant that
+  # is already spent. With the identity check unable to answer (offline, a slow
+  # reply past the 3s bound, a 401) that happened on EVERY attach.
+  local staged="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  _mk_account work 1789003600000 work-token
+  _box_account_write "$CN" work
+  mkdir -p "$CLEAT_RUN_DIR/$CN/auth"
+  _cred_blob 1789999999000 rotated-token > "$staged"
+  ln "$staged" "$TEST_TEMP/offline.link"
+  # The server cannot say whose login this is.
+  _account_cred_identity() { return 3; }
+
+  run _account_sync_in "$CN"
+  assert_success
+  run cat "$staged"
+  assert_output --partial "rotated-token"
+  refute_output --partial "work-token"
+  # Not rewritten either: a live session holds that file open.
+  run test "$staged" -ef "$TEST_TEMP/offline.link"
+  assert_success
+  # And nothing was quarantined for a question the server never answered.
+  run bash -c 'ls -A "$1"/.held 2>/dev/null | wc -l | tr -d " "' _ "$CLEAT_ACCOUNTS_DIR"
+  assert_output "0"
+}
+
+@test "account: an attach says so when the account could not be staged" {
+  # Silent before: the summary printed an Account row naming the pin while the
+  # box ran the session on whatever login it already had.
+  _mk_account work
+  _box_account_write "$CN" work
+  _account_box_ready() { return 0; }
+  _account_sync_in() { return 1; }
+  _ACCOUNT_STAGE_UNKEPT=0
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$CN"
+  assert_output --partial "starts with the login it already has"
+  assert_output --partial "work"
+
+  # The two failures that already had their own line keep it, and a staging
+  # that took stays quiet.
+  _account_sync_in() { return 0; }
+  CLAUDE_ENV=()
+  run _account_apply_exec_env "$CN"
+  refute_output --partial "starts with the login it already has"
+}
+
+@test "account: a shell or a login flags the cached identity when it stages another login" {
+  # Both verbs stage the pinned account into the box, so both can change which
+  # login it holds. Neither set the resolved project, so the flag that tells
+  # the next launch to drop Claude's cached identity was written nowhere and
+  # the box kept naming the account it used to be on.
+  _pass_gates
+  is_running() { return 0; }
+  container_exists() { return 0; }
+  _mk_account work 1789003600000 work-token
+  local proj="$TEST_TEMP/proj-shell"
+  mkdir -p "$proj"
+  local cn
+  cn="$(container_name_for "$proj" main)"
+  _box_account_write "$cn" work
+  mkdir -p "$CLEAT_RUN_DIR/$cn/auth"
+  _cred_blob 1789000100000 other-token > "$CLEAT_RUN_DIR/$cn/auth/.credentials.json"
+  local key f
+  key="$(_derive_project_session_key "$proj" main)"
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"old@example.com"}}\n' > "$f"
+  _account_box_ready() { return 0; }
+  docker() { return 0; }
+
+  run cmd_shell "$proj"
+  run test -e "${f}.identity-stale"
+  assert_success
+}
+
+@test "account: an oversized but real login is kept, never treated as junk" {
+  # The size check ran first, so a real login in a file the box had grown past
+  # the cap answered "junk" and every deleter destroyed it with no held copy.
+  local f="$TEST_TEMP/big.json"
+  {
+    printf '{"claudeAiOauth":{"accessToken":"a-token","refreshToken":"r-token","expiresAt":1789003600000},"junk":"'
+    head -c 70000 /dev/zero | tr '\0' 'x'
+    printf '"}\n'
+  } > "$f"
+  run _account_keepable_snapshot "$f"
+  # 2, not 1: cannot copy it, so keep it where it is.
+  assert_equal "$status" 2
+
+  # Junk of any size is still junk.
+  printf '{"not":"a login"}\n' > "$TEST_TEMP/junk.json"
+  run _account_keepable_snapshot "$TEST_TEMP/junk.json"
+  assert_equal "$status" 1
+}
+
+@test "account: a deferred identity drop leaves something for the next launch" {
+  # A live Claude holds claude.json open, so the drop waits. cleat account rm
+  # swallows that status, so with no flag the removed account's email stayed in
+  # the box forever.
+  local key f
+  key="$(_derive_project_session_key "$TEST_TEMP/idproj" main)"
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"gone@example.com"}}\n' > "$f"
+  _box_claude_live() { return 0; }
+
+  run _account_invalidate_identity_key "$key" "$CN"
+  assert_equal "$status" 3
+  run test -e "${f}.identity-stale"
+  assert_success
+
+  # With no live session the drop happens and the flag is cleared.
+  _box_claude_live() { return 1; }
+  run _account_invalidate_identity_key "$key" "$CN"
+  assert_success
+  run test -e "${f}.identity-stale"
+  assert_failure
+}

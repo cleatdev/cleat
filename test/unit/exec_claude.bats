@@ -801,3 +801,26 @@ rl_dead_pid() { local p; sleep 0.01 & p=$!; wait "$p" 2>/dev/null || true; echo 
   assert_output --partial "The box stopped during the account switch"
   run cat "$HB_EXEC_COUNT"; assert_output "1"
 }
+
+@test "the blank before claude survives a notice printed by the prepare" {
+  # The hooks advisory was fixed first, but the account and identity lines
+  # print INSIDE the relaunch loop, after that blank, so they became the last
+  # line again and the clean-exit reclaim erased them. The invariant now sits
+  # at the last moment before the exec.
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work" "$CLEAT_RUN_DIR/test-ctr/auth"
+  printf 'last_used\t1\n' > "$CLEAT_ACCOUNTS_DIR/work/meta"
+  _box_account_write test-ctr work
+  _account_box_ready() { return 1; }   # the box cannot use its account yet
+  local LF=$'\n'
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "has no account mount"
+  # A blank line separates that notice from the session output, so the reclaim
+  # erases the blank and the notice stays in the scrollback.
+  [[ "$output" == *"$LF$LF"* ]]
+  local tail_after_blank="${output##*"$LF$LF"}"
+  case "$tail_after_blank" in
+    *"Session ended"*) : ;;
+    *) printf 'no blank line before the session output\n' >&2; return 1 ;;
+  esac
+}

@@ -5764,7 +5764,7 @@ try "vnext_sessions_row_truncated" "a long title is truncated to the terminal wi
 # A title is model-written text drawn on the host terminal.
 cat > "$SED_TMP" << 'SED'
 /^_sessions_safe_str()/,/^}$/{
-  s/^  printf '%s' "\$1" | LC_ALL=C tr -d '\\000-\\037\\177' | sed 's\/\\\\\/\\\\\\\\\/g'/  printf '%s' "$1"/
+  s@^  v="[$](printf .%s. "[$]1" | LC_ALL=C tr -d ..000-.037.177.)"$@  v="$1"@
 }
 SED
 try "vnext_sessions_title_sanitized" "a newline in a title cannot split the row" "$CLI" "$SESSIONS_BATS"
@@ -8933,7 +8933,7 @@ try "vnext_hook_fork_workspace" "hook bridge the COPY, not the origin tree" "$CL
 # on "unbound variable", so the hooks cap was dead in every session. Only a
 # real-binary test sees it: the sourced suites strip strict mode.
 cat > "$SED_TMP" << 'SED'
-/^    _hook_bridge_watcher "[$]hooks_file" "[$]_hb_ws" /{
+/^      _hook_bridge_watcher "[$]hooks_file" "[$]_hb_ws" /{
   s@"[$]_hb_ws"@"$_workspace"@
 }
 SED
@@ -9004,7 +9004,7 @@ try "vnext_hook_drop_log_location" "the log lives outside every box-writable mou
 # line and sanitized first. Otherwise a forged payload writes its own log rows.
 cat > "$SED_TMP" << 'SED'
 /^_hook_drop_log()/,/^}$/{
-  s|_safe="[$](printf .%s. "[$]{line:0:200}" . tr .*.)"|_safe="${line:0:200}"|
+  s|_safe="[$](printf .%s. "[$]{line:0:200}" .*tr .*)"|_safe="${line:0:200}"|
 }
 SED
 try "vnext_hook_drop_log_onelined" "a forged event cannot inject a log line" "$CLI" "$HOOKS_BATS"
@@ -11100,7 +11100,7 @@ try "v150_attach_stamps_last_used" "an attach stamps the account as used" "$CLI"
 # The blank line that keeps a pre-launch advisory out of the session-end
 # reclaim's way. Without it the amber hooks line is erased on a clean exit.
 cat > "$SED_TMP" << 'SED'
-s@^  \[\[ [$]_ec_pre_notice -eq 0 \]\] || echo ""$@  :@
+s@^  \[\[ [$]_ec_pre_notice -eq 0 \]\] || _EC_SAID=1$@  :@
 SED
 try "v150_advisory_survives_reclaim" "the advisory survives the session-end reclaim" "$CLI" "$HOOKS_BATS"
 
@@ -11115,7 +11115,7 @@ try "v150_bridge_waits_for_spool" "waits for a spool that arrives late" "$CLI" "
 
 # And the spool is created before claude starts, so nothing depends on the box.
 cat > "$SED_TMP" << 'SED'
-s@^      ( umask 077; : > "[$]hooks_file" ) 2>/dev/null || true$@      :@
+s@^    ( set -C; umask 077; : > "[$]hooks_file" ) 2>/dev/null || true$@    :@
 SED
 try "v150_bridge_spool_precreated" "the hook spool exists before claude starts" "$CLI" "$HOOKS_BATS"
 
@@ -11132,10 +11132,167 @@ try "v150_attach_identity_before_expiry" "an attach refuses a newer login that b
 # to date rather than the box being pushed back onto an older token.
 cat > "$SED_TMP" << 'SED'
 /^_account_sync_in_locked()/,/^}$/{
-  s@^      if \[\[ [$]_hrc -eq 0 \]\]; then$@      if false; then@
+  s@^      _account_harvest_from "[$]acct" "[$]cname" "[$]snap" || _hrc=[$]?$@      _hrc=3@
 }
 SED
 try "v150_attach_keeps_own_refresh" "an attach keeps a newer login the server says is this account" "$CLI" "$ACCOUNTS_BATS"
+
+# An identity the server could not vouch for must leave the staged login alone.
+# Staging the store's copy over it rolls the box back to a spent grant.
+cat > "$SED_TMP" << 'SED'
+/^_account_sync_in_locked()/,/^}$/{
+  s@^      if \[\[ [$]_hrc -ne 2 \]\]; then$@      if false; then@
+}
+SED
+try "v150_attach_offline_keeps_staged" "an attach the server cannot vouch for keeps the login the box has" "$CLI" "$ACCOUNTS_BATS"
+
+# A staging that failed for any other reason used to be silent, under a summary
+# that named the pin.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s@^  elif \[\[ [$]_si -ne 0 && [$]{_ACCOUNT_STAGE_UNKEPT:-0} -ne 1 && [$]_si -ne [$]_ACCOUNT_LOCK_BUSY \]\]; then$@  elif false; then@
+}
+SED
+try "v150_attach_reports_failed_staging" "an attach says so when the account could not be staged" "$CLI" "$ACCOUNTS_BATS"
+
+# The spool is created with noclobber, so a planted link is never followed.
+cat > "$SED_TMP" << 'SED'
+s@^    ( set -C; umask 077; : > "[$]hooks_file" ) 2>/dev/null || true$@    ( umask 077; : > "$hooks_file" ) 2>/dev/null || true@
+SED
+try "v150_spool_noclobber" "a planted link is never created through" "$CLI" "$HOOKS_BATS"
+
+# cleat shell and cleat login stage the pinned account too, so they have to
+# leave the identity flag behind like every other path that changes the login.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  s@^  _RESOLVED_PROJECT="[$]project"$@  :@
+}
+SED
+try "v150_shell_flags_identity" "a shell or a login flags the cached identity" "$CLI" "$ACCOUNTS_BATS"
+
+# The blank that keeps a notice out of the reclaim's way is emitted at the exec,
+# because the prepare prints INSIDE the relaunch loop.
+cat > "$SED_TMP" << 'SED'
+s@^    \[\[ [$]{_EC_SAID:-0} -eq 0 \]\] || { echo ""; _EC_SAID=0; }$@    :@
+SED
+try "v150_blank_at_the_exec" "the blank before claude survives a notice printed by the prepare" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# And every late printer has to mark that window, or the blank never fires.
+cat > "$SED_TMP" << 'SED'
+/^_account_apply_exec_env()/,/^}$/{
+  s@^    _EC_SAID=1$@    :@
+}
+SED
+try "v150_late_printers_mark" "the blank before claude survives a notice printed by the prepare" "$CLI" "$EXEC_CLAUDE_BATS"
+
+# The spool offset advances by bytes consumed as whole lines. Jumping to the
+# window's end swallows the tail of an event the box was still writing.
+cat > "$SED_TMP" << 'SED'
+s@^      byte_offset=[$]_hb_pos$@      byte_offset=$file_size@
+SED
+try "v150_spool_offset_consumed" "an event torn across two polls is not lost" "$CLI" "$HOOKS_BATS"
+
+# A redirect truncates before jq runs, so the refresh writes through a variable.
+cat > "$SED_TMP" << 'SED'
+/^_refresh_settings_overlays()/,/^}$/{
+  s@^      if \[\[ -n "[$]_rso" \]\]; then$@      if true; then@
+}
+SED
+try "v150_overlay_refresh_keeps_last_good" "a malformed host settings file never empties the overlay" "$CLI" "$HOOKS_BATS"
+
+# cleat claude refreshes BOTH overlays through the shared function.
+cat > "$SED_TMP" << 'SED'
+/^cmd_claude()/,/^}$/{
+  s@^  _refresh_settings_overlays "[$]cname" "[$]project"$@  :@
+}
+SED
+try "v150_claude_refreshes_overlays" "wires the refresh in, not only the project half" "$CLI" "$HOOKS_BATS"
+
+# A real login that is merely too big to copy is not junk.
+cat > "$SED_TMP" << 'SED'
+/^_account_keepable_snapshot()/,/^}$/{
+  s@^  _account_cred_sane_size "[$]f" || return 2$@  _account_cred_sane_size "$f" || return 1@
+}
+SED
+try "v150_oversized_login_kept" "an oversized but real login is kept, never treated as junk" "$CLI" "$ACCOUNTS_BATS"
+
+# A deferred identity drop has to leave a retry behind, or the removed
+# account's name outlives the account.
+cat > "$SED_TMP" << 'SED'
+/^_account_invalidate_identity_key()/,/^}$/{
+  s@^    : > "[$]{f}.identity-stale" 2>/dev/null || true$@    :@
+}
+SED
+try "v150_deferred_drop_flags" "a deferred identity drop leaves something for the next launch" "$CLI" "$ACCOUNTS_BATS"
+
+# One bridge per box. Two tailing the same spool run every host hook twice.
+cat > "$SED_TMP" << 'SED'
+s@^    if _box_hook_bridge_live "[$]cname"; then$@    if false; then@
+SED
+try "v150_one_hook_bridge_per_box" "a second terminal on the same box does not start a second bridge" "$CLI" "$HOOKS_BATS"
+
+# The third browser refusal had no report, so cleat login said nothing at all.
+cat > "$SED_TMP" << 'SED'
+s@^  _maybe_report_nobind_opens "[$]log" "[$]off"$@  :@
+SED
+try "v150_nobind_reported" "a login deferred for a busy callback port is reported" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# The drops log grows on the box's schedule, so it is capped like the run log.
+cat > "$SED_TMP" << 'SED'
+/^_hook_drop_log()/,/^}$/{
+  s@^      mv -f "[$]f" "[$]f.1" 2>/dev/null || true$@      :@
+}
+SED
+try "v150_drops_log_rotates" "the box cannot grow it without bound" "$CLI" "$HOOKS_BATS"
+
+# bash 3.2 treats an EMPTY array under set -u as unbound, so the bridge died on
+# its first event whenever the host had no settings file.
+cat > "$SED_TMP" << 'SED'
+s%^        _execute_host_hook_bg "[$]_HOOK_EV_OUT" "[$]_HOOK_EV_DIR" "[$]_hb_ws" .*$%        _execute_host_hook_bg "$_HOOK_EV_OUT" "$_HOOK_EV_DIR" "$_hb_ws" "${settings_files[@]}"%
+SED
+try "v150_bridge_empty_array" "an array that can be empty uses the .form"
+
+# The title sanitiser ends in a locale-free expansion, not a sed that BSD
+# rejects on an invalid byte.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_safe_str()/,/^}$/{
+  s@^  printf .%s. "[$]{v//\\\\/\\\\\\\\}"$@  printf '%s' "$v" | sed 's/\\/\\\\/g'@
+}
+SED
+try "v150_safe_str_no_sed" "one invalid byte does not kill the picker" "$CLI" "$SESSIONS_BATS"
+
+# Typeahead is drained before the handover question, or a buffered Enter from
+# the picker answers it yes and a running session is restarted unasked.
+cat > "$SED_TMP" << 'SED'
+/^      _handoff_drain_typeahead$/{
+  s@^      _handoff_drain_typeahead$@      :@
+}
+SED
+try "v150_handoff_drains_before_ask" "a keystroke typed before the question is not an answer to it" "$CLI" "$HANDOFF_BATS"
+
+# The rename's temp paths are unguessable, so a link the box plants at a
+# predictable name is never written through.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  s@^  stamp="[$](mktemp "[$]{sdir}/.cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""$@  stamp="${sdir}/.cleat-mtime.$$"@
+}
+SED
+try "v150_rename_temp_mktemp" "a link planted at the temp path is never written through" "$CLI" "$SESSIONS_BATS"
+
+# One project is one box whatever the caller's locale.
+cat > "$SED_TMP" << 'SED'
+s@^  dir_name="[$](basename "[$]project_path" | LC_ALL=C tr .\[:upper:\]. .\[:lower:\]. | LC_ALL=C sed .s/\[^a-z0-9-\]/-/g.)"$@  dir_name="$(basename "$project_path" | tr '"'"'[:upper:]'"'"' '"'"'[:lower:]'"'"' | sed '"'"'s/[^a-z0-9-]/-/g'"'"')"@
+SED
+try "v150_container_name_locale" "the same project is one box whatever the caller" "$CLI" "$CONTAINER_NAME_BATS"
+
+# One regex engine on both platforms: BSD grep rejects the PCRE-isms Claude
+# Code's matchers use, so those hooks were silently skipped on a Mac. The
+# mutation makes jq's test() fall back to a literal compare, which \w cannot
+# satisfy.
+cat > "$SED_TMP" << 'SED'
+s@try ([$]t | test([$]m)) catch false@($t == $m)@
+SED
+try "v150_matcher_one_engine" "the same pattern matches on macOS and on Linux" "$CLI" "$HOOKS_BATS"
 
 # A staged login the box did not last run on takes the cached identity with it.
 # Without the flag Claude shows the old account and sends its organisation.
@@ -11155,10 +11312,32 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v150_probe_shell_path_only" "box probe ignores a process that merely names shell-snapshots" "$CLI" "$HANDOFF_BATS"
 
+
+
+# Every $( ) forks a shell with the same argv under a new pid, so a pid skip
+# list cannot cover the scan's own fork. Argv is the identity.
 cat > "$SED_TMP" << 'SED'
-s@^  _hb_scan "[$]home" "[$]proc" "[$]livepids [$][$] [$]{PPID:-}"$@  _hb_scan "$home" "$proc" "$livepids"@
+/^_hb_scan()/,/^}$/{
+  s@^      \[\[ "[$]joined" != "[$]selfcmd" \]\] || continue$@      :@
+}
 SED
-try "v150_probe_skips_itself" "box probe never reports its own shell" "$CLI" "$HANDOFF_BATS"
+try "v150_scan_skips_own_fork" "box scan ignores a fork of the script itself" "$CLI" "$HANDOFF_BATS"
+
+# A sibling exec of the same script, and its runuser parent, carry the shipped
+# text too. Neither is this pid, this parent, nor argv-identical to this scan.
+cat > "$SED_TMP" << 'SED'
+/^_hb_scan()/,/^}$/{
+  s@^      \[\[ "[$]w" == cleat-hb \]\] || continue$@      [[ "$w" == cleat-hb-never ]] || continue@
+}
+SED
+# The two self-skip tests in handoff.bats (the probe's own shell, the terminate
+# recheck's) are deliberately WITHOUT their own entry: three mechanisms cover
+# that scan now (the cleat-hb marker, the argv identity, the pid skip), and no
+# single revert is observable in those two fixtures because the others catch
+# it. The distinct scenarios each have an entry: v150_scan_skips_sibling_run
+# for the marker, v150_scan_skips_own_fork for the argv, v150_probe_shell_path_only
+# for the pattern.
+try "v150_scan_skips_sibling_run" "box scan ignores a sibling run of the script" "$CLI" "$HANDOFF_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

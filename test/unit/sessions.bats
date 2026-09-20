@@ -2176,3 +2176,53 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   [ "$status" -eq 3 ]
   [ -z "$(ls -A "$SDIR/.cleat-trash" 2>/dev/null)" ]
 }
+
+@test "session titles: one invalid byte does not kill the picker" {
+  # The sanitiser ended in an unpinned sed. BSD sed under a UTF-8 LC_CTYPE
+  # refuses a byte sequence that is not valid UTF-8 and exits non-zero, so a
+  # single bad byte in a model-written title took the whole list down on a Mac.
+  local bad
+  bad="$(printf 'ok\xff\xfetitle')"
+  LC_ALL=en_US.UTF-8 run _sessions_safe_str "$bad"
+  assert_success
+  assert_output --partial "ok"
+  assert_output --partial "title"
+
+  # A real backslash is still doubled for the echo -e that renders it.
+  run _sessions_safe_str 'a\b'
+  assert_success
+  assert_output 'a\\b'
+}
+
+@test "session rename: a link planted at the temp path is never written through" {
+  # Both temp paths were $$-named, and this directory is the box's own session
+  # tree, mounted read-write. A predictable name is one the box can pre-create
+  # as a link to any host file the user can write.
+  local sdir="$TEST_TEMP/projects/-workspace"
+  local uuid="11111111-2222-4333-8444-555555555555"
+  mkdir -p "$sdir/$uuid"
+  printf '{"type":"summary"}\n' > "$sdir/$uuid.jsonl"
+  local victim="$TEST_TEMP/host-secret.txt"
+  printf 'KEEP\n' > "$victim"
+  # The two names the old code used.
+  ln -s "$victim" "$sdir/.cleat-mtime.$$" 2>/dev/null || true
+  ln -s "$victim" "$sdir/$uuid/.custom-title.json.$$" 2>/dev/null || true
+
+  local before
+  before="$(stat -c %Y "$victim" 2>/dev/null || stat -f %m "$victim" 2>/dev/null)"
+  # Old enough that a stamp through the link is visible.
+  touch -t 202001010101 "$victim"
+  before="$(stat -c %Y "$victim" 2>/dev/null || stat -f %m "$victim" 2>/dev/null)"
+
+  run _sessions_rename_write "$sdir" "$uuid" "renamed"
+  run cat "$victim"
+  assert_output "KEEP"
+  # Not stamped either: `touch -r` through a planted link would have moved the
+  # host file's mtime, twice.
+  local after
+  after="$(stat -c %Y "$victim" 2>/dev/null || stat -f %m "$victim" 2>/dev/null)"
+  assert_equal "$after" "$before"
+  # And the rename still did its job.
+  run cat "$sdir/$uuid.jsonl"
+  assert_output --partial "renamed"
+}

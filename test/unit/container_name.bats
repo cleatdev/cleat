@@ -195,3 +195,23 @@ teardown() { _common_teardown; }
   [[ ${#result} -le 63 ]] || { echo "len=${#result}: $result"; return 1; }
   [[ "$result" =~ -[0-9a-f]{8}-verylongboxname12345678901234$ ]] || { echo "got: $result"; return 1; }
 }
+
+@test "container name: the same project is one box whatever the caller's locale" {
+  # tr and sed fold and substitute by the caller's locale, so a project whose
+  # name has non-ASCII characters hashed to one container under LANG=C and
+  # another under a UTF-8 locale: the same directory got two boxes, and the
+  # second looked like a fresh project. The session key beside it has been
+  # pinned to C since it shipped.
+  local proj="$TEST_TEMP/Cafe-Ätzend"
+  mkdir -p "$proj"
+  local a b
+  a="$(LC_ALL=C container_name_for "$proj" main)"
+  b="$(LC_ALL=en_US.UTF-8 container_name_for "$proj" main)"
+  assert_equal "$a" "$b"
+
+  # And an ASCII project is untouched by the pinning, so no box is renamed.
+  local ascii="$TEST_TEMP/PlainProject"
+  mkdir -p "$ascii"
+  run container_name_for "$ascii" main
+  assert_output --partial "cleat-plainproject-"
+}

@@ -2335,6 +2335,15 @@ _utf8_locale() {
   # And the honest single-line case still matches.
   _execute_host_hooks '{"hook_event_name":"PreToolUse","tool_name":"Bash"}' "$HOME/.claude/settings.json"
   [ -f "$TEST_TEMP/MATCHED" ] || { echo "an anchored matcher stopped matching its own tool"; return 1; }
+
+  # An UNANCHORED matcher is where the rejection still does the work: a forged
+  # multi-line tool_name contains the real one, so it would match on substring
+  # alone and run a hook the payload does not describe.
+  rm -f "$TEST_TEMP/MATCHED"
+  printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"touch %s/MATCHED"}]}]}}\n' \
+    "$TEST_TEMP" > "$HOME/.claude/settings.json"
+  _execute_host_hooks "$(printf '{"hook_event_name":"PreToolUse","tool_name":"Write\\nBash"}')" "$HOME/.claude/settings.json"
+  [ ! -f "$TEST_TEMP/MATCHED" ] || { echo "a multi-line tool_name satisfied an unanchored matcher"; return 1; }
 }
 
 # ── the drop log ────────────────────────────────────────────────────────────
@@ -3024,4 +3033,235 @@ _host_hook_appends() {
   run exec_claude "test-spool2" --dangerously-skip-permissions
   run cat "$victim"
   assert_output "KEEP"
+}
+
+@test "hook spool: a planted link is never created through, even with no window" {
+  # The pre-creation used to test then write. The box mounts that directory
+  # read-write, so a link planted between the two would have cleat truncate the
+  # host file it points at. noclobber closes the window entirely.
+  local victim="$TEST_TEMP/host-file.txt"
+  printf 'KEEP\n' > "$victim"
+  mkdir -p "$CLEAT_RUN_DIR/spool-box/hooks"
+  ln -s "$victim" "$CLEAT_RUN_DIR/spool-box/hooks/events.jsonl"
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run exec_claude "spool-box" --dangerously-skip-permissions
+  run cat "$victim"
+  assert_output "KEEP"
+
+  # An existing real spool is left exactly as it is, never truncated.
+  rm -f "$CLEAT_RUN_DIR/spool-box/hooks/events.jsonl"
+  printf '{"hook_event_name":"Stop"}\n' > "$CLEAT_RUN_DIR/spool-box/hooks/events.jsonl"
+  run exec_claude "spool-box" --dangerously-skip-permissions
+  run cat "$CLEAT_RUN_DIR/spool-box/hooks/events.jsonl"
+  assert_output --partial "hook_event_name"
+}
+
+@test "_hook_bridge_watcher: an event torn across two polls is not lost" {
+  # The box appends with `cat >>`, so a poll can land between the bytes of one
+  # event. The offset jumped to the end of the window, so the tail was
+  # swallowed and the remainder read as a fresh line: the event was lost and
+  # logged as a bad line the box supposedly wrote.
+  mkdir -p "$TEST_TEMP/torn"
+  local hooks_file="$TEST_TEMP/torn/events.jsonl"
+  local processed="$TEST_TEMP/torn-processed"
+  _execute_host_hook_bg() { echo "$1" >> "$processed"; }
+  _RESOLVED_PROJECT="$TEST_TEMP"
+  mkdir -p "${HOME}/.claude"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' \
+    > "${HOME}/.claude/settings.json"
+  : > "$hooks_file"
+
+  _hook_bridge_watcher "$hooks_file" &
+  local pid=$!
+  sleep 0.3
+  # Half an event, then the rest a poll later.
+  printf '{"hook_event_name":"Stop","_cleat_ts":"to' >> "$hooks_file"
+  sleep 0.6
+  printf 'rn1"}\n' >> "$hooks_file"
+  sleep 1.2
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+
+  [[ -f "$processed" ]] || { echo "the torn event was never forwarded"; return 1; }
+  grep -q "torn1" "$processed" || { echo "the torn event was lost"; return 1; }
+}
+
+@test "settings refresh: a malformed host settings file never empties the overlay" {
+  # The refresh redirected jq straight into the overlay, and a redirect
+  # truncates before jq runs. One stray comma in ~/.claude/settings.json left
+  # the box with a zero-byte overlay: host hooks off and the unsafe-rm guard
+  # gone, with nothing printed.
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  local dir="$CLEAT_RUN_DIR/refresh-box/settings"
+  mkdir -p "$dir"
+  printf '{"model":"opus","hooks":{}}\n' > "$dir/settings.json"
+  printf '{"model":"opus",,}\n' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+
+  run _refresh_settings_overlays "refresh-box" "$TEST_TEMP/proj"
+  assert_output --partial "Could not read"
+  # The overlay it already had is still there, byte for byte.
+  run cat "$dir/settings.json"
+  assert_output --partial "opus"
+
+  # A valid file still refreshes it.
+  printf '{"model":"sonnet","hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' \
+    > "$HOME/.claude/settings.json"
+  run _refresh_settings_overlays "refresh-box" "$TEST_TEMP/proj"
+  run cat "$dir/settings.json"
+  assert_output --partial "sonnet"
+  assert_output --partial "/var/log/cleat/events.jsonl"
+}
+
+@test "cleat claude wires the refresh in, not only the project half" {
+  # The wiring, not the function: this verb refreshed the PROJECT overlays
+  # only, inlined, so a host hook added after the box was created never
+  # reached a session started with `cleat claude`.
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  local proj="$TEST_TEMP/cwire"
+  mkdir -p "$proj"
+  local cn
+  cn="$(container_name_for "$proj" main)"
+  mkdir -p "$CLEAT_RUN_DIR/$cn/settings"
+  printf '{"model":"opus"}\n' > "$CLEAT_RUN_DIR/$cn/settings/settings.json"
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}\n' \
+    > "$HOME/.claude/settings.json"
+  _fork_preflight() { :; }
+  require_running() { :; }
+  resolve_caps() { ACTIVE_CAPS=(hooks); }
+  resolve_env_args() { :; }
+  _resolve_config_drift() { :; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _maybe_note_missing_kit_masks() { :; }
+  _maybe_show_release_highlight() { :; }
+  _print_summary_block() { :; }
+  _maybe_gate_on_disk_fill() { :; }
+  exec_claude() { :; }
+
+  run cmd_claude "$proj"
+  run cat "$CLEAT_RUN_DIR/$cn/settings/settings.json"
+  assert_output --partial "/var/log/cleat/events.jsonl"
+}
+
+@test "cleat claude refreshes the global overlay, not just the project one" {
+  # This verb refreshed the PROJECT overlays only, inlined, so a host hook
+  # added after the box was created was never forwarded to a session started
+  # with `cleat claude`, and the unsafe-rm guard did not match the caps
+  # resolved for that launch.
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  local dir="$CLEAT_RUN_DIR/claude-box/settings"
+  mkdir -p "$dir" "$TEST_TEMP/cproj"
+  printf '{"model":"opus"}\n' > "$dir/settings.json"
+  # A host hook added since the box was created.
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}\n' \
+    > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+
+  run _refresh_settings_overlays "claude-box" "$TEST_TEMP/cproj"
+  run cat "$dir/settings.json"
+  assert_output --partial "/var/log/cleat/events.jsonl"
+}
+
+@test "hook bridge: a second terminal on the same box does not start a second bridge" {
+  # Both bridges tail the same spool, so every host hook ran twice per event:
+  # a hook that writes, commits or notifies did it twice, silently.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  _host_open_cmd() { echo ""; }
+  export DOCKER_EXIT_CODE=0
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  mkdir -p "$CLEAT_RUN_DIR/two-term/hooks"
+  # Another terminal's bridge, alive.
+  : > "$CLEAT_RUN_DIR/two-term/hooks/.bridge.$$"
+
+  _HOOK_BRIDGE_PID="unset"
+  run exec_claude "two-term" --dangerously-skip-permissions
+  assert_success
+  # Its marker is untouched: this session did not take it over or remove it.
+  run test -f "$CLEAT_RUN_DIR/two-term/hooks/.bridge.$$"
+  assert_success
+
+  # A marker whose pid is gone is not a bridge, so this session starts one.
+  rm -f "$CLEAT_RUN_DIR/two-term/hooks/.bridge.$$"
+  : > "$CLEAT_RUN_DIR/two-term/hooks/.bridge.999999"
+  run _box_hook_bridge_live two-term
+  assert_failure
+  run test -e "$CLEAT_RUN_DIR/two-term/hooks/.bridge.999999"
+  assert_failure
+}
+
+@test "hook drops log: the box cannot grow it without bound" {
+  # Every malformed or oversized event the box forwards writes a row here. The
+  # run log beside it has been capped since it shipped and this one was not.
+  local f="$CLEAT_STATE_DIR/hook-drops.log"
+  mkdir -p "$CLEAT_STATE_DIR"
+  head -c $(( 1048576 + 4096 )) /dev/zero | tr '\0' 'x' > "$f"
+  _HOOK_DROP_LOG_N=0
+  _hook_drop_off=999999
+
+  _hook_drop_log "size" '{"hook_event_name":"Stop"}' "test-ctr" 0
+  run test -f "$f.1"
+  assert_success
+  # The new file holds only the row just written.
+  run bash -c 'wc -c < "$1" | tr -d " "' _ "$f"
+  [[ "$output" -lt 4096 ]]
+  # And the session's read offset went back to the start, or the end-of-session
+  # report would read past the end of the new file and say nothing.
+  assert_equal "$_hook_drop_off" 0
+}
+
+@test "hook bridge: it survives a host with no settings file at all" {
+  # bash 3.2 (macOS) treats an EMPTY array under `set -u` as unbound and exits.
+  # settings_files is empty whenever ~/.claude/settings.json was not there when
+  # the watcher started, so the bridge died on its first forwarded event, on a
+  # Mac only, with the box's event already consumed.
+  mkdir -p "$TEST_TEMP/nosettings"
+  local hooks_file="$TEST_TEMP/nosettings/events.jsonl"
+  local processed="$TEST_TEMP/nosettings-processed"
+  _execute_host_hook_bg() { echo "$1" >> "$processed"; }
+  _RESOLVED_PROJECT="$TEST_TEMP"
+  rm -f "${HOME}/.claude/settings.json"
+  : > "$hooks_file"
+
+  # Under `set -u`, as the real binary runs it. The sourced suite strips strict
+  # mode, which is exactly why a Mac saw this and the 3200-test run did not.
+  set -u
+  _hook_bridge_watcher "$hooks_file" &
+  local pid=$!
+  set +u
+  sleep 0.3
+  echo '{"hook_event_name":"Stop","_cleat_ts":"nosets"}' >> "$hooks_file"
+  sleep 1
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+
+  # The bridge is still the one deciding, and it did not die on the expansion.
+  [[ -f "$processed" ]] || { echo "the bridge died before forwarding"; return 1; }
+  grep -q "nosets" "$processed" || { echo "the event was never forwarded"; return 1; }
+}
+
+@test "hook matchers: the same pattern matches on macOS and on Linux" {
+  # Matchers were run through grep -E. GNU grep quietly accepts the PCRE-isms
+  # Claude Code's own docs use, BSD grep does not, so a matcher with \b or \w
+  # fired on Linux and was silently skipped on a Mac.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  local ran="$TEST_TEMP/matched"
+  : > "$ran"
+  local sf="$HOME/.claude/settings.json"
+  printf '{"hooks":{"PreToolUse":[{"matcher":"^\\\\w+sh$","hooks":[{"type":"command","command":"echo hit >> %s"}]}]}}\n' "$ran" > "$sf"
+
+  _execute_host_hooks '{"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":"/w"}' "$sf"
+  sleep 0.2
+  run cat "$ran"
+  assert_output --partial "hit"
+
+  # A tool the matcher does not name still does not run it.
+  : > "$ran"
+  _execute_host_hooks '{"hook_event_name":"PreToolUse","tool_name":"Write","cwd":"/w"}' "$sf"
+  sleep 0.2
+  run cat "$ran"
+  refute_output --partial "hit"
 }

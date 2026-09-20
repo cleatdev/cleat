@@ -1196,6 +1196,18 @@ EOF
   assert_failure
 }
 
+@test "regression bash-3.2: an array that can be empty uses the +form" {
+  # bash 3.2 treats "${arr[@]}" of an EMPTY array as an unbound variable and
+  # exits under `set -u`. bash 4.4 fixed that, so no run on a modern bash can
+  # see it and only a Mac does: the hook bridge died on its first forwarded
+  # event whenever ~/.claude/settings.json was absent, because settings_files
+  # was empty. A source guard, like every other bash 3.2 rule in this file.
+  # Only the BARE form. The safe one contains it as its own fallback, so the
+  # character before the quote is what tells them apart.
+  run grep -nE '[^+]"\$\{settings_files\[@\]\}"' "$CLI"
+  assert_failure
+}
+
 @test "regression bash-3.2: no readarray or mapfile" {
   run grep -nE '\b(readarray|mapfile)\b' "$CLI"
   assert_failure

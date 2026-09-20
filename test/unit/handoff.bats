@@ -124,6 +124,41 @@ teardown() { hb_teardown_pids; _common_teardown; }
   assert_line "shell	unreadable"
 }
 
+@test "box probe ignores a process that merely names shell-snapshots" {
+  # The probe is shipped to the box AS TEXT ON ARGV, so its own bash carried
+  # the words `shell-snapshots` in its command line, matched itself and
+  # reported a background shell on every run. Every live switch then refused
+  # with "background shell commands running" on a box that had none, which made
+  # the headline feature unusable. Found on a real Mac, 2026-09-20.
+  mkdir -p "$PV/930"
+  local mid="" i
+  for i in $(seq 1 18); do mid="$mid 0"; done
+  printf '%s (bash) R%s 90000 0 0 0\n' 930 "$mid" > "$PV/930/stat"
+  # A word holding the bare name, the way the probe's own source does.
+  printf 'bash\0-c\0case "$w" in *shell-snapshots*) found=1 ;; esac\0' > "$PV/930/cmdline"
+  : > "$PV/930/environ"
+  run hb_run_box probe "$BH" "$PV"
+  assert_success
+  refute_output --partial "shell	"
+
+  # A real tool shell, which sources the snapshot by path, is still reported.
+  hb_fake_snapshot_proc "$PV" 931 "CLEAT_EXEC_ID=aaaa1111bbbb"
+  run hb_run_box probe "$BH" "$PV"
+  assert_success
+  assert_line "shell	aaaa1111bbbb"
+}
+
+@test "box probe never reports its own shell or the one that launched it" {
+  # Belt to the pattern's braces: a path-shaped mention inside the shipped text
+  # would otherwise bring the self-match back.
+  # Called in-process, so $$ inside the probe is this shell and the fake entry
+  # stands in for the probe's own bash.
+  hb_fake_snapshot_proc "$PV" "$$" "CLEAT_EXEC_ID=cccc2222dddd"
+  run _hb_probe "$BH" "$PV"
+  assert_success
+  refute_output --partial "cccc2222dddd"
+}
+
 # ── the shipped closure ─────────────────────────────────────────────────────
 
 @test "box script defines every box helper and runs under an empty environment" {

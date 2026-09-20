@@ -18634,10 +18634,19 @@ _hb_session_record() {
 # Walk <PROC>/<digits>. Print `orphan <pid>` for a process _is_claude_argv
 # accepts whose pid is not in SKIPPIDS (the caller skips every pid it already
 # accounted for as a live session or a target), and `shell <execid>` for a
-# process one of whose argv words holds `shell-snapshots` (Claude's tool/bash
-# shell). Empty cmdlines and skipped pids are ignored. The executable decides:
-# a `claude` word in an argument (a ripgrep pattern, a dev server) is never a
-# session, which _is_claude_argv enforces.
+# process one of whose argv words holds a `/shell-snapshots/` PATH (Claude
+# sources one into every tool/bash shell). Empty cmdlines and skipped pids are
+# ignored. The executable decides: a `claude` word in an argument (a ripgrep
+# pattern, a dev server) is never a session, which _is_claude_argv enforces.
+#
+# The path slashes are not decoration. The match used to be the bare word, and
+# this probe is shipped to the box AS TEXT ON ARGV, so the probe's own bash
+# carried `shell-snapshots` in its command line, matched itself and reported a
+# background shell on every run. Every live switch refused with "background
+# shell commands running in another terminal" on a box that had none. The
+# headline feature was unusable and only a real box showed it (2026-09-20).
+# The caller also skips this shell and its parent, so a later mention of the
+# path inside the shipped text cannot bring the self-match back.
 _hb_scan() {
   local home="$1" proc="$2" skip="$3"
   local d pid w words execid found_shell
@@ -18658,7 +18667,7 @@ _hb_scan() {
     found_shell=0
     for w in "${words[@]}"; do
       case "$w" in
-        *shell-snapshots*) found_shell=1; break ;;
+        */shell-snapshots/*) found_shell=1; break ;;
       esac
     done
     if [[ $found_shell -eq 1 ]]; then
@@ -18737,7 +18746,8 @@ _hb_probe() {
       livepids="$livepids $pid"
     fi
   done
-  _hb_scan "$home" "$proc" "$livepids"
+  # This shell and whatever launched it: see _hb_scan's note on the self-match.
+  _hb_scan "$home" "$proc" "$livepids $$ ${PPID:-}"
   printf 'end\tok\n'
   return 0
 }

@@ -11145,6 +11145,20 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v150_attach_flags_stale_identity" "an attach that stages a different login flags the cached identity" "$CLI" "$ACCOUNTS_BATS"
+
+# The probe is shipped as text on argv, so a bare-word match made it report
+# itself as a background shell and every live switch refused.
+cat > "$SED_TMP" << 'SED'
+/^_hb_scan()/,/^}$/{
+  s@^        \*/shell-snapshots/\*) found_shell=1; break ;;$@        *shell-snapshots*) found_shell=1; break ;;@
+}
+SED
+try "v150_probe_shell_path_only" "box probe ignores a process that merely names shell-snapshots" "$CLI" "$HANDOFF_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@^  _hb_scan "[$]home" "[$]proc" "[$]livepids [$][$] [$]{PPID:-}"$@  _hb_scan "$home" "$proc" "$livepids"@
+SED
+try "v150_probe_skips_itself" "box probe never reports its own shell" "$CLI" "$HANDOFF_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 echo "  Total:   $total"

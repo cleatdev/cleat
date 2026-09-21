@@ -262,11 +262,19 @@ while :; do sleep 0.2; done
 SHIM
 
   # Run the interactive exec under a host pty, in the background, so we can TERM
-  # the shim and then read the exit code `script -e` propagated.
-  cat > "$TEST_TEMP/run-wrapper.sh" <<EOF
-script -qec "docker exec -it -e PATH=/workspace/.shim-bin:$INT_BOX_PATH $cname runuser -u coder -- bash /workspace/.wrapper.sh --resume x" /dev/null
-echo "WRAP_RC=\$?" > "$TEST_TEMP/wrap-rc"
-EOF
+  # the shim and then read the exit code `script -e` propagated. The two
+  # script(1) implementations take the command differently: GNU wants it as one
+  # -c string before the file, BSD (every macOS host) has no -c at all and takes
+  # it as trailing words after the file. Pick by probing, not by uname.
+  local inner="docker exec -it -e PATH=/workspace/.shim-bin:$INT_BOX_PATH $cname runuser -u coder -- bash /workspace/.wrapper.sh --resume x"
+  if script -qec true /dev/null >/dev/null 2>&1; then
+    printf 'script -qec "%s" /dev/null\n' "$inner" > "$TEST_TEMP/run-wrapper.sh"
+  elif script -qe /dev/null true >/dev/null 2>&1; then
+    printf 'script -qe /dev/null %s\n' "$inner" > "$TEST_TEMP/run-wrapper.sh"
+  else
+    skip "no script(1) here can run a command and return its exit status"
+  fi
+  printf 'echo "WRAP_RC=$?" > "%s"\n' "$TEST_TEMP/wrap-rc" >> "$TEST_TEMP/run-wrapper.sh"
   bash "$TEST_TEMP/run-wrapper.sh" &
   local runpid=$!
 

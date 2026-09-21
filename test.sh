@@ -44,6 +44,7 @@ RESET='\033[0m'
 total_pass=0
 total_fail=0
 total_skip=0
+total_tool_skip=0
 total_files=0
 failed_files=()
 start_time=$(date +%s)
@@ -108,6 +109,13 @@ for f in "${files[@]}"; do
   file_pass=$(echo "$output" | grep -c "^ok " || true)
   file_fail=$(echo "$output" | grep -c "^not ok " || true)
   file_skip=$(echo "$output" | grep -c "# skip" || true)
+  # Skips split in two. A TOOL skip means the runner is missing something the
+  # leg is supposed to install, which silently drops coverage: that is what the
+  # budget is for. An ENVIRONMENT skip is a fact about the host the suite
+  # cannot install its way out of (running as root, no UTF-8 locale, no IPv6
+  # loopback, a BSD script(1), inotifywait on macOS) and the matrix covers the
+  # other side of it elsewhere. Counting those made six honest legs red.
+  file_tool_skip=$(echo "$output" | grep "# skip" | grep -cE "needs jq|needs socat|socat is not installed|python3|perl|needs curl" || true)
 
   # Trust bats' EXIT STATUS, not just the "not ok" lines. A file whose bats run
   # is killed (OOM, the job timeout, a crashed helper) can exit non-zero having
@@ -123,6 +131,7 @@ not ok (harness) bats exited $bats_rc without reporting a failure: the run was k
   total_pass=$((total_pass + file_pass))
   total_fail=$((total_fail + file_fail))
   total_skip=$((total_skip + file_skip))
+  total_tool_skip=$((total_tool_skip + file_tool_skip))
 
   if [[ "$file_fail" -gt 0 ]]; then
     echo -e "  ${RED}✖${RESET} ${fname}  ${DIM}(${file_pass} passed, ${RED}${file_fail} failed${RESET}${DIM})${RESET}"
@@ -171,10 +180,10 @@ if [[ -n "${TEST_MAX_SKIPPED:-}" ]]; then
   case "$TEST_MAX_SKIPPED" in
     ''|*[!0-9]*) echo "TEST_MAX_SKIPPED must be a number" >&2; exit 2 ;;
   esac
-  if [[ "$total_skip" -gt "$TEST_MAX_SKIPPED" ]]; then
+  if [[ "$total_tool_skip" -gt "$TEST_MAX_SKIPPED" ]]; then
     echo ""
-    echo -e "  ${RED}${total_skip} tests skipped, budget is ${TEST_MAX_SKIPPED}${RESET}"
-    echo -e "  ${DIM}A tool the suite gates on is probably missing on this runner.${RESET}"
+    echo -e "  ${RED}${total_tool_skip} tests skipped for a missing tool, budget is ${TEST_MAX_SKIPPED}${RESET}"
+    echo -e "  ${DIM}${total_skip} skipped in total. The rest are environment facts this host cannot install away.${RESET}"
     for _tool in jq socat python3 perl curl script mkfifo; do
       command -v "$_tool" >/dev/null 2>&1 || echo -e "    ${DIM}missing: ${_tool}${RESET}"
     done

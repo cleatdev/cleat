@@ -104,6 +104,22 @@ int_share_dirs() {
   return 0
 }
 
+# The handoff takes Claude Code's own refresh lock by making a directory in the
+# box's credential store, so a box whose user cannot write that store can never
+# be switched. Prove the precondition from inside the box and say so, rather
+# than reading the refusal that follows as a handoff bug. Under rootless Docker
+# the box user lands on the host as a subuid, which is where this bites.
+int_box_can_lock() {
+  local cname="$1" out
+  out="$(docker exec "$cname" runuser -u coder -- bash -c '
+    d=/home/coder/.claude/.cleat-locktest.$$
+    if mkdir "$d" 2>/dev/null; then rmdir "$d"; echo yes; else echo "no:$(id -u):$(stat -c "%u %a" /home/coder/.claude 2>/dev/null)"; fi' 2>/dev/null)"
+  case "$out" in
+    yes) return 0 ;;
+    *) skip "the box user cannot write its credential store, so no switch can take the refresh lock here ($out)" ;;
+  esac
+}
+
 # A host transcript so the sid resolves under the session key dir (4.2 row 6).
 # Write it BEFORE the box starts. Under rootless Docker the container's uid maps
 # to a subuid the host user cannot write as, so a directory the box created
@@ -328,6 +344,7 @@ SHIM
   cname="$(int_cname)"
   int_clean_box "$cname"
   int_share_dirs "$cname"
+  int_box_can_lock "$cname"
   execid="d00dfeed1234"
 
   # Two named accounts on the SAME grant (harvest absorbs, no network).
@@ -383,6 +400,7 @@ SHIM
   cname="$(int_cname)"
   int_clean_box "$cname"
   int_share_dirs "$cname"
+  int_box_can_lock "$cname"
   execid="beadfeed5678"
 
   write_cred "$XDG_CONFIG_HOME/cleat/accounts/b/.credentials.json" "acc-b-ONLY" "b-refresh"

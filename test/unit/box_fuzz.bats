@@ -56,7 +56,13 @@ _FUZZ_PATHS=(
 @test "fuzz: _derive_project_session_key: default byte-identical to legacy; named appends -<box>; for ANY path" {
   local p b legacy
   for p in "${_FUZZ_PATHS[@]}"; do
-    legacy="$(basename "$p" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')-$(echo -n "$p" | _md5 | head -c 8)"
+    # LC_ALL=C on both stages, because the function under test pins them. The
+    # replica did not, so on a runner whose default locale is UTF-8 it folded
+    # and substituted by CHARACTER while the CLI does it by BYTE: one dash per
+    # multibyte character against one per byte. The CLI has always pinned it,
+    # so the drift was the test's, and it only appeared when the ubuntu image
+    # started defaulting to a UTF-8 locale.
+    legacy="$(basename "$p" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g')-$(echo -n "$p" | _md5 | head -c 8)"
     [[ "$(_derive_project_session_key "$p")" == "$legacy" ]]      || { echo "default key drift: p='$p'"; return 1; }
     [[ "$(_derive_project_session_key "$p" main)" == "$legacy" ]] || { echo "main key drift: p='$p'"; return 1; }
     for b in az dev scratch; do

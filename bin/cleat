@@ -9475,7 +9475,11 @@ _account_attach_gate() {
 # the [1m] suffix. Anything else is not relaunchable, so exec_claude stamps no
 # exec id and the session reads as R-foreign to a switch in another terminal.
 _exec_claude_argv_relaunchable() {
-  local re_uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  # Spelled out, not ranged: a bracket range is collated in the CURRENT locale,
+  # and under a UTF-8 one it also matches the uppercase letters. The _hb_*
+  # copies of this pattern run with LC_ALL=C exported, this one does not.
+  local _h='[0123456789abcdef]'
+  local re_uuid="^${_h}{8}-${_h}{4}-${_h}{4}-${_h}{4}-${_h}{12}$"
   local re_model='^claude-[a-z0-9.-]+\[1m\]$'
   [[ "${1:-}" == "--dangerously-skip-permissions" ]] || return 1
   shift
@@ -14454,9 +14458,13 @@ cmd_storage() {
 # locale or a bracket-escape surprise. This is the single highest-value guard in
 # the feature: nothing is listed, renamed, trashed or restored whose basename
 # does not match it.
+# The characters are spelled out rather than ranged. A `case` glob uses the
+# CURRENT locale's collation, and under a UTF-8 one [0-9a-f] also matches the
+# uppercase letters, so an uppercase id was accepted as a session id and used
+# to build paths. macOS CI caught it. Same reasoning as _account_token_ok.
 _sessions_is_uuid() {
   case "$1" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
+    [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) return 0 ;;
     *) return 1 ;;
   esac
 }

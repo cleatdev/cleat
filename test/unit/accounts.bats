@@ -1552,7 +1552,9 @@ _acct_keys() {
   run _account_do_remove work 1
   assert_success
   [ ! -d "$CLEAT_ACCOUNTS_DIR/work" ]
-  run grep -rc "harvested" "$CLEAT_ACCOUNTS_DIR/.trash/"*"-work/.credentials.json"
+  # No -r: BSD grep prefixes each count with the file name when it recurses,
+  # so this read "path:1" on macOS and bare "1" on Linux. One file, one count.
+  run bash -c 'grep -c harvested "$1"/.trash/*-work/.credentials.json' _ "$CLEAT_ACCOUNTS_DIR"
   assert_output "1"
 }
 

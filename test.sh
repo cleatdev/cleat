@@ -163,6 +163,25 @@ fi
 summary+="  ${DIM}(${elapsed}s)${RESET}"
 echo -e "$summary"
 
+# A skipped test reads as green. Most skips here are tool-gated (`command -v jq
+# || skip` and friends), so a runner missing one silently drops coverage: jq
+# alone gates 52 tests. TEST_MAX_SKIPPED lets CI say how many skips a leg is
+# allowed, so losing a tool fails the job instead of passing quietly.
+if [[ -n "${TEST_MAX_SKIPPED:-}" ]]; then
+  case "$TEST_MAX_SKIPPED" in
+    ''|*[!0-9]*) echo "TEST_MAX_SKIPPED must be a number" >&2; exit 2 ;;
+  esac
+  if [[ "$total_skip" -gt "$TEST_MAX_SKIPPED" ]]; then
+    echo ""
+    echo -e "  ${RED}${total_skip} tests skipped, budget is ${TEST_MAX_SKIPPED}${RESET}"
+    echo -e "  ${DIM}A tool the suite gates on is probably missing on this runner.${RESET}"
+    for _tool in jq socat python3 perl curl script mkfifo; do
+      command -v "$_tool" >/dev/null 2>&1 || echo -e "    ${DIM}missing: ${_tool}${RESET}"
+    done
+    exit 1
+  fi
+fi
+
 if [[ "${#failed_files[@]}" -gt 0 ]]; then
   echo ""
   echo -e "  ${RED}Failed suites:${RESET}"

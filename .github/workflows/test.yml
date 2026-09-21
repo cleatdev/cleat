@@ -57,10 +57,16 @@ jobs:
         # branch of _clipboard_watcher is really executed; the macOS leg has
         # neither inotifywait nor fswatch and keeps covering the polling
         # fallback. Together the matrix exercises both watch paths.
-        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat jq
       - name: Bash version
         run: bash --version
       - name: Run full BATS suite
+        # TEST_MAX_SKIPPED: a skipped test reads as green, and most skips here
+        # are tool-gated (jq alone gates 52 of them). With every tool installed
+        # above, this leg must skip NOTHING, so losing a tool fails the job
+        # instead of quietly dropping coverage.
+        env:
+          TEST_MAX_SKIPPED: '0'
         run: |
           rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
@@ -80,10 +86,12 @@ jobs:
         with:
           submodules: recursive
       - name: Install inotify-tools (exercise the inotifywait watcher branch)
-        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat jq
       - name: Bash and coreutils versions
         run: bash --version | head -1; cp --version | head -1
       - name: Run full BATS suite
+        env:
+          TEST_MAX_SKIPPED: '0'
         run: |
           rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
@@ -158,10 +166,19 @@ jobs:
         run: |
           /bin/bash -c 'echo "BASH_VERSION=$BASH_VERSION"' | grep -E '^BASH_VERSION=3\.2\.' \
             || { echo "Expected /bin/bash to be 3.2.x"; exit 1; }
+      - name: Tools the suite gates on (a missing one SKIPS tests, which reads as green)
+        run: |
+          brew list socat >/dev/null 2>&1 || brew install socat
+          for t in jq socat python3 perl curl; do
+            command -v "$t" >/dev/null || { echo "missing $t on this runner"; exit 1; }
+          done
       - name: Run suite shard ${{ matrix.shard }}/4 via /bin/bash
         env:
           TEST_SHARD_TOTAL: '4'
           TEST_SHARD_INDEX: ${{ matrix.shard }}
+          # One skip is legitimate here and only here: inotifywait is Linux-only,
+          # and the macOS leg exists to cover the polling fallback instead.
+          TEST_MAX_SKIPPED: '1'
         run: |
           rc=0; /bin/bash ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
@@ -311,8 +328,10 @@ jobs:
       - name: Bash version and arch
         run: bash --version | head -1; uname -m
       - name: Install inotify-tools (exercise the inotifywait watcher branch)
-        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools socat jq
       - name: Run full BATS suite
+        env:
+          TEST_MAX_SKIPPED: '0'
         run: |
           rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"
@@ -386,8 +405,17 @@ jobs:
       # metadata-off, so the exec bit is unreliable there; invoking bash directly
       # sidesteps it. Log to a WSL-local path and cat at the end, mirroring the
       # file-redirect convention (RUNNER_TEMP is a Windows path in WSL, so /tmp).
+      - name: Tools the suite gates on (inside WSL2)
+        shell: wsl-bash {0}
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq socat inotify-tools
       - name: Run full BATS suite inside WSL2 (mock docker, no real daemon)
         shell: wsl-bash {0}
+        # TEST_MAX_SKIPPED=0: with the tools installed above, a skip here means
+        # this leg lost coverage rather than that WSL2 is different. Advisory
+        # either way, but the signal is worth reading.
+        env:
+          TEST_MAX_SKIPPED: '0'
         run: |
           cd "$(wslpath '${{ github.workspace }}')"
           rc=0; bash ./test.sh > /tmp/suite.log 2>&1 < /dev/null || rc=$?

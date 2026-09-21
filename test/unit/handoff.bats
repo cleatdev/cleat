@@ -1411,3 +1411,37 @@ hb_render_copy() {
   assert_line --index 1 "drain"
   assert_line --index 2 "ask"
 }
+
+@test "handoff: the verified-version notice reads as prose, not a raw list" {
+  # The constant is space-separated. Printed raw it read as one mangled version
+  # number the moment it held more than one entry, which is what a second
+  # verified Claude Code made it hold.
+  _HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274"
+  run _handoff_verified_phrase
+  assert_success
+  assert_output "2.1.270 and 2.1.274"
+
+  # One entry stays bare, three read as a list without a serial comma.
+  _HANDOFF_VERIFIED_CLAUDE="2.1.270"
+  run _handoff_verified_phrase
+  assert_output "2.1.270"
+  _HANDOFF_VERIFIED_CLAUDE="1.0.0 2.0.0 3.0.0"
+  run _handoff_verified_phrase
+  assert_output "1.0.0, 2.0.0 and 3.0.0"
+}
+
+@test "handoff: a box on a verified version gets no version notice" {
+  # Both entries count as verified, or the notice fires for everyone on the
+  # newer one.
+  _HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274"
+  local v
+  for v in 2.1.270 2.1.274; do
+    case " $_HANDOFF_VERIFIED_CLAUDE " in
+      *" $v "*) : ;;
+      *) printf 'version %s should be verified\n' "$v" >&2; return 1 ;;
+    esac
+  done
+  case " $_HANDOFF_VERIFIED_CLAUDE " in
+    *" 2.1.999 "*) printf 'an unverified version matched\n' >&2; return 1 ;;
+  esac
+}

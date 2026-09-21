@@ -9556,6 +9556,23 @@ _handoff_acct_phrase() {
 # is _EC_PINNED, set by the prepare this iteration, so it names the login the
 # relaunch really uses, never the ticket's target. No dialog hint: the reopen
 # suppresses the resume-from-summary dialog (_HANDOFF_RESUME_THRESHOLD_MIN).
+# The verified versions as prose. The constant is a space-separated list, and
+# printing it raw read as one mangled version number once it held more than
+# one. No serial comma, per the writing rules.
+_handoff_verified_phrase() {
+  local out="" v n=0
+  for v in $_HANDOFF_VERIFIED_CLAUDE; do n=$(( n + 1 )); done
+  local i=0
+  for v in $_HANDOFF_VERIFIED_CLAUDE; do
+    i=$(( i + 1 ))
+    if [[ $i -eq 1 ]]; then out="$v"
+    elif [[ $i -eq $n ]]; then out="${out} and ${v}"
+    else out="${out}, ${v}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
 _handoff_say_t1() {
   # Prints in the window before the relaunch exec, so it marks it too.
   _EC_SAID=1
@@ -16602,7 +16619,11 @@ _HANDOFF_READY_MAX_AGE_S=120      # the one ticket age bound
 _HANDOFF_CONFIRM_WAIT_S=20        # terminal 2's wait for the reopen to confirm
 _HANDOFF_OUT_MAX_BYTES=65536      # cap on the terminate exec's captured output
 _HANDOFF_STD_WINDOW_TOKENS=200000 # the standard context window
-_HANDOFF_VERIFIED_CLAUDE="2.1.270" # the Claude Code the handoff was checked against, space-separated
+# Every Claude Code the handoff has actually been driven end to end against,
+# space-separated. 2.1.270 is the lab verification (concept/44). 2.1.274 is the
+# maintainer's Mac on 2026-09-20: a full live switch of an idle session, the
+# conversation reopened and the identity followed.
+_HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274"
 _HANDOFF_COMPACT_BUFFER_TOKENS=13000 # auto-compact fires this far below the window
 # Claude Code's resume-from-summary dialog, on the handoff reopen only. It fires
 # when a flag is on, the last message is older than
@@ -19860,7 +19881,7 @@ _handoff_say_disclosure() {
     if [[ -n "$v" ]]; then
       case " $_HANDOFF_VERIFIED_CLAUDE " in
         *" $v "*) : ;;
-        *) echo -e "    ${DIM}cleat has checked this handoff with Claude Code ${_HANDOFF_VERIFIED_CLAUDE}. This box runs ${v}.${RESET}" ;;
+        *) echo -e "    ${DIM}cleat has checked this handoff with Claude Code $(_handoff_verified_phrase). This box runs ${v}.${RESET}" ;;
       esac
     fi
     i=$(( i + 1 ))

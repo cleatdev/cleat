@@ -11302,6 +11302,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v150_clock_probe_from_root" "the reset clock ignores a file named like the epoch" "$CLI" "$ACCOUNTS_BATS"
 
+# The verified-version list is prose in the notice. Printed raw it reads as one
+# mangled version number as soon as it holds more than one entry.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_verified_phrase()/,/^}$/{
+  s@^    elif \[\[ [$]i -eq [$]n \]\]; then out="[$]{out} and [$]{v}"$@    elif [[ $i -eq $n ]]; then out="${out} ${v}"@
+}
+SED
+try "v150_verified_versions_prose" "the verified-version notice reads as prose" "$CLI" "$HANDOFF_BATS"
+
 # A staged login the box did not last run on takes the cached identity with it.
 # Without the flag Claude shows the old account and sends its organisation.
 cat > "$SED_TMP" << 'SED'

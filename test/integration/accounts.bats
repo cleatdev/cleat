@@ -140,7 +140,11 @@ teardown() {
   run docker exec "$cname" runuser -u coder -- \
     env PATH="$INT_BOX_PATH" CLAUDE_SECURESTORAGE_CONFIG_DIR=/tmp/int-probe-store \
     claude auth status --json
-  assert_success
+  # No assert_success: `auth status` exits 1 when it reads signed out, which is
+  # exactly the state an empty relocated store creates, and newer Claude Code
+  # is stricter about that than the version this was written against. What the
+  # probe is for is the JSON below, not the exit code.
+  [ "$status" -le 1 ] || { echo "auth status died: rc=$status"; echo "$output"; return 1; }
   # Relocated: an empty store reads as signed out...
   assert_output --partial '"loggedIn": false'
   # ...while the conversations do NOT move, which is the requirement.
@@ -159,7 +163,11 @@ teardown() {
   run docker exec "$cname" runuser -u coder -- \
     env PATH="$INT_BOX_PATH" CLAUDE_SECURESTORAGE_CONFIG_DIR=/tmp/int-probe-empty \
     claude auth status --json
-  assert_success
+  # No assert_success: `auth status` exits 1 when it reads signed out, which is
+  # exactly the state an empty relocated store creates, and newer Claude Code
+  # is stricter about that than the version this was written against. What the
+  # probe is for is the JSON below, not the exit code.
+  [ "$status" -le 1 ] || { echo "auth status died: rc=$status"; echo "$output"; return 1; }
   run docker exec "$cname" sh -c 'ls -A /tmp/int-probe-empty 2>/dev/null | wc -l'
   assert_success
   assert_output "0"
@@ -177,6 +185,10 @@ teardown() {
   run docker exec "$cname" runuser -u coder -- \
     env PATH="$INT_BOX_PATH" CLAUDE_CONFIG_DIR=/tmp/int-cfg-probe \
     claude auth status --json
-  assert_success
+  # No assert_success: `auth status` exits 1 when it reads signed out, which is
+  # exactly the state an empty relocated store creates, and newer Claude Code
+  # is stricter about that than the version this was written against. What the
+  # probe is for is the JSON below, not the exit code.
+  [ "$status" -le 1 ] || { echo "auth status died: rc=$status"; echo "$output"; return 1; }
   assert_output --partial '/tmp/int-cfg-probe/projects'
 }

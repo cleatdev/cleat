@@ -222,7 +222,14 @@ exit "$_CLAUDE_RC"
 WRAP
 
   # A `claude` on PATH that records its own pid and exits 143 on SIGTERM.
-  docker exec -i "$cname" runuser -u coder -- bash -c 'cat > /home/coder/.local/bin/claude && chmod +x /home/coder/.local/bin/claude' <<'SHIM'
+  # Into a directory of its own, put AHEAD of the real one on PATH. It used to
+  # be written over /home/coder/.local/bin/claude, which is a symlink into the
+  # installed bundle: a newer image makes that target unwritable, so the write
+  # failed with "Permission denied" and the test could not run at all.
+  # Shadowing is also closer to the thing under test, since the wrapper
+  # resolves `claude` through PATH.
+  docker exec "$cname" runuser -u coder -- mkdir -p /workspace/.shim-bin
+  docker exec -i "$cname" runuser -u coder -- bash -c 'cat > /workspace/.shim-bin/claude && chmod +x /workspace/.shim-bin/claude' <<'SHIM'
 #!/usr/bin/env bash
 trap 'exit 143' TERM
 echo $$ > /workspace/.shim-pid
@@ -232,7 +239,7 @@ SHIM
   # Run the interactive exec under a host pty, in the background, so we can TERM
   # the shim and then read the exit code `script -e` propagated.
   cat > "$TEST_TEMP/run-wrapper.sh" <<EOF
-script -qec "docker exec -it -e PATH=$INT_BOX_PATH $cname runuser -u coder -- bash /workspace/.wrapper.sh --resume x" /dev/null
+script -qec "docker exec -it -e PATH=/workspace/.shim-bin:$INT_BOX_PATH $cname runuser -u coder -- bash /workspace/.wrapper.sh --resume x" /dev/null
 echo "WRAP_RC=\$?" > "$TEST_TEMP/wrap-rc"
 EOF
   bash "$TEST_TEMP/run-wrapper.sh" &

@@ -366,14 +366,17 @@ teardown() { hb_teardown_pids; _common_teardown; }
   hb_require_linux
   # leg A: a lock aged past the stale bound is reclaimed
   local lock="$BH/.claude/.oauth_refresh.lock"
-  mkdir -p "$lock"; touch -d "61 seconds ago" "$lock"
+  # Well past the bound, not one second past it: WSL2 mounts the checkout over
+  # drvfs, whose mtime granularity and clock are coarse enough that a 1-second
+  # margin decided this test rather than the code did.
+  mkdir -p "$lock"; touch -d "300 seconds ago" "$lock"
   hb_spawn_claude exits "$SID" "$EXECID" idle; local t1="$HB_PID" r1="$HB_RS"
   hb_proc_view "$PV"
   run hb_run_box terminate "$BH" "$PV" default 1 8 1 "$t1" "$r1" "$SID" "$EXECID" idle
   assert_success
   assert_line "lock	ok"
   # leg B: a lock younger than the bound is left alone
-  mkdir -p "$lock"; touch -d "59 seconds ago" "$lock"
+  mkdir -p "$lock"; touch -d "5 seconds ago" "$lock"
   hb_spawn_claude exits "$SID" "$EXECID" idle; local t2="$HB_PID" r2="$HB_RS"
   hb_proc_view "$PV"
   run hb_run_box terminate "$BH" "$PV" default 1 8 1 "$t2" "$r2" "$SID" "$EXECID" idle

@@ -88,6 +88,16 @@ teardown() {
   _common_teardown
 }
 
+# A host transcript so the sid resolves under the session key dir (4.2 row 6).
+# Write it BEFORE the box starts. Under rootless Docker the container's uid maps
+# to a subuid the host user cannot write as, so a directory the box created
+# first leaves this `mkdir -p` a silent no-op and the redirect denied.
+int_write_transcript() {
+  local key="$1"
+  mkdir -p "$HOME/.claude/projects/$key"
+  printf '{"type":"user","sessionId":"%s"}\n' "$INT_SID" > "$HOME/.claude/projects/$key/$INT_SID.jsonl"
+}
+
 # Leave nothing in the box that could be mistaken for a Claude session. The
 # probe judges what is RUNNING, so a stray fake or shim from an earlier test
 # makes the next switch refuse with "could not tell what the session is doing",
@@ -286,13 +296,14 @@ EOF
 
 @test "integration: a live switch stops a fake Claude in a real box and stages the new login on the host" {
   cd "$INT_PROJECT"
+  local cname key execid
+  key="$(cli_call _derive_project_session_key "$INT_PROJECT" main)"
+  int_write_transcript "$key"
   run "$CLI" run
   assert_success
-  local cname key execid
   cname="$(int_cname)"
   int_clean_box "$cname"
   execid="d00dfeed1234"
-  key="$(cli_call _derive_project_session_key "$INT_PROJECT" main)"
 
   # Two named accounts on the SAME grant (harvest absorbs, no network).
   write_cred "$XDG_CONFIG_HOME/cleat/accounts/a/.credentials.json" "acc-a-token" "shared-refresh"
@@ -304,10 +315,6 @@ EOF
   assert_success
   run cli_call _account_sync_in "$cname"
   assert_success
-
-  # A host transcript so the sid resolves under the session key dir (4.2 row 6).
-  mkdir -p "$HOME/.claude/projects/$key"
-  printf '{"type":"user","sessionId":"%s"}\n' "$INT_SID" > "$HOME/.claude/projects/$key/$INT_SID.jsonl"
 
   write_fake_claude "$cname"
   start_fake_claude "$cname" "$execid" "$INT_SID"
@@ -343,13 +350,14 @@ EOF
 
 @test "integration: a live switch moves a box from the shared login to a named account and back" {
   cd "$INT_PROJECT"
+  local cname key execid
+  key="$(cli_call _derive_project_session_key "$INT_PROJECT" main)"
+  int_write_transcript "$key"
   run "$CLI" run
   assert_success
-  local cname key execid
   cname="$(int_cname)"
   int_clean_box "$cname"
   execid="beadfeed5678"
-  key="$(cli_call _derive_project_session_key "$INT_PROJECT" main)"
 
   write_cred "$XDG_CONFIG_HOME/cleat/accounts/b/.credentials.json" "acc-b-ONLY" "b-refresh"
 
@@ -357,9 +365,6 @@ EOF
   # the DEFAULT store, so the fake Claude runs WITHOUT the named store dir.
   run cli_call _box_account_read "$cname"
   assert_output "default"
-
-  mkdir -p "$HOME/.claude/projects/$key"
-  printf '{"type":"user","sessionId":"%s"}\n' "$INT_SID" > "$HOME/.claude/projects/$key/$INT_SID.jsonl"
 
   write_fake_claude "$cname"
   # Shared-login session: no CLAUDE_SECURESTORAGE_CONFIG_DIR, so store=default.

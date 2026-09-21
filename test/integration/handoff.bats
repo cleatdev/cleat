@@ -88,6 +88,21 @@ teardown() {
   _common_teardown
 }
 
+# Leave nothing in the box that could be mistaken for a Claude session. The
+# probe judges what is RUNNING, so a stray fake or shim from an earlier test
+# makes the next switch refuse with "could not tell what the session is doing",
+# which is a true statement about a box the test did not mean to create.
+int_clean_box() {
+  local cname="$1"
+  docker exec "$cname" runuser -u coder -- bash -c '
+    [ -s /workspace/.shim-pid ] && kill -KILL "$(cat /workspace/.shim-pid)" 2>/dev/null
+    [ -s /workspace/.fake-pid ] && kill -KILL "$(cat /workspace/.fake-pid)" 2>/dev/null
+    pkill -KILL -f "fake-claude" 2>/dev/null
+    pkill -KILL -f "shim-bin/claude" 2>/dev/null
+    rm -rf /workspace/.shim-bin /workspace/.shim-pid /workspace/.wrapper.sh
+    exit 0' >/dev/null 2>&1 || true
+}
+
 # Print the self-contained in-box closure exactly as the shipped host renders it
 # (declare -p the stale bound, declare -f every _hb_* and its helpers, then the
 # entry call). If any listed name were unset the CLI would refuse and this fails.
@@ -256,6 +271,17 @@ EOF
   run cat "$TEST_TEMP/wrap-rc"
   assert_success
   assert_output --partial "WRAP_RC=143"
+
+  # Leave the box as this test found it. The shim is a process called `claude`
+  # that survives its own SIGTERM handler's race, and its pid file and PATH
+  # directory outlive the test, so the NEXT test's probe saw a second Claude in
+  # the box and refused the switch it was there to prove. This test could not
+  # leak before, because writing the shim failed outright.
+  docker exec "$cname" runuser -u coder -- bash -c '
+    [ -s /workspace/.shim-pid ] && kill -KILL "$(cat /workspace/.shim-pid)" 2>/dev/null
+    pkill -KILL -f "/workspace/.shim-bin/claude" 2>/dev/null
+    rm -rf /workspace/.shim-bin /workspace/.shim-pid /workspace/.wrapper.sh
+    exit 0' || true
 }
 
 @test "integration: a live switch stops a fake Claude in a real box and stages the new login on the host" {
@@ -264,6 +290,7 @@ EOF
   assert_success
   local cname key execid
   cname="$(int_cname)"
+  int_clean_box "$cname"
   execid="d00dfeed1234"
   key="$(cli_call _derive_project_session_key "$INT_PROJECT" main)"
 
@@ -320,6 +347,7 @@ EOF
   assert_success
   local cname key execid
   cname="$(int_cname)"
+  int_clean_box "$cname"
   execid="beadfeed5678"
   key="$(cli_call _derive_project_session_key "$INT_PROJECT" main)"
 

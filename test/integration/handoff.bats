@@ -88,6 +88,22 @@ teardown() {
   _common_teardown
 }
 
+# Let the box's user and the host user both write the directories this test
+# shares with the box. Under rootless Docker the two sides of a bind mount are
+# different uids (the box's `coder` lands on the host as a subuid, the host user
+# lands in the box as root), so whichever side creates a directory locks the
+# other out of it. The in-box handoff takes its credential lock by `mkdir` in
+# one of these, and the host writes the transcript in another. Directories only,
+# never the staged credential, whose mode test 3 asserts.
+int_share_dirs() {
+  local cname="$1" auth
+  chmod 0777 "$HOME/.claude" 2>/dev/null || true
+  chmod 0777 "$HOME/.claude/projects" 2>/dev/null || true
+  auth="$(cli_call _account_box_auth_dir "$cname")"
+  [ -n "$auth" ] && chmod 0777 "$auth" 2>/dev/null || true
+  return 0
+}
+
 # A host transcript so the sid resolves under the session key dir (4.2 row 6).
 # Write it BEFORE the box starts. Under rootless Docker the container's uid maps
 # to a subuid the host user cannot write as, so a directory the box created
@@ -311,6 +327,7 @@ SHIM
   assert_success
   cname="$(int_cname)"
   int_clean_box "$cname"
+  int_share_dirs "$cname"
   execid="d00dfeed1234"
 
   # Two named accounts on the SAME grant (harvest absorbs, no network).
@@ -365,6 +382,7 @@ SHIM
   assert_success
   cname="$(int_cname)"
   int_clean_box "$cname"
+  int_share_dirs "$cname"
   execid="beadfeed5678"
 
   write_cred "$XDG_CONFIG_HOME/cleat/accounts/b/.credentials.json" "acc-b-ONLY" "b-refresh"

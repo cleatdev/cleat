@@ -132,18 +132,32 @@ int_dump_lock_state() {
 }
 
 # The handoff takes Claude Code's own refresh lock by making a directory in the
-# box's credential store, so a box whose user cannot write that store can never
-# be switched. Prove the precondition from inside the box and say so, rather
-# than reading the refusal that follows as a handoff bug. Under rootless Docker
-# the box user lands on the host as a subuid, which is where this bites.
+# store the box's session is using, so a box whose user cannot write that store
+# can never be switched. Both stores matter here: a pinned box locks in
+# ~/.cleat-auth and a box on the shared login locks in ~/.claude, and the
+# switch back to the shared login still locks the named one it is leaving.
+#
+# This is where rootless Docker stops. The host user maps to uid 0 INSIDE the
+# box, so the per-box auth directory cleat creates as 0700 lands root-owned and
+# the box's `coder` cannot read or write it. That breaks more than the switch:
+# the box cannot read the credential staged for it either, so named accounts do
+# not work on rootless at all. Say that here rather than let it read as a
+# handoff bug, and do not chmod it away: a real rootless user hits the same wall
+# and a green test would be a lie.
 int_box_can_lock() {
   local cname="$1" out
   out="$(docker exec "$cname" runuser -u coder -- bash -c '
-    d=/home/coder/.claude/.cleat-locktest.$$
-    if mkdir "$d" 2>/dev/null; then rmdir "$d"; echo yes; else echo "no:$(id -u):$(stat -c "%u %a" /home/coder/.claude 2>/dev/null)"; fi' 2>/dev/null)"
+    for d in /home/coder/.claude /home/coder/.cleat-auth; do
+      p="$d/.cleat-locktest.$$"
+      if mkdir "$p" 2>/dev/null; then rmdir "$p"; else
+        echo "$d not writable by $(id -un) (uid $(id -u)), it is $(stat -c "%U:%G %a" "$d" 2>/dev/null) in the box"
+        exit 0
+      fi
+    done
+    echo ok' 2>/dev/null)"
   case "$out" in
-    yes) return 0 ;;
-    *) skip "the box user cannot write its credential store, so no switch can take the refresh lock here ($out)" ;;
+    ok) return 0 ;;
+    *) skip "the box user cannot write a credential store, so no switch can take the refresh lock here: $out" ;;
   esac
 }
 

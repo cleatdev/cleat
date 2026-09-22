@@ -168,7 +168,30 @@ hb_run_box() {
       i=$(( i + 5 ))
     done
   fi
+  hb_fixture_pids_ok "${2:-}"
   hb_run_box_raw "$@"
+}
+
+# Every entry in a fake /proc must be a number no live process can hold. The
+# probe skips $$ and $PPID on purpose (it is shipped to the box as text on argv
+# and used to match its own forks), so a fixture numbered like a real pid can
+# BE the probe's own pid and vanish from the scan. That is invisible: the test
+# reads as a missing line, not as a collision, and it only fires on a freshly
+# booted macOS runner where pids are still low. macOS caps pids at 99998 and
+# Linux's default pid_max is 4194304, so fixtures live above both.
+hb_fixture_pids_ok() {
+  local dir="$1" d pid
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  for d in "$dir"/[0-9]*; do
+    [ -e "$d" ] || continue
+    pid="${d##*/}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if [ "$pid" -le 4194304 ]; then
+      echo "hb_run_box: fixture pid $pid can collide with a live pid; use one above 4194304" >&2
+      return 1
+    fi
+  done
+  return 0
 }
 
 # ── host-state helpers (markers, tickets, the account lock) ──────────────────

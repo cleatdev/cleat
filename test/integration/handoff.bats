@@ -104,6 +104,33 @@ int_share_dirs() {
   return 0
 }
 
+# Say WHY a switch refused, from inside the box. The refusal text cannot: a
+# lock that is already there, a lock path that is not a directory and a lock
+# the box user cannot create all read as "still refreshing its login". Prints
+# only on failure, so a green run stays quiet.
+int_dump_lock_state() {
+  local cname="$1"
+  [ "$status" -eq 0 ] && return 0
+  {
+    echo "# handoff rc=$status, box-side state of the refresh lock:"
+    docker exec "$cname" runuser -u coder -- bash -c '
+      echo "id: $(id)"
+      for p in /home/coder/.claude /home/coder/.claude/.oauth_refresh.lock \
+               /home/coder/.cleat-auth /home/coder/.cleat-auth/.oauth_refresh.lock; do
+        printf "%s -> " "$p"; ls -ldn "$p" 2>&1 | head -1
+      done
+      if mkdir /home/coder/.claude/.lockprobe 2>&1; then
+        rmdir /home/coder/.claude/.lockprobe; echo "mkdir in .claude: ok"
+      fi
+      if mkdir /home/coder/.cleat-auth/.lockprobe 2>&1; then
+        rmdir /home/coder/.cleat-auth/.lockprobe; echo "mkdir in .cleat-auth: ok"
+      fi
+      echo "mounts:"; grep -E "/home/coder/[.](claude|cleat-auth)" /proc/self/mountinfo | head -5
+    ' 2>&1 | sed "s/^/#   /"
+  } >&3
+  return 0
+}
+
 # The handoff takes Claude Code's own refresh lock by making a directory in the
 # box's credential store, so a box whose user cannot write that store can never
 # be switched. Prove the precondition from inside the box and say so, rather
@@ -365,6 +392,7 @@ SHIM
 
   # The switch: assume_yes=1, now=0, against the real daemon.
   run cli_call _account_handoff b main "$cname" "$INT_PROJECT" 1 0
+  int_dump_lock_state "$cname"
   assert_success
 
   # The fake Claude took TERM.
@@ -419,6 +447,7 @@ SHIM
 
   # Shared -> named b.
   run cli_call _account_handoff b main "$cname" "$INT_PROJECT" 1 0
+  int_dump_lock_state "$cname"
   assert_success
   run cli_call _box_account_read "$cname"
   assert_output "b"
@@ -441,6 +470,7 @@ SHIM
   write_marker "$cname" "$execid"
 
   run cli_call _account_handoff default main "$cname" "$INT_PROJECT" 1 0
+  int_dump_lock_state "$cname"
   assert_success
   # The pin is gone (back on the shared login).
   run cli_call _box_account_read "$cname"

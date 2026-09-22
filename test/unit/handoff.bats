@@ -47,77 +47,77 @@ teardown() { hb_teardown_pids; _common_teardown; }
 # ── probe (portable, fake roots) ────────────────────────────────────────────
 
 @test "box probe reports a live session with its status exec id store and sid" {
-  hb_fake_proc "$PV" 4242 "claude --continue" 5551234 R \
+  hb_fake_proc "$PV" 7004242 "claude --continue" 5551234 R \
     "CLEAT_EXEC_ID=$EXECID" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$BH/.cleat-auth"
-  hb_session "$BH" 4242 idle procStart=5551234 sessionId="$SID"
+  hb_session "$BH" 7004242 idle procStart=5551234 sessionId="$SID"
   run hb_run_box probe "$BH" "$PV"
   assert_success
   assert_line "hb	1"
   assert_line "args	ok"
-  assert_output --partial "$(printf 'claude\t4242 5551234 idle none interactive %s named %s' "$EXECID" "$SID")"
+  assert_output --partial "$(printf 'claude\t7004242 5551234 idle none interactive %s named %s' "$EXECID" "$SID")"
   assert_line "end	ok"
 }
 
 @test "box probe ignores a session file whose process start time does not match" {
-  hb_fake_proc "$PV" 4242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
-  hb_session "$BH" 4242 idle procStart=9999999 sessionId="$SID"
+  hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
+  hb_session "$BH" 7004242 idle procStart=9999999 sessionId="$SID"
   run hb_run_box probe "$BH" "$PV"
   assert_success
   refute_output --partial "$(printf 'claude\t')"
-  assert_line "orphan	4242"
+  assert_line "orphan	7004242"
 }
 
 @test "box probe reports a Claude process with no session file as an orphan" {
-  hb_fake_proc "$PV" 700 "claude --continue" 111 R
-  hb_fake_proc "$PV" 701 "claude auth login" 222 R
+  hb_fake_proc "$PV" 7000700 "claude --continue" 111 R
+  hb_fake_proc "$PV" 7000701 "claude auth login" 222 R
   run hb_run_box probe "$BH" "$PV"
   assert_success
-  assert_line "orphan	700"
-  assert_line "orphan	701"
+  assert_line "orphan	7000700"
+  assert_line "orphan	7000701"
 }
 
 @test "box probe judges processes by executable and never by a claude word in the arguments" {
-  hb_fake_proc "$PV" 810 "rg claude" 1 R                                             # a ripgrep pattern
-  hb_fake_proc "$PV" 811 "node /home/coder/app/server.js" 1 R                        # a dev server
-  hb_fake_proc "$PV" 812 "/home/coder/.local/bin/cleat account" 1 R                  # the cleat wrapper
-  hb_fake_proc "$PV" 813 "/home/coder/.local/share/claude/versions/2.1.270 --continue" 1 R  # a real claude
+  hb_fake_proc "$PV" 7000810 "rg claude" 1 R                                             # a ripgrep pattern
+  hb_fake_proc "$PV" 7000811 "node /home/coder/app/server.js" 1 R                        # a dev server
+  hb_fake_proc "$PV" 7000812 "/home/coder/.local/bin/cleat account" 1 R                  # the cleat wrapper
+  hb_fake_proc "$PV" 7000813 "/home/coder/.local/share/claude/versions/2.1.270 --continue" 1 R  # a real claude
   run hb_run_box probe "$BH" "$PV"
   assert_success
-  assert_line "orphan	813"
-  refute_output --partial "orphan	810"
-  refute_output --partial "orphan	811"
-  refute_output --partial "orphan	812"
+  assert_line "orphan	7000813"
+  refute_output --partial "orphan	7000810"
+  refute_output --partial "orphan	7000811"
+  refute_output --partial "orphan	7000812"
 }
 
 @test "box probe reads an unreadable environment as unreadable and never as none" {
-  hb_fake_proc_env_dir "$PV" 4242 "claude" 5551234
-  hb_session "$BH" 4242 idle procStart=5551234 sessionId="$SID"
+  hb_fake_proc_env_dir "$PV" 7004242 "claude" 5551234
+  hb_session "$BH" 7004242 idle procStart=5551234 sessionId="$SID"
   run hb_run_box probe "$BH" "$PV"
   assert_success
-  assert_output --partial "$(printf 'claude\t4242 5551234 idle none interactive unreadable unreadable %s' "$SID")"
+  assert_output --partial "$(printf 'claude\t7004242 5551234 idle none interactive unreadable unreadable %s' "$SID")"
   refute_output --partial "interactive none"
 }
 
 @test "box probe reads two exec ids in one environment as many" {
-  hb_fake_proc "$PV" 4242 "claude" 5551234 R "CLEAT_EXEC_ID=aaaa1111bbbb" "CLEAT_EXEC_ID=cccc2222dddd"
-  hb_session "$BH" 4242 busy procStart=5551234 sessionId="$SID"
+  hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=aaaa1111bbbb" "CLEAT_EXEC_ID=cccc2222dddd"
+  hb_session "$BH" 7004242 busy procStart=5551234 sessionId="$SID"
   run hb_run_box probe "$BH" "$PV"
   assert_success
-  assert_output --partial "$(printf 'claude\t4242 5551234 busy none interactive many default %s' "$SID")"
+  assert_output --partial "$(printf 'claude\t7004242 5551234 busy none interactive many default %s' "$SID")"
 }
 
 @test "box probe maps an unknown status to unknown" {
-  hb_fake_proc "$PV" 4242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
-  hb_session "$BH" 4242 frobnicate procStart=5551234 sessionId="$SID"
+  hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
+  hb_session "$BH" 7004242 frobnicate procStart=5551234 sessionId="$SID"
   run hb_run_box probe "$BH" "$PV"
   assert_success
-  assert_output --partial "$(printf 'claude\t4242 5551234 unknown none interactive %s default %s' "$EXECID" "$SID")"
+  assert_output --partial "$(printf 'claude\t7004242 5551234 unknown none interactive %s default %s' "$EXECID" "$SID")"
 }
 
 @test "box probe reports a shell snapshot process under the exec id it inherited" {
-  hb_fake_snapshot_proc "$PV" 900 "CLEAT_EXEC_ID=eeee3333ffff"
-  hb_fake_snapshot_proc "$PV" 901       # unreadable leg: no environ entries
-  rm -f "$PV/901/environ"; mkdir -p "$PV/901/environ"
+  hb_fake_snapshot_proc "$PV" 7000900 "CLEAT_EXEC_ID=eeee3333ffff"
+  hb_fake_snapshot_proc "$PV" 7000901       # unreadable leg: no environ entries
+  rm -f "$PV/7000901/environ"; mkdir -p "$PV/7000901/environ"
   run hb_run_box probe "$BH" "$PV"
   assert_success
   assert_line "shell	eeee3333ffff"
@@ -130,19 +130,19 @@ teardown() { hb_teardown_pids; _common_teardown; }
   # reported a background shell on every run. Every live switch then refused
   # with "background shell commands running" on a box that had none, which made
   # the headline feature unusable. Found on a real Mac, 2026-09-20.
-  mkdir -p "$PV/930"
+  mkdir -p "$PV/7000930"
   local mid="" i
   for i in $(seq 1 18); do mid="$mid 0"; done
-  printf '%s (bash) R%s 90000 0 0 0\n' 930 "$mid" > "$PV/930/stat"
+  printf '%s (bash) R%s 90000 0 0 0\n' 7000930 "$mid" > "$PV/7000930/stat"
   # A word holding the bare name, the way the probe's own source does.
-  printf 'bash\0-c\0case "$w" in *shell-snapshots*) found=1 ;; esac\0' > "$PV/930/cmdline"
-  : > "$PV/930/environ"
+  printf 'bash\0-c\0case "$w" in *shell-snapshots*) found=1 ;; esac\0' > "$PV/7000930/cmdline"
+  : > "$PV/7000930/environ"
   run hb_run_box probe "$BH" "$PV"
   assert_success
   refute_output --partial "shell	"
 
   # A real tool shell, which sources the snapshot by path, is still reported.
-  hb_fake_snapshot_proc "$PV" 931 "CLEAT_EXEC_ID=aaaa1111bbbb"
+  hb_fake_snapshot_proc "$PV" 7000931 "CLEAT_EXEC_ID=aaaa1111bbbb"
   run hb_run_box probe "$BH" "$PV"
   assert_success
   assert_line "shell	aaaa1111bbbb"
@@ -161,10 +161,10 @@ teardown() { hb_teardown_pids; _common_teardown; }
 
   # A real tool shell is still reported. Its argv is its own, never a copy of
   # the scanning script's, which is what tells a fork apart from a tool shell.
-  mkdir -p "$PV/941"
-  printf '%s (bash) R%s 90000 0 0 0\n' 941 "$mid" > "$PV/941/stat"
-  printf 'bash\0--rcfile\0/home/coder/.claude/shell-snapshots/snapshot-bash-9-xyz.sh\0-c\0sleep 600\0' > "$PV/941/cmdline"
-  printf 'CLEAT_EXEC_ID=ffff5555aaaa\0' > "$PV/941/environ"
+  mkdir -p "$PV/7000941"
+  printf '%s (bash) R%s 90000 0 0 0\n' 7000941 "$mid" > "$PV/7000941/stat"
+  printf 'bash\0--rcfile\0/home/coder/.claude/shell-snapshots/snapshot-bash-9-xyz.sh\0-c\0sleep 600\0' > "$PV/7000941/cmdline"
+  printf 'CLEAT_EXEC_ID=ffff5555aaaa\0' > "$PV/7000941/environ"
   run _hb_scan "$BH" "$PV" ""
   assert_success
   assert_line "shell	ffff5555aaaa"
@@ -182,13 +182,13 @@ teardown() { hb_teardown_pids; _common_teardown; }
   local mid="" i
   for i in $(seq 1 18); do mid="$mid 0"; done
   # A sibling probe's bash, a different verb, and its runuser parent.
-  mkdir -p "$PV/961" "$PV/962"
-  printf '%s (bash) R%s 90000 0 0 0\n' 961 "$mid" > "$PV/961/stat"
-  printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0cleat-hb\0terminate\0/home/coder\0/proc\0' > "$PV/961/cmdline"
-  : > "$PV/961/environ"
-  printf '%s (bash) R%s 90000 0 0 0\n' 962 "$mid" > "$PV/962/stat"
-  printf 'runuser\0-u\0coder\0--\0bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0cleat-hb\0probe\0/home/coder\0/proc\0' > "$PV/962/cmdline"
-  : > "$PV/962/environ"
+  mkdir -p "$PV/7000961" "$PV/7000962"
+  printf '%s (bash) R%s 90000 0 0 0\n' 7000961 "$mid" > "$PV/7000961/stat"
+  printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0cleat-hb\0terminate\0/home/coder\0/proc\0' > "$PV/7000961/cmdline"
+  : > "$PV/7000961/environ"
+  printf '%s (bash) R%s 90000 0 0 0\n' 7000962 "$mid" > "$PV/7000962/stat"
+  printf 'runuser\0-u\0coder\0--\0bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0cleat-hb\0probe\0/home/coder\0/proc\0' > "$PV/7000962/cmdline"
+  : > "$PV/7000962/environ"
 
   run _hb_scan "$BH" "$PV" ""
   assert_success
@@ -196,10 +196,10 @@ teardown() { hb_teardown_pids; _common_teardown; }
   refute_output --partial "orphan	"
 
   # A real tool shell still is one.
-  mkdir -p "$PV/963"
-  printf '%s (bash) R%s 90000 0 0 0\n' 963 "$mid" > "$PV/963/stat"
-  printf 'bash\0--rcfile\0/home/coder/.claude/shell-snapshots/snapshot-bash-3-q.sh\0-c\0sleep 900\0' > "$PV/963/cmdline"
-  printf 'CLEAT_EXEC_ID=bbbb6666cccc\0' > "$PV/963/environ"
+  mkdir -p "$PV/7000963"
+  printf '%s (bash) R%s 90000 0 0 0\n' 7000963 "$mid" > "$PV/7000963/stat"
+  printf 'bash\0--rcfile\0/home/coder/.claude/shell-snapshots/snapshot-bash-3-q.sh\0-c\0sleep 900\0' > "$PV/7000963/cmdline"
+  printf 'CLEAT_EXEC_ID=bbbb6666cccc\0' > "$PV/7000963/environ"
   run _hb_scan "$BH" "$PV" ""
   assert_success
   assert_line "shell	bbbb6666cccc"
@@ -218,10 +218,10 @@ teardown() { hb_teardown_pids; _common_teardown; }
   printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0' > "$PV/$$/cmdline"
   : > "$PV/$$/environ"
   # The fork: another pid, byte-identical argv.
-  mkdir -p "$PV/951"
-  printf '%s (bash) R%s 90000 0 0 0\n' 951 "$mid" > "$PV/951/stat"
-  printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0' > "$PV/951/cmdline"
-  : > "$PV/951/environ"
+  mkdir -p "$PV/7000951"
+  printf '%s (bash) R%s 90000 0 0 0\n' 7000951 "$mid" > "$PV/7000951/stat"
+  printf 'bash\0-c\0case "$w" in */shell-snapshots/*) x=1 ;; esac\0' > "$PV/7000951/cmdline"
+  : > "$PV/7000951/environ"
 
   run _hb_scan "$BH" "$PV" ""
   assert_success
@@ -266,8 +266,8 @@ teardown() { hb_teardown_pids; _common_teardown; }
 
 @test "box script rendered by this bash runs under every other bash on the machine" {
   hb_render_box
-  hb_fake_proc "$PV" 4242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
-  hb_session "$BH" 4242 idle procStart=5551234 sessionId="$SID"
+  hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
+  hb_session "$BH" 7004242 idle procStart=5551234 sessionId="$SID"
   local seen="" b rp
   for b in /bin/bash "$(command -v bash)" /opt/homebrew/bin/bash /usr/local/bin/bash; do
     [ -x "$b" ] || continue
@@ -279,14 +279,14 @@ teardown() { hb_teardown_pids; _common_teardown; }
     assert_success
     assert_line "hb	1"
     assert_line "end	ok"
-    assert_output --partial "$(printf 'claude\t4242 5551234 idle')"
+    assert_output --partial "$(printf 'claude\t7004242 5551234 idle')"
   done
   [ -n "$seen" ] || skip "no bash binary found to test"
 }
 
 @test "box terminate refuses malformed arguments before it touches anything" {
   # non-UUID sid
-  run hb_run_box_raw terminate "$BH" "$PV" named 8 8 1 4242 5551234 NOTAUUID "$EXECID" idle
+  run hb_run_box_raw terminate "$BH" "$PV" named 8 8 1 7004242 5551234 NOTAUUID "$EXECID" idle
   assert_line "args	bad"; assert_line "end	abort"; refute_output --partial "lock"
   # pid 0 (would signal a process group)
   run hb_run_box_raw terminate "$BH" "$PV" named 8 8 1 0 5551234 "$SID" "$EXECID" idle
@@ -295,10 +295,10 @@ teardown() { hb_teardown_pids; _common_teardown; }
   run hb_run_box_raw terminate "$BH" "$PV" named 8 8 1 -1 5551234 "$SID" "$EXECID" idle
   assert_line "args	bad"; refute_output --partial "lock"
   # wrong count: N says 2, only one tuple
-  run hb_run_box_raw terminate "$BH" "$PV" named 8 8 2 4242 5551234 "$SID" "$EXECID" idle
+  run hb_run_box_raw terminate "$BH" "$PV" named 8 8 2 7004242 5551234 "$SID" "$EXECID" idle
   assert_line "args	bad"; refute_output --partial "lock"
   # unknown EXPECT
-  run hb_run_box_raw terminate "$BH" "$PV" named 8 8 1 4242 5551234 "$SID" "$EXECID" whenever
+  run hb_run_box_raw terminate "$BH" "$PV" named 8 8 1 7004242 5551234 "$SID" "$EXECID" whenever
   assert_line "args	bad"; refute_output --partial "lock"
 }
 
@@ -406,7 +406,7 @@ teardown() { hb_teardown_pids; _common_teardown; }
   # the session's own exec id sits beside it in the proc view.
   hb_spawn_claude exits "$SID" "$EXECID" busy; local t1="$HB_PID" r1="$HB_RS"
   hb_proc_view "$PV"
-  hb_fake_snapshot_proc "$PV" 900 "CLEAT_EXEC_ID=$EXECID"
+  hb_fake_snapshot_proc "$PV" 7000900 "CLEAT_EXEC_ID=$EXECID"
   # expect=now: the session's own shell line is exempt, so the recheck passes and
   # the busy target is stopped. This is the path the host classify opens with
   # --now (spec 4.2 row 9), unreachable until the classify reorder.
@@ -420,7 +420,7 @@ teardown() { hb_teardown_pids; _common_teardown; }
   local PV2="$TEST_TEMP/pv2"; mkdir -p "$PV2"
   hb_spawn_claude exits "$SID" "$EXECID" idle; local t2="$HB_PID" r2="$HB_RS"
   hb_proc_view "$PV2"
-  hb_fake_snapshot_proc "$PV2" 901 "CLEAT_EXEC_ID=$EXECID"
+  hb_fake_snapshot_proc "$PV2" 7000901 "CLEAT_EXEC_ID=$EXECID"
   run hb_run_box terminate "$BH" "$PV2" default 8 8 1 "$t2" "$r2" "$SID" "$EXECID" idle
   assert_success
   assert_line "recheck	changed"
@@ -737,11 +737,11 @@ t2_exec() {
 # t2_rec PID PS STATUS WAITING STORE [EXEC] [SID]: one claude probe record.
 t2_rec() {
   printf 'claude\t%s %s %s %s interactive %s %s %s' \
-    "${1:-4242}" "${2:-5551}" "${3:-idle}" "${4:-none}" "${6:-$EXECID}" "${5:-named}" "${7:-$SID}"
+    "${1:-7004242}" "${2:-5551}" "${3:-idle}" "${4:-none}" "${6:-$EXECID}" "${5:-named}" "${7:-$SID}"
 }
 
 # t2_term_ok [PID]: a clean terminate capture (one target exited).
-t2_term_ok() { printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t%s exited\nscan\tok\nend\tok\n' "${1:-4242}"; }
+t2_term_ok() { printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t%s exited\nscan\tok\nend\tok\n' "${1:-7004242}"; }
 
 t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$CN" old; }
 
@@ -749,7 +749,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff classify lets an idle relaunchable session go" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" ok
   assert_equal "$_HO_N" 1
@@ -758,7 +758,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff classify refuses a turn in flight and lets it go only with now" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 busy none named)"
+  t2_exec "$(t2_rec 7004242 5551 busy none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R1
   _handoff_probe "$CN"; _handoff_classify "$CN" 1 "$T2_PROJ" work
@@ -768,24 +768,24 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff classify refuses a permission prompt and a non permission question with its own reason" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 waiting permission-prompt named)"
+  t2_exec "$(t2_rec 7004242 5551 waiting permission-prompt named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R2p
-  t2_exec "$(t2_rec 4242 5551 waiting input-needed named)"
+  t2_exec "$(t2_rec 7004242 5551 waiting input-needed named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R2q
 }
 
 @test "handoff classify refuses background shell commands even with now" {
   t2_prep; t2_named_box
-  t2_exec "$(printf '%s\nshell\tcccc2222dddd' "$(t2_rec 4242 5551 idle none named)")"
+  t2_exec "$(printf '%s\nshell\tcccc2222dddd' "$(t2_rec 7004242 5551 idle none named)")"
   _handoff_probe "$CN"; _handoff_classify "$CN" 1 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R3
 }
 
 @test "handoff classify refuses a session with a shell status" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 shell none named)"
+  t2_exec "$(t2_rec 7004242 5551 shell none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 1 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R3
 }
@@ -794,7 +794,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   t2_prep; t2_named_box
   # A busy turn running a background command shows a shell line under the
   # session's own exec id, alongside the busy record.
-  t2_exec "$(printf '%s\nshell\t%s' "$(t2_rec 4242 5551 busy none named)" "$EXECID")"
+  t2_exec "$(printf '%s\nshell\t%s' "$(t2_rec 7004242 5551 busy none named)" "$EXECID")"
   # Without --now the busy turn refuses (offering --now), not the shell refusal.
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R1
@@ -804,7 +804,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   assert_equal "$_HO_VERDICT" ok
   assert_equal "${_HO_EXPECT[0]}" now
   # A shell line under a different exec id still refuses, even with --now.
-  t2_exec "$(printf '%s\nshell\tdddd4444eeee' "$(t2_rec 4242 5551 busy none named)")"
+  t2_exec "$(printf '%s\nshell\tdddd4444eeee' "$(t2_rec 7004242 5551 busy none named)")"
   _handoff_probe "$CN"; _handoff_classify "$CN" 1 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R3
 }
@@ -814,7 +814,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   # a session whose exec id has no live marker (marker pid is dead)
   rm -f "$CLEAT_RUN_DIR/$CN"/.attached.*
   hb_marker "$CN" "$(hb_dead_pid)" "kind=claude exec=$EXECID"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
   # a shell marker (kind=shell) is not a claude attach
@@ -826,21 +826,21 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff classify refuses an orphan Claude process" {
   t2_prep; t2_named_box
-  t2_exec "$(printf '%s\norphan\t700' "$(t2_rec 4242 5551 idle none named)")"
+  t2_exec "$(printf '%s\norphan\t7000700' "$(t2_rec 7004242 5551 idle none named)")"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
 }
 
 @test "handoff classify refuses two processes sharing an exec id" {
   t2_prep; t2_named_box
-  t2_exec "$(printf '%s\n%s' "$(t2_rec 4242 5551 idle none named)" "$(t2_rec 4243 5552 idle none named)")"
+  t2_exec "$(printf '%s\n%s' "$(t2_rec 7004242 5551 idle none named)" "$(t2_rec 7004243 5552 idle none named)")"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
 }
 
 @test "handoff classify refuses a store that does not match the pin" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none default)"
+  t2_exec "$(t2_rec 7004242 5551 idle none default)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
 }
@@ -848,14 +848,14 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 @test "handoff classify refuses a session id without a transcript in this project" {
   t2_prep; t2_named_box
   rm -f "$T2_SDIR/$SID.jsonl"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
 }
 
 @test "handoff classify refuses an unknown status and a failed probe" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 frobnicate none named)"
+  t2_exec "$(t2_rec 7004242 5551 frobnicate none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R5
 }
@@ -868,7 +868,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   # cannot prove it ran with 1M, and reopening in the standard window would
   # compact it, so R7.
   printf '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":40000,"cache_read_input_tokens":154990}}}\n' > "$T2_SDIR/$SID.jsonl"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R7
 }
@@ -878,7 +878,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   # 186999, one token below the floor (STD_WINDOW - COMPACT_BUFFER = 187000):
   # there is still room to compact, so the standard window is safe and no R7.
   printf '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":40000,"cache_read_input_tokens":146989}}}\n' > "$T2_SDIR/$SID.jsonl"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" ok
 }
@@ -887,7 +887,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   t2_prep; t2_named_box
   # Exactly 187000, the floor: at or above it the reopen could compact, so R7.
   printf '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":40000,"cache_read_input_tokens":146990}}}\n' > "$T2_SDIR/$SID.jsonl"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R7
 }
@@ -899,7 +899,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   printf '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":40000,"cache_read_input_tokens":159991}}}\n' > "$T2_SDIR/$SID.jsonl"
   run _resume_model_carry "$T2_SDIR/$SID.jsonl"
   assert_output "claude-opus-5[1m]"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" ok
 }
@@ -907,7 +907,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 @test "handoff classify never refuses on context size when the size cannot be read" {
   t2_prep; t2_named_box
   : > "$T2_SDIR/$SID.jsonl"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" ok
 }
@@ -915,7 +915,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 @test "handoff classify refuses a live handoff to an account with no working login" {
   t2_prep; _m2_mk_account old; _box_account_write "$CN" old
   # target 'work' does not exist
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R6
 }
@@ -923,7 +923,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 @test "handoff classify lets the weekly limit question through only when the transcript confirms a limit" {
   t2_prep; t2_named_box
   # dialog open but no rate-limit record: not the limit question, so refused
-  t2_exec "$(t2_rec 4242 5551 waiting dialog-open named)"
+  t2_exec "$(t2_rec 7004242 5551 waiting dialog-open named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R2q
   # the same dialog with a 429 as the last conversation record goes through
@@ -937,7 +937,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   t2_prep; t2_named_box
   # a second live marker with an exec id no probe record carries: row 8a
   hb_marker "$CN" "$$" "kind=claude exec=aaaa1111bbbb2222"
-  t2_exec "$(t2_rec 4242 5551 idle none named)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R22
 }
@@ -946,7 +946,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff disclosure states the loss and the prompt cache cost before it acts" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _is_interactive() { return 0; }
   _ask_yn() { printf -v "$1" '%s' 'y'; }
   run _account_handoff work main "$CN" "$T2_PROJ" 0 0
@@ -961,7 +961,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 @test "handoff disclosure names the permission mode a session was in" {
   t2_prep; t2_named_box
   printf '{"type":"permission-mode","permissionMode":"plan"}\n' > "$T2_SDIR/$SID.jsonl"
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _account_handoff work main "$CN" "$T2_PROJ" 1 0 >/dev/null 2>&1 || true
   # render the disclosure directly for the plan-mode line
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
@@ -972,7 +972,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 @test "handoff disclosure says at its usage limit for a weekly limit question" {
   t2_prep; t2_named_box
   printf '{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n' > "$T2_SDIR/$SID.jsonl"
-  t2_exec "$(t2_rec 4242 5551 waiting dialog-open named)"
+  t2_exec "$(t2_rec 7004242 5551 waiting dialog-open named)"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   _HO_NOW_FLAG=0
   run _handoff_say_disclosure main work
@@ -1014,7 +1014,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   # switch within the window was refused as still reopening.
   t2_prep; t2_named_box
   _handoff_ticket_write "$CN" "$EXECID" ready "$SID" old
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   run _account_handoff work main "$CN" "$T2_PROJ" 1 0
   refute_output --partial "still reopening"
   assert_success
@@ -1025,7 +1025,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   t2_prep; t2_named_box
   _handoff_ticket_write "$CN" "$EXECID" ready "$SID" old
   # The probe reports a different conversation: the ticket's is still reopening.
-  t2_exec "$(t2_rec 4242 5551 idle none named "$EXECID" "aaaaaaaa-1111-2222-3333-444455556666")" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named "$EXECID" "aaaaaaaa-1111-2222-3333-444455556666")" "$(t2_term_ok)"
   run _account_handoff work main "$CN" "$T2_PROJ" 1 0
   assert_failure
   assert_output --partial "still reopening a session from an earlier switch"
@@ -1035,7 +1035,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 @test "handoff writes requested tickets before the signalling exec and ready only after the pin moved" {
   t2_prep; t2_named_box
   T2_TICKET_AT_TERM=""
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _handoff_docker_exec() {
     local out="$3" verb="$4"
     case "$verb" in
@@ -1063,7 +1063,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff changes nothing and writes no ticket when the question is answered no" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _is_interactive() { return 0; }
   _ask_yn() { printf -v "$1" '%s' 'n'; }
   run _account_handoff work main "$CN" "$T2_PROJ" 0 0
@@ -1076,7 +1076,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff prints the cost lines before it acts" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _handoff_docker_exec() {
     local out="$3" verb="$4"
     case "$verb" in
@@ -1093,7 +1093,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff refuses without a terminal after the cost lines unless yes is given" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _is_interactive() { return 1; }
   run _account_handoff work main "$CN" "$T2_PROJ" 0 0
   assert_failure
@@ -1108,7 +1108,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff takes the account lock after the question and never before" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _is_interactive() { return 0; }
   _ask_yn() { printf -v "$1" '%s' 'n'; }
   run _account_handoff work main "$CN" "$T2_PROJ" 0 0
@@ -1119,7 +1119,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff changes nothing and writes no ticket when the account lock is busy" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _ACCOUNT_LOCK_WAIT_S=0
   hb_lock_plant "$(hb_lock_live_record)"
   run _account_handoff work main "$CN" "$T2_PROJ" 1 0
@@ -1131,7 +1131,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff refuses under the lock when the pin changed during the question" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _is_interactive() { return 0; }
   # the answer races a switch that repins the box before the lock is taken
   _ask_yn() { _box_account_write "$CN" other; printf -v "$1" '%s' 'y'; }
@@ -1148,7 +1148,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   # terminate exec, never stop the live session first.
   sleep 30 & local sp=$!
   hb_marker "$CN" "$sp" "kind=shell"
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   # record every box exec so the test can prove the terminate never ran
   local calls="$TEST_TEMP/exec_calls"; : > "$calls"
   _handoff_docker_exec() {
@@ -1177,9 +1177,9 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   sleep 30 & local p2=$!
   hb_marker "$CN" "$p2" "kind=claude exec=$EXEC2"
   local body; body="$(printf '%s\n%s' \
-    "$(t2_rec 4242 5551 idle none named "$EXECID" "$SID")" \
-    "$(t2_rec 4243 5552 idle none named "$EXEC2" "$SID2")")"
-  local term; term="$(printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t4242 exited\npid\t4243 alive\nend\tabort\n')"
+    "$(t2_rec 7004242 5551 idle none named "$EXECID" "$SID")" \
+    "$(t2_rec 7004243 5552 idle none named "$EXEC2" "$SID2")")"
+  local term; term="$(printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t7004242 exited\npid\t7004243 alive\nend\tabort\n')"
   t2_exec "$body" "$term"
   run _account_handoff work main "$CN" "$T2_PROJ" 1 0
   kill "$p2" 2>/dev/null || true
@@ -1200,7 +1200,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff never moves the pin when terminate did not end ok" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t4242 exited\nscan\tok\nend\tabort\n')"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t7004242 exited\nscan\tok\nend\tabort\n')"
   run _account_handoff work main "$CN" "$T2_PROJ" 1 0
   assert_failure
   run _box_account_read "$CN"; assert_output "old"
@@ -1209,7 +1209,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff stops writing when another command took the account lock over" {
   t2_prep; t2_named_box
-  T2_PROBE="$(printf 'hb\t1\nargs\tok\n%s\nend\tok\n' "$(t2_rec 4242 5551 idle none named)")"
+  T2_PROBE="$(printf 'hb\t1\nargs\tok\n%s\nend\tok\n' "$(t2_rec 7004242 5551 idle none named)")"
   T2_TERM="$(t2_term_ok)"
   _handoff_docker_exec() {
     local out="$3" verb="$4"
@@ -1227,7 +1227,7 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 @test "handoff records Ctrl-C from the lock through the exec" {
   t2_prep; t2_named_box
-  T2_PROBE="$(printf 'hb\t1\nargs\tok\n%s\nend\tok\n' "$(t2_rec 4242 5551 idle none named)")"
+  T2_PROBE="$(printf 'hb\t1\nargs\tok\n%s\nend\tok\n' "$(t2_rec 7004242 5551 idle none named)")"
   T2_TERM="$(t2_term_ok)"
   _handoff_docker_exec() {
     local out="$3" verb="$4"
@@ -1282,7 +1282,7 @@ SH
 
 @test "handoff writes the ready ticket before it captures meta" {
   t2_prep; t2_named_box
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   _account_capture_meta() {
     if [ -f "$CLEAT_RUN_DIR/$CN/.handoff.$EXECID" ] && grep -q 'state=ready' "$CLEAT_RUN_DIR/$CN/.handoff.$EXECID"; then
       printf 'ready\n' > "$TEST_TEMP/ready_at_meta"
@@ -1297,7 +1297,7 @@ SH
 @test "handoff reopens only the sessions that stopped" {
   t2_prep; t2_named_box
   # the one target died on its own before the signal: reported gone, not exited
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t4242 gone\nscan\tok\nend\tok\n')"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(printf 'hb\t1\nargs\tok\nlock\tok\nrecheck\tok\npid\t7004242 gone\nscan\tok\nend\tok\n')"
   run _account_handoff work main "$CN" "$T2_PROJ" 1 0
   assert_success
   assert_output --partial "is now on account work"
@@ -1307,7 +1307,7 @@ SH
 
 @test "handoff going to the shared login unpins the box and reopens on the shared login" {
   t2_prep; _m2_mk_account old; _box_account_write "$CN" old
-  t2_exec "$(t2_rec 4242 5551 idle none named)" "$(t2_term_ok)"
+  t2_exec "$(t2_rec 7004242 5551 idle none named)" "$(t2_term_ok)"
   run _account_handoff default main "$CN" "$T2_PROJ" 1 0
   assert_success
   assert_output --partial "is back on your shared login"
@@ -1386,7 +1386,7 @@ hb_render_copy() {
 @test "handoff classify refuses a non interactive session kind" {
   t2_prep; t2_named_box
   # a bg/daemon kind is not an interactive session cleat can reopen
-  t2_exec "$(printf 'claude\t4242 5551 idle none bg %s named %s' "$EXECID" "$SID")"
+  t2_exec "$(printf 'claude\t7004242 5551 idle none bg %s named %s' "$EXECID" "$SID")"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
 }

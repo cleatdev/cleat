@@ -88,21 +88,21 @@ teardown() {
   _common_teardown
 }
 
-# Let the box's user and the host user both write the directories this test
+# Let the box's user and the host user both write the Claude home this test
 # shares with the box. Under rootless Docker the two sides of a bind mount are
-# different uids (the box's `coder` lands on the host as a subuid, the host user
-# lands in the box as root), so whichever side creates a directory locks the
-# other out of it. The in-box handoff takes its credential lock by `mkdir` in
-# one of these, and the host writes the transcript in another. Directories only,
-# never the staged credential, whose mode test 3 asserts.
+# different uids, so whichever side creates a directory locks the other out of
+# it, and a box on the shared login takes its credential lock in here.
+# Directories only, never a credential.
 int_share_dirs() {
-  local cname="$1" auth
   chmod 0777 "$HOME/.claude" 2>/dev/null || true
   chmod 0777 "$HOME/.claude/projects" 2>/dev/null || true
-  auth="$(cli_call _account_box_auth_dir "$cname")"
-  [ -n "$auth" ] && chmod 0777 "$auth" 2>/dev/null || true
   return 0
 }
+
+# The per-box auth directory is deliberately NOT opened here. It is 0700 because
+# it holds credentials, cleat resets it to 0700 on every sync anyway, and
+# opening it made the precondition probe below read a directory the switch
+# would no longer be able to use by the time it ran.
 
 # Say WHY a switch refused, from inside the box. The refusal text cannot: a
 # lock that is already there, a lock path that is not a directory and a lock
@@ -384,7 +384,7 @@ SHIM
   assert_success
   cname="$(int_cname)"
   int_clean_box "$cname"
-  int_share_dirs "$cname"
+  int_share_dirs
   int_box_can_lock "$cname"
   execid="d00dfeed1234"
 
@@ -441,7 +441,7 @@ SHIM
   assert_success
   cname="$(int_cname)"
   int_clean_box "$cname"
-  int_share_dirs "$cname"
+  int_share_dirs
   int_box_can_lock "$cname"
   execid="beadfeed5678"
 

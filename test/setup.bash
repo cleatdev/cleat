@@ -58,6 +58,16 @@ _common_setup() {
   # the CLI always resolves under the sandboxed HOME.
   unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
 
+  # Pin the engine's uid mapping to identity, the way every non-namespaced
+  # daemon behaves. The CLI measures this once per engine by running a throwaway
+  # container, so without a planted answer every test that inspects `docker run`
+  # would also see the measurement's own run line, and what it measured would
+  # depend on whatever the stub happened to print. A test that cares about a
+  # namespaced engine overwrites this file with the mapping it wants.
+  mkdir -p "$HOME/.config/cleat/state"
+  printf '%s\t-\t%s\t%s %s\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
+    "$(id -u)" "$(id -u)" "$(id -g)" > "$HOME/.config/cleat/state/uidmap"
+
   # Git commits in some tests need an author identity. Inject via env vars
   # so we don't need a global .gitconfig (which would pollute the real host).
   export GIT_AUTHOR_NAME="Cleat Test"

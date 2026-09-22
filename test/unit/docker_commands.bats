@@ -1080,3 +1080,228 @@ EOF
   local sz; sz="$(wc -c < "$clip/.watcher-log" | tr -d '[:space:]')"
   [ "$sz" -lt 1048576 ] || { echo "cleat login never capped the watcher log: $sz bytes"; return 1; }
 }
+
+# ── the uid the host user IS inside a container ─────────────────────────────
+#
+# Cleat tells the box which uid to run as so the agent's files come back owned
+# by the person who started it. A user-namespaced engine (rootless Docker,
+# Docker Desktop for Linux) maps the host user to container uid 0 and the host's
+# subuids to 1, 2, 3..., so the host's own number picks a subuid there instead
+# of the user. These pin the measured answer being used, not the host's number.
+
+int_uidmap_write() {   # helper: plant a measured answer for this engine
+  mkdir -p "$CLEAT_CONFIG_DIR/state"
+  local ep; ep="$(_docker_context_endpoint)"
+  printf '%s\t%s\t%s\t%s\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
+    "${ep:--}" "$(id -u)" "$1" > "$CLEAT_CONFIG_DIR/state/uidmap"
+}
+
+@test "uid map: a namespaced engine gets the in-namespace identity, not the host's number" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  int_uidmap_write "0 0"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "HOST_UID=0"
+  assert_success
+  run assert_docker_run_has "$cname" "HOST_GID=0"
+  assert_success
+}
+
+@test "uid map: an identity engine still gets the host's own ids" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  int_uidmap_write "4242 4243"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "HOST_UID=4242"
+  assert_success
+  run assert_docker_run_has "$cname" "HOST_GID=4243"
+  assert_success
+}
+
+@test "uid map: a measurement for another host user is not trusted" {
+  # The cache line carries the engine and the uid it was measured for. A line
+  # from a different user (a shared machine, a su) must be re-measured, never
+  # applied, or one user's box would run as another's mapping.
+  # Well formed in every other way, so the uid field is the only thing that can
+  # reject it. A malformed line would fail for the wrong reason.
+  mkdir -p "$CLEAT_CONFIG_DIR/state"
+  printf '%s\t-\t999999\t0 0\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
+    > "$CLEAT_CONFIG_DIR/state/uidmap"
+  run _box_identity_cached
+  assert_failure
+}
+
+@test "uid map: with nothing measured it falls back to the host's own ids" {
+  rm -f "$CLEAT_CONFIG_DIR/state/uidmap"
+  run _box_uid
+  assert_success
+  assert_output "$(id -u)"
+  run _box_gid
+  assert_success
+  assert_output "$(id -g)"
+}
+
+@test "uid map: the remap wait is satisfied by the uid the box was told to use" {
+  # It compared the HOST's uid against the box's, which on a namespaced engine
+  # are the same number while the mapping is wrong: a false green that hid every
+  # rootless failure. The function returns 0 on every path (it is fail-open), so
+  # the behaviour to pin is WHEN it stops: it must accept the box reporting 0
+  # once, not poll its full 50 rounds waiting for a number that never comes.
+  int_uidmap_write "0 0"
+  mock_docker_inspect "HOST_UID=0"
+  # The box reports the uid it was told to use. Every poll answers 0.
+  local shim="$TEST_TEMP/exec-reports-zero.sh"
+  cat > "$shim" <<'SH'
+#!/usr/bin/env bash
+echo 0
+SH
+  chmod +x "$shim"
+  export DOCKER_STUB_EXEC_SCRIPT="$shim"
+  : > "$DOCKER_CALLS"
+  _wait_for_coder_remap "cleat-whatever"
+  local polls
+  polls="$(grep -c '^docker exec ' "$DOCKER_CALLS" || true)"
+  [ "$polls" -eq 1 ] || { echo "polled $polls times, expected 1"; return 1; }
+}
+
+@test "uid map: a box created under the old mapping is told to recreate" {
+  # Its uid is frozen in Config.Env and the config fingerprint ignores
+  # cleat-injected env, so nothing else would ever mention it. On a namespaced
+  # engine that box cannot edit the project or reach its account, and none of
+  # those symptoms name the cause.
+  int_uidmap_write "0 0"
+  mock_docker_inspect "HOST_UID=1001"   # what the box was told at create
+  local shim="$TEST_TEMP/exec-reports-old.sh"
+  cat > "$shim" <<'SH'
+#!/usr/bin/env bash
+echo 1001
+SH
+  chmod +x "$shim"
+  export DOCKER_STUB_EXEC_SCRIPT="$shim"
+  run _wait_for_coder_remap "cleat-whatever"
+  assert_success
+  assert_output --partial "runs as uid 1001"
+  assert_output --partial "cleat rm"
+}
+
+@test "uid map: a box on the right mapping says nothing" {
+  int_uidmap_write "0 0"
+  mock_docker_inspect "HOST_UID=0"      # created under the mapping now in force
+  local shim="$TEST_TEMP/exec-reports-right.sh"
+  cat > "$shim" <<'SH'
+#!/usr/bin/env bash
+echo 0
+SH
+  chmod +x "$shim"
+  export DOCKER_STUB_EXEC_SCRIPT="$shim"
+  run _wait_for_coder_remap "cleat-whatever"
+  assert_success
+  refute_output --partial "cleat rm"
+}
+
+@test "uid map: the measurement is taken from a container and cached" {
+  # The engine is asked what uid it shows for a directory the host user owns.
+  # One container, then never again: the answer is written where the source-time
+  # IS_SANDBOX decision can read it without touching the daemon.
+  rm -f "$CLEAT_CONFIG_DIR/state/uidmap"
+  image_exists() { return 0; }
+  docker() { case "$1" in run) echo "0 0" ;; *) return 0 ;; esac; }
+  run _box_identity_probe
+  assert_success
+  assert_output "0 0"
+  run _box_identity_cached
+  assert_success
+  assert_output "0 0"
+}
+
+@test "uid map: an unreadable measurement is refused, not guessed at" {
+  # A garbled answer must never become a uid. Anything but two numbers falls
+  # back to the host's own ids, which is what every non-namespaced engine wants.
+  rm -f "$CLEAT_CONFIG_DIR/state/uidmap"
+  image_exists() { return 0; }
+  docker() { case "$1" in run) echo "Cannot connect to the Docker daemon" ;; *) return 0 ;; esac; }
+  run _box_identity_probe
+  assert_failure
+  [ ! -f "$CLEAT_CONFIG_DIR/state/uidmap" ] || { echo "cached a garbled measurement"; return 1; }
+  run _box_uid
+  assert_success
+  assert_output "$(id -u)"
+}
+
+@test "uid map: a box on the wrong mapping is not polled for five seconds first" {
+  # Its uid is frozen at create and the entrypoint re-reads that same value on
+  # every restart, so no number of polls can converge. Waiting anyway put a five
+  # second stall at the front of every session before saying anything.
+  int_uidmap_write "0 0"
+  mock_docker_inspect "HOST_UID=1001"
+  local shim="$TEST_TEMP/exec-never-converges.sh"
+  cat > "$shim" <<'SH'
+#!/usr/bin/env bash
+echo 1001
+SH
+  chmod +x "$shim"
+  export DOCKER_STUB_EXEC_SCRIPT="$shim"
+  : > "$DOCKER_CALLS"
+  run _wait_for_coder_remap "cleat-whatever"
+  assert_success
+  local polls
+  polls="$(grep -c '^docker exec ' "$DOCKER_CALLS" || true)"
+  [ "$polls" -eq 0 ] || { echo "polled $polls times, expected none"; return 1; }
+  assert_output --partial "cleat rm"
+}
+
+@test "uid map: DOCKER_HOST decides the key, the way docker itself resolves it" {
+  # Docker reads DOCKER_HOST first and the context second. Filing a measurement
+  # the other way round names it after something that did not choose the daemon,
+  # so a measurement taken against one engine gets applied to another.
+  export DOCKER_HOST="unix:///run/user/1001/docker.sock"
+  export DOCKER_CONTEXT="desktop-linux"
+  run _uid_map_key
+  assert_success
+  assert_output "unix:///run/user/1001/docker.sock"
+}
+
+@test "uid map: a measurement taken against another daemon is re-measured" {
+  # Same key, repointed endpoint: the number was true of a different engine.
+  mkdir -p "$CLEAT_CONFIG_DIR/state"
+  printf '%s\t%s\t%s\t%s\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
+    "unix:///somewhere/else.sock" "$(id -u)" "0 0" > "$CLEAT_CONFIG_DIR/state/uidmap"
+  image_exists() { return 0; }
+  docker() { case "$1" in run) echo "4242 4243" ;; *) return 0 ;; esac; }
+  run _box_identity
+  assert_success
+  assert_output "4242 4243"
+}
+
+@test "uid map: a corrupt measurement is refused rather than handed to the box" {
+  # A half-written or hand-edited line must never become a HOST_UID: that is the
+  # exact failure this code exists to prevent.
+  mkdir -p "$CLEAT_CONFIG_DIR/state"
+  local key; key="${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}"
+  printf '%s\t-\t%s\t%s\n' "$key" "$(id -u)" "notanumber 0" > "$CLEAT_CONFIG_DIR/state/uidmap"
+  run _box_identity_cached
+  assert_failure
+  printf '%s\t-\t%s\t%s\n' "$key" "$(id -u)" "4242" > "$CLEAT_CONFIG_DIR/state/uidmap"
+  run _box_identity_cached
+  assert_failure
+}
+
+@test "uid map: the measurement never puts the credential store in a container" {
+  # $CLEAT_CONFIG_DIR holds the account credential store. Learning a number is
+  # no reason to mount it anywhere, so the probe binds a dedicated empty dir.
+  rm -f "$CLEAT_CONFIG_DIR/state/uidmap"
+  mock_docker_images "cleat"
+  : > "$DOCKER_CALLS"
+  _box_identity_probe || true
+  local line
+  line="$(grep '^docker run' "$DOCKER_CALLS" | grep 'cleat-uidmap' | head -1)"
+  [ -n "$line" ] || { echo "no probe run recorded"; return 1; }
+  [[ "$line" == *"state/uidprobe:/cleat-uidmap:ro"* ]] || { echo "probe did not bind its own dir: $line"; return 1; }
+  [[ "$line" != *"$CLEAT_CONFIG_DIR:/cleat-uidmap"* ]] || { echo "probe mounted the config root"; return 1; }
+}

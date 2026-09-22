@@ -3522,9 +3522,90 @@ try "v1.2.0_root_is_sandbox_value" "root host rides IS_SANDBOX"
 # v1.2.0 ROOT HOST scope: invert the uid gate so non-root hosts get the flag
 # and root hosts lose it. Both halves of the regression test fail.
 cat > "$SED_TMP" << 'SED'
-s|"$(id -u)" == "0" ]]; then|"$(id -u)" != "0" ]]; then|
+s|\[\[ "$(id -u)" == "0" \]\]|[[ "$(id -u)" != "0" ]]|
 SED
 try "v1.2.0_root_is_sandbox_gate" "root host rides IS_SANDBOX"
+
+# v1.5.1 NAMESPACED ENGINE: the box identity must be the uid the host user IS
+# inside a container, not the host's own number. Revert it at the create site:
+# a measured mapping of 0 stops reaching the box and the agent runs as a subuid
+# that owns nothing, which is the whole rootless breakage.
+cat > "$SED_TMP" << 'SED'
+s|-e "HOST_UID=$_bx_uid"|-e "HOST_UID=$(id -u)"|
+SED
+try "v1.5.1_box_identity_uid" "namespaced engine gets the in-namespace identity" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s|-e "HOST_GID=$_bx_gid"|-e "HOST_GID=$(id -g)"|
+SED
+try "v1.5.1_box_identity_gid" "namespaced engine gets the in-namespace identity" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 CACHE SCOPE: a measurement carries the engine and the host uid it was
+# taken for. Trust any line regardless of who measured it and one user's box
+# runs as another user's mapping.
+cat > "$SED_TMP" << 'SED'
+s@  \[ "$h" = "$(id -u)" \] || return 1@  :@
+SED
+try "v1.5.1_box_identity_cache_scope" "measurement for another host user is not trusted" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 FALSE GREEN: the remap wait must compare the uid the box was TOLD to
+# use. Comparing the host's own number matches while the mapping is wrong,
+# which is what hid every rootless failure.
+cat > "$SED_TMP" << 'SED'
+s|  want="$(_box_uid)"|  want="$(id -u)"|
+SED
+try "v1.5.1_remap_wait_compares_box_uid" "remap wait is satisfied" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 IS_SANDBOX on a namespaced engine: drop the second disjunct and every
+# session on such an engine dies at launch, because claude refuses
+# --dangerously-skip-permissions under uid 0. NOTE the bare `||` below: in BRE
+# a backslashed pipe is GNU alternation, so escaping it matches a single space
+# and rewrites half the file instead.
+cat > "$SED_TMP" << 'SED'
+s@ || \[\[ "$(_box_uid_cached_only 2>/dev/null)" == "0" \]\]@@
+SED
+try "v1.5.1_is_sandbox_namespaced" "box that will run as uid 0 rides IS_SANDBOX"
+
+# v1.5.1 STALE BOX: a box created before the mapping was measured must be named
+# and told to recreate. Silence it and the user chases unrelated symptoms.
+cat > "$SED_TMP" << 'SED'
+s|  if \[ -n "$got" \] && \[ "$got" != "$want" \]; then|  if false; then|
+SED
+try "v1.5.1_stale_box_advisory" "box created under the old mapping is told to recreate" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 CACHE KEY: docker resolves DOCKER_HOST before the context. Reading them
+# the other way files a measurement under a name that did not choose the daemon.
+cat > "$SED_TMP" << 'SED'
+s|"${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}"|"${DOCKER_CONTEXT:-${DOCKER_HOST:-default}}"|
+SED
+try "v1.5.1_uid_map_key_precedence" "DOCKER_HOST decides the key" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 ENDPOINT: a number measured against one daemon must not be applied to
+# another that happens to share the key.
+cat > "$SED_TMP" << 'SED'
+s|\[ "$(_box_identity_cached_endpoint)" != "$(_uid_map_endpoint_field)" \]|false|
+SED
+try "v1.5.1_uid_map_endpoint_revalidated" "measurement taken against another daemon" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 CACHE VALIDATION: a corrupt line must re-measure, never become a uid.
+cat > "$SED_TMP" << 'SED'
+s|  case "$u" in ''\|\*\[!0123456789\]\*) return 1 ;; esac|  :|
+SED
+try "v1.5.1_uid_map_cache_validated" "corrupt measurement is refused" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 PROBE SCOPE: the credential store must never be mounted into a
+# container just to learn a number.
+cat > "$SED_TMP" << 'SED'
+s|-v "$probe:/cleat-uidmap:ro"|-v "$CLEAT_CONFIG_DIR:/cleat-uidmap:ro"|
+SED
+try "v1.5.1_uid_probe_scope" "never puts the credential store in a container" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# v1.5.1 DOOMED POLL: a box whose frozen uid can never converge must not cost
+# five seconds at the front of every session.
+cat > "$SED_TMP" << 'SED'
+s|  if \[ -n "$told" \] && \[ "$told" != "$want" \]; then|  if false; then|
+SED
+try "v1.5.1_remap_skips_doomed_poll" "not polled for five seconds first" "$CLI" "$DOCKER_COMMANDS_BATS"
 
 # ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
 # Collapse the predicate to always-VM (flip the host-local fall-through return):

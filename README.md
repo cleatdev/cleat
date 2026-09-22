@@ -1155,6 +1155,16 @@ On any engine other than Docker Desktop, Cleat adds `--add-host host.docker.inte
 
 ---
 
+## Which uid the box runs as
+
+Cleat maps the box user to your host UID, so files the agent writes come back owned by you. That holds because your uid usually means the same number inside a container as outside it.
+
+A **user-namespaced engine** breaks that assumption. Rootless Docker maps you to container uid 0 and your subordinate uids to container 1, 2, 3, so your own number lands on a subuid that owns nothing. Docker Desktop for Linux remaps the same way without calling itself rootless. Since v1.5.1 Cleat measures the mapping once per engine. It mounts a directory you own into a throwaway container, reads back the uid that container sees and caches the answer in `~/.config/cleat/state/uidmap`. On every engine that does not remap, the measurement is your own uid and nothing changes.
+
+A box created on a namespaced engine before v1.5.1 keeps the old number frozen in its container config. It now says so at session start and names the fix: `cleat rm`, then start it again.
+
+---
+
 ## Auto-upgrade notifications
 
 Cleat checks for new release tags at most once every 10 minutes via `git ls-remote --tags` (a lightweight network call that fetches no objects). When a newer version is available, you'll see a notice before Claude Code launches:

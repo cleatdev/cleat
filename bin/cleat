@@ -995,6 +995,161 @@ _is_docker_desktop() {
   [[ "$os" == *"Docker Desktop"* ]]
 }
 
+# ── Which uid the host user IS inside a container ────────────────────────────
+#
+# Cleat hands the box `HOST_UID` and the entrypoint remaps `coder` onto it, so
+# that files the agent writes come back owned by the person who started it. That
+# assumes the host's uid means the same number inside the container. On a
+# user-namespaced engine it does not: ROOTLESS Docker maps the host user to
+# container uid 0 and the host's subordinate uids (100000+) to container 1, 2,
+# 3..., so passing the host's own number picks a subuid instead of the user.
+# Measured in a real rootless box: the per-box credential mount reads
+# `drwx------ 0 0` while `coder` is 1001, and a directory the box created under
+# the shared ~/.claude was not writable by the host user afterwards.
+#
+# What that costs on rootless is not one feature: /workspace is chowned
+# non-recursively, so the agent can create files at the repo root and edit
+# nothing that was already there, while the host loses its own repo root to a
+# subuid. `chown -R` on the shared ~/.claude walks the user's REAL Claude home
+# and takes .credentials.json with it. The per-box auth dir, the clipboard
+# bridge, the hooks log, ~/.ssh and ~/.config/gh are never chowned at all, so
+# accounts, clipboard, image paste, hooks, ssh, gh and the OAuth browser
+# forward are all dead, the last one SILENTLY (open-bridge discards the write
+# error and exits 0, so a login simply never opens).
+#
+# The fix is to pass the host user's IN-NAMESPACE identity. Under rootless that
+# is 0, and every one of those couplings lines up at once with no mode widened
+# and nothing chowned that belongs to the user.
+#
+# This MEASURES the mapping instead of naming the engine, because both readings
+# of the engine name are wrong. Docker Desktop for Linux does the same remap and
+# is not rootless (its own docs: "maps the current user ID and GID to 0 in the
+# containers"), so a rootless check misses it. Colima, Lima or Rancher Desktop
+# on a Linux host answer `name=rootless` for a daemon inside a VM whose share
+# layer remaps separately, so the same check over-fires there. Measured on
+# Docker Desktop for macOS, host 501:20 reads as 501 20 inside: identity, which
+# is the engine nearly every user is on and it is untouched by this.
+_uid_map_cache_file() { printf '%s' "$CLEAT_CONFIG_DIR/state/uidmap"; }
+
+# The key a measurement is filed under. Docker's OWN precedence is DOCKER_HOST
+# first, then the context, so reading them the other way round files a
+# measurement under a name that does not decide which daemon was asked. Kept in
+# one helper because two call sites reading it differently is how a cache gets
+# applied to the wrong engine.
+_uid_map_key() { printf '%s' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}"; }
+
+# The endpoint field, never empty. `read` splits on a WHITESPACE IFS by runs, so
+# two tabs in a row are one delimiter and an empty field would shift every field
+# after it: the uid would be read out of the wrong column.
+_uid_map_endpoint_field() { printf '%s' "${_UID_MAP_ENDPOINT:--}"; }
+
+# The cached answer, or nothing. A PURE FILE READ: no daemon call and no
+# subprocess beyond `id`, so this is safe at source time and on any path that
+# must not touch docker. Keyed on the engine the measurement was filed under and
+# the host uid it was taken for, so another user re-measures instead of trusting
+# a number that was never about them.
+#
+# It deliberately does NOT check the recorded endpoint. That check needs a
+# docker call, and this reader runs at source time where the IS_SANDBOX decision
+# is made for `cleat resume` and `cleat start`, which create no container and so
+# get no chance to top it up later. Endpoint validation belongs to _box_identity,
+# which is only reached from paths that already talk to the daemon. The endpoint
+# read here is left where that caller can see it.
+_box_identity_cached() {
+  local f k e h rest u g
+  f="$(_uid_map_cache_file)"
+  [ -r "$f" ] || return 1
+  IFS="$(printf '\t')" read -r k e h rest < "$f" 2>/dev/null || return 1
+  [ "$k" = "$(_uid_map_key)" ] || return 1
+  [ "$h" = "$(id -u)" ] || return 1
+  # Validate what was read. A truncated, hand-edited or half-written line must
+  # re-measure, never become a uid: passing garbage here would hand the box a
+  # HOST_UID nothing owns, which is the exact failure this code exists to stop.
+  u="${rest%% *}"; g="${rest##* }"
+  [ "$u" != "$rest" ] || return 1
+  case "$u" in ''|*[!0123456789]*) return 1 ;; esac
+  case "$g" in ''|*[!0123456789]*) return 1 ;; esac
+  printf '%s %s' "$u" "$g"
+}
+
+# The endpoint a cached measurement was taken against, or nothing. Pure read,
+# separate from the value because the value is consumed in a command
+# substitution and a variable set in there cannot reach the caller.
+_box_identity_cached_endpoint() {
+  local f k e h rest
+  f="$(_uid_map_cache_file)"
+  [ -r "$f" ] || return 1
+  IFS="$(printf '\t')" read -r k e h rest < "$f" 2>/dev/null || return 1
+  printf '%s' "$e"
+}
+
+# Measure it: mount a directory the host user owns and ask the container what
+# uid it sees. One `docker run` per engine, cached, never repeated once there is
+# an answer. Falls back to the host's own ids whenever it cannot measure (no
+# image yet, daemon down, a stub), which is exactly the previous behaviour.
+_box_identity_probe() {
+  local out uid gid f probe
+  image_exists 2>/dev/null || return 1
+  # A dedicated empty directory, NOT the config root: that root holds the
+  # account credential store, and there is no reason to put it inside a
+  # container to learn a number. Created first, because a bind mount whose
+  # source is missing makes the engine materialise a directory on the host.
+  probe="$CLEAT_CONFIG_DIR/state/uidprobe"
+  mkdir -p "$probe" 2>/dev/null || true
+  [ -d "$probe" ] || return 1
+  # Measure a FILE in it, not the mount point. What a mount point reports can
+  # come from the mount layer rather than from the host inode underneath, so
+  # the directory itself is the one thing in there whose ownership may be
+  # synthesized. A file also proves the bind carried real content through.
+  : > "$probe/marker" 2>/dev/null || return 1
+  out="$(docker run --rm --entrypoint stat \
+    -v "$probe:/cleat-uidmap:ro" "$IMAGE_NAME" \
+    -c '%u %g' /cleat-uidmap/marker 2>/dev/null)" || return 1
+  out="${out%%$'\n'*}"
+  uid="${out%% *}"; gid="${out##* }"
+  [ "$uid" != "$out" ] || return 1
+  case "$uid" in ''|*[!0123456789]*) return 1 ;; esac
+  case "$gid" in ''|*[!0123456789]*) return 1 ;; esac
+  f="$(_uid_map_cache_file)"
+  mkdir -p "${f%/*}" 2>/dev/null || true
+  # stderr BEFORE the target, or bash's own "cannot create" goes to the
+  # terminal in the middle of a launch.
+  printf '%s\t%s\t%s\t%s %s\n' "$(_uid_map_key)" "$(_uid_map_endpoint_field)" \
+    "$(id -u)" "$uid" "$gid" 2>/dev/null > "$f" || true
+  printf '%s %s' "$uid" "$gid"
+}
+
+# "UID GID" to hand the box. Cached, else measured, else the host's own. Memoed
+# for the process: the create path asks for the uid and the gid separately, and
+# a cache that cannot be written would otherwise re-measure for each.
+_box_identity() {
+  local v
+  [ -n "${_BOX_IDENTITY_MEMO:-}" ] && { printf '%s' "$_BOX_IDENTITY_MEMO"; return 0; }
+  # Resolve the endpoint once per process, on the daemon-touching path only, so
+  # the key says WHICH daemon answered rather than only which env var was set.
+  [ -n "${_UID_MAP_ENDPOINT+x}" ] || _UID_MAP_ENDPOINT="$(_docker_context_endpoint)"
+  v="$(_box_identity_cached)"
+  # Same key, different daemon: a context that was repointed, or a DOCKER_HOST
+  # that resolves elsewhere now. The number was measured against the old one, so
+  # re-measure rather than hand the box a mapping from a different engine.
+  if [ -n "$v" ] && [ "$(_box_identity_cached_endpoint)" != "$(_uid_map_endpoint_field)" ]; then
+    v=""
+  fi
+  [ -n "$v" ] || v="$(_box_identity_probe)" || v="$(id -u) $(id -g)"
+  _BOX_IDENTITY_MEMO="$v"
+  printf '%s' "$v"
+}
+
+_box_uid() { local v; v="$(_box_identity)"; printf '%s' "${v%% *}"; }
+_box_gid() { local v; v="$(_box_identity)"; printf '%s' "${v##* }"; }
+
+# The cached uid only, for the source-time IS_SANDBOX decision below. Never
+# probes and never resolves the endpoint, so sourcing the CLI still costs no
+# docker call. An endpoint-keyed line simply will not match here, which fails
+# toward "no IS_SANDBOX" and is then topped up at create where the real
+# measurement happens.
+_box_uid_cached_only() { local v; v="$(_box_identity_cached)" || return 1; printf '%s' "${v%% *}"; }
+
 # True on macOS. macOS keeps Claude Code's OAuth login in the login Keychain,
 # not in ~/.claude/.credentials.json, so the shared ~/.claude mount carries no
 # token and a freshly-auth'd host still re-prompts inside the box. The seed
@@ -6020,9 +6175,25 @@ CLAUDE_ENV+=(-e "BROWSER=/usr/local/bin/open-bridge")
 # case, a sandboxed container (Anthropic's reference devcontainer sets it).
 # Scoped to a root host so ordinary boxes keep an unchanged env, and injected
 # at exec (not create) so existing root boxes heal on their next session.
-if [[ "$(id -u)" == "0" ]]; then
+# A user-namespaced engine reaches the same place by a different road: there the
+# host user IS container uid 0, so the remapped `coder` is uid 0 too and Claude
+# refuses in exactly the same way. Read from the cache only, so sourcing the CLI
+# still costs no docker call; a first ever run tops this up at create, where the
+# measurement happens (_claude_env_sandbox_topup).
+if [[ "$(id -u)" == "0" ]] || [[ "$(_box_uid_cached_only 2>/dev/null)" == "0" ]]; then
   CLAUDE_ENV+=(-e "IS_SANDBOX=1")
 fi
+
+# Add IS_SANDBOX once the box uid is known, if the source-time test above could
+# not know it yet. Idempotent: never adds a second -e.
+_claude_env_sandbox_topup() {
+  [ "${1:-}" = "0" ] || return 0
+  local a
+  for a in "${CLAUDE_ENV[@]+"${CLAUDE_ENV[@]}"}"; do
+    [ "$a" = "IS_SANDBOX=1" ] && return 0
+  done
+  CLAUDE_ENV+=(-e "IS_SANDBOX=1")
+}
 
 _host_clip_cmd() {
   if command -v pbcopy &>/dev/null; then echo pbcopy
@@ -9014,8 +9185,24 @@ _execute_host_hooks() {
 # rather than stall; a valid-but-mismatched uid means the remap is still in
 # flight, so we keep polling (up to 50 probes).
 _wait_for_coder_remap() {
-  local cname="$1" want got i=0
-  want="$(id -u)"
+  local cname="$1" want got told i=0
+  # Against the uid the box was actually TOLD to use, not the host's own. Those
+  # differ on a user-namespaced engine, and comparing the host's number there
+  # made this a false green: it matched while the mapping was wrong, which is
+  # why none of the rootless breakage ever reported itself.
+  want="$(_box_uid)"
+  # What this box was TOLD at create, frozen in its Config.Env. The entrypoint
+  # re-reads that same value on every restart, so a box carrying a different
+  # number can never converge and polling for it just spends five seconds at the
+  # front of every session before saying so.
+  told="$(docker inspect "$cname" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | sed -n 's/^HOST_UID=//p' | head -1)"
+  case "$told" in
+    ''|*[!0123456789]*) told="" ;;
+  esac
+  if [ -n "$told" ] && [ "$told" != "$want" ]; then
+    got="$told"; i=50
+  fi
   while [ "$i" -lt 50 ]; do
     got="$(docker exec "$cname" id -u coder 2>/dev/null)"
     case "$got" in
@@ -9025,6 +9212,18 @@ _wait_for_coder_remap() {
     i=$((i + 1))
     sleep 0.1
   done
+  # A box created before the engine's uid mapping was measured keeps the old
+  # number frozen in its Config.Env, and the config fingerprint deliberately
+  # ignores cleat-injected env, so nothing else would ever mention it. On a
+  # user-namespaced engine that box cannot edit the project, reach its account
+  # or use the clipboard, and the reasons all read as unrelated. Say it once,
+  # with the command that fixes it. Best effort: a box already damaged this way
+  # can fail earlier, on a host-side write it no longer owns.
+  if [ -n "$got" ] && [ "$got" != "$want" ]; then
+    warn "${BOLD}${_BOX}${RESET} runs as uid $got, but this engine maps you to $want."
+    echo -e "    ${DIM}It was created before cleat measured the mapping, so the agent cannot edit files you own.${RESET}"
+    echo -e "    ${DIM}Recreate it: ${BOLD}cleat rm${RESET}${DIM} then start it again.${RESET}"
+  fi
   return 0
 }
 
@@ -11333,7 +11532,7 @@ _upgrade_claude_image() {
   # the runtime container will remap coder to. Without this the throwaway defaults
   # to the image-baked uid (1000), baking a 1000-owned ~/.local that a host-uid
   # (e.g. macOS 501) runtime can't write, breaking manual `claude update`.
-  docker run --name "$tmp" -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" "$IMAGE_NAME" bash -c "$install_cmd" > "$log" 2>&1 || rc=$?
+  docker run --name "$tmp" -e "HOST_UID=$(_box_uid)" -e "HOST_GID=$(_box_gid)" "$IMAGE_NAME" bash -c "$install_cmd" > "$log" 2>&1 || rc=$?
 
   if [[ $rc -eq 0 ]]; then
     # Commit the updated filesystem over the working image. Restore the default
@@ -12004,6 +12203,12 @@ cmd_run() {
   # the image) so boxes recreated from an older image get it too. Placed BEFORE
   # the user's [env] args: docker's last -e wins, so a .cleat `BROWSER=` can
   # override the shim.
+  # Which uid the host user IS on this engine (identity everywhere except a
+  # user-namespaced daemon). Measured once and cached, see _box_identity.
+  local _bx _bx_uid _bx_gid
+  _bx="$(_box_identity)"; _bx_uid="${_bx%% *}"; _bx_gid="${_bx##* }"
+  _claude_env_sandbox_topup "$_bx_uid"
+
   local _docker_err="/tmp/cleat-err.$$"
   local run_rc=0
   docker run -d \
@@ -12015,8 +12220,8 @@ cmd_run() {
     -e "BROWSER=/usr/local/bin/open-bridge" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
     "${label_args[@]}" \
-    -e "HOST_UID=$(id -u)" \
-    -e "HOST_GID=$(id -g)" \
+    -e "HOST_UID=$_bx_uid" \
+    -e "HOST_GID=$_bx_gid" \
     -e "HOME=/home/coder" \
     --pids-limit 4096 \
     --memory "$box_memory" \
@@ -14282,6 +14487,11 @@ cmd_nuke() {
   if [[ -d "$CLEAT_KITS_DIR" ]]; then
     _nuke_wipe_dir "$CLEAT_KITS_DIR"
   fi
+
+  # The measured uid mapping is a cache, not user data, and nuke is the reset
+  # hammer. A wrong measurement must not be the one thing that survives it.
+  rm -f "$(_uid_map_cache_file)" 2>/dev/null || true
+  rm -rf "$CLEAT_CONFIG_DIR/state/uidprobe" 2>/dev/null || true
 
   # Dangling cleat builds only (label-scoped): other projects' dangling images
   # are not ours to delete. Same _dangling_cleat_images seam cmd_prune uses.

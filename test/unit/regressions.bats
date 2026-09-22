@@ -2852,6 +2852,35 @@ SCRIPT
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v1.5.1: a user-namespaced engine (rootless Docker, Docker Desktop for Linux)
+# maps the HOST USER to container uid 0, so the box's remapped `coder` is uid 0
+# there even though the host user is not root. Claude hard-refuses
+# --dangerously-skip-permissions under uid 0, so passing the in-namespace
+# identity WITHOUT this makes every session on such an engine die at launch
+# with "Claude exited with code 1" right after a green bring-up. The two have
+# to move together, which is why this is pinned separately from the uid itself.
+@test "regression v1.5.1: a box that will run as uid 0 rides IS_SANDBOX even when the host user is not root" {
+  local stripped="$TEST_TEMP/cli_stripped_uidmap"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$stripped"
+  mkdir -p "$TEST_TEMP/uidmaphome/.config/cleat/state"
+  printf 'default\t-\t501\t0 0\n' > "$TEST_TEMP/uidmaphome/.config/cleat/state/uidmap"
+  run bash -c "id() { echo 501; }; export HOME='$TEST_TEMP/uidmaphome'; unset XDG_CONFIG_HOME DOCKER_CONTEXT DOCKER_HOST; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
+  assert_success
+  assert_output --partial "IS_SANDBOX=1"
+}
+
+# The same engine, but nothing measured yet: the flag must NOT appear, or every
+# ordinary box on every ordinary engine gets an env it should not have.
+@test "regression v1.5.1: an unmeasured engine leaves a non-root host's env clean" {
+  local stripped="$TEST_TEMP/cli_stripped_uidmap_none"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$stripped"
+  mkdir -p "$TEST_TEMP/uidmaphome2/.config/cleat"
+  run bash -c "id() { echo 501; }; export HOME='$TEST_TEMP/uidmaphome2'; unset XDG_CONFIG_HOME DOCKER_CONTEXT DOCKER_HOST; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
+  assert_success
+  refute_output --partial "IS_SANDBOX"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # v1.2.0: the kit scout's generated frontmatter wrapped its description as an
 # unquoted YAML plain scalar containing colon-space ("all exploration:
 # finding"), which is invalid YAML ("mapping values are not allowed here").

@@ -1090,6 +1090,10 @@ EOF
 # of the user. These pin the measured answer being used, not the host's number.
 
 int_uidmap_write() {   # helper: plant a measured answer for this engine
+  # The measurement is Linux-only (macOS keeps the host's own ids), so a test
+  # that plants one is testing the Linux path. Say so, or the macOS shards
+  # would take the gate and never read the plant.
+  _is_macos() { return 1; }
   mkdir -p "$CLEAT_CONFIG_DIR/state"
   local ep; ep="$(_docker_context_endpoint)"
   printf '%s\t%s\t%s\t%s\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
@@ -1269,6 +1273,7 @@ SH
 
 @test "uid map: a measurement taken against another daemon is re-measured" {
   # Same key, repointed endpoint: the number was true of a different engine.
+  _is_macos() { return 1; }
   mkdir -p "$CLEAT_CONFIG_DIR/state"
   printf '%s\t%s\t%s\t%s\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
     "unix:///somewhere/else.sock" "$(id -u)" "0 0" > "$CLEAT_CONFIG_DIR/state/uidmap"
@@ -1304,4 +1309,24 @@ SH
   [ -n "$line" ] || { echo "no probe run recorded"; return 1; }
   [[ "$line" == *"state/uidprobe:/cleat-uidmap:ro"* ]] || { echo "probe did not bind its own dir: $line"; return 1; }
   [[ "$line" != *"$CLEAT_CONFIG_DIR:/cleat-uidmap"* ]] || { echo "probe mounted the config root"; return 1; }
+}
+
+@test "uid map: a macOS host keeps its own ids and never measures" {
+  # The inversion is a Linux user namespace. Every macOS engine runs the daemon
+  # in a VM whose share layer already presents your files as yours, and your own
+  # uid is what all of them have always run on. Measuring there bought nothing
+  # and cost a container run through the VM per launch, which took CI's Colima
+  # leg from 21 minutes to a timeout. Even a planted namespaced answer must not
+  # reach a macOS box, and nothing may be measured.
+  _is_macos() { return 0; }
+  mkdir -p "$CLEAT_CONFIG_DIR/state"
+  printf '%s\t-\t%s\t0 0\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" "$(id -u)" \
+    > "$CLEAT_CONFIG_DIR/state/uidmap"
+  mock_docker_images "cleat"
+  : > "$DOCKER_CALLS"
+  run _box_identity
+  assert_success
+  assert_output "$(id -u) $(id -g)"
+  run grep -c 'cleat-uidmap' "$DOCKER_CALLS"
+  assert_output "0"
 }

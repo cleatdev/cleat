@@ -1125,6 +1125,20 @@ _box_identity_probe() {
 _box_identity() {
   local v
   [ -n "${_BOX_IDENTITY_MEMO:-}" ] && { printf '%s' "$_BOX_IDENTITY_MEMO"; return 0; }
+  # macOS keeps the host's own ids and never measures. The inversion this exists
+  # for is a LINUX user namespace (rootless Docker, Docker Desktop for Linux).
+  # Every macOS engine (Docker Desktop, OrbStack, Colima, Rancher Desktop, Lima)
+  # runs the daemon in a VM whose file-sharing layer already presents your files
+  # as yours, and passing your own uid is what every one of them has always run
+  # on. Measuring there bought nothing and cost a container run through the VM
+  # on every uncached launch: on CI's Colima leg the integration tests went from
+  # 21 minutes to a 40-minute timeout. Measured on Docker Desktop for macOS the
+  # answer is identity anyway (host 501:20 reads as 501 20).
+  if _is_macos; then
+    _BOX_IDENTITY_MEMO="$(id -u) $(id -g)"
+    printf '%s' "$_BOX_IDENTITY_MEMO"
+    return 0
+  fi
   # Resolve the endpoint once per process, on the daemon-touching path only, so
   # the key says WHICH daemon answered rather than only which env var was set.
   [ -n "${_UID_MAP_ENDPOINT+x}" ] || _UID_MAP_ENDPOINT="$(_docker_context_endpoint)"

@@ -3607,6 +3607,15 @@ s|  if \[ -n "$told" \] && \[ "$told" != "$want" \]; then|  if false; then|
 SED
 try "v1.5.1_remap_skips_doomed_poll" "not polled for five seconds first" "$CLI" "$DOCKER_COMMANDS_BATS"
 
+# v1.5.1 macOS GATE: the inversion is a Linux user namespace. Measure on macOS
+# and every VM engine pays a container run per launch for an answer that is
+# identity anyway (CI's Colima leg went from 21 minutes to a timeout). Scoped to
+# _box_identity because the same test appears in other functions.
+cat > "$SED_TMP" << 'SED'
+/^_box_identity() {/,/if _is_macos; then/ s/if _is_macos; then/if false; then/
+SED
+try "v1.5.1_uid_map_macos_gate" "macOS host keeps its own ids and never measures" "$CLI" "$DOCKER_COMMANDS_BATS"
+
 # ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
 # Collapse the predicate to always-VM (flip the host-local fall-through return):
 # the native ready test fails.

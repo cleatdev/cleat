@@ -6846,7 +6846,10 @@ app.terraform.io sentry.io gitlab.com"
 # default is a hard `return 1`.
 _bridge_url_host() {
   local url="$1" rest authority host
-  [ "${#url}" -le 2048 ] || return 1
+  # In BYTES. ${#url} counts characters in the caller's locale, so under the
+  # UTF-8 locale a Mac terminal runs in, a URL of multibyte characters passed
+  # the 2048 cap at up to four times that many bytes.
+  [ "$(LC_ALL=C; printf '%s' "${#url}")" -le 2048 ] || return 1
   # The scheme is case-insensitive (RFC 3986) and a tool really does emit
   # HTTPS://. Fold only the scheme: the caller opens the ORIGINAL bytes, and the
   # path and query are case-SENSITIVE.
@@ -7194,7 +7197,7 @@ _is_auth_url_shape() {
   enc="${q#*redirect_uri=}"
   enc="${enc%%&*}"
   [ -n "$enc" ] || return 1
-  [ "${#enc}" -le 2048 ] || return 1
+  [ "$(LC_ALL=C; printf '%s' "${#enc}")" -le 2048 ] || return 1
   dec="$(printf '%b' "${enc//%/\\x}" 2>/dev/null)" || return 1
   # An absolute http(s) callback whose authority parses. _bridge_url_host
   # rejects an IPv6 literal and userinfo, so a redirect_uri of

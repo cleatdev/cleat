@@ -11647,6 +11647,16 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_clipimg_claim_host_only" "an image request was moved through a link the box planted"
 
+# The bridge URL cap counts bytes. ${#url} alone counts characters under the
+# caller's UTF-8 locale, which let a multibyte URL through at several times the
+# bytes the cap allows.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_url_host()/,/^}$/{
+  s@\[ "[$](LC_ALL=C; printf '%s' "[$]{#url}")" -le 2048 \]@[ "${#url}" -le 2048 ]@
+}
+SED
+try "vnext_bridge_url_cap_bytes" "the bridge URL cap counted characters, not bytes"
+
 # Egress stage zero. The stub must answer per container and per format, or no
 # assertion over two fields of one container can fail.
 # Anchor: the format test inside `_stub_inspect`. Replacing it with `:` makes

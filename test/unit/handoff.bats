@@ -76,6 +76,22 @@ teardown() { hb_teardown_pids; _common_teardown; }
   assert_line "orphan	7000701"
 }
 
+@test "the fake /proc guard refuses a pid a live process could hold" {
+  # The probe skips its own pid and its parent's by design, so a fabricated
+  # entry numbered like a real pid can BE one of them and silently vanish from
+  # the scan. The guard that stops that read the wrong argument and ignored its
+  # own result for a whole release, so it is pinned here through hb_run_box, the
+  # way every test reaches it, in both directions.
+  hb_fake_proc "$PV" 900 "claude" 1 R
+  run hb_run_box probe "$BH" "$PV"
+  assert_failure 98
+  rm -rf "${PV:?}/900"
+  hb_fake_proc "$PV" 7000900 "claude" 1 R
+  run hb_run_box probe "$BH" "$PV"
+  assert_success
+  assert_line "orphan	7000900"
+}
+
 @test "box probe sees a Claude behind a binfmt interpreter" {
   # An amd64 box on Apple Silicon runs under Rosetta, and qemu-user does the same
   # job elsewhere. Both can put [interpreter, binary, original argv...] in

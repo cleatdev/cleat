@@ -175,7 +175,10 @@ hb_run_box() {
       i=$(( i + 5 ))
     done
   fi
-  hb_fixture_pids_ok "${2:-}"
+  # $3 is the proc directory for both verbs (probe BH PV, terminate BH PV ...).
+  # This read $2, the box home, and ignored the result, so it guarded nothing
+  # (found 2026-09-23: a fake pid of 900 was reported as an orphan).
+  hb_fixture_pids_ok "${3:-}" || return 98
   hb_run_box_raw "$@"
 }
 
@@ -191,6 +194,9 @@ hb_fixture_pids_ok() {
   [ -n "$dir" ] && [ -d "$dir" ] || return 0
   for d in "$dir"/[0-9]*; do
     [ -e "$d" ] || continue
+    # A link is a REAL process the test spawned (hb_proc_view), and a real pid
+    # cannot be the scan's own or its parent's. Only a fabricated entry can.
+    [ -L "$d" ] && continue
     pid="${d##*/}"
     case "$pid" in ''|*[!0-9]*) continue ;; esac
     if [ "$pid" -le 4194304 ]; then

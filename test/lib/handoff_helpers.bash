@@ -116,6 +116,13 @@ _hb_on_term() {
     while [ ! -e "/proc/$np" ]; do :; done
     [ -n "${HB_PROC_VIEW:-}" ] && ln -sf "/proc/$np" "$HB_PROC_VIEW/$np"
   fi
+  # The successor as Rosetta or qemu-user shows it while it starts: the
+  # interpreter and the binary in front of the real argv. A fabricated entry, so
+  # it is numbered above any possible pid like every other fixture.
+  if [ "$HB_TERMMODE" = spawns_binfmt ] && [ -n "${HB_PROC_VIEW:-}" ]; then
+    mkdir -p "$HB_PROC_VIEW/7000860"
+    printf '/run/rosetta/rosetta\0/usr/bin/bash\0claude\0-c\0true\0' > "$HB_PROC_VIEW/7000860/cmdline"
+  fi
   rm -f "$HB_SF/$$.json"
   exit 143
 }

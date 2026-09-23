@@ -3625,6 +3625,47 @@ s#^    echo "$output" | awk '$#    echo "$output" | grep -A5 "^not ok" | sed 's/
 SED
 try "v1.5.2_testsh_full_failure_block" "test runner shows what a failed assertion actually saw" "$TEST_SH" "$REGRESSIONS"
 
+# v1.5.2 BINFMT: under Rosetta or qemu-user a process can read [interpreter,
+# binary, original argv...] in /proc/<pid>/cmdline. Measured on an amd64 box
+# under Docker Desktop's Rosetta, where the final scan missed a Claude started in
+# the switch window. Drop the per-process strip and the probe misses it again.
+cat > "$SED_TMP" << 'SED'
+/^    done < "\$d\/cmdline"$/,/^    \[\[ \${#words\[@\]} -gt 0 \]\] || continue$/ s/_is_binfmt_interp "\${words\[0\]}" "\${words\[1\]}"/false/
+SED
+try "v1.5.2_binfmt_strip" "box probe sees a Claude behind a binfmt interpreter" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 BINFMT precision: only a known interpreter followed by an ABSOLUTE path
+# is a binfmt argv. Accept any second word and a native argv that merely starts
+# with an interpreter-looking word gets its first two words thrown away.
+cat > "$SED_TMP" << 'SED'
+s|  case "\${2:-}" in /\*) ;; \*) return 1 ;; esac|  :|
+SED
+try "v1.5.2_binfmt_needs_path" "interpreted non-Claude" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 BINFMT in the box: the probe runs as a script shipped to the box as
+# text, built from an explicit function list. A helper left off that list is
+# undefined inside the box even though every host-side call works.
+cat > "$SED_TMP" << 'SED'
+s|_sessions_json_unesc _is_binfmt_interp _is_claude_argv|_sessions_json_unesc _is_claude_argv|
+SED
+try "v1.5.2_binfmt_shipped" "box probe sees a Claude behind a binfmt interpreter" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 BINFMT breadth: the interpreter is matched by its exact name. Loosen it
+# to any path containing "rosetta" and a native program called rosetta-notes has
+# its argv shifted and read as someone else's.
+cat > "$SED_TMP" << 'SED'
+s@    \*/rosetta|\*/qemu-\*|\*-binfmt-P) return 0 ;;@    *rosetta*|*/qemu-*|*-binfmt-P) return 0 ;;@
+SED
+try "v1.5.2_binfmt_exact_name" "interpreted non-Claude" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 BINFMT at the final scan, the actual bug path: a real Claude takes the
+# SIGTERM and its successor appears as Rosetta shows it. Without the strip the
+# final scan reports ok and the switch would stage over that Claude.
+cat > "$SED_TMP" << 'SED'
+/^    done < "\$d\/cmdline"$/,/^    \[\[ \${#words\[@\]} -gt 0 \]\] || continue$/ s/_is_binfmt_interp "\${words\[0\]}" "\${words\[1\]}"/false/
+SED
+try "v1.5.2_binfmt_final_scan" "final scan aborts a switch over a Claude seen through a binfmt" "$CLI" "$REGRESSIONS"
+
 # ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
 # Collapse the predicate to always-VM (flip the host-local fall-through return):
 # the native ready test fails.

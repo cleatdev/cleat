@@ -6324,6 +6324,31 @@ _b12_identity() { "$_B12_JQ" -r '.oauthAccount.emailAddress // "absent"' "$_B12_
   refute_line "end	ok"
 }
 
+# v1.5.2: on an amd64 box under Rosetta (or any qemu-user binfmt), a process
+# can read [interpreter, binary, original argv...] in /proc/<pid>/cmdline. The
+# final scan judged the interpreter, so a Claude started in the switch window was
+# invisible and the switch staged over it. Measured: the test above failed 10 of
+# 10 under Docker Desktop's Rosetta on Apple Silicon and passes with the strip.
+@test "regression v1.5.2: the final scan aborts a switch over a Claude seen through a binfmt interpreter" {
+  hb_require_linux
+  hb_reset_pids
+  local BH="$TEST_TEMP/box" PV="$TEST_TEMP/pv"
+  mkdir -p "$BH/.claude/sessions" "$PV"
+  local SID="d7b73579-1111-2222-3333-444455556666" EXECID="deadbeef1234cafe"
+  # A real Claude passes the recheck and takes the SIGTERM. Its successor then
+  # appears the way Rosetta showed one on an amd64 box, so the final scan is the
+  # only thing standing between it and a switch staged over it.
+  HB_PROC_VIEW="$PV" hb_spawn_claude spawns_binfmt "$SID" "$EXECID" idle
+  local t1="$HB_PID" r1="$HB_RS"
+  hb_proc_view "$PV"
+  run hb_run_box terminate "$BH" "$PV" default 8 8 1 "$t1" "$r1" "$SID" "$EXECID" idle
+  assert_success
+  assert_line "pid	$t1 exited"
+  assert_line "scan	changed"
+  assert_line "end	abort"
+  refute_line "end	ok"
+}
+
 @test "regression v1.5.0: every attach and shell waits for the account lock before it reads the pin" {
   # attack 1.1, the default-pin gap: a box on the shared login read its pin with
   # NO lock, so an attach or a shell racing a shared-to-named switch read the old

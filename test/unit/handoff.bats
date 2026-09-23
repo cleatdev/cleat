@@ -76,6 +76,37 @@ teardown() { hb_teardown_pids; _common_teardown; }
   assert_line "orphan	7000701"
 }
 
+@test "box probe sees a Claude behind a binfmt interpreter" {
+  # An amd64 box on Apple Silicon runs under Rosetta, and qemu-user does the same
+  # job elsewhere. Both can put [interpreter, binary, original argv...] in
+  # /proc/<pid>/cmdline. Measured under Docker Desktop's Rosetta: a Claude that
+  # started in the switch window read [/run/rosetta/rosetta][/usr/bin/bash]
+  # [claude]..., the probe looked at the interpreter and the final scan let the
+  # switch stage over it.
+  hb_fake_proc "$PV" 7000820 "/run/rosetta/rosetta /home/coder/.local/share/claude/versions/2.1.280 claude --continue" 1 R
+  hb_fake_proc "$PV" 7000821 "/usr/bin/qemu-x86_64 /home/coder/.local/bin/claude claude" 1 R
+  hb_fake_proc "$PV" 7000822 "/usr/libexec/qemu-binfmt/x86_64-binfmt-P /usr/bin/bash claude -c sleep" 1 R
+  run hb_run_box probe "$BH" "$PV"
+  assert_success
+  assert_line "orphan	7000820"
+  assert_line "orphan	7000821"
+  assert_line "orphan	7000822"
+}
+
+@test "box probe never takes an interpreted non-Claude, or a bare interpreter word, for a Claude" {
+  # The strip is for a KNOWN interpreter followed by an absolute path only. An
+  # interpreted dev server stays a dev server, and a native process whose argv
+  # merely starts with an interpreter-looking word is left exactly as it is.
+  hb_fake_proc "$PV" 7000830 "/run/rosetta/rosetta /usr/bin/node node server.js" 1 R
+  hb_fake_proc "$PV" 7000831 "/run/rosetta/rosetta claude claude" 1 R      # second word not a path: not a binfmt argv
+  hb_fake_proc "$PV" 7000832 "/usr/bin/rosetta-notes /usr/bin/claude claude" 1 R   # not an interpreter at all
+  run hb_run_box probe "$BH" "$PV"
+  assert_success
+  refute_output --partial "orphan	7000830"
+  refute_output --partial "orphan	7000831"
+  refute_output --partial "orphan	7000832"
+}
+
 @test "box probe judges processes by executable and never by a claude word in the arguments" {
   hb_fake_proc "$PV" 7000810 "rg claude" 1 R                                             # a ripgrep pattern
   hb_fake_proc "$PV" 7000811 "node /home/coder/app/server.js" 1 R                        # a dev server

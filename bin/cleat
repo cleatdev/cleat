@@ -13674,6 +13674,23 @@ _box_has_attached_session() {
 # arguments mention .claude/ (plugin MCP servers, Claude's Bash-tool shells)
 # and cleat's own `bash -c` wrapper, whose script text names claude. Every live
 # Claude has a process row of its own, so judging argv0 misses none of them.
+# Is this the front of an argv that a binfmt interpreter prepended? Rosetta and
+# qemu-user, registered with the "preserve argv0" flag, run a foreign-arch
+# binary as [interpreter, binary path, original argv...], and /proc/<pid>/cmdline
+# can show exactly that. Measured under Docker Desktop's Rosetta on Apple
+# Silicon (an amd64 box): a process the handoff had to see read
+# [/run/rosetta/rosetta][/usr/bin/bash][claude][-c]..., so _is_claude_argv
+# looked at the interpreter, missed the Claude and the final scan passed a
+# switch it should have aborted. Only a KNOWN interpreter followed by an
+# absolute path counts, so a native box is never touched.
+_is_binfmt_interp() {
+  case "${2:-}" in /*) ;; *) return 1 ;; esac
+  case "${1:-}" in
+    */rosetta|*/qemu-*|*-binfmt-P) return 0 ;;
+  esac
+  return 1
+}
+
 _is_claude_argv() {
   case "${1:-}" in
     claude|*/claude|*/claude/versions/*) return 0 ;;
@@ -19116,9 +19133,18 @@ _hb_scan() {
   skip="$skip $$ ${PPID:-}"
   if [[ -r "$proc/$$/cmdline" ]]; then
     selfcmd=""
+    words=()
     while IFS= read -r -d '' w || [[ -n "$w" ]]; do
-      selfcmd="$selfcmd$w"$'\001'
+      words+=("$w")
     done < "$proc/$$/cmdline"
+    # Normalised the same way as every other process below, or an interpreted
+    # scan would stop recognising its own forks.
+    if [[ ${#words[@]} -ge 3 ]] && _is_binfmt_interp "${words[0]}" "${words[1]}"; then
+      words=("${words[@]:2}")
+    fi
+    for w in "${words[@]+"${words[@]}"}"; do
+      selfcmd="$selfcmd$w"$'\001'
+    done
   fi
   for d in "$proc"/[0-9]*; do
     [[ -e "$d" || -L "$d" ]] || continue
@@ -19130,6 +19156,10 @@ _hb_scan() {
     while IFS= read -r -d '' w || [[ -n "$w" ]]; do
       words+=("$w")
     done < "$d/cmdline"
+    # A binfmt interpreter in front of the real argv, see _is_binfmt_interp.
+    if [[ ${#words[@]} -ge 3 ]] && _is_binfmt_interp "${words[0]}" "${words[1]}"; then
+      words=("${words[@]:2}")
+    fi
     [[ ${#words[@]} -gt 0 ]] || continue
     # Any process of this script, whichever verb it is running. cleat launches
     # it as `bash -c "$script" cleat-hb <verb> ...`, so that word is in the argv
@@ -19523,7 +19553,7 @@ _hb_main() {
 # References no host global, so it runs the same under `env -i`.
 _handoff_box_script() {
   declare -p _HB_CLAUDE_LOCK_STALE_S || return 1
-  declare -f _json_flat_str _sessions_json_unesc _is_claude_argv \
+  declare -f _json_flat_str _sessions_json_unesc _is_binfmt_interp _is_claude_argv \
              _hb_main _hb_args_ok _hb_probe _hb_terminate _hb_proc_state \
              _hb_scan _hb_env_value _hb_execid _hb_session_record _hb_recheck \
              _hb_lock_take _hb_cleanup || return 1

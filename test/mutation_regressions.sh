@@ -104,6 +104,25 @@ RESET=$'\033[0m'
 # of those WRITE the nine tracked files this lock exists to protect, so a run
 # that is correctly refused must not have reached them.
 _CLEAT_TEST_LOCK_ROOT="$REPO_ROOT"
+# Optional sharding for CI, the same shape test.sh uses: MUTATION_SHARD_TOTAL=N
+# and MUTATION_SHARD_INDEX=K run every Nth registered entry starting at K. Every
+# entry the filter admits is counted in registration order whether or not it
+# runs here, so N shards partition the registry exactly and their totals add up
+# to the whole. The registry is the same on every runner of one image, so every
+# shard counts the same sequence. Checked BEFORE the lock: an exit between taking
+# the lock and installing the trap that drops it leaves the lock held.
+if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then
+  if [[ ! "$MUTATION_SHARD_TOTAL" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MUTATION_SHARD_TOTAL must be a positive integer, got '$MUTATION_SHARD_TOTAL'." >&2
+    exit 2
+  fi
+  if [[ ! "${MUTATION_SHARD_INDEX:-0}" =~ ^[0-9]+$ ]] || [[ "${MUTATION_SHARD_INDEX:-0}" -ge "$MUTATION_SHARD_TOTAL" ]]; then
+    echo "MUTATION_SHARD_INDEX must be an integer in 0..$((MUTATION_SHARD_TOTAL - 1)), got '${MUTATION_SHARD_INDEX:-}'." >&2
+    exit 2
+  fi
+fi
+_shard_seq=0
+
 . "$REPO_ROOT/test/lib/testlock.sh"
 _take_test_lock "the mutation harness"
 
@@ -133,6 +152,7 @@ cp "$TEST_SH" "$TEST_SH_BACKUP"
 cp "$INT_LIFECYCLE_BATS" "$INT_LIFECYCLE_BACKUP"
 cp "$SETUP_BASH" "$SETUP_BASH_BACKUP"
 filter="${1:-}"
+
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
 # Target file defaults to $CLI; pass $INSTALLER (or any other path) to mutate
@@ -231,6 +251,10 @@ try() {
   local name="$1" test_filter="$2" target="${3:-$CLI}" test_file="${4:-$REGRESSIONS}"
   if [[ -n "$filter" && "$name" != *"$filter"* ]]; then
     return
+  fi
+  if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then
+    _shard_seq=$((_shard_seq + 1))
+    [[ $(( (_shard_seq - 1) % MUTATION_SHARD_TOTAL )) -eq "${MUTATION_SHARD_INDEX:-0}" ]] || return
   fi
   total=$((total + 1))
   local rc=0
@@ -11497,6 +11521,9 @@ SED
 try "v150_scan_skips_sibling_run" "box scan ignores a sibling run of the script" "$CLI" "$HANDOFF_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
+if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then
+  echo "  Shard:   ${MUTATION_SHARD_INDEX:-0}/${MUTATION_SHARD_TOTAL} (${total} of the ${_shard_seq} entries)"
+fi
 echo "  Total:   $total"
 echo "  Caught:  ${GREEN}$caught${RESET}"
 echo "  Missed:  ${RED}$missed${RESET}"

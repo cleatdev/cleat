@@ -111,12 +111,19 @@ jobs:
   # which at that rate is roughly 50 minutes, so the old 25-minute cap would
   # cancel the job mid-flight. 75 leaves headroom for a slow runner.
   # 2026-09-23: 1342 entries took 84 minutes on a slow day (52 two runs
-  # earlier), so the job has 130 and the step 120. The step times out FIRST so
-  # the job survives to print how far it got, see the step after it.
+  # earlier) and the registry grows every release, so it runs as four shards,
+  # the way the macOS suite does. MUTATION_SHARD_TOTAL/INDEX take every 4th
+  # registered entry, so the shards partition the registry exactly. Each shard
+  # is about a quarter of the old run. The step times out before the job so the
+  # job survives to print how far it got, see the step after it.
   mutation-linux:
-    name: mutation (ubuntu)
+    name: mutation (ubuntu) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 130
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -125,8 +132,11 @@ jobs:
         run: bash --version
       - name: Install socat (the OAuth forward mutations drive the real one)
         run: sudo apt-get update && sudo apt-get install -y socat
-      - name: Mutation test the regression registry
-        timeout-minutes: 120
+      - name: Mutation test the regression registry, shard ${{ matrix.shard }}/4
+        timeout-minutes: 40
+        env:
+          MUTATION_SHARD_TOTAL: '4'
+          MUTATION_SHARD_INDEX: ${{ matrix.shard }}
         run: |
           rc=0; ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/mutation.log"; : > "$RUNNER_TEMP/mutation.printed"; exit "$rc"
@@ -370,11 +380,17 @@ jobs:
   # (covered on the ubuntu/macos legs already), the same scope call as the intel
   # leg: this job is about the WSL runtime, not test depth.
   windows-wsl2:
-    name: test (windows, wsl2 ubuntu)
+    name: test (windows, wsl2 ubuntu) shard ${{ matrix.shard }}
     runs-on: windows-latest
-    # Green runs took 44 of the old 45 minutes and one was killed at 45, with
-    # nothing printed. 65 for the job, 55 for the suite step, see below.
-    timeout-minutes: 65
+    # The whole suite took 44 minutes, then its step alone 49.7, and one run was
+    # killed at the old 45 with nothing printed. Four shards like the macOS leg,
+    # each about a quarter of that. The step times out before the job so the job
+    # survives to print how far it got.
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     # Green, but kept advisory: WSL2 provisioning on windows-2025 has a known
     # intermittent per-user issue (actions/runner-images#14499); do not gate the
     # board on it until it has a longer green streak.
@@ -426,18 +442,21 @@ jobs:
         shell: wsl-bash {0}
         run: |
           sudo apt-get update && sudo apt-get install -y jq socat inotify-tools
-      - name: Run full BATS suite inside WSL2 (mock docker, no real daemon)
+      - name: Run suite shard ${{ matrix.shard }}/4 inside WSL2 (mock docker, no real daemon)
         shell: wsl-bash {0}
         # TEST_MAX_SKIPPED=0: with the tools installed above, a skip here means
         # this leg lost coverage rather than that WSL2 is different. Advisory
         # either way, but the signal is worth reading.
-        env:
-          TEST_MAX_SKIPPED: '0'
+        # Exported in the script, not through `env:`. A step's env reaches the
+        # WSL shell only for names listed in WSLENV, so a shard setting passed
+        # the usual way could silently not arrive and every shard would run the
+        # whole suite. test.sh prints the shard it ran in its header.
         run: |
+          export TEST_MAX_SKIPPED=0 TEST_SHARD_TOTAL=4 TEST_SHARD_INDEX=${{ matrix.shard }}
           cd "$(wslpath '${{ github.workspace }}')"
           rc=0; bash ./test.sh > /tmp/suite.log 2>&1 < /dev/null || rc=$?
           cat /tmp/suite.log; : > /tmp/suite.printed; exit "$rc"
-        timeout-minutes: 55
+        timeout-minutes: 25
       # Same reason as the mutation job: the suite writes to a file, so a killed
       # step prints nothing. This runs only when the step above failed, and
       # prints only when it never reached its own cat.

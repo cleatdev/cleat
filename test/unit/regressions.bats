@@ -6846,3 +6846,70 @@ _mount_targets_fixture() {
   exec 7<&-
   assert_failure
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: the docker stub answered every `docker inspect` with one canned blob,
+# ignoring both the container name and --format, so no test could build a
+# container whose NetworkMode was right and whose CapDrop was wrong. Every
+# assertion over two fields of one container passed whatever the code read.
+@test "regression vNEXT: the docker stub answered every inspect with one blob" {
+  printf 'BLOB-FOR-EVERY-INSPECT\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  mock_docker_inspect_field cleat-a '{{.HostConfig.NetworkMode}}' none
+  mock_docker_inspect_field cleat-a '{{json .HostConfig.CapDrop}}' 'null'
+  mock_docker_inspect_field cleat-b '{{.HostConfig.NetworkMode}}' bridge
+
+  run docker inspect --format '{{.HostConfig.NetworkMode}}' cleat-a
+  assert_success
+  assert_output "none"
+  run docker inspect --format '{{json .HostConfig.CapDrop}}' cleat-a
+  assert_success
+  assert_output "null"
+  run docker inspect cleat-b --format '{{.HostConfig.NetworkMode}}'
+  assert_success
+  assert_output "bridge"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: assert_docker_run_has selected the last `docker run` line containing
+# the container name anywhere in its argv. A second container created after the
+# box whose argv merely mentioned the box's name (a label naming what it serves)
+# took the selection, and every flag assertion on the box silently read the
+# other container's line.
+@test "regression vNEXT: assert_docker_run_has matched another container argv" {
+  local cname="cleat-project-12345678"
+  docker run -d --name "$cname" --memory 8g --cap-drop ALL cleat
+  docker run -d --name cleat-gw-0badc0de --label "sh.cleat.serves=$cname" \
+    --network none --memory 64m cleat
+  run assert_docker_run_has "$cname" "--memory 8g"
+  assert_success
+  run assert_docker_run_lacks "$cname" "--network none"
+  assert_success
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: the mutation harness trapped INT and TERM with its cleanup but never
+# exited, so bash went back into the registry after a Ctrl-C or a CI cancel
+# with every backup already deleted. Each later entry mutated its target with
+# nothing left to restore it from, and the tree ended the run mutated. No
+# mutation entry: the harness cannot mutate the script it is running, because
+# bash reads a running script by byte offset.
+@test "regression vNEXT: an interrupted mutation run kept mutating after its backups were gone" {
+  cat > "$TEST_TEMP/registry" << 'REG'
+cat > "$SED_TMP" << 'SED'
+s/pristine/mutated/
+SED
+try "first" "probe" "$SETUP_BASH" "$REPO_ROOT/test/unit/probe.bats"
+kill -TERM $$
+try "second" "probe" "$INSTALLER" "$REPO_ROOT/test/unit/probe.bats"
+REG
+  mutation_harness_tree "$TEST_TEMP/registry"
+  export HARNESS_OBS="$TEST_TEMP/obs" _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/harness/.lock"
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_failure 143
+  refute_output --partial "second"
+  run cat "$TEST_TEMP/harness/test/setup.bash" "$TEST_TEMP/harness/install.sh"
+  assert_output "$(printf '%s\n' 'pristine test/setup.bash' 'pristine install.sh')"
+  run test -e "$_CLEAT_TEST_LOCK_DIR"
+  assert_failure
+}

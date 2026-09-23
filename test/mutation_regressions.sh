@@ -75,6 +75,16 @@ DISK_GATE_BATS="$REPO_ROOT/test/unit/disk_gate.bats"
 STORAGE_BATS="$REPO_ROOT/test/unit/storage.bats"
 UPDATE_BATS="$REPO_ROOT/test/unit/update.bats"
 INSTALLER_BATS="$REPO_ROOT/test/unit/installer.bats"
+EGRESS_CONFIG_BATS="$REPO_ROOT/test/unit/egress_config.bats"
+EGRESS_HOSTNAME_BATS="$REPO_ROOT/test/unit/egress_hostname.bats"
+EGRESS_REQUIRE_BATS="$REPO_ROOT/test/unit/egress_require.bats"
+EGRESS_GATEWAY_BATS="$REPO_ROOT/test/unit/egress_gateway.bats"
+EGRESS_ENGINE_BATS="$REPO_ROOT/test/unit/egress_engine.bats"
+EGRESS_UI_BATS="$REPO_ROOT/test/unit/egress_ui.bats"
+EGRESS_CATALOGUE_BATS="$REPO_ROOT/test/unit/egress_catalogue.bats"
+EGRESS_FRAGMENT_BATS="$REPO_ROOT/test/unit/egress_fragment.bats"
+EGRESS_BROKER_BATS="$REPO_ROOT/test/unit/egress_broker.bats"
+STUB_VALIDATION_BATS="$REPO_ROOT/test/unit/stub_validation.bats"
 INT_LIFECYCLE_BATS="$REPO_ROOT/test/integration/lifecycle.bats"
 SETUP_BASH="$REPO_ROOT/test/setup.bash"
 ENTRYPOINT="$REPO_ROOT/docker/entrypoint.sh"
@@ -83,6 +93,7 @@ OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
 CLIP_DAEMON="$REPO_ROOT/docker/clip-daemon"
 CLIP_SHIM="$REPO_ROOT/docker/clip"
 TEST_SH="$REPO_ROOT/test.sh"
+MOCK_DOCKER="$REPO_ROOT/test/fixtures/mock_bin/docker"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
 INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
 ENTRYPOINT_BACKUP="/tmp/cleat-regression-mutation-entrypoint-backup-$$"
@@ -92,6 +103,7 @@ CLIP_SHIM_BACKUP="/tmp/cleat-regression-mutation-clipshim-backup-$$"
 TEST_SH_BACKUP="/tmp/cleat-regression-mutation-testsh-backup-$$"
 INT_LIFECYCLE_BACKUP="/tmp/cleat-regression-mutation-intlifecycle-backup-$$"
 SETUP_BASH_BACKUP="/tmp/cleat-regression-mutation-setupbash-backup-$$"
+MOCK_DOCKER_BACKUP="/tmp/cleat-regression-mutation-mockdocker-backup-$$"
 
 BOLD=$'\033[1m'
 RED=$'\033[0;31m'
@@ -101,7 +113,7 @@ DIM=$'\033[2m'
 RESET=$'\033[0m'
 
 # Mutual exclusion, taken BEFORE the backups and BEFORE the cleanup trap. Both
-# of those WRITE the nine tracked files this lock exists to protect, so a run
+# of those WRITE the ten tracked files this lock exists to protect, so a run
 # that is correctly refused must not have reached them.
 _CLEAT_TEST_LOCK_ROOT="$REPO_ROOT"
 # Optional sharding for CI, the same shape test.sh uses: MUTATION_SHARD_TOTAL=N
@@ -126,7 +138,11 @@ _shard_seq=0
 . "$REPO_ROOT/test/lib/testlock.sh"
 _take_test_lock "the mutation harness"
 
-cleanup() {
+# Every tracked target back to its pristine copy. The first act of every
+# run_mutation and of cleanup, so no entry observes another entry's mutation.
+# Restoring only the file about to be mutated left each mutation on disk for
+# every later entry, so a result depended on registry order and on the shard.
+_restore_targets() {
   [[ -f "$BACKUP" ]] && cp "$BACKUP" "$CLI"
   [[ -f "$INSTALLER_BACKUP" ]] && cp "$INSTALLER_BACKUP" "$INSTALLER"
   [[ -f "$ENTRYPOINT_BACKUP" ]] && cp "$ENTRYPOINT_BACKUP" "$ENTRYPOINT"
@@ -136,11 +152,23 @@ cleanup() {
   [[ -f "$TEST_SH_BACKUP" ]] && cp "$TEST_SH_BACKUP" "$TEST_SH"
   [[ -f "$INT_LIFECYCLE_BACKUP" ]] && cp "$INT_LIFECYCLE_BACKUP" "$INT_LIFECYCLE_BATS"
   [[ -f "$SETUP_BASH_BACKUP" ]] && cp "$SETUP_BASH_BACKUP" "$SETUP_BASH"
+  [[ -f "$MOCK_DOCKER_BACKUP" ]] && cp "$MOCK_DOCKER_BACKUP" "$MOCK_DOCKER"
+  return 0
+}
+
+cleanup() {
+  _restore_targets
   rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP" \
         "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$TEST_SH_BACKUP" \
-        "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP"
+        "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP" "$MOCK_DOCKER_BACKUP"
 }
-trap cleanup EXIT INT TERM
+# A signal only exits, and the EXIT trap does the restoring, exactly once. A
+# trap that ran cleanup on INT or TERM without exiting sent bash back into the
+# registry with every backup already deleted, so each later entry mutated its
+# target with nothing left to restore it from.
+trap 'cleanup; _drop_test_lock' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cp "$CLI" "$BACKUP"
 cp "$INSTALLER" "$INSTALLER_BACKUP"
@@ -151,12 +179,15 @@ cp "$CLIP_SHIM" "$CLIP_SHIM_BACKUP"
 cp "$TEST_SH" "$TEST_SH_BACKUP"
 cp "$INT_LIFECYCLE_BATS" "$INT_LIFECYCLE_BACKUP"
 cp "$SETUP_BASH" "$SETUP_BASH_BACKUP"
+cp "$MOCK_DOCKER" "$MOCK_DOCKER_BACKUP"
 filter="${1:-}"
 
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
-# Target file defaults to $CLI; pass $INSTALLER (or any other path) to mutate
-# a companion script. Returns 0 if mutation caught, 1 if missed, 2 if skipped.
+# Target file defaults to $CLI; pass another of the ten tracked targets
+# ($INSTALLER, $SETUP_BASH, $MOCK_DOCKER, ...) to mutate a companion file. A
+# path with no backup is refused rather than mutated, because nothing could
+# restore it. Returns 0 if mutation caught, 1 if missed, 2 if skipped.
 run_mutation() {
   local name="$1" test_filter="$2" sed_file="$3" target="${4:-$CLI}" test_file="${5:-$REGRESSIONS}" backup
   if [[ "$target" == "$INSTALLER" ]]; then
@@ -175,11 +206,22 @@ run_mutation() {
     backup="$INT_LIFECYCLE_BACKUP"
   elif [[ "$target" == "$SETUP_BASH" ]]; then
     backup="$SETUP_BASH_BACKUP"
-  else
+  elif [[ "$target" == "$MOCK_DOCKER" ]]; then
+    backup="$MOCK_DOCKER_BACKUP"
+  elif [[ "$target" == "$CLI" ]]; then
     backup="$BACKUP"
+  else
+    echo "${RED}✖ $name: NOT A TARGET${RESET} ${DIM}(${target#"$REPO_ROOT"/} has no backup, so add it to this chain and to _restore_targets)${RESET}"
+    return 1
+  fi
+  # A backup that vanished mid-run (a /tmp cleaner, a second cleanup) leaves
+  # nothing to restore this target from, so stop before mutating it.
+  if [[ ! -f "$backup" ]]; then
+    echo "${RED}✖ $name: the backup of ${target#"$REPO_ROOT"/} is gone, so the run stops here${RESET}" >&2
+    exit 2
   fi
 
-  cp "$backup" "$target"
+  _restore_targets
 
   # Apply the sed script. Use `-i.bak` which is portable across GNU sed
   # (Linux) and BSD sed (macOS). BSD sed's `-i` requires an explicit
@@ -239,7 +281,9 @@ run_mutation() {
 SED_TMP="$(mktemp)"
 
 
-trap 'cleanup; rm -f "$SED_TMP"; _drop_test_lock' EXIT INT TERM
+trap 'cleanup; rm -f "$SED_TMP"; _drop_test_lock' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 total=0
 caught=0
@@ -11589,6 +11633,41 @@ SED
 # for the marker, v150_scan_skips_own_fork for the argv, v150_probe_shell_path_only
 # for the pattern.
 try "v150_scan_skips_sibling_run" "box scan ignores a sibling run of the script" "$CLI" "$HANDOFF_BATS"
+
+# Egress stage zero. The stub must answer per container and per format, or no
+# assertion over two fields of one container can fail.
+# Anchor: the format test inside `_stub_inspect`. Replacing it with `:` makes
+# every record a match, so the first read of any format answers the first
+# record in the file, which is the one-blob stub.
+cat > "$SED_TMP" << 'SED'
+/^_stub_inspect()/,/^}$/{
+  s@^      \[\[ "[$]key" == "[$]fmt" \]\] || continue$@      :@
+}
+SED
+try "vnext_stub_inspect_per_format" "the docker stub answered every inspect with one blob" \
+    "$MOCK_DOCKER"
+
+# Egress stage zero. The run-line filter must be anchored on --name.
+# Anchor: `docker_run_line_for` in test/setup.bash.
+cat > "$SED_TMP" << 'SED'
+/^docker_run_line_for()/,/^}$/{
+  s@grep -F -e "--name \$1 "@grep "\$1"@
+}
+SED
+try "vnext_run_line_anchored" "assert_docker_run_has matched another container argv" \
+    "$SETUP_BASH"
+
+# Egress stage zero. assert_docker_run_lacks passed on an empty selection, so a
+# container that was never created lacked everything and every such assertion
+# was vacuous. Anchor: the empty-selection check in `assert_docker_run_lacks`.
+cat > "$SED_TMP" << 'SED'
+/^assert_docker_run_lacks()/,/^}$/{
+  /^  if \[\[ -z "[$]run_line" \]\]; then$/,/^  fi$/d
+}
+SED
+try "vnext_run_lacks_needs_a_line" "assert_docker_run_lacks fails when no run line names the container" \
+    "$SETUP_BASH" "$STUB_VALIDATION_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

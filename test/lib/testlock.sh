@@ -1,13 +1,14 @@
 # Mutual exclusion for everything that reads or executes the working tree while
 # the mutation harness is rewriting it.
 #
-# WHY THIS EXISTS. The harness rewrites nine tracked files IN PLACE (bin/cleat,
-# install.sh, test.sh, test/setup.bash, test/integration/lifecycle.bats and the
-# four docker/ shims), mutation by mutation. Anything reading them meanwhile
-# sees sabotaged or half-written source and fails for reasons unrelated to any
-# change: the bash32 mutation puts `local -A` on line 2, so every sourced test
-# dies with "local: -A: invalid option" on macOS bash 3.2, and a truncated read
-# gives "syntax error: unexpected end of file" at a different offset each time.
+# WHY THIS EXISTS. The harness rewrites ten tracked files IN PLACE (bin/cleat,
+# install.sh, test.sh, test/setup.bash, test/fixtures/mock_bin/docker,
+# test/integration/lifecycle.bats and the four docker/ shims), mutation by
+# mutation. Anything reading them meanwhile sees sabotaged or half-written
+# source and fails for reasons unrelated to any change: the bash32 mutation
+# puts `local -A` on line 2, so every sourced test dies with "local: -A:
+# invalid option" on macOS bash 3.2, and a truncated read gives "syntax error:
+# unexpected end of file" at a different offset each time.
 # From the other side the harness sees its tests pass against source someone
 # else restored underneath it, and reports a wall of false MISSED.
 #
@@ -37,12 +38,12 @@ _tl_refuse() {   # owner-record
   echo "" >&2
   echo "  Refusing to start: ${owner:-another run} holds the test lock." >&2
   echo "" >&2
-  echo "  The mutation harness rewrites bin/cleat and the shipped scripts in" >&2
-  echo "  place, so running anything against this checkout at the same time" >&2
-  echo "  makes BOTH report failures that are not real. This checkout may be" >&2
-  echo "  shared with a container or another machine, which is where it bites" >&2
-  echo "  hardest: same files, different /tmp, neither run able to see the" >&2
-  echo "  other." >&2
+  echo "  The mutation harness rewrites ten tracked files (bin/cleat, the shipped" >&2
+  echo "  scripts and four test files) in place, so running anything against" >&2
+  echo "  this checkout at the same time makes BOTH report failures that are not" >&2
+  echo "  real. This checkout may be shared with a container or another machine," >&2
+  echo "  which is where it bites hardest: same files, different /tmp, neither" >&2
+  echo "  run able to see the other." >&2
   echo "" >&2
   echo "  Wait for that run, or if you are certain it is dead:" >&2
   echo "    rm -rf $_CLEAT_TEST_LOCK" >&2

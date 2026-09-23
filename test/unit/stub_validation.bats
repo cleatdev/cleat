@@ -244,8 +244,303 @@ EOF
   assert_output "this-is-ps-a-output"
 }
 
+# ── inspect fixtures: one answer per container and per --format ─────────────
+# The shipped arm prints one blob for every inspect, whatever the container or
+# the format, so no test could build "NetworkMode right, CapDrop wrong". The
+# inspect/ directory opts a test into per-container, per-format answers.
+
+@test "stub: inspect --format returns the field named, per container" {
+  mock_docker_inspect_field cleat-a '{{.HostConfig.NetworkMode}}' none
+  mock_docker_inspect_field cleat-a '{{json .HostConfig.CapDrop}}' '["ALL"]'
+  mock_docker_inspect_field cleat-b '{{.HostConfig.NetworkMode}}' bridge
+  mock_docker_inspect_field cleat-b '{{json .HostConfig.CapDrop}}' 'null'
+
+  run run_docker_stub inspect --format '{{json .HostConfig.CapDrop}}' cleat-a
+  assert_success
+  assert_output '["ALL"]'
+  run run_docker_stub inspect --format '{{.HostConfig.NetworkMode}}' cleat-b
+  assert_success
+  assert_output "bridge"
+  run run_docker_stub inspect --format '{{.HostConfig.NetworkMode}}' cleat-a
+  assert_success
+  assert_output "none"
+  run run_docker_stub inspect --format '{{json .HostConfig.CapDrop}}' cleat-b
+  assert_success
+  assert_output "null"
+
+  # A value renders the way the daemon prints it: `\n` expands, so a
+  # {{println}} template answers one line per element, a JSON escape stays as
+  # written, and an empty value is a declared answer rather than a missing one.
+  local env='{{range .Config.Env}}{{println .}}{{end}}'
+  mock_docker_inspect_field cleat-a "$env" 'PATH=/usr/bin\nHOST_UID=501'
+  mock_docker_inspect_field cleat-a '{{json .Config.Labels}}' '{"k":"a\\b \\u00e9"}'
+  run run_docker_stub inspect cleat-a --format '{{json .Config.Labels}}'
+  assert_success
+  assert_output '{"k":"a\\b \\u00e9"}'
+  # A raw newline would split the record, so the helper refuses it.
+  run mock_docker_inspect_field cleat-a "$env" "$(printf 'A\nB')"
+  assert_failure
+  mock_docker_inspect_field cleat-b "$env" ''
+  run run_docker_stub inspect cleat-a --format "$env"
+  assert_success
+  assert_line --index 0 "PATH=/usr/bin"
+  assert_line --index 1 "HOST_UID=501"
+  run run_docker_stub inspect cleat-b --format "$env"
+  assert_success
+  assert_output ""
+  # A record on a final line with no newline still answers.
+  printf '{{.State.Running}}\ttrue' > "$DOCKER_MOCK_DIR/inspect/cleat-c"
+  run run_docker_stub inspect --format '{{.State.Running}}' cleat-c
+  assert_success
+  assert_output "true"
+}
+
+@test "stub: inspect falls back to inspect_output when no fixture directory exists" {
+  # Every shipped reader of the blob depends on this: no inspect/ directory,
+  # so the answer is the blob, byte for byte, whatever was asked.
+  printf 'line one\n{"Mounts":[]}\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  local want
+  want="$(cat "$DOCKER_MOCK_DIR/inspect_output")"
+  run run_docker_stub inspect --format '{{.HostConfig.NetworkMode}}' cleat-a
+  assert_success
+  assert_output "$want"
+  run run_docker_stub inspect cleat-b
+  assert_success
+  assert_output "$want"
+  run run_docker_stub inspect --type container -f '{{.Image}}' x y
+  assert_success
+  assert_output "$want"
+  # `run` strips trailing newlines, so compare one answer as raw bytes too.
+  run_docker_stub inspect --format '{{.HostConfig.NetworkMode}}' cleat-a > "$TEST_TEMP/got"
+  run cmp "$TEST_TEMP/got" "$DOCKER_MOCK_DIR/inspect_output"
+  assert_success
+  run test -e "$DOCKER_MOCK_DIR/inspect"
+  assert_failure
+}
+
+@test "stub: inspect refuses an undeclared container by name" {
+  printf 'BLOB\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  mock_docker_inspect_field cleat-a '{{.State.Running}}' true
+  run run_docker_stub inspect --format '{{.State.Running}}' cleat-b
+  assert_failure 1
+  assert_output "Error: No such object: cleat-b"
+  # A missing name sets rc 1 without suppressing the answers around it.
+  run run_docker_stub inspect --format '{{.State.Running}}' cleat-b cleat-a
+  assert_failure 1
+  assert_line --index 0 "Error: No such object: cleat-b"
+  assert_line --index 1 "true"
+  refute_output --partial "BLOB"
+  # An empty name is a name no container has, and no name at all is a usage
+  # error, never a successful empty read.
+  run run_docker_stub inspect --format '{{.State.Running}}' ""
+  assert_failure 1
+  assert_output "Error: No such object: "
+  run run_docker_stub inspect --format '{{.State.Running}}'
+  assert_failure 1
+  assert_output --partial "requires at least 1 argument"
+}
+
+@test "stub: inspect refuses an undeclared format" {
+  printf 'BLOB\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  mock_docker_inspect_field cleat-a '{{.State.Running}}' true
+  run run_docker_stub inspect --format '{{.State.Status}}' cleat-a
+  assert_failure 1
+  assert_output "Error: no fixture for container cleat-a and format: {{.State.Status}}"
+  # No --format is its own format, __raw__, and it is not declared either.
+  run run_docker_stub inspect cleat-a
+  assert_failure 1
+  assert_output "Error: no fixture for container cleat-a and format: __raw__"
+}
+
+@test "stub: inspect accepts the container name before and after the format flag" {
+  mock_docker_inspect_field cleat-a '{{.HostConfig.Memory}}' 8589934592
+  mock_docker_inspect_field cleat-b '{{.HostConfig.Memory}}' 4294967296
+  mock_docker_inspect_field cleat-a __raw__ '[{"Id":"a"}]'
+
+  run run_docker_stub inspect cleat-a --format '{{.HostConfig.Memory}}'
+  assert_success
+  assert_output "8589934592"
+  run run_docker_stub inspect --format '{{.HostConfig.Memory}}' cleat-a
+  assert_success
+  assert_output "8589934592"
+  run run_docker_stub inspect --format='{{.HostConfig.Memory}}' cleat-a
+  assert_success
+  assert_output "8589934592"
+  run run_docker_stub inspect -f '{{.HostConfig.Memory}}' cleat-a
+  assert_success
+  assert_output "8589934592"
+  run run_docker_stub inspect cleat-a
+  assert_success
+  assert_output '[{"Id":"a"}]'
+  # Several names on one line answer in argv order, as _container_image_ids and
+  # _running_memory_limits_sum pass them.
+  run run_docker_stub inspect --format '{{.HostConfig.Memory}}' cleat-b cleat-a
+  assert_success
+  assert_output "$(printf '4294967296\n8589934592')"
+  # Any other flag is outside the closed set and refuses like a daemon would.
+  run run_docker_stub inspect --type container --format '{{.HostConfig.Memory}}' cleat-a
+  assert_failure 125
+  assert_output --partial "unsupported docker inspect flag in fixture mode: --type"
+}
+
+@test "stub: inspect answers repeated records in order and repeats the last" {
+  local h='{{.State.Health.Status}}' r='{{.State.Running}}'
+  mock_docker_inspect_field cleat-gw-a "$h" starting
+  mock_docker_inspect_field cleat-gw-a "$r" true
+  mock_docker_inspect_field cleat-gw-a "$h" starting
+  mock_docker_inspect_field cleat-gw-a "$h" healthy
+  # The second format is read between the health polls, the way a caller reads
+  # labels and running state first. It must not move the health cursor.
+  local want=(starting true starting true healthy true healthy healthy) got=() i fmt
+  for i in 0 1 2 3 4 5 6 7; do
+    fmt="$h"
+    case "$i" in 1|3|5) fmt="$r" ;; esac
+    run run_docker_stub inspect --format "$fmt" cleat-gw-a
+    assert_success
+    got+=("$output")
+  done
+  assert_equal "${got[*]}" "${want[*]}"
+}
+
+# ── volume, cp and create arms ──────────────────────────────────────────────
+
+@test "stub: docker volume ls returns volume_ls_output" {
+  run run_docker_stub volume ls --filter label=sh.cleat.role=egress-sock --format '{{.Name}}'
+  assert_success
+  assert_output ""
+  printf 'cleat-gw-aaaa-sock\ncleat-gw-bbbb-sock\n' > "$DOCKER_MOCK_DIR/volume_ls_output"
+  run run_docker_stub volume ls --filter label=sh.cleat.role=egress-sock --format '{{.Name}}'
+  assert_success
+  assert_output "$(printf 'cleat-gw-aaaa-sock\ncleat-gw-bbbb-sock')"
+}
+
+@test "stub: docker volume inspect answers per volume and refuses an undeclared one" {
+  printf '{"blob":true}\n' > "$DOCKER_MOCK_DIR/volume_inspect_output"
+  run run_docker_stub volume inspect --format '{{json .Labels}}' cleat-gw-anything-sock
+  assert_success
+  assert_output '{"blob":true}'
+  mock_docker_volume_inspect_field cleat-gw-aaaa-sock '{{json .Labels}}' '{"sh.cleat.gateway-for":"aaaa"}'
+  run run_docker_stub volume inspect --format '{{json .Labels}}' cleat-gw-aaaa-sock
+  assert_success
+  assert_output '{"sh.cleat.gateway-for":"aaaa"}'
+  run run_docker_stub volume inspect --format '{{json .Labels}}' cleat-gw-bbbb-sock
+  assert_failure 1
+  assert_output "Error: No such volume: cleat-gw-bbbb-sock"
+}
+
+@test "stub: docker volume rm honours DOCKER_VOLUME_EXIT_CODE" {
+  export DOCKER_STUB_STRICT=1
+  run run_docker_stub volume create cleat-gw-aaaa-sock
+  assert_success
+  export DOCKER_VOLUME_EXIT_CODE=1
+  run run_docker_stub volume rm cleat-gw-aaaa-sock
+  assert_failure 1
+  # The rm failed, so the volume is still live and a run may mount it.
+  unset DOCKER_VOLUME_EXIT_CODE
+  run run_docker_stub run -v cleat-gw-aaaa-sock:/run/cleat-egress:ro test-image
+  assert_success
+  run run_docker_stub volume rm cleat-gw-aaaa-sock
+  assert_success
+}
+
+@test "stub: strict mode rejects a cleat-gw volume that is not live" {
+  export DOCKER_STUB_STRICT=1
+  # Never created.
+  run run_docker_stub run -v cleat-gw-never-sock:/run/cleat-egress:ro test-image
+  assert_failure 125
+  assert_output --partial "named volume is not live in this test: cleat-gw-never-sock"
+  # Created, then removed before the run: the teardown-ordering shape.
+  run run_docker_stub volume create cleat-gw-gone-sock
+  assert_success
+  run run_docker_stub volume rm cleat-gw-gone-sock
+  assert_success
+  run run_docker_stub run -v cleat-gw-gone-sock:/run/cleat-egress:ro test-image
+  assert_failure 125
+  assert_output --partial "not live in this test: cleat-gw-gone-sock"
+  # A create that failed never made the volume.
+  export DOCKER_VOLUME_EXIT_CODE=1
+  run run_docker_stub volume create cleat-gw-failed-sock
+  assert_failure 1
+  unset DOCKER_VOLUME_EXIT_CODE
+  run run_docker_stub run -v cleat-gw-failed-sock:/run/cleat-egress:ro test-image
+  assert_failure 125
+  assert_output --partial "not live in this test: cleat-gw-failed-sock"
+  # So did one that failed under the global exit code.
+  export DOCKER_EXIT_CODE=1
+  run run_docker_stub volume create cleat-gw-global-sock
+  assert_failure 1
+  export DOCKER_EXIT_CODE=0
+  run run_docker_stub run -v cleat-gw-global-sock:/run/cleat-egress:ro test-image
+  assert_failure 125
+  assert_output --partial "not live in this test: cleat-gw-global-sock"
+  # Created and still there, with the name before or after the flags.
+  run run_docker_stub volume create --label sh.cleat.role=egress-sock cleat-gw-live-sock
+  assert_success
+  run run_docker_stub run -v cleat-gw-live-sock:/run/cleat-egress:ro test-image
+  assert_success
+  run run_docker_stub volume create cleat-gw-first-sock --label sh.cleat.role=egress-sock
+  assert_success
+  run run_docker_stub run --volume=cleat-gw-first-sock:/run/cleat-egress:ro test-image
+  assert_success
+}
+
+@test "stub: docker cp still fails under the global DOCKER_EXIT_CODE" {
+  run run_docker_stub cp "$TEST_TEMP/x" cleat-a:/tmp/x
+  assert_success
+  export DOCKER_EXIT_CODE=1 DOCKER_STDERR="Error: No such container: cleat-a"
+  run run_docker_stub cp "$TEST_TEMP/x" cleat-a:/tmp/x
+  assert_failure 1
+  assert_output "Error: No such container: cleat-a"
+  export DOCKER_CP_EXIT_CODE=3
+  run run_docker_stub cp "$TEST_TEMP/x" cleat-a:/tmp/x
+  assert_failure 3
+}
+
+@test "stub: docker create is validated in strict mode" {
+  export DOCKER_STUB_STRICT=1
+  run run_docker_stub create -v /nonexistent/path:/x test-image
+  assert_failure 125
+  assert_output --partial "bind source path does not exist: /nonexistent/path"
+  run run_docker_stub create --name gw -v cleat-gw-never-sock:/run/cleat-egress test-image
+  assert_failure 125
+  assert_output --partial "not live in this test: cleat-gw-never-sock"
+  mkdir -p "$TEST_TEMP/src"
+  run run_docker_stub create --name gw -v "$TEST_TEMP/src:/x:ro" test-image
+  assert_success
+  export DOCKER_CREATE_EXIT_CODE=1
+  run run_docker_stub create --name gw -v "$TEST_TEMP/src:/x:ro" test-image
+  assert_failure 1
+}
+
+# ── The run-line helpers select one container's line, by --name ─────────────
+
+@test "stub: assert_docker_run_has picks the line named by the container, not the last matching line" {
+  # A named box's container name extends the default box's, so a substring
+  # match on the default name also selects the named box, created later.
+  local main="cleat-project-12345678" dev="cleat-project-12345678-dev"
+  run run_docker_stub run -d --name "$main" --memory 8g test-image
+  run run_docker_stub run -d --name "$dev" --memory 4g test-image
+  run assert_docker_run_has "$main" "--memory 8g"
+  assert_success
+  run assert_docker_run_lacks "$main" "--memory 4g"
+  assert_success
+  run assert_docker_run_has "$dev" "--memory 4g"
+  assert_success
+}
+
+@test "stub: assert_docker_run_lacks fails when no run line names the container" {
+  run run_docker_stub run -d --name cleat-other-12345678 test-image
+  run assert_docker_run_lacks cleat-never-created "--privileged"
+  assert_failure
+  assert_output "No docker run call found for container 'cleat-never-created'"
+  # The way to prove a container was never created.
+  run docker_run_line_for cleat-never-created
+  assert_success
+  assert_output ""
+}
+
 # ── The suite and the mutation harness must never run at once ───────────────
-# The harness rewrites nine tracked files in place. Anything reading or
+# The harness rewrites ten tracked files in place. Anything reading or
 # EXECUTING them meanwhile fails for reasons unrelated to any change, and the
 # harness reports false MISSED against source someone else restored. Both
 # happened for real, including ACROSS MACHINES: a run inside a Cleat box and a
@@ -253,6 +548,65 @@ EOF
 # the lock lives in the repo. See test/lib/testlock.sh.
 
 _lock_lib() { printf '%s\n' "$PROJECT_ROOT/test/lib/testlock.sh"; }
+
+# Law L7: every entry runs against pristine targets, whatever ran before it.
+# Restoring only the file about to be mutated left each mutation on disk for
+# every later entry, so a result depended on registry order and on the shard.
+@test "harness: an entry never observes an earlier entry's mutation" {
+  cat > "$TEST_TEMP/registry" << 'EOF'
+cat > "$SED_TMP" << 'SED'
+s/pristine/mutated/
+SED
+try "first" "probe" "$SETUP_BASH" "$REPO_ROOT/test/unit/probe.bats"
+try "second" "probe" "$INSTALLER" "$REPO_ROOT/test/unit/probe.bats"
+EOF
+  mutation_harness_tree "$TEST_TEMP/registry"
+  export HARNESS_OBS="$TEST_TEMP/obs" _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/harness/.lock"
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_success
+  run cat "$HARNESS_OBS"
+  assert_output "$(printf '%s\n' 'mutated test/setup.bash' 'pristine install.sh' \
+    'pristine test/setup.bash' 'mutated install.sh')"
+  run cat "$TEST_TEMP/harness/test/setup.bash" "$TEST_TEMP/harness/install.sh"
+  assert_output "$(printf '%s\n' 'pristine test/setup.bash' 'pristine install.sh')"
+}
+
+@test "harness: a backup that vanished mid-run stops the run before any mutation" {
+  cat > "$TEST_TEMP/registry" << 'EOF'
+cat > "$SED_TMP" << 'SED'
+s/pristine/mutated/
+SED
+rm -f "$INSTALLER_BACKUP"
+try "orphan" "probe" "$INSTALLER" "$REPO_ROOT/test/unit/probe.bats"
+EOF
+  mutation_harness_tree "$TEST_TEMP/registry"
+  export HARNESS_OBS="$TEST_TEMP/obs" _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/harness/.lock"
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_failure 2
+  assert_output --partial "the backup of install.sh is gone"
+  run cat "$TEST_TEMP/harness/install.sh"
+  assert_output "pristine install.sh"
+}
+
+@test "harness: an entry whose target has no backup is refused, not mutated" {
+  cat > "$TEST_TEMP/registry" << 'EOF'
+cat > "$SED_TMP" << 'SED'
+s/pristine/mutated/
+SED
+try "stray" "probe" "$REPO_ROOT/test/unit/probe.bats" "$REPO_ROOT/test/unit/probe.bats"
+EOF
+  mutation_harness_tree "$TEST_TEMP/registry"
+  export HARNESS_OBS="$TEST_TEMP/obs" _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/harness/.lock"
+  cp "$TEST_TEMP/harness/test/unit/probe.bats" "$TEST_TEMP/probe.before"
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_failure 1
+  assert_output --partial "stray: NOT A TARGET"
+  run cmp "$TEST_TEMP/probe.before" "$TEST_TEMP/harness/test/unit/probe.bats"
+  assert_success
+}
 
 @test "lock: the suite refuses while the harness holds it" {
   export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
@@ -267,19 +621,30 @@ _lock_lib() { printf '%s\n' "$PROJECT_ROOT/test/lib/testlock.sh"; }
 
 @test "lock: the harness refuses while the suite holds it, WITHOUT writing anything" {
   # The refusal path must run before the backups and before the cleanup trap.
-  # Both of those cp over the nine tracked files, so a refused harness that
-  # reached them would perform the very write the lock exists to prevent.
+  # Both of those cp over the ten tracked files, so a refused harness that
+  # reached them would perform the very write the lock exists to prevent. A
+  # content checksum cannot see a restore that writes the same bytes back, so
+  # the ten targets are backdated and the check is that none of them moved.
+  : > "$TEST_TEMP/registry"
+  mutation_harness_tree "$TEST_TEMP/registry"
+  local h="$TEST_TEMP/harness" f targets=()
+  for f in bin/cleat install.sh docker/entrypoint.sh docker/open-bridge docker/clip-daemon \
+    docker/clip test.sh test/integration/lifecycle.bats test/setup.bash \
+    test/fixtures/mock_bin/docker; do
+    touch -t 200001010000 "$h/$f"
+    targets+=("$h/$f")
+  done
+  touch -t 200001010001 "$TEST_TEMP/marker"
   export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
   mkdir -p "$_CLEAT_TEST_LOCK_DIR"
   echo "the test suite host $(hostname) pid $$ at $(date +%s)" > "$_CLEAT_TEST_LOCK_DIR/owner"
 
-  local before after
-  before="$(cat "$CLI" | cksum)"
-  run "$PROJECT_ROOT/test/mutation_regressions.sh"
-  after="$(cat "$CLI" | cksum)"
+  run "$h/test/mutation_regressions.sh"
   assert_failure
   assert_output --partial "holds the test lock"
-  [[ "$before" == "$after" ]] || { echo "the refused harness rewrote bin/cleat"; return 1; }
+  run find "${targets[@]}" -newer "$TEST_TEMP/marker"
+  assert_success
+  assert_output ""
 }
 
 @test "lock: a holder on ANOTHER machine is obeyed, never pid-probed" {

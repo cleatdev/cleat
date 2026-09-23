@@ -345,6 +345,36 @@ mock_docker_inspect() {
   printf '%s\n' "$1" > "$DOCKER_MOCK_DIR/inspect_output"
 }
 
+# Declare one inspect answer. Opts this test into fixture mode on first call.
+# Repeating a format for one container builds a sequence answered in
+# declaration order, and the last record repeats. In the value, `\n` and `\t`
+# expand and nothing else does, so `\n` answers on two lines the way a
+# {{println}} template does and a JSON value is written verbatim. A raw newline
+# would split the record, so it is refused rather than silently truncated.
+mock_docker_inspect_field() {
+  _mock_inspect_record "$DOCKER_MOCK_DIR/inspect" "$@"
+}
+
+# The same for `docker volume inspect`, one file per volume name.
+mock_docker_volume_inspect_field() {
+  _mock_inspect_record "$DOCKER_MOCK_DIR/volume_inspect" "$@"
+}
+
+_mock_inspect_record() {   # dir name format value
+  case "$3" in
+    ''|*$'\t'*|*$'\n'*)
+      echo "mock inspect fixture: the format must be one line with no tab: $3" >&2
+      return 1 ;;
+  esac
+  case "$4" in
+    *$'\n'*)
+      echo "mock inspect fixture: write a newline in the value as \\n" >&2
+      return 1 ;;
+  esac
+  mkdir -p "$1"
+  printf '%s\t%s\n' "$3" "$4" >> "$1/$2"
+}
+
 # The `docker top` process table, header row first. With no file the stub prints
 # nothing, which _box_has_live_agent reads as "live" (its fail-safe).
 mock_docker_top() {
@@ -356,6 +386,38 @@ mock_docker_top() {
 # short-circuit.
 mock_docker_image_cached() {
   printf '%s\n' "$1" >> "$DOCKER_MOCK_DIR/cached_images"
+}
+
+# A throwaway checkout for the mutation harness: its real script with the
+# registry replaced by the entries in $1, its real lock library, the ten
+# tracked targets as one-line files that read "pristine <path>", and a
+# test/unit/probe.bats that appends test/setup.bash and install.sh to
+# $HARNESS_OBS, then fails. Run "$TEST_TEMP/harness/test/mutation_regressions.sh".
+mutation_harness_tree() {
+  local t="$TEST_TEMP/harness" f
+  mkdir -p "$t/bin" "$t/docker" "$t/test/lib" "$t/test/unit" "$t/test/integration" \
+    "$t/test/fixtures/mock_bin"
+  cp "$PROJECT_ROOT/test/lib/testlock.sh" "$t/test/lib/"
+  ln -s "$PROJECT_ROOT/test/bats" "$t/test/bats"
+  for f in bin/cleat install.sh docker/entrypoint.sh docker/open-bridge docker/clip-daemon \
+    docker/clip test.sh test/integration/lifecycle.bats test/setup.bash \
+    test/fixtures/mock_bin/docker; do
+    printf 'pristine %s\n' "$f" > "$t/$f"
+  done
+  awk -v reg="$1" '
+    index($0, "echo \"${BOLD}Running regression mutations${RESET}\"") == 1 {
+      print; while ((getline l < reg) > 0) print l; skip = 1; next
+    }
+    index($0, "echo \"${BOLD}Mutation test summary${RESET}\"") == 1 { skip = 0 }
+    !skip { print }
+  ' "$PROJECT_ROOT/test/mutation_regressions.sh" > "$t/test/mutation_regressions.sh"
+  chmod +x "$t/test/mutation_regressions.sh"
+  cat > "$t/test/unit/probe.bats" << 'PROBE'
+@test "probe" {
+  cat "$BATS_TEST_DIRNAME/../setup.bash" "$BATS_TEST_DIRNAME/../../install.sh" >> "$HARNESS_OBS"
+  false
+}
+PROBE
 }
 
 # Read all recorded docker calls
@@ -376,14 +438,24 @@ docker_build_calls() {
   grep "^docker build " "$DOCKER_CALLS" || true
 }
 
+# The recorded `docker run` line for ONE container, anchored on `--name <cname> `.
+# A bare `grep "$cname"` matches any OTHER container whose argv merely mentions
+# this name (a gateway's label, a --volumes-from), and which line wins then
+# depends on creation order. Anchoring removes the ordering dependency.
+docker_run_line_for() {
+  grep "^docker run " "$DOCKER_CALLS" | grep -F -e "--name $1 " | tail -1
+}
+
 # Assert that a docker run call for a given container contains a substring.
 # These use echo+exit instead of fail/return, so they work under set +e.
+# Both take exactly (cname, needle). A `--` between them is the needle, not an
+# end of options, and every recorded run line contains one.
 # Usage: run assert_docker_run_has "container-name" "--memory 8g"
 #        assert_success
 assert_docker_run_has() {
   local cname="$1" needle="$2"
   local run_line
-  run_line="$(grep "^docker run " "$DOCKER_CALLS" | grep "$cname" | tail -1)"
+  run_line="$(docker_run_line_for "$cname")"
   if [[ -z "$run_line" ]]; then
     echo "No docker run call found for container '$cname'" >&2
     exit 1
@@ -395,11 +467,18 @@ assert_docker_run_has() {
   fi
 }
 
+# Fails when no line is selected, like assert_docker_run_has: a container that
+# was never created lacks everything, which proves nothing. To assert that a
+# container was never created, run docker_run_line_for and assert_output "".
 assert_docker_run_lacks() {
   local cname="$1" needle="$2"
   local run_line
-  run_line="$(grep "^docker run " "$DOCKER_CALLS" | grep "$cname" | tail -1)"
-  if [[ -n "$run_line" ]] && [[ "$run_line" == *"$needle"* ]]; then
+  run_line="$(docker_run_line_for "$cname")"
+  if [[ -z "$run_line" ]]; then
+    echo "No docker run call found for container '$cname'" >&2
+    exit 1
+  fi
+  if [[ "$run_line" == *"$needle"* ]]; then
     echo "docker run for '$cname' should not contain '$needle'" >&2
     exit 1
   fi

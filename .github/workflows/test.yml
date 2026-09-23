@@ -104,7 +104,8 @@ jobs:
   # pushed CI toward timing out before it could catch anything. Splitting also
   # runs the two in parallel, which cuts total wall clock rather than adding to
   # it. The harness must never run concurrently with another copy of itself: it
-  # mutates bin/cleat in place and restores from a backup on exit.
+  # mutates ten tracked files in place, restores all ten before every entry and
+  # again on exit.
   #
   # Cap sized from a measured run: the last green CI run spent 1343 s on 582
   # mutations (about 2.3 s each). The registry now holds about 1290 entries,

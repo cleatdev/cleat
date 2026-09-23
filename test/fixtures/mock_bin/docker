@@ -8,10 +8,14 @@
 # Opt-in strict modes (enable via env vars):
 #
 #   DOCKER_STUB_STRICT=1
-#     Validates `docker run -v SRC:DEST[:FLAGS]` arguments:
+#     Validates `docker run -v SRC:DEST[:FLAGS]` arguments (and `docker create`):
 #     - SRC must exist on the host filesystem
 #     - DEST must be absolute
 #     - Flags limited to ro/rw/z/Z/delegated/cached/consistent
+#     - A named volume starting `cleat-gw-` must be live in this test (created
+#       by `docker volume create`, not removed since). A real daemon
+#       auto-creates a missing named volume empty, so an ordering bug would
+#       otherwise pass unseen. Every other named volume is skipped.
 #     Failure mode mimics real docker: exit 125, stderr "Error response from
 #     daemon: invalid mount".
 #
@@ -25,7 +29,16 @@
 #   ps_output     : for `docker ps --filter ...`
 #   ps_a_output   : for `docker ps -a --filter ...`
 #   images_output : for `docker images ...`
-#   inspect_output: for `docker inspect ...`
+#   inspect_output: for `docker inspect ...`, one blob for every container and
+#                   every --format, unless the inspect/ directory exists
+#   inspect/<container-name>: per-container, per-format answers, one
+#                   `<format><TAB><value>` record per line. The directory's
+#                   presence opts the test in. See _stub_inspect.
+#   volume_ls_output     : for `docker volume ls ...`
+#   volume_inspect_output: for `docker volume inspect ...`, unless the
+#                   volume_inspect/ directory exists, which answers per volume
+#                   and per format exactly as inspect/ does per container
+#   volumes       : state, not a response. The live named volumes of this test.
 #
 # Every call is appended to $DOCKER_CALLS (one call per line; multi-arg
 # commands like `docker exec container bash -c 'foo'` are written on a
@@ -39,6 +52,9 @@
 #   $DOCKER_PULL_EXIT_CODE   : `docker pull`   (default 1, no registry in tests)
 #   $DOCKER_RUN_EXIT_CODE    : `docker run`    (default: falls through to 0)
 #   $DOCKER_COMMIT_EXIT_CODE : `docker commit` (default 0)
+#   $DOCKER_VOLUME_EXIT_CODE : `docker volume` (default: falls through)
+#   $DOCKER_CP_EXIT_CODE     : `docker cp`     (default: falls through)
+#   $DOCKER_CREATE_EXIT_CODE : `docker create` (default: falls through)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Record the call (always, for observability)
@@ -60,10 +76,18 @@ _stub_die() {
 # Returns 0 if valid, calls _stub_die if invalid.
 _validate_mount_spec() {
   local spec="$1"
-  # Split into SRC, DEST, FLAGS using parameter expansion.
-  # Named volumes (no leading /) are allowed and skipped.
-  [[ "$spec" == /* ]] || return 0
+  # Named volumes (no leading /) are skipped, except a gateway socket volume,
+  # which must be live in this test: created, and not removed since.
+  if [[ "$spec" != /* ]]; then
+    case "$spec" in
+      cleat-gw-*)
+        grep -Fxq -e "${spec%%:*}" "${DOCKER_MOCK_DIR:-}/volumes" 2>/dev/null \
+          || _stub_die "named volume is not live in this test: ${spec%%:*}" ;;
+    esac
+    return 0
+  fi
 
+  # Split into SRC, DEST, FLAGS using parameter expansion.
   local src="${spec%%:*}"
   local rest="${spec#*:}"
   local dest flags
@@ -192,6 +216,109 @@ _handle_image_inspect() {
   done
 }
 
+# Per-container, per-format inspect. Opt-in: the presence of the `inspect`
+# DIRECTORY switches this arm over. Absent, the answer is byte-identical to
+# the shipped stub and every shipped reader of the blob is untouched.
+# Records that share a container and a format are a sequence: the Nth call
+# answers the Nth record and the last one repeats. The cursor for each pair
+# lives in inspect/.seq/<container>.<cksum of the format>.
+# `docker volume inspect` reuses it over volume_inspect/, with the object
+# noun in its errors: _STUB_INSPECT_DIR and _STUB_INSPECT_NOUN pick which.
+_stub_inspect() {
+  local fmt="" want_fmt=0 names="" rc=0 a tab ck seqf nl bsn bst
+  local base="${_STUB_INSPECT_DIR:-${DOCKER_MOCK_DIR}/inspect}"
+  local noun="${_STUB_INSPECT_NOUN:-container}"
+  tab=$'\t'; nl=$'\n'; bsn='\n'; bst='\t'
+  shift                       # drop the literal `inspect`
+  for a in "$@"; do
+    if [[ "$want_fmt" -eq 1 ]]; then fmt="$a"; want_fmt=0; continue; fi
+    case "$a" in
+      --format=*)   fmt="${a#--format=}" ;;
+      --format|-f)  want_fmt=1 ;;
+      -*)           _stub_die "unsupported docker inspect flag in fixture mode: $a" ;;
+      '')           echo "Error: No such object: " >&2; rc=1 ;;
+      *)            names="$names $a" ;;
+    esac
+  done
+  if [[ -z "$names" && "$rc" -eq 0 ]]; then
+    echo "\"docker inspect\" requires at least 1 argument." >&2
+    exit 1
+  fi
+  [[ -n "$fmt" ]] || fmt="__raw__"
+  ck="$(printf '%s' "$fmt" | cksum)"
+  ck="${ck%% *}"
+  for a in $names; do
+    local f="$base/$a"
+    if [[ ! -f "$f" ]]; then
+      if [[ "$noun" == volume ]]; then
+        echo "Error: No such volume: $a" >&2
+      else
+        echo "Error: No such object: $a" >&2
+      fi
+      rc=1
+      continue
+    fi
+    local line found=0 key val ans="" i=0 n=0
+    seqf="$base/.seq/$a.$ck"
+    [[ -f "$seqf" ]] && read -r n < "$seqf"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      key="${line%%$tab*}"
+      val="${line#*$tab}"
+      [[ "$key" == "$fmt" ]] || continue
+      ans="$val"; found=1
+      [[ "$i" -ge "$n" ]] && break
+      i=$((i + 1))
+    done < "$f"
+    if [[ "$found" -eq 0 ]]; then
+      echo "Error: no fixture for $noun $a and format: $fmt" >&2
+      rc=1
+      continue
+    fi
+    mkdir -p "$base/.seq"
+    echo $((n + 1)) > "$seqf"
+    # `\n` and `\t` expand and nothing else, so a JSON value is written
+    # verbatim and every bash answers alike (printf %b expands \u only from
+    # bash 4.2, and turns \\ and \c into something no daemon prints).
+    ans=${ans//"$bsn"/$nl}
+    ans=${ans//"$bst"/$tab}
+    printf '%s\n' "$ans"
+  done
+  exit "$rc"
+}
+
+# Named-volume state for the strict cleat-gw- check: one live name per line in
+# $DOCKER_MOCK_DIR/volumes. A per-test file, because DOCKER_MOCK_DIR sits under
+# the fresh mktemp -d every _common_setup makes.
+_stub_volume_add() {
+  local name=""
+  shift 2                                # drop `volume create`
+  # The name is the one argument that is not a flag or a flag's value, in any
+  # position: Docker takes `volume create NAME --label k=v` as readily as the
+  # name last, and a ledger that recorded a label value would refuse a live
+  # volume.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name=*)                              name="${1#--name=}" ;;
+      --name)                                shift; name="${1:-}" ;;
+      -d|--driver|-l|--label|-o|--opt)       shift ;;
+      -*)                                    ;;
+      *)                                     name="$1" ;;
+    esac
+    [[ $# -gt 0 ]] && shift
+  done
+  [[ -n "$name" ]] && printf '%s\n' "$name" >> "${DOCKER_MOCK_DIR}/volumes"
+}
+_stub_volume_del() {
+  local a f="${DOCKER_MOCK_DIR}/volumes"
+  shift 2                                # drop `volume rm`
+  [[ -f "$f" ]] || return 0
+  for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    grep -Fxv -e "$a" "$f" > "$f.tmp" || true
+    mv "$f.tmp" "$f"
+  done
+}
+
 # ─── Subcommand dispatch ───────────────────────────────────────────────────
 case "$1" in
   ps)
@@ -209,6 +336,8 @@ case "$1" in
     _mock "images_output"
     ;;
   inspect)
+    # _stub_inspect always exits, so the blob is read only outside fixture mode.
+    [[ -d "${DOCKER_MOCK_DIR:-}/inspect" ]] && _stub_inspect "$@"
     _mock "inspect_output"
     ;;
   top)
@@ -234,6 +363,37 @@ case "$1" in
     # Tests that need a `docker run` to fail (e.g. installer failure in
     # upgrade-claude) set DOCKER_RUN_EXIT_CODE.
     [[ -n "${DOCKER_RUN_EXIT_CODE:-}" ]] && exit "$DOCKER_RUN_EXIT_CODE"
+    ;;
+  create)
+    # Validated exactly like `run`, so a create cannot slip a bad bind mount
+    # past DOCKER_STUB_STRICT or DOCKER_STUB_SIMULATE_VIRTIOFS.
+    _validate_docker_run "$@"
+    [[ -n "${DOCKER_CREATE_EXIT_CODE:-}" ]] && exit "$DOCKER_CREATE_EXIT_CODE"
+    ;;
+  volume)
+    # The volume ledger moves only on a call that succeeds, which is what a
+    # failed create or rm leaves on a real daemon. No `exit` without an
+    # override: the fallthrough still honours DOCKER_STDERR and DOCKER_EXIT_CODE.
+    _vrc="${DOCKER_VOLUME_EXIT_CODE:-${DOCKER_EXIT_CODE:-0}}"
+    case "${2:-}" in
+      ls)      _mock "volume_ls_output" ;;
+      inspect)
+        # Per-volume answers when volume_inspect/ exists, as for containers.
+        if [[ -d "${DOCKER_MOCK_DIR:-}/volume_inspect" ]]; then
+          shift
+          _STUB_INSPECT_DIR="$DOCKER_MOCK_DIR/volume_inspect" \
+            _STUB_INSPECT_NOUN=volume _stub_inspect "$@"
+        fi
+        _mock "volume_inspect_output" ;;
+      create)  [[ "$_vrc" -eq 0 ]] && _stub_volume_add "$@" ;;
+      rm)      [[ "$_vrc" -eq 0 ]] && _stub_volume_del "$@" ;;
+    esac
+    [[ -n "${DOCKER_VOLUME_EXIT_CODE:-}" ]] && exit "$DOCKER_VOLUME_EXIT_CODE"
+    ;;
+  cp)
+    # Three live call sites in bin/cleat. A test that sets only the global
+    # DOCKER_EXIT_CODE still sees `docker cp` fail through the fallthrough.
+    [[ -n "${DOCKER_CP_EXIT_CODE:-}" ]] && exit "$DOCKER_CP_EXIT_CODE"
     ;;
   image)
     # `docker image inspect <ref>` is the only image subcommand currently

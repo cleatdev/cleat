@@ -136,8 +136,20 @@ not ok (harness) bats exited $bats_rc without reporting a failure: the run was k
   if [[ "$file_fail" -gt 0 ]]; then
     echo -e "  ${RED}✖${RESET} ${fname}  ${DIM}(${file_pass} passed, ${RED}${file_fail} failed${RESET}${DIM})${RESET}"
     failed_files+=("$fname")
-    # Show failure details indented
-    echo "$output" | grep -A5 "^not ok" | sed 's/^/      /'
+    # Show each failing test's WHOLE diagnostic block, indented. It used to be
+    # `grep -A5`, but bats-assert prints the expected and actual values AFTER
+    # the assertion header, so five lines showed which assertion failed and cut
+    # off what it saw. A CI-only failure on 2026-09-22 was undiagnosable because
+    # of it. Every `#` line up to the next test is kept, capped at 80 per failure
+    # so a runaway dump cannot bury the summary.
+    echo "$output" | awk '
+      /^not ok / { show = 1; n = 0; print; next }
+      /^ok / { show = 0; next }
+      show && /^#/ {
+        n++
+        if (n <= 80) print
+        else if (n == 81) print "# ... (cut at 80 lines)"
+      }' | sed 's/^/      /'
   else
     local_info=""
     if [[ "$file_skip" -gt 0 ]]; then

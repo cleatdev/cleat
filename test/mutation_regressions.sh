@@ -3616,6 +3616,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v1.5.1_uid_map_macos_gate" "macOS host keeps its own ids and never measures" "$CLI" "$DOCKER_COMMANDS_BATS"
 
+# v1.5.2 TEST RUNNER: each failing test's whole diagnostic block must reach the
+# summary. Back to `grep -A5` and bats-assert's expected/actual lines are cut
+# off, which is what made a CI-only failure undiagnosable. The awk program runs
+# over several lines, so the rest of it is swallowed as a quoted argument.
+cat > "$SED_TMP" << 'SED'
+s#^    echo "$output" | awk '$#    echo "$output" | grep -A5 "^not ok" | sed 's/^/      /'; true '#
+SED
+try "v1.5.2_testsh_full_failure_block" "test runner shows what a failed assertion actually saw" "$TEST_SH" "$REGRESSIONS"
+
 # ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
 # Collapse the predicate to always-VM (flip the host-local fall-through return):
 # the native ready test fails.

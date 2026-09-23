@@ -43,6 +43,18 @@ teardown() {
   rm -rf $CLEAT_RUN_DIR/cleat-project-*/hooks 2>/dev/null || true
   rm -rf $CLEAT_RUN_DIR/cleat-project-*/clip 2>/dev/null || true
   hb_teardown_pids 2>/dev/null || true
+  # A race test that failed says what its racing command printed and how far the
+  # handshake got. One of these failed once on a CI runner and passed in 300
+  # local runs, and its log held only the assertion, so the next one has to
+  # explain itself. Quiet for every test that passes.
+  if [[ -z "${BATS_TEST_COMPLETED:-}" && -f "${TEST_TEMP:-}/race.out" ]]; then
+    local esc; esc="$(printf '\033')"
+    echo "# the racing command printed:"
+    sed "s/${esc}\[[0-9;]*m//g" "$TEST_TEMP/race.out" 2>/dev/null | sed 's/^/#   /'
+    echo "# handshake: hooked=$([[ -e "$TEST_TEMP/race.hooked" ]] && echo y || echo n)" \
+      "waiting=$([[ -e "$TEST_TEMP/race.waiting" ]] && echo y || echo n)" \
+      "done=$([[ -e "$TEST_TEMP/race.done" ]] && echo y || echo n)"
+  fi
   _common_teardown
 }
 
@@ -2878,6 +2890,33 @@ SCRIPT
   run bash -c "id() { echo 501; }; export HOME='$TEST_TEMP/uidmaphome2'; unset XDG_CONFIG_HOME DOCKER_CONTEXT DOCKER_HOST; source '$stripped'; printf '%s\n' \"\${CLAUDE_ENV[@]}\""
   assert_success
   refute_output --partial "IS_SANDBOX"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.2: the suite runner printed `grep -A5` after each "not ok", and
+# bats-assert puts the expected and actual values AFTER its assertion header, so
+# a failure showed which line failed and cut off what it saw. A CI-only failure
+# on 2026-09-22 could not be diagnosed from its log for exactly that reason. Run
+# a copy of test.sh against one fixture that fails on purpose and demand the
+# value the fixture really saw in the summary.
+@test "regression v1.5.2: the test runner shows what a failed assertion actually saw" {
+  local h="$TEST_TEMP/runner"
+  mkdir -p "$h/test/unit" "$h/test/lib"
+  cp "$PROJECT_ROOT/test.sh" "$h/test.sh"
+  cp "$PROJECT_ROOT/test/lib/testlock.sh" "$h/test/lib/testlock.sh"
+  ln -s "$PROJECT_ROOT/test/bats" "$h/test/bats"
+  cat > "$h/test/unit/fixture.bats" <<EOF
+load '$PROJECT_ROOT/test/test_helper/bats-support/load'
+load '$PROJECT_ROOT/test/test_helper/bats-assert/load'
+@test "fixture fails on purpose" {
+  run echo "the-value-it-really-saw"
+  assert_output "what-it-expected"
+}
+EOF
+  run bash "$h/test.sh" < /dev/null
+  assert_failure
+  assert_output --partial "fixture fails on purpose"
+  assert_output --partial "the-value-it-really-saw"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

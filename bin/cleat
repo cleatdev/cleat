@@ -16675,6 +16675,15 @@ _ACCOUNT_LOCK_UNWRITABLE=0
 
 _account_lock_path() { printf '%s' "$CLEAT_ACCOUNTS_DIR/.lock"; }
 
+# Is something other than a directory at PATH? One type test per kind, never
+# "exists and is not a directory": a lock released between those two stats read
+# as planted, so a waiter gave up at the moment the lock came free. No test here
+# is true for a directory or for nothing, whenever either comes or goes. The box
+# script's refresh lock uses it too (_hb_lock_take).
+_lock_path_planted() {
+  [[ -L "$1" || -f "$1" || -p "$1" || -S "$1" || -b "$1" || -c "$1" ]]
+}
+
 # One poll while another command holds the lock. A function so a test can
 # observe a waiter instead of timing one.
 _account_lock_pause() { sleep 0.1; }
@@ -16727,7 +16736,7 @@ _account_lock() {
   lock="$(_account_lock_path)"
   max=$(( _ACCOUNT_LOCK_WAIT_S * 10 ))
   while :; do
-    if [[ -L "$lock" ]] || { [[ -e "$lock" ]] && [[ ! -d "$lock" ]]; }; then
+    if _lock_path_planted "$lock"; then
       # This CLI only ever makes a directory here, so anything else was planted.
       # It is never followed, cleared or waited on.
       return "$_ACCOUNT_LOCK_BUSY"
@@ -16748,7 +16757,10 @@ _account_lock() {
     # So the path is looked at. Nothing there means the failure was not EEXIST,
     # and the wait is over before it starts. A release that landed between the
     # mkdir and this look leaves nothing there either, so the make is retried
-    # once, without a pause, before the directory is called unwritable.
+    # once, without a pause, before the directory is called unwritable. Only
+    # back-to-back misses spend that retry. With several waiters a release can
+    # land in that window more than once, so a lock seen held in between earns
+    # it back.
     if [[ ! -e "$lock" && ! -L "$lock" ]]; then
       if [[ $unmade -eq 0 ]]; then
         unmade=1
@@ -16757,6 +16769,7 @@ _account_lock() {
       _ACCOUNT_LOCK_UNWRITABLE=1
       return "$_ACCOUNT_LOCK_BUSY"
     fi
+    unmade=0
     owner=""
     IFS= read -r owner 2>/dev/null < "$lock/owner" || true
     if [[ -d "$lock" && ! -L "$lock" ]] && _account_lock_is_stale "$owner"; then
@@ -19292,8 +19305,7 @@ _hb_lock_take() {
   local lock="$1" wait="$2" stale="$3" start now mt
   start=$SECONDS
   while :; do
-    if [[ -L "$lock" ]]; then return 1; fi
-    if [[ -e "$lock" && ! -d "$lock" ]]; then return 1; fi
+    if _lock_path_planted "$lock"; then return 1; fi
     if mkdir "$lock" 2>/dev/null; then
       _HB_OWN_LOCK="$lock"
       return 0
@@ -19565,7 +19577,7 @@ _hb_main() {
 # References no host global, so it runs the same under `env -i`.
 _handoff_box_script() {
   declare -p _HB_CLAUDE_LOCK_STALE_S || return 1
-  declare -f _json_flat_str _sessions_json_unesc _is_binfmt_interp _is_claude_argv \
+  declare -f _json_flat_str _sessions_json_unesc _is_binfmt_interp _lock_path_planted _is_claude_argv \
              _hb_main _hb_args_ok _hb_probe _hb_terminate _hb_proc_state \
              _hb_scan _hb_env_value _hb_execid _hb_session_record _hb_recheck \
              _hb_lock_take _hb_cleanup || return 1

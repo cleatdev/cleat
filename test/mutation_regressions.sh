@@ -3670,7 +3670,7 @@ try "v1.5.2_binfmt_needs_path" "interpreted non-Claude" "$CLI" "$HANDOFF_BATS"
 # text, built from an explicit function list. A helper left off that list is
 # undefined inside the box even though every host-side call works.
 cat > "$SED_TMP" << 'SED'
-s|_sessions_json_unesc _is_binfmt_interp _is_claude_argv|_sessions_json_unesc _is_claude_argv|
+s|_sessions_json_unesc _is_binfmt_interp _lock_path_planted|_sessions_json_unesc _lock_path_planted|
 SED
 try "v1.5.2_binfmt_shipped" "box probe sees a Claude behind a binfmt interpreter" "$CLI" "$HANDOFF_BATS"
 
@@ -3731,6 +3731,34 @@ cat > "$SED_TMP" << 'SED'
 s/^_HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274 2.1.280"/_HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274"/
 SED
 try "v1.5.2_verified_2_1_280" "verified version, or one cleat cannot read" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 LOCK RELEASED MID-CHECK: "exists and is not a directory" in two stats
+# read a lock released between them as planted, and the waiter gave up.
+cat > "$SED_TMP" << 'SED'
+s/^  \[\[ -L "\$1" || -f "\$1" || -p "\$1" || -S "\$1" || -b "\$1" || -c "\$1" \]\]$/  [[ -L "$1" ]] || { [[ -e "$1" ]] \&\& [[ ! -d "$1" ]]; }/
+SED
+try "v1.5.2_lock_planted_atomic" "planted check never reads as planted" "$CLI" "$REGRESSIONS"
+
+# v1.5.2 LOCK RETRY: the one free retry after a failed make was spent for good,
+# so a second release in that window read as an unwritable directory.
+cat > "$SED_TMP" << 'SED'
+/^    unmade=0$/d
+SED
+try "v1.5.2_lock_unmade_reset" "sees two releases" "$CLI" "$REGRESSIONS"
+
+# v1.5.2 LOCK CHECK IN THE BOX: the box script must carry the helper, or the
+# refresh lock check fails as a missing command and a planted file is waited on.
+cat > "$SED_TMP" << 'SED'
+s/_is_binfmt_interp _lock_path_planted _is_claude_argv/_is_binfmt_interp _is_claude_argv/
+SED
+try "v1.5.2_lock_helper_shipped" "planted as the refresh lock" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 LOCK CHECK ON THE HOST: the account lock must use the helper, which
+# also refuses a file or a FIFO, not only a symlink.
+cat > "$SED_TMP" << 'SED'
+s/^    if _lock_path_planted "\$lock"; then$/    if [[ -L "$lock" ]]; then/
+SED
+try "v1.5.2_lock_account_uses_helper" "FIFO at the lock path" "$CLI" "$ACCOUNTS_BATS"
 
 # ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
 # Collapse the predicate to always-VM (flip the host-local fall-through return):
@@ -7467,7 +7495,7 @@ try "vnext_account_unlock_own_only" "releasing never removes a lock another proc
 # polled for the whole wait.
 cat > "$SED_TMP" << 'SED'
 /^_account_lock()/,/^}$/{
-  s/^    if \[\[ -L "[$]lock" \]\] .. { .*; then$/    if false; then/
+  s/^    if _lock_path_planted "[$]lock"; then$/    if false; then/
 }
 SED
 try "vnext_account_lock_symlink" "something this CLI did not create at the lock path" "$CLI" "$ACCOUNTS_BATS"

@@ -2941,6 +2941,59 @@ EOF
   assert_equal "${_HO_SID[0]:-}" "$sid"
 }
 
+@test "regression v1.5.2: a lock released during the planted check never reads as planted" {
+  # The account lock asked "exists, and not a directory?" in two stats. A holder
+  # that released between them read as a planted file, and the waiter gave up
+  # with "Another cleat command is changing accounts right now" at the moment
+  # the lock came free. The account race tests hit it on CI. A directory made
+  # and removed as fast as a shell can must never read as planted.
+  local lock="$TEST_TEMP/flip.lock" tp end hit=0 held=0 free=0
+  ( while :; do mkdir "$lock" 2>/dev/null; rmdir "$lock" 2>/dev/null; done ) 3>&- &
+  tp=$!
+  end=$(( SECONDS + 2 ))
+  while [[ $SECONDS -lt $end && $hit -eq 0 ]]; do
+    if _lock_path_planted "$lock"; then hit=1; fi
+    if [[ -d "$lock" ]]; then held=$(( held + 1 )); else free=$(( free + 1 )); fi
+  done
+  kill "$tp" 2>/dev/null || true
+  wait "$tp" 2>/dev/null || true
+  assert_equal "$hit" 0
+  # Proof the lock really came and went under the check, or the loop is vacuous.
+  run test "$held" -gt 0 -a "$free" -gt 0
+  assert_success
+}
+
+@test "regression v1.5.2: a waiter that sees two releases is not told the accounts directory is unwritable" {
+  # A failed make with nothing at the path means either an unwritable directory
+  # or a release that landed in between, so one retry comes free. It was spent
+  # for good: with several waiters a second release in that window read as an
+  # unwritable directory and the command failed with the wrong cause. Here the
+  # first make loses to a release, the second loses to another waiter that then
+  # releases during the pause, and the third loses to a release again.
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/accounts"
+  command mkdir -p "$CLEAT_ACCOUNTS_DIR"
+  _T_LOCK="$CLEAT_ACCOUNTS_DIR/.lock"
+  _T_MK="$TEST_TEMP/mk"
+  mkdir() {
+    if [[ "$1" != "$_T_LOCK" ]]; then command mkdir "$@"; return; fi
+    printf 'x' >> "$_T_MK"
+    case "$(wc -c < "$_T_MK" | tr -d ' ')" in
+      1|3) return 1 ;;
+      2) command mkdir "$_T_LOCK"
+         printf 'host %s pid %s at %s\n' "${HOSTNAME:-unknown}" "$$" "$(date +%s)" > "$_T_LOCK/owner"
+         return 1 ;;
+      *) command mkdir "$@" ;;
+    esac
+  }
+  _account_lock_pause() { rm -rf "$_T_LOCK"; }
+  _ACCOUNT_LOCK_WAIT_S=2
+  run _account_lock
+  unset -f mkdir
+  assert_success
+  run cat "$_T_MK"
+  assert_output "xxxx"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # v1.2.0: the kit scout's generated frontmatter wrapped its description as an
 # unquoted YAML plain scalar containing colon-space ("all exploration:

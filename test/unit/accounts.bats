@@ -2592,6 +2592,23 @@ _lock_absent() {   # $1 = what just ran
   assert_failure
 }
 
+@test "account: a file or a FIFO at the lock path is refused at once like a symlink" {
+  local kind
+  _account_lock_pause() { echo waited >> "$TEST_TEMP/pauses"; }
+  _ACCOUNT_LOCK_WAIT_S=2
+  for kind in file fifo; do
+    rm -rf "$CLEAT_ACCOUNTS_DIR" "$TEST_TEMP/pauses"
+    mkdir -p "$CLEAT_ACCOUNTS_DIR"
+    if [[ $kind == file ]]; then : > "$(_lock_dir)"; else mkfifo "$(_lock_dir)"; fi
+    run _account_lock
+    assert_equal "$status" "$_ACCOUNT_LOCK_BUSY"
+    run test -e "$TEST_TEMP/pauses"
+    assert_failure
+    run test -d "$(_lock_dir)"
+    assert_failure
+  done
+}
+
 @test "account: a wipe that cannot take the account lock keeps the staged credential" {
   # Never an unlocked delete. The rest of the run dir still goes.
   _lock_pinned_pair

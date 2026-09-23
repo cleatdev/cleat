@@ -161,7 +161,7 @@ teardown() { hb_teardown_pids; _common_teardown; }
   # extra fields, must come through as unknown and nothing else.
   local v
   for v in '2.1.280\u001b[31m' '2.1.280 extra' '../../x' '' '2.1.280.1.2'; do
-    rm -f "$BH/.claude/sessions/"*.json "${PV:?}/7004242" -r 2>/dev/null
+    rm -rf "$BH/.claude/sessions/"*.json "${PV:?}/7004242"
     hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
     printf '{"pid":7004242,"sessionId":"%s","procStart":"5551234","version":"%s","kind":"interactive","entrypoint":"cli","status":"idle"}' \
       "$SID" "$v" > "$BH/.claude/sessions/7004242.json"
@@ -433,6 +433,25 @@ teardown() { hb_teardown_pids; _common_teardown; }
   assert_line "end	abort"
   refute_output --partial "recheck"
   kill -0 "$t1" 2>/dev/null || fail "the target was stopped despite the lock timeout"
+}
+
+@test "box terminate stops at once on a file planted as the refresh lock, and leaves it" {
+  hb_require_linux
+  # Not a lock Claude made, so it is never waited on. The check is a function
+  # the box script must carry: without it the box would sit out the whole wait.
+  local lock="$BH/.claude/.oauth_refresh.lock" t0
+  : > "$lock"
+  hb_spawn_claude exits "$SID" "$EXECID" idle; local t1="$HB_PID" r1="$HB_RS"
+  hb_proc_view "$PV"
+  t0=$SECONDS
+  run hb_run_box terminate "$BH" "$PV" default 8 8 1 "$t1" "$r1" "$SID" "$EXECID" idle
+  assert_success
+  assert_line "lock	timeout"
+  refute_output --partial "not found"
+  run test $(( SECONDS - t0 )) -lt 5
+  assert_success
+  run test -f "$lock" -a ! -d "$lock"
+  assert_success
 }
 
 @test "box terminate removes a refresh lock only when it is older than the Claude stale bound" {

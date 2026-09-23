@@ -2913,7 +2913,10 @@ load '$PROJECT_ROOT/test/test_helper/bats-assert/load'
   assert_output "what-it-expected"
 }
 EOF
-  run bash "$h/test.sh" < /dev/null
+  # The copy must not inherit the runner's own knobs from the leg running THIS
+  # suite: a sharded CI leg exports TEST_SHARD_TOTAL/INDEX, and one fixture file
+  # split four ways leaves shard 3 with nothing to run.
+  run env -u TEST_SHARD_TOTAL -u TEST_SHARD_INDEX -u TEST_MAX_SKIPPED bash "$h/test.sh" < /dev/null
   assert_failure
   assert_output --partial "fixture fails on purpose"
   assert_output --partial "the-value-it-really-saw"

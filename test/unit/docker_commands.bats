@@ -1314,10 +1314,10 @@ SH
 @test "uid map: a macOS host keeps its own ids and never measures" {
   # The inversion is a Linux user namespace. Every macOS engine runs the daemon
   # in a VM whose share layer already presents your files as yours, and your own
-  # uid is what all of them have always run on. Measuring there bought nothing
-  # and cost a container run through the VM per launch, which took CI's Colima
-  # leg from 21 minutes to a timeout. Even a planted namespaced answer must not
-  # reach a macOS box, and nothing may be measured.
+  # uid is what all of them have always run on. Measuring there could only cost
+  # a container run through the VM per launch for an answer that is identity
+  # anyway. Even a planted namespaced answer must not reach a macOS box, and
+  # nothing may be measured.
   _is_macos() { return 0; }
   mkdir -p "$CLEAT_CONFIG_DIR/state"
   printf '%s\t-\t%s\t0 0\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" "$(id -u)" \

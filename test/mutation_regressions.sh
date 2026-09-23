@@ -3609,8 +3609,8 @@ try "v1.5.1_remap_skips_doomed_poll" "not polled for five seconds first" "$CLI" 
 
 # v1.5.1 macOS GATE: the inversion is a Linux user namespace. Measure on macOS
 # and every VM engine pays a container run per launch for an answer that is
-# identity anyway (CI's Colima leg went from 21 minutes to a timeout). Scoped to
-# _box_identity because the same test appears in other functions.
+# identity anyway. Scoped to _box_identity because the same test appears in
+# other functions.
 cat > "$SED_TMP" << 'SED'
 /^_box_identity() {/,/if _is_macos; then/ s/if _is_macos; then/if false; then/
 SED

@@ -6874,3 +6874,21 @@ _mount_targets_fixture() {
   run ls -A "$TEST_TEMP/hostdir"
   assert_output ""
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: the browser bridge's 2048 cap on a box-chosen URL counted characters,
+# not bytes. ${#url} follows the caller's locale, and a Mac terminal runs in a
+# UTF-8 one, so a URL of multibyte characters passed at up to four times the
+# bytes the cap and its documented bandwidth (about 60 KB a session) allow.
+@test "regression vNEXT: the bridge URL cap counted characters, not bytes" {
+  local utf8; utf8="$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true)"
+  [ -n "$utf8" ] || skip "no UTF-8 locale available on this host"
+  LC_ALL="$utf8"
+  # 1500 two-byte characters: under 2048 characters, over 3000 bytes.
+  local pad; pad="$(printf '\303\251%.0s' $(seq 1 1500))"
+  run _bridge_url_host "https://claude.ai/x?p=$pad"
+  assert_failure
+  run _bridge_url_host "https://claude.ai/x?p=short"
+  assert_success
+  assert_output "claude.ai"
+}

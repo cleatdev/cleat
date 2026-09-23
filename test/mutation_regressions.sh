@@ -11602,6 +11602,16 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_clipimg_claim_host_only" "an image request was moved through a link the box planted"
+
+# The bridge URL cap counts bytes. ${#url} alone counts characters under the
+# caller's UTF-8 locale, which let a multibyte URL through at several times the
+# bytes the cap allows.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_url_host()/,/^}$/{
+  s@\[ "[$](LC_ALL=C; printf '%s' "[$]{#url}")" -le 2048 \]@[ "${#url}" -le 2048 ]@
+}
+SED
+try "vnext_bridge_url_cap_bytes" "the bridge URL cap counted characters, not bytes"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

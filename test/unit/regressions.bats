@@ -6846,3 +6846,31 @@ _mount_targets_fixture() {
   exec 7<&-
   assert_failure
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: the image request was claimed by renaming it to `.image-req.claimed`
+# in the box's own read-write clip dir. The box could plant that name as a link
+# to a host directory, and mv then moved the request, a file or a whole tree of
+# the box's choosing, into that directory, outside every mount, four times a
+# second.
+@test "regression vNEXT: an image request was moved through a link the box planted" {
+  local clip="$TEST_TEMP/ir/clip" i
+  mkdir -p "$clip" "$TEST_TEMP/hostdir" "$TEST_TEMP/bin"
+  printf '#!/bin/sh\nexit 0\n' > "$TEST_TEMP/bin/docker"
+  chmod +x "$TEST_TEMP/bin/docker"
+  PATH="$TEST_TEMP/bin:$PATH"
+  _host_clip_read_image() { return 1; }
+  ln -s "$TEST_TEMP/hostdir" "$clip/.image-req.claimed"
+  mkdir "$clip/.image-req"
+  printf 'box payload\n' > "$clip/.image-req/evil"
+  _clipimg_watcher "$clip" "abox" >/dev/null 2>&1 &
+  local wpid=$!
+  i=0
+  while { [ -e "$clip/.image-req" ] || [ -L "$clip/.image-req" ]; } && [ "$i" -lt 40 ]; do
+    sleep 0.1; i=$((i+1))
+  done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+}

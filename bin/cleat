@@ -6499,6 +6499,26 @@ _clipimg_serve() {
   rm -f "$img" "$done" 2>/dev/null || true
 }
 
+# Claim one image request into $2, the host-only claim dir. rc 0 when this
+# watcher took it. The request sits in the box's read-write clip dir, so it is
+# renamed into the claim dir under a name the box cannot predict, then removed
+# unread. Renaming it to a fixed name beside itself (`.image-req.claimed`) let
+# the box plant that name as a link to a host directory: mv then moved the
+# request, a file or a whole tree of the box's choosing, INTO that directory,
+# outside every mount. With no usable claim dir the request is removed and not
+# served, because a claim made inside the mount reopens exactly that.
+_clipimg_claim_req() {
+  local req="$1" claim_dir="$2" claimed
+  if [ ! -d "$claim_dir" ] || [ -L "$claim_dir" ]; then
+    rm -rf "$req" 2>/dev/null || true
+    return 1
+  fi
+  claimed="$claim_dir/.image-req.$$.$RANDOM"
+  mv "$req" "$claimed" 2>/dev/null || return 1
+  rm -rf "$claimed" 2>/dev/null || true
+  return 0
+}
+
 # Poll for image requests and serve them. One dedicated watcher rather than
 # folding into _clipboard_watcher, because that one is event-driven off inotify
 # and this needs a tight fixed cadence at keystroke time. 250 ms worst-case
@@ -6510,6 +6530,9 @@ _clipimg_watcher() {
   local req="$clip_dir/.image-req"
   local lock="$clip_dir/.image-lock"
   local stage_dir; stage_dir="$(dirname "$clip_dir")/clipimg-stage"
+  # Outside the bind mount, beside the browser's and the clipboard's claims.
+  local claim_dir; claim_dir="$(dirname "$clip_dir")/clipclaim"
+  mkdir -p "$claim_dir" 2>/dev/null || true
   while true; do
     # Orphan guards, same as the other watchers: the run dir vanishing (rm/nuke)
     # or the parent cleat dying (terminal closed, SIGKILL) stops the poll.
@@ -6546,8 +6569,7 @@ _clipimg_watcher() {
     # for the life of every session, and the overwhelmingly common case is no
     # pending request. Same shape as the browser watcher's claim guard. The
     # -L arm keeps a planted symlink claimable, so it is still swept below.
-    if { [ -e "$req" ] || [ -L "$req" ]; } && mv "$req" "$req.claimed" 2>/dev/null; then
-      rm -f "$req.claimed" 2>/dev/null || true
+    if { [ -e "$req" ] || [ -L "$req" ]; } && _clipimg_claim_req "$req" "$claim_dir"; then
       _clipimg_serve "$cname" "$stage_dir"
     fi
     sleep 0.25

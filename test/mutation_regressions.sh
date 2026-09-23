@@ -5362,7 +5362,9 @@ try "clipimg_serve_done_signal" "delivered as in.png then in.done" "$CLI" "$CLIP
 # never consumed, so the shim never gets its liveness signal and the watcher
 # re-serves every tick.
 cat > "$SED_TMP" << 'SED'
-s@ && mv "[$]req" "[$]req.claimed" 2>/dev/null; then@; then@
+/^_clipimg_claim_req()/,/^}$/{
+  s@^  mv "[$]req" "[$]claimed" 2>/dev/null || return 1$@  :@
+}
 SED
 try "clipimg_watcher_consumes" "consumes the request marker and serves once" "$CLI" "$CLIPIMG_BATS"
 
@@ -5401,10 +5403,12 @@ s@^mkdir "[$]LOCK" 2>/dev/null || exit 1@rm -f "$D/in.png" "$D/in.done" "$D/cach
 SED
 try "clipimg_clear_after_lock" "does not delete the winner" "$CLI" "$CLIPIMG_BATS"
 
-# ATOMIC CLAIM RESIDUE: leave the .claimed rename behind and the shared dir fills
+# ATOMIC CLAIM RESIDUE: leave the claimed request behind and the claim dir fills
 # with residue the sweeps do not match.
 cat > "$SED_TMP" << 'SED'
-s@      rm -f "[$]req.claimed" 2>/dev/null || true@      :@
+/^_clipimg_claim_req()/,/^}$/{
+  s@^  rm -rf "[$]claimed" 2>/dev/null || true$@  :@
+}
 SED
 try "clipimg_claim_residue" "leaves no residue" "$CLI" "$CLIPIMG_BATS"
 
@@ -5601,7 +5605,7 @@ SED
 try "vnext_clipimg_idle_fork" "an idle tick never forks an mv" "$CLI" "$CLIPIMG_BATS"
 
 cat > "$SED_TMP" << 'SED'
-s@{ \[ -e "\$req" \] || \[ -L "\$req" \]; } && mv@{ false; } \&\& mv@
+s@{ \[ -e "\$req" \] || \[ -L "\$req" \]; } && _clipimg_claim_req@{ false; } \&\& _clipimg_claim_req@
 SED
 try "vnext_clipimg_guard_not_overstrict" "a present request is still claimed" "$CLI" "$CLIPIMG_BATS"
 
@@ -11589,6 +11593,15 @@ SED
 # for the marker, v150_scan_skips_own_fork for the argv, v150_probe_shell_path_only
 # for the pattern.
 try "v150_scan_skips_sibling_run" "box scan ignores a sibling run of the script" "$CLI" "$HANDOFF_BATS"
+
+# The image request is claimed into the host-only claim dir. A fixed name beside
+# it in the box's clip dir let a planted link send the request into a host dir.
+cat > "$SED_TMP" << 'SED'
+/^_clipimg_claim_req()/,/^}$/{
+  s@^  claimed="[$]claim_dir/.image-req.[$][$].[$]RANDOM"$@  claimed="$req.claimed"@
+}
+SED
+try "vnext_clipimg_claim_host_only" "an image request was moved through a link the box planted"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

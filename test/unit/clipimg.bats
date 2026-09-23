@@ -420,6 +420,9 @@ EOF
   wait "$wpid" 2>/dev/null || true
   [ ! -e "$CLIPDIR/.image-req" ]         || { echo "request not consumed"; return 1; }
   [ ! -e "$CLIPDIR/.image-req.claimed" ] || { echo "claim residue left behind"; return 1; }
+  # The claim is made in the host-only claim dir and removed there too.
+  run find "$(dirname "$CLIPDIR")/clipclaim" -name '.image-req.*'
+  assert_output ""
 }
 
 # ── Host-side image watcher ─────────────────────────────────────────────────

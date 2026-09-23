@@ -2647,6 +2647,75 @@ WRAP
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat shell claims an oversized hook spool under strict mode" {
+  # The session-entry pass of the spool cap runs at statement position in the
+  # real binary, so a set -e slip in it would end the shell before it opens.
+  # The spool is sparse, so the 64 MiB costs no disk.
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf '[caps]\nhooks\n' > "$CLEAT_CONFIG_DIR/config"
+  local spool="$CLEAT_CONFIG_DIR/run/$cname/hooks/events.jsonl"
+  mkdir -p "${spool%/*}"
+  dd if=/dev/zero of="$spool" bs=1 count=0 seek=67108864 2>/dev/null
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 20 shell
+  assert_success
+  assert_output --partial "Discarded"
+  refute_output --partial "unbound variable"
+  run test -e "$spool"
+  assert_failure
+}
+
+@test "smoke: a hooks box with no spool yet prints no shell error at session entry" {
+  # A box that has not forwarded an event has no spool. The entry pass sizes
+  # it without opening it, so nothing reaches the terminal.
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf '[caps]\nhooks\n' > "$CLEAT_CONFIG_DIR/config"
+  mkdir -p "$CLEAT_CONFIG_DIR/run/$cname/hooks"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 20 shell
+  assert_success
+  refute_output --partial "No such file"
+  refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat claude reports a rate-capped image paste under strict mode" {
+  # A refused image request leaves one line in the box's watcher log. The
+  # session-end reader counts this session's lines under strict mode.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  local wlog="$CLEAT_CONFIG_DIR/run/$cname/clip/.watcher-log"
+  cat > "$TEST_TEMP/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+  "exec -it "*)
+    mkdir -p "\$(dirname "$wlog")"
+    echo "[clipimg-watcher 12:00:00] IMAGE-RATE-CAPPED limit=12/min" >> "$wlog" ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+WRAP
+  chmod +x "$TEST_TEMP/wrap/docker"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env \
+    PATH="$TEST_TEMP/wrap:$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE=0 \
+    "$CLI" claude
+  refute_output --partial "unbound variable"
+  assert_output --partial "Did not paste"
+  assert_output --partial "12 a minute"
+}
+
 @test "smoke: cleat browser origins lists a loopback entry as ignored under strict mode" {
   CLEAT_BROWSER_ORIGINS="localhost auth.example.com" run cleat_bin_timeout 10 browser origins
   assert_success

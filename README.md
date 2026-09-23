@@ -118,7 +118,7 @@ Cleat gives you the best of both worlds:
 - **Zero file permission issues** -- container user matches your host UID/GID automatically
 - **Shared auth** -- log in once and every box uses the same credentials, unless you pin a box to a named login with `cleat account`
 - **Clipboard support** -- `pbcopy`, `xclip` and `xsel` shims route to your host clipboard via a file bridge -- no X11 or special terminal features needed
-- **Image paste (ctrl+v)** -- paste a screenshot from your host clipboard straight into Claude Code inside a box. No install, no capability, images only (clipboard text never crosses this channel)
+- **Image paste (ctrl+v)** -- paste a screenshot from your host clipboard straight into Claude Code inside a box. No install, no capability, images only (clipboard text never crosses this channel). At most 12 requests a minute reach your clipboard
 - **Lightweight** -- Node.js-based image with Python, Git, GitHub CLI, jq and socat
 - **Capabilities** -- opt-in access to host git identity (`--cap git`), SSH keys (`--cap ssh`), env var passthrough (`--cap env`), host hook execution (`--cap hooks`), GitHub CLI auth (`--cap gh`), host Docker daemon for testing dockerized apps (`--cap docker`) and a guard that answers Claude Code's dangerous-rm prompt (`--cap unsafe-rm`). All disabled by default
 - **Pre-built image** -- `cleat start` pulls from `ghcr.io/cleatdev/cleat` (~30s) instead of building locally (~2-5 min), with automatic local-build fallback
@@ -126,7 +126,7 @@ Cleat gives you the best of both worlds:
 - **Contained Claude home** -- a box sees only its own project's Claude history. The instruction surfaces your host `claude` obeys are read-only inside the cage
 - **Account switching** -- `cleat account` keeps two or more Claude logins under names and pins a box to one, so hitting the five-hour limit on one Max account is one command instead of a browser login. Conversations and project history are shared across the switch
 - **Session management** -- `cleat session` lists a box's Claude conversations with their real sizes, deletes the ones you are done with (which the Claude Code CLI itself cannot do for a single conversation) and keeps them restorable in a trash for 30 days
-- **Hook execution on host** -- the hooks in your `~/.claude/settings.json` run on the host, not in the container. Hooks a project defines never run there
+- **Hook execution on host** -- the hooks in your `~/.claude/settings.json` run on the host, not in the container. Hooks a project defines never run there. The event queue the box writes is bounded at every session start and while a hook bridge runs
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser. Cleat checks the origin first, so the box cannot choose where your logged-in browser goes
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
 - **Configuration drift detection** -- notifies when config has changed since container creation
@@ -776,7 +776,7 @@ cleat --cap ssh start
 | `hooks` | mount | Runs the hooks in `~/.claude/settings.json` on the host. Hooks from the project's own `.claude/settings*.json` never run there. |
 | `gh` | mount | Mounts `~/.config/gh` (read-write). `gh auth login` inside container writes tokens to host. |
 | `docker` | sandbox | Mounts `/var/run/docker.sock`. `docker`, `docker compose` and anything that talks to the daemon run against your host: sibling containers, zero overhead. **Sandbox-escaping. See security note below.** |
-| `unsafe-rm` | guard | Answers Claude Code's un-bypassable "dangerous rm" prompt so `rm`/`rmdir` run unattended. That prompt survives `--dangerously-skip-permissions` by design (an upstream circuit breaker). Cleat installs a `PermissionRequest` hook that answers whenever the command invokes `rm`/`rmdir` at the top level, so chained cleanups (`mkdir -p $S && rm -rf $S/*`) run unattended. A command that removes nothing is never answered. **This disarms a real guard**: `/workspace` and `~/.claude` are read-write host mounts. Global or `--cap` only, never a project `.cleat`. Default off, red warning every launch. |
+| `unsafe-rm` | guard | Answers Claude Code's un-bypassable "dangerous rm" prompt so `rm`/`rmdir` run unattended. That prompt survives `--dangerously-skip-permissions` by design (an upstream circuit breaker). Cleat installs a `PermissionRequest` hook that answers whenever the command invokes `rm`/`rmdir` at the top level, so chained cleanups (`mkdir -p $S && rm -rf $S/*`) run unattended. A command that removes nothing is never answered. **This disarms a real guard**: `/workspace` and `~/.claude` are read-write host mounts. The guard is a rail against an accidental `rm`, not a boundary, because it runs inside the box with the agent. Global or `--cap` only, never a project `.cleat`. Default off, red warning every launch. |
 
 > Cloud CLI caps (`az`, `aws`, `gcloud`) and the lazy-install framework that backed them shipped in v0.11.0 / v0.12.0 and were removed after v0.12.3. They bloated first-run time without earning their weight. Install the CLI on the host and pass credentials via the `env` cap.
 
@@ -1041,7 +1041,7 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
                             [fork] exclude, plus any [box.<name>.<kind>] overrides
 <project>/.cleat.env      ← project-level env vars
 <project>/.cleat.<box>.env ← per-box env vars (falls back to .cleat.env)
-~/.config/cleat/state/hook-drops.log ← hook events the bridge refused (hooks cap)
+~/.config/cleat/state/hook-drops.log ← hook events the bridge refused and spool discards (hooks cap)
 ~/.config/cleat/state/hook-runs.log  ← hook events handed to your hooks (hooks cap)
 ```
 

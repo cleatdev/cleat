@@ -496,3 +496,77 @@ EOF
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
   [ ! -e "$dir/.image-lock" ] || { echo "a planted file at the lock path survived"; return 1; }
 }
+
+# ── The request rate cap ────────────────────────────────────────────────────
+# Every request is a host pasteboard read, and the watcher polls four times a
+# second, so a box looping on requests drove that read at will. A per-minute
+# ledger outside the bind mount bounds it.
+
+# Send one request and wait for its answer. Prints nothing, returns once
+# in.done arrived.
+_imgreq_once() {
+  rm -f "$TEST_TEMP/captured/in.done" "$TEST_TEMP/captured/in.png"
+  : > "$CLIPDIR/.image-req"
+  local i=0
+  while [ ! -e "$TEST_TEMP/captured/in.done" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i+1)); done
+}
+
+@test "image request: the thirteenth request in a minute is refused" {
+  _use_capturing_docker
+  _host_clip_read_image() { echo read >> "$TEST_TEMP/reads"; printf '\x89PNG\r\n\x1a\nIMG' > "$1"; return 0; }
+  _clipimg_watcher "$CLIPDIR" "abox" > "$TEST_TEMP/wlog" 2>&1 &
+  local wpid=$! n
+  for n in 1 2 3 4 5 6 7 8 9 10 11 12 13; do _imgreq_once; done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  # Twelve reads of the pasteboard and no thirteenth, or the cap would count
+  # while the read still happened.
+  run grep -c read "$TEST_TEMP/reads"
+  assert_output "12"
+  # The thirteenth was still answered, as a miss, so the shim never hangs.
+  [ -e "$TEST_TEMP/captured/in.done" ] || { echo "the refused request got no answer"; return 1; }
+  [ ! -s "$TEST_TEMP/captured/in.png" ] || { echo "the refused request got an image"; return 1; }
+  run _maybe_report_capped_images "$TEST_TEMP/wlog" 0
+  assert_output --regexp 'Did not paste .*1.* image into the box'
+  assert_output --partial "12 a minute"
+}
+
+@test "image request: the ledger lives outside the bind mount" {
+  _use_capturing_docker
+  _host_clip_read_image() { printf '\x89PNG\r\n\x1a\nIMG' > "$1"; return 0; }
+  _clipimg_watcher "$CLIPDIR" "abox" >/dev/null 2>&1 &
+  local wpid=$!
+  _imgreq_once
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  run grep -c . "$(dirname "$CLIPDIR")/clipclaim/.imgreq"
+  assert_output "1"
+  run find "$CLIPDIR" -name '.imgreq*'
+  assert_output ""
+}
+
+@test "image request: a missing claim dir refuses the channel rather than running uncapped" {
+  _use_capturing_docker
+  _host_clip_read_image() { echo read >> "$TEST_TEMP/reads"; printf '\x89PNG\r\n\x1a\nIMG' > "$1"; return 0; }
+  # A file where the claim dir goes, so it cannot be made outside the mount.
+  : > "$(dirname "$CLIPDIR")/clipclaim"
+  _clipimg_watcher "$CLIPDIR" "abox" >/dev/null 2>&1 &
+  local wpid=$!
+  _imgreq_once
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  run test -e "$TEST_TEMP/reads"
+  assert_failure
+  [ -e "$TEST_TEMP/captured/in.done" ] || { echo "the request got no answer"; return 1; }
+  [ ! -s "$TEST_TEMP/captured/in.png" ] || { echo "a refused channel delivered an image"; return 1; }
+  run find "$CLIPDIR" -name '.imgreq*'
+  assert_output ""
+}
+
+@test "image request: a refusal logged before this session is not reported" {
+  printf '[clipimg-watcher 12:00:00] IMAGE-RATE-CAPPED limit=12/min\n' > "$TEST_TEMP/wlog"
+  local off; off="$(wc -c < "$TEST_TEMP/wlog" | tr -d '[:space:]')"
+  run _maybe_report_capped_images "$TEST_TEMP/wlog" "$off"
+  assert_success
+  assert_output ""
+}

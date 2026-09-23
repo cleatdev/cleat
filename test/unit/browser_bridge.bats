@@ -620,6 +620,33 @@ EOF
   assert_failure
 }
 
+@test "browser origins: an egress section never widens the browser origin list" {
+  # The browser gate's origins are their own list, never the union with an
+  # egress allowlist: a host allowed for the box's traffic is not a host the
+  # box may open in the user's browser. Planted in both configs, the project's
+  # included, because each is a place a later change could read it from.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[browser]\norigin = fromglobal.example.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  cd "$TEST_TEMP"
+  _RESOLVED_PROJECT="$TEST_TEMP"
+  local before
+  before="$(_bridge_origins_effective)"
+  printf '\n[egress]\nmode = strict\nallow = egress-only.example.com\n' >> "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nallow = project-egress.example.com\n' > "$TEST_TEMP/.cleat"
+  run _bridge_origins_effective
+  assert_success
+  assert_output "$before"
+  run _bridge_dest_allowed "https://egress-only.example.com/x"
+  assert_failure
+}
+
+@test "browser origins print names the open redirect residual" {
+  run _browser_origins_print
+  assert_success
+  assert_output --partial "An allowed origin that runs an OAuth redirect can still forward the"
+  assert_output --partial "browser onward. The list bounds the first hop, never the last."
+}
+
 @test "origins config: cleat browser allow writes it and keeps the rest of the file" {
   mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
   printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"

@@ -9347,7 +9347,7 @@ try "vnext_b6_ledger_outside_mount" "a seventh open inside a minute is refused" 
 
 # B6: a leading-zero entry is refused before arithmetic reads it as octal.
 cat > "$SED_TMP" << 'SED'
-/^_browser_rate_take()/,/^}$/{
+/^_rate_ledger_take()/,/^}$/{
   s/in ''|0[*]|/in ''|/
 }
 SED
@@ -9356,7 +9356,7 @@ try "vnext_b6_ledger_octal" "a malformed or future ledger entry neither counts n
 # B6: an entry from the future is dropped, or a stepped-back clock holds the
 # window shut for as long as the step.
 cat > "$SED_TMP" << 'SED'
-/^_browser_rate_take()/,/^}$/{
+/^_rate_ledger_take()/,/^}$/{
   /\[ "[$]line" -le "[$]now" \] || continue/d
 }
 SED
@@ -11647,6 +11647,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_clipimg_claim_host_only" "an image request was moved through a link the box planted"
 
+# The hook drop report reads the whole log when its offset points past the end,
+# which is what a rotation leaves behind.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  /^  \[ "[$]off" -le "[$]sz" \] || off=0$/d
+}
+SED
+try "vnext_hook_report_after_rotation" "a rotated hook drop log silenced the session-end report"
+
 # The bridge URL cap counts bytes. ${#url} alone counts characters under the
 # caller's UTF-8 locale, which let a multibyte URL through at several times the
 # bytes the cap allows.
@@ -11656,6 +11665,45 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_bridge_url_cap_bytes" "the bridge URL cap counted characters, not bytes"
+
+# Egress stage one, EGRESS-SPEC 2.1. The browser origin list is never the union
+# with an egress allowlist: pointing its one global read at [egress] is exactly
+# that bug.
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_from_config()/,/^}$/{
+  s|_read_section_all_from_file "\$CLEAT_GLOBAL_CONFIG" browser origin|_read_section_all_from_file "$CLEAT_GLOBAL_CONFIG" egress allow|
+}
+SED
+try "vnext_browser_origin_union" "an egress section never widens the browser origin list" \
+    "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# Egress stage one, EGRESS-SPEC 2.1 residual two. `cleat browser origins` names
+# the open-redirect residual.
+cat > "$SED_TMP" << 'SED'
+/^_browser_origins_print()/,/^}$/{
+  /The list bounds the first hop, never the last./d
+}
+SED
+try "vnext_redirect_residual_line" "browser origins print names the open redirect residual" \
+    "$CLI" "$BROWSER_BRIDGE_BATS"
+
+# Egress stage one, EGRESS-SPEC 2.5. The image request channel had no rate cap.
+# Unanchored on purpose: the constant is stated verbatim by the spec.
+cat > "$SED_TMP" << 'SED'
+s|_CLIPIMG_RATE_PER_MIN=12|_CLIPIMG_RATE_PER_MIN=100000|
+SED
+try "vnext_clipimg_rate_cap" "the image request channel had no rate cap"
+
+# Egress stage one, EGRESS-SPEC 2.2 H2. The hook spool had no bound. Both
+# watcher calls become `false`, which leaves the start line a no-op under its
+# `|| true` and never enters the per-poll `then`. The session-entry calls name
+# the spool by its full path through _hook_spool_entry_cap, outside the range.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s|_hook_spool_cap "[$]hooks_file"|false "$hooks_file"|
+}
+SED
+try "vnext_hook_spool_cap" "the hook spool grew without bound"
 
 # Egress stage zero. The stub must answer per container and per format, or no
 # assertion over two fields of one container can fail.

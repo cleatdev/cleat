@@ -12,6 +12,11 @@ FROM node:24-bookworm-slim@sha256:c2d5ade763cacfb03fe9cb8e8af5d1be5041ff331921fa
 #         is NOT installed. The CLI talks to the host daemon over a socket
 #         mount when the `docker` capability is enabled. See
 #         concept/15-docker-capability.md for the full rationale.
+# The sed below points Debian's own suites at https. Port 80 carries no
+# ClientHello, so the egress gateway cannot validate an SNI on it and refuses
+# it outright. The base image ships no CA bundle, so this can only run after
+# ca-certificates lands, which is why it is chained here rather than in its
+# own RUN. See concept/46-egress-control.md.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     bash \
@@ -25,6 +30,8 @@ RUN apt-get update && \
     sudo \
     ca-certificates \
     gpg && \
+    sed -i 's|^URIs: http://deb.debian.org|URIs: https://deb.debian.org|' \
+      /etc/apt/sources.list.d/debian.sources && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \

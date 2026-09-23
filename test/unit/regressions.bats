@@ -6915,6 +6915,94 @@ REG
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: the hook spool had no bound. The box appends to it through the
+# read-write hooks mount and the bridge only ever read forward, so a box with
+# project hooks queued host disk without limit for as long as it lived. The
+# spool is grown past the cap AFTER the bridge's start pass, so only the
+# per-poll claim can catch it: a spool planted before the start is claimed by
+# the start call and would pass a build with no per-poll call.
+@test "regression vNEXT: the hook spool grew without bound" {
+  _HOOK_SPOOL_MAX=200
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  # One event past the cap. Its translation is the only work the pass does.
+  printf '{"hook_event_name":"Stop","pad":"%s"}\n' "$(head -c 250 /dev/zero | tr '\0' 'x')" >> "$spool"
+  i=0
+  while [ -e "$spool" ] && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run test -e "$spool"
+  assert_failure
+  run ls -A "$CLEAT_RUN_DIR/box-a/hookclaim"
+  assert_output ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: the image request channel had no rate cap. _CLIPIMG_MAX_BYTES bounds
+# one image, not how often the box asks, and every request is a host pasteboard
+# read, so a box looping on requests read the host clipboard four times a
+# second for as long as the session lasted.
+@test "regression vNEXT: the image request channel had no rate cap" {
+  local clip="$TEST_TEMP/rc/clip" i now
+  mkdir -p "$clip" "$TEST_TEMP/rc/clipclaim" "$TEST_TEMP/bin" "$TEST_TEMP/captured"
+  printf '#!/bin/sh\n[ "$1" = cp ] && cp "$2" "%s/${3##*/}"\nexit 0\n' "$TEST_TEMP/captured" \
+    > "$TEST_TEMP/bin/docker"
+  chmod +x "$TEST_TEMP/bin/docker"
+  PATH="$TEST_TEMP/bin:$PATH"
+  _host_clip_read_image() { echo read >> "$TEST_TEMP/reads"; return 1; }
+  # Twelve requests already inside this minute.
+  now="$(date +%s)"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo "$now"; done > "$TEST_TEMP/rc/clipclaim/.imgreq"
+  _clipimg_watcher "$clip" "abox" >/dev/null 2>&1 &
+  local wpid=$!
+  : > "$clip/.image-req"
+  i=0
+  while [ ! -e "$TEST_TEMP/captured/in.done" ] && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i+1)); done
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  run test -e "$TEST_TEMP/captured/in.done"
+  assert_success
+  run test -e "$TEST_TEMP/reads"
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: the browser bridge's 2048 cap on a box-chosen URL counted characters,
+# not bytes. ${#url} follows the caller's locale, and a Mac terminal runs in a
+# UTF-8 one, so a URL of multibyte characters passed at up to four times the
+# bytes the cap and its documented bandwidth (about 60 KB a session) allow.
+@test "regression vNEXT: the bridge URL cap counted characters, not bytes" {
+  local utf8; utf8="$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true)"
+  [ -n "$utf8" ] || skip "no UTF-8 locale available on this host"
+  LC_ALL="$utf8"
+  # 1500 two-byte characters: under 2048 characters, over 3000 bytes.
+  local pad; pad="$(printf '\303\251%.0s' $(seq 1 1500))"
+  run _bridge_url_host "https://claude.ai/x?p=$pad"
+  assert_failure
+  run _bridge_url_host "https://claude.ai/x?p=short"
+  assert_success
+  assert_output "claude.ai"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: a rotated hook drop log silenced the session-end report. The log
+# rotates past 1 MiB, and the report tailed from an offset captured before the
+# session. A rotation done by the bridge, which runs in the background, never
+# reset that offset, so it pointed past the end of the new file and the drops
+# of the rest of the session were never reported.
+@test "regression vNEXT: a rotated hook drop log silenced the session-end report" {
+  mkdir -p "$CLEAT_STATE_DIR"
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\ttext\n' "$_HOOK_DROP_MARK" > "$CLEAT_STATE_DIR/hook-drops.log"
+  run _maybe_report_hook_drops "$CLEAT_STATE_DIR/hook-drops.log" 5000 box-a
+  assert_success
+  assert_output --partial "Dropped"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # vNEXT: the image request was claimed by renaming it to `.image-req.claimed`
 # in the box's own read-write clip dir. The box could plant that name as a link
 # to a host directory, and mv then moved the request, a file or a whole tree of
@@ -6940,22 +7028,4 @@ REG
   wait "$wpid" 2>/dev/null || true
   run ls -A "$TEST_TEMP/hostdir"
   assert_output ""
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# vNEXT: the browser bridge's 2048 cap on a box-chosen URL counted characters,
-# not bytes. ${#url} follows the caller's locale, and a Mac terminal runs in a
-# UTF-8 one, so a URL of multibyte characters passed at up to four times the
-# bytes the cap and its documented bandwidth (about 60 KB a session) allow.
-@test "regression vNEXT: the bridge URL cap counted characters, not bytes" {
-  local utf8; utf8="$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true)"
-  [ -n "$utf8" ] || skip "no UTF-8 locale available on this host"
-  LC_ALL="$utf8"
-  # 1500 two-byte characters: under 2048 characters, over 3000 bytes.
-  local pad; pad="$(printf '\303\251%.0s' $(seq 1 1500))"
-  run _bridge_url_host "https://claude.ai/x?p=$pad"
-  assert_failure
-  run _bridge_url_host "https://claude.ai/x?p=short"
-  assert_success
-  assert_output "claude.ai"
 }

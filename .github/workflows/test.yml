@@ -47,7 +47,8 @@ jobs:
   test-linux:
     name: test (ubuntu, bash 5.x)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,7 +81,8 @@ jobs:
   test-linux-2204:
     name: test (ubuntu 22.04, bash 5.1)
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,10 +110,13 @@ jobs:
   # mutations (about 2.3 s each). The registry now holds about 1290 entries,
   # which at that rate is roughly 50 minutes, so the old 25-minute cap would
   # cancel the job mid-flight. 75 leaves headroom for a slow runner.
+  # 2026-09-23: 1342 entries took 84 minutes on a slow day (52 two runs
+  # earlier), so the job has 130 and the step 120. The step times out FIRST so
+  # the job survives to print how far it got, see the step after it.
   mutation-linux:
     name: mutation (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,9 +126,19 @@ jobs:
       - name: Install socat (the OAuth forward mutations drive the real one)
         run: sudo apt-get update && sudo apt-get install -y socat
       - name: Mutation test the regression registry
+        timeout-minutes: 120
         run: |
           rc=0; ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
-          cat "$RUNNER_TEMP/mutation.log"; exit "$rc"
+          cat "$RUNNER_TEMP/mutation.log"; : > "$RUNNER_TEMP/mutation.printed"; exit "$rc"
+      # The run above writes to a file, never the step's pipe, so a test that
+      # leaves a straggler cannot hold the step open (3b2fb57). The price is that
+      # a KILLED step prints nothing. Its own timeout sits under the job's, so
+      # the job survives it and this prints the tail. A normal finish already
+      # printed the whole log and left the marker, so this stays quiet then.
+      - name: Mutation log (only when the step above was killed)
+        if: failure()
+        run: |
+          [ -e "$RUNNER_TEMP/mutation.printed" ] || tail -n 400 "$RUNNER_TEMP/mutation.log" 2>/dev/null || echo "no mutation log was written"
 
   # ── Full test suite on macOS via /bin/bash (bash 3.2, catches bash 4+ bugs) ─
   # macOS ships both /bin/bash (Apple's 3.2.57, unchanged since 2009 due to the
@@ -357,7 +372,9 @@ jobs:
   windows-wsl2:
     name: test (windows, wsl2 ubuntu)
     runs-on: windows-latest
-    timeout-minutes: 45
+    # Green runs took 44 of the old 45 minutes and one was killed at 45, with
+    # nothing printed. 65 for the job, 55 for the suite step, see below.
+    timeout-minutes: 65
     # Green, but kept advisory: WSL2 provisioning on windows-2025 has a known
     # intermittent per-user issue (actions/runner-images#14499); do not gate the
     # board on it until it has a longer green streak.
@@ -419,7 +436,16 @@ jobs:
         run: |
           cd "$(wslpath '${{ github.workspace }}')"
           rc=0; bash ./test.sh > /tmp/suite.log 2>&1 < /dev/null || rc=$?
-          cat /tmp/suite.log; exit "$rc"
+          cat /tmp/suite.log; : > /tmp/suite.printed; exit "$rc"
+        timeout-minutes: 55
+      # Same reason as the mutation job: the suite writes to a file, so a killed
+      # step prints nothing. This runs only when the step above failed, and
+      # prints only when it never reached its own cat.
+      - name: Suite log (only when the step above was killed)
+        if: failure()
+        shell: wsl-bash {0}
+        run: |
+          [ -e /tmp/suite.printed ] || tail -n 400 /tmp/suite.log 2>/dev/null || echo "no suite log was written"
 
   # ── Colima on macOS (alternate Docker engine, real integration) ─────────────
   # docker-autopilot targets Docker Desktop, OrbStack, Colima and rootless, but CI
@@ -448,7 +474,9 @@ jobs:
   colima-macos:
     name: integration (colima, macos intel)
     runs-on: macos-15-intel
-    timeout-minutes: 40
+    # 35 of the old 40 minutes on a slow day and one run killed at 40 with
+    # nothing printed. 55 for the job, 45 for the integration step.
+    timeout-minutes: 55
     needs: test-linux
     continue-on-error: true
     steps:
@@ -492,7 +520,12 @@ jobs:
           # cap resolves + binds it regardless of the test's HOME.
           export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
           rc=0; ./test/integration/run.sh > "$RUNNER_TEMP/integration.log" 2>&1 < /dev/null || rc=$?
-          cat "$RUNNER_TEMP/integration.log"; exit "$rc"
+          cat "$RUNNER_TEMP/integration.log"; : > "$RUNNER_TEMP/integration.printed"; exit "$rc"
+        timeout-minutes: 45
+      - name: Integration log (only when the step above was killed)
+        if: failure()
+        run: |
+          [ -e "$RUNNER_TEMP/integration.printed" ] || tail -n 400 "$RUNNER_TEMP/integration.log" 2>/dev/null || echo "no integration log was written"
 
   # ── Integration tests against a ROOTLESS Docker daemon (Linux only) ──────────
   # The existing test-integration job runs against the runner's stock ROOTFUL

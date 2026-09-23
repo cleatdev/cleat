@@ -3690,6 +3690,48 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v1.5.2_binfmt_final_scan" "final scan aborts a switch over a Claude seen through a binfmt" "$CLI" "$REGRESSIONS"
 
+# v1.5.2 VERSION NOTE, parser: the probe parser blanked every session's version,
+# so the note naming an unchecked Claude Code version could never appear.
+cat > "$SED_TMP" << 'SED'
+/\[\[ "\$9" =~ /d
+SED
+try "v1.5.2_version_parser_keeps" "probe parser keeps the Claude Code version" "$CLI" "$REGRESSIONS"
+
+# v1.5.2 VERSION NOTE, box: the box probe never sent the version at all.
+cat > "$SED_TMP" << 'SED'
+s|  ver="\$(_json_flat_str "\$blob" version 2>/dev/null \|\| true)"|  ver=unknown|
+SED
+try "v1.5.2_version_box_sends" "box probe reports the Claude Code version its session file names" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 VERSION NOTE, end to end: the chain the note depends on.
+cat > "$SED_TMP" << 'SED'
+/\[\[ "\$9" =~ /d
+SED
+try "v1.5.2_version_note_e2e" "unchecked Claude Code version, end to end" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 VERSION NOTE, box check: the version comes from a file the box writes
+# and is printed on the user's terminal, so only a dotted number may pass.
+cat > "$SED_TMP" << 'SED'
+/  ver="\$(_json_flat_str "\$blob" version/{
+n
+s/.*/  :/
+}
+SED
+try "v1.5.2_version_box_validates" "never passes on a version it cannot trust" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 VERSION NOTE, host check: the host re-checks what it prints.
+cat > "$SED_TMP" << 'SED'
+s|        \[\[ "\$9" =~ \^\[0123456789\]{1,4}(\\\.\[0123456789\]{1,6}){1,3}\$ \]\] && _HO_VER\[\$n\]="\$9"|        _HO_VER[$n]="$9"|
+SED
+try "v1.5.2_version_host_validates" "verified version, or one cleat cannot read" "$CLI" "$HANDOFF_BATS"
+
+# v1.5.2 VERIFIED LIST: 2.1.280 was driven end to end on the maintainer's Mac.
+# Drop it and every box on it gets the unchecked-version note again.
+cat > "$SED_TMP" << 'SED'
+s/^_HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274 2.1.280"/_HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274"/
+SED
+try "v1.5.2_verified_2_1_280" "verified version, or one cleat cannot read" "$CLI" "$HANDOFF_BATS"
+
 # ENGINE-AWARE POOL NOUN: a native Linux engine must never be called a VM.
 # Collapse the predicate to always-VM (flip the host-local fall-through return):
 # the native ready test fails.

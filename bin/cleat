@@ -16871,8 +16871,12 @@ _HANDOFF_STD_WINDOW_TOKENS=200000 # the standard context window
 # Every Claude Code the handoff has actually been driven end to end against,
 # space-separated. 2.1.270 is the lab verification (concept/44). 2.1.274 is the
 # maintainer's Mac on 2026-09-20: a full live switch of an idle session, the
-# conversation reopened and the identity followed.
-_HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274"
+# conversation reopened and the identity followed. 2.1.280 is the maintainer's
+# Mac on 2026-09-23: an idle session switched from the shared login to a named
+# account and back, reopening each time with the identity confirmed by /status,
+# after a diff of all 50 Claude Code behaviours the switch relies on found no
+# change that matters (concept/44).
+_HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274 2.1.280"
 _HANDOFF_COMPACT_BUFFER_TOKENS=13000 # auto-compact fires this far below the window
 # Claude Code's resume-from-summary dialog, on the handoff reopen only. It fires
 # when a flag is on, the last message is older than
@@ -19053,7 +19057,7 @@ _hb_execid() {
 # to a fixed word (an unknown one fails to `unknown`/`other`/`none`).
 _hb_session_record() {
   local home="$1" proc="$2" pid="$3" f="$4"
-  local st start blob ps status waiting kind sid execid store sraw scnt sval
+  local st start blob ps status waiting kind sid execid store sraw scnt sval ver
   local re_uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
   st="$(_hb_proc_state "$proc" "$pid")"
   case "$st" in
@@ -19085,6 +19089,14 @@ _hb_session_record() {
   esac
   sid="$(_json_flat_str "$blob" sessionId 2>/dev/null || true)"
   [[ "$sid" =~ $re_uuid ]] || sid=none
+  # The Claude Code version this session runs, which Claude writes at the top
+  # of its own session file. The host prints it on the user's terminal, and the
+  # file is the box's to write, so only a dotted number gets through: anything
+  # else (an escape sequence, a space that would split this record) is unknown.
+  # Digits are spelled out because a range can match more than digits under a
+  # UTF-8 locale.
+  ver="$(_json_flat_str "$blob" version 2>/dev/null || true)"
+  [[ "$ver" =~ ^[0123456789]{1,4}(\.[0123456789]{1,6}){1,3}$ ]] || ver=unknown
   execid="$(_hb_execid "$proc" "$pid")"
   sraw="$(_hb_env_value "$proc" "$pid" CLAUDE_SECURESTORAGE_CONFIG_DIR)"
   if [[ "$sraw" == unreadable ]]; then
@@ -19097,8 +19109,8 @@ _hb_session_record() {
       *) store=other ;;
     esac
   fi
-  printf 'claude\t%s %s %s %s %s %s %s %s\n' \
-    "$pid" "$start" "$status" "$waiting" "$kind" "$execid" "$store" "$sid"
+  printf 'claude\t%s %s %s %s %s %s %s %s %s\n' \
+    "$pid" "$start" "$status" "$waiting" "$kind" "$execid" "$store" "$sid" "$ver"
   return 0
 }
 
@@ -19794,10 +19806,17 @@ _handoff_parse_probe() {
       end) [[ "$rest" == ok ]] && endok=1; [[ "$rest" == abort ]] && return 1 ;;
       claude)
         set -- $rest
-        [[ $# -eq 8 ]] || return 1
+        [[ $# -eq 9 ]] || return 1
         n=${#_HO_PID[@]}
         _HO_PID[$n]="$1"; _HO_PS[$n]="$2"; _HO_STATUS[$n]="$3"; _HO_WAIT[$n]="$4"
-        _HO_KIND[$n]="$5"; _HO_EXEC[$n]="$6"; _HO_STORE[$n]="$7"; _HO_SID[$n]="$8"; _HO_VER[$n]=""
+        _HO_KIND[$n]="$5"; _HO_EXEC[$n]="$6"; _HO_STORE[$n]="$7"; _HO_SID[$n]="$8"
+        # The version the box reported, checked again here because it is
+        # printed on this terminal. This was always blanked, so the note that
+        # names an unchecked Claude Code version (D10) could never appear.
+        # "unknown" stays blank: a version cleat cannot read gets no note
+        # rather than a wrong one.
+        _HO_VER[$n]=""
+        [[ "$9" =~ ^[0123456789]{1,4}(\.[0123456789]{1,6}){1,3}$ ]] && _HO_VER[$n]="$9"
         ;;
       orphan) _HO_ORPHANS="$_HO_ORPHANS $rest" ;;
       shell)  _HO_SHELLS="$_HO_SHELLS $rest" ;;

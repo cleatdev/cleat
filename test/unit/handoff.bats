@@ -145,6 +145,32 @@ teardown() { hb_teardown_pids; _common_teardown; }
   refute_output --partial "interactive none"
 }
 
+@test "box probe reports the Claude Code version its session file names" {
+  # Claude writes its own version at the top of its session file. The probe used
+  # to drop it, so the note naming an unchecked version could never appear.
+  hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
+  hb_session "$BH" 7004242 idle procStart=5551234 sessionId="$SID" version=2.1.280
+  run hb_run_box probe "$BH" "$PV"
+  assert_success
+  assert_output --partial "$(printf 'claude\t7004242 5551234 idle none interactive %s default %s 2.1.280' "$EXECID" "$SID")"
+}
+
+@test "box probe never passes on a version it cannot trust" {
+  # The file is the box's to write and the host prints this value on the user's
+  # terminal. An escape sequence, or a space that would split the record into
+  # extra fields, must come through as unknown and nothing else.
+  local v
+  for v in '2.1.280\u001b[31m' '2.1.280 extra' '../../x' '' '2.1.280.1.2'; do
+    rm -f "$BH/.claude/sessions/"*.json "${PV:?}/7004242" -r 2>/dev/null
+    hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=$EXECID"
+    printf '{"pid":7004242,"sessionId":"%s","procStart":"5551234","version":"%s","kind":"interactive","entrypoint":"cli","status":"idle"}' \
+      "$SID" "$v" > "$BH/.claude/sessions/7004242.json"
+    run hb_run_box probe "$BH" "$PV"
+    assert_success
+    assert_output --partial "$(printf '%s unknown' "$SID")"
+  done
+}
+
 @test "box probe reads two exec ids in one environment as many" {
   hb_fake_proc "$PV" 7004242 "claude" 5551234 R "CLEAT_EXEC_ID=aaaa1111bbbb" "CLEAT_EXEC_ID=cccc2222dddd"
   hb_session "$BH" 7004242 busy procStart=5551234 sessionId="$SID"
@@ -783,8 +809,11 @@ t2_exec() {
 
 # t2_rec PID PS STATUS WAITING STORE [EXEC] [SID]: one claude probe record.
 t2_rec() {
-  printf 'claude\t%s %s %s %s interactive %s %s %s' \
-    "${1:-7004242}" "${2:-5551}" "${3:-idle}" "${4:-none}" "${6:-$EXECID}" "${5:-named}" "${7:-$SID}"
+  # The 9th field is the Claude Code version the session file names. It
+  # defaults to one on the verified list, so a test only sees the unchecked-
+  # version note when it asks for another version on purpose.
+  printf 'claude\t%s %s %s %s interactive %s %s %s %s' \
+    "${1:-7004242}" "${2:-5551}" "${3:-idle}" "${4:-none}" "${6:-$EXECID}" "${5:-named}" "${7:-$SID}" "${8:-2.1.280}"
 }
 
 # t2_term_ok [PID]: a clean terminate capture (one target exited).
@@ -1003,6 +1032,26 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
   assert_output --partial "Anything typed there but not sent is lost."
   assert_output --partial "Any background agent or monitor it runs in this box stops with it."
   assert_output --partial "may read the whole conversation again without a prompt cache. That can use a large share of work's usage."
+}
+
+@test "handoff disclosure names an unchecked Claude Code version, end to end" {
+  # The box half and the host half together: the record the real probe script
+  # emits for a session on 2.1.999 is fed to the real parser, and the note has
+  # to reach the disclosure. Each half was fine to look at on its own. The
+  # version field between them was never carried, so the note never showed.
+  local pv="$TEST_TEMP/pv-e2e" bh="$TEST_TEMP/bh-e2e" rec
+  mkdir -p "$pv" "$bh/.claude/sessions"
+  # On the named store, as the pinned box below expects, or the classifier
+  # rightly refuses before any per-session note is reached.
+  hb_fake_proc "$pv" 7004242 "claude" 5551 R "CLEAT_EXEC_ID=$EXECID" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$bh/.cleat-auth"
+  hb_session "$bh" 7004242 idle procStart=5551 sessionId="$SID" version=2.1.999
+  rec="$(hb_run_box probe "$bh" "$pv" | grep "^claude$(printf '\t')")"
+  [ -n "$rec" ] || { echo "the probe emitted no session record"; return 1; }
+  t2_prep; t2_named_box
+  t2_exec "$rec"
+  _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
+  run _handoff_say_disclosure main work
+  assert_output --partial "cleat has checked this handoff with Claude Code 2.1.270, 2.1.274 and 2.1.280. This box runs 2.1.999."
 }
 
 @test "handoff disclosure names the permission mode a session was in" {
@@ -1433,7 +1482,7 @@ hb_render_copy() {
 @test "handoff classify refuses a non interactive session kind" {
   t2_prep; t2_named_box
   # a bg/daemon kind is not an interactive session cleat can reopen
-  t2_exec "$(printf 'claude\t7004242 5551 idle none bg %s named %s' "$EXECID" "$SID")"
+  t2_exec "$(printf 'claude\t7004242 5551 idle none bg %s named %s 2.1.280' "$EXECID" "$SID")"
   _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
   assert_equal "$_HO_VERDICT" R4
 }
@@ -1480,18 +1529,21 @@ hb_render_copy() {
   assert_output "1.0.0, 2.0.0 and 3.0.0"
 }
 
-@test "handoff: a box on a verified version gets no version notice" {
-  # Both entries count as verified, or the notice fires for everyone on the
-  # newer one.
-  _HANDOFF_VERIFIED_CLAUDE="2.1.270 2.1.274"
+@test "handoff: a box on a verified version, or one cleat cannot read, gets no version notice" {
+  # Driven through the real probe parser and disclosure, not by setting the list
+  # and matching it by hand, which is what this test used to do and why it could
+  # not notice the note never appeared at all. The three versions are the ones
+  # driven end to end (concept/44). A version cleat cannot read gets no note
+  # rather than a wrong one.
   local v
-  for v in 2.1.270 2.1.274; do
-    case " $_HANDOFF_VERIFIED_CLAUDE " in
-      *" $v "*) : ;;
-      *) printf 'version %s should be verified\n' "$v" >&2; return 1 ;;
-    esac
+  # 2.1.28x reaches the host only if the box check is bypassed, and the host
+  # must still refuse to print it.
+  for v in 2.1.270 2.1.274 2.1.280 unknown 2.1.28x; do
+    t2_prep; t2_named_box
+    t2_exec "$(t2_rec 7004242 5551 idle none named "$EXECID" "$SID" "$v")"
+    _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
+    run _handoff_say_disclosure main work
+    assert_success
+    refute_output --partial "cleat has checked this handoff"
   done
-  case " $_HANDOFF_VERIFIED_CLAUDE " in
-    *" 2.1.999 "*) printf 'an unverified version matched\n' >&2; return 1 ;;
-  esac
 }

@@ -2923,6 +2923,25 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v1.5.2: the live switch's note naming a Claude Code version cleat had not
+# checked the handoff against (disclosure D10) could never appear. The probe
+# parser set every session's version to empty and nothing filled it, and the
+# box probe never sent one. v1.5.0's notes promised the handoff "says so when a
+# box runs another version". A maintainer switch on 2.1.280, then unlisted,
+# showed no note. The version is in Claude's own session file.
+@test "regression v1.5.2: the probe parser keeps the Claude Code version a session reports" {
+  CLEAT_RUN_DIR="$TEST_TEMP/run"; mkdir -p "$CLEAT_RUN_DIR"
+  local sid="d7b73579-1111-2222-3333-444455556666"
+  _handoff_docker_exec() {
+    printf 'hb\t1\nargs\tok\nclaude\t7004242 5551 idle none interactive deadbeef1234cafe named %s 2.1.999\nend\tok\n' \
+      "d7b73579-1111-2222-3333-444455556666" > "$3"
+  }
+  _handoff_probe "cleat-reg-box"
+  assert_equal "${_HO_VER[0]:-}" "2.1.999"
+  assert_equal "${_HO_SID[0]:-}" "$sid"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # v1.2.0: the kit scout's generated frontmatter wrapped its description as an
 # unquoted YAML plain scalar containing colon-space ("all exploration:
 # finding"), which is invalid YAML ("mapping values are not allowed here").

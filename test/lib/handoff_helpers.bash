@@ -60,7 +60,7 @@ hb_fake_snapshot_proc() {
 # fake proc's start time to make the session live).
 hb_session() {
   local home="$1" pid="$2" status="$3"; shift 3
-  local sid="d7b73579-1111-2222-3333-444455556666" ps="" kind="interactive" waiting="" kv k v
+  local sid="d7b73579-1111-2222-3333-444455556666" ps="" kind="interactive" waiting="" ver="2.1.270" kv k v
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
@@ -68,10 +68,11 @@ hb_session() {
       procStart) ps="$v" ;;
       kind) kind="$v" ;;
       waitingFor) waiting="$v" ;;
+      version) ver="$v" ;;
     esac
   done
   mkdir -p "$home/.claude/sessions"
-  local json="{\"pid\":$pid,\"sessionId\":\"$sid\",\"procStart\":\"$ps\",\"version\":\"2.1.270\",\"kind\":\"$kind\",\"entrypoint\":\"cli\",\"status\":\"$status\""
+  local json="{\"pid\":$pid,\"sessionId\":\"$sid\",\"procStart\":\"$ps\",\"version\":\"$ver\",\"kind\":\"$kind\",\"entrypoint\":\"cli\",\"status\":\"$status\""
   [[ -n "$waiting" ]] && json="$json,\"waitingFor\":\"$waiting\""
   json="$json}"
   printf '%s' "$json" > "$home/.claude/sessions/$pid.json"

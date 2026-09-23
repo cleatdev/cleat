@@ -13,7 +13,7 @@
     The first reply on b may read the whole conversation again without a prompt cache. That can use a large share of b's usage.
     b is on a Pro plan. cleat cannot tell whether that plan keeps 1M context.
     It was in plan mode. Check its mode there after it reopens.
-    cleat has checked this handoff with Claude Code 2.1.270 and 2.1.274. This box runs 2.1.999.
+    cleat has checked this handoff with Claude Code 2.1.270, 2.1.274 and 2.1.280. This box runs 2.1.999.
 # disclosure, two sessions
   ! main has 2 live Claude sessions in other terminals.
     Handing both over to b restarts each in its own terminal and reopens its own conversation.

@@ -11612,6 +11612,42 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_bridge_url_cap_bytes" "the bridge URL cap counted characters, not bytes"
+
+# The session trash is host-only. Back inside the session dir the box mounts, a
+# link planted at the entry name sends a deleted transcript into a host dir.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_path()/,/^}$/{
+  s@^  printf '%s/session-trash/%s' "[$]CLEAT_CONFIG_DIR" "[$]{1##\*/}"$@  printf '%s/.cleat-trash' "$1"@
+}
+SED
+try "v154_session_trash_host_only" "a session delete followed a link the box planted in its trash"
+
+# Restore names the session DIRECTORY with mv -n. Renaming onto the full name
+# lets a link planted there after the check take the sidecar into a host dir.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_restore()/,/^}$/{
+  s@^        mv -n "[$]p" "[$]{sdir}/" 2>/dev/null || true ;;$@        mv "$p" "${sdir}/${base}" 2>/dev/null || true ;;@
+}
+SED
+try "v154_session_restore_names_dir" "a session restore moved through a link the box planted at the session name"
+
+# The old in-mount trash is renamed out whole and only unpacked when it is a
+# real directory. Walking a link unpacks a host dir into the trash.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_dir()/,/^}$/{
+  s@^      if \[\[ -d "[$]staged" && ! -L "[$]staged" \]\]; then$@      if [[ -d "$staged" ]]; then@
+}
+SED
+try "v154_session_trash_legacy_link" "the old in-mount trash was unpacked through a link the box planted"
+
+# The trash entry is created with a plain mkdir. mkdir -p walks through a link
+# already at the entry name and the delete moves the transcript through it.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash()/,/^}$/{
+  s@^  mkdir "[$]dest" 2>/dev/null || return 2$@  mkdir -p "$dest" 2>/dev/null || return 2@
+}
+SED
+try "v154_session_trash_entry_exclusive" "a session delete wrote through a link already at its trash entry name"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

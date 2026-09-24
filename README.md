@@ -551,7 +551,7 @@ The list fills the window, showing as many conversations as the terminal has roo
 
 The size column is why the list is useful. A conversation is a transcript **plus** a sibling directory of subagent transcripts and tool results. That sidecar is usually several times bigger, so the sizes shown add both and a delete always takes both. They are apparent sizes, the same caveat `cleat fork` carries.
 
-Deleting moves the conversation to a trash inside the session directory and prints how to undo it. It refuses while the box has a live Claude session. It also refuses when Docker cannot tell it whether the box is running, because a transcript removed while Claude is writing to it is lost silently. Without a terminal it shows what would go and deletes nothing unless you add `--yes`.
+Deleting moves the conversation to a trash in `~/.config/cleat/session-trash/`, outside every folder a box can see. It prints how to undo it. It refuses while the box has a live Claude session. It also refuses when Docker cannot tell it whether the box is running, because a transcript removed while Claude is writing to it is lost silently. Without a terminal it shows what would go and deletes nothing unless you add `--yes`.
 
 Restoring resolves the id against the trash, so the short id the delete printed is the one that works. It never overwrites a conversation that has come back under the same name.
 

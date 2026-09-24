@@ -15170,21 +15170,55 @@ _sessions_delete_set() {
   printf '%s\n' "/tmp/claude-$(id -u)/$(_claude_session_key "$project")/${uuid}"
 }
 
-# Where a deleted session goes. Inside the key dir on purpose: `mv` is then a
-# rename on one filesystem, so trashing the 938 MB sidecar copies zero bytes and
-# is instant. A copy-based trash would be indefensible at that size.
-# The trash directory, refused when it is not a real directory sitting directly
-# inside the session dir. It lives in a tree the box mounts read-write, so a
-# symlink planted there would relocate a "deleted" session outside the session
-# directory while the delete reported success. Every source path is contained;
-# the destination has to be too.
+# Where a deleted session goes: $CLEAT_CONFIG_DIR/session-trash/<key>, on the
+# host and outside every mount. It used to be <key>/.cleat-trash, inside the
+# session dir the box mounts read-write. The box could plant a link at the entry
+# name a delete was about to create (the epoch is predictable, the uuid known),
+# and the delete then moved the transcript into whatever host directory the link
+# named. It also kept every deleted conversation readable by the box for the
+# whole thirty days. Not the per-box run dir, because that is wiped on every
+# recreate and the trash keeps thirty days. $CLEAT_CONFIG_DIR sits under $HOME
+# like ~/.claude, so `mv` stays a rename on one filesystem and trashing the
+# 938 MB sidecar still copies zero bytes.
+_sessions_trash_path() {
+  printf '%s/session-trash/%s' "$CLEAT_CONFIG_DIR" "${1##*/}"
+}
+
+# The trash directory, refused when it is anything but a real directory or
+# nothing yet. A trash left inside the session dir from before the move is
+# carried out to it, and that tree is the box's: it can swap any part of it for
+# a link at any moment. So the whole legacy directory is first renamed into
+# the host-only trash, which moves a link rather than following it, and only
+# there, out of the box's reach, is it checked and unpacked. Real
+# <epoch>-<uuid> directories move into the trash, an entry already there is
+# never overwritten, and whatever else it held is removed.
 _sessions_trash_dir() {
-  local d="${1}/.cleat-trash"
+  local sdir="$1" d legacy staged e base
+  case "${sdir##*/}" in ''|.|..) return 1 ;; esac
+  d="$(_sessions_trash_path "$sdir")"
   if [[ -L "$d" ]]; then
     return 1
   fi
   if [[ -e "$d" ]] && [[ ! -d "$d" ]]; then
     return 1
+  fi
+  legacy="${sdir}/.cleat-trash"
+  if [[ -e "$legacy" || -L "$legacy" ]]; then
+    mkdir -p "$d" 2>/dev/null || return 1
+    staged="$d/.legacy.$$.$RANDOM"
+    if mv "$legacy" "$staged" 2>/dev/null; then
+      if [[ -d "$staged" && ! -L "$staged" ]]; then
+        for e in "$staged"/*; do
+          [[ -d "$e" && ! -L "$e" ]] || continue
+          base="${e##*/}"
+          case "${base%%-*}" in ''|*[!0-9]*) continue ;; esac
+          _sessions_is_uuid "${base#*-}" || continue
+          [[ -e "$d/$base" || -L "$d/$base" ]] && continue
+          mv "$e" "$d/$base" 2>/dev/null || true
+        done
+      fi
+      rm -rf "$staged" 2>/dev/null || true
+    fi
   fi
   printf '%s' "$d"
 }
@@ -15202,7 +15236,7 @@ _sessions_trash_sweep() {
   case "$now" in ''|*[!0-9]*|0) return 0 ;; esac
   cutoff=$(( now - _SESSIONS_TRASH_DAYS * 86400 ))
   for d in "$tdir"/*; do
-    [[ -d "$d" ]] || continue
+    [[ -d "$d" && ! -L "$d" ]] || continue
     base="${d##*/}"
     stamp="${base%%-*}"
     case "$stamp" in ''|*[!0-9]*) continue ;; esac
@@ -15226,7 +15260,14 @@ _sessions_trash() {
   # has to tell them apart or a poisoned trash directory reads as a success.
   tdir="$(_sessions_trash_dir "$sdir")" || return 2
   dest="${tdir}/${now}-${uuid}"
-  mkdir -p "$dest" || return 1
+  # The entry is created here and never reused. Plain mkdir fails on any name
+  # that already exists, a link included, where -p would walk through a link
+  # to a directory. The box cannot write in the host-only trash, but the
+  # carry-out of an old in-mount trash renames whatever that tree held at the
+  # time, so a link can still arrive under an entry name. Refusing is the only
+  # check it cannot race.
+  mkdir -p "$tdir" 2>/dev/null || return 2
+  mkdir "$dest" 2>/dev/null || return 2
   local idx=0 target moved=0
   while IFS= read -r p; do
     idx=$(( idx + 1 ))
@@ -15280,7 +15321,7 @@ _sessions_restore() {
   tdir="$(_sessions_trash_dir "$sdir")" || return 1
   [[ -d "$tdir" ]] || return 1
   for d in "$tdir"/*-"$uuid"; do
-    [[ -d "$d" ]] || continue
+    [[ -d "$d" && ! -L "$d" ]] || continue
     found="$d"
   done
   [[ -n "$found" ]] || return 1
@@ -15289,8 +15330,13 @@ _sessions_restore() {
     base="${p##*/}"
     case "$base" in
       "${uuid}.jsonl"|"$uuid"|"${uuid}."*)
-        [[ -e "${sdir}/${base}" ]] && continue
-        mv "$p" "${sdir}/${base}" 2>/dev/null || true ;;
+        # -L too: a link the box planted at the name, even a dangling one, is
+        # never renamed onto or through. The box can still plant one after
+        # this check, so the move names the DIRECTORY with -n: mv never
+        # follows a link at the final name and never replaces what is there.
+        # The session dir itself is the box's mount root, which it cannot swap.
+        [[ -e "${sdir}/${base}" || -L "${sdir}/${base}" ]] && continue
+        mv -n "$p" "${sdir}/" 2>/dev/null || true ;;
     esac
   done
   rmdir "$found" 2>/dev/null || true
@@ -15314,7 +15360,7 @@ _sessions_trash_scan() {
   tdir="$(_sessions_trash_dir "$sdir")" || return 0
   [[ -d "$tdir" ]] || return 0
   for d in "$tdir"/*; do
-    [[ -d "$d" ]] || continue
+    [[ -d "$d" && ! -L "$d" ]] || continue
     base="${d##*/}"
     stamp="${base%%-*}"
     case "$stamp" in ''|*[!0-9]*) continue ;; esac
@@ -15340,7 +15386,7 @@ _sessions_trash_count() {
   tdir="$(_sessions_trash_dir "$sdir")" || { printf '0'; return 0; }
   if [[ -d "$tdir" ]]; then
     for d in "$tdir"/*; do
-      [[ -d "$d" ]] || continue
+      [[ -d "$d" && ! -L "$d" ]] || continue
       base="${d##*/}"
       case "${base%%-*}" in ''|*[!0-9]*) continue ;; esac
       _sessions_is_uuid "${base#*-}" || continue
@@ -16053,8 +16099,8 @@ _sessions_do_delete() {
   local _trc=0
   _sessions_trash "$sdir" "$uuid" "$project" "$cname" || _trc=$?
   if [[ $_trc -eq 2 ]]; then
-    error "Refusing to delete: the trash directory is not a plain directory in the session dir."
-    echo -e "    ${DIM}Nothing was moved. Check ${sdir}/.cleat-trash${RESET}"
+    error "Refusing to delete: the trash directory is not a plain directory."
+    echo -e "    ${DIM}Nothing was moved. Check $(_sessions_trash_path "$sdir")${RESET}"
     return 1
   fi
   if [[ $_trc -eq 3 ]]; then
@@ -16096,7 +16142,7 @@ _sessions_do_restore() {
   # _sessions_restore refuses to overwrite anything that reappeared under the
   # same name, so "it is already back" is the likeliest reason and the user can
   # check it themselves.
-  echo -e "    ${DIM}Nothing was overwritten. Trash: ${sdir}/.cleat-trash${RESET}"
+  echo -e "    ${DIM}Nothing was overwritten. Trash: $(_sessions_trash_path "$sdir")${RESET}"
   return 1
 }
 
@@ -22268,7 +22314,7 @@ cmd_sessions() {
       fi
       if [[ $_rrc -ne 0 || -z "$ruuid" ]]; then
         error "No trashed session in this project matching ${BOLD}${id}${RESET}."
-        echo -e "    ${DIM}Trash: ${sdir}/.cleat-trash${RESET}"
+        echo -e "    ${DIM}Trash: $(_sessions_trash_path "$sdir")${RESET}"
         return 1
       fi
       if _sessions_restore "$sdir" "$ruuid"; then
@@ -22292,7 +22338,7 @@ cmd_sessions() {
       rm -f "$tfile"
       if [[ "$_SESS_N" -eq 0 ]]; then
         info "The trash is empty."
-        echo -e "    ${DIM}Deleted sessions land in ${sdir}/.cleat-trash${RESET}"
+        echo -e "    ${DIM}Deleted sessions land in $(_sessions_trash_path "$sdir")${RESET}"
         return 0
       fi
       echo ""
@@ -22402,7 +22448,7 @@ _sessions_restore_resolve() {
   tdir="$(_sessions_trash_dir "$sdir")" || return 1
   [[ -d "$tdir" ]] || return 1
   for d in "$tdir"/*; do
-    [[ -d "$d" ]] || continue
+    [[ -d "$d" && ! -L "$d" ]] || continue
     base="${d##*/}"
     uuid="${base#*-}"
     _sessions_is_uuid "$uuid" || continue

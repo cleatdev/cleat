@@ -6892,3 +6892,97 @@ _mount_targets_fixture() {
   assert_success
   assert_output "claude.ai"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: `cleat session rm` moved a session into <key>/.cleat-trash, inside the
+# session dir the box mounts read-write. The box could plant a link at the entry
+# name the delete was about to create (the epoch is predictable, the uuid is
+# known to it), and the delete moved the transcript into whatever host directory
+# the link named. The trash is now host-only, under $CLEAT_CONFIG_DIR.
+@test "regression v1.5.4: a session delete followed a link the box planted in its trash" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef" now i
+  local uuid="11111111-1111-2222-3333-444444444444"
+  mkdir -p "$sdir/.cleat-trash" "$TEST_TEMP/hostdir"
+  echo "transcript" > "$sdir/${uuid}.jsonl"
+  now="$(date +%s)"
+  for i in 0 1 2 3 4 5; do
+    ln -s "$TEST_TEMP/hostdir" "$sdir/.cleat-trash/$(( now + i ))-${uuid}"
+  done
+  run _sessions_trash "$sdir" "$uuid" "$TEST_TEMP/proj" "cleat-x"
+  assert_success
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run cat "$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef/"*"-${uuid}/${uuid}.jsonl"
+  assert_output "transcript"
+}
+
+# v1.5.4: restore checked the session's name and then renamed onto it, inside
+# the session dir the box mounts. A link to a host directory planted at the name
+# between the check and the move made mv move the trashed sidecar into that
+# directory. Restore now names the session DIRECTORY with mv -n, which never
+# descends into a planted final name.
+@test "regression v1.5.4: a session restore moved through a link the box planted at the session name" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef"
+  local uuid="11111111-1111-2222-3333-444444444444"
+  local entry="$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef/100-${uuid}"
+  mkdir -p "$sdir" "$entry/$uuid" "$TEST_TEMP/hostdir"
+  echo "t" > "$entry/${uuid}.jsonl"
+  echo "sidecar" > "$entry/$uuid/marker"
+  # mv stands in for the box winning the window after the check. It plants the
+  # link only when the sidecar moves, so the glob order of the two items does
+  # not decide whether the check before the move already saw it.
+  mv() {
+    case "$* " in
+      *"/$uuid "*) [ -L "$sdir/$uuid" ] || ln -s "$TEST_TEMP/hostdir" "$sdir/$uuid" ;;
+    esac
+    command mv "$@"
+  }
+  run _sessions_restore "$sdir" "$uuid"
+  unset -f mv
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run cat "$entry/$uuid/marker"
+  assert_output "sidecar"
+}
+
+# v1.5.4: the first trash operation carries an old <key>/.cleat-trash out to the
+# host-only trash. That tree is the box's, so it can be a link to any host
+# directory. The carry-out renames the link and drops it, it never walks it.
+@test "regression v1.5.4: the old in-mount trash was unpacked through a link the box planted" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef"
+  local uuid="11111111-1111-2222-3333-444444444444"
+  mkdir -p "$sdir" "$TEST_TEMP/hostdir/100-${uuid}"
+  echo "not the box's" > "$TEST_TEMP/hostdir/100-${uuid}/${uuid}.jsonl"
+  ln -s "$TEST_TEMP/hostdir" "$sdir/.cleat-trash"
+  run _sessions_trash_count "$sdir"
+  assert_output "0"
+  run cat "$TEST_TEMP/hostdir/100-${uuid}/${uuid}.jsonl"
+  assert_output "not the box's"
+  run test -e "$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef/100-${uuid}"
+  assert_failure
+  run test -L "$sdir/.cleat-trash"
+  assert_failure
+}
+
+# v1.5.4: a delete created its trash entry with mkdir -p, which walks through a
+# link to a directory. A link can still reach the host-only trash under an entry
+# name (a box descriptor held across the carry-out of an old trash), and the
+# delete then moved the transcript through it. The entry is now created with a
+# plain mkdir, so an existing name refuses the delete and nothing moves.
+@test "regression v1.5.4: a session delete wrote through a link already at its trash entry name" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef" now i
+  local uuid="11111111-1111-2222-3333-444444444444"
+  local trash="$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef"
+  mkdir -p "$sdir" "$trash" "$TEST_TEMP/hostdir"
+  echo "transcript" > "$sdir/${uuid}.jsonl"
+  now="$(date +%s)"
+  for i in 0 1 2 3 4 5; do
+    ln -s "$TEST_TEMP/hostdir" "$trash/$(( now + i ))-${uuid}"
+  done
+  run _sessions_trash "$sdir" "$uuid" "$TEST_TEMP/proj" "cleat-x"
+  assert_failure 2
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run cat "$sdir/${uuid}.jsonl"
+  assert_output "transcript"
+}

@@ -21,6 +21,8 @@ setup() {
   _has_unicode() { return 1; }
   SDIR="$TEST_TEMP/home/.claude/projects/proj-deadbeef"
   mkdir -p "$SDIR"
+  # The trash is host-only, outside the session dir the box mounts.
+  TRASH="$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef"
 }
 teardown() { _common_teardown; }
 
@@ -682,8 +684,8 @@ _pass_gates() {
   assert_success
   [ ! -e "$SDIR/${U1}.jsonl" ]
   [ ! -e "$SDIR/$U1" ]
-  [ -f "$SDIR/.cleat-trash/"*"-$U1/${U1}.jsonl" ]
-  [ -f "$SDIR/.cleat-trash/"*"-$U1/$U1/subagents/a.jsonl" ]
+  [ -f "$TRASH/"*"-$U1/${U1}.jsonl" ]
+  [ -f "$TRASH/"*"-$U1/$U1/subagents/a.jsonl" ]
 }
 
 @test "sessions: delete is a move, not an unlink" {
@@ -691,7 +693,7 @@ _pass_gates() {
   _mk_session "$U1" "doomed"
   run _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
   assert_success
-  run cat "$SDIR/.cleat-trash/"*"-$U1/${U1}.jsonl"
+  run cat "$TRASH/"*"-$U1/${U1}.jsonl"
   assert_output --partial "doomed"
 }
 
@@ -706,7 +708,7 @@ _pass_gates() {
   run _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
   assert_success
   [ ! -e "$CLEAT_RUN_DIR/cleat-x/home/session-env/$U1" ] || { echo "the per-box session-env was left behind"; return 1; }
-  run grep -rl "box env" "$SDIR/.cleat-trash"
+  run grep -rl "box env" "$TRASH"
   assert_success
 }
 
@@ -852,25 +854,25 @@ _pass_gates() {
 }
 
 @test "sessions: the trash sweep drops entries past the window" {
-  mkdir -p "$SDIR/.cleat-trash/1-$U1"
-  : > "$SDIR/.cleat-trash/1-$U1/x"
+  mkdir -p "$TRASH/1-$U1"
+  : > "$TRASH/1-$U1/x"
   run _sessions_trash_sweep "$SDIR"
   assert_success
-  [ ! -d "$SDIR/.cleat-trash/1-$U1" ]
+  [ ! -d "$TRASH/1-$U1" ]
 }
 
 @test "sessions: the trash sweep keeps a fresh entry" {
-  mkdir -p "$SDIR/.cleat-trash/$(date +%s)-$U1"
+  mkdir -p "$TRASH/$(date +%s)-$U1"
   run _sessions_trash_sweep "$SDIR"
   assert_success
-  [ -d "$SDIR/.cleat-trash/$(date +%s)-$U1" ] || [ -d "$SDIR/.cleat-trash/"*"-$U1" ]
+  [ -d "$TRASH/$(date +%s)-$U1" ] || [ -d "$TRASH/"*"-$U1" ]
 }
 
 @test "sessions: the trash sweep ignores anything not named epoch-uuid" {
-  mkdir -p "$SDIR/.cleat-trash/not-a-session"
+  mkdir -p "$TRASH/not-a-session"
   run _sessions_trash_sweep "$SDIR"
   assert_success
-  [ -d "$SDIR/.cleat-trash/not-a-session" ]
+  [ -d "$TRASH/not-a-session" ]
 }
 
 # ── title validation ───────────────────────────────────────────────────────
@@ -1278,11 +1280,11 @@ _pass_gates() {
 }
 
 @test "sessions: a symlinked trash directory is refused" {
-  # .cleat-trash sits in a tree the box mounts read-write, so a symlink there
-  # would relocate a deleted session outside the session directory while the
-  # delete reported success. Every source path is contained; so is the target.
-  mkdir -p "$TEST_TEMP/outside"
-  ln -s "$TEST_TEMP/outside" "$SDIR/.cleat-trash"
+  # A symlink at the trash would relocate a deleted session somewhere else
+  # while the delete reported success. Every source path is contained, and so
+  # is the target, even though the trash is now outside every mount.
+  mkdir -p "$TEST_TEMP/outside" "${TRASH%/*}"
+  ln -s "$TEST_TEMP/outside" "$TRASH"
   run _sessions_trash_dir "$SDIR"
   assert_failure
 }
@@ -1290,8 +1292,8 @@ _pass_gates() {
 @test "sessions: a delete refuses rather than trashing through a symlinked trash" {
   _pass_gates
   _mk_session "$U1" "doomed"
-  mkdir -p "$TEST_TEMP/outside"
-  ln -s "$TEST_TEMP/outside" "$SDIR/.cleat-trash"
+  mkdir -p "$TEST_TEMP/outside" "${TRASH%/*}"
+  ln -s "$TEST_TEMP/outside" "$TRASH"
   run _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
   assert_failure
   # The transcript stays put and nothing lands outside the session directory.
@@ -1310,15 +1312,15 @@ _pass_gates() {
   run _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
   assert_success
   # The sidecar keeps its own name, because that is what restore looks for.
-  [ -f "$SDIR/.cleat-trash/"*"-$U1/$U1/marker" ]
+  [ -f "$TRASH/"*"-$U1/$U1/marker" ]
   # The session-env copy must be a SIBLING of the sidecar, not buried inside it.
   # Asserting only that both markers exist proves nothing: under the collision
   # both DO exist, one nested in the other, which is the bug.
   local nested
-  nested="$(find "$SDIR/.cleat-trash" -path "*/$U1/$U1/*" -name marker | wc -l | tr -d ' ')"
+  nested="$(find "$TRASH" -path "*/$U1/$U1/*" -name marker | wc -l | tr -d ' ')"
   [ "$nested" -eq 0 ]
   local siblings
-  siblings="$(find "$SDIR/.cleat-trash" -mindepth 2 -maxdepth 3 -name marker | wc -l | tr -d ' ')"
+  siblings="$(find "$TRASH" -mindepth 2 -maxdepth 3 -name marker | wc -l | tr -d ' ')"
   [ "$siblings" -eq 2 ]
 }
 
@@ -1327,13 +1329,13 @@ _pass_gates() {
   # conversations is the same class of mistake as a delete that does.
   local A="aaaaaaaa-1111-2222-3333-444444444444"
   local B="aaaaaaaa-1111-2222-3333-555555555555"
-  mkdir -p "$SDIR/.cleat-trash/100-$A" "$SDIR/.cleat-trash/200-$B"
+  mkdir -p "$TRASH/100-$A" "$TRASH/200-$B"
   run _sessions_restore_resolve "$SDIR" "aaaaaaaa"
   [ "$status" -eq 4 ]
 }
 
 @test "sessions: restore still resolves an unambiguous prefix" {
-  mkdir -p "$SDIR/.cleat-trash/100-$U1"
+  mkdir -p "$TRASH/100-$U1"
   run _sessions_restore_resolve "$SDIR" "11111111"
   assert_success
   assert_output "$U1"
@@ -1530,13 +1532,13 @@ _widest_col() {
 
 _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   local uuid="$1" stamp="${2:-1789000000}" title="${3:-}"
-  mkdir -p "$SDIR/.cleat-trash/${stamp}-${uuid}"
+  mkdir -p "$TRASH/${stamp}-${uuid}"
   {
     printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid"
     if [[ -n "$title" ]]; then
       printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}\n' "$title" "$uuid"
     fi
-  } > "$SDIR/.cleat-trash/${stamp}-${uuid}/${uuid}.jsonl"
+  } > "$TRASH/${stamp}-${uuid}/${uuid}.jsonl"
 }
 
 @test "sessions: a rename redraws the list instead of ending the verb" {
@@ -1746,8 +1748,8 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
 }
 
 @test "sessions: the trash scan ignores anything not named epoch-uuid" {
-  mkdir -p "$SDIR/.cleat-trash/not-a-session" "$SDIR/.cleat-trash/abc-$U1" \
-           "$SDIR/.cleat-trash/100-notauuid"
+  mkdir -p "$TRASH/not-a-session" "$TRASH/abc-$U1" \
+           "$TRASH/100-notauuid"
   run _sessions_trash_scan "$SDIR"
   assert_success
   assert_output ""
@@ -1768,8 +1770,8 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
 }
 
 @test "sessions: the trash scan refuses a symlinked trash directory" {
-  mkdir -p "$TEST_TEMP/outside/1-$U1"
-  ln -s "$TEST_TEMP/outside" "$SDIR/.cleat-trash"
+  mkdir -p "$TEST_TEMP/outside/1-$U1" "${TRASH%/*}"
+  ln -s "$TEST_TEMP/outside" "$TRASH"
   run _sessions_trash_scan "$SDIR"
   assert_success
   assert_output ""
@@ -1781,9 +1783,9 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   # not-a-session is rejected by the uuid check, 100-notauuid by the uuid check
   # too, and abc-<uuid> ONLY by the stamp check. All three are needed or one of
   # the two guards can be removed without the count moving.
-  mkdir -p "$SDIR/.cleat-trash/not-a-session" "$SDIR/.cleat-trash/100-notauuid" \
-           "$SDIR/.cleat-trash/abc-$U1"
-  : > "$SDIR/.cleat-trash/a-file"
+  mkdir -p "$TRASH/not-a-session" "$TRASH/100-notauuid" \
+           "$TRASH/abc-$U1"
+  : > "$TRASH/a-file"
   run _sessions_trash_count "$SDIR"
   assert_success
   assert_output "2"
@@ -2165,7 +2167,7 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   run _sessions_do_delete "$SDIR" "$U1" "$TEST_TEMP/proj" "main" "cleat-x" 1
   assert_failure
   assert_output --partial "already gone"
-  [ -z "$(ls -A "$SDIR/.cleat-trash" 2>/dev/null)" ]
+  [ -z "$(ls -A "$TRASH" 2>/dev/null)" ]
 }
 
 @test "sessions: an empty trash entry is never left behind" {
@@ -2174,7 +2176,7 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   rm -f "$SDIR/${U1}.jsonl"
   run _sessions_trash "$SDIR" "$U1" "$TEST_TEMP/proj" "cleat-x"
   [ "$status" -eq 3 ]
-  [ -z "$(ls -A "$SDIR/.cleat-trash" 2>/dev/null)" ]
+  [ -z "$(ls -A "$TRASH" 2>/dev/null)" ]
 }
 
 @test "session titles: one invalid byte does not kill the picker" {
@@ -2225,4 +2227,54 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   # And the rename still did its job.
   run cat "$sdir/$uuid.jsonl"
   assert_output --partial "renamed"
+}
+
+@test "sessions: a trash left inside the session dir is carried out to the host-only trash" {
+  # Before the trash moved out of the session dir, it lived in <key>/.cleat-trash.
+  # Its real entries move out. A link, a stray name and an entry that would
+  # overwrite one already in the new trash do not, and the old dir is gone.
+  mkdir -p "$SDIR/.cleat-trash/100-$U1" "$SDIR/.cleat-trash/300-$U2" "$TRASH/300-$U2" \
+    "$SDIR/.cleat-trash/not-a-session" "$SDIR/.cleat-trash/abc-$U1" \
+    "$SDIR/.cleat-trash/100-notauuid" "$TEST_TEMP/outside/keep"
+  echo "old" > "$SDIR/.cleat-trash/100-$U1/${U1}.jsonl"
+  echo "legacy duplicate" > "$SDIR/.cleat-trash/300-$U2/${U2}.jsonl"
+  echo "already here" > "$TRASH/300-$U2/${U2}.jsonl"
+  ln -s "$TEST_TEMP/outside" "$SDIR/.cleat-trash/200-$U2"
+  run _sessions_trash_count "$SDIR"
+  assert_output "2"
+  run cat "$TRASH/100-$U1/${U1}.jsonl"
+  assert_output "old"
+  run cat "$TRASH/300-$U2/${U2}.jsonl"
+  assert_output "already here"
+  run test -e "$TRASH/300-$U2/300-$U2"
+  assert_failure
+  run ls -A "$TRASH"
+  assert_output "$(printf '%s\n' "100-$U1" "300-$U2")"
+  run test -e "$SDIR/.cleat-trash"
+  assert_failure
+  run test -d "$TEST_TEMP/outside/keep"
+  assert_success
+}
+
+@test "sessions: a session dir with no key gets no trash" {
+  run _sessions_trash_dir "$HOME/.claude/projects/.."
+  assert_failure
+  run _sessions_trash_dir "$HOME/.claude/projects/"
+  assert_failure
+}
+
+@test "sessions: restore never renames onto a link planted at the session name" {
+  # The session dir is the box's own mount, so it can plant a link at the name
+  # a restore is about to write, dangling or not.
+  mkdir -p "$TRASH/100-$U1" "$TEST_TEMP/outside"
+  echo "back" > "$TRASH/100-$U1/${U1}.jsonl"
+  ln -s "$TEST_TEMP/outside/nowhere" "$SDIR/${U1}.jsonl"
+  run _sessions_restore "$SDIR" "$U1"
+  assert_failure
+  run test -L "$SDIR/${U1}.jsonl"
+  assert_success
+  run ls -A "$TEST_TEMP/outside"
+  assert_output ""
+  run cat "$TRASH/100-$U1/${U1}.jsonl"
+  assert_output "back"
 }

@@ -1018,6 +1018,30 @@ CURL
   assert_failure
 }
 
+@test "smoke: cleat session trash carries an old in-mount trash out under strict mode" {
+  # The trash moved out of the session dir. The first trash command carries the
+  # old <key>/.cleat-trash out, and that code runs here on the real binary,
+  # where set -u would catch a name the sourced tests cannot see.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  local proj="$TEST_TEMP/project" uuid="0123abcd-1111-2222-3333-444455556666"
+  local key sdir entry
+  key="project-$(echo -n "$proj" | _md5 | head -c 8)"
+  sdir="$HOME/.claude/projects/$key"
+  # A fresh stamp, so the sweep that runs first keeps it.
+  entry="$sdir/.cleat-trash/$(date +%s)-$uuid"
+  mkdir -p "$entry"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid" > "$entry/$uuid.jsonl"
+  run cleat_bin_timeout 10 session trash
+  refute_output --partial "unbound variable"
+  assert_success
+  assert_output --partial "0123abcd"
+  run test -e "$sdir/.cleat-trash"
+  assert_failure
+}
+
 @test "smoke: the plural and the short form still reach the session verb" {
   # Nothing has shipped under either name, so this is courtesy rather than
   # compatibility. `cleat sessions` is what fingers type.

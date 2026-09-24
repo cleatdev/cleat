@@ -7029,3 +7029,26 @@ REG
   run ls -A "$TEST_TEMP/hostdir"
   assert_output ""
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vNEXT: `cleat session rm` moved a session into <key>/.cleat-trash, inside the
+# session dir the box mounts read-write. The box could plant a link at the entry
+# name the delete was about to create (the epoch is predictable, the uuid is
+# known to it), and the delete moved the transcript into whatever host directory
+# the link named. The trash is now host-only, under $CLEAT_CONFIG_DIR.
+@test "regression vNEXT: a session delete followed a link the box planted in its trash" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef" now i
+  local uuid="11111111-1111-2222-3333-444444444444"
+  mkdir -p "$sdir/.cleat-trash" "$TEST_TEMP/hostdir"
+  echo "transcript" > "$sdir/${uuid}.jsonl"
+  now="$(date +%s)"
+  for i in 0 1 2 3 4 5; do
+    ln -s "$TEST_TEMP/hostdir" "$sdir/.cleat-trash/$(( now + i ))-${uuid}"
+  done
+  run _sessions_trash "$sdir" "$uuid" "$TEST_TEMP/proj" "cleat-x"
+  assert_success
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run cat "$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef/"*"-${uuid}/${uuid}.jsonl"
+  assert_output "transcript"
+}

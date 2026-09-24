@@ -11647,6 +11647,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_clipimg_claim_host_only" "an image request was moved through a link the box planted"
 
+# The session trash is host-only. Back inside the session dir the box mounts, a
+# link planted at the entry name sends a deleted transcript into a host dir.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_path()/,/^}$/{
+  s@^  printf '%s/session-trash/%s' "[$]CLEAT_CONFIG_DIR" "[$]{1##\*/}"$@  printf '%s/.cleat-trash' "$1"@
+}
+SED
+try "vnext_session_trash_host_only" "a session delete followed a link the box planted in its trash"
+
 # The hook drop report reads the whole log when its offset points past the end,
 # which is what a rotation leaves behind.
 cat > "$SED_TMP" << 'SED'

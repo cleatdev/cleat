@@ -6853,7 +6853,7 @@ _mount_targets_fixture() {
 # to a host directory, and mv then moved the request, a file or a whole tree of
 # the box's choosing, into that directory, outside every mount, four times a
 # second.
-@test "regression vNEXT: an image request was moved through a link the box planted" {
+@test "regression v1.5.3: an image request was moved through a link the box planted" {
   local clip="$TEST_TEMP/ir/clip" i
   mkdir -p "$clip" "$TEST_TEMP/hostdir" "$TEST_TEMP/bin"
   printf '#!/bin/sh\nexit 0\n' > "$TEST_TEMP/bin/docker"
@@ -6880,7 +6880,7 @@ _mount_targets_fixture() {
 # not bytes. ${#url} follows the caller's locale, and a Mac terminal runs in a
 # UTF-8 one, so a URL of multibyte characters passed at up to four times the
 # bytes the cap and its documented bandwidth (about 60 KB a session) allow.
-@test "regression vNEXT: the bridge URL cap counted characters, not bytes" {
+@test "regression v1.5.3: the bridge URL cap counted characters, not bytes" {
   local utf8; utf8="$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true)"
   [ -n "$utf8" ] || skip "no UTF-8 locale available on this host"
   LC_ALL="$utf8"

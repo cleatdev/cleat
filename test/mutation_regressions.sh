@@ -4135,9 +4135,10 @@ try "vnext_trust_target_ctrl_char_guard" "project path containing a tab is refus
 # yellow when its .cleat.<box> hash no longer matches what was approved. Force
 # the comparison to never trip (equal hash): every row stays green, so the
 # "flips green to yellow" assertion (which needs the yellow marker after an
-# edit) must fail.
+# edit) must fail. Retargeted when the marker stopped requiring a .cleat, so a
+# row approved for env-file host variables alone can turn yellow too.
 cat > "$SED_TMP" << 'SED'
-s@if \[\[ -f "\$_cf" && -n "\$_cur" && "\$_stored" != "\$_cur" \]\]; then@if [[ -f "$_cf" \&\& -n "$_cur" \&\& "$_stored" == "$_cur" ]]; then@
+s@if \[\[ -n "\$_cur" && "\$_stored" != "\$_cur" \]\]; then@if [[ -n "$_cur" \&\& "$_stored" == "$_cur" ]]; then@
 SED
 try "vnext_trust_list_box_staleness" "flips green to yellow when its" "$CLI" "$PROVISION_BATS"
 
@@ -4788,10 +4789,12 @@ try "hook_concurrency_bound" "concurrency is bounded so a spool flood" "$CLI" "$
 # TRUST HASH BEFORE PROMPT: hashing after the answer records a .cleat the user
 # never saw, so an agent can rewrite it while the prompt is on screen.
 # Retargeted when the hash came from the single-read view: the mutation hashes
-# a fresh read once the answer is back.
+# a fresh read once the answer is back. Retargeted again when the call gained
+# the empty-array guard (a decision on env-file host variables alone has no
+# caps to pass, and bash 3.2 under set -u calls an empty "${a[@]}" unbound).
 cat > "$SED_TMP" << 'SED'
 /^_resolve_project_trust()/,/^}$/{
-  s#^    if _trust_prompt "[$]project" "[$]{req_caps\[@\]}"; then$#    if _trust_prompt "$project" "${req_caps[@]}"; then hash="$(_hash_cleat_caps "$caps_file" "$box")"#
+  s#^    if _trust_prompt "[$]project" [$]{req_caps\[@\]+"[$]{req_caps\[@\]}"}; then$#    if _trust_prompt "$project" ${req_caps[@]+"${req_caps[@]}"}; then hash="$(_hash_cleat_caps "$caps_file" "$box")"#
 }
 SED
 try "trust_hash_before_prompt" "recorded hash is the one the user was shown" "$CLI" "$TRUST_BATS"
@@ -11322,9 +11325,14 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v150_snapshot_fd_deref" "a snapshot still refuses a descriptor on another file"
 
+# The symlink refusal. Since the path is listed without following it, a static
+# link is refused twice, by the -L test and by its own inode, so dropping either
+# alone is not observable: the entry reverts both guards (the precedent is
+# v0.6.0_claude_guard).
 cat > "$SED_TMP" << 'SED'
 /^_fd_holds_path()/,/^}$/{
   s@^  \[\[ ! -L "[$]path" \]\] || return 1$@  :@
+  s@ls -di "[$]path"@ls -Ldi "$path"@
 }
 SED
 try "v150_snapshot_symlink_path" "a snapshot refuses a symlinked path and a missing one"
@@ -12117,6 +12125,143 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_caps_unknown_warning_bounded" "warning names at most three names" "$CLI" "$TRUST_BATS"
+
+# Bare names in a project env file behind trust. A bare KEY in .cleat.env
+# copied the host's value into the box with no approval, and the box or a
+# cloned repo picks the names. The set of bare names now joins the project
+# trust decision, read once, and a symlinked env file is never read.
+#
+# A bare name resolves whether or not the decision approved it.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_lines()/,/^}$/{
+  s@^    \[\[ "[$]_PENV_APPROVED" == 1 \]\] || continue$@    :@
+}
+SED
+try "v154_env_bare_names_gated" "a project env file cannot copy a host variable into an untrusted box"
+
+# The names leave the trust hash, so an approval of one name set stands for
+# any other.
+cat > "$SED_TMP" << 'SED'
+/^_trust_decision_hash()/,/^}$/{
+  s@printf 'caps:%s\\nenv:%s' "[$]caps" "[$]names"@printf 'caps:%s\\nenv:' "$caps"@
+}
+SED
+try "v154_env_names_in_trust_hash" "a new host variable in the project env file needs fresh approval"
+
+# Every project hashes the combined form, names or not, so a v1.5.3 caps-only
+# approval no longer matches and nobody's trust survives the upgrade.
+cat > "$SED_TMP" << 'SED'
+/^_trust_decision_hash()/,/^}$/{
+  s@^  if \[\[ -z "[$]names" \]\]; then$@  if false; then@
+}
+/^_resolve_project_trust()/,/^}$/{
+  s@^  \[\[ -z "[$]_PENV_BARE" \]\] || hash=@  hash=@
+}
+SED
+try "v154_env_no_names_same_hash" "a project env file with no host variables keeps its trust hash"
+
+# The env file is read through a plain bounded read that follows a link, with
+# no refusal of a symlinked file.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_view()/,/^}$/{
+  s@^  if \[\[ -L "[$]file" \]\]; then$@  if false; then@
+  s@_read_unlinked_bounded "[$]file"@_read_bounded "$file"@
+}
+SED
+try "v154_env_symlink_not_read" "a symlinked project env file is not read"
+
+# The descriptor is not checked after the open, so a link swapped in after the
+# checks is followed.
+cat > "$SED_TMP" << 'SED'
+/^_read_unlinked_bounded()/,/^}$/{
+  s@^_fd_holds_path 8 "[$]1" || exit 1$@: || exit 1@
+}
+SED
+try "v154_env_read_checked_fd" "a project env file swapped for a link before its open is not read"
+
+# The descriptor check lists the path through the link again.
+cat > "$SED_TMP" << 'SED'
+/^_fd_holds_path()/,/^}$/{
+  s@ls -di "[$]path"@ls -Ldi "$path"@
+}
+SED
+try "v154_fd_check_lstat" "the descriptor check lists the path without following it"
+
+# The values come from a fresh read at apply time that rides the decision taken
+# on the earlier one.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_current()/,/^}$/{
+  s@^  \[\[ "[$]_PENV_OF" == "[$]file|[$]box" \]\] || _project_env_view "[$]file" "[$]box"$@  local _a="$_PENV_APPROVED"; _project_env_view "$file" "$box"; _PENV_APPROVED="$_a"@
+}
+SED
+try "v154_env_apply_same_read" "host variables apply from the same read the trust prompt showed"
+
+# The prompt shows the caps alone while the hash still covers the names.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@^    local _TRUST_PROMPT_VARS="[$]_PENV_BARE"$@    local _TRUST_PROMPT_VARS=""@
+}
+SED
+try "v154_env_names_in_prompt" "env-file host variables change the hash and appear in the prompt" "$CLI" "$TRUST_BATS"
+
+# An approval never reaches the env view, so approved names stay unresolved.
+cat > "$SED_TMP" << 'SED'
+/^resolve_caps()/,/^}$/{
+  s@^        _PENV_APPROVED=1$@        :@
+}
+SED
+try "v154_env_approval_applies" "approves env-file host variables and records them" "$CLI" "$TRUST_BATS"
+
+# cleat trust records the caps hash alone, so the approval it prints never
+# matches the next launch.
+cat > "$SED_TMP" << 'SED'
+/^cmd_trust()/,/^}$/{
+  s@^  \[\[ -z "[$]_PENV_BARE" \]\] || hash=.*$@  :@
+}
+SED
+try "v154_cmd_trust_records_env_names" "cleat trust approves the host variables an env file asks for" "$CLI" "$TRUST_BATS"
+
+# The names are asked about even when no source can turn the env cap on, so a
+# project nobody reads the env file of prompts anyway.
+cat > "$SED_TMP" << 'SED'
+/^resolve_caps()/,/^}$/{
+  s@^    local _env_asks=0 _c$@    local _env_asks=1 _c@
+}
+SED
+try "v154_env_asked_only_with_env_cap" "asked about only when the env cap can be on" "$CLI" "$TRUST_BATS"
+
+# The skipped-names warning prints every box-written name.
+cat > "$SED_TMP" << 'SED'
+/^_warn_project_env_view()/,/^}$/{
+  s@if \[\[ [$]count -le 5 \]\]; then@if true; then@
+}
+SED
+try "v154_env_warning_bounded" "warning names at most five" "$CLI" "$TRUST_BATS"
+
+# The skipped-names warning prints on every resolve of one launch.
+cat > "$SED_TMP" << 'SED'
+/^_warn_project_env_view()/,/^}$/{
+  s@^  case "[$]_WARNED_PROJECT_ENV" in .*esac$@  :@
+}
+SED
+try "v154_env_warning_once" "warning names at most five" "$CLI" "$TRUST_BATS"
+
+# The env snapshot is left in the temp directory after every launch.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_view()/,/^}$/{
+  s@^  rm -f "[$]snap"$@  :@
+}
+SED
+try "v154_env_snapshot_cleanup" "env snapshot leaves no temp file behind" "$CLI" "$TRUST_BATS"
+
+# cleat trust --list compares the caps hash alone, so a row approved for
+# env-file host variables never turns yellow when a name is added.
+cat > "$SED_TMP" << 'SED'
+/^cmd_trust()/,/^}$/{
+  s@_cur="[$](_project_trust_hash "[$]p" "[$]b")"@_cur="$(_hash_cleat_caps "$(_project_caps_file "$p")" "$b")"@
+}
+SED
+try "v154_trust_list_env_rows" "turns yellow when a name is added" "$CLI" "$TRUST_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

@@ -1826,6 +1826,36 @@ EOF
   }
 }
 
+@test "smoke: a bare key in an untrusted .cleat.env warns and stays out of docker run" {
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/project" "$CLEAT_CONFIG_DIR"
+  printf '[caps]\nenv\n' > "$CLEAT_CONFIG_DIR/config"
+  printf 'SMOKE_R154\nSMOKE_LITERAL=1\n' > "$TEST_TEMP/project/.cleat.env"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  cd "$TEST_TEMP/project"
+  export SMOKE_R154=smoke-host-value
+  run cleat_bin_timeout 5 start
+  unset SMOKE_R154
+  refute_output --partial "unbound variable"
+  assert_output --partial "Not passing the host variables"
+  run grep -q 'SMOKE_LITERAL=1' "$DOCKER_CALLS"
+  assert_success
+  run grep -q 'smoke-host-value' "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "smoke: cleat trust approves the host variables a .cleat.env asks for" {
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/proj"
+  printf 'SMOKE_R154_TRUST\n' > "$TEST_TEMP/proj/.cleat.env"
+  run cleat_bin trust "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Approved host variables: SMOKE_R154_TRUST"
+  refute_output --partial "unbound variable"
+}
+
 @test "smoke: cleat start with gh cap mounts ~/.config/gh" {
   mkdir -p "$TEST_TEMP/project"
   mkdir -p "$HOME/.config/gh"

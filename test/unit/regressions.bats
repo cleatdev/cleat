@@ -7505,3 +7505,162 @@ EOF
   run cap_is_active docker
   assert_failure
 }
+
+# ── v1.5.4: bare names in a project env file behind trust ───────────────────
+#
+# A bare KEY line in .cleat.env (or .cleat.<box>.env) copied the host's value
+# of KEY into the box with no approval at all. The file sits in /workspace, so
+# the box, or a cloned repo, picked which host secrets left the shell. The set
+# of bare names now joins the project trust decision.
+
+# The box writes the name of a host secret into .cleat.env. Non-TTY, no opt-in.
+@test "regression v1.5.4: a project env file cannot copy a host variable into an untrusted box" {
+  unset CLEAT_TRUST_PROJECT
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  export CLEAT_R154_HOST_SECRET=host-only-value
+  printf 'CLEAT_R154_HOST_SECRET\nLITERAL_OK=1\n' > "$TEST_TEMP/project/.cleat.env"
+  _is_tty() { return 1; }
+  run cmd_run "$TEST_TEMP/project"
+  unset CLEAT_R154_HOST_SECRET
+  assert_success
+  assert_output --partial "Not passing the host variables"
+  assert_output --partial "CLEAT_R154_HOST_SECRET"
+  run assert_docker_run_has "$cname" "LITERAL_OK=1"
+  assert_success
+  run grep -q host-only-value "$DOCKER_CALLS"
+  assert_failure
+}
+
+# An approval covers the names it was given for. The box adds one more.
+@test "regression v1.5.4: a new host variable in the project env file needs fresh approval" {
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_FIRST\n' > "$p/.cleat.env"
+  export R154_FIRST=first-value R154_SECOND=second-value
+  _is_tty() { return 1; }
+  _BOX=main
+  export CLEAT_TRUST_PROJECT=1
+  resolve_caps "$p" > "$TEST_TEMP/fresh.1" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/fresh.1" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  assert_output --partial "R154_FIRST=first-value"
+  unset CLEAT_TRUST_PROJECT
+  _TRUST_SESSION_DECISION=""
+  printf 'R154_FIRST\nR154_SECOND\n' > "$p/.cleat.env"
+  resolve_caps "$p" > "$TEST_TEMP/fresh.2" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/fresh.2" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_FIRST R154_SECOND
+  refute_output --partial "second-value"
+  run cat "$TEST_TEMP/fresh.2"
+  assert_output --partial "R154_SECOND"
+}
+
+# Folding the names in must not re-prompt the projects that ask for none: their
+# trust rows were written by v1.5.3 over the caps alone.
+@test "regression v1.5.4: a project env file with no host variables keeps its trust hash" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p"
+  printf '[caps]\ngit\nenv\n' > "$p/.cleat"
+  printf 'LITERAL_ONLY=1\n# COMMENTED_NAME\n' > "$p/.cleat.env"
+  _trust_record "$p" "$(printf 'env,git' | _md5 | awk '{print $1}')" main
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/stable.out" 2>&1
+  run cap_is_active git
+  assert_success
+  run cat "$TEST_TEMP/stable.out"
+  refute_output --partial "skipped"
+  refute_output --partial "not trusted"
+}
+
+# Git stores symlinks, so a cloned repo can ship .cleat.env pointing at any
+# file the user can read. Relative on purpose: that is the shape a clone brings.
+@test "regression v1.5.4: a symlinked project env file is not read" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/hostdir"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'aws_secret_access_key = host-file-secret\nexport R154_RC=rc-secret\n' > "$TEST_TEMP/hostdir/credentials"
+  ln -s ../hostdir/credentials "$TEST_TEMP/project/.cleat.env"
+  printf 'GLOBAL_OK=1\n' > "$CLEAT_GLOBAL_ENV"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is a symlink and was not read"
+  run assert_docker_run_has "$cname" "GLOBAL_OK=1"
+  assert_success
+  run grep -q 'host-file-secret' "$DOCKER_CALLS"
+  assert_failure
+  run grep -q 'rc-secret' "$DOCKER_CALLS"
+  assert_failure
+}
+
+# A regular .cleat.env passes the checks. The box swaps in a link before the
+# open. The time bound's argv builder runs in that gap.
+@test "regression v1.5.4: a project env file swapped for a link before its open is not read" {
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p" "$TEST_TEMP/hostdir"
+  printf 'SECRET_LINE=host-file-secret\n' > "$TEST_TEMP/hostdir/credentials"
+  printf 'PLAIN=1\n' > "$p/.cleat.env"
+  _R154_SWAP_F="$p/.cleat.env"
+  _R154_SWAP_T="$TEST_TEMP/hostdir/credentials"
+  eval "_r154_real_bounded_argv() $(declare -f _bounded_argv | sed 1d)"
+  _bounded_argv() { rm -f "$_R154_SWAP_F"; ln -s "$_R154_SWAP_T" "$_R154_SWAP_F"; _r154_real_bounded_argv "$@"; }
+  run _read_unlinked_bounded "$p/.cleat.env" 4096
+  assert_success
+  refute_output --partial "host-file-secret"
+}
+
+# The open went through a link, the box put a regular file back for the -L test
+# and the link again for the listing. `ls -L` then named the file the
+# descriptor held and the check passed.
+@test "regression v1.5.4: the descriptor check lists the path without following it" {
+  _R154_HELD="$TEST_TEMP/held"
+  _R154_PATH="$TEST_TEMP/named"
+  printf 'X=1\n' > "$_R154_HELD"
+  printf 'Y=2\n' > "$_R154_PATH"
+  exec 7<"$_R154_HELD"
+  ls() {
+    local last
+    for last in "$@"; do :; done
+    if [[ "$last" == "$_R154_PATH" ]]; then
+      rm -f "$_R154_PATH"
+      ln -s "$_R154_HELD" "$_R154_PATH"
+    fi
+    command ls "$@"
+  }
+  run _fd_holds_path 7 "$_R154_PATH"
+  exec 7<&-
+  unset -f ls
+  assert_failure
+}
+
+# The prompt listed one read of .cleat.env and the host values came from
+# another. The box adds a name while the user reads the prompt.
+@test "regression v1.5.4: host variables apply from the same read the trust prompt showed" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_SHOWN\n' > "$p/.cleat.env"
+  export R154_SHOWN=shown-value R154_ADDED=added-value
+  _R154_ENV="$p/.cleat.env"
+  _is_tty() { return 0; }
+  _trust_prompt() { printf 'R154_SHOWN\nR154_ADDED\n' > "$_R154_ENV"; return 0; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/shownenv.out" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/shownenv.out" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_SHOWN R154_ADDED
+  assert_output --partial "R154_SHOWN=shown-value"
+  refute_output --partial "added-value"
+  run _trust_lookup "$p" main
+  assert_output "$(_trust_decision_hash "" "R154_SHOWN")"
+}

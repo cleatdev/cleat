@@ -4487,6 +4487,33 @@ _hash_cleat_caps() {
   printf '%s' "$_PCAPS_HASH"
 }
 
+# The trust hash of one project decision: its caps ($1) plus the host variables
+# its env file asks for ($2, bare names), both one per line. With no names it is
+# exactly _caps_list_hash, so a project whose env file asks for nothing keeps
+# the hash it was approved at and nobody is asked again. With names the input
+# gains a newline, which no caps-only input holds (cap names are KNOWN_CAPS
+# names, env names are [A-Za-z0-9_]), so the two can never hash alike. Any change
+# to the name set changes the hash and needs a fresh approval.
+_trust_decision_hash() {
+  local caps names
+  names="$(printf '%s\n' "$2" | _canonical_caps)"
+  if [[ -z "$names" ]]; then
+    _caps_list_hash "$1"
+    return 0
+  fi
+  caps="$(printf '%s\n' "$1" | _canonical_caps)"
+  printf 'caps:%s\nenv:%s' "$caps" "$names" | _md5 | awk '{print $1}'
+}
+
+# The trust hash of a project box from fresh single reads of .cleat and of its
+# env file. Call it inside $( ): it replaces the current views.
+_project_trust_hash() {
+  local project="$1" box="$2"
+  _project_caps_view "$(_project_caps_file "$project")" "$box"
+  _project_env_view "$(_project_env_file "$project" "$box")" "$box"
+  _trust_decision_hash "$_PCAPS" "$_PENV_BARE"
+}
+
 # A project cap name Cleat does not know is dropped (see _project_caps_view).
 # Say so rather than drop it silently: it is a typo or a cap this version
 # lacks. Once per file and box per run, since a launch resolves caps more than
@@ -4640,21 +4667,21 @@ _trust_list() {
   ' "$CLEAT_TRUST_FILE" 2>/dev/null
 }
 
-# Is a project trusted at its current .cleat caps hash?
-# Returns 0 when trusted, 1 when not (missing entry, stale hash, or no .cleat).
-# $2, when given, is the hash to check: the caller's single-read view (see
-# _project_caps_view). Without it the hash is taken fresh.
+# Is a project trusted at its current trust hash (its caps plus the host
+# variables its env file asks for, see _trust_decision_hash)?
+# Returns 0 when trusted, 1 when not (missing entry, stale hash, or nothing to
+# trust). $2, when given, is the hash to check: the caller's single-read views
+# (see _project_caps_view, _project_env_view). Without it the hash is taken fresh.
 _is_project_trusted() {
   local project="$1"
   local box="${_BOX:-main}"
-  local caps_file stored current
-  caps_file="$(_project_caps_file "$project")"
+  local stored current
   stored="$(_trust_lookup "$project" "$box")"
   [[ -z "$stored" ]] && return 1
   if [[ $# -ge 2 ]]; then
     current="$2"
   else
-    current="$(_hash_cleat_caps "$caps_file" "$box")"
+    current="$(_project_trust_hash "$project" "$box")"
   fi
   [[ -z "$current" ]] && return 1
   [[ "$stored" == "$current" ]]
@@ -4681,7 +4708,13 @@ _trust_subject() {
 
 _trust_prompt() {
   local project="$1"; shift
-  local caps=("$@")
+  # No caps at all when the decision is on env-file host variables alone.
+  local -a caps=()
+  if [[ $# -gt 0 ]]; then caps=("$@"); fi
+  # The host variables the project env file asks for, one per line, from the
+  # caller's single-read view (_resolve_project_trust sets this for the call).
+  # Empty for a caps-only decision, which keeps the prompt exactly as it was.
+  local vars="${_TRUST_PROMPT_VARS:-}"
 
   # Detect if this is a re-prompt (stored hash exists but doesn't match).
   local is_reprompt=0
@@ -4691,7 +4724,7 @@ _trust_prompt() {
   # breaks the sandbox. Same aligned startup-prompt style (info + _ask_yn) as the
   # image-rebuild, Claude-update, and recreate prompts, not the old notice box.
   local cap _cap_safe _list=""
-  for cap in "${caps[@]}"; do
+  for cap in ${caps[@]+"${caps[@]}"}; do
     _cap_safe="$(_sanitize_repo_str "$cap")"
     if [[ "$cap" == "docker" ]]; then
       _list="${_list:+$_list, }${AMBER}${_cap_safe}${RESET}"
@@ -4700,16 +4733,38 @@ _trust_prompt() {
     fi
   done
 
-  if [[ $is_reprompt -eq 1 ]]; then
-    info "Project ${BOLD}.cleat${RESET} changed since you trusted it: it now grants ${_list} ${DIM}on your host${RESET}"
+  local ask="Trust this project's .cleat? ${DIM}(applies its caps; approve once, undo with cleat untrust)${RESET} [y/N] "
+  if [[ -z "$vars" ]]; then
+    if [[ $is_reprompt -eq 1 ]]; then
+      info "Project ${BOLD}.cleat${RESET} changed since you trusted it: it now grants ${_list} ${DIM}on your host${RESET}"
+    else
+      info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" caps)${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
+    fi
   else
-    info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" caps)${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
+    # Every name is listed in full: this is what the approval covers. They
+    # passed the env-file name check, so only [A-Za-z0-9_] reaches echo -e.
+    local v _vlist="" env_base
+    while IFS= read -r v; do
+      [[ -n "$v" ]] || continue
+      _vlist="${_vlist:+$_vlist, }${BOLD}${v}${RESET}"
+    done <<< "$vars"
+    env_base="$(basename "$(_project_env_file "$project" "${_BOX:-main}")")"
+    if [[ $is_reprompt -eq 1 && -n "$_list" ]]; then
+      info "Project ${BOLD}.cleat${RESET} or ${BOLD}${env_base}${RESET} changed since you trusted it"
+    elif [[ $is_reprompt -eq 1 ]]; then
+      info "Project ${BOLD}${env_base}${RESET} changed since you trusted it"
+    fi
+    if [[ -n "$_list" ]]; then
+      info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" caps)${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
+    fi
+    info "Project ${BOLD}${env_base}${RESET} asks for host variables: ${_vlist} ${DIM}(their values go from your shell into the box)${RESET}"
+    ask="Trust this project? ${DIM}(grants what it asks for above, approve once, undo with cleat untrust)${RESET} [y/N] "
   fi
 
   # Default-DENY ([y/N]): only an explicit yes grants the caps. Empty / EOF / no
   # all decline, so untrusted project input never auto-applies.
   local yn=""
-  _ask_yn yn "Trust this project's .cleat? ${DIM}(applies its caps; approve once, undo with cleat untrust)${RESET} [y/N] "
+  _ask_yn yn "$ask"
   case "$yn" in
     [yY]*) return 0 ;;
     *) return 1 ;;
@@ -4791,22 +4846,29 @@ _SETUP_LAST_RC=0
 # _maybe_run_setup. Force runs (the `cleat setup` verb) ignore it.
 _SETUP_ATTEMPTED=""
 
-# Decide whether to apply a project's .cleat caps. Sets _TRUST_SESSION_* on
-# first call for a given project. Returns 0 = apply, 1 = skip.
-# $1 = project path (must have a .cleat with caps; caller's responsibility).
+# Decide whether to apply a project's .cleat caps and resolve the host
+# variables its env file asks for: one decision for both. Sets _TRUST_SESSION_*
+# on first call for a given project. Returns 0 = apply, 1 = skip.
+# $1 = project path (must have caps or env-file host variables to decide on,
+# the caller's responsibility).
 # $2 = "prompt" (default) or "readonly" to forbid interactive prompting.
 _resolve_project_trust() {
   local project="$1"
   local mode="${2:-prompt}"
   local box="${_BOX:-main}"
-  local caps_file
+  local caps_file env_file
   caps_file="$(_project_caps_file "$project")"
+  env_file="$(_project_env_file "$project" "$box")"
 
-  # Decide on the view resolve_caps just took and will apply, so the set that
+  # Decide on the views resolve_caps just took and will apply, so the set that
   # is checked, shown and recorded is the set that applies. A caller with no
   # view for this file and box gets a fresh one, still a single read.
   [[ "$_PCAPS_OF" == "$caps_file|$box" ]] || _project_caps_view "$caps_file" "$box"
+  [[ "$_PENV_OF" == "$env_file|$box" ]] || _project_env_view "$env_file" "$box"
   local hash="$_PCAPS_HASH"
+  # The host variables the env file asks for join the same decision. Without
+  # any the hash stays the caps hash (see _trust_decision_hash).
+  [[ -z "$_PENV_BARE" ]] || hash="$(_trust_decision_hash "$_PCAPS" "$_PENV_BARE")"
   [[ -n "$hash" ]] || return 1
 
   # Cached decision for this session/project/box. An approval holds only at the
@@ -4854,7 +4916,9 @@ _resolve_project_trust() {
     local -a req_caps=()
     local c
     while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done <<< "$_PCAPS"
-    if _trust_prompt "$project" "${req_caps[@]}"; then
+    # The prompt lists the env view's host variables too, from the same read.
+    local _TRUST_PROMPT_VARS="$_PENV_BARE"
+    if _trust_prompt "$project" ${req_caps[@]+"${req_caps[@]}"}; then
       # Preserve any existing [setup] trust (col4): see the opt-in branch
       # above, same reasoning.
       _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
@@ -4863,7 +4927,11 @@ _resolve_project_trust() {
       _TRUST_SESSION_BOX="$box"
       return 0
     else
-      warn "Project .cleat ignored, not trusted ${DIM}(global config still applied)${RESET}"
+      # A decision on host variables alone says so where they are skipped
+      # (_warn_project_env_view), once.
+      if [[ -n "$_PCAPS" ]]; then
+        warn "Project .cleat ignored, not trusted ${DIM}(global config still applied)${RESET}"
+      fi
       _TRUST_SESSION_DECISION="rejected"
       _TRUST_SESSION_PROJECT="$project"
       _TRUST_SESSION_BOX="$box"
@@ -4872,7 +4940,9 @@ _resolve_project_trust() {
   fi
 
   # Non-TTY, no explicit opt-in: default-deny with an informational warning
-  warn "Project .cleat skipped in non-interactive mode ${DIM}(pass --trust-project or set CLEAT_TRUST_PROJECT=1 to approve)${RESET}"
+  if [[ -n "$_PCAPS" ]]; then
+    warn "Project .cleat skipped in non-interactive mode ${DIM}(pass --trust-project or set CLEAT_TRUST_PROJECT=1 to approve)${RESET}"
+  fi
   _TRUST_SESSION_DECISION="rejected"
   _TRUST_SESSION_PROJECT="$project"
   _TRUST_SESSION_BOX="$box"
@@ -5099,14 +5169,15 @@ resolve_caps() {
   # The box's cap file REPLACES .cleat (no merge): .cleat.<box> if present,
   # else .cleat; main always uses .cleat. See concept/20-boxes.md.
   local project_caps=""
+  _PENV_APPROVED=0
   if [[ -n "$project" ]]; then
     local caps_file
     caps_file="$(_project_caps_file "$project")"
     [[ -f "$caps_file" ]] && _warn_unknown_cleat_sections "$caps_file" project || true
+    # One read decides it all: the caps hashed, shown and applied below are
+    # the same bytes (see _project_caps_view). A missing .cleat is an empty view.
+    _project_caps_view "$caps_file" "$box"
     if [[ -f "$caps_file" ]]; then
-      # One read decides it all: the caps hashed, shown and applied below are
-      # the same bytes (see _project_caps_view).
-      _project_caps_view "$caps_file" "$box"
       # unsafe-rm disarms the box's delete-safety guard, and the caged agent can
       # write .cleat in its own workspace. A project file must NEVER grant it, not
       # even a trusted one: the view strips it, so the only sources are the user's
@@ -5123,10 +5194,26 @@ resolve_caps() {
         esac
       fi
       _warn_unknown_project_caps "$caps_file" "$box" "$_PCAPS_UNKNOWN"
-      if [[ -n "$_PCAPS" ]]; then
-        if _resolve_project_trust "$project" "$trust_mode"; then
-          project_caps="$_PCAPS"
-        fi
+    fi
+    # The host variables the project env file asks for (bare names) are part of
+    # the same decision, from the same kind of single read (_project_env_view).
+    # They count only when the env cap can be on this launch: from the global
+    # config, a --cap flag or these very caps. Otherwise the file is never read
+    # and there is nothing to ask about.
+    _project_env_view "$(_project_env_file "$project" "$box")" "$box"
+    local _env_asks=0 _c
+    if [[ -n "$_PENV_BARE" ]]; then
+      while IFS= read -r _c; do
+        if [[ "$_c" == env ]]; then _env_asks=1; fi
+      done <<< "${global_caps}"$'\n'"${_PCAPS}"
+      for _c in ${_CLI_CAPS[@]+"${_CLI_CAPS[@]}"}; do
+        if [[ "$_c" == env ]]; then _env_asks=1; fi
+      done
+    fi
+    if [[ -n "$_PCAPS" || $_env_asks -eq 1 ]]; then
+      if _resolve_project_trust "$project" "$trust_mode"; then
+        project_caps="$_PCAPS"
+        _PENV_APPROVED=1
       fi
     fi
   fi
@@ -5167,9 +5254,11 @@ cap_is_active() {
 
 # ── Capabilities: env file parsing ─────────────────────────────────────────
 # Parse an env file and output KEY=VALUE lines (resolved).
-# Bare KEY entries are resolved from the host environment.
+# Bare KEY entries are resolved from the host environment. With $2 = entries a
+# bare KEY is printed as the name alone, unresolved, in file order among the
+# KEY=VALUE lines: the project env view decides later whether it may resolve.
 _parse_env_file() {
-  local file="$1"
+  local file="$1" mode="${2:-}"
   [[ -f "$file" && -r "$file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip carriage return (CRLF from Windows editors)
@@ -5191,12 +5280,120 @@ _parse_env_file() {
       if [[ ! "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
         continue
       fi
+      if [[ "$mode" == entries ]]; then
+        echo "$line"
+        continue
+      fi
       local val="${!line:-}"
       if [[ -n "$val" ]]; then
         echo "${line}=${val}"
       fi
     fi
   done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
+}
+
+# The project env file (.cleat.env, or .cleat.<box>.env) sits in /workspace,
+# which the box rewrites at will. Git ships whatever a clone brings. Its
+# KEY=VALUE lines are literal values, so they pass as they are. A bare KEY
+# copies a HOST value into the box, so the set of bare names joins the project
+# trust decision (_trust_decision_hash) and resolves only once that decision
+# approved it. Everything comes from ONE read, the same rule as
+# _project_caps_view: the names the prompt lists, the names hashed and the names
+# resolved are the same bytes. The copy is taken through _read_unlinked_bounded,
+# so a symlinked env file is never read. Sets:
+#   _PENV           entries in file order: a KEY=VALUE line as written, or a
+#                   bare NAME (already name-checked by _parse_env_file)
+#   _PENV_BARE      the bare names, sorted, no repeats, one per line
+#   _PENV_LINK      1 when the file is a symlink and was not read
+#   _PENV_APPROVED  1 once resolve_caps' trust decision approved _PENV_BARE
+#   _PENV_OF        "<file>|<box>", what this view describes
+_PENV=""
+_PENV_BARE=""
+_PENV_LINK=0
+_PENV_APPROVED=0
+_PENV_OF=""
+_project_env_view() {
+  local file="$1" box="$2" snap
+  _PENV=""; _PENV_BARE=""; _PENV_LINK=0; _PENV_APPROVED=0
+  _PENV_OF="$file|$box"
+  if [[ -L "$file" ]]; then
+    _PENV_LINK=1
+    return 0
+  fi
+  [[ -f "$file" ]] || return 0
+  snap="$(mktemp "${TMPDIR:-/tmp}/cleat-env.XXXXXX" 2>/dev/null)" || {
+    warn "Could not read ${BOLD}$(basename "$file")${RESET}: its variables are skipped this run" >&2
+    return 0
+  }
+  _read_unlinked_bounded "$file" "$_BOX_FILE_READ_MAX" > "$snap"
+  _PENV="$(_parse_env_file "$snap" entries)"
+  rm -f "$snap"
+  [[ -n "$_PENV" ]] || return 0
+  _PENV_BARE="$(printf '%s\n' "$_PENV" | awk 'NF && index($0, "=") == 0' | LC_ALL=C sort -u)"
+}
+
+# Make sure the env view describes this project's env file for the current box.
+# resolve_caps took it and decided on it. Any other caller gets a fresh view,
+# which nobody approved, so its bare names stay unresolved. Call it in the
+# parent shell, never inside $( ), or the view is lost.
+_project_env_current() {
+  local project="$1" box="${_BOX:-main}" file
+  file="$(_project_env_file "$project" "$box")"
+  [[ "$_PENV_OF" == "$file|$box" ]] || _project_env_view "$file" "$box"
+}
+
+# The env view as KEY=VALUE lines, in file order: literal lines as written plus
+# each bare name with the host value it has, only when the view is approved.
+_project_env_lines() {
+  local e val
+  [[ -n "$_PENV" ]] || return 0
+  while IFS= read -r e; do
+    [[ -n "$e" ]] || continue
+    if [[ "$e" == *=* ]]; then
+      printf '%s\n' "$e"
+      continue
+    fi
+    [[ "$_PENV_APPROVED" == 1 ]] || continue
+    [[ "$e" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || continue
+    val="${!e:-}"
+    if [[ -n "$val" ]]; then
+      printf '%s=%s\n' "$e" "$val"
+    fi
+  done <<< "$_PENV"
+  return 0
+}
+
+# Say what the env view left out, once per file and box per run (a launch
+# resolves env more than once). A symlinked file was not read at all. Bare
+# names the trust decision did not approve were skipped: at most five are
+# named, each cut to 64 characters. They passed the name check, so nothing but
+# [A-Za-z0-9_] reaches echo -e.
+_WARNED_PROJECT_ENV=""
+_warn_project_env_view() {
+  local file="$1" box="$2" base n shown="" count=0 target=""
+  case "$_WARNED_PROJECT_ENV" in *"|$file|$box|"*) return 0 ;; esac
+  base="$(basename "$file")"
+  if [[ "$_PENV_LINK" == 1 ]]; then
+    _WARNED_PROJECT_ENV="${_WARNED_PROJECT_ENV}|$file|$box|"
+    warn "${BOLD}${base}${RESET} is a symlink and was not read ${DIM}(the box can point it at any file you can read)${RESET}"
+    echo -e "    ${DIM}Make it a regular file, or name the file you meant with ${BOLD}--env-file${RESET}${DIM}.${RESET}"
+    return 0
+  fi
+  [[ -n "$_PENV_BARE" && "$_PENV_APPROVED" != 1 ]] || return 0
+  _WARNED_PROJECT_ENV="${_WARNED_PROJECT_ENV}|$file|$box|"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    count=$((count + 1))
+    if [[ $count -le 5 ]]; then
+      shown="${shown:+$shown, }${n:0:64}"
+    fi
+  done <<< "$_PENV_BARE"
+  if [[ $count -gt 5 ]]; then
+    shown="$shown ${DIM}(+$((count - 5)) more)${RESET}"
+  fi
+  [[ "$box" == main ]] || target=" $box"
+  warn "Not passing the host variables ${BOLD}${base}${RESET} asks for: ${BOLD}${shown}${RESET} ${DIM}(the project is not trusted for them)${RESET}"
+  echo -e "    ${DIM}Approve them with ${BOLD}cleat trust${target}${RESET}${DIM} or ${BOLD}--trust-project${RESET}${DIM}. Its KEY=VALUE lines still apply.${RESET}"
 }
 
 # Resolve all env vars to pass to the container.
@@ -5232,15 +5429,17 @@ resolve_env_args() {
       done < <(_parse_env_file "$CLEAT_GLOBAL_ENV")
     fi
 
-    # Project env file, box-aware: .cleat.<box>.env else .cleat.env
-    local _env_file
-    _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
-    if [[ -n "$project" && -f "$_env_file" ]]; then
+    # Project env file, box-aware: .cleat.<box>.env else .cleat.env. Applied
+    # from the view resolve_caps took and decided on (see _project_env_view),
+    # so a bare name resolves only when the trust decision approved it.
+    if [[ -n "$project" ]]; then
+      _project_env_current "$project"
+      _warn_project_env_view "${_PENV_OF%|*}" "${_BOX:-main}"
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         key="${line%%=*}"; val="${line#*=}"
         _env_set "$key" "$val"
-      done < <(_parse_env_file "$_env_file")
+      done < <(_project_env_lines)
     fi
   fi
 
@@ -5300,7 +5499,9 @@ _env_summary() {
     local _env_file
     _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
     if [[ -n "$project" && -f "$_env_file" ]]; then
-      project_count=$(_parse_env_file "$_env_file" | wc -l)
+      # What resolve_env_args passes: the view it applied from.
+      _project_env_current "$project"
+      project_count=$(_project_env_lines | wc -l)
       project_count=$((project_count + 0))
     fi
   fi
@@ -6253,7 +6454,9 @@ _env_summary_inline() {
     _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
     if [[ -n "$project" && -f "$_env_file" ]]; then
       project_exists=true
-      project_count=$(_parse_env_file "$_env_file" | wc -l)
+      # What resolve_env_args passes: the view it applied from.
+      _project_env_current "$project"
+      project_count=$(_project_env_lines | wc -l)
       project_count=$((project_count + 0))
     fi
   fi
@@ -7748,6 +7951,25 @@ _read_bounded() {
   else
     _run_bounded "$_BOX_FILE_READ_SECS" tail -c "+$from" -- "$f" 2>/dev/null | head -c "$max" 2>/dev/null || true
   fi
+  return 0
+}
+
+# _read_bounded for a name whose bytes decide what leaves the host, where a
+# symlink must never be followed. A link there, committed to the repo or planted
+# by the box, has the host read any file the user can read (~/.aws/credentials,
+# a shell rc full of exported keys). So the file is opened ONCE and
+# _fd_holds_path confirms, on the open descriptor, that it is the regular file
+# the path names. A link swapped in and back around the checks fails that.
+# Nothing after it touches the path again. The open runs in a child bash under
+# _run_bounded, so a FIFO swapped in after the -f test costs at most the time
+# bound. Prints nothing when refused. Always rc 0, like _read_bounded.
+_read_unlinked_bounded() {
+  local f="$1" max="$2"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  _run_bounded "$_BOX_FILE_READ_SECS" bash -c "$(declare -f _fd_holds_path)"'
+exec 8<"$1" || exit 1
+_fd_holds_path 8 "$1" || exit 1
+exec head -c "$2" <&8' cleat-read "$f" "$max" 2>/dev/null || true
   return 0
 }
 
@@ -17579,11 +17801,18 @@ _account_copy_whole_0600() {
 # node). Inode alone is enough because the only writer of the directory this
 # guards is the box, through a bind mount into the host filesystem the path is
 # already on, so it cannot present a same-inode file from anywhere else.
+#
+# The PATH is listed without following it (`ls -d`, no -L: neither GNU nor BSD
+# ls follows a command-line link under -d). The open can go through a link the
+# box then swaps for a regular file to pass the -L test and swaps back before
+# the listing. With -L the listing then named the link's target, the very file
+# the descriptor had opened through it, so the check passed. The -L test stays
+# as the cheap first refusal.
 _fd_holds_path() {
   local fd="$1" path="$2" a b
   [[ ! -L "$path" ]] || return 1
   [[ -f "/dev/fd/$fd" ]] || return 1
-  a="$(ls -Ldi "$path" 2>/dev/null | awk '{print $1}')"
+  a="$(ls -di "$path" 2>/dev/null | awk '{print $1}')"
   b="$(ls -Ldi "/dev/fd/$fd" 2>/dev/null | awk '{print $1}')"
   case "$a" in ''|*[!0-9]*) return 1 ;; esac
   [[ "$a" == "$b" ]]
@@ -22883,7 +23112,7 @@ _scaffold_cleat_env() {
 # Add to .gitignore: do not commit secrets.
 #
 # KEY=VALUE  set explicitly
-# KEY        inherit from host environment
+# KEY        copy from your shell, once you approve it at the trust prompt
 #
 # Example:
 # GH_TOKEN
@@ -24006,12 +24235,13 @@ cmd_trust() {
       [[ -z "$p" ]] && continue
       [[ -z "$b" ]] && b="main"
       local marker="${GREEN}●${RESET}"
-      # Indicate if the box's cap file has changed since approval
-      local _cf _stored _cur
-      _cf="$(_project_caps_file "$p")"
+      # Indicate if what the box's trust covers (its caps plus the host
+      # variables its env file asks for) has changed since approval. A row for
+      # a project with nothing left to trust stays green, as before.
+      local _stored _cur
       _stored="$(_trust_lookup "$p" "$b")"
-      _cur="$(_hash_cleat_caps "$_cf" "$b")"
-      if [[ -f "$_cf" && -n "$_cur" && "$_stored" != "$_cur" ]]; then
+      _cur="$(_project_trust_hash "$p" "$b")"
+      if [[ -n "$_cur" && "$_stored" != "$_cur" ]]; then
         marker="${YELLOW}●${RESET}"
       fi
       if [[ "$b" == "main" ]]; then
@@ -24021,7 +24251,7 @@ cmd_trust() {
       fi
     done
     echo ""
-    echo -e "  ${DIM}${GREEN}●${DIM} trusted at current caps   ${YELLOW}●${DIM} .cleat changed since approval${RESET}"
+    echo -e "  ${DIM}${GREEN}●${DIM} trusted at current caps   ${YELLOW}●${DIM} .cleat or its env file changed since approval${RESET}"
     return 0
   fi
 
@@ -24037,17 +24267,24 @@ cmd_trust() {
   local caps_file caps_base
   caps_file="$(_project_caps_file "$project")"
   caps_base="$(basename "$caps_file")"
-  if [[ ! -f "$caps_file" ]]; then
+  # The host variables the env file asks for are part of the same decision
+  # (see _trust_decision_hash), so a project with only an env file that names
+  # some is still something to trust.
+  _project_env_view "$(_project_env_file "$project" "$box")" "$box"
+  if [[ ! -f "$caps_file" && -z "$_PENV_BARE" ]]; then
     error "No ${caps_base} file found in ${BOLD}${project}${RESET}"
     echo -e "    ${DIM}Nothing to trust. This box has no capability config.${RESET}"
     exit 1
   fi
   # One read for the hash recorded and the caps line printed below, so what the
   # user is told was approved is what was recorded (see _project_caps_view).
-  local hash approved_caps
+  # Same for the host variables, from the env view just taken.
+  local hash approved_caps approved_vars
   _project_caps_view "$caps_file" "$box"
   hash="$_PCAPS_HASH"
+  [[ -z "$_PENV_BARE" ]] || hash="$(_trust_decision_hash "$_PCAPS" "$_PENV_BARE")"
   approved_caps="$(printf '%s\n' "$_PCAPS" | _canonical_caps)"
+  approved_vars="$(printf '%s\n' "$_PENV_BARE" | awk 'NF { printf "%s%s", (n++ ? ", " : ""), $0 }')"
   _warn_unknown_project_caps "$caps_file" "$box" "$_PCAPS_UNKNOWN"
   # An explicit `cleat trust` approves the whole file the user is looking
   # at: caps and [setup] both, separate consent classes (concept/16). A
@@ -24077,8 +24314,11 @@ cmd_trust() {
   else
     success "Trusted ${BOLD}${project}${RESET} ${DIM}[${box}]${RESET}"
   fi
-  if [[ -n "$hash" ]]; then
+  if [[ -n "$approved_caps" ]]; then
     echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$approved_caps")${RESET}"
+  fi
+  if [[ -n "$approved_vars" ]]; then
+    echo -e "    ${DIM}Approved host variables: ${approved_vars}${RESET}"
   fi
   if [[ -n "$setup_payload" ]]; then
     echo -e "    ${DIM}Approved setup: ${setup_count} command(s)${RESET}"

@@ -600,7 +600,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 #### Workspace trust
 | Command | Description |
 |---|---|
-| `cleat trust [path] [box]` | Record approval for a project's (or a box's) `.cleat` capabilities and `[setup]` |
+| `cleat trust [path] [box]` | Record approval for a project's (or a box's) `.cleat` capabilities, `[setup]` and env-file host variables |
 | `cleat trust [box]` | Trust a box of the current project (a lone valid box name) |
 | `cleat trust --list` | List trusted projects and boxes (yellow = config changed since approval) |
 | `cleat untrust [path] [box]` | Remove a project's (or a box's) trust entry |
@@ -627,7 +627,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `--env KEY=VALUE` | Pass environment variable to container |
 | `--env KEY` | Inherit from host environment |
 | `--env-file PATH` | Load env vars from file |
-| `--trust-project` | Auto-approve the current project's `.cleat` caps without prompting |
+| `--trust-project` | Auto-approve the current project's `.cleat` caps and env-file host variables without prompting |
 | `--trust-setup` | Auto-approve the current project's `[setup]` provisioning without prompting |
 | `--desc <text>` | Set the box's description at start (host-side, never recreates) |
 | `--fork` | Give the box its own copy of the project instead of the live tree (create time only) |
@@ -874,6 +874,20 @@ Only capabilities Cleat knows count. A name it does not know (a typo, a cap this
 The hash is per box, so trust rows are keyed on (project, box). Editing one box's
 section re-prompts for that box only. Every other box keeps its approval.
 
+A bare `KEY` line in the project env file (`.cleat.env`, or `.cleat.<box>.env`)
+copies a variable from your shell into the box, so it joins the same approval.
+The prompt lists those names as host variables, never their values:
+
+```
+  ▸ Project .cleat.env asks for host variables: GH_TOKEN (their values go from your shell into the box)
+    Trust this project? (grants what it asks for above, approve once, undo with cleat untrust) [y/N]
+```
+
+A project whose env file names no host variable keeps the approval it had.
+Adding or removing a name asks again. Until approved the names are skipped with
+a warning and the file's `KEY=VALUE` lines still apply. `cleat trust` and
+`CLEAT_TRUST_PROJECT=1` approve them along with the caps.
+
 #### Scripting & CI
 
 Non-interactive contexts (pipes, CI, `cleat … | tee log`) can't answer a prompt, so they default-deny: project `.cleat` caps are silently dropped, global config and `--cap` flags still apply. To opt in explicitly:
@@ -906,6 +920,7 @@ cleat untrust ~/proj         # remove a project's trust entry
 | `~/.config/cleat/config` (global) | ✔ always: user's own file |
 | `--cap <name>` CLI flag | ✔ always: affirmative typed action |
 | `<project>/.cleat` | requires approval per-project, per-cap-set |
+| bare `KEY` lines in `<project>/.cleat.env` | requires approval, part of the same decision as the caps |
 | `[setup]` in `<project>/.cleat` | requires approval per-project, a separate consent class from caps |
 
 `cleat status` never prompts: it's read-only and silently omits untrusted project caps when displaying.
@@ -1019,6 +1034,15 @@ cleat --env-file .env.local start
 # .cleat.env              ← project-specific
 ```
 
+In an env file, `KEY=VALUE` sets a value and a bare `KEY` copies that variable
+from your shell. Your own sources (`~/.config/cleat/env`, `--env-file` and
+`--env KEY`) do that as they always have. A project env file (`.cleat.env` or
+`.cleat.<box>.env`) sits in the repo, where a clone or the box itself can edit
+it, so its bare names go through workspace trust: the trust prompt lists them as
+the host variables the project asks for and a new name asks again. Until you
+approve, they are skipped with a warning while the file's `KEY=VALUE` lines
+still apply. A project env file that is a symlink is not read at all.
+
 ### Configuration drift detection
 
 When you change **capabilities or env keys** after a container was created, Cleat detects the mismatch the next time you run `cleat`, `cleat resume`, or `cleat claude`. On a TTY it prompts you to recreate (a plain-text line, no box):
@@ -1043,7 +1067,7 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
 ~/.config/cleat/forks/    ← fork workspace copies (default root, moved by [fork] dir)
 <project>/.cleat          ← project capabilities (extends global), [resources], [setup],
                             [fork] exclude, plus any [box.<name>.<kind>] overrides
-<project>/.cleat.env      ← project-level env vars
+<project>/.cleat.env      ← project-level env vars (bare KEY lines need trust)
 <project>/.cleat.<box>.env ← per-box env vars (falls back to .cleat.env)
 ~/.config/cleat/state/hook-drops.log ← hook events the bridge refused and spool discards (hooks cap)
 ~/.config/cleat/state/hook-runs.log  ← hook events handed to your hooks (hooks cap)

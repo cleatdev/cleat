@@ -7402,3 +7402,106 @@ EOF
   run test -d "$_RD_SWAP_DIR/fired"
   assert_success
 }
+
+# ── v1.5.4: one read decides the project caps ────────────────────────────────
+#
+# resolve_caps applied the caps from its own read of .cleat, while the trust
+# check hashed a second read, the prompt listed a third and recorded the hash of
+# a fourth. .cleat sits in /workspace, so the box can flip it between any two.
+# Every test here models that flip at the exact point one read used to happen.
+
+# The trust lookup stands in for the moment between resolve_caps' read and the
+# check's own: the box puts back the file the user trusted.
+@test "regression v1.5.4: project caps apply from the same read the trust check hashed" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/sameread" h
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  h="$(_hash_cleat_caps "$p/.cleat" main)"
+  _trust_record "$p" "$h" main
+  printf '[caps]\ngit\ndocker\n' > "$p/.cleat"
+  _SAMEREAD_H="$h"
+  _trust_lookup() { printf '[caps]\ngit\n' > "$1/.cleat"; printf '%s\n' "$_SAMEREAD_H"; }
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/sameread.out" 2>&1
+  run cap_is_active docker
+  assert_failure
+}
+
+# cmd_start resolves caps, then a recreate through cmd_run resolves them again
+# in the same process. The session cache held a bare "approved".
+@test "regression v1.5.4: an in-process approval does not carry over to a rewritten .cleat" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/sesscache"
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  _trust_record "$p" "$(_hash_cleat_caps "$p/.cleat" main)" main
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/sesscache.1" 2>&1
+  run cap_is_active git
+  assert_success
+  printf '[caps]\ngit\ndocker\n' > "$p/.cleat"
+  resolve_caps "$p" > "$TEST_TEMP/sesscache.2" 2>&1
+  run cap_is_active docker
+  assert_failure
+}
+
+# The prompt listed one read and recorded the hash of another, taken just
+# before it. The hash function stands in for that second read.
+@test "regression v1.5.4: the trust prompt records the caps it showed, not a second read" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/shown" ben
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  ben="$(_hash_cleat_caps "$p/.cleat" main)"
+  eval "_real_hash_cleat_caps() $(declare -f _hash_cleat_caps | sed 1d)"
+  _hash_cleat_caps() { printf '[caps]\ngit\ndocker\n' > "$1"; _real_hash_cleat_caps "$@"; }
+  _is_tty() { return 0; }
+  _SHOWN_OUT="$TEST_TEMP/shown.caps"
+  _trust_prompt() { shift; printf '%s\n' "$@" > "$_SHOWN_OUT"; return 0; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/shown.out" 2>&1
+  run cat "$_SHOWN_OUT"
+  assert_output "git"
+  run _trust_lookup "$p" main
+  assert_output "$ben"
+}
+
+# cmd_trust hashed one read and printed "Approved caps" from a later one, so it
+# could tell the user it approved git while recording git and docker.
+@test "regression v1.5.4: cleat trust prints the caps it records" {
+  local p="$TEST_TEMP/trustprint" hmal
+  mkdir -p "$p"
+  printf '[caps]\ngit\ndocker\n' > "$p/.cleat"
+  hmal="$(_hash_cleat_caps "$p/.cleat" main)"
+  _TRUSTPRINT_P="$p"
+  _build_setup_payload() { printf '[caps]\ngit\n' > "$_TRUSTPRINT_P/.cleat"; }
+  run cmd_trust "$p"
+  assert_success
+  assert_output --partial "Approved caps: docker,git"
+  run _trust_lookup "$p" main
+  assert_output "$hmal"
+}
+
+# One line `docker,git` is no cap at all, yet it hashed exactly like the two
+# lines docker and git, so approving the inert line trusted the real pair.
+@test "regression v1.5.4: an approved inert cap line cannot later stand for real caps" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/inert"
+  mkdir -p "$p"
+  printf '[caps]\ndocker,git\n' > "$p/.cleat"
+  _is_tty() { return 0; }
+  _trust_prompt() { return 0; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/inert.1" 2>&1
+  printf '[caps]\ndocker\ngit\n' > "$p/.cleat"
+  _TRUST_SESSION_DECISION=""
+  _TRUST_SESSION_PROJECT=""
+  _TRUST_SESSION_BOX=""
+  _is_tty() { return 1; }
+  resolve_caps "$p" > "$TEST_TEMP/inert.2" 2>&1
+  run cap_is_active docker
+  assert_failure
+}

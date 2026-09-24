@@ -1252,6 +1252,15 @@ CURL
   assert_output --partial "$TEST_TEMP/proj"
 }
 
+@test "smoke: cleat trust ignores an unknown project cap and records the known ones" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\nfoo,bar\n' > "$TEST_TEMP/proj/.cleat"
+  run cleat_bin trust "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Approved caps: git"
+  assert_output --partial "Ignoring unknown capability"
+}
+
 @test "smoke: cleat untrust removes a project's trust entry" {
   mkdir -p "$TEST_TEMP/proj"
   printf '[caps]\ngit\n' > "$TEST_TEMP/proj/.cleat"

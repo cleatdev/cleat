@@ -4405,18 +4405,110 @@ _canonical_caps() {
   awk 'NF' | LC_ALL=C sort -u | paste -sd, -
 }
 
-# Hash the canonical cap list from a .cleat file. Prints empty when the
-# file is missing or declares no caps (nothing to gate).
+# The trust hash of a cap list, one name per line: canonical form, md5, hex
+# only. An empty list hashes to empty (nothing to gate). The comma join is
+# unambiguous only because every name that reaches it is a KNOWN_CAPS name and
+# none of those holds a comma: _project_caps_view drops anything else. Before
+# that, the one inert line `docker,git` hashed the same as the two real caps.
 # Note: `_md5` passes stdin through `md5sum` on Linux, which appends
 # "  -" (the filename of stdin). Strip that so the stored trust hash is
 # purely hex, otherwise we write malformed tab-separated lines.
+_caps_list_hash() {
+  local caps
+  caps="$(printf '%s\n' "$1" | _canonical_caps)"
+  [[ -z "$caps" ]] && return 0
+  echo -n "$caps" | _md5 | awk '{print $1}'
+}
+
+# Is $1 a capability this Cleat knows? Exact match, no fork.
+_cap_is_known() {
+  local k
+  for k in "${KNOWN_CAPS[@]}"; do
+    [[ "$k" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# Everything the trust gate decides about a project's caps comes from ONE read.
+# .cleat sits in /workspace, which the box rewrites at will, and
+# _read_caps_from_file opens its path twice. Hashing, showing and applying from
+# separate reads let a box get one set checked and another applied. So the file
+# is copied once, bounded, to a private temp file outside every mount and parsed
+# there. Sets:
+#   _PCAPS            caps that can apply, one per line: KNOWN_CAPS names only,
+#                     unsafe-rm removed (concept/42), no repeats
+#   _PCAPS_HASH       the trust hash of exactly that list, empty when it is empty
+#   _PCAPS_UNKNOWN    names dropped as unknown, one per line, raw
+#   _PCAPS_UNSAFE_RM  1 when the section listed unsafe-rm
+#   _PCAPS_OF         "<file>|<box>", what this view describes
+# The copy goes through _read_bounded, so a FIFO or a device the box swaps in
+# after the -f check costs at most its time bound, and the byte cap keeps a link
+# to /dev/zero from filling the host temp directory.
+_PCAPS_READ_MAX=262144
+_PCAPS=""
+_PCAPS_HASH=""
+_PCAPS_UNKNOWN=""
+_PCAPS_UNSAFE_RM=0
+_PCAPS_OF=""
+_project_caps_view() {
+  local file="$1" box="$2" snap raw c seen=","
+  _PCAPS=""; _PCAPS_HASH=""; _PCAPS_UNKNOWN=""; _PCAPS_UNSAFE_RM=0
+  _PCAPS_OF="$file|$box"
+  [[ -f "$file" ]] || return 0
+  snap="$(mktemp "${TMPDIR:-/tmp}/cleat-caps.XXXXXX" 2>/dev/null)" || {
+    warn "Could not read ${BOLD}$(basename "$file")${RESET}: its capabilities are skipped this run" >&2
+    return 0
+  }
+  _read_bounded "$file" "$_PCAPS_READ_MAX" 2>/dev/null > "$snap" || true
+  raw="$(_read_caps_from_file "$snap" "$box")"
+  rm -f "$snap"
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    if [[ "$c" == unsafe-rm ]]; then _PCAPS_UNSAFE_RM=1; continue; fi
+    if _cap_is_known "$c"; then
+      case "$seen" in
+        *",$c,"*) ;;
+        *) seen+="$c,"; _PCAPS+="$c"$'\n' ;;
+      esac
+    else
+      _PCAPS_UNKNOWN+="$c"$'\n'
+    fi
+  done <<< "$raw"
+  _PCAPS_HASH="$(_caps_list_hash "$_PCAPS")"
+}
+
+# The trust hash of a .cleat's caps for one box, from a single read. Empty when
+# the file is missing or declares no cap Cleat can apply. Call it inside $( ):
+# it replaces the current _PCAPS view.
 _hash_cleat_caps() {
   local path="$1" box="${2?_hash_cleat_caps needs a box}"
   [[ -f "$path" ]] || return 0
-  local caps
-  caps="$(_read_caps_from_file "$path" "$box" | _canonical_caps)"
-  [[ -z "$caps" ]] && return 0
-  echo -n "$caps" | _md5 | awk '{print $1}'
+  _project_caps_view "$path" "$box"
+  printf '%s' "$_PCAPS_HASH"
+}
+
+# A project cap name Cleat does not know is dropped (see _project_caps_view).
+# Say so rather than drop it silently: it is a typo or a cap this version
+# lacks. Once per file and box per run, since a launch resolves caps more than
+# once. The names are box-written text: at most three are shown, each cut to 32
+# characters before it is sanitized.
+_WARNED_UNKNOWN_CAPS=""
+_warn_unknown_project_caps() {
+  local file="$1" box="$2" names="$3" n shown="" count=0
+  [[ -n "$names" ]] || return 0
+  case "$_WARNED_UNKNOWN_CAPS" in *"|$file|$box|"*) return 0 ;; esac
+  _WARNED_UNKNOWN_CAPS="${_WARNED_UNKNOWN_CAPS}|$file|$box|"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    count=$((count + 1))
+    if [[ $count -le 3 ]]; then
+      shown="${shown:+$shown, }$(_sanitize_repo_str "${n:0:32}")"
+    fi
+  done <<< "$names"
+  if [[ $count -gt 3 ]]; then
+    shown="$shown ${DIM}(+$((count - 3)) more)${RESET}"
+  fi
+  warn "Ignoring unknown capability in the project .cleat: ${BOLD}${shown}${RESET} ${DIM}(nothing is granted for it)${RESET}"
 }
 
 # Hash a built [setup] payload (see _build_setup_payload) for trust
@@ -4550,6 +4642,8 @@ _trust_list() {
 
 # Is a project trusted at its current .cleat caps hash?
 # Returns 0 when trusted, 1 when not (missing entry, stale hash, or no .cleat).
+# $2, when given, is the hash to check: the caller's single-read view (see
+# _project_caps_view). Without it the hash is taken fresh.
 _is_project_trusted() {
   local project="$1"
   local box="${_BOX:-main}"
@@ -4557,7 +4651,11 @@ _is_project_trusted() {
   caps_file="$(_project_caps_file "$project")"
   stored="$(_trust_lookup "$project" "$box")"
   [[ -z "$stored" ]] && return 1
-  current="$(_hash_cleat_caps "$caps_file" "$box")"
+  if [[ $# -ge 2 ]]; then
+    current="$2"
+  else
+    current="$(_hash_cleat_caps "$caps_file" "$box")"
+  fi
   [[ -z "$current" ]] && return 1
   [[ "$stored" == "$current" ]]
 }
@@ -4662,7 +4760,7 @@ _setup_trust_prompt() {
 
 # Session-scoped decision cache: avoid prompting twice per invocation when
 # resolve_caps is called from multiple command paths in the same run.
-_TRUST_SESSION_DECISION=""   # "", "approved", "rejected"
+_TRUST_SESSION_DECISION=""   # "", "approved:<caps hash>", "rejected"
 _TRUST_SESSION_PROJECT=""    # the project path we decided on
 _TRUST_SESSION_BOX=""        # the box we decided on (per-box trust)
 
@@ -4704,14 +4802,27 @@ _resolve_project_trust() {
   local caps_file
   caps_file="$(_project_caps_file "$project")"
 
-  # Cached decision for this session/project/box
+  # Decide on the view resolve_caps just took and will apply, so the set that
+  # is checked, shown and recorded is the set that applies. A caller with no
+  # view for this file and box gets a fresh one, still a single read.
+  [[ "$_PCAPS_OF" == "$caps_file|$box" ]] || _project_caps_view "$caps_file" "$box"
+  local hash="$_PCAPS_HASH"
+  [[ -n "$hash" ]] || return 1
+
+  # Cached decision for this session/project/box. An approval holds only at the
+  # hash it was given for: a .cleat rewritten between two resolve_caps calls in
+  # one process (cmd_start, then a recreate through cmd_run) must not ride an
+  # approval of other caps. Same rule as _SETUP_SESSION_DECISION.
   if [[ -n "$_TRUST_SESSION_DECISION" && "$_TRUST_SESSION_PROJECT" == "$project" && "$_TRUST_SESSION_BOX" == "$box" ]]; then
-    [[ "$_TRUST_SESSION_DECISION" == "approved" ]] && return 0 || return 1
+    case "$_TRUST_SESSION_DECISION" in
+      "approved:$hash") return 0 ;;
+      rejected) return 1 ;;
+    esac
   fi
 
-  # Already approved at the current hash (per box)
-  if _is_project_trusted "$project"; then
-    _TRUST_SESSION_DECISION="approved"
+  # Already approved at this hash (per box)
+  if _is_project_trusted "$project" "$hash"; then
+    _TRUST_SESSION_DECISION="approved:$hash"
     _TRUST_SESSION_PROJECT="$project"
     _TRUST_SESSION_BOX="$box"
     return 0
@@ -4719,13 +4830,11 @@ _resolve_project_trust() {
 
   # Explicit non-interactive opt-in
   if [[ "${CLEAT_TRUST_PROJECT:-}" == "1" || "${_CLI_TRUST_PROJECT:-0}" == "1" ]]; then
-    local hash
-    hash="$(_hash_cleat_caps "$caps_file" "$box")"
     # Preserve any existing [setup] trust (col4): approving caps never
     # creates setup trust, and passing through an empty lookup is exactly
     # that (a no-op 4th arg keeps the row 3-column, see _trust_record).
     _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
-    _TRUST_SESSION_DECISION="approved"
+    _TRUST_SESSION_DECISION="approved:$hash"
     _TRUST_SESSION_PROJECT="$project"
     _TRUST_SESSION_BOX="$box"
     return 0
@@ -4736,24 +4845,20 @@ _resolve_project_trust() {
 
   # Interactive prompt
   if _is_tty; then
+    # The prompt lists the view's caps and a yes records the view's hash, both
+    # from the one read taken before the prompt. Hashing after the answer came
+    # back recorded a .cleat rewritten while the user read the prompt, and a
+    # second read before it could differ from the list on screen. Either way
+    # the user approved one set and the store remembered another, with no
+    # re-prompt next run, and the writer can be the sandboxed agent itself.
     local -a req_caps=()
     local c
-    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$caps_file" "$box")
-    # Hash BEFORE the prompt, from the same read that produced the caps we are
-    # about to display. It used to be computed after the answer came back, so a
-    # .cleat rewritten while the user was reading the prompt got recorded as
-    # approved at its NEW hash: the user approved one set of capabilities and
-    # the trust store remembered a different set, with no re-prompt on the next
-    # run. The window is however long someone takes to read a security prompt,
-    # which is exactly the window that matters, and the writer can be the
-    # sandboxed agent itself.
-    local hash
-    hash="$(_hash_cleat_caps "$caps_file" "$box")"
+    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done <<< "$_PCAPS"
     if _trust_prompt "$project" "${req_caps[@]}"; then
       # Preserve any existing [setup] trust (col4): see the opt-in branch
       # above, same reasoning.
       _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
-      _TRUST_SESSION_DECISION="approved"
+      _TRUST_SESSION_DECISION="approved:$hash"
       _TRUST_SESSION_PROJECT="$project"
       _TRUST_SESSION_BOX="$box"
       return 0
@@ -4999,15 +5104,16 @@ resolve_caps() {
     caps_file="$(_project_caps_file "$project")"
     [[ -f "$caps_file" ]] && _warn_unknown_cleat_sections "$caps_file" project || true
     if [[ -f "$caps_file" ]]; then
-      local _raw_project_caps
-      _raw_project_caps="$(_read_caps_from_file "$caps_file" "$box")"
+      # One read decides it all: the caps hashed, shown and applied below are
+      # the same bytes (see _project_caps_view).
+      _project_caps_view "$caps_file" "$box"
       # unsafe-rm disarms the box's delete-safety guard, and the caged agent can
       # write .cleat in its own workspace. A project file must NEVER grant it, not
-      # even a trusted one: strip it here so the only sources are the user's global
-      # config and the --cap flag. Say so, because a silent drop reads as a bug.
-      if printf '%s\n' "$_raw_project_caps" | grep -qx 'unsafe-rm'; then
+      # even a trusted one: the view strips it, so the only sources are the user's
+      # global config and the --cap flag. Say so, because a silent drop reads as a bug.
+      if [[ "$_PCAPS_UNSAFE_RM" == 1 ]]; then
         # Said once per file per run: a launch resolves caps more than once, and
-        # the warning printed twice. The strip below stays unconditional.
+        # the warning printed twice. The strip in the view stays unconditional.
         case "$_WARNED_UNSAFE_RM_FILES" in
           *"|$caps_file|"*) ;;
           *)
@@ -5015,11 +5121,11 @@ resolve_caps() {
             warn "Ignoring ${BOLD}unsafe-rm${RESET} from the project .cleat: it disarms the delete-safety guard and is accepted only from your global config or ${BOLD}--cap${RESET}."
             ;;
         esac
-        _raw_project_caps="$(printf '%s\n' "$_raw_project_caps" | grep -vx 'unsafe-rm' || true)"
       fi
-      if [[ -n "$_raw_project_caps" ]]; then
+      _warn_unknown_project_caps "$caps_file" "$box" "$_PCAPS_UNKNOWN"
+      if [[ -n "$_PCAPS" ]]; then
         if _resolve_project_trust "$project" "$trust_mode"; then
-          project_caps="$_raw_project_caps"
+          project_caps="$_PCAPS"
         fi
       fi
     fi
@@ -23936,8 +24042,13 @@ cmd_trust() {
     echo -e "    ${DIM}Nothing to trust. This box has no capability config.${RESET}"
     exit 1
   fi
-  local hash
-  hash="$(_hash_cleat_caps "$caps_file" "$box")"
+  # One read for the hash recorded and the caps line printed below, so what the
+  # user is told was approved is what was recorded (see _project_caps_view).
+  local hash approved_caps
+  _project_caps_view "$caps_file" "$box"
+  hash="$_PCAPS_HASH"
+  approved_caps="$(printf '%s\n' "$_PCAPS" | _canonical_caps)"
+  _warn_unknown_project_caps "$caps_file" "$box" "$_PCAPS_UNKNOWN"
   # An explicit `cleat trust` approves the whole file the user is looking
   # at: caps and [setup] both, separate consent classes (concept/16). A
   # caps-less file with a [setup] section is still approvable: setup trust
@@ -23967,9 +24078,7 @@ cmd_trust() {
     success "Trusted ${BOLD}${project}${RESET} ${DIM}[${box}]${RESET}"
   fi
   if [[ -n "$hash" ]]; then
-    local caps
-    caps="$(_read_caps_from_file "$caps_file" "$box" | _canonical_caps)"
-    echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$caps")${RESET}"
+    echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$approved_caps")${RESET}"
   fi
   if [[ -n "$setup_payload" ]]; then
     echo -e "    ${DIM}Approved setup: ${setup_count} command(s)${RESET}"

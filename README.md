@@ -869,6 +869,8 @@ Say yes and the approval is stored at `~/.config/cleat/trust`. Next launch, noth
 
 Approval is keyed on the **canonical list of capabilities** declared in `.cleat`, not the raw file. Comment edits and cap reordering don't invalidate trust. Adding, removing, or changing a cap triggers a re-prompt with an "…has changed since you trusted it" framing.
 
+Only capabilities Cleat knows count. A name it does not know (a typo, a cap this version lacks or a line like `docker,git`) is ignored with a warning and grants nothing. It never appears in the prompt and never counts toward the approval. The same goes for `unsafe-rm`, which a project file can never grant. Cleat reads `.cleat` once per check: the caps it shows you, the caps it records and the caps it applies all come from that one read, so a file rewritten during a launch is checked again.
+
 The hash is per box, so trust rows are keyed on (project, box). Editing one box's
 section re-prompts for that box only. Every other box keeps its approval.
 

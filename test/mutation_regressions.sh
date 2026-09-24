@@ -589,9 +589,13 @@ try "vnext_docker_cap_loopback_liveness_guard" "with no host socket warns" "$CLI
 
 # vnext unsafe-rm: the guard cap must NOT be grantable from a project .cleat (the
 # caged agent can write it). Stop stripping it from project caps; the
-# project-ignored test should fail.
+# project-ignored test should fail. Retargeted when the strip moved into
+# _project_caps_view: unsafe-rm then falls through to the known-name check and
+# applies.
 cat > "$SED_TMP" << 'SED'
-s@grep -vx 'unsafe-rm' || true@cat@
+/^_project_caps_view()/,/^}$/{
+  s@_PCAPS_UNSAFE_RM=1; continue; fi@_PCAPS_UNSAFE_RM=1; fi@
+}
 SED
 try "vnext_unsafe_rm_project_stripped" "unsafe-rm from a project" "$CLI" "$CAPABILITIES_BATS"
 
@@ -685,22 +689,23 @@ try "v0.10.0_status_readonly_trust" "cmd_status never prompts for trust"
 
 # v0.10.0: the trust hash must be over the *canonical* cap list, not the
 # raw .cleat file. If the hash includes comments/whitespace, comment
-# edits trigger re-approval churn. Replace canonical hashing with raw
-# file hashing and the hash-stability guard should fail.
+# edits trigger re-approval churn. Replace canonical hashing with the list
+# in file order and the hash-stability guard should fail. Retargeted when the
+# hashing moved into _caps_list_hash, which hashes the single-read view.
 cat > "$SED_TMP" << 'SED'
-/^_hash_cleat_caps\(\)/,/^}$/{
-  s|caps="\$(_read_caps_from_file "\$path" "\$box" \| _canonical_caps)"|caps="$(cat "$path")"|
+/^_caps_list_hash()/,/^}$/{
+  s@caps="[$](printf '%s\\n' "[$]1" | _canonical_caps)"@caps="$1"@
 }
 SED
 try "v0.10.0_trust_hash_canonical" "trust hash is over canonical caps"
 
 # v0.10.0: _md5 on Linux uses md5sum which appends "  -" (stdin filename)
-# after the hash. The `awk '{print $1}'` strip in _hash_cleat_caps must
+# after the hash. The `awk '{print $1}'` strip in _caps_list_hash must
 # remain so the trust file stores pure hex. Removing it reintroduces the
 # junk suffix and the hex-only guard should fail. Use `#` as sed
 # delimiter since the source line contains many `|` characters.
 cat > "$SED_TMP" << 'SED'
-/^_hash_cleat_caps()/,/^}$/{
+/^_caps_list_hash()/,/^}$/{
   s#| awk .*##
 }
 SED
@@ -4782,9 +4787,11 @@ try "hook_concurrency_bound" "concurrency is bounded so a spool flood" "$CLI" "$
 
 # TRUST HASH BEFORE PROMPT: hashing after the answer records a .cleat the user
 # never saw, so an agent can rewrite it while the prompt is on screen.
+# Retargeted when the hash came from the single-read view: the mutation hashes
+# a fresh read once the answer is back.
 cat > "$SED_TMP" << 'SED'
-/# Hash BEFORE the prompt, from the same read that produced the caps we are/,/^    hash="\$(_hash_cleat_caps "\$caps_file" "\$box")"$/{
-  /^    hash="\$(_hash_cleat_caps "\$caps_file" "\$box")"$/d
+/^_resolve_project_trust()/,/^}$/{
+  s#^    if _trust_prompt "[$]project" "[$]{req_caps\[@\]}"; then$#    if _trust_prompt "$project" "${req_caps[@]}"; then hash="$(_hash_cleat_caps "$caps_file" "$box")"#
 }
 SED
 try "trust_hash_before_prompt" "recorded hash is the one the user was shown" "$CLI" "$TRUST_BATS"
@@ -12037,6 +12044,79 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_boxread_log_blocked_nolink" "session-end reports never follow a link"
+
+# One read decides the project caps. resolve_caps applied its own read of
+# .cleat while the trust check hashed a second, the prompt listed a third and
+# recorded the hash of a fourth, so a box that flips the file between two of
+# them got one set checked and another applied.
+#
+# The check hashes a fresh read again: the box puts back the trusted file for
+# the check while the view it rewrote is applied.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@_is_project_trusted "[$]project" "[$]hash"@_is_project_trusted "$project"@
+}
+SED
+try "v154_caps_apply_same_read" "caps apply from the same read the trust check hashed"
+
+# The session cache holds a bare approval again: a .cleat rewritten between
+# cmd_start's resolve_caps and the recreate's rides the first answer.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@"approved:[$]hash") return 0 ;;@approved:*) return 0 ;;@
+}
+SED
+try "v154_caps_session_cache_hash_bound" "in-process approval does not carry over"
+
+# The prompt lists the view but records the hash of a second read.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@^  local hash="[$]_PCAPS_HASH"$@  local hash; hash="$(_hash_cleat_caps "$caps_file" "$box")"@
+}
+SED
+try "v154_caps_prompt_records_shown" "trust prompt records the caps it showed"
+
+# cleat trust prints "Approved caps" from a read after the one it recorded.
+cat > "$SED_TMP" << 'SED'
+/^cmd_trust()/,/^}$/{
+  s@Approved caps: [$](_sanitize_repo_str "[$]approved_caps")@Approved caps: $(_read_caps_from_file "$caps_file" "$box" | _canonical_caps)@
+}
+SED
+try "v154_cmd_trust_prints_recorded" "cleat trust prints the caps it records"
+
+# Unknown names are hashed again, so the inert line `docker,git` hashes the
+# same as the two real caps and its approval stands for them.
+cat > "$SED_TMP" << 'SED'
+/^_project_caps_view()/,/^}$/{
+  s@if _cap_is_known "[$]c"; then@if true; then@
+}
+SED
+try "v154_caps_unknown_names_dropped" "approved inert cap line cannot later stand"
+
+# The snapshot copy loses its byte cap, so a link to /dev/zero swapped in after
+# the -f check fills the host temp directory.
+cat > "$SED_TMP" << 'SED'
+/^_project_caps_view()/,/^}$/{
+  s@_read_bounded "[$]file" "[$]_PCAPS_READ_MAX" 2>/dev/null >@cat -- "$file" 2>/dev/null >@
+}
+SED
+try "v154_caps_snapshot_bounded" "reads at most 256 KiB" "$CLI" "$TRUST_BATS"
+
+# The snapshot is left in the temp directory after every launch.
+cat > "$SED_TMP" << 'SED'
+/^_project_caps_view()/,/^}$/{
+  s@^  rm -f "[$]snap"$@  :@
+}
+SED
+try "v154_caps_snapshot_cleanup" "leaves no temp file behind" "$CLI" "$TRUST_BATS"
+
+# The ignored-cap warning prints a box-written name at full length.
+cat > "$SED_TMP" << 'SED'
+/^_warn_unknown_project_caps()/,/^}$/{
+  s@"[$]{n:0:32}"@"$n"@
+}
+SED
+try "v154_caps_unknown_warning_bounded" "warning names at most three names" "$CLI" "$TRUST_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

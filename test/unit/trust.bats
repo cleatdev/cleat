@@ -584,3 +584,123 @@ EOF
   run _trust_list
   assert_output --partial "$proj"
 }
+
+# ── One read, known names only ──────────────────────────────────────────────
+#
+# The caps a project .cleat grants are hashed, shown and applied from a single
+# bounded snapshot, and only names Cleat knows count (see _project_caps_view).
+
+@test "trust: an unknown project cap is warned about and never reaches the prompt" {
+  local p="$TEST_TEMP/unk"
+  mkdir -p "$p"
+  printf '[caps]\ngit\nfoo\n' > "$p/.cleat"
+  _is_tty() { return 0; }
+  _UNK_SHOWN="$TEST_TEMP/unk.shown"
+  _trust_prompt() { shift; printf '%s\n' "$@" > "$_UNK_SHOWN"; return 0; }
+  resolve_caps "$p" > "$TEST_TEMP/unk.out" 2>&1
+  run cat "$_UNK_SHOWN"
+  assert_output "git"
+  run cat "$TEST_TEMP/unk.out"
+  assert_output --partial "Ignoring unknown capability"
+  assert_output --partial "foo"
+  run cap_is_active foo
+  assert_failure
+  run cap_is_active git
+  assert_success
+}
+
+@test "trust: the unknown-cap warning names at most three names of 32 characters" {
+  local p="$TEST_TEMP/unk5" long a32 a33
+  mkdir -p "$p"
+  long="$(printf 'a%.0s' $(seq 1 100))"
+  a32="$(printf 'a%.0s' $(seq 1 32))"
+  a33="${a32}a"
+  printf '[caps]\none\n%s\nthree\nfour\nfive\n' "$long" > "$p/.cleat"
+  _is_tty() { return 1; }
+  run resolve_caps "$p"
+  assert_success
+  assert_output --partial "one, $a32, three"
+  refute_output --partial "$a33"
+  refute_output --partial "four"
+  assert_output --partial "(+2 more)"
+}
+
+@test "trust: the unknown-cap warning prints once per launch" {
+  local p="$TEST_TEMP/unkonce"
+  mkdir -p "$p"
+  printf '[caps]\nfoo\n' > "$p/.cleat"
+  _is_tty() { return 1; }
+  resolve_caps "$p" > "$TEST_TEMP/uo1" 2>&1
+  resolve_caps "$p" > "$TEST_TEMP/uo2" 2>&1
+  run grep -c "Ignoring unknown capability" "$TEST_TEMP/uo1" "$TEST_TEMP/uo2"
+  assert_line "$TEST_TEMP/uo1:1"
+  assert_line "$TEST_TEMP/uo2:0"
+}
+
+@test "trust: a known-only cap set keeps its v1.5.3 hash" {
+  # Upgrading must not re-prompt anyone whose .cleat lists only real caps: the
+  # hash stays md5 of the comma-joined sorted names, as it always was.
+  local p="$TEST_TEMP/stable"
+  mkdir -p "$p"
+  printf '[caps]\nssh\ngit\n' > "$p/.cleat"
+  run _hash_cleat_caps "$p/.cleat" main
+  assert_output "$(printf 'git,ssh' | _md5 | awk '{print $1}')"
+}
+
+@test "trust: unsafe-rm does not count toward the caps trust hash" {
+  # It is never applied from a project file, so it is not part of what the
+  # user approves either.
+  local p="$TEST_TEMP/urmhash" h
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  h="$(_hash_cleat_caps "$p/.cleat" main)"
+  printf '[caps]\ngit\nunsafe-rm\n' > "$p/.cleat"
+  run _hash_cleat_caps "$p/.cleat" main
+  assert_output "$h"
+}
+
+@test "trust: no known cap name can hold the hash separator" {
+  # The trust hash joins names with commas. That is unambiguous only while no
+  # cap name Cleat knows contains a comma or whitespace.
+  local k
+  for k in "${KNOWN_CAPS[@]}"; do
+    run bash -c '[[ "$1" =~ ^[a-z][a-z0-9-]*$ ]]' _ "$k"
+    assert_success
+  done
+}
+
+@test "trust: the caps snapshot reads at most 256 KiB of .cleat" {
+  local p="$TEST_TEMP/big"
+  mkdir -p "$p"
+  { printf '[caps]\ngit\n#'; head -c 262144 /dev/zero | tr '\0' a; printf '\ndocker\n'; } > "$p/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  resolve_caps "$p" > "$TEST_TEMP/big.out" 2>&1
+  run cap_is_active git
+  assert_success
+  run cap_is_active docker
+  assert_failure
+}
+
+@test "trust: the caps snapshot leaves no temp file behind" {
+  local p="$TEST_TEMP/snapclean"
+  mkdir -p "$p" "$TEST_TEMP/tmp"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  TMPDIR="$TEST_TEMP/tmp" resolve_caps "$p" > "$TEST_TEMP/snapclean.out" 2>&1
+  run cap_is_active git
+  assert_success
+  run ls -A "$TEST_TEMP/tmp"
+  assert_output ""
+}
+
+@test "trust: a snapshot that cannot be taken applies no project caps" {
+  local p="$TEST_TEMP/nosnap"
+  mkdir -p "$p"
+  printf '[caps]\ndocker\n' > "$p/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  TMPDIR="$TEST_TEMP/missing-dir" resolve_caps "$p" > "$TEST_TEMP/nosnap.out" 2>&1
+  run cap_is_active docker
+  assert_failure
+  run cat "$TEST_TEMP/nosnap.out"
+  assert_output --partial "Could not read"
+}

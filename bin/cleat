@@ -2193,6 +2193,88 @@ _read_setup_from_file() {
   done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
+# ── Config files the box can write ──────────────────────────────────────────
+# A project .cleat and .cleat.env sit in the workspace, which the box mounts
+# read-write. It owns those names and every name beside them, at any moment,
+# so nothing here opens a path in that directory for writing. New bytes are
+# built in a fresh host-only directory under $CLEAT_CONFIG_DIR and renamed into
+# place. A rename replaces whatever holds the name, a link included, without
+# following it. Old bytes are read once, through one descriptor that must still
+# be the regular file the name holds (_read_unlinked_bounded).
+#
+# The staged copy used to sit beside the file as <file>.cleat-tmp.<pid>, where
+# a link the box planted at every pid had the host write the new .cleat through
+# it into any file the user can write. The read followed a .cleat linked to a
+# host file, and the rename then republished that file's bytes as a regular
+# .cleat the box could read. The bound is _PCAPS_READ_MAX's, so the trust view
+# reads every byte an edit keeps.
+_CONFIG_FILE_MAX_BYTES=262144
+
+# A host-only copy of FILE's bytes, printed as a path the caller removes. An
+# absent FILE copies as empty. Returns 2 when $CLEAT_CONFIG_DIR cannot hold the
+# copy. Returns 1, printing nothing, when FILE is a link, not a regular file,
+# over the bound or swapped between the check and the open. The global config
+# is host-only and may be a dotfiles link (stow, chezmoi), so it alone is still
+# read through one.
+_config_snapshot() {
+  local src="$1" tmp sz
+  mkdir -p "$CLEAT_CONFIG_DIR" 2>/dev/null || return 2
+  tmp="$(mktemp "$CLEAT_CONFIG_DIR/.snap.XXXXXX" 2>/dev/null)" || return 2
+  if [[ "$src" == "$CLEAT_GLOBAL_CONFIG" ]]; then
+    _read_bounded "$src" "$(( _CONFIG_FILE_MAX_BYTES + 1 ))" > "$tmp"
+  elif [[ -e "$src" || -L "$src" ]]; then
+    if ! [[ -f "$src" && ! -L "$src" ]]; then
+      rm -f "$tmp" 2>/dev/null; return 1
+    fi
+    _read_unlinked_bounded "$src" "$(( _CONFIG_FILE_MAX_BYTES + 1 ))" > "$tmp"
+    # A refused read prints nothing. A name that holds bytes but read as none
+    # was swapped around the open, and an edit written over an empty preamble
+    # would drop every other section. Refuse instead.
+    if [[ ! -s "$tmp" && -s "$src" ]]; then
+      rm -f "$tmp" 2>/dev/null; return 1
+    fi
+  fi
+  sz="$(_path_size "$tmp")"
+  if [[ "$sz" -gt "$_CONFIG_FILE_MAX_BYTES" ]]; then
+    rm -f "$tmp" 2>/dev/null; return 1
+  fi
+  printf '%s' "$tmp"
+}
+
+# Replace FILE with stdin. The bytes land under FILE's name in a new host-only
+# directory, then move into FILE's DIRECTORY. mv into a directory renames onto
+# the final name, so a link there is replaced rather than followed (a plain
+# `mv tmp FILE` moves INTO a directory the link names) and a real directory
+# there fails the move. That directory is the workspace root, which the box
+# cannot swap.
+_config_put() {
+  local file="$1" stage=""
+  mkdir -p "$CLEAT_CONFIG_DIR" 2>/dev/null || true
+  if stage="$(mktemp -d "$CLEAT_CONFIG_DIR/.stage.XXXXXX" 2>/dev/null)" \
+     && cat > "$stage/${file##*/}" \
+     && mv -f "$stage/${file##*/}" "$(dirname "$file")/" 2>/dev/null; then
+    rm -rf "$stage" 2>/dev/null || true
+    return 0
+  fi
+  [[ -z "$stage" ]] || rm -rf "$stage" 2>/dev/null || true
+  error "Could not write ${file/#${HOME}/~}"
+  return 1
+}
+
+# Say why _config_snapshot (its return code in $2) would not take FILE.
+_config_refuse() {
+  local shown="${1/#${HOME}/~}"
+  if [[ "${2:-1}" -eq 2 ]]; then
+    error "Could not write ${shown}: ${CLEAT_CONFIG_DIR/#${HOME}/~} is not writable."
+  elif [[ "$1" == "$CLEAT_GLOBAL_CONFIG" ]]; then
+    error "Refusing to edit ${shown}: it is over 256 KB."
+  else
+    error "Refusing to edit ${shown}: it is a link, a non-regular file or over 256 KB."
+    echo -e "    ${DIM}A box can write that directory, so Cleat never edits through a link there. Replace it with a regular file.${RESET}"
+  fi
+  return 0
+}
+
 # Write capabilities to a config file. Preserves non-[caps] sections.
 _write_caps_to_file() {
   local file="$1"
@@ -2204,9 +2286,11 @@ _write_caps_to_file() {
 
   mkdir -p "$(dirname "$file")"
 
-  # If file exists, preserve everything outside [caps] section
-  local preserved=""
-  if [[ -f "$file" ]]; then
+  # Preserve everything outside [caps], read from one host-only snapshot: a
+  # project .cleat is never read through a link (_config_snapshot).
+  local preserved="" snap
+  snap="$(_config_snapshot "$file")" || { _config_refuse "$file" "$?"; return 1; }
+  if [[ -s "$snap" ]]; then
     local in_caps=false _h
     # `|| [[ -n "$line" ]]` so a project .cleat whose LAST section is hand-written
     # and ends WITHOUT a trailing newline (e.g. a final `[setup]` line) is not
@@ -2239,8 +2323,9 @@ _write_caps_to_file() {
         continue
       fi
       preserved+="$line"$'\n'
-    done < "$file"
+    done < "$snap"
   fi
+  rm -f "$snap" 2>/dev/null
 
   # Write preserved content + new [caps] section
   {
@@ -2259,11 +2344,7 @@ _write_caps_to_file() {
     elif [[ "$_sec" != "caps" && "${_WRITE_EMPTY_SECTION:-0}" == "1" ]]; then
       echo "[$_sec]"
     fi
-  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
-    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
-    error "Could not write ${file/#${HOME}/~}"
-    return 1
-  }
+  } | _config_put "$file"
 }
 
 # Which section the editor writes for a box, resolved exactly the way the
@@ -2293,11 +2374,13 @@ _config_section_for() {
 # reads as the permissive project set on a teammate's older CLI. That fails
 # OPEN, so it is worth saying in the file itself rather than only in the docs.
 _config_note_sections_version() {
-  local file="$1"
-  [[ -r "$file" ]] || return 0
-  grep -q '^# Per-box config' "$file" 2>/dev/null && return 0
-  grep -q '^\[box\.' "$file" 2>/dev/null || return 0
-  local tmp="${file}.cleat-note.$$"
+  local file="$1" snap
+  [[ -f "$file" ]] || return 0
+  snap="$(_config_snapshot "$file")" || return 0
+  if grep -q '^# Per-box config' "$snap" 2>/dev/null || ! grep -q '^\[box\.' "$snap" 2>/dev/null; then
+    rm -f "$snap" 2>/dev/null
+    return 0
+  fi
   {
     # No version number. VERSION is the release being RUN, and at the moment a
     # file first grows a section that is still the last release that CANNOT read
@@ -2305,8 +2388,9 @@ _config_note_sections_version() {
     # then commits. The warning that matters does not need a number.
     echo "# Per-box config: [box.<name>.<kind>] sections, read by newer Cleat."
     echo "# Older versions ignore them and apply [caps] to every box."
-    cat "$file"
-  } > "$tmp" && mv -f "$tmp" "$file" || rm -f "$tmp" 2>/dev/null || true
+    cat "$snap"
+  } | _config_put "$file" >/dev/null || true
+  rm -f "$snap" 2>/dev/null
   return 0
 }
 
@@ -2325,7 +2409,7 @@ _config_write_caps_scoped() {
   local file="$1" sec="$2" box="$3"; shift 3
   local caps=("$@")
   if [[ -z "$box" ]]; then
-    _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+    _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}" || return 1
     # Editing the project default while box `main` DECLARES its own section
     # changes nothing for main, and reporting a bare success reads as if it did.
     if _cleat_section_present "$file" "box.main.caps"; then
@@ -2343,11 +2427,11 @@ _config_write_caps_scoped() {
   # And never on an EMPTY set: a bare [box.B.caps] is an explicit lockdown, and
   # dropping it would let the box inherit whatever the project gains later.
   if [[ "$sec" == box.* && -n "$_mine" && "$_mine" == "$_inherited" ]]; then
-    _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=0 _write_caps_to_file "$file"
+    _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=0 _write_caps_to_file "$file" || return 1
     info "Box ${BOLD}${box}${RESET} now inherits the project capabilities."
     return
   fi
-  _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+  _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}" || return 1
   _config_note_sections_version "$file"
 }
 
@@ -2370,8 +2454,9 @@ _write_resources_to_file() {
   case "$memory" in default|all) memory="" ;; esac
   case "$cpus" in default|all) cpus="" ;; esac
 
-  local preserved="" in_res=false line
-  if [[ -f "$file" ]]; then
+  local preserved="" in_res=false line snap
+  snap="$(_config_snapshot "$file")" || { _config_refuse "$file" "$?"; return 1; }
+  if [[ -s "$snap" ]]; then
     # `|| [[ -n "$line" ]]` and the `\r` strip mirror the caps/kits writers: keep a
     # no-trailing-newline final section, and match a CRLF `[resources]\r` header so
     # the old section is REPLACED (not duplicated into two [resources] blocks).
@@ -2396,8 +2481,9 @@ _write_resources_to_file() {
         continue
       fi
       preserved+="$line"$'\n'
-    done < "$file"
+    done < "$snap"
   fi
+  rm -f "$snap" 2>/dev/null
 
   {
     if [[ -n "$preserved" ]]; then
@@ -2412,11 +2498,7 @@ _write_resources_to_file() {
         echo "cpus = $cpus"
       fi
     fi
-  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
-    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
-    error "Could not write ${file/#${HOME}/~}"
-    return 1
-  }
+  } | _config_put "$file"
 }
 
 # Resolve which project cap file applies to a box (see concept/20-boxes.md):
@@ -23105,8 +23187,14 @@ _cap_description() {
 _scaffold_cleat_env() {
   local project="${1:-$PWD}"
   local env_file="$project/.cleat.env"
-  [[ -f "$env_file" ]] && return 0
-  cat > "$env_file" << 'ENVEOF'
+  # Never through a link: the workspace is the box's, and `cat >` created the
+  # host file a dangling link there named.
+  if [[ -L "$env_file" ]]; then
+    warn "Not creating ${env_file}: a link already holds that name."
+    return 0
+  fi
+  [[ -e "$env_file" ]] && return 0
+  _config_put "$env_file" << 'ENVEOF' || return 1
 # .cleat.env: project environment variables for Cleat
 # Loaded when the "env" capability is enabled.
 # Add to .gitignore: do not commit secrets.
@@ -23473,8 +23561,8 @@ _config_editor_save() {
   case "$mem_w" in default|all) mem_w="" ;; esac
   case "$cpu_w" in default|all) cpu_w="" ;; esac
 
-  _config_write_caps_scoped "$config_file" "$_esec_caps" "$_ebox" "${final_caps[@]+"${final_caps[@]}"}"
-  _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"
+  _config_write_caps_scoped "$config_file" "$_esec_caps" "$_ebox" "${final_caps[@]+"${final_caps[@]}"}" || return 1
+  _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w" || return 1
   _config_note_sections_version "$config_file"
   if [[ -n "$_ebox" ]]; then
     success "Saved to ${config_file} ${DIM}(box ${_ebox})${RESET}"
@@ -23640,10 +23728,10 @@ _generate_project_cleat() {
   shift 3
   local caps=("$@")
   local file="${project}/.cleat"
-  local fresh=0
-  [[ -f "$file" ]] || fresh=1
 
-  if [[ $fresh -eq 1 ]]; then
+  # Fresh means nothing holds the name. A dangling link is not fresh: the
+  # writers below refuse it, where `> "$file"` created the file it names.
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
     mkdir -p "$project"
     {
       echo "# .cleat: Cleat project config. Commit it so every clone runs in the same cage."
@@ -23651,11 +23739,11 @@ _generate_project_cleat() {
       echo "# [caps] grant host access (off by default). [resources] cap the box."
       echo "# Docs: https://cleat.sh/docs"
       echo ""
-    } > "$file"
+    } | _config_put "$file" || return 1
   fi
 
-  _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
-  _write_resources_to_file "$file" "$memory" "$cpus"
+  _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}" || return 1
+  _write_resources_to_file "$file" "$memory" "$cpus" || return 1
 }
 
 # Confirm and stamp the selections into ./.cleat (global-scope generate row). This
@@ -23726,7 +23814,7 @@ _config_generate_project() {
   local yn=""
   _ask_yn yn "Write this .cleat? ${DIM}[y/N]${RESET} "
   if [[ "$yn" == [yY]* ]]; then
-    _generate_project_cleat "$project" "$memory" "$cpus" "${caps[@]+"${caps[@]}"}"
+    _generate_project_cleat "$project" "$memory" "$cpus" "${caps[@]+"${caps[@]}"}" || return 1
     success "Wrote ${target}"
     info "Its capabilities apply after you approve it on the next run ${DIM}(or cleat trust)${RESET}"
   else
@@ -24032,7 +24120,7 @@ cmd_config() {
     cur_mem="$(_read_section_from_file "$config_file" "$_sec_res" memory || true)"
     cur_cpus="$(_read_section_from_file "$config_file" "$_sec_res" cpus || true)"
     if [[ "$res_key" == "memory" ]]; then cur_mem="$write_val"; else cur_cpus="$write_val"; fi
-    _WRITE_RES_SECTION="$_sec_res" _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus"
+    _WRITE_RES_SECTION="$_sec_res" _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus" || exit 1
     _config_note_sections_version "$config_file"
     if [[ -n "$write_val" ]]; then
       success "${res_key} set to ${write_val} ${DIM}(${config_file})${RESET}"
@@ -24103,7 +24191,7 @@ cmd_config() {
       if ! $already; then
         current_caps+=("$cap_name")
       fi
-      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${current_caps[@]}"
+      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${current_caps[@]}" || exit 1
       success "${cap_name} enabled"
       echo -e "    ${DIM}$(_cap_description "$cap_name")${RESET}"
 
@@ -24117,7 +24205,7 @@ cmd_config() {
       for cap in "${current_caps[@]+"${current_caps[@]}"}"; do
         [[ "$cap" != "$cap_name" ]] && new_caps+=("$cap")
       done
-      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${new_caps[@]+"${new_caps[@]}"}"
+      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${new_caps[@]+"${new_caps[@]}"}" || exit 1
       success "${cap_name} disabled"
     fi
     return

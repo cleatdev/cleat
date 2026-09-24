@@ -1213,6 +1213,23 @@ CURL
   assert_output --partial "Resources"
 }
 
+@test "smoke: cleat config --project refuses a symlinked .cleat under strict mode" {
+  # The edit used to read through the link and rename a copy of the target
+  # into the workspace. Refused now, with no success line after it.
+  mkdir -p "$TEST_TEMP/link-project"
+  printf 'HOSTSECRET\n' > "$TEST_TEMP/secret"
+  ln -s "$TEST_TEMP/secret" "$TEST_TEMP/link-project/.cleat"
+  cd "$TEST_TEMP/link-project"
+  run cleat_bin config --project --enable git
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  refute_output --partial "git enabled"
+  refute_output --partial "unbound variable"
+  [ -L "$TEST_TEMP/link-project/.cleat" ] || { echo ".cleat is no longer the link"; return 1; }
+  run cat "$TEST_TEMP/secret"
+  assert_output "HOSTSECRET"
+}
+
 @test "smoke: cleat config --cpus above the core count exits cleanly" {
   run cleat_bin config --cpus 512
   assert_success

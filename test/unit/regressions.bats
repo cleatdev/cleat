@@ -7664,3 +7664,103 @@ EOF
   run _trust_lookup "$p" main
   assert_output "$(_trust_decision_hash "" "R154_SHOWN")"
 }
+
+# The writers staged the new .cleat beside it as .cleat.cleat-tmp.<pid> (and
+# .cleat.cleat-note.<pid>), opened with a plain redirect. The workspace is the
+# box's, so it planted a link at every pid and the next `cleat config` wrote
+# the new .cleat, box-authored sections included, into a host file such as
+# ~/.zshenv.
+@test "regression v1.5.4: a .cleat edit never writes through a link planted at its temp name" {
+  local proj="$TEST_TEMP/proj" victim="$TEST_TEMP/host-zshenv"
+  mkdir -p "$proj"
+  printf 'export HOST=1\n' > "$victim"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  ln -s "$victim" "$proj/.cleat.cleat-tmp.$$"
+  ln -s "$victim" "$proj/.cleat.cleat-note.$$"
+  _write_caps_to_file "$proj/.cleat" ssh
+  _write_resources_to_file "$proj/.cleat" 4g ""
+  _config_write_caps_scoped "$proj/.cleat" box.web.caps web git
+  run cat "$victim"
+  assert_output "export HOST=1"
+  run cat "$proj/.cleat"
+  assert_output --partial "memory = 4g"
+  assert_output --partial "[box.web.caps]"
+  assert_output --partial "# Per-box config"
+}
+
+# [[ -f ]] and `< "$file"` followed a link, and the rename then put the bytes
+# back as a regular .cleat in /workspace: a box that planted
+# .cleat -> ../../.aws/credentials read the secret after the next edit.
+@test "regression v1.5.4: a .cleat linked to a host file is refused, never copied into the workspace" {
+  local proj="$TEST_TEMP/proj" host="$TEST_TEMP/host-credentials"
+  mkdir -p "$proj"
+  printf '[default]\naws_secret_access_key = HOSTSECRET\n' > "$host"
+  ln -s "$host" "$proj/.cleat"
+  run _write_caps_to_file "$proj/.cleat" git
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  run _write_resources_to_file "$proj/.cleat" 4g ""
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  [ -L "$proj/.cleat" ] || { echo ".cleat is no longer the link"; return 1; }
+  run grep -rl HOSTSECRET "$proj" "$CLEAT_CONFIG_DIR"
+  assert_output ""
+  run cat "$host"
+  assert_output "$(printf '[default]\naws_secret_access_key = HOSTSECRET')"
+}
+
+# A dangling link fails [[ -f ]], so the generate row took .cleat as fresh and
+# wrote its header with `> "$file"`, creating the link's target on the host.
+@test "regression v1.5.4: generate never creates the file a dangling .cleat link names" {
+  local proj="$TEST_TEMP/proj" target="$TEST_TEMP/host-new-file"
+  mkdir -p "$proj"
+  ln -s "$target" "$proj/.cleat"
+  run _generate_project_cleat "$proj" 4g 2 git
+  assert_failure
+  [ ! -e "$target" ] || { echo "created: $(cat "$target")"; return 1; }
+  [ -L "$proj/.cleat" ] || { echo ".cleat is no longer the link"; return 1; }
+}
+
+# Same shape in the .cleat.env scaffold: `[[ -f ]] && return`, then `cat >`
+# through a dangling link.
+@test "regression v1.5.4: the .cleat.env scaffold never creates the file a dangling link names" {
+  local proj="$TEST_TEMP/proj" target="$TEST_TEMP/host-env-target"
+  mkdir -p "$proj"
+  ln -s "$target" "$proj/.cleat.env"
+  run _scaffold_cleat_env "$proj"
+  assert_success
+  assert_output --partial "Not creating"
+  [ ! -e "$target" ] || { echo "created: $(cat "$target")"; return 1; }
+  [ -L "$proj/.cleat.env" ] || { echo ".cleat.env is no longer the link"; return 1; }
+}
+
+# `mv -f tmp .cleat` moves INTO a directory a link at .cleat names, so a box
+# swapping one in after the checks had the new file dropped in any host
+# directory. The move names the workspace directory instead, which renames onto
+# the final name and never follows a link there. The swap runs at the stage's
+# mktemp, the last step before the rename.
+@test "regression v1.5.4: the rename lands on .cleat even when a link to a host directory is swapped in" {
+  local proj="$TEST_TEMP/proj"
+  _R154_HOSTDIR="$TEST_TEMP/host-dir"
+  _R154_FLAG="$TEST_TEMP/swapped"
+  _R154_CLEAT="$proj/.cleat"
+  mkdir -p "$proj" "$_R154_HOSTDIR"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  mktemp() {
+    if [[ "$1" == "-d" && ! -e "$_R154_FLAG" ]]; then
+      : > "$_R154_FLAG"
+      command rm -f "$_R154_CLEAT"
+      command ln -s "$_R154_HOSTDIR" "$_R154_CLEAT"
+    fi
+    command mktemp "$@"
+  }
+  run _write_caps_to_file "$proj/.cleat" ssh
+  unset -f mktemp
+  assert_success
+  [ -e "$_R154_FLAG" ] || { echo "the swap never ran"; return 1; }
+  run ls -A "$_R154_HOSTDIR"
+  assert_output ""
+  [ ! -L "$proj/.cleat" ] || { echo ".cleat is still the link"; return 1; }
+  run cat "$proj/.cleat"
+  assert_output --partial "ssh"
+}

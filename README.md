@@ -1081,6 +1081,14 @@ A project's `.cleat` and env files count only when they are regular files. A
 FIFO, a socket or a link to a device at either name reads as absent, so a box
 cannot hang a launch by planting one there.
 
+`cleat config` never edits a project file through a link. The project folder is
+the box's workspace, so the new `.cleat` is built under `~/.config/cleat` and
+renamed into the project, where nothing at the final name is followed. A
+`.cleat` that is a symlink, a directory or larger than 256 KB is refused with
+`Refusing to edit`. To edit a shared `.cleat`, edit the file the link points to.
+`.cleat.env` is never created over a link either. Project edits need
+`~/.config/cleat` to be writable.
+
 ---
 
 ## Terminal output

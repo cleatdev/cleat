@@ -4814,9 +4814,12 @@ SED
 try "desktop_settings_engine_gate" "leftover Desktop settings file is ignored" "$CLI" "$REPO_ROOT/test/unit/docker_gate.bats"
 
 # ATOMIC CONFIG WRITE: truncate-then-write destroys the preserved [setup] block
-# if anything fails part way.
+# if anything fails part way. Retargeted when the project writers moved to
+# _config_put: the old unscoped sed then hit only the global-only writers.
 cat > "$SED_TMP" << 'SED'
-s@  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {@  } > "$file" || {@
+/^_write_caps_to_file()/,/^}$/{
+  s@^  } | _config_put "[$]file"$@  } > "$file"@
+}
 SED
 try "config_write_atomic" "replaced by rename, never truncated in place" "$CLI" "$CONFIG_BATS"
 
@@ -12262,6 +12265,159 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_trust_list_env_rows" "turns yellow when a name is added" "$CLI" "$TRUST_BATS"
+
+# ── v1.5.4: project .cleat writers never go through the workspace ───────────
+# The writers staged the new .cleat beside it as <file>.cleat-tmp.<pid> and
+# <file>.cleat-note.<pid>, where a link the box planted had the host write
+# through it into any host file. Each entry puts one writer's old temp back.
+cat > "$SED_TMP" << 'SED'
+/^_write_caps_to_file()/,/^}$/{
+  s@^  } | _config_put "[$]file"$@  } > "$file.cleat-tmp.$$" \&\& mv -f "$file.cleat-tmp.$$" "$file"@
+}
+SED
+try "v154_c3_caps_temp_link" "edit never writes through a link planted at its temp name"
+
+cat > "$SED_TMP" << 'SED'
+/^_write_resources_to_file()/,/^}$/{
+  s@^  } | _config_put "[$]file"$@  } > "$file.cleat-tmp.$$" \&\& mv -f "$file.cleat-tmp.$$" "$file"@
+}
+SED
+try "v154_c3_resources_temp_link" "edit never writes through a link planted at its temp name"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_note_sections_version()/,/^}$/{
+  s@^  } | _config_put "[$]file" >/dev/null || true$@  } > "${file}.cleat-note.$$" \&\& mv -f "${file}.cleat-note.$$" "$file" || true@
+}
+SED
+try "v154_c3_note_temp_link" "edit never writes through a link planted at its temp name"
+
+# The snapshot reads a project .cleat through a link, and the rename then
+# republishes a host file's bytes in the workspace.
+cat > "$SED_TMP" << 'SED'
+/^_config_snapshot()/,/^}$/{
+  s@^  if \[\[ "[$]src" == "[$]CLEAT_GLOBAL_CONFIG" \]\]; then$@  if true; then@
+}
+SED
+try "v154_c3_snapshot_no_follow" "linked to a host file is refused"
+
+# Generate took a dangling link as fresh and wrote its header through it.
+cat > "$SED_TMP" << 'SED'
+/^_generate_project_cleat()/,/^}$/{
+  s@^  if \[\[ ! -e "[$]file" && ! -L "[$]file" \]\]; then$@  if [[ ! -f "$file" ]]; then@
+  s@^    } | _config_put "[$]file" || return 1$@    } > "$file" || return 1@
+}
+SED
+try "v154_c3_generate_dangling_link" "generate never creates the file a dangling"
+
+# The .cleat.env scaffold wrote its template through a dangling link.
+cat > "$SED_TMP" << 'SED'
+/^_scaffold_cleat_env()/,/^}$/{
+  s@^  if \[\[ -L "[$]env_file" \]\]; then$@  if false; then@
+  s@^  _config_put "[$]env_file" << 'ENVEOF' || return 1$@  cat > "$env_file" << 'ENVEOF'@
+}
+SED
+try "v154_c3_scaffold_dangling_link" "scaffold never creates the file a dangling link names"
+
+# `mv tmp FILE` moves INTO a directory a link at FILE names. The move must name
+# the workspace directory so it renames onto the final name.
+cat > "$SED_TMP" << 'SED'
+/^_config_put()/,/^}$/{
+  s@ "[$](dirname "[$]file")/" 2>/dev/null; then$@ "$file" 2>/dev/null; then@
+}
+SED
+try "v154_c3_put_into_dir" "the rename lands on"
+
+# Every edit leaves an empty stage directory in the config dir.
+cat > "$SED_TMP" << 'SED'
+/^_config_put()/,/^}$/{
+  s@^    rm -rf "[$]stage" 2>/dev/null || true$@    :@
+}
+SED
+try "v154_c3_put_stage_cleanup" "nothing is staged beside" "$CLI" "$CONFIG_BATS"
+
+# The global config is host-only. Refusing a link there breaks every dotfiles
+# setup (stow, chezmoi) for no gain.
+cat > "$SED_TMP" << 'SED'
+/^_config_snapshot()/,/^}$/{
+  s@^  if \[\[ "[$]src" == "[$]CLEAT_GLOBAL_CONFIG" \]\]; then$@  if false; then@
+}
+SED
+try "v154_c3_global_link_followed" "a global config kept as a dotfiles link" "$CLI" "$CONFIG_BATS"
+
+# No bound: a .cleat of any size is copied into the config dir.
+cat > "$SED_TMP" << 'SED'
+s@^_CONFIG_FILE_MAX_BYTES=262144$@_CONFIG_FILE_MAX_BYTES=99999999@
+SED
+try "v154_c3_size_bound" "an oversized" "$CLI" "$CONFIG_BATS"
+
+# A read refused because the name changed around its open comes back empty, and
+# the edit is then written over it, dropping every other section.
+cat > "$SED_TMP" << 'SED'
+/^_config_snapshot()/,/^}$/{
+  s@^    if \[\[ ! -s "[$]tmp" && -s "[$]src" \]\]; then$@    if false; then@
+}
+SED
+try "v154_c3_swap_refused" "refused mid-swap" "$CLI" "$CONFIG_BATS"
+
+# An unwritable config dir is reported as a link in the workspace.
+cat > "$SED_TMP" << 'SED'
+/^_config_refuse()/,/^}$/{
+  s@^  if \[\[ "[$]{2:-1}" -eq 2 \]\]; then$@  if false; then@
+}
+SED
+try "v154_c3_confdir_named" "cannot hold the stage" "$CLI" "$CONFIG_BATS"
+
+# A refused edit still printed its success line in a caller without errexit.
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s#^      _config_write_caps_scoped "[$]config_file" "[$]_sec_caps" "[$]_box_scope" "[$]{current_caps\[@\]}" || exit 1$#      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${current_caps[@]}"#
+}
+SED
+try "v154_c3_enable_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s# "[$]{new_caps\[@\]+"[$]{new_caps\[@\]}"}" || exit 1$# "${new_caps[@]+"${new_caps[@]}"}"#
+}
+SED
+try "v154_c3_disable_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s@ "[$]config_file" "[$]cur_mem" "[$]cur_cpus" || exit 1$@ "$config_file" "$cur_mem" "$cur_cpus"@
+}
+SED
+try "v154_c3_resource_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_write_caps_scoped()/,/^}$/{
+  s#^    _write_caps_to_file "[$]file" "[$]{caps\[@\]+"[$]{caps\[@\]}"}" || return 1$#    _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"#
+}
+SED
+try "v154_c3_scoped_project_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_write_caps_scoped()/,/^}$/{
+  s# _WRITE_EMPTY_SECTION=1 _write_caps_to_file "[$]file" "[$]{caps\[@\]+"[$]{caps\[@\]}"}" || return 1$# _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"#
+}
+SED
+try "v154_c3_scoped_box_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+# Both writes in the editor save must stop it: either one alone refuses too.
+cat > "$SED_TMP" << 'SED'
+/^_config_editor_save()/,/^}$/{
+  s# "[$]{final_caps\[@\]+"[$]{final_caps\[@\]}"}" || return 1$# "${final_caps[@]+"${final_caps[@]}"}"#
+  s@ "[$]config_file" "[$]mem_w" "[$]cpu_w" || return 1$@ "$config_file" "$mem_w" "$cpu_w"@
+}
+SED
+try "v154_c3_editor_save_stops" "a refused project save or generate" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_generate_project()/,/^}$/{
+  s# "[$]{caps\[@\]+"[$]{caps\[@\]}"}" || return 1$# "${caps[@]+"${caps[@]}"}"#
+}
+SED
+try "v154_c3_generate_stops" "a refused project save or generate" "$CLI" "$CONFIG_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

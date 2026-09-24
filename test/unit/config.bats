@@ -1339,3 +1339,124 @@ EOF
   run _read_resource_from_file "$TEST_TEMP/config" memory
   assert_output "8g"
 }
+
+# ── Project config writers never go through the workspace ──────────────────
+# The project folder is the box's read-write workspace. An edit is built under
+# $CLEAT_CONFIG_DIR and renamed into place, and the old .cleat is read once,
+# never through a link (see the v1.5.4 regressions).
+
+@test "write_caps: nothing is staged beside .cleat and no stage is left behind" {
+  local proj="$TEST_TEMP/proj"
+  mkdir -p "$proj"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  _write_caps_to_file "$proj/.cleat" ssh
+  ln -s "$TEST_TEMP/elsewhere" "$proj/.cleat.link"
+  run _write_caps_to_file "$proj/.cleat.link" ssh
+  assert_failure
+  run ls -A "$proj"
+  assert_output "$(printf '.cleat\n.cleat.link')"
+  run bash -c 'ls -A "$1" | grep -E "^[.](stage|snap)[.]"' _ "$CLEAT_CONFIG_DIR"
+  assert_output ""
+}
+
+@test "write_caps: a global config kept as a dotfiles link is still edited" {
+  # The global config is host-only, so a link there is the user's own (stow,
+  # chezmoi). Only the box-writable project files refuse links.
+  mkdir -p "$TEST_TEMP/dotfiles"
+  printf '[kits]\nworker_model = sonnet\n' > "$TEST_TEMP/dotfiles/config"
+  ln -s "$TEST_TEMP/dotfiles/config" "$CLEAT_GLOBAL_CONFIG"
+  run _write_caps_to_file "$CLEAT_GLOBAL_CONFIG" git
+  assert_success
+  run cat "$CLEAT_GLOBAL_CONFIG"
+  assert_output --partial "worker_model = sonnet"
+  assert_output --partial "git"
+}
+
+@test "write_caps: an oversized .cleat is refused and left intact" {
+  local proj="$TEST_TEMP/proj"
+  mkdir -p "$proj"
+  head -c 300000 /dev/zero | tr '\0' '#' > "$proj/.cleat"
+  cp "$proj/.cleat" "$TEST_TEMP/before"
+  run _write_caps_to_file "$proj/.cleat" git
+  assert_failure
+  assert_output --partial "over 256 KB"
+  cmp -s "$proj/.cleat" "$TEST_TEMP/before" || { echo "changed"; return 1; }
+}
+
+@test "write_caps: a .cleat that is a directory is refused and nothing lands in it" {
+  # v1.5.3 moved its temp file INTO the directory.
+  local proj="$TEST_TEMP/proj"
+  mkdir -p "$proj/.cleat"
+  run _write_caps_to_file "$proj/.cleat" git
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  run ls -A "$proj/.cleat"
+  assert_output ""
+}
+
+@test "write_caps: a .cleat whose read was refused mid-swap is left intact" {
+  # _read_unlinked_bounded prints nothing when the name changed around its open.
+  # Writing the edit over that empty read would drop every other section.
+  local proj="$TEST_TEMP/proj"
+  mkdir -p "$proj"
+  printf '[caps]\ngit\n[setup]\nmake bootstrap\n' > "$proj/.cleat"
+  cp "$proj/.cleat" "$TEST_TEMP/before"
+  _read_unlinked_bounded() { return 0; }
+  run _write_caps_to_file "$proj/.cleat" ssh
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  cmp -s "$proj/.cleat" "$TEST_TEMP/before" || { echo "changed:"; cat "$proj/.cleat"; return 1; }
+}
+
+@test "write_caps: a config dir that cannot hold the stage is named and the .cleat is kept" {
+  local proj="$TEST_TEMP/proj"
+  mkdir -p "$proj"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  : > "$TEST_TEMP/not-a-dir"
+  CLEAT_CONFIG_DIR="$TEST_TEMP/not-a-dir"
+  run _write_caps_to_file "$proj/.cleat" ssh
+  assert_failure
+  assert_output --partial "is not writable"
+  run cat "$proj/.cleat"
+  assert_output "$(printf '[caps]\ngit')"
+}
+
+@test "config --project: a refused edit exits 1 and prints no success line" {
+  # errexit already stops the real binary. The explicit exit is what keeps a
+  # caller without it (and this sourced test) from claiming the edit landed.
+  local proj="$TEST_TEMP/linkproj"
+  mkdir -p "$proj"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/shared-cleat"
+  ln -s "$TEST_TEMP/shared-cleat" "$proj/.cleat"
+  cd "$proj"
+  run cmd_config --project --enable ssh
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  refute_output --partial "enabled"
+  run cmd_config --project --disable git
+  assert_failure
+  refute_output --partial "disabled"
+  run cmd_config --project --memory 4g
+  assert_failure
+  refute_output --partial "memory set to"
+  run cmd_config web --enable ssh
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  refute_output --partial "enabled"
+  [ -L "$proj/.cleat" ] || { echo ".cleat is no longer the link"; return 1; }
+}
+
+@test "config editor: a refused project save or generate prints no success line" {
+  local proj="$TEST_TEMP/linkproj"
+  mkdir -p "$proj"
+  printf '[caps]\ngit\n' > "$TEST_TEMP/shared-cleat"
+  ln -s "$TEST_TEMP/shared-cleat" "$proj/.cleat"
+  run _config_editor_save "$proj/.cleat" project "$proj" "git,ssh" default default 0 0
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  refute_output --partial "Saved to"
+  run _config_generate_project "$proj" 4g "" git <<< "y"
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  refute_output --partial "Wrote"
+}

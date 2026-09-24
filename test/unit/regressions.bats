@@ -3706,8 +3706,10 @@ EOF
 
   run cat "$TEST_TEMP/fake-rc"
   assert_output "echo original"
-  [ ! -L "$dir/.proxy-log" ] || {
-    echo "REGRESSION: the planted symlink survived"; return 1; }
+  # Since v1.5.4 the log is not in the clip dir at all: the line lands in the
+  # host-only bridge dir, where no link the box plants can redirect it.
+  run grep -c 'opening URL' "$TEST_TEMP/bridge/proxy-log"
+  assert_output "1"
 }
 
 @test "regression v1.5.0: cap watcher log does not truncate a host file through a symlink" {
@@ -4096,7 +4098,7 @@ _vnext_watch_once() {
   local wpid=$! i=0
   printf '%s' "$1" > "$dir/.browser-open"
   while [ "$i" -lt 100 ]; do
-    grep -q "opening URL\|deferring URL\|$_BROWSER_BLOCKED_MARK" "$dir/.proxy-log" 2>/dev/null && break
+    grep -q "opening URL\|deferring URL\|$_BROWSER_BLOCKED_MARK" "$TEST_TEMP/bridge/proxy-log" 2>/dev/null && break
     sleep 0.1
     i=$((i + 1))
   done
@@ -4110,15 +4112,18 @@ _vnext_watch_once() {
 # the offset guard is under test too.
 _vnext_refuse_during_exec() {
   _T_BW_CLIP="$1"
+  # The watcher's log is the host-only bridge dir beside the clip dir.
+  _T_BW_LOG="$(dirname "$_T_BW_CLIP")/bridge/proxy-log"
+  mkdir -p "$(dirname "$_T_BW_LOG")"
   printf '[browser-watcher 09:00:00] %s origin=old.example.com url=https://old.example.com/oauth/authorize?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A45454%%2Fcb\n' \
-    "$_BROWSER_BLOCKED_MARK" > "$_T_BW_CLIP/.proxy-log"
+    "$_BROWSER_BLOCKED_MARK" > "$_T_BW_LOG"
   docker() {
     case "$*" in
       "exec -it "*)
         printf '%s' "https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback" > "$_T_BW_CLIP/.browser-open"
         local i=0
         while [ "$i" -lt 100 ]; do
-          grep -q "$_BROWSER_BLOCKED_MARK origin=auth.example.com" "$_T_BW_CLIP/.proxy-log" 2>/dev/null && break
+          grep -q "$_BROWSER_BLOCKED_MARK origin=auth.example.com" "$_T_BW_LOG" 2>/dev/null && break
           sleep 0.1
           i=$((i + 1))
         done ;;
@@ -4166,7 +4171,7 @@ _vnext_refuse_during_exec() {
   # `${l##*origin=}` took a trailing origin= the query chose.
   local u="https://auth.example.com/oauth/authorize?client_id=x&return_url=https://app.example.org/done&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback&origin=evil.example"
   _vnext_watch_once "$u" 1
-  run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+  run _maybe_report_blocked_opens "$TEST_TEMP/bridge/proxy-log" 0
   assert_output --partial "$u"
   assert_output --partial "cleat browser allow auth.example.com"
   refute_output --partial "allow evil.example"
@@ -4179,11 +4184,11 @@ _vnext_refuse_during_exec() {
   # allow line, the second one a command the verb rejects.
   local u
   for u in "https://docs.python.org/3/library/" "http://localhost:3000/"; do
-    rm -rf "$TEST_TEMP/clip"
+    rm -rf "$TEST_TEMP/clip" "$TEST_TEMP/bridge"
     _vnext_watch_once "$u" 0
-    run cat "$TEST_TEMP/clip/.proxy-log"
+    run cat "$TEST_TEMP/bridge/proxy-log"
     assert_output --partial "deferring URL to terminal"
-    run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+    run _maybe_report_blocked_opens "$TEST_TEMP/bridge/proxy-log" 0
     assert_output ""
   done
 }
@@ -4195,9 +4200,9 @@ _vnext_refuse_during_exec() {
   # The forged text is the whole shape the watcher writes, timestamp included,
   # so only an anchor on the line's first byte tells the two apart.
   _vnext_watch_once "https://github.com/x?a=[browser-watcher 00:00:00] ${_BROWSER_BLOCKED_MARK} origin=gh-login.evil.tld url=https://gh-login.evil.tld/" 1
-  run cat "$TEST_TEMP/clip/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "deferring URL to terminal"
-  run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+  run _maybe_report_blocked_opens "$TEST_TEMP/bridge/proxy-log" 0
   assert_success
   assert_output ""
 }
@@ -7332,6 +7337,8 @@ EOF
 # The session-end reports read .watcher-log and .proxy-log in the clip dir the
 # box mounts read-write. `[ -f ]` follows a link, so a link there made them read
 # a host file. Only a yes or no or a count came of it, but it is never Cleat's.
+# The browser reports' log has since moved to the host-only bridge dir. The
+# guards stay as a second layer, so these still hand the reports a clip path.
 @test "regression v1.5.4: session-end reports never follow a link planted as their log" {
   local clip="$TEST_TEMP/clip-links" host="$TEST_TEMP/host-log"
   mkdir -p "$clip"
@@ -8064,4 +8071,129 @@ _h154_inspect_from_run() {
   assert_success
   [ -f "$HOME/.claude/history.jsonl" ] && [ ! -L "$HOME/.claude/history.jsonl" ] \
     || { echo "cmd_run did not create the target"; return 1; }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the browser bridge's log lived in the clip dir, which the box mounts
+# read-write, and every write to it followed a link: the watcher's `>>`, the
+# callback proxy's own log lines, socat's `2>>` and python's open(). v1.5.0
+# re-checked the path once per claimed URL, but a box that renames a fresh
+# link over it in a loop wins any gap a check leaves, so URL lines of its
+# choosing still landed in any host file the user can write, a shell rc file
+# included. The log and the callback proxy's readiness marker now live in
+# bridge/, a sibling of the clip dir that no mount contains.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Wait for a basic regex to appear in a file. $1 = file, $2 = pattern.
+_v154_bw_wait_for() {
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    grep -q "$2" "$1" 2>/dev/null && return 0
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+@test "regression v1.5.4: a proxy log link the box keeps re-planting never receives a line from the watcher or the callback proxy" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  # Hardcoded rather than read from the helper, so a mutated helper cannot
+  # redirect this test's own read.
+  local log="$TEST_TEMP/bridge/proxy-log"
+  printf 'echo original\n' > "$TEST_TEMP/fake-rc"
+  _extract_callback_port() { echo "1455"; return 0; }
+  _port_in_use() { return 1; }
+  # The proxy child writes to the log itself, after the readiness wait, which
+  # is the window the per-claim check never covered.
+  _auth_callback_proxy() {
+    echo "[proxy x] starting" >> "$3"
+    : > "$4"
+    sleep 2
+    echo "[proxy x] exited" >> "$3"
+  }
+  _browser_watcher "$dir" "true" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  ( while :; do
+      ln -sf "$TEST_TEMP/fake-rc" "$dir/.pl.tmp" 2>/dev/null
+      mv -f "$dir/.pl.tmp" "$dir/.proxy-log" 2>/dev/null
+      sleep 0.05
+    done ) &
+  local lpid=$!
+
+  # The waits never fail the test on their own: the host file is the property,
+  # so it is checked first even when the lines went somewhere else.
+  printf '%s' "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb" > "$dir/.browser-open"
+  _v154_bw_wait_for "$log" "opening URL" || true
+  printf '%s' "https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback;id;#" > "$dir/.browser-open"
+  _v154_bw_wait_for "$log" "$_BROWSER_BLOCKED_MARK origin=auth.example.com" || true
+  printf '%s' "https://docs.python.org/3/library/" > "$dir/.browser-open"
+  _v154_bw_wait_for "$log" "deferring URL" || true
+  _v154_bw_wait_for "$log" "proxy x. exited" || true
+
+  kill "$lpid" 2>/dev/null || true; wait "$lpid" 2>/dev/null || true
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  run cat "$TEST_TEMP/fake-rc"
+  assert_output "echo original"
+  run cat "$log"
+  assert_output --partial "extracted callback port=1455"
+  assert_output --partial "opening URL on host"
+  assert_output --partial "$_BROWSER_BLOCKED_MARK origin=auth.example.com"
+  assert_output --partial "deferring URL to terminal"
+  assert_output --partial "[proxy x] starting"
+  assert_output --partial "[proxy x] exited"
+}
+
+@test "regression v1.5.4: with no state dir outside the mount a faked readiness marker never starts the proxy or opens the browser" {
+  # Regular files where both host-only dirs would go, so neither can be made.
+  # v1.5.3 then put the readiness marker in the clip dir, where the box could
+  # create it (an open with no listener) or point it at a host file.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  : > "$TEST_TEMP/clipclaim"
+  : > "$TEST_TEMP/bridge"
+  cat > "$TEST_TEMP/fake_open" <<OPEN
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+OPEN
+  chmod +x "$TEST_TEMP/fake_open"
+  _extract_callback_port() { echo "1455"; return 0; }
+  _port_in_use() { return 1; }
+  # Never writes the marker: only the box's fake could make it appear.
+  _auth_callback_proxy() { touch "$TEST_TEMP/proxy_started"; sleep 5; }
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  # The watcher's $$ is this shell's $$, so this is the name it would poll.
+  ( while :; do : > "$dir/.proxy-ready.$$" 2>/dev/null; sleep 0.05; done ) &
+  local lpid=$!
+  printf '%s' "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb" > "$dir/.browser-open"
+  sleep 3
+  kill "$lpid" 2>/dev/null || true; wait "$lpid" 2>/dev/null || true
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  [ ! -e "$TEST_TEMP/proxy_started" ] || {
+    echo "REGRESSION: the callback proxy started with its marker inside the mount"; return 1; }
+  [ ! -e "$TEST_TEMP/opened.log" ] || {
+    echo "REGRESSION: a readiness marker the box faked opened the browser"; return 1; }
+}
+
+@test "regression v1.5.4: a refusal line the box writes into its clip dir is never reported at session end" {
+  # The report reads the host-only log. A line the box forges in its own clip
+  # dir, where the log used to be, must never reach the terminal.
+  _host_open_cmd() { echo ""; }
+  mkdir -p "$CLEAT_RUN_DIR/test-ctr/clip" "$CLEAT_RUN_DIR/test-ctr/bridge"
+  docker() {
+    if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
+      printf '[browser-watcher 10:00:00] %s origin=evil.example url=https://evil.example/oauth/authorize?redirect_uri=x\n' \
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+      printf '[browser-watcher 10:00:00] %s origin=auth.example.com url=https://auth.example.com/oauth/authorize?redirect_uri=x\n' \
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
+    fi
+    command docker "$@"
+  }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "evil.example"
 }

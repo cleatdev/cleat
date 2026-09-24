@@ -5525,15 +5525,21 @@ try "int_cname_threads_box" "int_cname threads a box name through" "$SETUP_BASH"
 
 # The clip dir is mounted rw into the box, so every host-side path it can plant
 # a symlink at needs a guard. `>>` and `[ -f ]` both follow links.
+# Retargeted when the bridge log left the clip dir (v1.5.4): the per-claim
+# guard is gone, so the mutation puts the opening line back in the mount.
 cat > "$SED_TMP" << 'SED'
 /^_browser_watcher()/,/^}$/{
-  s|_drop_unless_regular "\$clip_dir/\.proxy-log"|:|
+  s@\(opening URL on host .*\) >> "[$]_bw_log"$@\1 >> "$clip_dir/.proxy-log"@
 }
 SED
 try "vnext_proxy_log_symlink" "cannot append to a host file through a planted proxy log symlink"
 
+# Retargeted (v1.5.4): the watcher now unlinks the old in-mount log at start,
+# never following a link planted there.
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$clip_dir\/\.proxy-log" >\/dev\/null/d
+/^_browser_watcher()/,/^}$/{
+  /^  rm -f "[$]clip_dir\/\.proxy-log" 2>\/dev\/null || true$/d
+}
 SED
 try "vnext_proxy_log_symlink_at_start" "a symlink present at watcher start is dropped too" "$CLI" "$BROWSER_BRIDGE_BATS"
 
@@ -5543,8 +5549,11 @@ s@tr -d '\[:cntrl:\]'@cat@
 SED
 try "vnext_proxy_log_sanitize" "a URL carrying a newline cannot forge its own log line" "$CLI" "$BROWSER_BRIDGE_BATS"
 
+# Retargeted (v1.5.4): the cap runs on the host-only bridge log.
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$clip_dir\/\.proxy-log" >\/dev\/null/d
+/^_browser_watcher()/,/^}$/{
+  /^    _cap_watcher_log "[$]_bw_log" >\/dev\/null$/d
+}
 SED
 try "vnext_proxy_log_cap" "an oversized log is capped at watcher start" "$CLI" "$BROWSER_BRIDGE_BATS"
 
@@ -5739,12 +5748,16 @@ SED
 try "v0.6.4_bind_retry" "retries a busy bind"
 
 # Any shape that is not a regular file is dropped, not just a symlink.
+# Retargeted (v1.5.4): the watcher no longer writes in the clip dir, so the
+# FIFO test pins that instead. Every append put back at the old in-mount path
+# blocks on the FIFO the box planted there. The FIFO arm of
+# _drop_unless_regular stays pinned by the two entries below.
 cat > "$SED_TMP" << 'SED'
-/^_drop_unless_regular()/,/^}$/{
-  s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
+/^_browser_watcher()/,/^}$/{
+  s@>> "[$]_bw_log"@>> "$clip_dir/.proxy-log"@
 }
 SED
-try "vnext_drop_fifo_proxy_log" "a FIFO planted mid-session is dropped" "$CLI" "$BROWSER_BRIDGE_BATS"
+try "vnext_drop_fifo_proxy_log" "a FIFO planted at the old in-mount path never blocks the watcher" "$CLI" "$BROWSER_BRIDGE_BATS"
 cat > "$SED_TMP" << 'SED'
 /^_drop_unless_regular()/,/^}$/{
   s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
@@ -8732,10 +8745,10 @@ try "vnext_bridge_claim_bounded" "the claim read is bounded" "$CLI" "$BROWSER_BR
 # ── refusal reporting, 2026-09-13 ───────────────────────────────────────────
 
 # cleat shell runs the browser watcher, so a login from the shell can be
-# refused. Without the report the refusal lives only in the box's own log.
+# refused. Without the report the refusal lives only in the bridge log.
 cat > "$SED_TMP" << 'SED'
 /^cmd_shell()/,/^}$/{
-  /_maybe_report_blocked_opens "[$]_shell_clip_dir\/.proxy-log"/d
+  /_maybe_report_blocked_opens "[$]_shell_proxy_log"/d
 }
 SED
 try "vnext_refusal_shell_reports" "cleat shell reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
@@ -8743,7 +8756,7 @@ try "vnext_refusal_shell_reports" "cleat shell reports a browser open the gate r
 # cleat login promises the browser will open. A refused origin must say why not.
 cat > "$SED_TMP" << 'SED'
 /^cmd_login()/,/^}$/{
-  /_maybe_report_blocked_opens "[$]_login_clip_dir\/.proxy-log"/d
+  /_maybe_report_blocked_opens "[$]_login_proxy_log"/d
 }
 SED
 try "vnext_refusal_login_reports" "cleat login reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
@@ -9980,7 +9993,7 @@ try "vnext_acp_wait_300" "the socat wait is bounded at 300 seconds" "$CLI" "$BRO
 # captured before the session, not the start of the file.
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
-  /^  _maybe_report_blocked_opens "[$]_CLIP_DIR\/.proxy-log" "[$]_proxy_log_off"$/d
+  /^  _maybe_report_blocked_opens "[$]_proxy_log_file" "[$]_proxy_log_off"$/d
 }
 SED
 try "vnext_session_end_reports_blocked" "a refusal written during the session is reported" "$CLI" "$EXEC_CLAUDE_BATS"
@@ -9994,7 +10007,7 @@ try "vnext_session_end_reports_hook_drops" "a hook drop written during the sessi
 
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
-  s@^  _proxy_log_off="[$](_cap_watcher_log "[$]_CLIP_DIR/.proxy-log")"$@  _proxy_log_off=0@
+  s@^  _proxy_log_off="[$](_cap_watcher_log "[$]_proxy_log_file")"$@  _proxy_log_off=0@
 }
 SED
 try "vnext_session_end_proxy_log_offset" "a refusal from an earlier session is not repeated" "$CLI" "$EXEC_CLAUDE_BATS"
@@ -12618,6 +12631,73 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_history_target_create_only_start" "nested history target is never touched"
+
+# ── v1.5.4: the bridge log and the proxy's readiness marker leave the mount ──
+
+# The bridge log lived in the clip dir, and every write to it followed a link
+# the box could keep re-planting there faster than any check. Each of these
+# puts one writer back in the mount: the path helper, the watcher's appends and
+# the callback proxy's own log.
+cat > "$SED_TMP" << 'SED'
+/^_browser_proxy_log()/,/^}$/{
+  s@printf '%s/bridge/proxy-log' "[$](dirname "[$]{1:?}")"@printf '%s/.proxy-log' "${1:?}"@
+}
+SED
+try "v154_proxy_log_outside_mount" "a proxy log link the box keeps re-planting never receives a line"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@>> "[$]_bw_log"@>> "$clip_dir/.proxy-log"@
+}
+SED
+try "v154_watcher_appends_outside_mount" "a proxy log link the box keeps re-planting never receives a line"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@_auth_callback_proxy "[$]cb_port" "[$]cname" "[$]_bw_log"@_auth_callback_proxy "$cb_port" "$cname" "$clip_dir/.proxy-log"@
+}
+SED
+try "v154_proxy_child_log_outside_mount" "a proxy log link the box keeps re-planting never receives a line"
+
+# With no host-only dir the readiness marker is never put back in the mount,
+# where the box could fake it or aim it at a host file, and the proxy is
+# refused outright.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@^    _bw_log=/dev/null$@    _bw_log=/dev/null; _bw_ready="$clip_dir/.proxy-ready.$$"@
+}
+SED
+try "v154_ready_marker_never_in_mount" "a faked readiness marker never starts the proxy"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@^            elif \[ -z "[$]_bw_ready" \]; then$@            elif false; then@
+}
+SED
+try "v154_no_state_dir_refuses_proxy" "a faked readiness marker never starts the proxy"
+
+# The session-end reports read the host-only log, never a file in the clip dir
+# the box can write.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _proxy_log_file="[$](_browser_proxy_log "[$]_CLIP_DIR")"$@  _proxy_log_file="$_CLIP_DIR/.proxy-log"@
+}
+SED
+try "v154_session_end_reads_host_log" "a refusal line the box writes into its clip dir"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  s@^  _shell_proxy_log="[$](_browser_proxy_log "[$]_shell_clip_dir")"$@  _shell_proxy_log="$_shell_clip_dir/.proxy-log"@
+}
+SED
+try "v154_shell_reads_host_log" "cleat shell reports a browser open the gate refused"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  s@^  _login_proxy_log="[$](_browser_proxy_log "[$]_login_clip_dir")"$@  _login_proxy_log="$_login_clip_dir/.proxy-log"@
+}
+SED
+try "v154_login_reads_host_log" "cleat login reports a browser open the gate refused"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

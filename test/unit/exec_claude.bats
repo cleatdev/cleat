@@ -285,10 +285,13 @@ teardown() { _common_teardown; }
 
 @test "session end: a refusal written during the session is reported" {
   _host_open_cmd() { echo ""; }
+  # No watcher runs here (no opener), so nothing creates the host-only bridge
+  # dir the watcher would log into.
+  mkdir -p "$CLEAT_RUN_DIR/test-ctr/bridge"
   docker() {
     if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
       printf '[browser-watcher 10:00:00] %s origin=auth.example.com url=https://auth.example.com/oauth/authorize?redirect_uri=x\n' \
-        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
     fi
     command docker "$@"
   }
@@ -302,13 +305,13 @@ teardown() { _common_teardown; }
   # forbids. One refusal this session keeps the report on screen, so the test
   # reads what it printed rather than a report that never ran.
   _host_open_cmd() { echo ""; }
-  mkdir -p "$CLEAT_RUN_DIR/test-ctr/clip"
+  mkdir -p "$CLEAT_RUN_DIR/test-ctr/clip" "$CLEAT_RUN_DIR/test-ctr/bridge"
   printf '[browser-watcher 09:00:00] %s origin=old.example.com url=https://old.example.com/oauth/authorize?redirect_uri=x\n' \
-    "$_BROWSER_BLOCKED_MARK" > "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+    "$_BROWSER_BLOCKED_MARK" > "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
   docker() {
     if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
       printf '[browser-watcher 10:00:00] %s origin=new.example.com url=https://new.example.com/oauth/authorize?redirect_uri=x\n' \
-        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
     fi
     command docker "$@"
   }

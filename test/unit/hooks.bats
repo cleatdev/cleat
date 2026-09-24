@@ -1606,7 +1606,8 @@ SCRIPT
   [[ -f "$marker" ]] || { echo "URL was not opened in browser"; return 1; }
   [[ -f "$proxy_marker" ]] || { echo "Callback proxy was not started"; return 1; }
   run cat "$proxy_marker"
-  assert_output "34063 test-container $clip_dir/.proxy-log"
+  # The proxy writes to the host-only bridge log, never into the clip dir.
+  assert_output "34063 test-container $(dirname "$clip_dir")/bridge/proxy-log"
 }
 
 @test "_auth_callback_proxy: writes diagnostic start line to log file" {
@@ -1653,8 +1654,9 @@ SCRIPT
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
 
-  [[ -f "$clip_dir/.proxy-log" ]] || { echo "proxy log was not created"; return 1; }
-  run cat "$clip_dir/.proxy-log"
+  local log="$(dirname "$clip_dir")/bridge/proxy-log"
+  [[ -f "$log" ]] || { echo "proxy log was not created"; return 1; }
+  run cat "$log"
   assert_output --partial "extracted callback port=49152"
 }
 

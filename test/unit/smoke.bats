@@ -2713,6 +2713,8 @@ _smoke_refused_open() {
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
   local clip="$XDG_CONFIG_HOME/cleat/run/$cname/clip"
+  # The watcher logs to the host-only bridge dir beside the clip dir.
+  local blog="$XDG_CONFIG_HOME/cleat/run/$cname/bridge/proxy-log"
   cat > "$TEST_TEMP/wrap/docker" <<WRAP
 #!/usr/bin/env bash
 case "\$*" in
@@ -2720,7 +2722,7 @@ case "\$*" in
     printf '%s' 'https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback' > "$clip/.browser-open"
     i=0
     while [ "\$i" -lt 100 ]; do
-      grep -q 'BLOCKED-ORIGIN origin=auth.example.com' "$clip/.proxy-log" 2>/dev/null && break
+      grep -q 'BLOCKED-ORIGIN origin=auth.example.com' "$blog" 2>/dev/null && break
       sleep 0.1
       i=\$((i + 1))
     done ;;
@@ -2763,6 +2765,7 @@ WRAP
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
   local clip="$XDG_CONFIG_HOME/cleat/run/$cname/clip"
+  local blog="$XDG_CONFIG_HOME/cleat/run/$cname/bridge/proxy-log"
   local ledger="$XDG_CONFIG_HOME/cleat/run/$cname/clipclaim/.opens"
   cat > "$TEST_TEMP/wrap/docker" <<WRAP
 #!/usr/bin/env bash
@@ -2774,7 +2777,7 @@ case "\$*" in
     printf '%s' 'https://docs.example.org/capped-page' > "$clip/.browser-open"
     i=0
     while [ "\$i" -lt 100 ]; do
-      grep -q 'RATE-CAPPED limit=' "$clip/.proxy-log" 2>/dev/null && break
+      grep -q 'RATE-CAPPED limit=' "$blog" 2>/dev/null && break
       sleep 0.1
       i=\$((i + 1))
     done ;;

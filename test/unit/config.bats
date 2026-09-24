@@ -120,6 +120,27 @@ EOF
   refute_output --partial "not_a_cap"
 }
 
+@test "read_caps: a .cleat that links to a regular file is still read" {
+  # Deliberate. A special file at .cleat reads as absent, but .cleat and the
+  # global config are commonly symlinked from a dotfiles repo, so a link to a
+  # regular file is followed, as the plain redirect before it was.
+  mkdir -p "$TEST_TEMP/dotfiles" "$TEST_TEMP/proj"
+  printf '[caps]\ngit\n[resources]\nmemory = 4g\n' > "$TEST_TEMP/dotfiles/cleat"
+  ln -s "$TEST_TEMP/dotfiles/cleat" "$TEST_TEMP/proj/.cleat"
+  run _read_caps_from_file "$TEST_TEMP/proj/.cleat" main
+  assert_success
+  assert_output "git"
+  run _read_resource_from_file "$TEST_TEMP/proj/.cleat" memory main
+  assert_output "4g"
+}
+
+@test "read_caps: a directory at .cleat reads as absent, without an error" {
+  mkdir -p "$TEST_TEMP/proj/.cleat"
+  run _read_caps_from_file "$TEST_TEMP/proj/.cleat"
+  assert_success
+  assert_output ""
+}
+
 @test "write_caps: preserves sections from CRLF file" {
   printf '[other]\r\nsomething\r\n[caps]\r\ngit\r\n' > "$TEST_TEMP/config"
   _write_caps_to_file "$TEST_TEMP/config" ssh

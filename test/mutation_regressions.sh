@@ -4364,8 +4364,12 @@ try "vnext_fork_diag_pattern" "explains a fork error logged this session" "$CLI"
 # The diagnostic must read only THIS session's slice of the log (from the start
 # offset), or a stale error from a past session re-triggers it every run. Drop
 # the offset so it scans the whole log: the "ignores a PRIOR session" test fails.
+# Retargeted when the read became _read_bounded, scoped to the function because
+# the hook drop report still has a tail of the same shape.
 cat > "$SED_TMP" << 'SED'
-s@tail -c "+\$(( off + 1 ))"@tail -c "+1"@
+/^_maybe_explain_fork_exhaustion()/,/^}$/{
+  s@_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))"@_read_bounded "$log" "$_BOX_FILE_READ_MAX" 1@
+}
 SED
 try "vnext_fork_diag_offset" "ignores a fork error from a PRIOR session" "$CLI" "$EXEC_CLAUDE_BATS"
 
@@ -4709,9 +4713,15 @@ SED
 try "kits_writer_header_trim" "an indented .kits. header is replaced" "$CLI" "$KITS_BATS"
 
 # CONFIG READER READABILITY: an unreadable .cleat reached the redirect and
-# killed every command in the project with a raw bash error.
+# killed every command in the project with a raw bash error. Retargeted when the
+# readers moved to _read_bounded, which fails quiet on its own: the bug needs
+# both the -f-only gate and the plain redirect back, in the reader the test
+# calls.
 cat > "$SED_TMP" << 'SED'
-s@^  \[\[ -r "$file" \]\] || return 0$@  [[ -f "$file" ]] || return 0@
+/^_read_caps_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -f "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
 SED
 try "config_reader_unreadable" "an unreadable file yields nothing instead of crashing the CLI" "$CLI" "$CONFIG_BATS"
 
@@ -8670,7 +8680,7 @@ try "vnext_bridge_bind_before_open" "a proxy that never binds opens nothing" "$C
 # sed matches the line by its start. The property is unchanged.
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_blocked_opens()/,/^}$/{
-  s@^  lines="[$](tail -c .*$@  lines="" || return 0@
+  s@^  lines="[$](_read_bounded .*$@  lines="" || return 0@
 }
 SED
 try "vnext_bridge_blocked_reported" "names the URL, the bare origin and the command that allows it" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -8679,7 +8689,7 @@ try "vnext_bridge_blocked_reported" "names the URL, the bare origin and the comm
 # on every launch, which is the nagging concept/21 forbids.
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_blocked_opens()/,/^}$/{
-  s@tail -c "+[$](( off + 1 ))" "[$]log"@cat "$log"@
+  s@_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))"@cat "$log"@
 }
 SED
 try "vnext_bridge_blocked_this_session" "only this session, never a previous one" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -9356,7 +9366,7 @@ try "vnext_b6_capped_reported" "names the URL the cap held back and how many" "$
 # B6: only this session's capped opens.
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_capped_opens()/,/^}$/{
-  s@tail -c "+[$](( off + 1 ))" "[$]log"@cat "$log"@
+  s@_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))"@cat "$log"@
 }
 SED
 try "vnext_b6_capped_this_session" "capped report: only this session" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -11823,15 +11833,210 @@ SED
 try "v154_spool_offset_reset" "the first events after a per-poll claim are delivered" \
     "$CLI" "$HOOKS_BATS"
 
-# The size read after a claim is braced, so a missing spool writes no error to
-# the watcher log on every poll.
+# The size read after a claim is a stat, so a missing spool writes no error to
+# the watcher log on every poll. A redirect opens it and fails out loud there.
 cat > "$SED_TMP" << 'SED'
 /^_hook_bridge_watcher()/,/^}$/{
-  s#file_size=[$]( { wc -c < "[$]hooks_file"; } 2>/dev/null || echo 0)#file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)#
+  s#file_size="[$](_path_size "[$]hooks_file")"#file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)#
 }
 SED
 try "v154_spool_size_read_quiet" "a claimed spool leaves no error in the watcher log" \
     "$CLI" "$HOOKS_BATS"
+
+# Host reads of names the box can write. A .cleat or .cleat.env reader gates on
+# -f and reads through _read_bounded. Back to -r and a plain redirect, a FIFO
+# .cleat hangs the launch fingerprint, and each other reader, on its own.
+cat > "$SED_TMP" << 'SED'
+/^_read_section_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_fingerprint_reader" "does not hang the launch fingerprint"
+
+cat > "$SED_TMP" << 'SED'
+/^_cleat_section_present()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 1$@  [[ -r "$file" ]] || return 1@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_section_present" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_caps_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_caps" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_setup_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_setup" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_section_all_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_section_all" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_warn_unknown_cleat_sections()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_unknown_sections" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_parse_env_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_env" "reader opens a FIFO"
+
+# The time bound on each branch of _read_bounded. Without it a FIFO swapped in
+# after the -f check blocks the open for good.
+cat > "$SED_TMP" << 'SED'
+/^_read_bounded()/,/^}$/{
+  s@_run_bounded "[$]_BOX_FILE_READ_SECS" head @head @
+}
+SED
+try "v154_boxread_head_timed" "swapped for a FIFO after its check is read under a time bound"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_bounded()/,/^}$/{
+  s@_run_bounded "[$]_BOX_FILE_READ_SECS" tail @tail @
+}
+SED
+try "v154_boxread_tail_timed" "hook spool swapped for a FIFO before the window read"
+
+# The [setup] script is read bounded and refused past 1 MiB. `cat` blocks on a
+# FIFO swapped in after the checks, and without the size check the script is
+# cut at the read bound instead of refused.
+cat > "$SED_TMP" << 'SED'
+/^_build_setup_payload()/,/^}$/{
+  s@^        _read_bounded "[$]full" "[$]_BOX_FILE_READ_MAX"$@        cat "$full"@
+}
+SED
+try "v154_boxread_setup_script" "setup script swapped for a FIFO after its checks"
+
+cat > "$SED_TMP" << 'SED'
+/^_build_setup_payload()/,/^}$/{
+  s@-gt "[$]_BOX_FILE_READ_MAX" \]; then@-lt 0 ]; then@
+}
+SED
+try "v154_boxread_setup_size_cap" "setup script over 1 MiB is refused"
+
+# The hook bridge sizes its spool with a stat, in the loop and for its start
+# offset, and _path_size never opens what it sizes. Any of them opening the
+# spool blocks on a FIFO the box swapped in.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^    file_size="[$](_path_size "[$]hooks_file")"$@    file_size=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)@
+}
+SED
+try "v154_boxread_spool_loop_size" "hook bridge sizes its spool without opening it"
+
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^  byte_offset="[$](_path_size "[$]hooks_file")"$@  byte_offset=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)@
+}
+SED
+try "v154_boxread_spool_entry_size" "hook bridge sizes its spool without opening it"
+
+# The bridge starts at the spool's current end, so a prior session's events
+# never run again. The v0.6.0 test grepped for `wc -c` and drives the bridge
+# now that the start offset is a stat.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^  byte_offset="[$](_path_size "[$]hooks_file")"$@  byte_offset=0@
+}
+SED
+try "v0.6.0_bridge_start_offset" "hook bridge skips pre-existing events at startup"
+
+cat > "$SED_TMP" << 'SED'
+/^_path_size()/,/^}$/{
+  s@^  z="[$](stat -L -c %s .*$@  z="$(wc -c < "$1" 2>/dev/null || echo "")"@
+}
+SED
+try "v154_boxread_path_size_no_open" "hook bridge sizes its spool without opening it"
+
+# And reads each window bounded. An unbounded tail wedges the bridge on a FIFO
+# swapped in between the size read and the open.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@done < <(_read_bounded "[$]hooks_file" "[$]_count" "[$]_start")@done < <(tail -c +"$_start" "$hooks_file" 2>/dev/null | head -c "$_count")@
+}
+SED
+try "v154_boxread_hook_window" "hook spool swapped for a FIFO before the window read"
+
+# The four session-end reports read their log bounded. Back to a plain tail,
+# each blocks on a FIFO swapped in after its check.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_explain_fork_exhaustion()/,/^}$/{
+  s@^  _read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep -q@  tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep -q@
+}
+SED
+try "v154_boxread_log_fork_bounded" "session-end reports do not hang on a log swapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_opens()/,/^}$/{
+  s@lines="[$](_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep @lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep @
+}
+SED
+try "v154_boxread_log_capped_bounded" "session-end reports do not hang on a log swapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_nobind_opens()/,/^}$/{
+  s@lines="[$](_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep @lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep @
+}
+SED
+try "v154_boxread_log_nobind_bounded" "session-end reports do not hang on a log swapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@lines="[$](_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep @lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep @
+}
+SED
+try "v154_boxread_log_blocked_bounded" "session-end reports do not hang on a log swapped"
+
+# And none follows a link planted as its log. Each report alone: the refusal
+# report calls the other two first, and they stay silent through the link.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_explain_fork_exhaustion()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_fork_nolink" "session-end reports never follow a link"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_opens()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_capped_nolink" "session-end reports never follow a link"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_nobind_opens()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_nobind_nolink" "session-end reports never follow a link"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_blocked_nolink" "session-end reports never follow a link"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

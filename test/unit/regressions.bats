@@ -171,31 +171,29 @@ EOF
 # Fix: _hook_bridge_watcher reads the file's current byte size at startup and
 # only tails bytes that appear AFTER that offset.
 #
-# This test verifies the fix structurally (the function body must initialize
-# byte_offset from wc -c BEFORE the tail loop). A behavioral test requires
-# launching a real subshell of the watcher and observing subprocess spawns,
-# which is too fragile for unit testing. End-to-end coverage is in the
-# integration suite.
+# This test used to grep the function body for `byte_offset=... wc -c`. The
+# start offset became a stat in v1.5.4 (a `wc -c <` opened a FIFO the box
+# swapped in), so it now drives the bridge instead: two events from a prior
+# session, one after the start, and only the new one reaches a hook.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.0: hook bridge skips pre-existing events at startup" {
-  local body
-  body="$(declare -f _hook_bridge_watcher)"
-  [[ -n "$body" ]] || { echo "REGRESSION: _hook_bridge_watcher missing"; return 1; }
-
-  # The function must initialize byte_offset with wc -c BEFORE entering its
-  # tail loop. Anything else means we'd start at 0 and replay old events.
-  echo "$body" | grep -qE 'byte_offset=.*wc -c' || {
-    echo "REGRESSION: _hook_bridge_watcher must initialize byte_offset from wc -c"
-    return 1
-  }
-
-  # Verify wc -c appears BEFORE the `while true` loop
-  local before_loop
-  before_loop="${body%%while true*}"
-  echo "$before_loop" | grep -qE 'byte_offset=' || {
-    echo "REGRESSION: byte_offset must be initialized before the tail loop"
-    return 1
-  }
+  local spool="$TEST_TEMP/hooks-v060/events.jsonl" processed="$TEST_TEMP/processed-v060" bpid i
+  mkdir -p "${spool%/*}"
+  echo '{"hook_event_name":"Stop","_cleat_ts":"old1"}' > "$spool"
+  echo '{"hook_event_name":"Stop","_cleat_ts":"old2"}' >> "$spool"
+  _execute_host_hook_bg() { echo "$1" >> "$processed"; }
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" >/dev/null 2>&1 3>&- &
+  bpid=$!
+  sleep 0.5
+  echo '{"hook_event_name":"Stop","_cleat_ts":"new1"}' >> "$spool"
+  i=0
+  while ! grep -q new1 "$processed" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run grep -c new1 "$processed"
+  assert_output "1"
+  run grep -c old "$processed"
+  assert_output "0"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7125,4 +7123,282 @@ _mount_targets_fixture() {
   run _maybe_report_hook_drops "$CLEAT_STATE_DIR/hook-drops.log" 5000 box-a
   assert_success
   assert_output --partial "Dropped"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: host readers of names the box can write. .cleat, .cleat.env, a [setup]
+# script, the hook spool and the session-end logs all sit in a mount the box
+# writes. A FIFO there blocks open(2) until something writes to it, a link to
+# /dev/zero never reaches EOF, and the box can swap either in after a check.
+# Sizes now come from a stat and content from _read_bounded.
+#
+# Helpers. _rd_start runs a command in the background in a process group of
+# its own. _rd_wait_pid waits for it to end, and after the deadline kills the
+# whole group (a subshell stuck on a FIFO or spinning on /dev/zero included),
+# hands the FIFO a writer and leaves a regular file at its name. Nothing a
+# reverted fix left blocked may outlive the test, because it would hold bats'
+# descriptors and hang the file. _rd_swap_on_open puts stand-ins for head,
+# tail and cat on PATH. The first one handed <target> as its last argument
+# swaps that name for a FIFO and then execs the real tool, which is the instant
+# between Cleat's check and its open, made deterministic. It records that it
+# fired, so a reader that never reached the tools cannot pass by reading
+# nothing.
+_rd_start() {
+  set -m
+  "$@" </dev/null >"$TEST_TEMP/rd.out" 2>&1 3>&- &
+  _RD_PID=$!
+  set +m
+}
+
+_rd_wait_pid() {
+  local secs="$1" pid="$2" fifo="${3:-}" i=0 n st
+  n=$(( secs * 10 ))
+  while [ "$i" -lt "$n" ]; do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    st="$(_proc_state "$pid")"
+    case "$st" in Z*) wait "$pid" 2>/dev/null; return 0 ;; esac
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  kill -9 -- "-$pid" 2>/dev/null || true
+  kill -9 "$pid" 2>/dev/null || true
+  if [ -n "$fifo" ] && [ -p "$fifo" ]; then
+    exec 4<>"$fifo"
+    rm -f "$fifo"
+    : > "$fifo"
+    exec 4>&-
+  fi
+  wait "$pid" 2>/dev/null || true
+  return 1
+}
+
+_rd_finishes_within() {
+  local secs="$1" fifo="$2"
+  shift 2
+  _rd_start "$@"
+  _rd_wait_pid "$secs" "$_RD_PID" "$fifo"
+}
+
+_rd_swap_on_open() {
+  local target="$1" d t real
+  [ -n "${_RD_ORIG_PATH:-}" ] || _RD_ORIG_PATH="$PATH"
+  d="$(mktemp -d "$TEST_TEMP/swap.XXXXXX")"
+  for t in head tail cat; do
+    real="$(PATH="$_RD_ORIG_PATH"; command -v "$t")"
+    cat > "$d/$t" <<EOF
+#!/bin/sh
+for a in "\$@"; do last="\$a"; done
+if [ "\$last" = "$target" ] && mkdir "$d/fired" 2>/dev/null; then
+  rm -f "$target"
+  mkfifo "$target"
+fi
+exec "$real" "\$@"
+EOF
+    chmod +x "$d/$t"
+  done
+  PATH="$d:$_RD_ORIG_PATH"
+  _RD_SWAP_DIR="$d"
+}
+
+# A FIFO .cleat reached the launch fingerprint, which reads [resources] with no
+# -f gate and no trust check, and hung every launch of the project until
+# Ctrl-C. No race needed. A link to /dev/zero spun instead.
+@test "regression v1.5.4: a FIFO or device .cleat does not hang the launch fingerprint" {
+  local p="$TEST_TEMP/fp-proj" want
+  mkdir -p "$p"
+  ACTIVE_CAPS=()
+  _RESOLVED_ENV_ARGS=()
+  want="$(compute_config_fingerprint "$p")"
+  mkfifo "$p/.cleat"
+  _rd_finishes_within 5 "$p/.cleat" compute_config_fingerprint "$p" \
+    || fail "the launch fingerprint blocked on a FIFO .cleat"
+  run cat "$TEST_TEMP/rd.out"
+  assert_output "$want"
+  rm -f "$p/.cleat"
+  ln -s /dev/zero "$p/.cleat"
+  _rd_finishes_within 5 "" compute_config_fingerprint "$p" \
+    || fail "the launch fingerprint never finished reading a .cleat linked to /dev/zero"
+  run cat "$TEST_TEMP/rd.out"
+  assert_output "$want"
+}
+
+# The other .cleat and .cleat.env readers had the same -r-only gate.
+@test "regression v1.5.4: no .cleat reader opens a FIFO" {
+  local p="$TEST_TEMP/fifo-proj"
+  mkdir -p "$p"
+  mkfifo "$p/.cleat" "$p/.cleat.env"
+  _rd_finishes_within 3 "$p/.cleat" _cleat_section_present "$p/.cleat" caps \
+    || fail "_cleat_section_present opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _read_caps_from_file "$p/.cleat" \
+    || fail "_read_caps_from_file opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _read_setup_from_file "$p/.cleat" \
+    || fail "_read_setup_from_file opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _read_section_all_from_file "$p/.cleat" fork exclude \
+    || fail "_read_section_all_from_file opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _warn_unknown_cleat_sections "$p/.cleat" project \
+    || fail "_warn_unknown_cleat_sections opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat.env" _parse_env_file "$p/.cleat.env" \
+    || fail "_parse_env_file opened the FIFO"
+}
+
+# A regular .cleat passes the gate, and the box swaps a FIFO in before the read.
+@test "regression v1.5.4: a .cleat swapped for a FIFO after its check is read under a time bound" {
+  local p="$TEST_TEMP/swap-proj"
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  _BOX_FILE_READ_SECS=1
+  _rd_swap_on_open "$p/.cleat"
+  _rd_finishes_within 8 "$p/.cleat" _read_caps_from_file "$p/.cleat" \
+    || fail "the read of a .cleat swapped for a FIFO was not bounded"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
+
+# The script passed -f, -L and the containment checks, then `cat` opened
+# whatever the box had put at the name by then.
+@test "regression v1.5.4: a setup script swapped for a FIFO after its checks does not hang the payload" {
+  local p="$TEST_TEMP/setup-proj"
+  mkdir -p "$p"
+  printf '[setup]\nscript provision.sh\n' > "$p/.cleat"
+  printf 'echo provisioned\n' > "$p/provision.sh"
+  _BOX_FILE_READ_SECS=1
+  _rd_swap_on_open "$p/provision.sh"
+  _rd_finishes_within 8 "$p/provision.sh" _build_setup_payload "$p" main \
+    || fail "the setup payload blocked on a script swapped for a FIFO"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
+
+# Refused whole, before a byte of it is read, rather than cut at the read bound.
+@test "regression v1.5.4: a setup script over 1 MiB is refused before it is read" {
+  local p="$TEST_TEMP/big-proj"
+  mkdir -p "$p"
+  printf '[setup]\nscript big.sh\n' > "$p/.cleat"
+  head -c 1048577 /dev/zero | tr '\0' '#' > "$p/big.sh"
+  run _build_setup_payload "$p" main
+  assert_failure
+  assert_output --partial "larger than 1 MiB"
+  refute_output --partial "# cleat setup: begin script"
+}
+
+# The bridge sized the spool with `wc -c <`, which opens it. A FIFO swapped in
+# blocked that open, and bash holds the session-end TERM while a command
+# substitution waits, so the bridge outlived its session. The loop's size read
+# now comes before its shape check, so this swap needs no race. The start offset
+# is read after the start pass, which stands in for a swap won there.
+@test "regression v1.5.4: the hook bridge sizes its spool without opening it" {
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _rd_start _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a"
+  bpid=$_RD_PID
+  sleep 1.2
+  rm -f "$spool"
+  mkfifo "$spool"
+  _rd_wait_pid 4 "$bpid" "$spool" || fail "the bridge opened a FIFO swapped in for its spool"
+  run test -p "$spool"
+  assert_failure
+  : > "$spool"
+  _hook_spool_cap() { rm -f "$1"; mkfifo "$1"; return 1; }
+  _rd_start _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a"
+  bpid=$_RD_PID
+  _rd_wait_pid 4 "$bpid" "$spool" || fail "the bridge opened the spool to size its start offset"
+  run test -p "$spool"
+  assert_failure
+}
+
+# And the window read, a tail from the offset. The spool starts with one line
+# from a prior session, so the window starts past byte 1 and the tail branch
+# of the bounded read is the one that opens.
+@test "regression v1.5.4: a hook spool swapped for a FIFO before the window read does not wedge the bridge" {
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid
+  mkdir -p "${spool%/*}"
+  printf '{"hook_event_name":"Stop"}\n' > "$spool"
+  _BOX_FILE_READ_SECS=1
+  # Before the bridge starts, which takes PATH with it.
+  _rd_swap_on_open "$spool"
+  _rd_start _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a"
+  bpid=$_RD_PID
+  sleep 1.2
+  printf '{"hook_event_name":"Stop"}\n' >> "$spool"
+  _rd_wait_pid 8 "$bpid" "$spool" || fail "the bridge wedged on a spool swapped for a FIFO before its read"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  run test -p "$spool"
+  assert_failure
+}
+
+# The session-end reports read .watcher-log and .proxy-log in the clip dir the
+# box mounts read-write. `[ -f ]` follows a link, so a link there made them read
+# a host file. Only a yes or no or a count came of it, but it is never Cleat's.
+@test "regression v1.5.4: session-end reports never follow a link planted as their log" {
+  local clip="$TEST_TEMP/clip-links" host="$TEST_TEMP/host-log"
+  mkdir -p "$clip"
+  {
+    echo "bash: fork: retry: Resource temporarily unavailable"
+    echo "[browser-watcher 12:00:00] ${_BROWSER_BLOCKED_MARK} origin=blocked.example url=https://blocked.example/a"
+    echo "[browser-watcher 12:00:00] ${_BROWSER_CAPPED_MARK} limit=${_BROWSER_RATE_PER_MIN}/min,${_BROWSER_RATE_PER_SESSION}/session url=https://capped.example/b"
+    echo "[browser-watcher 12:00:00] ${_BROWSER_NOBIND_MARK} deferring URL to terminal (callback port unavailable) url=https://nobind.example/c"
+  } > "$host"
+  # The same lines as regular logs are reported, so the lines match.
+  cp "$host" "$clip/.watcher-log"
+  cp "$host" "$clip/.proxy-log"
+  run _maybe_explain_fork_exhaustion "$clip/.watcher-log" 0
+  assert_output --partial "process slots"
+  run _maybe_report_blocked_opens "$clip/.proxy-log" 0
+  assert_output --partial "blocked.example"
+  assert_output --partial "capped.example"
+  assert_output --partial "nobind.example"
+  rm -f "$clip/.watcher-log" "$clip/.proxy-log"
+  ln -s "$host" "$clip/.watcher-log"
+  ln -s "$host" "$clip/.proxy-log"
+  run _maybe_explain_fork_exhaustion "$clip/.watcher-log" 0
+  assert_success
+  assert_output ""
+  run _maybe_report_capped_opens "$clip/.proxy-log" 0
+  assert_success
+  assert_output ""
+  run _maybe_report_nobind_opens "$clip/.proxy-log" 0
+  assert_success
+  assert_output ""
+  run _maybe_report_blocked_opens "$clip/.proxy-log" 0
+  assert_success
+  assert_output ""
+}
+
+# And a FIFO swapped in after that check blocked the report's tail, which runs
+# at session end after the box has had the whole session to set it up.
+@test "regression v1.5.4: session-end reports do not hang on a log swapped for a FIFO after the check" {
+  local clip="$TEST_TEMP/clip-swap"
+  mkdir -p "$clip"
+  _BOX_FILE_READ_SECS=1
+  # From the start of the log, the head branch.
+  echo "prior" > "$clip/.watcher-log"
+  _rd_swap_on_open "$clip/.watcher-log"
+  _rd_finishes_within 6 "$clip/.watcher-log" _maybe_explain_fork_exhaustion "$clip/.watcher-log" 0 \
+    || fail "the fork report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  # From past a prior session's line, the tail branch.
+  rm -f "$clip/.proxy-log"; echo "prior" > "$clip/.proxy-log"; echo "now" >> "$clip/.proxy-log"
+  _rd_swap_on_open "$clip/.proxy-log"
+  _rd_finishes_within 6 "$clip/.proxy-log" _maybe_report_capped_opens "$clip/.proxy-log" 6 \
+    || fail "the rate cap report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  rm -f "$clip/.proxy-log"; echo "prior" > "$clip/.proxy-log"; echo "now" >> "$clip/.proxy-log"
+  _rd_swap_on_open "$clip/.proxy-log"
+  _rd_finishes_within 6 "$clip/.proxy-log" _maybe_report_nobind_opens "$clip/.proxy-log" 6 \
+    || fail "the busy callback port report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  # The refusal report's own read, with the two reports it calls first quiet.
+  rm -f "$clip/.proxy-log"; echo "prior" > "$clip/.proxy-log"; echo "now" >> "$clip/.proxy-log"
+  _maybe_report_capped_opens() { :; }
+  _maybe_report_nobind_opens() { :; }
+  _rd_swap_on_open "$clip/.proxy-log"
+  _rd_finishes_within 6 "$clip/.proxy-log" _maybe_report_blocked_opens "$clip/.proxy-log" 6 \
+    || fail "the refusal report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
 }

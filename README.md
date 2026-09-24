@@ -932,7 +932,9 @@ A `script <path>` line inlines a project-relative script file at that position
 instead of writing commands inline. List as many `script` directives as you
 like, mixed with inline commands, in any order. Copy-paste examples live in
 [`examples/setup/`](examples/setup): `dotnet` (inline commands), `python` (one
-script file) and `rust` (two script files).
+script file) and `rust` (two script files). A script must live inside the
+project, must not be a symlink and must be at most 1 MiB. One that breaks any of
+these is refused and setup is skipped for that run.
 
 Setup trust is separate from capability trust. `CLEAT_TRUST_SETUP=1` (or
 `--trust-setup`) approves it non-interactively, `cleat trust` approves both
@@ -1048,6 +1050,10 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
 One project, one `.cleat`. Boxes scope their caps, resources, setup and fork
 excludes into `[box.<name>.<kind>]` sections of that file. Env vars are the
 exception and keep their own sidecar.
+
+A project's `.cleat` and env files count only when they are regular files. A
+FIFO, a socket or a link to a device at either name reads as absent, so a box
+cannot hang a launch by planting one there.
 
 ---
 

@@ -273,6 +273,20 @@ _th_record_setup() {
   refute_output --partial "from-main"
 }
 
+@test "build_setup_payload: a script of exactly 1 MiB is inlined whole" {
+  # The boundary of the size refusal and of the read bound: 1 MiB is allowed
+  # and every byte of it reaches the payload.
+  head -c 1048576 /dev/zero | tr '\0' '#' > "$PROJECT/exact.sh"
+  printf '[setup]\nscript exact.sh\n' > "$PROJECT/.cleat"
+  local rc=0
+  _build_setup_payload "$PROJECT" main > "$TEST_TEMP/payload" 2>&1 || rc=$?
+  run echo "$rc"
+  assert_output "0"
+  local begin="# cleat setup: begin script exact.sh" end="# cleat setup: end script exact.sh"
+  run _path_size "$TEST_TEMP/payload"
+  assert_output "$(( ${#begin} + 1 + 1048576 + 1 + ${#end} + 1 ))"
+}
+
 @test "setup_payload_hash: stable for an identical payload, changes on any inline edit" {
   local h1 h2 h3
   h1="$(_setup_payload_hash "echo one")"

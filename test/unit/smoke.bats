@@ -1200,6 +1200,19 @@ CURL
   assert_output --partial "caps memory at"
 }
 
+@test "smoke: cleat config --project --list returns when the project .cleat is a FIFO" {
+  # The box can put a FIFO at /workspace/.cleat. Every reader opened it and
+  # blocked until something wrote to it. Now it reads as absent, under the real
+  # binary's strict mode.
+  mkdir -p "$TEST_TEMP/fifo-project"
+  mkfifo "$TEST_TEMP/fifo-project/.cleat"
+  cd "$TEST_TEMP/fifo-project"
+  run cleat_bin_timeout 20 config --project --list
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Resources"
+}
+
 @test "smoke: cleat config --cpus above the core count exits cleanly" {
   run cleat_bin config --cpus 512
   assert_success

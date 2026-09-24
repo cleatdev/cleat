@@ -2095,16 +2095,24 @@ _seed_macos_credentials() {
 # substitution. `local out="$(f)"` reports local's status, not f's, so an
 # rc-based declared/absent contract silently reads "declared" every time. Six
 # call sites in this file already use that idiom.
+#
+# The gate is `-f`, not `-r` alone, here and in every .cleat and .cleat.env
+# reader after it. The box can write /workspace/.cleat, and a FIFO or a link to
+# /dev/zero or /dev/tty passes `-r`. The launch fingerprint reads [resources]
+# with no `-f` and no trust check of its own, so a FIFO there hung every launch
+# of the project and a device link never ended. Such a file now reads as
+# absent. The read itself goes through _read_bounded, which bounds a FIFO the
+# box swaps in after the check.
 _cleat_section_present() {
   local file="$1" want="[$2]" line
-  [[ -r "$file" ]] || return 1
+  [[ -f "$file" && -r "$file" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     line="${line#$'\xef\xbb\xbf'}"
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ "$line" == "$want" ]] && return 0
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
   return 1
 }
 
@@ -2131,7 +2139,7 @@ _scoped_section() {
 # Callers that mean the global config (which has no boxes) pass nothing.
 _read_caps_from_file() {
   local file="$1" _box="${2:-}"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local _want; _want="[$(_scoped_section "$file" "$_box" caps)]"
   local in_caps=false
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (common in
@@ -2155,7 +2163,7 @@ _read_caps_from_file() {
     if $in_caps; then
       echo "$line"
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # Read [setup] provisioning lines from a config file. Exact structural
@@ -2166,7 +2174,7 @@ _read_caps_from_file() {
 # use `test`, and _warn_unknown_cleat_sections surfaces the mistake).
 _read_setup_from_file() {
   local file="$1" _box="${2:-}"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local _want; _want="[$(_scoped_section "$file" "$_box" setup)]"
   local in_setup=false
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -2182,7 +2190,7 @@ _read_setup_from_file() {
     if $in_setup; then
       echo "$line"
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # Write capabilities to a config file. Preserves non-[caps] sections.
@@ -2523,9 +2531,19 @@ _build_setup_payload() {
             warn "Project [setup] script escapes the project directory: ${BOLD}${path_disp}${RESET}" >&2
             return 1 ;;
         esac
+        # Refused whole rather than cut at the read bound below: a truncated
+        # script would run as something the user never wrote.
+        if [ "$(_path_size "$full")" -gt "$_BOX_FILE_READ_MAX" ]; then
+          warn "Project [setup] script is larger than 1 MiB: ${BOLD}${path_disp}${RESET}" >&2
+          return 1
+        fi
 
         echo "# cleat setup: begin script $path"
-        cat "$full"
+        # Bounded. The script sits in the box's workspace, so a FIFO swapped in
+        # after the checks above hung the launch on `cat`, and a link to
+        # /dev/zero grew host memory without end. A won race yields nothing, or
+        # at most the cap, and the payload hash then fails the approval match.
+        _read_bounded "$full" "$_BOX_FILE_READ_MAX"
         printf '\n'
         echo "# cleat setup: end script $path"
         ;;
@@ -2553,7 +2571,7 @@ _project_env_file() {
 # comment- and whitespace-tolerant. Prints the value, or nothing when absent.
 _read_section_from_file() {
   local file="$1" section="$2" key="$3"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local in_section=false line k v
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (a hand-edited
   # `.cleat` ending in `memory = 8g`) is still read; without it `read` returns
@@ -2579,7 +2597,7 @@ _read_section_from_file() {
       echo "$v"
       return 0
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # Back-compat wrapper: every existing [resources] call site keeps its shape.
@@ -4201,7 +4219,7 @@ _fork_preflight() {
 # `memory = 8g` and wrong for `exclude = node_modules` repeated N times.
 _read_section_all_from_file() {
   local file="$1" section="$2" key="$3"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local in_section=false line k v
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
@@ -4220,7 +4238,7 @@ _read_section_all_from_file() {
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
     [[ "$k" == "$key" && -n "$v" ]] && printf '%s\n' "$v"
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # cp flags, probed ONCE from the cp BINARY and never from `uname -s`. A macOS
@@ -4880,7 +4898,7 @@ _WARNED_UNSAFE_RM_FILES=""
 # as "wrong file" rather than "ignored".
 _warn_unknown_cleat_sections() {
   local file="$1" scope="$2"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   case "$_WARNED_SECTIONS_FILES" in
     *"|$file|"*) return 0 ;;
   esac
@@ -4945,7 +4963,7 @@ _warn_unknown_cleat_sections() {
         esac ;;
     esac
     warn "Unknown section [$(_sanitize_repo_str "$name")] in ${base} ${DIM}(ignored)${RESET}"
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
   return 0
 }
 
@@ -5046,7 +5064,7 @@ cap_is_active() {
 # Bare KEY entries are resolved from the host environment.
 _parse_env_file() {
   local file="$1"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip carriage return (CRLF from Windows editors)
     line="${line%$'\r'}"
@@ -5072,7 +5090,7 @@ _parse_env_file() {
         echo "${line}=${val}"
       fi
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # Resolve all env vars to pass to the container.
@@ -7597,6 +7615,36 @@ _browser_claim_url() {
   return 0
 }
 
+# The most _read_bounded reads, in bytes and in seconds. No real .cleat,
+# .cleat.env, [setup] script or session-end log window comes near either.
+_BOX_FILE_READ_MAX=1048576
+_BOX_FILE_READ_SECS=2
+
+# Print at most $2 bytes of the regular file $1, starting at byte $3 (1-based,
+# default 1), and never block doing it. For a name the box can write: a FIFO
+# there blocks open(2) until something writes to it, and a link to a device
+# like /dev/zero never reaches EOF.
+#
+# `[ -f ]` refuses both when they are already in place, without a fork. The box
+# can still swap one in after that check, so the read itself runs under
+# _run_bounded's time bound and head's byte bound, and a won race costs at most
+# the bound. It follows a link to a regular file, as the redirects it replaced
+# did. A caller that must not follow one tests `[ -L ]` first.
+#
+# Always rc 0. The binary runs under pipefail and errexit, so a producer killed
+# by the bound or by SIGPIPE (a `grep -q` or a `break` that stops reading early)
+# must never mask the reader's answer or abort the caller.
+_read_bounded() {
+  local f="$1" max="$2" from="${3:-1}"
+  [ -f "$f" ] || return 0
+  if [ "$from" -le 1 ]; then
+    _run_bounded "$_BOX_FILE_READ_SECS" head -c "$max" -- "$f" 2>/dev/null || true
+  else
+    _run_bounded "$_BOX_FILE_READ_SECS" tail -c "+$from" -- "$f" 2>/dev/null | head -c "$max" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # Byte size of what a path names, or 0 when it can't be read, WITHOUT opening
 # it. It follows a symlink, as `wc -c <` does, but a FIFO or a device reads as
 # 0 rather than blocking the caller on its open. GNU stat (-c) first, then
@@ -8257,10 +8305,9 @@ _hook_bridge_watcher() {
   # We track our byte offset to avoid wc -l / tail race conditions.
   # Start from the current end of the file to skip events from prior sessions.
   local byte_offset
-  # Braced so a missing spool's redirect error is silenced too: a claim removes
-  # the spool, and it stays missing until the box's next event.
-  byte_offset=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)
-  byte_offset=$((byte_offset + 0))
+  # Sized with a stat, never opened (see the loop below). A missing spool, which
+  # is what a claim leaves until the box's next event, reads as 0 in silence.
+  byte_offset="$(_path_size "$hooks_file")"
   # Set while the rest of an oversized line is being discarded. Kept across
   # passes, because one line can span two read windows.
   local _hb_skip=0
@@ -8268,6 +8315,14 @@ _hook_bridge_watcher() {
     # Liveness BEFORE processing: an orphaned bridge must not run one last
     # batch of host hooks for a session whose cleat process is already gone.
     kill -0 "$_hb_parent" 2>/dev/null || { _hook_bridge_cleanup; exit 0; }
+    # Sized before the shape check below and without opening the spool. stat
+    # answers a FIFO or a device with 0 at once. `wc -c <` opened it, so a FIFO
+    # the box swapped in after the check blocked the open, and bash holds the
+    # session-end TERM while a command substitution waits: the bridge outlived
+    # its session. Ahead of the check so that the check always sees whatever
+    # this pass sized.
+    local file_size
+    file_size="$(_path_size "$hooks_file")"
     # Re-checked every pass, not just at startup: the box can plant the link at
     # any moment, including between two polls of a live bridge.
     if [ -L "$hooks_file" ] || { [ -e "$hooks_file" ] && [ ! -f "$hooks_file" ]; }; then
@@ -8275,9 +8330,6 @@ _hook_bridge_watcher() {
       _hook_bridge_cleanup
       exit 0
     fi
-    local file_size
-    file_size=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)
-    file_size=$((file_size + 0))
 
     local _win _start _count
     # A spool that shrank starts over, and so does any discard in progress.
@@ -8330,7 +8382,12 @@ _hook_bridge_watcher() {
         # every box whose host settings file is absent or empty: the bridge
         # then died on its first forwarded event, on a Mac only.
         _execute_host_hook_bg "$_HOOK_EV_OUT" "$_HOOK_EV_DIR" "$_hb_ws" "${settings_files[@]+"${settings_files[@]}"}"
-      done < <(tail -c +"$_start" "$hooks_file" 2>/dev/null | head -c "$_count")
+      # Bounded in time as well as bytes. A FIFO the box swaps in between the
+      # size read and this open blocks for the bound at most, and the next pass
+      # sees it and drops it. A read cut short loses nothing: _hook_read_chunk
+      # refuses a partial last line, and the offset moves only past what was
+      # handled.
+      done < <(_read_bounded "$hooks_file" "$_count" "$_start")
 
       # Past the bytes CONSUMED as whole lines, not past everything the window
       # covered. The box appends with `cat >>`, so a poll can land between the
@@ -10613,8 +10670,13 @@ _cap_watcher_log() {
 
 _maybe_explain_fork_exhaustion() {
   local log="$1" off="${2:-0}"
-  [ -f "$log" ] || return 0
-  tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep -q "Resource temporarily unavailable" || return 0
+  # The log sits in the clip dir the box mounts read-write, and the box keeps
+  # running after the exec returns. A link there is never Cleat's (see
+  # _drop_unless_regular), so it is not followed. A FIFO or a device swapped in
+  # after this check costs the read bound, not a hang at session end. The three
+  # browser reports below read .proxy-log the same way.
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  _read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep -q "Resource temporarily unavailable" || return 0
   echo ""
   warn "${BOLD}Your machine ran low on process slots${RESET} during this session ${DIM}(a host limit, not the box)${RESET}."
   echo -e "    ${DIM}A large multi-agent run can spawn thousands of host processes and hit your per-user cap.${RESET}"
@@ -10690,8 +10752,8 @@ _maybe_report_account_harvest_refused() {
 # because the URL is the only way to finish that login by hand.
 _maybe_report_nobind_opens() {
   local log="$1" off="${2:-0}" lines n=0 l url shown=0
-  [ -f "$log" ] || return 0
-  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_NOBIND_MARK} " 2>/dev/null)" || return 0
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  lines="$(_read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_NOBIND_MARK} " 2>/dev/null)" || return 0
   [ -n "$lines" ] || return 0
   n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
   n="$(printf '%s' "$n" | tr -d '[:space:]')"
@@ -10719,12 +10781,12 @@ EOF
 
 _maybe_report_blocked_opens() {
   local log="$1" off="${2:-0}" lines n=0 l rest origin url shown=0
-  [ -f "$log" ] || return 0
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
   # A capped open is another refusal the bridge makes, and it is reported from
   # here so every caller of this report gets all three.
   _maybe_report_capped_opens "$log" "$off"
   _maybe_report_nobind_opens "$log" "$off"
-  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_BLOCKED_MARK} origin=[^ ]* url=" 2>/dev/null)" || return 0
+  lines="$(_read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_BLOCKED_MARK} origin=[^ ]* url=" 2>/dev/null)" || return 0
   [ -n "$lines" ] || return 0
   n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
   n="$(printf '%s' "$n" | tr -d '[:space:]')"
@@ -10775,8 +10837,8 @@ EOF
 # "/session url=", which the anchor pins inside the watcher's own prefix.
 _maybe_report_capped_opens() {
   local log="$1" off="${2:-0}" lines n=0 l url shown=0
-  [ -f "$log" ] || return 0
-  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_CAPPED_MARK} limit=[0-9]*/min,[0-9]*/session url=" 2>/dev/null)" || return 0
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  lines="$(_read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_CAPPED_MARK} limit=[0-9]*/min,[0-9]*/session url=" 2>/dev/null)" || return 0
   [ -n "$lines" ] || return 0
   n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
   n="$(printf '%s' "$n" | tr -d '[:space:]')"

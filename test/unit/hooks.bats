@@ -3166,6 +3166,70 @@ _host_hook_appends() {
   assert_output --partial "/var/log/cleat/events.jsonl"
 }
 
+# ── project settings read once, never through a link ────────────────────
+@test "run: a project settings file over 1 MB is not copied or mounted" {
+  # The box picks the file's size, and a sparse one costs it nothing, so the
+  # host copy of it into the run dir is bounded.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  head -c 1048577 /dev/zero | tr '\0' ' ' > "$TEST_TEMP/project/.claude/settings.json"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is larger than 1 MB, so Cleat did not read it."
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+  [ ! -e "$CLEAT_RUN_DIR/$cname/settings/project-settings.json" ] || {
+    echo "an overlay was written for the oversized file"; return 1; }
+}
+
+@test "resume: a FIFO at a project settings path neither blocks the refresh nor reaches the box" {
+  # The refresh has no -f pre-filter of its own. A FIFO the box planted there
+  # blocked jq's open, and with it the resume, until something wrote to it.
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  local cname="c2-fifo" dir fifo pid i=0
+  dir="$CLEAT_RUN_DIR/$cname/settings"
+  mkdir -p "$dir" "$TEST_TEMP/project/.claude"
+  printf '{}\n' > "$dir/settings.json"
+  printf '{"old":1}\n' > "$dir/project-settings.json"
+  fifo="$TEST_TEMP/project/.claude/settings.json"
+  mkfifo "$fifo"
+  ACTIVE_CAPS=(hooks)
+  ( _refresh_settings_overlays "$cname" "$TEST_TEMP/project" ) 3>&- >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    # Release the blocked reader so bats does not hang, then fail.
+    : > "$fifo" &
+    wait "$pid" 2>/dev/null || true
+    echo "the refresh blocked on the FIFO"; return 1
+  fi
+  wait "$pid" 2>/dev/null || true
+  run cat "$dir/project-settings.json"
+  assert_output "{}"
+}
+
+@test "run: a jq-less host never copies a linked project settings file" {
+  # With no jq, a file with no hooks text and no \u escape passes through
+  # verbatim. Through a link that was any host file of that shape.
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf 'aws_secret_access_key = FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/credentials"
+  ln -s "$TEST_TEMP/outside/credentials" "$TEST_TEMP/project/.claude/settings.local.json"
+  _hide_jq
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is a link or unreadable"
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.local.json"
+  assert_success
+  run grep -rl FAKE-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+}
+
 @test "hook bridge: a second terminal on the same box does not start a second bridge" {
   # Both bridges tail the same spool, so every host hook ran twice per event:
   # a hook that writes, commits or notifies did it twice, silently.

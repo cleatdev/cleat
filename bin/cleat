@@ -12607,12 +12607,30 @@ cmd_run() {
   # target lives inside the copy, and a copy without .claude would fail the
   # mount on macOS VirtioFS with an opaque "create mountpoint" error.
   if [[ -d "$_workspace/.claude" ]]; then
-    local pf
+    local pf _pf_snap _pf_rc
     for pf in "$_workspace/.claude/settings.json" "$_workspace/.claude/settings.local.json"; do
       [[ -f "$pf" ]] || continue
       local _base _overlay_name
       _base="$(basename "$pf")"
       _overlay_name="project-$_base"
+      # Every arm below reads a host-only snapshot, never the workspace path.
+      # The workspace is the box's to write, and `[[ -f ]]`, cp, jq and grep all
+      # follow a link, so a link at either file or at .claude had the host copy
+      # any file the user can read into an overlay mounted into the box. A
+      # refused file gets no overlay and no mount, as a missing one does.
+      _pf_snap="$settings_overlay_dir/.in.$$.$_base"
+      _pf_rc=0
+      _project_settings_snapshot "$_workspace" "$_base" "$_pf_snap" || _pf_rc=$?
+      if [[ $_pf_rc -ne 0 ]]; then
+        if [[ $_pf_rc -eq 2 ]]; then
+          warn "Project ${BOLD}.claude/${_base}${RESET} is larger than 1 MB, so Cleat did not read it."
+        else
+          warn "Project ${BOLD}.claude/${_base}${RESET} is a link or unreadable, so Cleat did not read it."
+        fi
+        echo -e "    ${DIM}Cleat reads project settings only from a regular file of at most 1 MB inside the project. The box sees this one as it is, with no hooks stripped or forwarded.${RESET}"
+        continue
+      fi
+      pf="$_pf_snap"
       # No jq on the host means we can neither rewrite the hook commands into the
       # forwarder nor strip them, and BOTH arms below used to fall through to a
       # verbatim `cp`. That mounted the user's real host hook commands into the
@@ -12661,6 +12679,7 @@ cmd_run() {
           cp "$pf" "$settings_overlay_dir/$_overlay_name"
         fi
       fi
+      rm -f "$_pf_snap" 2>/dev/null || true
       mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
     done
   fi
@@ -12894,6 +12913,55 @@ _ensure_host_mount_targets() {
   fi
 }
 
+# No project settings file needs a megabyte. The cap bounds what one read can
+# copy into the run dir: the box can grow the file, or make it sparse, at will.
+_PROJECT_SETTINGS_MAX_BYTES=1048576
+
+# ONE read of the project settings file BASE in WS/.claude, into DST, a path in
+# the host-only settings dir. rc 0 with DST written. 1 when the file is missing,
+# not a regular file, a link or inside a linked .claude. 2 when it is over the
+# cap. DST is gone on any failure.
+#
+# The workspace is mounted read-write, so every name under it is the box's. A
+# link planted at either settings file, or at .claude itself, had the host copy
+# any file the user can read into an overlay mounted into the box. No cap was
+# needed: a cloned repo that ships the link is enough.
+#
+# So .claude is pinned first. Its inode is read without following a link, then
+# the subshell changes into it and compares that with the directory it landed
+# in. A link has an inode of its own, so a link there, or one swapped in between
+# the two steps, fails the compare. From then on the file is named relative to
+# the pinned directory, where a later swap of .claude reaches nothing. The file
+# goes through _read_unlinked_bounded: one open, the descriptor proven to be the
+# regular file at that name, and a FIFO swapped in after the -f test bounded in
+# time. A file swapped during that read reads as empty, never as another file.
+#
+# The redirect to DST is made before the subshell changes directory, so a
+# relative run dir can never land the snapshot inside the pinned .claude.
+_project_settings_snapshot() {
+  local ws="$1" base="$2" dst="$3" _rc=0
+  rm -f "$dst" 2>/dev/null || true
+  ( _d="$(ls -di "$ws/.claude" 2>/dev/null | awk '{print $1}')"
+    CDPATH='' cd -P "$ws/.claude" >/dev/null 2>&1 || exit 1
+    _c="$(ls -di . 2>/dev/null | awk '{print $1}')"
+    case "$_d" in ''|*[!0-9]*) exit 1 ;; esac
+    [[ "$_c" == "$_d" ]] || exit 1
+    [[ -f "./$base" && ! -L "./$base" ]] || exit 1
+    _read_unlinked_bounded "./$base" "$(( _PROJECT_SETTINGS_MAX_BYTES + 1 ))"
+  ) 2>/dev/null >"$dst" || _rc=$?
+  # Not `if ! ( ... ) >"$dst"`: when that redirect fails, bash skips the `!`
+  # and the refusal branch with it.
+  if [[ $_rc -ne 0 ]]; then
+    rm -f "$dst" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "$(_path_size "$dst")" -gt "$_PROJECT_SETTINGS_MAX_BYTES" ]]; then
+    rm -f "$dst" 2>/dev/null || true
+    return 2
+  fi
+  return 0
+}
+
 # Refresh the settings overlays from the host files (the user may have changed
 # hooks between sessions) and re-inject or drop the unsafe-rm hook to match the
 # caps resolved for THIS launch. cmd_resume and cmd_start both call it: only
@@ -12939,13 +13007,22 @@ _refresh_settings_overlays() {
         _inject_unsafe_rm_hook "$settings_overlay_dir/settings.json"
       fi
     fi
-    # Project-level settings overlays (only when .claude/ exists)
-    if cap_is_active hooks && [[ -d "$project/.claude" ]]; then
-      local pf
-      for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+    # Project-level settings overlays (only when .claude/ exists). From the tree
+    # cmd_run built them from: a fork box's own copy, never the live project.
+    local _pws="$project"
+    if _box_is_fork "$cname"; then _pws="$(_fork_dir "$cname")"; fi
+    if cap_is_active hooks && [[ -d "$_pws/.claude" ]]; then
+      local pf _pf_snap
+      for pf in "$_pws/.claude/settings.json" "$_pws/.claude/settings.local.json"; do
         local _base _overlay_name
         _base="$(basename "$pf")"
         _overlay_name="project-$_base"
+        # One guarded read, as on the create path. A file that is missing,
+        # linked, not regular or over the cap leaves no snapshot and lands in
+        # the '{}' arm below.
+        _pf_snap="$settings_overlay_dir/.in.$$.$_base"
+        _project_settings_snapshot "$_pws" "$_base" "$_pf_snap" || true
+        pf="$_pf_snap"
         if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
           jq '
             if .hooks then
@@ -12961,6 +13038,7 @@ _refresh_settings_overlays() {
         else
           echo '{}' > "$settings_overlay_dir/$_overlay_name"
         fi
+        rm -f "$_pf_snap" 2>/dev/null || true
       done
     fi
   fi

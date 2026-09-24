@@ -7764,3 +7764,109 @@ EOF
   run cat "$proj/.cleat"
   assert_output --partial "ssh"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the project settings overlays were built with `[[ -f ]]` and a plain
+# cp, jq or grep, and all of them follow a link. The workspace is the box's to
+# write, so a link at .claude/settings.json, .claude/settings.local.json or
+# .claude itself had the host copy any file the user can read into an overlay
+# mounted into the box. No cap was needed: a cloned repo shipping the link was
+# enough. Every arm fell back to a verbatim copy for a non-JSON target.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.4: a project settings file linked out of the workspace is never copied into the box" {
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf 'FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/id_rsa"
+  ln -s "$TEST_TEMP/outside/id_rsa" "$TEST_TEMP/project/.claude/settings.json"
+  printf '{"permissions":{"allow":["Read"]}}\n' > "$TEST_TEMP/project/.claude/settings.local.json"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --regexp 'settings\.json[^ ]{0,8} is a link or unreadable, so Cleat did not read it\.'
+  refute_output --regexp 'settings\.local\.json[^ ]{0,8} is a link'
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+  run assert_docker_run_has "$cname" "/workspace/.claude/settings.local.json"
+  assert_success
+  run grep -rl FAKE-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+  run cat "$CLEAT_RUN_DIR/$cname/settings/project-settings.local.json"
+  assert_output --partial '"Read"'
+  run find "$CLEAT_RUN_DIR/$cname/settings" -name '.in.*'
+  assert_output ""
+}
+
+@test "regression v1.5.4: a linked .claude directory is never read for project settings" {
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/hostclaude"
+  # Valid JSON with no hooks: the plain copy arm.
+  printf '{"env":{"TOKEN":"FAKE-HOST-SECRET"}}\n' > "$TEST_TEMP/hostclaude/settings.json"
+  ln -s "$TEST_TEMP/hostclaude" "$TEST_TEMP/project/.claude"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is a link or unreadable, so Cleat did not read it."
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+  run grep -rl FAKE-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+}
+
+# The file passes the -f and -L checks. The box swaps in a link before the
+# open. The time bound's argv builder runs in that gap.
+@test "regression v1.5.4: a project settings file swapped for a link before its open is not copied" {
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside" "$TEST_TEMP/snaps"
+  printf 'FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/id_rsa"
+  printf '{"model":"opus"}\n' > "$TEST_TEMP/project/.claude/settings.json"
+  _R154_SWAP_F="$TEST_TEMP/project/.claude/settings.json"
+  _R154_SWAP_T="$TEST_TEMP/outside/id_rsa"
+  eval "_r154_real_bounded_argv() $(declare -f _bounded_argv | sed 1d)"
+  _bounded_argv() { rm -f "$_R154_SWAP_F"; ln -s "$_R154_SWAP_T" "$_R154_SWAP_F"; _r154_real_bounded_argv "$@"; }
+  _project_settings_snapshot "$TEST_TEMP/project" settings.json "$TEST_TEMP/snaps/s" || true
+  [ -L "$_R154_SWAP_F" ] || { echo "the swap never ran"; return 1; }
+  run grep -rl FAKE-HOST-SECRET "$TEST_TEMP/snaps"
+  assert_failure
+}
+
+@test "regression v1.5.4: the hooks refresh writes empty settings for a linked project file, never its target" {
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf 'PLANTED-HOST-SECRET\n' > "$TEST_TEMP/outside/secret"
+  local cname="c2-refresh-link" dir
+  dir="$CLEAT_RUN_DIR/$cname/settings"
+  mkdir -p "$dir"
+  # As a mounted overlay would be: the box plants the link beside it.
+  printf '{}\n' > "$dir/settings.json"
+  printf '{"old":1}\n' > "$dir/project-settings.json"
+  ln -s "$TEST_TEMP/outside/secret" "$TEST_TEMP/project/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run _refresh_settings_overlays "$cname" "$TEST_TEMP/project"
+  run cat "$dir/project-settings.json"
+  assert_output "{}"
+  run grep -rl PLANTED-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+}
+
+# cmd_run builds a fork box's overlays from its own copy since v1.4.0, but the
+# refresh at every start, resume and `cleat claude` still read the live tree.
+@test "regression v1.5.4: a fork box's settings refresh reads its own copy, not the origin tree" {
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  local cname="c2-refresh-fork" dir fork
+  dir="$CLEAT_RUN_DIR/$cname/settings"
+  mkdir -p "$dir" "$TEST_TEMP/project/.claude"
+  printf '{}\n' > "$dir/settings.json"
+  printf '{"old":1}\n' > "$dir/project-settings.json"
+  _fork_mark "$cname"
+  fork="$(_fork_dir "$cname")"
+  mkdir -p "$fork/.claude"
+  printf '{"permissions":{"allow":["FORK"]}}\n' > "$fork/.claude/settings.json"
+  printf '{"permissions":{"allow":["LIVE"]}}\n' > "$TEST_TEMP/project/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run _refresh_settings_overlays "$cname" "$TEST_TEMP/project"
+  run jq -r '.permissions.allow[0]' "$dir/project-settings.json"
+  assert_output "FORK"
+}

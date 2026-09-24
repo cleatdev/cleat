@@ -285,10 +285,13 @@ SED
 try "v0.5.1_hook_replace" "hook overlay replaces command with forwarder"
 
 # v0.6.0 + v0.6.5: both guards must hold. Break BOTH the -d dir check and
-# the -f file skip so the overlay is mounted even when neither exists.
+# the -f file skip so the overlay is mounted even when neither exists. Since
+# v1.5.4 the one-read snapshot refuses a missing file too, so its refusal is
+# broken as well.
 cat > "$SED_TMP" << 'SED'
 s|if \[\[ -d "\$_workspace/.claude" \]\]; then|if true; then|
 /\[\[ -f "\$pf" \]\] || continue/d
+/_project_settings_snapshot "[$]_workspace"/,/^      pf="[$]_pf_snap"$/s@^        continue$@        :@
 SED
 try "v0.6.0_claude_guard" "skip project overlay when .claude/ missing"
 
@@ -374,9 +377,11 @@ s|-\\\\,ignoreeof|-|g
 SED
 try "v0.6.4_ignoreeof" "forwards TCP6 first with ignoreeof"
 
-# v0.6.5: cmd_run must skip overlay mount when host file doesn't exist
+# v0.6.5: cmd_run must skip overlay mount when host file doesn't exist. The
+# one-read snapshot's refusal goes too (see v0.6.0_claude_guard).
 cat > "$SED_TMP" << 'SED'
 /\[\[ -f "\$pf" \]\] || continue/d
+/_project_settings_snapshot "[$]_workspace"/,/^      pf="[$]_pf_snap"$/s@^        continue$@        :@
 SED
 try "v0.6.5_skip_missing" "cmd_run skips overlay mount for missing"
 
@@ -12418,6 +12423,86 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_c3_generate_stops" "a refused project save or generate" "$CLI" "$CONFIG_BATS"
+# v1.5.4: the project settings overlays were built by a cp, jq or grep that
+# follows a link, so a link at either settings file or at .claude copied any
+# host file the user can read into an overlay mounted into the box. Every arm
+# reads the workspace path again when the snapshot is skipped.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^      _project_settings_snapshot "[$]_workspace" "[$]_base" "[$]_pf_snap" || _pf_rc=[$]?$@      :@
+  s@^      pf="[$]_pf_snap"$@      :@
+}
+SED
+try "v154_settings_link_create" "linked out of the workspace is never copied"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^      _project_settings_snapshot "[$]_workspace" "[$]_base" "[$]_pf_snap" || _pf_rc=[$]?$@      :@
+  s@^      pf="[$]_pf_snap"$@      :@
+}
+SED
+try "v154_settings_link_create_jqless" "jq-less host never copies a linked project settings file" "$CLI" "$HOOKS_BATS"
+
+# .claude is not pinned: the inode compare between the name and the directory
+# the subshell landed in is gone, so a linked .claude is read through.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@^    \[\[ "[$]_c" == "[$]_d" \]\] || exit 1$@    :@
+}
+SED
+try "v154_settings_dir_pin" "directory is never read for project settings"
+
+# The name's inode is read through the link, so it is the target's and the
+# compare passes.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@ls -di "[$]ws/.claude"@ls -Ldi "$ws/.claude"@
+}
+SED
+try "v154_settings_dir_lstat" "directory is never read for project settings"
+
+# The file is read by a plain bounded read, which follows a link swapped in
+# after the checks.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@_read_unlinked_bounded "[.]/[$]base"@_read_bounded "./$base"@
+}
+SED
+try "v154_settings_swap_open" "project settings file swapped for a link before its open"
+
+# The hooks refresh reads the workspace path again.
+cat > "$SED_TMP" << 'SED'
+/^_refresh_settings_overlays()/,/^}$/{
+  s@^        _project_settings_snapshot "[$]_pws" "[$]_base" "[$]_pf_snap" || true$@        :@
+  s@^        pf="[$]_pf_snap"$@        :@
+}
+SED
+try "v154_settings_link_refresh" "hooks refresh writes empty settings for a linked project file"
+
+# A fork box's refresh reads the live tree, not its own copy.
+cat > "$SED_TMP" << 'SED'
+/^_refresh_settings_overlays()/,/^}$/{
+  s@^    if _box_is_fork "[$]cname"; then _pws="[$](_fork_dir "[$]cname")"; fi$@    :@
+}
+SED
+try "v154_settings_refresh_fork" "settings refresh reads its own copy"
+
+# No size bound on the copy.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@^  if \[\[ "[$](_path_size "[$]dst")" -gt "[$]_PROJECT_SETTINGS_MAX_BYTES" \]\]; then$@  if false; then@
+}
+SED
+try "v154_settings_size_cap" "over 1 MB is not copied" "$CLI" "$HOOKS_BATS"
+
+# No regular-file check before the read.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@^    \[\[ -f "[.]/[$]base" && ! -L "[.]/[$]base" \]\] || exit 1$@    :@
+}
+SED
+try "v154_settings_precheck_fifo" "FIFO at a project settings path" "$CLI" "$HOOKS_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

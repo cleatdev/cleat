@@ -1531,6 +1531,25 @@ CURL
   assert_output --partial "~/.claude/.config.json"
 }
 
+@test "smoke: cleat start with a linked project settings file warns and starts under strict mode" {
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  printf 'FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/secret"
+  ln -s "$TEST_TEMP/outside/secret" "$TEST_TEMP/project/.claude/settings.json"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 start
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  assert_output --partial "is a link or unreadable"
+  run grep -c ':/workspace/.claude/settings.json' "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -rl FAKE-HOST-SECRET "$XDG_CONFIG_HOME/cleat/run"
+  assert_failure
+}
+
 @test "smoke: cleat start fails cleanly when docker run errors" {
   mkdir -p "$TEST_TEMP/project"
   printf '' > "$DOCKER_MOCK_DIR/ps_output"

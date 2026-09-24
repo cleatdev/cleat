@@ -1140,7 +1140,7 @@ cleat --cap hooks start        # enable for one session
 ### How it works
 
 1. Cleat creates a settings overlay that replaces hook commands with an event forwarder inside the container
-2. Project settings files that exist when the box is created get an overlay too, so their hooks do not run in the container either
+2. Project settings files that exist when the box is created get an overlay too, so their hooks do not run in the container either. Cleat reads each one once and only from a regular file of at most 1 MB inside the project. A link, a file inside a linked `.claude` or a larger file gets no overlay and a warning at start. A fork box's overlays are refreshed from its own copy
 3. A host-side bridge reads forwarded events, looks the event up in `~/.claude/settings.json` and runs the matching commands on the host
 4. Before anything runs, the event is validated and its path fields are rewritten from `/workspace/...` to your real project path (the fork's copy for a fork box). A path has to land inside the project on disk, symlinks included. An event that fails a check is dropped and logged to `~/.config/cleat/state/hook-drops.log`. When the session ends it tells you how many were dropped. Every event handed to your hooks gets a row in `hook-runs.log` beside it
 5. Event JSON is piped to stdin and matchers are respected. The hook runs in the event's working directory, translated the same way. Each command is bounded per event (15s for PreToolUse and PostToolUse, 120s for Stop and SubagentStop, 30s for UserPromptSubmit and anything else), through `timeout`, `gtimeout` or `perl`. A host with none of the three runs it unbounded

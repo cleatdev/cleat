@@ -2173,11 +2173,51 @@ EOF
     cat "$DOCKER_CALLS"
     return 1
   }
-  grep -qF -- "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
-    echo "History overlay source doesn't match project key"
+  # The source is the host-only store, keyed by the project, never a name
+  # inside the session dir the box mounts read-write.
+  grep -qF -- "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
+    echo "History overlay source is not the project's host-only store"
     cat "$DOCKER_CALLS"
     return 1
   }
+  [ -f "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl" ] || {
+    echo "The history store was not created"
+    return 1
+  }
+}
+
+@test "smoke: cleat start recreates a box whose history bind is in its session dir" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname _bn _h project_key s
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
+  project_key="${_bn}-${_h}"
+  s="$HOME/.claude/projects/$project_key"
+  mkdir -p "$s" "$CLEAT_CONFIG_DIR/run/$cname/settings"
+  echo '{}' > "$CLEAT_CONFIG_DIR/run/$cname/settings/settings.json"
+  printf '{"display":"old-line"}\n' > "$s/history.jsonl"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  printf 'H%s\nS%s\n' "$s/history.jsonl" "$s" > "$DOCKER_MOCK_DIR/inspect_output"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 start
+  refute_output --partial "unbound variable"
+  assert_output --partial "Recreating container"
+  grep -qF -- "docker rm -f $cname" "$DOCKER_CALLS" || {
+    echo "The legacy box was not removed"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  grep -qF -- "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
+    echo "The recreated box does not mount the host-only store"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  run cat "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl"
+  assert_output '{"display":"old-line"}'
 }
 
 # ── Config drift and version label ──────────────────────────────────────────

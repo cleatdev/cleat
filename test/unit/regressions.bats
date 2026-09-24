@@ -1170,8 +1170,9 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 # v0.8.0: Per-project history isolation. The base ~/.claude mount shares
 # history.jsonl across all containers, so arrow-up in Claude shows commands
-# from other projects. Fix: overlay history.jsonl with a per-project copy
-# from the same session directory used for projects/-workspace.
+# from other projects. Fix: overlay history.jsonl with a per-project copy,
+# keyed like the session directory used for projects/-workspace. (Since v1.5.4
+# the copy lives in the host-only CLEAT_HISTORY_DIR, not inside that directory.)
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.8.0: history.jsonl overlay isolates per-project history" {
   mock_docker_images "cleat"
@@ -1186,7 +1187,7 @@ EOF
   run assert_docker_run_has "$cname" "history.jsonl:/home/coder/.claude/history.jsonl"
   assert_success
 
-  # The source must be inside the per-project session dir (not the global one)
+  # The source must be keyed by this project (not the global one)
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
   _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
@@ -7869,4 +7870,198 @@ EOF
   run _refresh_settings_overlays "$cname" "$TEST_TEMP/project"
   run jq -r '.permissions.allow[0]' "$dir/project-settings.json"
   assert_output "FORK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the per-project input history was bind-mounted from
+# ~/.claude/projects/<key>/history.jsonl, a name inside the session dir that
+# every box of the project mounts read-write. The box could swap it for a
+# relative link (from there ../../../ is $HOME, no host path needed), and the
+# next recreate or start followed it: cmd_run's bare touch re-stamped the file
+# the link named or created the file a dangling one named, and the bind then
+# mounted that host file read-write into the box. The store is host-only now,
+# and a box created before the move is recreated once on its next start or
+# resume, because only a recreate changes a recorded bind source.
+# ─────────────────────────────────────────────────────────────────────────────
+_h154_fixture() {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  H154_CN="$(container_name_for "$TEST_TEMP/project")"
+  H154_KEY="$(_derive_project_session_key "$TEST_TEMP/project")"
+  H154_S="$HOME/.claude/projects/$H154_KEY"
+  H154_STORE="$CLEAT_HISTORY_DIR/$H154_KEY/history.jsonl"
+  mkdir -p "$H154_S"
+}
+
+# A stopped box created before the store: its recorded history source is the
+# name inside its recorded session-dir source.
+_h154_legacy_box() {
+  _h154_fixture
+  export DOCKER_STUB_STRICT=1
+  mkdir -p "$CLEAT_RUN_DIR/$H154_CN/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/$H154_CN/settings/settings.json"
+  printf '{"display":"old-line"}\n' > "$H154_S/history.jsonl"
+  is_running() { return 1; }
+  mock_docker_ps_a "$H154_CN"
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$H154_S/history.jsonl" "$H154_S")"
+}
+
+# The H and S inspect lines for the box the last recorded `docker run` of $1
+# created, so a restart is judged on the mounts cmd_run really passed.
+_h154_inspect_from_run() {
+  local line tok prev="" src rest dst out=""
+  line="$(grep "^docker run " "$DOCKER_CALLS" | grep -- "$1" | tail -1)"
+  set -f
+  for tok in $line; do
+    if [ "$prev" = "-v" ]; then
+      src="${tok%%:*}"
+      rest="${tok#*:}"
+      dst="${rest%%:*}"
+      case "$dst" in
+        /home/coder/.claude/history.jsonl) out="${out}H${src}"$'\n' ;;
+        /home/coder/.claude/projects/-workspace) out="${out}S${src}"$'\n' ;;
+      esac
+    fi
+    prev="$tok"
+  done
+  set +f
+  printf '%s' "$out"
+}
+
+@test "regression v1.5.4: the history bind source is host-only, not in the session dir" {
+  _h154_fixture
+  export DOCKER_STUB_STRICT=1
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+  run assert_docker_run_lacks "$H154_CN" "$H154_S/history.jsonl:"
+  assert_success
+  [ -f "$H154_STORE" ] && [ ! -L "$H154_STORE" ] || { echo "the store is not a regular file"; return 1; }
+  [ ! -e "$H154_S/history.jsonl" ] || { echo "cmd_run wrote a history file in the session dir"; return 1; }
+}
+
+@test "regression v1.5.4: a history link planted in the session dir is never followed" {
+  _h154_fixture
+  printf 'SECRET\n' > "$HOME/secret"
+  touch -t 200001010000 "$HOME/secret"
+  local before
+  before="$(_path_mtime "$HOME/secret")"
+  ln -s ../../../secret "$H154_S/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run cat "$HOME/secret"
+  assert_output "SECRET"
+  run _path_mtime "$HOME/secret"
+  assert_output "$before"
+  [ -f "$H154_STORE" ] && [ ! -L "$H154_STORE" ] || { echo "the store is not a regular file"; return 1; }
+  run grep -c SECRET "$H154_STORE"
+  assert_output "0"
+  [ ! -e "$H154_S/history.jsonl" ] && [ ! -L "$H154_S/history.jsonl" ] \
+    || { echo "the planted link is still in the session dir"; return 1; }
+}
+
+@test "regression v1.5.4: a dangling history link in the session dir creates no host file" {
+  _h154_fixture
+  ln -s ../../../created-by-cleat "$H154_S/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ ! -e "$HOME/created-by-cleat" ] || { echo "cmd_run created the file the link named"; return 1; }
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+}
+
+@test "regression v1.5.4: cmd_start recreates a box whose history bind is in its session dir" {
+  _h154_legacy_box
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  assert_output --partial "host paths changed"
+  run docker_calls
+  assert_output --partial "docker rm -f $H154_CN"
+  refute_output --partial "docker start $H154_CN"
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+  # The recreate carried the box's history over, and left no name behind.
+  run cat "$H154_STORE"
+  assert_output '{"display":"old-line"}'
+  [ ! -e "$H154_S/history.jsonl" ] || { echo "the old history file is still in the session dir"; return 1; }
+}
+
+@test "regression v1.5.4: cmd_resume recreates a box whose history bind is in its session dir" {
+  _h154_legacy_box
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  assert_output --partial "host paths changed"
+  run docker_calls
+  assert_output --partial "docker rm -f $H154_CN"
+  refute_output --partial "docker start $H154_CN"
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+  run cat "$H154_STORE"
+  assert_output '{"display":"old-line"}'
+}
+
+# The recreate must happen once. The second start is judged on the mounts the
+# first one's cmd_run really recorded, through both verbs.
+@test "regression v1.5.4: a box on the host-only history store restarts without a recreate" {
+  _h154_legacy_box
+  run cmd_start "$TEST_TEMP/project"
+  assert_output --partial "Recreating container"
+  run _h154_inspect_from_run "$H154_CN"
+  assert_line "H$H154_STORE"
+  assert_line "S$H154_S"
+  mock_docker_inspect "$(_h154_inspect_from_run "$H154_CN")"
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Recreating"
+  run docker_calls
+  assert_output --partial "docker start $H154_CN"
+  refute_output --partial "docker rm -f $H154_CN"
+  : > "$DOCKER_CALLS"
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Recreating"
+  run docker_calls
+  assert_output --partial "docker start $H154_CN"
+  refute_output --partial "docker rm -f $H154_CN"
+}
+
+# ~/.claude/history.jsonl is the nested bind TARGET, pre-created for VirtioFS.
+# `touch` on it followed a link there, like the source's touch did.
+@test "regression v1.5.4: the nested history target is never touched through a link" {
+  _h154_fixture
+  printf 'SECRET\n' > "$HOME/secret"
+  touch -t 200001010000 "$HOME/secret"
+  local before
+  before="$(_path_mtime "$HOME/secret")"
+  ln -s ../secret "$HOME/.claude/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run _path_mtime "$HOME/secret"
+  assert_output "$before"
+  _container_has_kit_mounts() { return 1; }
+  run _ensure_host_mount_targets "$H154_CN"
+  assert_success
+  run _path_mtime "$HOME/secret"
+  assert_output "$before"
+  run cat "$HOME/secret"
+  assert_output "SECRET"
+  # A dangling link there never becomes a new host file.
+  rm -f "$HOME/.claude/history.jsonl"
+  ln -s ../made-by-cleat "$HOME/.claude/history.jsonl"
+  run _ensure_host_mount_targets "$H154_CN"
+  [ ! -e "$HOME/made-by-cleat" ] || { echo "the start created the file the link named"; return 1; }
+  # With nothing there, both paths still create the target VirtioFS needs.
+  rm -f "$HOME/.claude/history.jsonl"
+  run _ensure_host_mount_targets "$H154_CN"
+  [ -f "$HOME/.claude/history.jsonl" ] && [ ! -L "$HOME/.claude/history.jsonl" ] \
+    || { echo "the start did not create the target"; return 1; }
+  rm -f "$HOME/.claude/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -f "$HOME/.claude/history.jsonl" ] && [ ! -L "$HOME/.claude/history.jsonl" ] \
+    || { echo "cmd_run did not create the target"; return 1; }
 }

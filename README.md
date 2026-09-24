@@ -481,6 +481,15 @@ before these masks existed prints a recreate note on every start with the
 command for that box: `cleat rm && cleat` for the default box,
 `cleat rm <box> && cleat start <box>` for a named one.
 
+Arrow-up prompt history is per project too. It lives in
+`~/.config/cleat/history/<key>/`, outside every folder a box can see, so a box
+can add lines to it but can never swap the file for a link to one of yours. A
+history file an older release kept in the session folder is carried over once.
+A box created before this move is recreated once, with no prompt, the next time
+Cleat starts or resumes it: its old history mount cannot be changed any other
+way. The recreate keeps conversations, logins and trust, then runs `[setup]`
+again. Anything you installed inside the box outside `[setup]` is gone.
+
 ### Accounts: two Claude logins, one command to switch
 
 A Claude Max account has a five-hour window. With two of them the only way to move between them is `/login`, in a browser, both directions, every time one runs out. `cleat account` gives each login a name and pins a box to one of them.
@@ -555,7 +564,7 @@ Deleting moves the conversation to a trash in `~/.config/cleat/session-trash/`, 
 
 Restoring resolves the id against the trash, so the short id the delete printed is the one that works. It never overwrites a conversation that has come back under the same name.
 
-Only a real session id is ever touched. That directory also holds this project's Claude memory and Cleat's own prompt history. Nothing in `cleat session` can reach them.
+Only a real session id is ever touched. That directory also holds this project's Claude memory. Nothing in `cleat session` can reach it.
 
 Listing works with Docker down, which is usually when you want it.
 

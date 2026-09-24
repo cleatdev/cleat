@@ -210,7 +210,8 @@ _with_build_context() {
   run assert_docker_run_has "$cname" "history.jsonl:/home/coder/.claude/history.jsonl"
   assert_success
 
-  # The history mount source must be inside the project session dir (same hash key)
+  # The history mount source must be keyed by the project (same hash key as the
+  # session dir, in the host-only store)
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
   _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
@@ -219,6 +220,133 @@ _with_build_context() {
   assert_success
 
   rm -rf "$CLEAT_RUN_DIR/${cname}/settings" "$CLEAT_RUN_DIR/${cname}/hooks"
+}
+
+# ── Input history store (host-only, see CLEAT_HISTORY_DIR) ──────────────────
+_hist_fixture() {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  HKEY="$(_derive_project_session_key "$TEST_TEMP/project")"
+  HS="$HOME/.claude/projects/$HKEY"
+  HSTORE="$CLEAT_HISTORY_DIR/$HKEY/history.jsonl"
+  mkdir -p "$HS"
+}
+
+@test "run: carries a session-dir history.jsonl into the host-only store once" {
+  _hist_fixture
+  printf 'old-line\n' > "$HS/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run cat "$HSTORE"
+  assert_output "old-line"
+  [ ! -e "$HS/history.jsonl" ] || { echo "the old file was copied, not moved"; return 1; }
+  # History typed since, then a name the box wrote in its session dir. The
+  # next create keeps the store and never looks at that name again.
+  printf 'new-line\n' >> "$HSTORE"
+  printf 'box-wrote\n' > "$HS/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run cat "$HSTORE"
+  assert_output "$(printf 'old-line\nnew-line')"
+  run cat "$HS/history.jsonl"
+  assert_output "box-wrote"
+}
+
+@test "run: a directory or a link at the history store path is replaced by a fresh file" {
+  _hist_fixture
+  mkdir -p "$HSTORE/inner"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -f "$HSTORE" ] && [ ! -L "$HSTORE" ] || { echo "a directory at the store path survived"; return 1; }
+  rm -f "$HSTORE"
+  printf 'SECRET\n' > "$HOME/secret"
+  touch -t 200001010000 "$HOME/secret"
+  local before
+  before="$(_path_mtime "$HOME/secret")"
+  ln -s "$HOME/secret" "$HSTORE"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -f "$HSTORE" ] && [ ! -L "$HSTORE" ] || { echo "a link at the store path survived"; return 1; }
+  run cat "$HOME/secret"
+  assert_output "SECRET"
+  run _path_mtime "$HOME/secret"
+  assert_output "$before"
+}
+
+# An absolute link survives the rename into the store dir still pointing at
+# its target, so only the shape check there stops it being imported. A FIFO is
+# renamed, never opened: the time bound turns a regression into a failure
+# rather than a hang.
+@test "run: a link, directory or FIFO at the legacy history path is never imported" {
+  _hist_fixture
+  printf 'SECRET\n' > "$HOME/secret"
+  ln -s "$HOME/secret" "$HS/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -f "$HSTORE" ] && [ ! -L "$HSTORE" ] && [ ! -s "$HSTORE" ] \
+    || { echo "the store is not an empty regular file"; return 1; }
+  run cat "$HOME/secret"
+  assert_output "SECRET"
+  rm -f "$HSTORE"
+  mkdir -p "$HS/history.jsonl/inner"
+  : > "$HS/history.jsonl/inner/x"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -f "$HSTORE" ] && [ ! -s "$HSTORE" ] || { echo "the store is not an empty regular file"; return 1; }
+  [ ! -e "$HS/history.jsonl" ] || { echo "the planted directory is still in the session dir"; return 1; }
+  run ls -A "$CLEAT_HISTORY_DIR/$HKEY"
+  assert_output "history.jsonl"
+  rm -f "$HSTORE"
+  mkfifo "$HS/history.jsonl"
+  local stripped="$TEST_TEMP/cli_stripped_hist"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$stripped"
+  run _portable_timeout 10 bash -c "source '$stripped'; _project_history_store '$HKEY'"
+  assert_success
+  assert_output "$HSTORE"
+  [ -f "$HSTORE" ] && [ ! -s "$HSTORE" ] || { echo "the store is not an empty regular file"; return 1; }
+  [ ! -e "$HS/history.jsonl" ] || { echo "the FIFO is still in the session dir"; return 1; }
+}
+
+@test "run: the history store directory is private" {
+  _hist_fixture
+  # A directory an earlier umask left open is tightened too.
+  mkdir -p "$CLEAT_HISTORY_DIR/$HKEY"
+  chmod 755 "$CLEAT_HISTORY_DIR" "$CLEAT_HISTORY_DIR/$HKEY"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run bash -c "ls -ld '$CLEAT_HISTORY_DIR/$HKEY' | cut -c1-10"
+  assert_output "drwx------"
+  run bash -c "ls -ld '$CLEAT_HISTORY_DIR' | cut -c1-10"
+  assert_output "drwx------"
+  rm -rf "$CLEAT_HISTORY_DIR"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run bash -c "ls -ld '$CLEAT_HISTORY_DIR/$HKEY' | cut -c1-10"
+  assert_output "drwx------"
+}
+
+@test "run: the history store refuses a key that is not one path segment" {
+  local k
+  for k in "" "." ".." "a/b" "../x"; do
+    run _project_history_store "$k"
+    assert_failure
+    assert_output ""
+  done
+  [ ! -e "$CLEAT_HISTORY_DIR/history.jsonl" ] && [ ! -e "$CLEAT_CONFIG_DIR/history.jsonl" ] \
+    || { echo "a bad key wrote outside a per-key directory"; return 1; }
+}
+
+@test "run: stops with a clear error when the history store cannot be created" {
+  _hist_fixture
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  : > "$CLEAT_HISTORY_DIR"
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Could not create this project's input history file"
+  run docker_run_calls
+  refute_output --partial "$cname"
 }
 
 @test "run: different projects get different session overlay sources" {

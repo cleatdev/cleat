@@ -278,6 +278,73 @@ teardown() { _common_teardown; }
   assert_success
 }
 
+# ── _history_bind_in_session_dir (boxes created before the history store) ─────
+# A box whose recorded input history source sits inside its recorded session-dir
+# source mounts a name the box can replace, so the start recreates it once.
+
+@test "history bind: legacy when its source sits inside the session-dir source" {
+  local s="$HOME/.claude/projects/proj-12345678"
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$s/history.jsonl" "$s")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_success
+}
+
+@test "history bind: not legacy for the host-only store" {
+  local s="$HOME/.claude/projects/proj-12345678"
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$CLEAT_HISTORY_DIR/proj-12345678/history.jsonl" "$s")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+}
+
+@test "history bind: not legacy with no history mount, an empty inspect or bind|src blob lines" {
+  local s="$HOME/.claude/projects/proj-12345678"
+  mock_docker_inspect "$(printf 'S%s\n' "$s")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+  mock_docker_inspect "$(printf 'H%s\n' "$s/history.jsonl")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+  mock_docker_inspect ""
+  run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+  # The sibling checks' line shape never reads as a history or session line.
+  mock_docker_inspect "$(printf 'bind|%s\nbind|%s\n' "$s/history.jsonl" "$s")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+  # An unreadable inspect fails open, like the siblings.
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$s/history.jsonl" "$s")"
+  DOCKER_EXIT_CODE=1 run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+}
+
+@test "history bind: paths holding | spaces and glob characters compare literally" {
+  local s="$TEST_TEMP/a b|c"
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$s/history.jsonl" "$s")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_success
+  # As patterns these session sources would match; as paths they do not.
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$TEST_TEMP/pX/history.jsonl" "$TEST_TEMP/p*")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$TEST_TEMP/p1/history.jsonl" "$TEST_TEMP/p[1]")"
+  run _history_bind_in_session_dir "cleat-x"
+  assert_failure
+}
+
+# Docker auto-creates a deleted file bind source as a directory, as for the
+# per-project claude.json. The start must recreate rather than hit OCI.
+@test "overlay intact: a directory at the history store source forces a recreate" {
+  mkdir -p "$CLEAT_RUN_DIR/cleat-x/settings"
+  mkdir -p "$CLEAT_HISTORY_DIR/proj-12345678/history.jsonl"
+  mock_docker_inspect "$CLEAT_HISTORY_DIR/proj-12345678/history.jsonl"
+  run _settings_overlay_intact "cleat-x"
+  assert_failure
+  rm -rf "$CLEAT_HISTORY_DIR/proj-12345678/history.jsonl"
+  : > "$CLEAT_HISTORY_DIR/proj-12345678/history.jsonl"
+  run _settings_overlay_intact "cleat-x"
+  assert_success
+}
+
 @test "no arguments to main defaults to start" {
   mock_docker_images "cleat"
   run bash -c '

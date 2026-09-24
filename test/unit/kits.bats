@@ -1752,7 +1752,9 @@ ssh"
 #   (a) the host's ~/.claude is mounted exactly once, at /home/coder/.claude
 #   (b) every writable target under /home/coder/.claude is on the allowlist
 #   (c) every writable source inside the host's ~/.claude is this project's own
-#       session dir or its history file
+#       session dir. The input history source is host-only, outside ~/.claude,
+#       because a file bound from inside a writable mount is a name the box can
+#       swap for a link
 _claude_home_mount_audit() {
   local cname="$1" extra="${2:-}"
   local line tok prev="" spec rest src dst opt rel roots=0
@@ -1781,7 +1783,7 @@ _claude_home_mount_audit() {
             case "$allow" in *" $rel "*) ;; *) echo "writable target outside the allowlist: $rel" ;; esac ;;
         esac
         case "$src" in
-          "$HOME/.claude/projects/$key"|"$HOME/.claude/projects/$key/history.jsonl") ;;
+          "$HOME/.claude/projects/$key") ;;
           "$HOME/.claude/"*) echo "writable source inside the host ~/.claude: ${src#$HOME/}" ;;
         esac
       fi

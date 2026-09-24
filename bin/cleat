@@ -126,6 +126,16 @@ _SESSIONS_PAGE_LINES=10
 # persist. One file per project: $CLEAT_PROJECTS_DIR/<project_session_key>/claude.json
 CLEAT_PROJECTS_DIR="$CLEAT_CONFIG_DIR/projects"
 
+# Per-project input (arrow-up) history, bind-mounted read-write at
+# ~/.claude/history.jsonl in the box: $CLEAT_HISTORY_DIR/<key>/history.jsonl.
+# Host-only, because a bind source is re-resolved by name on every start. It
+# used to sit in ~/.claude/projects/<key>, the session dir every box of the
+# project mounts read-write, so the box could swap the name for a link and the
+# next start mounted whatever host file the link named. Not $CLEAT_PROJECTS_DIR,
+# which `cleat nuke` wipes while it has always left input history alone, and not
+# the run dir, which every recreate wipes.
+CLEAT_HISTORY_DIR="$CLEAT_CONFIG_DIR/history"
+
 # Known capabilities (order matters for display).
 # Three behavioral categories. See _cap_category for the mapping:
 #   mount   git, ssh, env, hooks, gh   auth/identity bind-mounts (no install)
@@ -5747,11 +5757,11 @@ _settings_overlay_intact() {
   while IFS= read -r src; do
     [[ -z "$src" ]] && continue
     case "$src" in
-      "$overlay_dir"/* | "$CLEAT_PROJECTS_DIR"/*)
-        # Overlay files and the persistent per-project .claude.json are bind
-        # sources mounted onto file destinations. If one was deleted, Docker
-        # would auto-create it as a directory and the start would fail with an
-        # opaque OCI error; recreate instead.
+      "$overlay_dir"/* | "$CLEAT_PROJECTS_DIR"/* | "$CLEAT_HISTORY_DIR"/*)
+        # Overlay files, the persistent per-project .claude.json and the input
+        # history store are bind sources mounted onto file destinations. If one
+        # was deleted, Docker would auto-create it as a directory and the start
+        # would fail with an opaque OCI error; recreate instead.
         [[ -f "$src" ]] || return 1
         ;;
     esac
@@ -5790,6 +5800,35 @@ _container_bind_sources_present() {
     [[ -e "$src" ]] || return 1
   done <<< "$mounts"
   return 0
+}
+
+# Return success when the box's input history bind source sits inside its
+# session-dir bind source: the layout every box created before the host-only
+# store has baked in. The session dir is mounted read-write, so there the
+# history file is an ordinary name the box can replace with a link, and
+# `docker start` re-resolves that name. A recorded bind source only changes on
+# a recreate, so the caller recreates. It compares the two RECORDED sources
+# with each other rather than rebuilding a host path from HOME and the key, so
+# a translated source form on any engine still compares consistently, and the
+# `eq` filter keeps a `|` or a space in another mount's path out of the parse.
+# Unreadable inspect or either mount missing → not legacy (1), like the
+# siblings above: the start path that follows surfaces any real error.
+_history_bind_in_session_dir() {
+  local cname="$1"
+  local out line
+  local hist=""
+  local sess=""
+  out="$(docker inspect "$cname" --format '{{range .Mounts}}{{if eq .Destination "/home/coder/.claude/history.jsonl"}}H{{.Source}}{{"\n"}}{{end}}{{if eq .Destination "/home/coder/.claude/projects/-workspace"}}S{{.Source}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)" || return 1
+  [[ -n "$out" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      H?*) hist="${line#H}" ;;
+      S?*) sess="${line#S}" ;;
+    esac
+  done <<< "$out"
+  [[ -n "$hist" && -n "$sess" ]] || return 1
+  case "$hist" in "$sess"/*) return 0 ;; esac
+  return 1
 }
 
 # Build a per-project ~/.claude.json for the container, isolated from the shared
@@ -12311,6 +12350,52 @@ _inject_unsafe_rm_hook() {
   fi
 }
 
+# Create a missing file bind target, and never write through what is already
+# there. `touch` follows a link: it re-stamps the file a link names, or creates
+# the file a dangling one names. noclobber is O_EXCL, which refuses both.
+_ensure_file_target() {
+  [[ -e "$1" || -L "$1" ]] || ( set -C; : > "$1" ) 2>/dev/null || true
+}
+
+# Print the path of this project's input history store (see CLEAT_HISTORY_DIR),
+# creating it, or return 1. Called only from cmd_run, after this key's container
+# is gone. A history.jsonl left in the session dir by an older release is carried
+# over once, and that directory is the box's: any name in it may be a link, a
+# FIFO or a directory. So the old entry is renamed whole into the host-only dir,
+# which moves a link rather than following it and never opens a FIFO, and only
+# there, out of the box's reach, is it checked. Anything but a regular file is
+# dropped. The store is created with noclobber, never with touch. The directory
+# is 0700 because the file used to live under ~/.claude, and a default-umask
+# ~/.config would leave prompt history readable by other local users.
+_project_history_store() {
+  local key="$1"
+  # One path segment. Not _account_session_key_ok, which would refuse the
+  # non-ASCII legacy-locale keys _derive_project_session_key can still return.
+  case "$key" in ''|.|..|*/*) return 1 ;; esac
+  local dir="$CLEAT_HISTORY_DIR/$key"
+  local f="$dir/history.jsonl"
+  local old="${HOME}/.claude/projects/$key/history.jsonl"
+  local staged
+  mkdir -p "$CLEAT_CONFIG_DIR" 2>/dev/null || return 1
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null || return 1
+  chmod 700 "$CLEAT_HISTORY_DIR" "$dir" 2>/dev/null || true
+  _drop_unless_regular "$f"
+  if [[ ! -e "$f" ]] && [[ -e "$old" || -L "$old" ]]; then
+    staged="$dir/.import.$$.$RANDOM"
+    rm -rf "$staged" 2>/dev/null || true
+    if mv -f "$old" "$staged" 2>/dev/null; then
+      _drop_unless_regular "$staged"
+      if [[ -f "$staged" ]]; then
+        mv -f "$staged" "$f" 2>/dev/null || true
+      fi
+      rm -f "$staged" 2>/dev/null || true
+    fi
+  fi
+  ( set -C; : > "$f" ) 2>/dev/null || true
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  printf '%s' "$f"
+}
+
 cmd_run() {
   local project box
   project="$(resolve_project "${1:-}")"
@@ -12502,17 +12587,23 @@ cmd_run() {
   # so all containers write to ~/.claude/projects/-workspace/. We overlay
   # that path with a per-project directory so each container sees only its
   # own sessions. Input history (arrow-up) lives in ~/.claude/history.jsonl.
-  # We overlay that too so each project has its own history.
+  # We overlay that too so each project has its own history, from a host-only
+  # store keyed like the session dir (see CLEAT_HISTORY_DIR). Nothing here
+  # writes inside the session dir except creating the dir itself, the box's
+  # mount root: every other name in it is the box's to replace.
   # The base ~/.claude mount provides auth and global config.
   local project_session_key
   project_session_key="$(_derive_project_session_key "$project" "$box")"
   local project_session_dir="${HOME}/.claude/projects/${project_session_key}"
   mkdir -p "$project_session_dir"
-  # Ensure per-project history file exists (Docker needs the source for bind mounts)
-  touch "$project_session_dir/history.jsonl"
+  local project_history
+  if ! project_history="$(_project_history_store "$project_session_key")"; then
+    error "Could not create this project's input history file under ${BOLD}${CLEAT_HISTORY_DIR}${RESET}."
+    exit 1
+  fi
   # Also ensure host history.jsonl exists (macOS virtiofs rejects nested mounts
   # when the target file is missing inside the parent bind mount's source)
-  touch "${HOME}/.claude/history.jsonl"
+  _ensure_file_target "${HOME}/.claude/history.jsonl"
   # Also ensure the overlay target exists in the base mount (Docker needs it)
   mkdir -p "${HOME}/.claude/projects/-workspace"
   # Also ensure the settings-mask target exists in the base mount. Same
@@ -12565,7 +12656,7 @@ cmd_run() {
     -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
     -v "$home_overlay/projects:/home/coder/.claude/projects:ro"
     -v "${project_session_dir}:/home/coder/.claude/projects/-workspace"
-    -v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"
+    -v "${project_history}:/home/coder/.claude/history.jsonl"
     -v "$CLEAT_RUN_DIR/${cname}/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/agents:/home/coder/.claude/agents:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/commands:/home/coder/.claude/commands:ro"
@@ -12906,7 +12997,7 @@ cmd_run() {
 _ensure_host_mount_targets() {
   local cname="$1"
   mkdir -p "${HOME}/.claude/projects/-workspace"
-  touch "${HOME}/.claude/history.jsonl"
+  _ensure_file_target "${HOME}/.claude/history.jsonl"
   [[ -f "${HOME}/.claude/settings.json" ]] || echo '{}' > "${HOME}/.claude/settings.json"
   if _container_has_kit_mounts "$cname"; then
     _ensure_kit_mask_targets || exit 1
@@ -13095,8 +13186,12 @@ cmd_start() {
       # instead. Two independent classes: a missing/wrong-type settings overlay
       # (_settings_overlay_intact), and any vanished bind source, most often
       # the macOS SSH agent socket, whose launchd path rotates every reboot
-      # (_container_bind_sources_present).
-      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname"; then
+      # (_container_bind_sources_present). A third is forced, once per box:
+      # a box created before the host-only history store mounts its input
+      # history from inside its read-write session dir, where the box can swap
+      # the name for a link that this start would mount
+      # (_history_bind_in_session_dir). Only a recreate changes a bind source.
+      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
         info "Recreating container ${DIM}(host paths changed)"
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
@@ -13216,8 +13311,10 @@ cmd_resume() {
       # settings overlay (_settings_overlay_intact) or any vanished bind source,
       # most often the macOS SSH agent socket, whose launchd path rotates
       # every reboot (_container_bind_sources_present), would otherwise make
-      # `docker start` abort with an opaque OCI error.
-      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname"; then
+      # `docker start` abort with an opaque OCI error. A box created before the
+      # host-only history store is recreated once, as in cmd_start
+      # (_history_bind_in_session_dir).
+      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
         info "Recreating container ${DIM}(host paths changed)${RESET}"
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
@@ -15393,11 +15490,12 @@ cmd_storage() {
 #    the bytes behind. They are always handled as one unit.
 #
 # 2. The directory is NOT a pure session store. It also holds Claude Code's
-#    per-project auto-memory (memory/), cleat's own history.jsonl (created at
-#    cmd_run and bind-mounted live into every box of this project), and whatever
-#    scratch directories agents made. A `*` glob or a subtractive "everything
-#    that is not X" rule would eat the user's memory and orphan a live mount.
-#    Every operation is gated on a strict UUID allowlist instead.
+#    per-project auto-memory (memory/), whatever scratch directories agents
+#    made, and possibly a history.jsonl: cleat's input history lived here, bound
+#    live into every box, until it moved to the host-only CLEAT_HISTORY_DIR. A
+#    name left by an older release, or one the box wrote, can still be there. A
+#    `*` glob or a subtractive "everything that is not X" rule would eat the
+#    user's memory. Every operation is gated on a strict UUID allowlist instead.
 
 # The strict UUID shape, as a `case` glob rather than a regex: bash 3.2 has no
 # {n} repetition in its POSIX ERE, and writing it out leaves nothing to a
@@ -15560,8 +15658,8 @@ _sessions_size_kb() {
 
 # One tab-joined row per session: mtime, size in KB, uuid, title. Sorted by the
 # caller. Only strict-UUID basenames are considered, which is what keeps
-# history.jsonl (same directory, matches *.jsonl, and a LIVE bind source for
-# every running box of this project) out of the list.
+# history.jsonl (same directory, matches *.jsonl, and a live bind source for
+# every box created before the host-only history store) out of the list.
 _sessions_scan() {
   local sdir="$1"
   local f base uuid mt kb title
@@ -15600,9 +15698,9 @@ _sessions_path_under_key() {
   local target="$1" root="$2" base root_p parent_p
   base="${target##*/}"
   # history.jsonl is redundant against the UUID test every caller already ran,
-  # and it is asserted anyway: it is cleat's own file, it matches *.jsonl, and
-  # it is bind-mounted live into every box of this project, so losing it is the
-  # one mistake in this directory that breaks a RUNNING container.
+  # and it is asserted anyway: it matches *.jsonl, and in a box created before
+  # the host-only history store it is still bind-mounted live, so losing it is
+  # the one mistake in this directory that breaks a RUNNING container.
   case "$base" in ''|.|..|history.jsonl) return 1 ;; esac
   case "$target" in "$root"/?*) : ;; *) return 1 ;; esac
   [[ -L "$target" ]] && return 1

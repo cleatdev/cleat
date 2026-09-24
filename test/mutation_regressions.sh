@@ -402,8 +402,9 @@ SED
 try "v0.8.0_session_isolation" "session overlay mount isolates projects"
 
 # v0.8.0: history.jsonl must be overlaid per-project. Remove the history mount.
+# (Anchor moved in v1.5.4, when the source became the host-only store.)
 cat > "$SED_TMP" << 'SED'
-/history\.jsonl:\/home\/coder\/\.claude\/history\.jsonl/d
+/:\/home\/coder\/\.claude\/history\.jsonl"$/d
 SED
 try "v0.8.0_history_isolation" "history.jsonl overlay isolates per-project history"
 
@@ -12502,6 +12503,121 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_settings_precheck_fifo" "FIFO at a project settings path" "$CLI" "$HOOKS_BATS"
+
+# ── v1.5.4: input history bind source (host-only store) ─────────────────────
+
+# The history bind comes from the name inside the session dir again.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@-v "[$]{project_history}:/home/coder/.claude/history.jsonl"@-v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"@
+}
+SED
+try "v154_history_bind_host_only" "history bind source is host-only"
+
+# cmd_run touches the name in the session dir again, which follows a link.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^  mkdir -p "[$]project_session_dir"$@  mkdir -p "$project_session_dir"; touch "$project_session_dir/history.jsonl"@
+}
+SED
+try "v154_history_no_touch_through_link" "dangling history link"
+
+# The carry-over reads the old name, which follows a planted link, instead of
+# renaming it.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  s@if mv -f "[$]old" "[$]staged" 2>/dev/null; then@if cat "$old" > "$staged" 2>/dev/null; then@
+}
+SED
+try "v154_history_import_moves_not_reads" "history link planted in the session dir"
+
+# No shape check after the rename: an absolute link lands as the store.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  /^      _drop_unless_regular "[$]staged"$/d
+}
+SED
+try "v154_history_import_drops_shapes" "legacy history path is never imported" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# The carry-over runs on every create, so a name the box writes later
+# replaces the store.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  s@if \[\[ ! -e "[$]f" \]\] && \[\[ -e "[$]old" || -L "[$]old" \]\]; then@if [[ -e "$old" || -L "$old" ]]; then@
+}
+SED
+try "v154_history_import_once" "carries a session-dir history" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# A directory or a link at the store path is kept, so the create stops.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  /^  _drop_unless_regular "[$]f"$/d
+}
+SED
+try "v154_history_store_heals" "at the history store path is replaced" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# The store directory is created and left with the default umask.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  s@^  ( umask 077; mkdir -p "[$]dir" ) 2>/dev/null || return 1$@  mkdir -p "$dir" 2>/dev/null || return 1@
+  /^  chmod 700 "[$]CLEAT_HISTORY_DIR" "[$]dir"/d
+}
+SED
+try "v154_history_store_private" "history store directory is private" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# A pre-store box goes straight to docker start.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  s@ || _history_bind_in_session_dir "[$]cname"@@
+}
+SED
+try "v154_legacy_history_recreate_start" "cmd_start recreates a box whose history bind"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  s@ || _history_bind_in_session_dir "[$]cname"@@
+}
+SED
+try "v154_legacy_history_recreate_resume" "cmd_resume recreates a box whose history bind"
+
+# Every box with both mounts reads as legacy, so every start recreates.
+cat > "$SED_TMP" << 'SED'
+/^_history_bind_in_session_dir()/,/^}$/{
+  s@^  case "[$]hist" in "[$]sess"/\*) return 0 ;; esac$@  return 0@
+}
+SED
+try "v154_history_store_no_recreate_loop" "host-only history store restarts"
+
+# The session source is compared as a pattern, not a path.
+cat > "$SED_TMP" << 'SED'
+/^_history_bind_in_session_dir()/,/^}$/{
+  s@^  case "[$]hist" in "[$]sess"/\*) return 0 ;; esac$@  case "$hist" in $sess/*) return 0 ;; esac@
+}
+SED
+try "v154_history_bind_literal" "compare literally" "$CLI" "$START_RESUME_BATS"
+
+# A directory Docker made at a deleted store path is not caught before start.
+cat > "$SED_TMP" << 'SED'
+/^_settings_overlay_intact()/,/^}$/{
+  s@ | "[$]CLEAT_HISTORY_DIR"/\*)@)@
+}
+SED
+try "v154_overlay_intact_history_store" "a directory at the history store source" "$CLI" "$START_RESUME_BATS"
+
+# The nested target is touched again, through a link, at create and at start.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^  _ensure_file_target "[$]{HOME}/.claude/history.jsonl"$@  touch "${HOME}/.claude/history.jsonl"@
+}
+SED
+try "v154_history_target_create_only_run" "nested history target is never touched"
+
+cat > "$SED_TMP" << 'SED'
+/^_ensure_host_mount_targets()/,/^}$/{
+  s@^  _ensure_file_target "[$]{HOME}/.claude/history.jsonl"$@  touch "${HOME}/.claude/history.jsonl"@
+}
+SED
+try "v154_history_target_create_only_start" "nested history target is never touched"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

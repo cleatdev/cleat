@@ -41,7 +41,7 @@ _image_inputs_hash() {
 }
 
 @test "image spec: build inputs match the recorded hash for this _IMAGE_SPEC_VERSION" {
-  local expected="1c00245a47e47b643e3f431fb6c6cdd050fe959d46c638504804cef034d58687"
+  local expected="af053e7786e31a6514addc7866ffda39ddddf3b9611398cf96245a748d10b067"
   local actual
   actual="$(_image_inputs_hash "$DOCKER_DIR")"
   [[ "$actual" == "$expected" ]] || {

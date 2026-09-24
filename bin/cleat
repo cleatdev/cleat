@@ -50,7 +50,9 @@ REPO_URL="https://github.com/cleatdev/cleat"
 #      whose UID is not 1000 (i.e. every macOS host) hit EACCES on ~/.bashrc,
 #      ~/.profile and mkdir ~/.config/*, which aborts the payload under bash -e
 #   5  Debian's own apt suites fetched over https rather than http, so an
-#      egress gateway that only ever sees TLS can serve apt at all
+#      egress gateway that only ever sees TLS can serve apt at all, and the
+#      baked box notes say an image pasted with ctrl+v reaches Claude Code on
+#      its own, where they used to say reading the clipboard back never works
 _IMAGE_SPEC_VERSION=5
 # Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
 # existed, so they carry no spec label): their content is inferred from the
@@ -3057,7 +3059,7 @@ This environment runs inside Docker with clipboard bridge forwarding.
 `xclip`, `pbcopy`, `xsel`, and `clip` all work for COPYING text to the host clipboard.
 The primary mechanism writes to a shared file that the host picks up automatically.
 OSC 52 terminal escape sequences are used as a fallback when the bridge is unavailable.
-Paste/read-back (`xclip -o`, `xsel -o`, `pbpaste`) is not supported. Do NOT try to verify clipboard contents after copying.
+Reading text back (`xclip -o`, `xsel -o`, `pbpaste`) is not supported. An image the user pastes with ctrl+v reaches Claude Code on its own, so never read the clipboard yourself. Do NOT try to verify clipboard contents after copying.
 The copy succeeded if the command exits 0. Do not run a second command to check.
 BOX_NOTES_EOF
 }

@@ -1215,7 +1215,7 @@ echo "hello" | xsel --clipboard  # Linux-style (alternative)
 git log -1 --format=%B | clip    # copy last commit message
 ```
 
-**Limits:** Payloads are capped at 100KB. Paste (`xclip -o`, `xsel --output`, `pbpaste`) is not supported -- clipboard is copy-only.
+**Limits:** Payloads are capped at 100KB. Reading text back (`xclip -o`, `xsel --output`, `pbpaste`) is not supported. Images reach Claude Code through ctrl+v, below.
 
 ---
 

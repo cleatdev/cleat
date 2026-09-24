@@ -1188,11 +1188,13 @@ EOF
   local cname; cname="$(container_name_for "$TEST_TEMP/project")"
   mock_docker_ps "$cname"
   _host_open_cmd() { echo "true"; }
-  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
-  head -c 1200000 /dev/zero | tr '\0' 'x' > "$clip/.watcher-log"
+  local log="$CLEAT_RUN_DIR/$cname/logs/watcher.log"; mkdir -p "${log%/*}"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$log"
   run cmd_shell "$TEST_TEMP/project"
   assert_success
-  local sz; sz="$(wc -c < "$clip/.watcher-log" | tr -d '[:space:]')"
+  # Rotation removes the log, and the spawn's `>>` may not have recreated it yet.
+  local sz=0
+  [ -e "$log" ] && sz="$(wc -c < "$log" | tr -d '[:space:]')"
   [ "$sz" -lt 1048576 ] || { echo "cleat shell never capped the watcher log: $sz bytes"; return 1; }
 }
 
@@ -1201,11 +1203,13 @@ EOF
   local cname; cname="$(container_name_for "$TEST_TEMP/project")"
   mock_docker_ps "$cname"
   _host_open_cmd() { echo "true"; }
-  local clip="$CLEAT_RUN_DIR/$cname/clip"; mkdir -p "$clip"
-  head -c 1200000 /dev/zero | tr '\0' 'x' > "$clip/.watcher-log"
+  local log="$CLEAT_RUN_DIR/$cname/logs/watcher.log"; mkdir -p "${log%/*}"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$log"
   run cmd_login "$TEST_TEMP/project"
   assert_success
-  local sz; sz="$(wc -c < "$clip/.watcher-log" | tr -d '[:space:]')"
+  # Rotation removes the log, and the spawn's `>>` may not have recreated it yet.
+  local sz=0
+  [ -e "$log" ] && sz="$(wc -c < "$log" | tr -d '[:space:]')"
   [ "$sz" -lt 1048576 ] || { echo "cleat login never capped the watcher log: $sz bytes"; return 1; }
 }
 

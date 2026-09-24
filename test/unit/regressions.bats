@@ -3496,7 +3496,7 @@ EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Every host-side watcher (clipboard, browser, hook bridge) is backgrounded
-# with its stdout+stderr redirected to a per-box .watcher-log, NOT the
+# with its stdout+stderr redirected to a per-box watcher log, NOT the
 # interactive terminal. Under a heavy multi-agent load the host hits its
 # process cap, and a backgrounded watcher that inherits the terminal's fd 2
 # prints bash's own "fork: Resource temporarily unavailable" straight into the
@@ -3551,7 +3551,8 @@ EOF
 
   # The watcher wrote its stderr to the per-box log: proves it ran AND that the
   # redirect targets a debuggable file, not the terminal and not /dev/null.
-  run grep -q "WATCHER_FD2_SENTINEL" "$clip_dir/.watcher-log"
+  # Since v1.5.4 the log is host-only, beside the clip dir.
+  run grep -q "WATCHER_FD2_SENTINEL" "$HOME/.config/cleat/run/${cname}/logs/watcher.log"
   assert_success
   # ...and it did NOT leak into the caller's fd 2 (the terminal in production).
   run grep -q "WATCHER_FD2_SENTINEL" "$TEST_TEMP/caller-stderr"
@@ -3716,7 +3717,8 @@ EOF
   local target="$TEST_TEMP/precious-log"
   head -c 1200000 /dev/zero | tr '\0' 'q' > "$target"
   ln -s "$target" "$TEST_TEMP/.watcher-log"
-  run _cap_watcher_log "$TEST_TEMP/.watcher-log"
+  # Every caller passes a claim dir since v1.5.4, so the oversized arm is live.
+  run _cap_watcher_log "$TEST_TEMP/.watcher-log" "$TEST_TEMP/claim"
   assert_success
   local sz; sz="$(wc -c < "$target" | tr -d '[:space:]')"
   [ "$sz" -gt 1000000 ] || {
@@ -7337,8 +7339,8 @@ EOF
 # The session-end reports read .watcher-log and .proxy-log in the clip dir the
 # box mounts read-write. `[ -f ]` follows a link, so a link there made them read
 # a host file. Only a yes or no or a count came of it, but it is never Cleat's.
-# The browser reports' log has since moved to the host-only bridge dir. The
-# guards stay as a second layer, so these still hand the reports a clip path.
+# Both logs have since moved to host-only dirs (bridge/ and logs/). The guards
+# stay as a second layer, so these still hand the reports a clip path.
 @test "regression v1.5.4: session-end reports never follow a link planted as their log" {
   local clip="$TEST_TEMP/clip-links" host="$TEST_TEMP/host-log"
   mkdir -p "$clip"
@@ -8196,4 +8198,157 @@ OPEN
   assert_success
   assert_output --partial "cleat browser allow auth.example.com"
   refute_output --partial "evil.example"
+}
+
+# ── v1.5.4: the watcher log leaves the mount, and its cap rotates by rename ──
+#
+# The watcher log lived at clip/.watcher-log, inside the clip dir the box has
+# read-write. The cap dropped a link once, then `[ -f ]`, `wc -c <` and `: >`
+# each looked the name up again, so a link swapped in after the drop had the cap
+# empty any host file over 1 MB. And every watcher spawn opened the name again
+# for `>>` with no check at all, so a link planted after the cap sent watcher
+# output into a host file the box chose, created if missing. The log now lives
+# at logs/watcher.log beside clip/, never mounted, and the cap sizes by stat and
+# rotates an oversized log by rename into a host-only dir.
+
+# Swaps the log for another shape right after the real pre-filter, which is the
+# window the box had. $_WL_SWAP names the shape: a link to $_WL_VICTIM or a FIFO.
+_wl_swap_after_drop() {
+  eval "_wl_real_drop_unless_regular() $(declare -f _drop_unless_regular | sed 1d)"
+  _drop_unless_regular() {
+    _wl_real_drop_unless_regular "$@"
+    rm -f "$1"
+    case "$_WL_SWAP" in
+      link) ln -s "$_WL_VICTIM" "$1" ;;
+      fifo) mkfifo "$1" ;;
+    esac
+  }
+}
+
+@test "regression v1.5.4: capping a watcher log never truncates through a link swapped in after the check" {
+  local clip="$TEST_TEMP/wl/clip" claim="$TEST_TEMP/wl/clipclaim"
+  mkdir -p "$clip"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$clip/.proxy-log"
+  _WL_VICTIM="$TEST_TEMP/wl-victim"
+  head -c 1200000 /dev/zero | tr '\0' 'v' > "$_WL_VICTIM"
+  _WL_SWAP=link
+  _wl_swap_after_drop
+  run _cap_watcher_log "$clip/.proxy-log" "$claim"
+  assert_success
+  assert_output "0"
+  local sz; sz="$(wc -c < "$_WL_VICTIM" | tr -d '[:space:]')"
+  [ "$sz" -eq 1200000 ] || fail "the cap emptied the file a swapped-in link named: $sz bytes left"
+  # The link itself was moved away and deleted, never written through.
+  run test -L "$clip/.proxy-log"
+  assert_failure
+  run ls -A "$claim"
+  assert_output ""
+}
+
+@test "regression v1.5.4: a FIFO swapped in after the check never blocks the watcher log cap" {
+  local clip="$TEST_TEMP/wl/clip" out="$TEST_TEMP/wl-out" pid i=0
+  mkdir -p "$clip"
+  echo "prior" > "$clip/.watcher-log"
+  _WL_SWAP=fifo
+  _wl_swap_after_drop
+  ( _cap_watcher_log "$clip/.watcher-log" "$TEST_TEMP/wl/claim" > "$out" 2>/dev/null ) 3>&- &
+  pid=$!
+  while [ "$i" -lt 50 ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    # Release the blocked reader so the test process is not left hanging.
+    _portable_timeout 5 bash -c ': > "$1"' _ "$clip/.watcher-log" || true
+    wait "$pid" 2>/dev/null || true
+    fail "the cap blocked on a FIFO swapped in after its pre-filter"
+  fi
+  wait "$pid" 2>/dev/null || true
+  run cat "$out"
+  assert_output "0"
+}
+
+# The spawn half. After the cap has run, the box plants a link at the old
+# in-mount log name, and the session's interactive exec waits until one of the
+# two possible logs exists, so every watcher's `>>` has opened before the
+# session ends. Shared by the exec_claude, cmd_shell and cmd_login tests.
+_wl_cap_then_plant() {
+  _wl_real_cap_watcher_log "$@"
+  rm -f "$_WL_CLIP/.watcher-log"
+  ln -s "$_WL_VICTIM" "$_WL_CLIP/.watcher-log"
+}
+_wl_session_exec_waits() {
+  local i=0
+  if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
+    while [ "$i" -lt 50 ] && [ ! -e "$_WL_VICTIM" ] && [ ! -e "$_WL_HOSTLOG" ]; do
+      sleep 0.1
+      i=$(( i + 1 ))
+    done
+  fi
+  command docker "$@"
+}
+_wl_arm_spawn_link() {
+  eval "_wl_real_cap_watcher_log() $(declare -f _cap_watcher_log | sed 1d)"
+  _cap_watcher_log() { _wl_cap_then_plant "$@"; }
+  docker() { _wl_session_exec_waits "$@"; }
+}
+
+@test "regression v1.5.4: session watchers never append through a link in the clip dir" {
+  local cname="wl-spawn-ctr"
+  local rd="$HOME/.config/cleat/run/${cname}"
+  mkdir -p "$rd/clip"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  cat > "$TEST_TEMP/wl_spawner.sh" <<EOF
+source "$TEST_TEMP/cli_stripped"
+_WL_CLIP="$rd/clip"
+_WL_VICTIM="$TEST_TEMP/host-victim"
+_WL_HOSTLOG="$rd/logs/watcher.log"
+$(declare -f _wl_cap_then_plant _wl_session_exec_waits _wl_arm_spawn_link)
+_wl_arm_spawn_link
+# The clipboard watcher only: no opener, so no browser watcher.
+_host_clip_cmd() { echo "true"; }
+_host_open_cmd() { echo ""; }
+exec_claude "$cname" --dangerously-skip-permissions >/dev/null 2>&1
+EOF
+  _portable_timeout 15 bash "$TEST_TEMP/wl_spawner.sh" || true
+  run test -e "$TEST_TEMP/host-victim"
+  assert_failure
+  run test -f "$rd/logs/watcher.log"
+  assert_success
+}
+
+@test "regression v1.5.4: cleat shell never appends watcher output through a link in the clip dir" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  _WL_CLIP="$CLEAT_RUN_DIR/$cname/clip"
+  _WL_VICTIM="$TEST_TEMP/host-victim"
+  _WL_HOSTLOG="$CLEAT_RUN_DIR/$cname/logs/watcher.log"
+  mkdir -p "$_WL_CLIP"
+  _wl_arm_spawn_link
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  run test -e "$_WL_VICTIM"
+  assert_failure
+  run test -f "$_WL_HOSTLOG"
+  assert_success
+}
+
+@test "regression v1.5.4: cleat login never appends watcher output through a link in the clip dir" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  _WL_CLIP="$CLEAT_RUN_DIR/$cname/clip"
+  _WL_VICTIM="$TEST_TEMP/host-victim"
+  _WL_HOSTLOG="$CLEAT_RUN_DIR/$cname/logs/watcher.log"
+  mkdir -p "$_WL_CLIP"
+  _wl_arm_spawn_link
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  run test -e "$_WL_VICTIM"
+  assert_failure
+  run test -f "$_WL_HOSTLOG"
+  assert_success
 }

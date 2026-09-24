@@ -1419,7 +1419,9 @@ EOF
   local wpid=$!
   sleep 1
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  local sz; sz="$(wc -c < "$TEST_TEMP/bridge/proxy-log" | tr -d '[:space:]')"
+  # Rotation removes the log. It stays absent until the watcher's next line.
+  local sz=0
+  [ -e "$TEST_TEMP/bridge/proxy-log" ] && sz="$(wc -c < "$TEST_TEMP/bridge/proxy-log" | tr -d '[:space:]')"
   [ "$sz" -lt 1048576 ] || { echo "proxy log was never capped: $sz bytes"; return 1; }
 }
 

@@ -75,11 +75,11 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 # bind-mount sources out from under it and force a recreate (which would discard
 # the container's writable layer, e.g. an ad-hoc `az` install).
 #   $CLEAT_RUN_DIR/<cname>/{auth,clip,home,hooks,kit,settings}   mount sources
-#   $CLEAT_RUN_DIR/<cname>/{bridge,clipclaim,clipimg-stage,hookbridge,hookclaim}   host-only
+#   $CLEAT_RUN_DIR/<cname>/{bridge,clipclaim,clipimg-stage,hookbridge,hookclaim,logs}   host-only
 # The host-only siblings hold what the box must not reach (claims, rate ledgers,
-# staged images, the browser bridge's log), so none of them may ever be
-# mounted. Which mounts are read-only is decided in cmd_run's mount_args, not
-# here.
+# staged images, the browser bridge's log, the watcher log), so none of them may
+# ever be mounted. Which mounts are read-only is decided in cmd_run's
+# mount_args, not here.
 CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 # Host-side per-box descriptions, keyed by container name. NOT Docker labels:
@@ -8387,7 +8387,7 @@ _browser_watcher() {
     # losing this session's refusals from the report (concept/41). Only here,
     # on the real file: /dev/null must never reach _cap_watcher_log or
     # _drop_unless_regular, whose arm for a non-file runs rm -rf.
-    _cap_watcher_log "$_bw_log" >/dev/null
+    _cap_watcher_log "$_bw_log" "${_bw_log%/*}" >/dev/null
     _bw_ready="${_bw_log%/*}/.proxy-ready.$$"
   else
     echo "[browser-watcher $(date +%H:%M:%S)] no state dir outside the mount, bridge log and callback proxy off this session"
@@ -10650,18 +10650,21 @@ exec_claude() {
     touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
   }
 
-  # The per-box watcher log (target of the redirects below). Cap it on session
-  # start and record the post-cap size, which is this session's read offset for
-  # the end-of-session fork diagnostic.
-  local _watcher_log="$_CLIP_DIR/.watcher-log" _watcher_log_off
-  _watcher_log_off="$(_cap_watcher_log "$_watcher_log")"
+  # The per-box watcher log (target of the redirects below), host-only beside
+  # the clip dir (see _watcher_log_path). Cap it on session start and record the
+  # post-cap size, which is this session's read offset for the end-of-session
+  # fork diagnostic.
+  local _watcher_log _watcher_log_off
+  _watcher_log="$(_watcher_log_path "$cname")"
+  mkdir -p "${_watcher_log%/*}"
+  _watcher_log_off="$(_cap_watcher_log "$_watcher_log" "${_watcher_log%/*}")"
   # The same offset trick for the bridge's own log, so the post-session report
   # names only the URLs THIS session refused. Without the offset a refusal from
   # a previous session re-fires on every run, which is the nagging concept/21
   # forbids.
   local _proxy_log_file _proxy_log_off
   _proxy_log_file="$(_browser_proxy_log "$_CLIP_DIR")"
-  _proxy_log_off="$(_cap_watcher_log "$_proxy_log_file")"
+  _proxy_log_off="$(_cap_watcher_log "$_proxy_log_file" "${_proxy_log_file%/*}")"
   # Whether ~/.claude/.config.json is there before the box runs, so the end of
   # the session can say it APPEARED. See _maybe_note_host_global_config.
   local _cfgjson_before=0
@@ -10687,8 +10690,9 @@ exec_claude() {
     # the Claude Code TUI, corrupting it. The watcher never has anything the
     # user should see (it drives pbcopy and marker files, never the terminal),
     # so a log keeps fork spew and any stray output off-screen but debuggable.
-    # `.watcher-log` (hyphen) stays clear of the `.watcher.*` liveness glob.
-    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+    # The log lives outside the clip dir, so the `.watcher.*` liveness glob
+    # never meets it and the box cannot aim these appends at a host file.
+    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>"$_watcher_log" 2>&1 &
     _CLIP_WATCHER_PID=$!
     disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
 
@@ -10700,7 +10704,7 @@ exec_claude() {
     # falls back to today's "No image found", never an error.
     if [ "${CLEAT_NO_CLIPBOARD_IMAGE:-}" != "1" ]; then
       if _clipimg_drop_shim "$cname"; then
-        _clipimg_watcher "$_CLIP_DIR" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+        _clipimg_watcher "$_CLIP_DIR" "$cname" >>"$_watcher_log" 2>&1 &
         _CLIPIMG_WATCHER_PID=$!
         disown "$_CLIPIMG_WATCHER_PID" 2>/dev/null || true
       fi
@@ -10722,7 +10726,7 @@ exec_claude() {
     # URLs (`$open_cmd ... >/dev/null 2>&1`) and logs to the bridge log, so it never
     # needs the terminal, and a fork failure under load must not spew into the
     # TUI. Its callback-proxy child inherits these fds, so it is covered too.
-    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" "$(_browser_bridge_mode)" "$_bw_interactive" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" "$(_browser_bridge_mode)" "$_bw_interactive" >>"$_watcher_log" 2>&1 &
     _BROWSER_WATCHER_PID=$!
     disown "$_BROWSER_WATCHER_PID" 2>/dev/null || true
   fi
@@ -10793,7 +10797,7 @@ exec_claude() {
       mkdir -p "$CLEAT_RUN_DIR/${cname}/hookbridge" 2>/dev/null || true
       ( umask 077; : > "$CLEAT_RUN_DIR/${cname}/hookbridge/.bridge.$$" ) 2>/dev/null || true
       _HOOK_BRIDGE_MARK="$CLEAT_RUN_DIR/${cname}/hookbridge/.bridge.$$"
-      _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+      _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_watcher_log" 2>&1 &
       _HOOK_BRIDGE_PID=$!
       disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
     fi
@@ -11084,23 +11088,6 @@ _maybe_explain_oom() {
   echo -e "    ${DIM}•${RESET} Cap CPU so runners self-limit: add ${BOLD}cpus = 2${RESET} under ${BOLD}[resources]${RESET}"
 }
 
-# During a heavy multi-agent run the HOST (not the box) can exhaust its per-user
-# process table, and any host-side fork then fails with EAGAIN. Cleat's background
-# watchers hit this and bash writes "fork: Resource temporarily unavailable" to
-# the per-box watcher log (redirected off the terminal at the watcher spawns, so
-# it no longer corrupts the Claude TUI). This surfaces ONE plain diagnostic when
-# that happened THIS session, so the raw bash spam in the log gets a human
-# explanation and a fix. It reads only the bytes written after `off` (this
-# session's watcher output), so a stale error from a past session never
-# re-triggers it. The failing fork is host-side (the box has its own pid pool and
-# a working session), so this is guidance for the user's machine, not a box fix.
-# Fail-soft: a missing log or `tail`/`grep` hiccup just prints nothing.
-# Cap the per-box watcher log at ~1 MB and echo its post-cap byte size. Nothing
-# else sweeps this log (it dodges the .watcher.* liveness glob by design), so
-# without the cap a host fork storm, which appends many bash retry lines, could
-# grow it unbounded across a long-lived box. The echoed size is the session's
-# read offset so the end-of-session diagnostic scans only this session's slice.
-# Fail-soft: a missing or unreadable log yields 0 (and no truncation).
 # Remove whatever sits at a box-writable host path unless it is a regular
 # file. The clip dir is mounted read-write, so the box can plant any shape
 # there, and each one defeats a different idiom: a symlink is FOLLOWED by `>>`
@@ -11119,36 +11106,73 @@ _drop_unless_regular() {
   return 0
 }
 
+# Where the per-box watcher log lives: logs/watcher.log in the box's run dir.
+# Every host-side watcher's stdout and stderr go there (see exec_claude). It
+# used to be clip/.watcher-log, inside the clip dir the box has read-write, so
+# the box chose what each `>>` at a watcher spawn opened: a link planted there
+# after the cap sent watcher output into any host file the user can write, and
+# one swapped in under the cap had the cap empty that file. Beside clip/ and
+# never mounted, it needs no guard (concept/41). A subdir rather than the run
+# dir itself, so rotating the log never re-stamps the run dir's mtime, which the
+# idle sweep reads, and _account_hold_run_extras, which reads every regular
+# file at the run dir's top level, never meets it. $1 is the container name.
+_watcher_log_path() {
+  printf '%s/%s/logs/watcher.log' "$CLEAT_RUN_DIR" "$1"
+}
+
+# Cap a watcher or bridge log at ~1 MB and echo its post-cap byte size. Nothing
+# else sweeps these logs (the watcher log dodges the .watcher.* liveness glob by
+# design), so without the cap a host fork storm, which appends many bash retry
+# lines, could grow one unbounded across a long-lived box. The echoed size is
+# the session's read offset, so the end-of-session reports scan only this
+# session's slice. Fail-soft: a missing or unreadable log yields 0.
+#
+# Both callers' logs are host-only now, and the cap is still safe on a path the
+# box can write. The size is a stat, which opens nothing, so a FIFO there cannot
+# hang the caller. An oversized log is ROTATED BY RENAME into $2, a host-only
+# dir, under a name nobody can predict, then deleted there. It is never emptied
+# in place: `: > "$log"` after a check writes through whatever link was swapped
+# in between. rename(2) moves a link, a FIFO or a directory without following
+# or opening it, on BSD and GNU alike, and the next `>>` makes a fresh log.
+# With no usable $2 the log stays uncapped this session rather than being
+# emptied in place, the rule _hook_spool_cap follows.
 _cap_watcher_log() {
-  local log="$1" sz=0
-  # Anything that is not a regular file is never ours (see
-  # _drop_unless_regular): `[ -f ]` DEREFERENCES a link, so a planted one would
-  # have the truncation below empty whatever host file it names, and a FIFO
-  # would block the caller's later `>>` forever.
+  local log="$1" claim_dir="${2:-}" sz claimed
+  # A cheap pre-filter only (see _drop_unless_regular): whoever can write the
+  # dir can plant a new shape after it returns.
   _drop_unless_regular "$log"
-  [ -f "$log" ] || { echo 0; return 0; }
-  # `tr -d [:space:]` strips BSD wc's leading padding (macOS prints "      6",
-  # not "6"): without it the ^[0-9]+$ guard below rejects the padded string and
-  # forces sz=0, which on macOS would defeat BOTH the cap (never truncates) and
-  # the offset (always 0 -> a stale prior-session fork error re-fires the
-  # advisory every run). Same normalization the hook bridge already does.
-  sz="$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]' || echo 0)"
-  [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
-  if (( sz > 1048576 )); then
-    : > "$log" 2>/dev/null || true
-    sz=0
+  # Sized without opening it. It follows a link, as `wc -c <` did, so a link
+  # swapped in after the pre-filter is renamed away below, never written.
+  sz="$(_path_size "$log")"
+  if (( sz > 1048576 )) && [ -n "$claim_dir" ] && mkdir -p "$claim_dir" 2>/dev/null \
+    && [ -d "$claim_dir" ] && [ ! -L "$claim_dir" ]; then
+    claimed="$claim_dir/.caplog.$$.$RANDOM"
+    if mv -f "$log" "$claimed" 2>/dev/null; then
+      rm -rf "$claimed" 2>/dev/null || true
+      sz=0
+    fi
   fi
   echo "$sz"
 }
 
+# During a heavy multi-agent run the HOST (not the box) can exhaust its per-user
+# process table, and any host-side fork then fails with EAGAIN. Cleat's background
+# watchers hit this and bash writes "fork: Resource temporarily unavailable" to
+# the per-box watcher log (redirected off the terminal at the watcher spawns, so
+# it no longer corrupts the Claude TUI). This surfaces ONE plain diagnostic when
+# that happened THIS session, so the raw bash spam in the log gets a human
+# explanation and a fix. It reads only the bytes written after `off` (this
+# session's watcher output), so a stale error from a past session never
+# re-triggers it. The failing fork is host-side (the box has its own pid pool and
+# a working session), so this is guidance for the user's machine, not a box fix.
+# Fail-soft: a missing log or `tail`/`grep` hiccup just prints nothing.
 _maybe_explain_fork_exhaustion() {
   local log="$1" off="${2:-0}"
-  # The log sits in the clip dir the box mounts read-write, and the box keeps
-  # running after the exec returns. A link there is never Cleat's (see
-  # _drop_unless_regular), so it is not followed. A FIFO or a device swapped in
-  # after this check costs the read bound, not a hang at session end. The three
-  # browser reports below read the bridge log the same way. It is host-only, but
-  # the same guards cost nothing there.
+  # The watcher log and the bridge log the three browser reports below read are
+  # both host-only now (logs/ and bridge/). The guards stay as a second layer
+  # and cost nothing: a link is never Cleat's (see _drop_unless_regular), so it
+  # is not followed, and a FIFO or a device swapped in after this check costs
+  # the read bound, not a hang at session end.
   [ -f "$log" ] && [ ! -L "$log" ] || return 0
   _read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep -q "Resource temporarily unavailable" || return 0
   echo ""
@@ -13507,13 +13531,14 @@ cmd_shell() {
   # nowhere and a loopback login would wait forever on a callback. Same
   # parameters as exec_claude: auto mode defers plain links to this terminal,
   # and an authorize URL at an allowlisted origin opens on the host.
-  local _shell_clip_dir="$CLEAT_RUN_DIR/${cname}/clip"
-  mkdir -p "$_shell_clip_dir"
+  local _shell_clip_dir="$CLEAT_RUN_DIR/${cname}/clip" _shell_watcher_log
+  _shell_watcher_log="$(_watcher_log_path "$cname")"
+  mkdir -p "$_shell_clip_dir" "${_shell_watcher_log%/*}"
   # This shell's byte window of the bridge log, captured before the watcher
   # starts, so a refusal from an earlier session is never reported again.
   local _shell_proxy_log _shell_proxy_off
   _shell_proxy_log="$(_browser_proxy_log "$_shell_clip_dir")"
-  _shell_proxy_off="$(_cap_watcher_log "$_shell_proxy_log")"
+  _shell_proxy_off="$(_cap_watcher_log "$_shell_proxy_log" "${_shell_proxy_log%/*}")"
   # The spool cap's discards are reported like exec_claude's hook drops, from
   # this session's byte window of the per-install drop log.
   local _shell_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _shell_drop_off=0
@@ -13528,9 +13553,9 @@ cmd_shell() {
     local _shell_interactive=0
     _is_tty && _shell_interactive=1
     # Terminal-safety redirect (see exec_claude): keep a fork-starved watcher's
-    # stderr out of this shell's TUI, in a per-box log instead.
-    _cap_watcher_log "$_shell_clip_dir/.watcher-log" >/dev/null
-    _browser_watcher "$_shell_clip_dir" "$_shell_open_cmd" "$cname" "$(_browser_bridge_mode)" "$_shell_interactive" >>"$_shell_clip_dir/.watcher-log" 2>&1 &
+    # stderr out of this shell's TUI, in the host-only per-box log instead.
+    _cap_watcher_log "$_shell_watcher_log" "${_shell_watcher_log%/*}" >/dev/null
+    _browser_watcher "$_shell_clip_dir" "$_shell_open_cmd" "$cname" "$(_browser_bridge_mode)" "$_shell_interactive" >>"$_shell_watcher_log" 2>&1 &
     _shell_bw_pid=$!
     disown "$_shell_bw_pid" 2>/dev/null || true
   fi
@@ -13623,7 +13648,8 @@ cmd_login() {
   info "Authenticating with your Anthropic team account..."
 
   # Start browser bridge so auth URL opens automatically and callback works
-  local _login_clip_dir="$CLEAT_RUN_DIR/${cname}/clip"
+  local _login_clip_dir="$CLEAT_RUN_DIR/${cname}/clip" _login_watcher_log
+  _login_watcher_log="$(_watcher_log_path "$cname")"
   local _login_browser_pid=""
   local _login_open_cmd
   _login_open_cmd="$(_host_open_cmd)"
@@ -13631,7 +13657,7 @@ cmd_login() {
   # reads as 0, so it is safe before the bridge dir exists.
   local _login_proxy_log _login_proxy_off
   _login_proxy_log="$(_browser_proxy_log "$_login_clip_dir")"
-  _login_proxy_off="$(_cap_watcher_log "$_login_proxy_log")"
+  _login_proxy_off="$(_cap_watcher_log "$_login_proxy_log" "${_login_proxy_log%/*}")"
   # See cmd_shell: the spool cap's discards, reported after the login.
   local _login_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _login_drop_off=0
   if [ -f "$_login_drop_log" ]; then
@@ -13641,7 +13667,7 @@ cmd_login() {
   _hook_spool_entry_cap "$cname"
 
   if [ -n "$_login_open_cmd" ]; then
-    mkdir -p "$_login_clip_dir"
+    mkdir -p "$_login_clip_dir" "${_login_watcher_log%/*}"
     local _login_bridge_mode
     _login_bridge_mode="$(_browser_bridge_mode)"
     # host_opens_clicks=0: this watcher only ever sees the auth URL
@@ -13654,9 +13680,9 @@ cmd_login() {
     # (the callback proxy still runs). An unlisted origin is refused and
     # reported below, after the watcher stops.
     # Terminal-safety redirect (see exec_claude): keep a fork-starved watcher's
-    # stderr out of the login TUI, in a per-box log instead.
-    _cap_watcher_log "$_login_clip_dir/.watcher-log" >/dev/null
-    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" >>"$_login_clip_dir/.watcher-log" 2>&1 &
+    # stderr out of the login TUI, in the host-only per-box log instead.
+    _cap_watcher_log "$_login_watcher_log" "${_login_watcher_log%/*}" >/dev/null
+    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" >>"$_login_watcher_log" 2>&1 &
     _login_browser_pid=$!
     disown "$_login_browser_pid" 2>/dev/null || true
     if [ "$_login_bridge_mode" = off ]; then

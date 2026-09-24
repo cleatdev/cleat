@@ -4339,12 +4339,13 @@ SED
 try "vnext_config_env_scaffold_offer" "enabling env offers to scaffold" "$CLI" "$CONFIG_BATS"
 
 # WATCHER TERMINAL SAFETY. Every host-side watcher redirects its stdout+stderr
-# to a per-box .watcher-log so a fork-starved watcher's "fork: Resource
+# to a per-box watcher log so a fork-starved watcher's "fork: Resource
 # temporarily unavailable" never corrupts the Claude Code TUI. Strip the
 # redirect from the clipboard watcher spawn: the watcher's stderr leaks onto the
 # caller's fd 2 and the log is never created, so the regression test fails.
+# Retargeted (v1.5.4): the log moved to logs/watcher.log, named by $_watcher_log.
 cat > "$SED_TMP" << 'SED'
-s|_clipboard_watcher "\$_CLIP_DIR" "\$clip_cmd" >>"\$_CLIP_DIR/.watcher-log" 2>&1 &|_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" \&|
+s|_clipboard_watcher "[$]_CLIP_DIR" "[$]clip_cmd" >>"[$]_watcher_log" 2>[&]1 |_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" |
 SED
 try "watcher_fd2_redirect" "watchers redirect fork-error stderr"
 
@@ -4393,14 +4394,17 @@ s@(( sz > 1048576 ))@(( sz > 999999999999 ))@
 SED
 try "vnext_watcher_log_cap" "oversized log is truncated" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# WATCHER LOG CAP: BSD wc padding. macOS `wc -c` emits a space-padded count, so
-# the size must be de-padded before the numeric guard or it drops to 0 (defeating
-# the cap and the offset). Drop the `tr` strip: the padded count fails the regex
-# and the "BSD wc padding is stripped" test fails.
+# WATCHER LOG CAP: BSD stat. macOS stat has no -c, so the size must come from
+# its -f %z form or it reads as 0 (defeating the cap and the offset). Drop the
+# BSD branch: the size falls to 0 and the "sized by BSD stat" test fails.
+# Retargeted (v1.5.4): it was the BSD wc padding strip until the cap stopped
+# opening the log and sized it with _path_size.
 cat > "$SED_TMP" << 'SED'
-/^_cap_watcher_log()/,/^}$/ s@ | tr -d '\[:space:\]'@@
+/^_path_size()/,/^}$/{
+  s@ || stat -L -f %z "[$]1" 2>/dev/null@@
+}
 SED
-try "vnext_watcher_log_bsd_wc" "BSD wc padding is stripped" "$CLI" "$EXEC_CLAUDE_BATS"
+try "vnext_watcher_log_bsd_stat" "sized by BSD stat when GNU stat is absent" "$CLI" "$EXEC_CLAUDE_BATS"
 
 # FORK ADVISORY PLACEMENT. The session-end fork advisory must be emitted after the
 # rc==0 reclaim (which erases the line above it). Delete the call: the advisory
@@ -5549,10 +5553,11 @@ s@tr -d '\[:cntrl:\]'@cat@
 SED
 try "vnext_proxy_log_sanitize" "a URL carrying a newline cannot forge its own log line" "$CLI" "$BROWSER_BRIDGE_BATS"
 
-# Retargeted (v1.5.4): the cap runs on the host-only bridge log.
+# Retargeted (v1.5.4): the cap runs on the host-only bridge log, and takes the
+# bridge dir as its claim dir.
 cat > "$SED_TMP" << 'SED'
 /^_browser_watcher()/,/^}$/{
-  /^    _cap_watcher_log "[$]_bw_log" >\/dev\/null$/d
+  /^    _cap_watcher_log "[$]_bw_log" /d
 }
 SED
 try "vnext_proxy_log_cap" "an oversized log is capped at watcher start" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -5565,9 +5570,13 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_proxy_log_drop_not_overbroad" "a real log is never dropped, only a symlink is" "$CLI" "$BROWSER_BRIDGE_BATS"
 
+# Since v1.5.4 the cap rotates by rename, which moves a link without following
+# it, so dropping the pre-filter alone no longer reaches the target. The
+# mutation also puts back the in-place truncate the pre-filter guarded.
 cat > "$SED_TMP" << 'SED'
 /^_cap_watcher_log()/,/^}$/{
   s|_drop_unless_regular "\$log"|:|
+  s|if mv -f "[$]log" "[$]claimed" 2>/dev/null; then|if : > "$log" 2>/dev/null; then|
 }
 SED
 try "vnext_cap_log_symlink" "cap watcher log does not truncate a host file through a symlink"
@@ -5805,13 +5814,13 @@ SED
 try "vnext_teardown_solo_unconditional" "teardown removes even a fresh browser-open" "$CLI" "$HOOKS_BATS"
 
 # cleat shell and cleat login cap the watcher log before spawning, as the
-# session always did.
+# session always did. Retargeted (v1.5.4): the log is host-only.
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$_shell_clip_dir\/\.watcher-log" >\/dev\/null/d
+/_cap_watcher_log "[$]_shell_watcher_log" /d
 SED
 try "vnext_shell_caps_watcher_log" "shell: caps an oversized watcher log" "$CLI" "$DOCKER_COMMANDS_BATS"
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$_login_clip_dir\/\.watcher-log" >\/dev\/null/d
+/_cap_watcher_log "[$]_login_watcher_log" /d
 SED
 try "vnext_login_caps_watcher_log" "login: caps an oversized watcher log" "$CLI" "$DOCKER_COMMANDS_BATS"
 
@@ -10007,7 +10016,7 @@ try "vnext_session_end_reports_hook_drops" "a hook drop written during the sessi
 
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
-  s@^  _proxy_log_off="[$](_cap_watcher_log "[$]_proxy_log_file")"$@  _proxy_log_off=0@
+  s@^  _proxy_log_off="[$](_cap_watcher_log "[$]_proxy_log_file" .*$@  _proxy_log_off=0@
 }
 SED
 try "vnext_session_end_proxy_log_offset" "a refusal from an earlier session is not repeated" "$CLI" "$EXEC_CLAUDE_BATS"
@@ -12698,6 +12707,38 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_login_reads_host_log" "cleat login reports a browser open the gate refused"
+
+# ── v1.5.4: the watcher log leaves the mount, and its cap rotates by rename ──
+
+# The cap emptied an oversized log in place, through whatever link the box
+# swapped in after the pre-filter. Put the in-place truncate back.
+cat > "$SED_TMP" << 'SED'
+/^_cap_watcher_log()/,/^}$/{
+  s|if mv -f "[$]log" "[$]claimed" 2>/dev/null; then|if : > "$log" 2>/dev/null; then|
+}
+SED
+try "v154_cap_log_renames_not_truncates" "capping a watcher log never truncates through a link swapped in"
+
+# The size read opened the log, so a FIFO swapped in after the pre-filter hung
+# the caller.
+cat > "$SED_TMP" << 'SED'
+/^_cap_watcher_log()/,/^}$/{
+  s@sz="[$](_path_size "[$]log")"@sz="$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]' || echo 0)"@
+}
+SED
+try "v154_cap_log_size_never_opens" "a FIFO swapped in after the check never blocks"
+
+# Every watcher spawn opened the in-mount name for `>>` with no check, so a
+# link planted after the cap sent watcher output into a host file the box
+# chose. Put the log back in the clip dir, once per caller.
+cat > "$SED_TMP" << 'SED'
+/^_watcher_log_path()/,/^}$/{
+  s|/logs/watcher[.]log|/clip/.watcher-log|
+}
+SED
+try "v154_session_watcher_log_host_only" "session watchers never append through a link"
+try "v154_shell_watcher_log_host_only" "cleat shell never appends watcher output through a link"
+try "v154_login_watcher_log_host_only" "cleat login never appends watcher output through a link"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

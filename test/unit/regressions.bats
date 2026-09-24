@@ -6986,3 +6986,143 @@ _mount_targets_fixture() {
   run cat "$sdir/${uuid}.jsonl"
   assert_output "transcript"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the hook bridge's liveness marker lived in hooks/, the box's own
+# read-write mount, and the reader trusted any regular .bridge.<pid> there that
+# named a live pid. A marker the box planted made every session believe a bridge
+# was already running, so no bridge started and no host hook ever ran while the
+# summary still listed the cap. The markers now live in the host-only
+# hookbridge/ beside it.
+@test "regression v1.5.4: a bridge marker the box planted in its hooks mount stood the hook bridge down" {
+  command -v jq >/dev/null 2>&1 || skip "the bridge branch needs jq on the host"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  _host_open_cmd() { echo ""; }
+  local cname="test-planted-mark" rec="$TEST_TEMP/bridge_started"
+  mkdir -p "$CLEAT_RUN_DIR/$cname/hooks"
+  # The test's own pid, which is alive, as the box would name any live pid.
+  : > "$CLEAT_RUN_DIR/$cname/hooks/.bridge.$$"
+  # The bridge is spawned in the background, so it leaves a record and
+  # exec_claude is held at the next step until the record exists. Bounded, so a
+  # bridge that never spawns fails rather than hangs.
+  _hook_bridge_watcher() { : > "$rec"; }
+  _wait_for_coder_remap() {
+    local i=0
+    while [ ! -f "$rec" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  }
+  run exec_claude "$cname" --dangerously-skip-permissions
+  run test -f "$rec"
+  assert_success
+}
+
+# v1.5.4: the marker was written with a plain redirect into the same read-write
+# mount. A dangling link the box left at hooks/.bridge.<pid> made the host
+# create an empty file at a host path the box picked, and a FIFO there hung the
+# session start. The writer now puts the marker in hookbridge/, where the reader
+# looks, and never writes through a name in the box's mount.
+@test "regression v1.5.4: the bridge marker was written through a link the box planted in its hooks mount" {
+  command -v jq >/dev/null 2>&1 || skip "the bridge branch needs jq on the host"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  _host_open_cmd() { echo ""; }
+  local cname="test-marker-link" rec="$TEST_TEMP/bridge_seen"
+  mkdir -p "$CLEAT_RUN_DIR/$cname/hooks" "$TEST_TEMP/outside"
+  ln -s "$TEST_TEMP/outside/made-by-host" "$CLEAT_RUN_DIR/$cname/hooks/.bridge.$$"
+  # What the next terminal on this box would see once this bridge is up.
+  _hook_bridge_watcher() {
+    if _box_hook_bridge_live "$3"; then echo live; else echo absent; fi > "$rec.part"
+    mv "$rec.part" "$rec"
+  }
+  _wait_for_coder_remap() {
+    local i=0
+    while [ ! -f "$rec" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  }
+  run exec_claude "$cname" --dangerously-skip-permissions
+  run test -e "$TEST_TEMP/outside/made-by-host"
+  assert_failure
+  run cat "$rec"
+  assert_output "live"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the hook spool had no bound. The box appends to it through the
+# read-write hooks mount and the bridge only ever read forward, so a box with
+# project hooks queued host disk without limit for as long as it lived. The
+# spool is grown past the cap AFTER the bridge's start pass, so only the
+# per-poll claim can catch it: a spool planted before the start is claimed by
+# the start call and would pass a build with no per-poll call.
+@test "regression v1.5.4: the hook spool grew without bound" {
+  _HOOK_SPOOL_MAX=200
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  # One event past the cap. Its translation is the only work the pass does.
+  printf '{"hook_event_name":"Stop","pad":"%s"}\n' "$(head -c 250 /dev/zero | tr '\0' 'x')" >> "$spool"
+  i=0
+  while [ -e "$spool" ] && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run test -e "$spool"
+  assert_failure
+  run ls -A "$CLEAT_RUN_DIR/box-a/hookclaim"
+  assert_output ""
+}
+
+# v1.5.4: and with no bridge at all (no host hook, no jq, or a shell or login
+# session) nothing read the spool, so it kept every byte the box queued for the
+# life of the box. Every session entry now bounds it: start, resume, claude,
+# shell and login.
+@test "regression v1.5.4: a hooks box with no bridge kept its spool for its whole life" {
+  # The cap is on, a project hook forwards into the spool, the host has no hook
+  # of its own, so no bridge ever starts to read what the box queues.
+  printf '[caps]\nhooks\n' > "$CLEAT_GLOBAL_CONFIG"
+  : > "$HOME/.claude/settings.json"
+  _host_open_cmd() { echo ""; }
+  _HOOK_SPOOL_MAX=100
+  mkdir -p "$TEST_TEMP/project/.claude"
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' \
+    > "$TEST_TEMP/project/.claude/settings.json"
+  local cname spool
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  spool="$CLEAT_RUN_DIR/$cname/hooks/events.jsonl"
+  mkdir -p "${spool%/*}"
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Discarded"
+  run test -e "$spool"
+  assert_failure
+  run cat "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output --partial "	spool	$cname	"
+  # The same pass runs at a login and at a Claude session.
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  run cmd_login "$TEST_TEMP/project"
+  assert_output --partial "Discarded"
+  run test -e "$spool"
+  assert_failure
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  resolve_caps "$TEST_TEMP/project"
+  run exec_claude "$cname" --dangerously-skip-permissions
+  assert_output --partial "Discarded"
+  run test -e "$spool"
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: a rotated hook drop log silenced the session-end report. The log
+# rotates past 1 MiB, and the report tailed from an offset captured before the
+# session. A rotation done by the bridge, which runs in the background, never
+# reset that offset, so it pointed past the end of the new file and the drops
+# of the rest of the session were never reported.
+@test "regression v1.5.4: a rotated hook drop log silenced the session-end report" {
+  mkdir -p "$CLEAT_STATE_DIR"
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\ttext\n' "$_HOOK_DROP_MARK" > "$CLEAT_STATE_DIR/hook-drops.log"
+  run _maybe_report_hook_drops "$CLEAT_STATE_DIR/hook-drops.log" 5000 box-a
+  assert_success
+  assert_output --partial "Dropped"
+}

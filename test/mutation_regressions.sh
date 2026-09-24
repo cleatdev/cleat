@@ -11648,6 +11648,190 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_session_trash_entry_exclusive" "a session delete wrote through a link already at its trash entry name"
+
+# The hook bridge's liveness markers are read from the host-only hookbridge/.
+# Read back from hooks/, the box's read-write mount, a marker the box planted
+# naming any live pid stands the bridge down and no host hook runs.
+cat > "$SED_TMP" << 'SED'
+/^_box_hook_bridge_live()/,/^}$/{
+  s@^  for m in "[$]CLEAT_RUN_DIR/[$]1"/hookbridge/[.]bridge[.][*]; do$@  for m in "$CLEAT_RUN_DIR/$1"/hooks/.bridge.*; do@
+}
+SED
+try "v154_hook_marker_read_host_only" "a bridge marker the box planted in its hooks mount stood the hook bridge down"
+
+# And written there. A plain redirect into hooks/ opens whatever the box left
+# at the name: a dangling link creates a host file, a FIFO hangs the start.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^      ( umask 077; : > "[$]CLEAT_RUN_DIR/[$]{cname}/hookbridge/[.]bridge[.][$][$]" ) 2>/dev/null || true$@      ( umask 077; : > "${hooks_file%/*}/.bridge.$$" ) 2>/dev/null || true@
+}
+SED
+try "v154_hook_marker_write_host_only" "the bridge marker was written through a link the box planted in its hooks mount"
+
+# The marker dir is made before the write. Without it the write fails in
+# silence and the next terminal on the box starts a second bridge.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^      mkdir -p "[$]CLEAT_RUN_DIR/[$]{cname}/hookbridge" 2>/dev/null || true$@      :@
+}
+SED
+try "v154_hook_marker_dir_created" "the bridge marker was written through a link the box planted in its hooks mount"
+
+# The hook spool is bounded while a bridge runs. Both watcher calls become
+# `false`, which leaves the start line a no-op under its `|| true` and never
+# enters the per-poll `then`. The session-entry calls name the spool by its full
+# path through _hook_spool_entry_cap, outside the range.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s|_hook_spool_cap "[$]hooks_file"|false "$hooks_file"|
+}
+SED
+try "v154_hook_spool_cap" "the hook spool grew without bound"
+
+# The bridge's start pass alone. A spool already past the cap when the bridge
+# starts would be claimed by the first poll with nothing counted, because the
+# bridge starts at its end.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^  _hook_spool_cap "[$]hooks_file" "[$]_hb_cname" 0 || true$@  :@
+}
+SED
+try "v154_spool_start_claim" "a spool already past the cap when the bridge starts is claimed and counted whole" \
+    "$CLI" "$HOOKS_BATS"
+
+# And at every session entry, with or without a bridge. The pass itself, then
+# each of its three callers.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_entry_cap()/,/^}$/{
+  s|_hook_spool_cap "[$]CLEAT_RUN_DIR|false "$CLEAT_RUN_DIR|
+}
+SED
+try "v154_hook_spool_entry_cap" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  /^  _hook_spool_entry_cap "[$]cname"$/d
+}
+SED
+try "v154_hook_spool_entry_shell" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  /^  _hook_spool_entry_cap "[$]cname"$/d
+}
+SED
+try "v154_hook_spool_entry_login" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /^  _hook_spool_entry_cap "[$]cname"$/d
+}
+SED
+try "v154_hook_spool_entry_claude" "a hooks box with no bridge kept its spool for its whole life"
+
+# A shell or a login reports what the entry pass discarded, as a Claude session
+# does. Without the report the discard is silent.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  /^  _maybe_report_hook_drops "[$]_shell_drop_log" /d
+}
+SED
+try "v154_hook_report_shell" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  /^  _maybe_report_hook_drops "[$]_login_drop_log" /d
+}
+SED
+try "v154_hook_report_login" "a hooks box with no bridge kept its spool for its whole life"
+
+# The hook drop report reads the whole log when its offset points past the end,
+# which is what a rotation leaves behind.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  /^  \[ "[$]off" -le "[$]sz" \] || off=0$/d
+}
+SED
+try "v154_hook_report_after_rotation" "a rotated hook drop log silenced the session-end report"
+
+# A spool discard is reported as bytes discarded, never as refused events.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  /[$]3 == "spool"/d
+}
+SED
+try "v154_spool_report_split" "a claimed spool reports the discarded bytes at session end" \
+    "$CLI" "$HOOKS_BATS"
+
+# The spool is claimed by rename. Truncating it through its name writes through
+# a link the box planted after the pre-filter.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_cap()/,/^}$/{
+  s#mv -f "[$]spool" "[$]claimed" 2>/dev/null || return 1#: > "$spool"#
+}
+SED
+try "v154_spool_claim_by_rename" "the spool cap never writes through a link planted at the spool" \
+    "$CLI" "$HOOKS_BATS"
+
+# Sized with a stat. `wc -c <` opens the spool, and a FIFO the box plants after
+# the pre-filter hangs the foreground session-entry pass.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_cap()/,/^}$/{
+  s#size="[$](_path_size "[$]spool")"#size="$(wc -c < "$spool")"#
+}
+SED
+try "v154_spool_size_without_open" "the spool cap never blocks on a FIFO planted at the spool" \
+    "$CLI" "$HOOKS_BATS"
+
+# The claim dir is hooks/'s host-only sibling. A claim dir inside the mount
+# reinstates the race the rename exists to close.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_cap()/,/^}$/{
+  s#claim_dir="[$]{claim_dir%/[*]}/hookclaim"#claim_dir="$claim_dir/.hookclaim"#
+}
+SED
+try "v154_spool_claim_outside_mount" "a missing claim dir skips the cap rather than writing in the hooks dir" \
+    "$CLI" "$HOOKS_BATS"
+
+# The entry pass stands aside for a live bridge, which owns the offset.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_entry_cap()/,/^}$/{
+  s#&& ! _box_hook_bridge_live "[$]cname"##
+}
+SED
+try "v154_spool_entry_live_bridge" "a session start leaves the spool alone while another bridge is live" \
+    "$CLI" "$HOOKS_BATS"
+
+# A bridge pass stops at its line budget, so a flood of short lines cannot keep
+# the cap from being checked. Timing based: the flood outlasts the test window
+# only when every line is handled in one pass.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  /\[ "[$]_hb_lines" -le "[$]_HOOK_PASS_LINES" \] || break/d
+}
+SED
+try "v154_spool_pass_budget" "the spool cap still runs while the box floods the spool with short lines" \
+    "$CLI" "$HOOKS_BATS"
+
+# A per-poll claim resets the offset. The box can append past the old offset
+# before the next poll, and the fresh spool's first event would be skipped.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s#then byte_offset=0; _hb_skip=0; fi#then _hb_skip=0; fi#
+}
+SED
+try "v154_spool_offset_reset" "the first events after a per-poll claim are delivered" \
+    "$CLI" "$HOOKS_BATS"
+
+# The size read after a claim is braced, so a missing spool writes no error to
+# the watcher log on every poll.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s#file_size=[$]( { wc -c < "[$]hooks_file"; } 2>/dev/null || echo 0)#file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)#
+}
+SED
+try "v154_spool_size_read_quiet" "a claimed spool leaves no error in the watcher log" \
+    "$CLI" "$HOOKS_BATS"
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

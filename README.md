@@ -126,7 +126,7 @@ Cleat gives you the best of both worlds:
 - **Contained Claude home** -- a box sees only its own project's Claude history. The instruction surfaces your host `claude` obeys are read-only inside the cage
 - **Account switching** -- `cleat account` keeps two or more Claude logins under names and pins a box to one, so hitting the five-hour limit on one Max account is one command instead of a browser login. Conversations and project history are shared across the switch
 - **Session management** -- `cleat session` lists a box's Claude conversations with their real sizes, deletes the ones you are done with (which the Claude Code CLI itself cannot do for a single conversation) and keeps them restorable in a trash for 30 days
-- **Hook execution on host** -- the hooks in your `~/.claude/settings.json` run on the host, not in the container. Hooks a project defines never run there
+- **Hook execution on host** -- the hooks in your `~/.claude/settings.json` run on the host, not in the container. Hooks a project defines never run there. The event queue the box writes is bounded at every session start and while a hook bridge runs
 - **Browser bridge** -- `open` and `xdg-open` inside the container forward URLs to your host browser. Cleat checks the origin first, so the box cannot choose where your logged-in browser goes
 - **Host connectivity** -- `host.docker.internal` always available, user-defined hooks and MCP servers work out of the box
 - **Configuration drift detection** -- notifies when config has changed since container creation
@@ -1041,7 +1041,7 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
                             [fork] exclude, plus any [box.<name>.<kind>] overrides
 <project>/.cleat.env      ← project-level env vars
 <project>/.cleat.<box>.env ← per-box env vars (falls back to .cleat.env)
-~/.config/cleat/state/hook-drops.log ← hook events the bridge refused (hooks cap)
+~/.config/cleat/state/hook-drops.log ← hook events the bridge refused and spool discards (hooks cap)
 ~/.config/cleat/state/hook-runs.log  ← hook events handed to your hooks (hooks cap)
 ```
 

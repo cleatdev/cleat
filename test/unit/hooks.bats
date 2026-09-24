@@ -3174,23 +3174,23 @@ _host_hook_appends() {
   export DOCKER_EXIT_CODE=0
   printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' > "$HOME/.claude/settings.json"
   ACTIVE_CAPS=(hooks)
-  mkdir -p "$CLEAT_RUN_DIR/two-term/hooks"
+  mkdir -p "$CLEAT_RUN_DIR/two-term/hooks" "$CLEAT_RUN_DIR/two-term/hookbridge"
   # Another terminal's bridge, alive.
-  : > "$CLEAT_RUN_DIR/two-term/hooks/.bridge.$$"
+  : > "$CLEAT_RUN_DIR/two-term/hookbridge/.bridge.$$"
 
   _HOOK_BRIDGE_PID="unset"
   run exec_claude "two-term" --dangerously-skip-permissions
   assert_success
   # Its marker is untouched: this session did not take it over or remove it.
-  run test -f "$CLEAT_RUN_DIR/two-term/hooks/.bridge.$$"
+  run test -f "$CLEAT_RUN_DIR/two-term/hookbridge/.bridge.$$"
   assert_success
 
   # A marker whose pid is gone is not a bridge, so this session starts one.
-  rm -f "$CLEAT_RUN_DIR/two-term/hooks/.bridge.$$"
-  : > "$CLEAT_RUN_DIR/two-term/hooks/.bridge.999999"
+  rm -f "$CLEAT_RUN_DIR/two-term/hookbridge/.bridge.$$"
+  : > "$CLEAT_RUN_DIR/two-term/hookbridge/.bridge.999999"
   run _box_hook_bridge_live two-term
   assert_failure
-  run test -e "$CLEAT_RUN_DIR/two-term/hooks/.bridge.999999"
+  run test -e "$CLEAT_RUN_DIR/two-term/hookbridge/.bridge.999999"
   assert_failure
 }
 
@@ -3264,4 +3264,272 @@ _host_hook_appends() {
   sleep 0.2
   run cat "$ran"
   refute_output --partial "hit"
+}
+
+# ── The spool cap ────────────────────────────────────────────────────────────
+# The spool is box-written through a read-write mount and the bridge only ever
+# reads forward, so nothing bounded it. It is claimed by rename into hookclaim/
+# (outside every mount) and deleted, never truncated through its name.
+
+_spool_box() {   # makes $CLEAT_RUN_DIR/box-a/hooks/events.jsonl holding $1 bytes
+  mkdir -p "$CLEAT_RUN_DIR/box-a/hooks"
+  head -c "$1" /dev/zero | tr '\0' 'x' > "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl"
+}
+
+@test "hooks: the spool is claimed and removed when it passes the cap" {
+  _HOOK_SPOOL_MAX=100
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl"
+  _spool_box 99
+  run _hook_spool_cap "$spool" box-a 0
+  assert_failure
+  run wc -c < "$spool"
+  assert_output --regexp '^ *99$'
+  _spool_box 150
+  run _hook_spool_cap "$spool" box-a 40
+  assert_success
+  run test -e "$spool"
+  assert_failure
+  # The claim is gone at once, so no second box-sized file persists.
+  run ls -A "$CLEAT_RUN_DIR/box-a/hookclaim"
+  assert_output ""
+  # One row: reason spool, the box, and the unread bytes in the offset field.
+  run awk -F '\t' -v m="$_HOOK_DROP_MARK" '$2 == m { print $3, $4, $6 }' "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output "spool box-a 110"
+}
+
+@test "hooks: a claimed spool reports the discarded bytes at session end" {
+  _HOOK_SPOOL_MAX=100
+  _spool_box 150
+  _hook_spool_cap "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" box-a 0
+  mkdir -p "$CLEAT_RUN_DIR/box-b/hooks"
+  head -c 300 /dev/zero > "$CLEAT_RUN_DIR/box-b/hooks/events.jsonl"
+  _hook_spool_cap "$CLEAT_RUN_DIR/box-b/hooks/events.jsonl" box-b 0
+  run _maybe_report_hook_drops "$CLEAT_STATE_DIR/hook-drops.log" 0 box-a
+  assert_success
+  assert_output --partial "Discarded"
+  assert_output --partial "150"
+  assert_output --partial "bytes of queued hook events to keep the spool under its cap"
+  refute_output --partial "300"
+  refute_output --partial "failed validation"
+  refute_output --partial "Dropped"
+}
+
+@test "hooks: the spool cap never writes through a link planted at the spool" {
+  # The pre-filter would remove a link planted before the call, so it is
+  # stubbed out: what is under test is a link planted after it returned.
+  _drop_unless_regular() { :; }
+  _HOOK_SPOOL_MAX=100
+  mkdir -p "$CLEAT_RUN_DIR/box-a/hooks"
+  head -c 200 /dev/zero | tr '\0' 'v' > "$TEST_TEMP/victim"
+  cp "$TEST_TEMP/victim" "$TEST_TEMP/victim.orig"
+  ln -s "$TEST_TEMP/victim" "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl"
+  run _hook_spool_cap "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" box-a 0
+  run cmp "$TEST_TEMP/victim" "$TEST_TEMP/victim.orig"
+  assert_success
+  run ls -A "$CLEAT_RUN_DIR/box-a/hookclaim"
+  assert_output ""
+}
+
+@test "hooks: a missing claim dir skips the cap rather than writing in the hooks dir" {
+  _HOOK_SPOOL_MAX=100
+  _spool_box 150
+  # A file where the claim dir goes, so it cannot be made.
+  : > "$CLEAT_RUN_DIR/box-a/hookclaim"
+  run _hook_spool_cap "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" box-a 0
+  assert_failure
+  run wc -c < "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl"
+  assert_output --regexp '^ *150$'
+  run ls -A "$CLEAT_RUN_DIR/box-a/hooks"
+  assert_output "events.jsonl"
+}
+
+@test "hooks: a session start leaves the spool alone while another bridge is live" {
+  _host_open_cmd() { echo ""; }
+  _HOOK_SPOOL_MAX=100
+  local cname spool
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mkdir -p "$TEST_TEMP/project"
+  mock_docker_ps "$cname"
+  spool="$CLEAT_RUN_DIR/$cname/hooks/events.jsonl"
+  mkdir -p "${spool%/*}"
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  # This test's own pid is alive, so the bridge it names reads as live.
+  mkdir -p "$CLEAT_RUN_DIR/$cname/hookbridge"
+  : > "$CLEAT_RUN_DIR/$cname/hookbridge/.bridge.$$"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  run wc -c < "$spool"
+  assert_output --regexp '^ *150$'
+}
+
+@test "hooks: the spool cap never blocks on a FIFO planted at the spool" {
+  # The session-entry pass runs in the foreground, so a read that opens the
+  # spool would hang the session on a FIFO the box re-plants after the
+  # pre-filter. The pre-filter is stubbed out to stand for that race.
+  _drop_unless_regular() { :; }
+  _HOOK_SPOOL_MAX=100
+  mkdir -p "$CLEAT_RUN_DIR/box-a/hooks"
+  mkfifo "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl"
+  _hook_spool_cap "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" box-a 0 &
+  local pid=$!
+  if ! process_exited "$pid"; then
+    # Hand the blocked reader a writer and close it, so it returns rather than
+    # outlive the test. Opening read-write never blocks on a FIFO.
+    exec 4<>"$CLEAT_RUN_DIR/box-a/hooks/events.jsonl"
+    exec 4>&-
+    wait "$pid" 2>/dev/null || true
+    fail "the spool cap blocked on the FIFO"
+  fi
+  wait "$pid" 2>/dev/null || true
+  run test -p "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl"
+  assert_success
+}
+
+@test "hooks: a session start bounds the spool of a box that kept its hooks mount with the cap off" {
+  # The cap was on at create, so the box has the read-write spool mount. It
+  # stays when the cap is turned off and the recreate is declined.
+  _host_open_cmd() { echo ""; }
+  printf '[caps]\n' > "$CLEAT_GLOBAL_CONFIG"
+  _HOOK_SPOOL_MAX=100
+  local cname spool
+  mkdir -p "$TEST_TEMP/project"
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  spool="$CLEAT_RUN_DIR/$cname/hooks/events.jsonl"
+  mkdir -p "${spool%/*}"
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  run test -e "$spool"
+  assert_failure
+}
+
+@test "hooks: the spool cap still runs while the box floods the spool with short lines" {
+  # Every line costs the host a few forks, so a pass over a flood of junk
+  # lines could run for minutes with the cap never checked. The pass stops at
+  # its line budget and the claim check after it runs every poll.
+  _HOOK_SPOOL_MAX=200
+  _HOOK_PASS_LINES=8
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  # Far more lines than an unbudgeted pass handles inside the window below,
+  # every one a JSON refusal with its own forks.
+  seq 1 20000 | sed 's/.*/x/' >> "$spool"
+  i=0
+  while [ -e "$spool" ] && [ "$i" -lt 40 ]; do sleep 0.5; i=$((i+1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run test -e "$spool"
+  assert_failure
+}
+
+@test "hooks: a claimed spool leaves no error in the watcher log" {
+  # The spool stays missing after a claim until the box's next event, and a
+  # size read that let its redirect error through wrote one line per poll.
+  _HOOK_SPOOL_MAX=200
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" > "$TEST_TEMP/wlog" 2>&1 &
+  bpid=$!
+  sleep 0.7
+  head -c 300 /dev/zero | tr '\0' 'x' >> "$spool"
+  i=0
+  while [ -e "$spool" ] && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+  sleep 1.2
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run test -e "$spool"
+  assert_failure
+  run grep -c 'No such file' "$TEST_TEMP/wlog"
+  assert_output "0"
+}
+
+@test "hooks: a bridge marker planted in the hooks mount is not a live bridge" {
+  # hooks/ is the box's read-write mount. A marker there naming a live pid
+  # used to stand the bridge and the spool cap's session-entry pass down.
+  _host_open_cmd() { echo ""; }
+  _HOOK_SPOOL_MAX=100
+  local cname spool
+  mkdir -p "$TEST_TEMP/project"
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  spool="$CLEAT_RUN_DIR/$cname/hooks/events.jsonl"
+  mkdir -p "${spool%/*}"
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  : > "${spool%/*}/.bridge.$$"
+  run _box_hook_bridge_live "$cname"
+  assert_failure
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  run test -e "$spool"
+  assert_failure
+}
+
+@test "hooks: the first events after a per-poll claim are delivered" {
+  # After a claim the box's next event starts a fresh spool. The offset is
+  # reset with the claim, because the box can append past the old offset
+  # before the next poll, and the bytes it skipped would be the fresh spool's
+  # first event. Only unread bytes are ever counted as discarded.
+  command -v jq >/dev/null 2>&1 || skip "the bridge needs jq on the host"
+  _HOOK_SPOOL_MAX=200
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
+  _execute_host_hook_bg() { printf '%s\n' "$1" >> "$TEST_TEMP/ran"; }
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  for i in 1 2 3 4; do
+    printf '{"hook_event_name":"Stop","n":"old%s","pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxx"}\n' "$i" >> "$spool"
+  done
+  i=0
+  while [ -e "$spool" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+  # The fresh spool's first event, longer than everything read before it.
+  printf '{"hook_event_name":"Stop","n":"fresh","pad":"%s"}\n' "$(head -c 400 /dev/zero | tr '\0' 'y')" >> "$spool"
+  i=0
+  while ! grep -q '"fresh"' "$TEST_TEMP/ran" 2>/dev/null && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run grep -c '"old' "$TEST_TEMP/ran"
+  assert_output "4"
+  run grep -c '"fresh"' "$TEST_TEMP/ran"
+  assert_output "1"
+  # All four were delivered before the claim, so nothing was discarded.
+  local rows
+  rows="$(cat "$CLEAT_STATE_DIR/hook-drops.log" 2>/dev/null | grep -c "	spool	" || true)"
+  assert_equal "$rows" "0"
+}
+
+@test "hooks: a spool already past the cap when the bridge starts is claimed and counted whole" {
+  # The bridge starts at the end of the spool, so nothing in it would ever be
+  # delivered. The start pass claims it and counts every byte as discarded.
+  _HOOK_SPOOL_MAX=200
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
+  mkdir -p "${spool%/*}"
+  head -c 300 /dev/zero | tr '\0' 'x' > "$spool"
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  i=0
+  while [ -e "$spool" ] && [ "$i" -lt 60 ]; do sleep 0.1; i=$((i+1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run test -e "$spool"
+  assert_failure
+  run awk -F '\t' '$3 == "spool" { print $4, $6 }' "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output "box-a 300"
+}
+
+@test "hooks: a spool discard from an earlier session is not reported again" {
+  _HOOK_SPOOL_MAX=100
+  _spool_box 150
+  _hook_spool_cap "$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" box-a 0
+  local off; off="$(wc -c < "$CLEAT_STATE_DIR/hook-drops.log" | tr -d '[:space:]')"
+  run _maybe_report_hook_drops "$CLEAT_STATE_DIR/hook-drops.log" "$off" box-a
+  assert_success
+  assert_output ""
 }

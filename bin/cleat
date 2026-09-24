@@ -70,14 +70,15 @@ CLEAT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cleat"
 CLEAT_GLOBAL_CONFIG="$CLEAT_CONFIG_DIR/config"
 CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 
-# Per-container runtime state: the settings overlay, clipboard bridge, and hook
-# event spool. Persistent (deliberately NOT under /tmp) so macOS file rotation
-# and reboots can't delete a container's bind-mount sources out from under it and
-# force a recreate (which would discard the container's writable layer, e.g. an
-# ad-hoc `az` install). One dir per container:
-#   $CLEAT_RUN_DIR/<cname>/{settings,clip,hooks,kit}
-# settings and hooks are host-side state. clip and the kit masks ARE mounted in
-# (kit/* read-only).
+# Per-container runtime state, one dir per container. Persistent (deliberately
+# NOT under /tmp) so macOS file rotation and reboots can't delete a container's
+# bind-mount sources out from under it and force a recreate (which would discard
+# the container's writable layer, e.g. an ad-hoc `az` install).
+#   $CLEAT_RUN_DIR/<cname>/{auth,clip,home,hooks,kit,settings}   mount sources
+#   $CLEAT_RUN_DIR/<cname>/{clipclaim,clipimg-stage,hookbridge,hookclaim}   host-only
+# The host-only siblings hold what the box must not reach (claims, rate ledgers,
+# staged images), so none of them may ever be mounted. Which mounts are
+# read-only is decided in cmd_run's mount_args, not here.
 CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 # Host-side per-box descriptions, keyed by container name. NOT Docker labels:
@@ -7596,6 +7597,17 @@ _browser_claim_url() {
   return 0
 }
 
+# Byte size of what a path names, or 0 when it can't be read, WITHOUT opening
+# it. It follows a symlink, as `wc -c <` does, but a FIFO or a device reads as
+# 0 rather than blocking the caller on its open. GNU stat (-c) first, then
+# BSD/macOS (-f).
+_path_size() {
+  local z
+  z="$(stat -L -c %s "$1" 2>/dev/null || stat -L -f %z "$1" 2>/dev/null || echo "")"
+  case "$z" in ''|*[!0-9]*) z=0 ;; esac
+  printf '%s' "$z"
+}
+
 # Epoch mtime of a path, or 0 when it can't be read. GNU stat (-c) first, then
 # BSD/macOS (-f).
 _path_mtime() {
@@ -8239,12 +8251,15 @@ _hook_bridge_watcher() {
   # signal at all. `[[ -f ]]` dereferences, so the link test has to come first.
   _drop_unless_regular "$hooks_file"
   [[ -f "$hooks_file" ]] || return 0
+  _hook_spool_cap "$hooks_file" "$_hb_cname" 0 || true
 
   # Tail new lines and execute matching host hooks.
   # We track our byte offset to avoid wc -l / tail race conditions.
   # Start from the current end of the file to skip events from prior sessions.
   local byte_offset
-  byte_offset=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
+  # Braced so a missing spool's redirect error is silenced too: a claim removes
+  # the spool, and it stays missing until the box's next event.
+  byte_offset=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)
   byte_offset=$((byte_offset + 0))
   # Set while the rest of an oversized line is being discarded. Kept across
   # passes, because one line can span two read windows.
@@ -8261,7 +8276,7 @@ _hook_bridge_watcher() {
       exit 0
     fi
     local file_size
-    file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)
+    file_size=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)
     file_size=$((file_size + 0))
 
     local _win _start _count
@@ -8274,8 +8289,12 @@ _hook_bridge_watcher() {
 
       # _hb_pos is the spool byte offset of the chunk being handled, which the
       # logs record so an entry can be found in the spool afterwards.
-      local _hb_pos=$(( _start - 1 )) _hb_lpos
+      local _hb_pos=$(( _start - 1 )) _hb_lpos _hb_lines=0
       while _hook_read_chunk; do
+        # A chunk read here but not handled is read again next pass, because
+        # the offset below only moves past what was handled.
+        _hb_lines=$(( _hb_lines + 1 ))
+        [ "$_hb_lines" -le "$_HOOK_PASS_LINES" ] || break
         _hb_lpos=$_hb_pos
         # Over the cap: the read stopped at the cap, so the newline is still
         # unread and the rest of the line follows as more chunks. Log the line
@@ -8321,6 +8340,12 @@ _hook_bridge_watcher() {
       # supposedly wrote. _hb_pos tracks what the reader actually took.
       byte_offset=$_hb_pos
     fi
+    # Bounded while the session is attached. After this pass delivered what it
+    # could, so only what arrived since is discarded. The offset is reset here
+    # rather than left to the shrink-rewind above, because the box can append
+    # past the old offset before the next poll and the rewind would never fire.
+    # A discard in progress ends with the spool it was discarding.
+    if [ "$file_size" -ge "$_HOOK_SPOOL_MAX" ] && _hook_spool_cap "$hooks_file" "$_hb_cname" "$byte_offset"; then byte_offset=0; _hb_skip=0; fi
     sleep 0.5
   done
 }
@@ -8345,6 +8370,60 @@ _hook_bridge_window() {
   [[ "$size" -lt "$offset" ]] && offset=0
   [[ "$size" -gt "$offset" ]] || return 1
   printf '%s %s' "$(( offset + 1 ))" "$(( size - offset ))"
+}
+
+# Bound the box-written hook spool. rc 0 when the spool was at or past
+# _HOOK_SPOOL_MAX and has been claimed and deleted, 1 when nothing was touched.
+# $3 is how far the caller has already read, so only unread bytes are reported.
+#
+# The spool sits in a directory the box mounts read-write, so the box controls
+# its name between any check and any open. It is therefore CLAIMED BY RENAME
+# into hookclaim/, the sibling of hooks/ outside every mount, and never
+# truncated through its name: `: > "$spool"` after a check writes through
+# whatever link the box planted in between. rename(2) moves a link, a FIFO or a
+# directory without following or opening it, on BSD and GNU alike, and rm then
+# unlinks it unread. The box's next `cat >>` makes a fresh regular spool.
+#
+# Claimed and deleted rather than rotated: a rotation keeps a second host file
+# whose size the box also controls. The spool is a queue, not a log. What the
+# bridge ran is recorded in hook-runs.log, outside every mount.
+_hook_spool_cap() {
+  local spool="$1" cname="$2" off="${3:-0}" size claim_dir claimed
+  # A cheap pre-filter only: the box can plant a link after it returns.
+  _drop_unless_regular "$spool"
+  # Sized without opening it. The session-entry pass runs in the foreground,
+  # and `wc -c <` on a FIFO the box plants right after the pre-filter would
+  # hang `cleat shell` or `cleat start` until something wrote to it.
+  size="$(_path_size "$spool")"
+  [ "$size" -ge "$_HOOK_SPOOL_MAX" ] || return 1
+  claim_dir="${spool%/*}"
+  claim_dir="${claim_dir%/*}/hookclaim"
+  # Never fall back into the hooks directory, as the clipboard claim may: a
+  # claim made inside the mount reinstates the race this exists to close.
+  mkdir -p "$claim_dir" 2>/dev/null || return 1
+  [ -d "$claim_dir" ] && [ ! -L "$claim_dir" ] || return 1
+  claimed="$claim_dir/.spool.$$.$RANDOM"
+  mv -f "$spool" "$claimed" 2>/dev/null || return 1
+  rm -rf "$claimed" 2>/dev/null || true
+  # Bytes appended between the size read and the rename went with the claim
+  # uncounted, so the count is a lower bound.
+  if [ "$size" -gt "$off" ]; then
+    _hook_drop_log spool "" "$cname" "$(( size - off ))"
+  fi
+  return 0
+}
+
+# The session-entry pass: a box with a hooks mount and no live bridge gets its
+# spool bounded when a session starts, whether or not jq or a host hook is
+# there to start a bridge. A live bridge owns the offset, so it is left alone.
+# Keyed on the mount's directory rather than on the cap: a box created with the
+# cap keeps its read-write spool mount when the cap is turned off and the
+# recreate is declined, and that spool still needs a bound.
+_hook_spool_entry_cap() {
+  local cname="$1"
+  if [ -d "$CLEAT_RUN_DIR/$cname/hooks" ] && ! _box_hook_bridge_live "$cname"; then
+    _hook_spool_cap "$CLEAT_RUN_DIR/$cname/hooks/events.jsonl" "$cname" 0 || true
+  fi
 }
 
 # Read the next spool line from stdin into _HOOK_CHUNK, never more than one
@@ -8524,6 +8603,16 @@ _hook_bridge_live_count() {
 # on the read itself (_hook_read_chunk), so an oversized line is never held
 # whole in memory.
 _HOOK_LINE_MAX=1044480
+
+# The spool is box-written and the watcher only ever reads forward, so nothing
+# bounds it today. 64 MiB is 64 maximum lines, so the line cap always fires
+# first on any single legitimate event and this cap only ever catches volume.
+_HOOK_SPOOL_MAX=67108864
+# Spool lines one bridge pass handles before it checks the spool cap again. The
+# box picks the line count and every line costs the host a few forks, so an
+# unbounded pass let the box keep the cap from ever being checked by queueing
+# short lines faster than they were read. The rest waits for the next poll.
+_HOOK_PASS_LINES=256
 
 # Upstream's own ceilings: at most 256 path fields judged per event (more drops
 # it), and at most 64 missing components or symlink hops walked per path.
@@ -10055,6 +10144,7 @@ exec_claude() {
     _hook_drop_off="$(wc -c < "$_hook_drop_log_path" 2>/dev/null | tr -d '[:space:]')"
     case "$_hook_drop_off" in ''|*[!0-9]*) _hook_drop_off=0 ;; esac
   fi
+  _hook_spool_entry_cap "$cname"
 
   local clip_cmd
   clip_cmd="$(_host_clip_cmd)"
@@ -10166,8 +10256,13 @@ exec_claude() {
       # bridge would run every host hook a second time.
       _HOOK_BRIDGE_PID=""
     else
-      ( umask 077; : > "${hooks_file%/*}/.bridge.$$" ) 2>/dev/null || true
-      _HOOK_BRIDGE_MARK="${hooks_file%/*}/.bridge.$$"
+      # The marker lives beside hooks/, never in it. hooks/ is the box's own
+      # read-write mount, and a marker planted there naming any live pid made
+      # every session believe a bridge was running: no bridge started and the
+      # spool cap's session-entry pass stood down for the life of the box.
+      mkdir -p "$CLEAT_RUN_DIR/${cname}/hookbridge" 2>/dev/null || true
+      ( umask 077; : > "$CLEAT_RUN_DIR/${cname}/hookbridge/.bridge.$$" ) 2>/dev/null || true
+      _HOOK_BRIDGE_MARK="$CLEAT_RUN_DIR/${cname}/hookbridge/.bridge.$$"
       _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
       _HOOK_BRIDGE_PID=$!
       disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
@@ -10724,15 +10819,31 @@ EOF
 # counted row is a path refusal. An oversized line or a malformed one did not
 # name a path at all, so those get the neutral wording.
 _maybe_report_hook_drops() {
-  local log="$1" off="${2:-0}" cname="${3:-}" counts n np
+  local log="$1" off="${2:-0}" cname="${3:-}" counts n np nb sz
   [ -f "$log" ] || return 0
+  # The log rotates past 1 MiB, from this process or from a bridge running in
+  # the background, and an offset captured before a rotation points past the
+  # end of the new file. Read the whole new file then, or the report is silent.
+  sz="$(_path_size "$log")"
+  case "$off" in ''|*[!0-9]*) off=0 ;; esac
+  [ "$off" -le "$sz" ] || off=0
+  # A `spool` row is not a refused event: it is the spool cap discarding queued
+  # bytes, and its offset field carries how many. Summed on a line of its own,
+  # so a discard never reads as "failed validation".
   counts="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null \
     | awk -F '\t' -v m="$_HOOK_DROP_MARK" -v c="$cname" '
+        $2 == m && $4 == c && $3 == "spool" { if ($6 ~ /^[0-9]+$/) b += $6; next }
         $2 == m && $4 == c { n++; if ($3 == "path") p++ }
-        END { printf "%d %d", n, p }' 2>/dev/null)" || return 0
-  read -r n np <<< "$counts"
+        END { printf "%d %d %d", n, p, b }' 2>/dev/null)" || return 0
+  read -r n np nb <<< "$counts"
   case "$n" in ''|*[!0-9]*) return 0 ;; esac
   case "$np" in ''|*[!0-9]*) np=0 ;; esac
+  case "$nb" in ''|*[!0-9]*) nb=0 ;; esac
+  if [ "$nb" -gt 0 ]; then
+    echo ""
+    warn "Discarded ${BOLD}${nb}${RESET} bytes of queued hook events to keep the spool under its cap"
+    [ "$n" -gt 0 ] || return 0
+  fi
   [ "$n" -gt 0 ] || return 0
   echo ""
   if [ "$np" -eq "$n" ] && [ "$n" -eq 1 ]; then
@@ -12729,6 +12840,14 @@ cmd_shell() {
   # starts, so a refusal from an earlier session is never reported again.
   local _shell_proxy_off
   _shell_proxy_off="$(_cap_watcher_log "$_shell_clip_dir/.proxy-log")"
+  # The spool cap's discards are reported like exec_claude's hook drops, from
+  # this session's byte window of the per-install drop log.
+  local _shell_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _shell_drop_off=0
+  if [ -f "$_shell_drop_log" ]; then
+    _shell_drop_off="$(wc -c < "$_shell_drop_log" 2>/dev/null | tr -d '[:space:]')"
+    case "$_shell_drop_off" in ''|*[!0-9]*) _shell_drop_off=0 ;; esac
+  fi
+  _hook_spool_entry_cap "$cname"
   local _shell_open_cmd _shell_bw_pid=""
   _shell_open_cmd="$(_host_open_cmd)"
   if [ -n "$_shell_open_cmd" ]; then
@@ -12806,6 +12925,7 @@ cmd_shell() {
   # from this shell goes through the same watcher, and a refusal that lives only
   # in the box's log is the silent failure the report exists to end.
   _CLIP_DIR="$_shell_clip_dir" _maybe_report_blocked_opens "$_shell_clip_dir/.proxy-log" "$_shell_proxy_off"
+  _maybe_report_hook_drops "$_shell_drop_log" "$_shell_drop_off" "$cname"
   return "$shell_rc"
 }
 
@@ -12837,6 +12957,13 @@ cmd_login() {
   # reads as 0, so it is safe before the clip dir exists.
   local _login_proxy_off
   _login_proxy_off="$(_cap_watcher_log "$_login_clip_dir/.proxy-log")"
+  # See cmd_shell: the spool cap's discards, reported after the login.
+  local _login_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _login_drop_off=0
+  if [ -f "$_login_drop_log" ]; then
+    _login_drop_off="$(wc -c < "$_login_drop_log" 2>/dev/null | tr -d '[:space:]')"
+    case "$_login_drop_off" in ''|*[!0-9]*) _login_drop_off=0 ;; esac
+  fi
+  _hook_spool_entry_cap "$cname"
 
   if [ -n "$_login_open_cmd" ]; then
     mkdir -p "$_login_clip_dir"
@@ -12897,6 +13024,7 @@ cmd_login() {
   # promised the browser would open, and without this line nothing explains
   # why it did not.
   _CLIP_DIR="$_login_clip_dir" _maybe_report_blocked_opens "$_login_clip_dir/.proxy-log" "$_login_proxy_off"
+  _maybe_report_hook_drops "$_login_drop_log" "$_login_drop_off" "$cname"
 
   # A login into a pinned box lands in that box's staged copy. Only a harvest
   # carries it to the account. Without one the account still read "signed out"
@@ -13654,10 +13782,12 @@ _print_docker_vm_fix() {
 # attached-session markers beside it. Two terminals on one box each started a
 # bridge, both tailed the same spool, and every host hook ran TWICE per event:
 # a hook that writes, commits or notifies did it twice with nothing to say why
-# (2026-09-20). A marker whose pid is gone is removed on sight.
+# (2026-09-20). A marker whose pid is gone is removed on sight. The markers sit
+# in hookbridge/, a host-only sibling of the box's hooks/ mount, because a
+# marker the box could plant would stand every bridge and every spool check down.
 _box_hook_bridge_live() {
   local m pid found=1
-  for m in "$CLEAT_RUN_DIR/$1"/hooks/.bridge.*; do
+  for m in "$CLEAT_RUN_DIR/$1"/hookbridge/.bridge.*; do
     [[ -f "$m" ]] || continue
     pid="${m##*/.bridge.}"
     case "$pid" in ''|*[!0-9]*) continue ;; esac

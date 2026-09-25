@@ -11729,6 +11729,26 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_bridge_url_cap_bytes" "the bridge URL cap counted characters, not bytes"
 
+# The auth-shape check caps the ENCODED redirect_uri at 2048 bytes. Widen it to
+# the 8192 bytes the claim reads: only the watcher's refused-origin branch
+# reaches this cap, so every _is_auth_url test stays green. Test A's 2049-byte
+# case catches it. It catches a dropped cap the same way.
+cat > "$SED_TMP" << 'SED'
+/^_is_auth_url_shape()/,/^}$/{
+  s@ -le 2048 ] || return 1$@ -le 8192 ] || return 1@
+}
+SED
+try "v154_auth_shape_redirect_cap" "the auth-shape check caps the encoded redirect_uri at 2048 bytes"
+
+# The same cap counts bytes. Restore the character count it had before the
+# byte fix, the shape of vnext_bridge_url_cap_bytes above.
+cat > "$SED_TMP" << 'SED'
+/^_is_auth_url_shape()/,/^}$/{
+  s@"[$](LC_ALL=C; printf '%s' "[$]{#enc}")"@"${#enc}"@
+}
+SED
+try "v154_auth_shape_redirect_cap_bytes" "the auth-shape redirect_uri cap counts bytes, not characters"
+
 # The session trash is host-only. Back inside the session dir the box mounts, a
 # link planted at the entry name sends a deleted transcript into a host dir.
 cat > "$SED_TMP" << 'SED'

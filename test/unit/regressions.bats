@@ -6980,6 +6980,51 @@ _mount_targets_fixture() {
   assert_output "claude.ai"
 }
 
+# v1.5.4: _is_auth_url_shape caps the ENCODED redirect_uri at 2048 bytes before
+# it decodes it. Nothing tested that cap. It is out of reach through
+# _is_auth_url, whose origin gate refuses a whole URL over 2048 bytes first. The
+# value is a substring of that URL. The watcher reaches it directly: it asks
+# the shape question of a refused origin, and that URL runs to the 8192 bytes
+# the claim reads. %41 pads at three encoded bytes per decoded byte, so the
+# decoded callback stays far under _bridge_url_host's own cap and only the
+# encoded cap can refuse it.
+@test "regression v1.5.4: the auth-shape check caps the encoded redirect_uri at 2048 bytes" {
+  local head="https://sso.example.com/authorize?client_id=x&redirect_uri="
+  local cb="http%3A%2F%2Flocalhost%3A45454%2Fcb%3Fp%3D"
+  local pad; pad="$(printf '%%41%.0s' $(seq 1 668))"
+  local enc="${cb}${pad}AA"
+  # The fixture checks its own size, so an edit to cb cannot move the boundary.
+  run printf '%s' "${#enc}"
+  assert_output "2048"
+  run _is_auth_url_shape "${head}${enc}&scope=a"
+  assert_success
+  # 2049 encoded bytes, 699 decoded.
+  run _is_auth_url_shape "${head}${enc}A&scope=a"
+  assert_failure
+}
+
+# v1.5.4: the same change that moved _bridge_url_host's cap to bytes moved the
+# redirect_uri cap in _is_auth_url_shape too. Only the first had a test.
+# Under the UTF-8 locale a Mac terminal runs in, ${#enc} alone counts characters.
+@test "regression v1.5.4: the auth-shape redirect_uri cap counts bytes, not characters" {
+  local utf8; utf8="$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true)"
+  [ -n "$utf8" ] || skip "no UTF-8 locale available on this host"
+  LC_ALL="$utf8"
+  local head="https://sso.example.com/authorize?client_id=x&redirect_uri="
+  local cb="http%3A%2F%2Flocalhost%3A45454%2Fcb%3Fp%3D"
+  local pad; pad="$(printf '%%41%.0s' $(seq 1 500))"
+  local two three
+  two="$(printf '\303\251%.0s' $(seq 1 200))"
+  three="$(printf '\303\251%.0s' $(seq 1 300))"
+  # 1942 bytes.
+  run _is_auth_url_shape "${head}${cb}${pad}${two}&scope=a"
+  assert_success
+  # 2142 bytes but only 1842 characters. It decodes to 1128 bytes, under
+  # _bridge_url_host's cap, so only the encoded cap refuses it.
+  run _is_auth_url_shape "${head}${cb}${pad}${three}&scope=a"
+  assert_failure
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # v1.5.4: `cleat session rm` moved a session into <key>/.cleat-trash, inside the
 # session dir the box mounts read-write. The box could plant a link at the entry

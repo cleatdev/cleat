@@ -7334,6 +7334,31 @@ EOF
   _RD_SWAP_DIR="$d"
 }
 
+# _rd_swap_on_open, but for a size read: _path_size sizes with stat, never
+# head/tail/cat, so the swap fires from a stat stand-in. The first stat handed
+# <target> as its last argument swaps it for a FIFO and then execs the real
+# stat, which the fixed reader answers 0 for without opening. A reader that
+# opens instead never reaches stat, so the swap never fires: the fired marker
+# stays absent and the size read comes back off the un-swapped file.
+_rd_stat_swap() {
+  local target="$1" d real
+  [ -n "${_RD_ORIG_PATH:-}" ] || _RD_ORIG_PATH="$PATH"
+  d="$(mktemp -d "$TEST_TEMP/statswap.XXXXXX")"
+  real="$(PATH="$_RD_ORIG_PATH"; command -v stat)"
+  cat > "$d/stat" <<EOF
+#!/bin/sh
+for a in "\$@"; do last="\$a"; done
+if [ "\$last" = "$target" ] && mkdir "$d/fired" 2>/dev/null; then
+  rm -f "$target"
+  mkfifo "$target"
+fi
+exec "$real" "\$@"
+EOF
+  chmod +x "$d/stat"
+  PATH="$d:$_RD_ORIG_PATH"
+  _RD_SWAP_DIR="$d"
+}
+
 # A FIFO .cleat reached the launch fingerprint, which reads [resources] with no
 # -f gate and no trust check, and hung every launch of the project until
 # Ctrl-C. No race needed. A link to /dev/zero spun instead.
@@ -7537,6 +7562,54 @@ EOF
     || fail "the refusal report blocked on a swapped log"
   run test -d "$_RD_SWAP_DIR/fired"
   assert_success
+}
+
+# The session list sized each transcript with `wc -c <`, which opens it, inside
+# a plain -f gate. A device symlink swapped in after the gate read forever and a
+# FIFO blocked on the open. The size now comes from a stat, which reads a FIFO
+# or a device as 0 without opening it. The stat stand-in swaps the checked
+# regular transcript for a FIFO at the instant of the size read, so the fixed
+# reader stats a FIFO and returns 0; a reverted reader never stats, opens the
+# un-swapped file and reports its real KB.
+@test "regression v1.5.4: a session size read stats the transcript instead of opening it" {
+  local sdir="$TEST_TEMP/sess" uuid="00000000-0000-4000-8000-0000000000aa"
+  mkdir -p "$sdir"
+  # Over 1 KiB, so a reader that opens the file reports a nonzero KB.
+  head -c 4096 /dev/zero | tr '\0' 'x' > "$sdir/$uuid.jsonl"
+  _rd_stat_swap "$sdir/$uuid.jsonl"
+  _rd_finishes_within 6 "$sdir/$uuid.jsonl" _sessions_size_kb "$sdir" "$uuid" \
+    || fail "the session size read blocked on a transcript swapped for a FIFO"
+  PATH="$_RD_ORIG_PATH"
+  run cat "$TEST_TEMP/rd.out"
+  assert_output "0"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
+
+# The credential file sits in the box's auth dir, read-write. It passed the -f
+# and -L checks, then the open ran unbounded, so a FIFO the box swapped in
+# between the mktemp and the open hung open(2) forever and only the account
+# lock's age bound ever freed the next command. The open runs under the time
+# bound now, like _read_unlinked_bounded. mktemp is the deterministic instant
+# between the check and the open, and runs in both the bounded and the reverted
+# unbounded code.
+@test "regression v1.5.4: a credential file swapped for a FIFO after its check is read under a time bound" {
+  local src="$TEST_TEMP/auth/.credentials.json"
+  mkdir -p "${src%/*}"
+  printf '{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}\n' > "$src"
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/accounts"
+  _BOX_FILE_READ_SECS=1
+  # After the -f/-L check, before the open, in both code paths.
+  mktemp() {
+    if [ ! -p "$src" ]; then rm -f "$src"; mkfifo "$src"; fi
+    command mktemp "$@"
+  }
+  _rd_finishes_within 6 "$src" _account_snapshot_cred "$src" \
+    || fail "the credential open blocked on a FIFO swapped in after its check"
+  unset -f mktemp
+  # The bounded open gave up, so nothing was snapshotted.
+  run cat "$TEST_TEMP/rd.out"
+  assert_output ""
 }
 
 # ── v1.5.4: one read decides the project caps ────────────────────────────────

@@ -126,6 +126,21 @@ _tui_keys() {   # last arg is the over-read fallback, so a buggy loop cannot han
   [[ "$(printf '%s\n' "$output" | head -1)" == *"$U2"* ]]
 }
 
+# ── size ───────────────────────────────────────────────────────────────────
+
+@test "sessions: size is the transcript byte count in KiB" {
+  head -c 2048 /dev/zero | tr '\0' 'x' > "$SDIR/${U1}.jsonl"
+  run _sessions_size_kb "$SDIR" "$U1"
+  assert_success
+  assert_output "2"
+}
+
+@test "sessions: size of an absent transcript with no fork sidecar is zero" {
+  run _sessions_size_kb "$SDIR" "$U1"
+  assert_success
+  assert_output "0"
+}
+
 # ── title resolution ───────────────────────────────────────────────────────
 
 @test "sessions: title comes from a custom-title record" {

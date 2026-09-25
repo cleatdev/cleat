@@ -7734,10 +7734,11 @@ try "vnext_account_pin_dir_mode" "the pin directory is not readable by other use
 # symlink. Without that second check a symlink swapped in after the first one
 # has the host read the file it points at. Retargeted when the check moved into
 # _fd_holds_path (the -ef reader never matched on macOS, see
-# v150_snapshot_inode_not_ef).
+# v150_snapshot_inode_not_ef), and again in v1.5.4 when the open moved into a
+# bounded child on fd 8 (see v154_account_snapshot_bounded_open).
 cat > "$SED_TMP" << 'SED'
 /^_account_snapshot_cred()/,/^}$/{
-  s@^         _fd_holds_path 3 "[$]src" || exit 1$@         : || exit 1@
+  s@^_fd_holds_path 8 "[$]1" || exit 1$@: || exit 1@
 }
 SED
 try "vnext_account_snapshot_relink" "a snapshot refuses a symlink swapped in after the regular-file check" "$CLI" "$ACCOUNTS_BATS"
@@ -12094,6 +12095,27 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_boxread_path_size_no_open" "hook bridge sizes its spool without opening it"
+
+# The session list sized each transcript with a stat, not `wc -c <`. Reverting
+# it opens the transcript, so a device or FIFO swapped in after the -f gate
+# hangs or over-reads. The stat stand-in never fires for the opener, so the size
+# comes back off the un-swapped file instead of 0.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_size_kb()/,/^}$/{
+  s@^    bytes="[$](_path_size "[$]{sdir}/[$]{uuid}.jsonl")"$@    bytes="$(wc -c < "${sdir}/${uuid}.jsonl")"@
+}
+SED
+try "v154_session_size_stat_no_open" "a session size read stats the transcript instead of opening it"
+
+# The credential open runs in a child under the time bound now, like
+# _read_unlinked_bounded. Drop the bound and the child's open blocks forever on
+# a FIFO the box swaps in after the -f check.
+cat > "$SED_TMP" << 'SED'
+/^_account_snapshot_cred()/,/^}$/{
+  s@  if ! _run_bounded "[$]_BOX_FILE_READ_SECS" bash -c @  if ! bash -c @
+}
+SED
+try "v154_account_snapshot_bounded_open" "a credential file swapped for a FIFO after its check is read under a time bound"
 
 # And reads each window bounded. An unbounded tail wedges the bridge on a FIFO
 # swapped in between the size read and the open.

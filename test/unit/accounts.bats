@@ -2946,6 +2946,21 @@ _lock_absent() {   # $1 = what just ran
   assert_output --partial "r-token"
 }
 
+@test "account: a snapshot copies a regular credential at mode 0600" {
+  # The read moved into a bounded child in v1.5.4 and the old subshell umask
+  # went with it. mktemp already makes the copy 0600, so this pins the outcome:
+  # a normal credential still snapshots and the copy is not world-readable.
+  local src="$CLEAT_RUN_DIR/$CN/auth/.credentials.json" snap mode
+  mkdir -p "${src%/*}"
+  _cred_blob > "$src"
+  snap="$(_account_snapshot_cred "$src")"
+  [ -n "$snap" ] || fail "the snapshot returned no path for a regular credential"
+  run cat "$snap"
+  assert_output --partial "r-token"
+  mode="$(stat -c '%a' "$snap" 2>/dev/null || stat -f '%Lp' "$snap")"
+  assert_equal "$mode" "600"
+}
+
 @test "account: a box pinned while rm waits at its prompt is unpinned too" {
   # The pinned boxes were read before the question and never again, so a box
   # pinned while it was on screen stayed pinned to a store in the trash.

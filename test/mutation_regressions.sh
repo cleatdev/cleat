@@ -13685,6 +13685,69 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_mask_note_after_recreate_resume" "cmd_resume never prints the recreate note"
 
+# ── Egress stage two, slice one: the policy reader and writer ────────────────
+# EGRESS-SPEC.md 4.2, 5.2 and 5.3, roster rows of 11.5.
+
+# The raw counter must see a line the shared reader discards. With it zeroed,
+# `mode = strict` plus one `deny =` compares 0 with 0 and the empty-deny
+# refusal disappears (the launch still refuses through the mode case, which is
+# why the regression asserts the message).
+cat > "$SED_TMP" << 'SED'
+/^_egress_raw_key_count()/,/^}$/{
+  s@    END { print n + 0 }@    END { print 0 }@
+}
+SED
+try "vnext_egress_empty_deny" "an empty deny line silently widened the policy" "$CLI"
+
+# `mode` is read with the all-reader. The first-match reader hides the second
+# value, so the refusal can name only one and the both-values assertion fails.
+cat > "$SED_TMP" << 'SED'
+s@_read_section_all_from_file "[$]_file" "[$]_section" mode@_read_section_from_file "$_file" "$_section" mode@
+SED
+try "vnext_egress_duplicate_mode" "a duplicate mode line resolved first wins" "$CLI"
+
+# Containment: the compare against a read-write source never matches.
+cat > "$SED_TMP" << 'SED'
+/^_egress_config_is_containable()/,/^}$/{
+  s@      "[$]rsrc"/\*)@      "$rsrc"/never-a-match/*)@
+}
+SED
+try "vnext_egress_containment" "a config dir inside the workspace refuses to enable a policy" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# The directory-target guard: without the -d arm a link to a directory falls
+# to the not-a-regular-file arm, and the test asserts the directory refusal.
+cat > "$SED_TMP" << 'SED'
+/^_egress_path_is_writable_policy()/,/^}$/{
+  s@  if \[ -d "[$]p" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_dir_target_guard" "a policy path that is a symlink to a directory is refused rather than silently vanishing" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# The lost-update check: drop the re-read before the rename.
+cat > "$SED_TMP" << 'SED'
+/^_write_egress_to_file()/,/^}$/{
+  s@  if \[ "[$](_egress_section_canon "[$]file")" != "[$]before" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_lost_update" "a concurrent policy edit refuses rather than overwriting" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# Never-vanish: emit the header only when a list is non-empty.
+cat > "$SED_TMP" << 'SED'
+/^_write_egress_to_file()/,/^}$/{
+  s@    echo "\[egress\]"@    if [ -n "$packs$denies$allows" ]; then echo "[egress]"; fi@
+}
+SED
+try "vnext_egress_never_vanish" "an empty egress header is still emitted once mode is set" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# The writer's header compare trims. Without the left trim an indented header
+# is kept as text beside a second, appended block.
+cat > "$SED_TMP" << 'SED'
+/^_write_egress_to_file()/,/^}$/{
+  s@^      _h="[$]{_h#"[$]{_h%%.*@      :@
+}
+SED
+try "vnext_egress_writer_indented_header" "an indented egress header is replaced not duplicated" "$CLI" "$EGRESS_CONFIG_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

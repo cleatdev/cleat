@@ -5399,6 +5399,11 @@ _warn_unknown_cleat_sections() {
           browser)
             warn "Section [browser] in .cleat is ignored ${DIM}(browser origins are global: ${BOLD}cleat browser allow <host>${RESET}${DIM})${RESET}"
             continue ;;
+          # The egress policy is global for the same reason, and more so: a
+          # policy the caged agent can author is not a policy (concept/46).
+          egress|box.*.egress)
+            warn "Section [$(_sanitize_repo_str "$name")] in .cleat is ignored ${DIM}(egress policy is global: ${BOLD}cleat egress${RESET}${DIM})${RESET}"
+            continue ;;
         esac
         # Per-box sections. The name AND the kind are both validated, so
         # [box.feta-a.caps] (a typo'd box) and [box.review.capss] still warn:
@@ -5419,9 +5424,10 @@ _warn_unknown_cleat_sections() {
         esac ;;
       global)
         case "$name" in
-          # Browser origins are GLOBAL only. See _bridge_origins_from_config:
-          # the project file is one the caged agent edits as ordinary work.
-          browser) continue ;;
+          # Browser origins and the egress policy are GLOBAL only. See
+          # _bridge_origins_from_config: the project file is one the caged agent
+          # edits as ordinary work.
+          browser|egress) continue ;;
           # Box names are per PROJECT, so a global [box.feat-a.*] would apply to
           # every project that happens to have a box called feat-a.
           box.*)
@@ -9104,6 +9110,277 @@ _browser_origins_print() {
   echo ""
   echo -e "  ${DIM}Add one with ${BOLD}cleat browser allow <host>${RESET}${DIM}. The list can never be complete:${RESET}"
   echo -e "  ${DIM}an MCP server, an Atlassian site or a self-hosted host is yours, not Cleat's.${RESET}"
+  return 0
+}
+
+# ── Egress policy: the language, the reader and the writer ─────────────────
+# EGRESS-SPEC.md sections 4.2, 4.3b and 5.1 to 5.4, concept/46. The policy is a
+# section of the GLOBAL config, never of a project .cleat: the caged agent
+# writes /workspace/.cleat, so a policy authored there is authored by the thing
+# it defends against. Per-box widening lives in egress-boxes/<cname>, which no
+# box mounts. Nothing here enforces anything yet. Absent everywhere, the
+# feature is off and the box runs exactly as it does without it.
+
+_EGRESS_BOXES_DIR="$CLEAT_CONFIG_DIR/egress-boxes"
+
+# Raw count of `<key> =` lines inside [<section>] of <file>, empty values
+# INCLUDED. The shared reader drops an empty value, so a truncated `deny =`
+# is invisible to it, and dropping a deny WIDENS. Counting the raw lines is
+# what lets the validator refuse. awk, not a bash loop, because this runs
+# once per config file per launch and BSD/GNU awk agree on all of it.
+# The BOM strip is octal, not \x: POSIX awk takes octal escapes and BSD awk
+# does not take hex. It runs first so the section compare can match. It reads
+# through _read_bounded, the same bounded read the shared reader uses, so the
+# two always see the same bytes.
+_egress_raw_key_count() {
+  _read_bounded "$1" "$_BOX_FILE_READ_MAX" | awk -v sec="[$2]" -v key="$3" '
+    NR == 1 { sub(/^\357\273\277/, "") }
+    { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+    /^#/ { next }
+    /^\[.*\]$/ { in_s = ($0 == sec); next }
+    !in_s { next }
+    $0 !~ /=/ { next }
+    { k = $0; sub(/=.*$/, "", k); sub(/[ \t]+$/, "", k)
+      if (k == key) n++ }
+    END { print n + 0 }
+  ' 2>/dev/null || echo 0
+}
+
+# One policy file into four globals: _e_vals (allow), _p_vals (pack) and
+# _d_vals (deny), one value per line, and _m_mode, which is `absent` or the one
+# valid mode. Called at statement position in the caller's shell and nowhere
+# else (rule R1). A refusal prints and exits 1 here rather than returning 1,
+# because a return code is lost to a caller whose strict mode is stripped.
+# Host values are validated afterwards by section 4.3b. This reads and counts.
+_egress_read_file() {                    # <file> <section>
+  local _file="$1" _section="$2"
+  local _e_line _p_line _d_line _m_line _m_vals="" _m_n=0 _m_raw _d_n=0 _d_raw
+  _e_vals="" _p_vals="" _d_vals=""
+  while IFS= read -r _e_line; do
+    [ -n "$_e_line" ] || continue
+    _e_vals="$_e_vals$_e_line
+"
+  done < <(_read_section_all_from_file "$_file" "$_section" allow)
+  while IFS= read -r _p_line; do
+    [ -n "$_p_line" ] || continue
+    _p_vals="$_p_vals$_p_line
+"
+  done < <(_read_section_all_from_file "$_file" "$_section" pack)
+  while IFS= read -r _d_line; do
+    [ -n "$_d_line" ] || continue
+    _d_vals="$_d_vals$_d_line
+"
+    _d_n=$((_d_n + 1))
+  done < <(_read_section_all_from_file "$_file" "$_section" deny)
+  while IFS= read -r _m_line; do
+    [ -n "$_m_line" ] || continue
+    _m_vals="${_m_vals:+$_m_vals, }$_m_line"
+    _m_n=$((_m_n + 1))
+  done < <(_read_section_all_from_file "$_file" "$_section" mode)
+  _d_raw=$(_egress_raw_key_count "$_file" "$_section" deny)
+  if [ "$_d_raw" -gt "$_d_n" ]; then
+    error "Empty deny line in [$_section] of $(_sanitize_repo_str "$_file"). A deny with no host would widen the policy."
+    exit 1
+  fi
+  _m_raw=$(_egress_raw_key_count "$_file" "$_section" mode)
+  case "$_m_raw:$_m_n" in
+    0:0) _m_mode=absent ;;
+    1:1) case "$_m_vals" in
+           strict|open|off) _m_mode=$_m_vals ;;
+           *) error "Unknown egress mode in $(_sanitize_repo_str "$_file"): $(_sanitize_repo_str "$_m_vals")"; exit 1 ;;
+         esac ;;
+    1:0) error "Empty mode line in [$_section] of $(_sanitize_repo_str "$_file")."; exit 1 ;;
+    *) error "More than one mode line in [$_section] of $(_sanitize_repo_str "$_file"): $(_sanitize_repo_str "$_m_vals")"; exit 1 ;;
+  esac
+}
+
+# Section 4.3b on the host side: prints the normalized name and returns 0, or
+# prints nothing and returns 1 with the reason in _EG_HOST_REASON. The same
+# rules as normalize_host in docker/gateway/gateway.py, plus two absolutes: any
+# `[` or `]` (no stored value can ever read back as a section header) and any
+# `:` (every port, IPv6 and scheme spelling). It rejects, never repairs, and it
+# folds case and one trailing dot, which real clients emit. Character classes
+# are spelled out rather than written as ranges, because a range like [a-z]
+# follows the locale's collation on bash 3.2 and can match capitals. The two
+# copies are pinned to one table, test/fixtures/egress_hosts.tsv, which both the
+# bats suite and the gateway corpus read.
+_egress_valid_host() {
+  local s="$1" h rest label last="" n
+  _EG_HOST_REASON=""
+  n="$(LC_ALL=C; printf '%s' "${#s}")"
+  if [ "$n" -eq 0 ] || [ "$n" -gt 255 ]; then _EG_HOST_REASON=TOO_LONG; return 1; fi
+  if ! (LC_ALL=C; case "$s" in *[!\!-~]*) exit 1 ;; esac; exit 0); then
+    _EG_HOST_REASON=NON_ASCII; return 1
+  fi
+  case "$s" in
+    */*|*\\*|*\?*|*\#*|*%*|*@*|*:*|*\[*|*\]*) _EG_HOST_REASON=BAD_CHARS; return 1 ;;
+  esac
+  h="$(printf '%s' "$s" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+  case "$h" in *.) h="${h%.}" ;; esac
+  case "$h" in *.) _EG_HOST_REASON=MULTI_TRAILING_DOT; return 1 ;; esac
+  if [ "${#h}" -gt 253 ]; then _EG_HOST_REASON=TOO_LONG; return 1; fi
+  case "$h" in *.*) ;; *) _EG_HOST_REASON=NOT_FQDN; return 1 ;; esac
+  rest="$h."
+  while [ -n "$rest" ]; do
+    label="${rest%%.*}"
+    rest="${rest#*.}"
+    if [ -z "$label" ] || [ "${#label}" -gt 63 ]; then _EG_HOST_REASON=BAD_LABEL; return 1; fi
+    case "$label" in
+      *[!abcdefghijklmnopqrstuvwxyz0123456789-]*|-*|*-) _EG_HOST_REASON=BAD_LABEL; return 1 ;;
+    esac
+    last="$label"
+  done
+  case "$last" in *[!0123456789]*) ;; *) _EG_HOST_REASON=IP_LITERAL; return 1 ;; esac
+  case "$last" in 0x*) _EG_HOST_REASON=IP_LITERAL; return 1 ;; esac
+  printf '%s' "$h"
+}
+
+# True when $1 is safe to hold policy: absent (the ordinary first write), a
+# regular file, or a symlink to a regular file (a dotfiles checkout does this
+# and refusing it would break honest users). Refused: a directory, a symlink
+# to a directory, and anything that is neither.
+#
+# The directory case is the one that matters. VERIFIED: `mv -f tmp link-to-dir`
+# returns 0, drops the file INSIDE the directory and leaves the link, so the
+# writer's `|| error` arm never fires and a write that vanished reports success.
+_egress_path_is_writable_policy() {
+  local p="$1"
+  [ -e "$p" ] || return 0
+  if [ -d "$p" ]; then
+    error "Refusing to write policy to a directory: ${p/#${HOME}/~}"
+    return 1
+  fi
+  if [ ! -f "$p" ]; then
+    error "Not a regular file: ${p/#${HOME}/~}"
+    return 1
+  fi
+  return 0
+}
+
+# The [egress] section of <file> in the writer's canonical order: mode, then
+# pack, deny and allow, each sorted and deduped, one `key = value` line each.
+# Two files that mean the same policy print the same bytes, which is what the
+# lost-update check compares. Reads raw values: a value the validator would
+# reject still takes part in the compare.
+_egress_section_canon() {
+  local _f="$1" _k _v
+  for _k in mode pack deny allow; do
+    while IFS= read -r _v; do
+      [ -n "$_v" ] && printf '%s = %s\n' "$_k" "$_v"
+    done < <(_read_section_all_from_file "$_f" egress "$_k" | LC_ALL=C sort -u)
+  done
+}
+
+# Writes the [egress] section of <file>: `_write_egress_to_file <file> <mode>
+# <packs> <denies> <allows>`, each list one value per line. Every other section
+# and every comment or unknown key inside [egress] is kept as written. The
+# section is emitted in canonical order: mode, then pack sorted, deny sorted and
+# deduped, allow sorted and deduped, so two users who reach one policy write
+# identical bytes. A copy of _write_caps_to_file and _bridge_origin_write, with
+# their fixes kept on purpose:
+#   1. the header compare trims, so an indented `  [egress]` is replaced rather
+#      than kept beside a second, appended block
+#   2. a UTF-8 BOM is stripped, matching the readers, so a BOM file keeps its
+#      first section
+#   3. `|| [[ -n "$line" ]]` keeps a final section with no trailing newline
+#   4. full `if` blocks inside the redirected compound, never `[[ ]] && echo`,
+#      so the write-nothing path cannot return 1 into a strict-mode caller
+#   5. the tmp-and-rename is a SYMLINK CONTROL as well as crash safety: `mv -f`
+#      replaces a link to a file where `> "$file"` would write through it.
+#      Never refactor it to a direct redirect. A link to a DIRECTORY is the
+#      remaining hole, closed by _egress_path_is_writable_policy first.
+# Two deliberate divergences from the caps writer. There is no delete-on-equal:
+# for a restriction it inverts into an escalation, because a per-box file that
+# happens to equal today's global policy would vanish and the next host the
+# global policy gains would reach that box. A per-box file goes only by
+# `cleat egress <box> --inherit` or with its box. And a concurrent edit refuses
+# rather than overwrites: the section is re-read just before the rename and a
+# change since the start aborts the write, because a confirmed deny that is not
+# in the file is a control reporting a write it did not perform.
+# Once written, the header and its mode are always there (never-vanish): an
+# absent [egress] means the feature is off, which means full network egress.
+_write_egress_to_file() {
+  local file="$1" mode="$2" packs="$3" denies="$4" allows="$5"
+  local preserved="" others="" line _h _k in_sec=false before tmp v
+  case "$mode" in strict|open|off) ;; *) error "Refusing to write an egress policy without a mode"; return 1 ;; esac
+  if ! _egress_path_is_writable_policy "$file"; then return 1; fi
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  before="$(_egress_section_canon "$file")"
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      _h="${line%$'\r'}"
+      _h="${_h#$'\xef\xbb\xbf'}"
+      _h="${_h#"${_h%%[![:space:]]*}"}"
+      _h="${_h%"${_h##*[![:space:]]}"}"
+      if [[ "$_h" == "[egress]" ]]; then in_sec=true; continue; fi
+      if $in_sec; then
+        if [[ "$_h" == "["*"]" ]]; then in_sec=false; preserved+="$line"$'\n'; continue; fi
+        case "$_h" in
+          *=*)
+            _k="${_h%%=*}"
+            _k="${_k%"${_k##*[![:space:]]}"}"
+            case "$_k" in mode|pack|deny|allow) continue ;; esac ;;
+        esac
+        if [ -n "$_h" ]; then others+="$line"$'\n'; fi
+        continue
+      fi
+      preserved+="${line#$'\xef\xbb\xbf'}"$'\n'
+    done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
+  fi
+  tmp="$file.cleat-tmp.$$"
+  {
+    if [ -n "$preserved" ]; then printf '%s' "$preserved"; fi
+    echo "[egress]"
+    if [ -n "$others" ]; then printf '%s' "$others"; fi
+    echo "mode = $mode"
+    for _k in pack deny allow; do
+      case "$_k" in pack) v="$packs" ;; deny) v="$denies" ;; allow) v="$allows" ;; esac
+      while IFS= read -r line; do
+        if [ -n "$line" ]; then echo "$_k = $line"; fi
+      done < <(printf '%s\n' "$v" | LC_ALL=C sort -u)
+    done
+  } > "$tmp" || { rm -f "$tmp" 2>/dev/null || true; error "Could not write ${file/#${HOME}/~}"; return 1; }
+  if [ "$(_egress_section_canon "$file")" != "$before" ]; then
+    rm -f "$tmp" 2>/dev/null || true
+    error "The policy changed in another terminal.  Nothing was written."
+    echo -e "  ${DIM}Re-run to see the current policy.${RESET}"
+    return 1
+  fi
+  mv -f "$tmp" "$file" || { rm -f "$tmp" 2>/dev/null || true; error "Could not write ${file/#${HOME}/~}"; return 1; }
+  chmod 0600 "$file" 2>/dev/null || true
+  return 0
+}
+
+# Hard refusal when the config directory is not host-side: at or under the
+# workspace, or under any other read-write bind source passed after it, or
+# reached through a symlinked directory between it and $HOME. Resolving the
+# leaf says nothing about how the walk got there, so every component is
+# checked. `cd -P` in a subshell rather than realpath, which a stock macOS
+# lacks. Prints the collision. A policy inside the cage is not a policy.
+_egress_config_is_containable() {        # <workspace> [<rw source>...]
+  local conf real src rsrc p
+  conf="$CLEAT_CONFIG_DIR"
+  p="$conf"
+  while [ -n "$p" ] && [ "$p" != "/" ] && [ "$p" != "$HOME" ] && [ "$p" != "." ]; do
+    if [ -L "$p" ]; then
+      error "The Cleat config directory is reached through a symlink: ${p/#${HOME}/~}"
+      echo -e "  ${DIM}An egress policy must live somewhere a box cannot reach. Point XDG_CONFIG_HOME at a real directory.${RESET}"
+      return 1
+    fi
+    p="$(dirname "$p")"
+  done
+  real="$(cd -P "$conf" 2>/dev/null && pwd)" || real=""
+  [ -n "$real" ] || return 0
+  for src in "$@"; do
+    [ -n "$src" ] || continue
+    rsrc="$(cd -P "$src" 2>/dev/null && pwd)" || continue
+    case "$real/" in
+      "$rsrc"/*)
+        error "The Cleat config directory is inside a folder a box can write: ${rsrc/#${HOME}/~}"
+        echo -e "  ${DIM}An egress policy there could be rewritten by the agent it restricts. Run Cleat from a project folder instead.${RESET}"
+        return 1 ;;
+    esac
+  done
   return 0
 }
 

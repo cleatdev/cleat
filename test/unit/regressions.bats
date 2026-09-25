@@ -9810,3 +9810,25 @@ _c19_star_project() {
   refute_output --partial "docker"
   refute_output --partial "git"
 }
+
+# ── Egress stage two: the policy reader (EGRESS-SPEC.md 4.2) ────────────────
+# Design hazards the spec names as regressions. The shared reader drops an
+# empty value, so an empty deny was invisible and a policy that looked narrowed
+# was wider. The first-match reader made a second mode line silently lose.
+
+@test "regression vNEXT: an empty deny line silently widened the policy" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\ndeny =\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress
+  assert_failure
+  assert_output --partial "Empty deny line"
+}
+
+@test "regression vNEXT: a duplicate mode line resolved first wins" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\nallow = a.example\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress
+  assert_failure
+  assert_output --partial "More than one mode line"
+  assert_output --partial "strict, open"
+}

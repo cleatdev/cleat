@@ -1,0 +1,49 @@
+# One hostname normalization table, two implementations (EGRESS-SPEC.md 4.3b):
+# _egress_valid_host in bin/cleat (test/unit/egress_hostname.bats) and
+# normalize_host in docker/gateway/gateway.py (test/gateway/corpus.py).
+# Columns, tab separated: input, the normalized name or !REASON, and
+# host-only when only the host validator must give that reason (the
+# gateway must still reject). If the two ever disagree, an entry a user
+# adds will not match the name the gateway sees.
+deb.debian.org	deb.debian.org	
+DEB.DEBIAN.ORG	deb.debian.org	
+Api.Anthropic.Com.	api.anthropic.com	
+deb.debian.org.	deb.debian.org	
+deb.debian.org..	!MULTI_TRAILING_DOT	
+xn--exmple-cua.com	xn--exmple-cua.com	
+github.com.evil.tld	github.com.evil.tld	
+a-b.c-d.example	a-b.c-d.example	
+123.example	123.example	
+example.123x	example.123x	
+exämple.com	!NON_ASCII	
+host.example # main	!NON_ASCII	
+localhost	!NOT_FQDN	
+2130706433	!NOT_FQDN	
+0x7f000001	!NOT_FQDN	
+1.2.3.4	!IP_LITERAL	
+0177.0.0.1	!IP_LITERAL	
+0x7f.0x0.0x0.0x1	!IP_LITERAL	
+0x7f.1	!IP_LITERAL	
+0X7F.1	!IP_LITERAL	
+user@host.example	!BAD_CHARS	
+host.example:443	!BAD_CHARS	
+a/b.example	!BAD_CHARS	
+a%2fb.example	!BAD_CHARS	
+a?b.example	!BAD_CHARS	
+a#b.example	!BAD_CHARS	
+a\b.example	!BAD_CHARS	
+2001:db8::1	!BAD_CHARS	
+[host.example]	!BAD_CHARS	host-only
+[egress]	!BAD_CHARS	host-only
+-bad.example	!BAD_LABEL	
+bad-.example	!BAD_LABEL	
+a..b	!BAD_LABEL	
+.example.com	!BAD_LABEL	
+*.example.com	!BAD_LABEL	
+under_score.example	!BAD_LABEL	
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example	
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example	!BAD_LABEL	
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	!TOO_LONG	
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bb	!TOO_LONG	
+	!TOO_LONG	

@@ -2829,6 +2829,131 @@ WRAP
   refute_output --partial "unbound variable"
 }
 
+# Recording stubs for both host openers, first on PATH, so whichever one
+# _host_open_cmd picks (a Linux runner can carry an `open` too) writes its
+# argument to opened.log and nothing reaches a real browser.
+_smoke_record_openers() {
+  local o
+  for o in open xdg-open; do
+    printf '#!/usr/bin/env bash\necho "$1" >> "%s"\n' "$TEST_TEMP/opened.log" > "$1/$o"
+    chmod +x "$1/$o"
+  done
+}
+
+@test "smoke: cleat shell keeps the browser bridge off under strict mode when clipclaim cannot be made" {
+  # A regular file where the host-only claim dir goes, so it cannot be made.
+  # The watcher turns the bridge off instead of claiming inside the clip mount,
+  # and that branch has to hold under set -euo pipefail. always mode, so no
+  # origin check stands between a claim in the mount and an open.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  local rd="$XDG_CONFIG_HOME/cleat/run/$cname"
+  mkdir -p "$rd/clip"
+  : > "$rd/clipclaim"
+  cat > "$TEST_TEMP/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+  "exec -it "*)
+    printf '%s' 'https://x.example/no-claim-dir' > "$rd/clip/.browser-open"
+    i=0
+    while [ "\$i" -lt 30 ]; do
+      grep -q 'browser bridge off this session' "$rd/logs/watcher.log" 2>/dev/null && break
+      sleep 0.1
+      i=\$((i + 1))
+    done
+    sleep 0.6 ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+WRAP
+  chmod +x "$TEST_TEMP/wrap/docker"
+  _smoke_record_openers "$TEST_TEMP/wrap"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env \
+    PATH="$TEST_TEMP/wrap:$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE=0 \
+    CLEAT_BROWSER_BRIDGE=always \
+    "$CLI" shell
+  assert_success
+  refute_output --partial "unbound variable"
+  run grep -c 'browser bridge off this session' "$rd/logs/watcher.log"
+  assert_output "1"
+  run test -e "$TEST_TEMP/opened.log"
+  assert_failure
+}
+
+@test "smoke: a session keeps both bridges off and still ends cleanly under strict mode when clipclaim cannot be made" {
+  # The session path: a fake pbcopy so the clipboard watcher runs, recording
+  # openers so the browser watcher runs, and a regular file at clipclaim. Both
+  # watchers turn their bridge off, readiness is never announced, and the
+  # teardown still reaches the end. BSD rm -f fails on a path under a regular
+  # file (ENOTDIR is not ENOENT) where GNU rm -f does not, so the rm below
+  # brings every runner to the macOS behaviour.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
+  printf '#!/bin/sh\ncat >/dev/null\n' > "$TEST_TEMP/wrap/pbcopy"
+  chmod +x "$TEST_TEMP/wrap/pbcopy"
+  _smoke_record_openers "$TEST_TEMP/wrap"
+  local real_rm; real_rm="$(command -v rm)"
+  cat > "$TEST_TEMP/wrap/rm" <<RM
+#!/bin/sh
+for a in "\$@"; do
+  case "\$a" in -*) continue ;; esac
+  p="\${a%/*}"
+  if [ "\$p" != "\$a" ] && [ -e "\$p" ] && [ ! -d "\$p" ]; then
+    echo "rm: \$a: Not a directory" >&2
+    exit 1
+  fi
+done
+exec "$real_rm" "\$@"
+RM
+  chmod +x "$TEST_TEMP/wrap/rm"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  local rd="$XDG_CONFIG_HOME/cleat/run/$cname"
+  mkdir -p "$rd/clip"
+  : > "$rd/clipclaim"
+  cat > "$TEST_TEMP/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+  "exec -it "*)
+    i=0
+    while [ "\$i" -lt 30 ]; do
+      grep -q 'clipboard bridge off this session' "$rd/logs/watcher.log" 2>/dev/null \
+        && grep -q 'browser bridge off this session' "$rd/logs/watcher.log" 2>/dev/null && break
+      sleep 0.1
+      i=\$((i + 1))
+    done ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+WRAP
+  chmod +x "$TEST_TEMP/wrap/docker"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env \
+    PATH="$TEST_TEMP/wrap:$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE=0 \
+    CLEAT_NO_CLIPBOARD_IMAGE=1 \
+    "$CLI" start
+  assert_success
+  refute_output --partial "unbound variable"
+  refute_output --partial "Not a directory"
+  run grep -c 'bridge off this session' "$rd/logs/watcher.log"
+  assert_output "2"
+  run grep -c '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS"
+  assert_output "0"
+  run test -e "$rd/clip/.host-ready"
+  assert_failure
+}
+
 @test "smoke: cleat shell claims an oversized hook spool under strict mode" {
   # The session-entry pass of the spool cap runs at statement position in the
   # real binary, so a set -e slip in it would end the shell before it opens.

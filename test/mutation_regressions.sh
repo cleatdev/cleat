@@ -9379,8 +9379,7 @@ SED
 try "vnext_b6_ledger_future" "a malformed or future ledger entry neither counts nor breaks the count" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 # B6: the watcher's own open count reaches the helper and grows. Without the
-# increment the session cap never closes, and it is the only cap left when the
-# claim dir falls back into the mount.
+# increment the session cap never closes.
 cat > "$SED_TMP" << 'SED'
 /^_browser_watcher()/,/^}$/{
   /_bw_opens=[$](( _bw_opens + 1 ))/d
@@ -12813,6 +12812,64 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_teardown_drops_own_marker" "cleanup removes session marker" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# ── v1.5.4: claims never fall back into the clip mount ──
+
+# With no host-only clipclaim/ the clipboard watcher claimed inside the clip
+# dir, where the claim, the cap temp and the read all sat on names the box can
+# plant. Put the fallback back: the watcher keeps running, announces readiness
+# and claims in the mount.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  s@^  if ! claim_dir="[$](_host_claim_dir "[$]clip_dir")"; then$@  claim_dir="$(_host_claim_dir "$clip_dir")" || claim_dir="$clip_dir"; if false; then@
+}
+SED
+try "v154_clip_claim_no_mount_fallback" "clipboard bridge claimed inside the box mount"
+try "v154_session_clip_claim_no_mount_fallback" "a session keeps both bridges off" "$CLI" "$SMOKE_BATS"
+
+# The same fallback in the browser watcher: the URL is claimed in the mount and
+# opened.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@^  if ! _bw_claim_dir="[$](_host_claim_dir "[$]clip_dir")"; then$@  _bw_claim_dir="$(_host_claim_dir "$clip_dir")" || _bw_claim_dir="$clip_dir"; if false; then@
+}
+SED
+try "v154_browser_claim_no_mount_fallback" "browser bridge claimed inside the box mount"
+try "v154_shell_browser_claim_no_mount_fallback" "cleat shell keeps the browser bridge off" "$CLI" "$SMOKE_BATS"
+
+# A link at clipclaim is refused like a missing dir, never followed.
+cat > "$SED_TMP" << 'SED'
+/^_host_claim_dir()/,/^}$/{
+  s@ && [[] ! -L "[$]d" []]@@
+}
+SED
+try "v154_claim_dir_link_refused" "a link at clipclaim is refused" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# The refused clipboard watcher drops a stale .host-ready, or the box's shim
+# keeps writing to a bridge nobody reads instead of taking OSC 52.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  /^    _clip_watchers_live "[$]clip_dir" || rm -f "[$]clip_dir[^"]*host-ready" 2>[^|]*|| true$/d
+}
+SED
+try "v154_clip_refusal_drops_host_ready" "clipboard bridge claimed inside the box mount"
+
+# And its own marker, which as a live watcher holds .host-ready on.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  /^    rm -f "[$](_clip_watch_dir "[$]clip_dir")[^"]*watcher[.][$][$]" 2>[^|]*|| true$/d
+}
+SED
+try "v154_clip_refusal_drops_own_marker" "clipboard bridge claimed inside the box mount"
+
+# With no directory at clipclaim BSD rm -f fails on the teardown's claim unlink,
+# and under errexit the session ended before the terminal came back.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    rm -f "[$](dirname "[$]{_CLIP_DIR:?}")/clipclaim/[.]claim[.][$][$][.]"[*] 2>/dev/null || true$@    rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."*@
+}
+SED
+try "v154_teardown_claim_unlink_fail_soft" "a session keeps both bridges off" "$CLI" "$SMOKE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

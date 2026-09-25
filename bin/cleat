@@ -7122,6 +7122,25 @@ _image_magic_kind() {
 # a file in the shared clip dir, and the README states the limit as a fact.
 _CLIP_MAX_PAYLOAD=102400          # 100KB
 
+# The host-only claim dir for the clip dir $1: its sibling clipclaim/, created
+# when missing. Prints the path, rc 0, only when it is a real directory and not
+# a link. The clipboard and browser watchers rename box-written names into it.
+# Neither falls back into the mount when this fails: a claim, a cap temp or a
+# rate ledger inside the mount is a name the box can list and plant, which is
+# what this directory exists to prevent. Only clip/ beside it is mounted, so the
+# box cannot race this check. What it turns away is a host-side failure: a full
+# disk, a run dir the user cannot write, or something else left at the name.
+_host_claim_dir() {
+  local d
+  d="$(dirname "${1:?}")/clipclaim"
+  mkdir -p "$d" 2>/dev/null || true
+  if [ -d "$d" ] && [ ! -L "$d" ]; then
+    printf '%s' "$d"
+    return 0
+  fi
+  return 1
+}
+
 _clipboard_watcher() {
   local clip_dir="$1"
   local clip_cmd="$2"
@@ -7167,9 +7186,20 @@ _clipboard_watcher() {
   # the run dir itself: the idle sweep measures staleness from the run dir's
   # mtime, so churning claim files directly in it would re-stamp that clock on
   # every copy and quietly hold the box out of the sweep.
+  #
+  # With no such dir the bridge is off for this session. It never claims inside
+  # the mount instead: there the claim, the cap temp and the read below would
+  # all sit on names the box can plant. This session's liveness marker goes, and
+  # so does .host-ready when no live watcher is left, so the box's shim takes
+  # its OSC 52 path rather than writing to a bridge nobody reads. Both are
+  # unlinks, which never follow a link. Readiness is never announced.
   local claim_dir
-  claim_dir="$(dirname "$clip_dir")/clipclaim"
-  mkdir -p "$claim_dir" 2>/dev/null || claim_dir="$clip_dir"
+  if ! claim_dir="$(_host_claim_dir "$clip_dir")"; then
+    echo "[clipboard-watcher $(date +%H:%M:%S)] no claim dir outside the mount, clipboard bridge off this session"
+    rm -f "$(_clip_watch_dir "$clip_dir")/.watcher.$$" 2>/dev/null || true
+    _clip_watchers_live "$clip_dir" || rm -f "$clip_dir/.host-ready" 2>/dev/null || true
+    return 0
+  fi
 
   # Claims stranded by a watcher killed between rename and delivery are the
   # same kind of leftover: same age gate. A live claim is milliseconds old
@@ -8077,7 +8107,8 @@ _browser_claim_url() {
   local bridge_file="$1"
   # Where the claim goes. The watcher passes a directory outside the box's bind
   # mount, which is what stops the box swapping the claim between the rename and
-  # the read. Defaults beside the bridge file so direct callers are unchanged.
+  # the read. It passes nothing else: with no such directory the watcher does
+  # not run. The default beside the bridge file serves direct callers only.
   local claim_dir="${2:-}"
   [ -n "$claim_dir" ] || claim_dir="$(dirname "$bridge_file")"
   # Same shape as the clipboard payload path, same fix. A symlink is never a
@@ -8260,9 +8291,10 @@ _BROWSER_CAPPED_MARK="RATE-CAPPED"
 # find it.
 _BROWSER_NOBIND_MARK="CALLBACK-UNAVAILABLE"
 # Returns 0 and records the open when it fits under both caps, 1 when a cap is
-# reached. $1 is the ledger path, empty when the claim dir could not be created
-# outside the mount (then only the session cap applies, because a ledger the box
-# can write is not a cap). $2 is how many opens this watcher has already made.
+# reached. $1 is the ledger path. The watcher always passes one, because with no
+# claim dir outside the mount it does not run at all. Empty, from a direct
+# caller, means only the session cap applies, because a ledger the box can write
+# is not a cap. $2 is how many opens this watcher has already made.
 _browser_rate_take() {
   local ledger="${1:-}" made="${2:-0}" now line n=0 keep=""
   case "$made" in ''|*[!0-9]*) made=0 ;; esac
@@ -8456,13 +8488,17 @@ _browser_watcher() {
   # a copy left there would only mislead. rm unlinks a link, never its target.
   rm -f "$clip_dir/.proxy-log" 2>/dev/null || true
   # Claims land outside the bind mount, same sibling the clipboard bridge uses.
+  # Never inside it: there the claim and the minute ledger below would be names
+  # the box can plant. With no claim dir the bridge is off for this session. A
+  # URL the box writes stays unread in its own clip dir, where the next
+  # session's startup sweep finds it.
   local _bw_claim_dir
-  _bw_claim_dir="$(dirname "$clip_dir")/clipclaim"
-  mkdir -p "$_bw_claim_dir" 2>/dev/null || _bw_claim_dir="$clip_dir"
+  if ! _bw_claim_dir="$(_host_claim_dir "$clip_dir")"; then
+    echo "[browser-watcher $(date +%H:%M:%S)] no claim dir outside the mount, browser bridge off this session"
+    return 0
+  fi
   # The per-box minute ledger for the rate cap, and this session's open count.
-  # No ledger when the claim dir fell back into the mount: see _browser_rate_take.
-  local _bw_ledger="" _bw_opens=0
-  [ "$_bw_claim_dir" != "$clip_dir" ] && _bw_ledger="$_bw_claim_dir/.opens"
+  local _bw_ledger="$_bw_claim_dir/.opens" _bw_opens=0
   _browser_sweep_stale_markers "$clip_dir"
   while true; do
     # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
@@ -8986,8 +9022,9 @@ _hook_spool_cap() {
   [ "$size" -ge "$_HOOK_SPOOL_MAX" ] || return 1
   claim_dir="${spool%/*}"
   claim_dir="${claim_dir%/*}/hookclaim"
-  # Never fall back into the hooks directory, as the clipboard claim may: a
-  # claim made inside the mount reinstates the race this exists to close.
+  # Never fall back into the hooks directory, the rule the clipboard and browser
+  # claims follow too: a claim made inside the mount reinstates the race this
+  # exists to close.
   mkdir -p "$claim_dir" 2>/dev/null || return 1
   [ -d "$claim_dir" ] && [ ! -L "$claim_dir" ] || return 1
   claimed="$claim_dir/.spool.$$.$RANDOM"
@@ -10686,8 +10723,10 @@ exec_claude() {
     # Own claims only: another session's live claim must survive our exit (see
     # _do_copy's claim-name note). Both locations: claims moved out of the bind
     # mount into clipclaim/, and the legacy in-mount path for a watcher started
-    # by an older CLI that is still running against this box.
-    rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."*
+    # by an older CLI that is still running against this box. Fail-soft: with
+    # no directory at clipclaim BSD rm -f still fails (ENOTDIR is not ENOENT),
+    # and under errexit that ended the teardown before the terminal came back.
+    rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."* 2>/dev/null || true
     rm -f "${_CLIP_DIR:?}/.claim.$$."*
     rm -f "$(_clip_watch_dir "${_CLIP_DIR:?}")/.watcher.$$" 2>/dev/null || true
     # After our own marker is gone, so a solo session sweeps unconditionally.

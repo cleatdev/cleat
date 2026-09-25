@@ -8155,11 +8155,12 @@ _v154_bw_wait_for() {
 }
 
 @test "regression v1.5.4: with no state dir outside the mount a faked readiness marker never starts the proxy or opens the browser" {
-  # Regular files where both host-only dirs would go, so neither can be made.
-  # v1.5.3 then put the readiness marker in the clip dir, where the box could
-  # create it (an open with no listener) or point it at a host file.
+  # A regular file where the bridge state dir would go, so it cannot be made.
+  # The readiness marker is then refused, never put in the clip dir, where the
+  # box could create it (an open with no listener) or point it at a host file.
+  # The claim dir stays usable. Without it the whole browser bridge is off (see
+  # the claim dir regression further down) and this path is never reached.
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
-  : > "$TEST_TEMP/clipclaim"
   : > "$TEST_TEMP/bridge"
   cat > "$TEST_TEMP/fake_open" <<OPEN
 #!/usr/bin/env bash
@@ -8419,4 +8420,75 @@ EOF
   stop_watcher "$pid" "$clip_dir"
   run test -e "$target"
   assert_failure
+}
+
+@test "regression v1.5.4: the clipboard bridge claimed inside the box mount when clipclaim was unusable" {
+  # With no host-only clipclaim/ the watcher fell back to claiming inside the
+  # clip dir, which the box has read-write. The claim, the cap temp and the
+  # read that pipes it to the host clipboard then sat on names the box can list
+  # and plant. A regular file at clipclaim makes the mkdir fail, even as root.
+  # The bridge is off for the session instead: nothing is claimed, readiness is
+  # never announced, and this session's marker and a stale .host-ready go, so
+  # the box's shim takes its OSC 52 path.
+  use_docker_stub
+  local clip="$TEST_TEMP/cf/clip" watch
+  mkdir -p "$clip"
+  : > "$TEST_TEMP/cf/clipclaim"
+  watch="$(_clip_watch_dir "$clip")"
+  mkdir -p "$watch"
+  # The marker exec_claude writes before it starts the watcher. $$ inside the
+  # backgrounded watcher is this shell's pid, so this is the session's name.
+  : > "$watch/.watcher.$$"
+  : > "$clip/.host-ready"
+  # A fresh copy, delivered the way the shim does it. The startup sweep keeps
+  # it, so a watcher that claims anything would claim this.
+  echo payload > "$clip/.clipboard.t"
+  mv "$clip/.clipboard.t" "$clip/clipboard"
+  _clipboard_watcher "$clip" "cat > '$TEST_TEMP/cf-copied'" test-cf154 > "$TEST_TEMP/cf-wlog" 2>&1 &
+  local pid=$!
+  if ! process_exited "$pid"; then
+    stop_watcher "$pid" "$clip"
+    fail "REGRESSION: the clipboard watcher kept running with no host-only claim dir"
+  fi
+  wait "$pid" 2>/dev/null || true
+  run test -e "$TEST_TEMP/cf-copied"
+  assert_failure
+  run test -f "$clip/clipboard"
+  assert_success
+  run test -e "$clip/.host-ready"
+  assert_failure
+  run test -e "$watch/.watcher.$$"
+  assert_failure
+  run grep -c '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS"
+  assert_output "0"
+  run cat "$TEST_TEMP/cf-wlog"
+  assert_output --partial "clipboard bridge off this session"
+}
+
+@test "regression v1.5.4: the browser bridge claimed inside the box mount when clipclaim was unusable" {
+  # The same fallback in the browser watcher: the URL was claimed inside the
+  # clip dir and the minute ledger was skipped. always mode takes the
+  # destination gate out of the way, so a claim made in the mount would open.
+  local clip="$TEST_TEMP/bf/clip"
+  mkdir -p "$clip"
+  : > "$TEST_TEMP/bf/clipclaim"
+  cat > "$TEST_TEMP/fake_open" <<OPEN
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+OPEN
+  chmod +x "$TEST_TEMP/fake_open"
+  printf '%s' "https://x.example/fallback" > "$clip/.browser-open"
+  _browser_watcher "$clip" "$TEST_TEMP/fake_open" "" "always" "0" > "$TEST_TEMP/bf-wlog" 2>&1 &
+  local pid=$! exited=0
+  process_exited "$pid" && exited=1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ ! -e "$TEST_TEMP/opened.log" ] || fail "REGRESSION: a URL claimed inside the mount was opened"
+  run test -f "$clip/.browser-open"
+  assert_success
+  run test -e "$clip/.opens"
+  assert_failure
+  [ "$exited" = 1 ] || fail "REGRESSION: the browser watcher kept running with no host-only claim dir"
+  run cat "$TEST_TEMP/bf-wlog"
+  assert_output --partial "browser bridge off this session"
 }

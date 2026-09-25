@@ -179,6 +179,23 @@ EOF
   assert_success
 }
 
+@test "claim dir: a link at clipclaim is refused, never used" {
+  # The watchers rename box-written names into this directory. A link there
+  # would send them wherever it points, so it is refused like a missing one,
+  # and the bridge that needed it stays off.
+  mkdir -p "$TEST_TEMP/lk" "$TEST_TEMP/elsewhere"
+  ln -s "$TEST_TEMP/elsewhere" "$TEST_TEMP/lk/clipclaim"
+  run _host_claim_dir "$TEST_TEMP/lk/clip"
+  assert_failure
+  assert_output ""
+  # A missing one is created, and its path is the one the watchers use.
+  run _host_claim_dir "$TEST_TEMP/ok/clip"
+  assert_success
+  assert_output "$TEST_TEMP/ok/clipclaim"
+  run test -d "$TEST_TEMP/ok/clipclaim"
+  assert_success
+}
+
 # ── exec_claude teardown: the marker and the sentinel ───────────────────────
 # These drive exec_claude's real _cleanup_session. They used to define their own
 # copy of the teardown inline and test that, so they passed whatever the real

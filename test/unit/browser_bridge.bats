@@ -1042,9 +1042,8 @@ _bw_run_once() {
 
 @test "rate cap: the watcher counts its own opens toward the session cap" {
   # The helper refusing at thirty proves nothing unless the watcher hands it a
-  # count that grows. It is also the only cap left when the claim dir cannot be
-  # created outside the mount. Lowered here in the sourced shell, and the
-  # minute cap raised out of the way, so three URLs reach it.
+  # count that grows. Lowered here in the sourced shell, and the minute cap
+  # raised out of the way, so three URLs reach it.
   _BROWSER_RATE_PER_SESSION=2
   _BROWSER_RATE_PER_MIN=100
   local dir="$TEST_TEMP/clip"; mkdir -p "$dir"

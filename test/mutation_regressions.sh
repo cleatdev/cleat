@@ -329,10 +329,13 @@ SED
 try "v0.5.1_hook_replace" "hook overlay replaces command with forwarder"
 
 # v0.6.0 + v0.6.5: both guards must hold. Break BOTH the -d dir check and
-# the -f file skip so the overlay is mounted even when neither exists.
+# the -f file skip so the overlay is mounted even when neither exists. Since
+# v1.5.4 the one-read snapshot refuses a missing file too, so its refusal is
+# broken as well.
 cat > "$SED_TMP" << 'SED'
 s|if \[\[ -d "\$_workspace/.claude" \]\]; then|if true; then|
 /\[\[ -f "\$pf" \]\] || continue/d
+/_project_settings_snapshot "[$]_workspace"/,/^      pf="[$]_pf_snap"$/s@^        continue$@        :@
 SED
 try "v0.6.0_claude_guard" "skip project overlay when .claude/ missing"
 
@@ -418,9 +421,11 @@ s|-\\\\,ignoreeof|-|g
 SED
 try "v0.6.4_ignoreeof" "forwards TCP6 first with ignoreeof"
 
-# v0.6.5: cmd_run must skip overlay mount when host file doesn't exist
+# v0.6.5: cmd_run must skip overlay mount when host file doesn't exist. The
+# one-read snapshot's refusal goes too (see v0.6.0_claude_guard).
 cat > "$SED_TMP" << 'SED'
 /\[\[ -f "\$pf" \]\] || continue/d
+/_project_settings_snapshot "[$]_workspace"/,/^      pf="[$]_pf_snap"$/s@^        continue$@        :@
 SED
 try "v0.6.5_skip_missing" "cmd_run skips overlay mount for missing"
 
@@ -441,8 +446,9 @@ SED
 try "v0.8.0_session_isolation" "session overlay mount isolates projects"
 
 # v0.8.0: history.jsonl must be overlaid per-project. Remove the history mount.
+# (Anchor moved in v1.5.4, when the source became the host-only store.)
 cat > "$SED_TMP" << 'SED'
-/history\.jsonl:\/home\/coder\/\.claude\/history\.jsonl/d
+/:\/home\/coder\/\.claude\/history\.jsonl"$/d
 SED
 try "v0.8.0_history_isolation" "history.jsonl overlay isolates per-project history"
 
@@ -633,9 +639,13 @@ try "vnext_docker_cap_loopback_liveness_guard" "with no host socket warns" "$CLI
 
 # vnext unsafe-rm: the guard cap must NOT be grantable from a project .cleat (the
 # caged agent can write it). Stop stripping it from project caps; the
-# project-ignored test should fail.
+# project-ignored test should fail. Retargeted when the strip moved into
+# _project_caps_view: unsafe-rm then falls through to the known-name check and
+# applies.
 cat > "$SED_TMP" << 'SED'
-s@grep -vx 'unsafe-rm' || true@cat@
+/^_project_caps_view()/,/^}$/{
+  s@_PCAPS_UNSAFE_RM=1; continue; fi@_PCAPS_UNSAFE_RM=1; fi@
+}
 SED
 try "vnext_unsafe_rm_project_stripped" "unsafe-rm from a project" "$CLI" "$CAPABILITIES_BATS"
 
@@ -729,22 +739,23 @@ try "v0.10.0_status_readonly_trust" "cmd_status never prompts for trust"
 
 # v0.10.0: the trust hash must be over the *canonical* cap list, not the
 # raw .cleat file. If the hash includes comments/whitespace, comment
-# edits trigger re-approval churn. Replace canonical hashing with raw
-# file hashing and the hash-stability guard should fail.
+# edits trigger re-approval churn. Replace canonical hashing with the list
+# in file order and the hash-stability guard should fail. Retargeted when the
+# hashing moved into _caps_list_hash, which hashes the single-read view.
 cat > "$SED_TMP" << 'SED'
-/^_hash_cleat_caps\(\)/,/^}$/{
-  s|caps="\$(_read_caps_from_file "\$path" "\$box" \| _canonical_caps)"|caps="$(cat "$path")"|
+/^_caps_list_hash()/,/^}$/{
+  s@caps="[$](printf '%s\\n' "[$]1" | _canonical_caps)"@caps="$1"@
 }
 SED
 try "v0.10.0_trust_hash_canonical" "trust hash is over canonical caps"
 
 # v0.10.0: _md5 on Linux uses md5sum which appends "  -" (stdin filename)
-# after the hash. The `awk '{print $1}'` strip in _hash_cleat_caps must
+# after the hash. The `awk '{print $1}'` strip in _caps_list_hash must
 # remain so the trust file stores pure hex. Removing it reintroduces the
 # junk suffix and the hex-only guard should fail. Use `#` as sed
 # delimiter since the source line contains many `|` characters.
 cat > "$SED_TMP" << 'SED'
-/^_hash_cleat_caps()/,/^}$/{
+/^_caps_list_hash()/,/^}$/{
   s#| awk .*##
 }
 SED
@@ -1875,7 +1886,7 @@ try "bugfix_installmethod_native" "forces installMethod=native even when" "$CLI"
 # macOS keychain → box credential seed must actually write the file. Neuter the
 # move: the "writes the keychain blob" test sees no creds file and fails.
 cat > "$SED_TMP" << 'SED'
-s|mv -f "\$tmp" "\$cred" 2>/dev/null|false|
+s|if _rename_onto "\$tmp" "\$cred"; then _SEEDED_CREDS=1; fi|:|
 SED
 try "bugfix_keychain_seed_write" "writes the keychain blob" "$CLI" "$CREDENTIALS_BATS"
 
@@ -2596,9 +2607,11 @@ try "v1.4.3_seed_unreadable_no_abort" "an unreadable shared credential file does
 
 # v1.4.3: ~/.claude is mounted read-write into every box. Bring back the
 # guessable pid temp name: a planted symlink there receives the Keychain login.
+# Since v1.5.4 the temp is a fixed name in a host-only stage dir, so the pid
+# name replaces that.
 cat > "$SED_TMP" << 'SED'
 /^_seed_macos_credentials()/,/^}$/{
-  s/^  tmp="[$](mktemp .*$/  tmp="${cred}.tmp.$$"/
+  s/^  tmp="[$]stage\/[.]credentials[.]json"$/  tmp="${cred}.tmp.$$"/
 }
 SED
 try "v1.4.3_seed_temp_mktemp" "macOS seed never writes the token through a planted temp symlink"
@@ -2794,9 +2807,10 @@ try "bugfix_identity_attach_heal" "running logged-out box heals" "$CLI" "$REGRES
 # IDENTITY: the attach-heal gate must key on hasCompletedOnboarding ALONE. Add
 # back the oauthAccount clause: an onboarded API-key box (no oauthAccount) then
 # fails the gate and runs the pipeline + docker probe on every attach, so the
-# "onboarded API-key box short-circuits" test sees the probe fire.
+# "onboarded API-key box short-circuits" test sees the probe fire. Since v1.5.4
+# the gate reads a bounded prefix of the file on stdin.
 cat > "$SED_TMP" << 'SED'
-s|jq -e '\.hasCompletedOnboarding == true' "\$f" >/dev/null 2>&1 \&\& return 0|jq -e '(.hasCompletedOnboarding == true) and has("oauthAccount")' "$f" >/dev/null 2>\&1 \&\& return 0|
+s@| jq -e '\.hasCompletedOnboarding == true' >/dev/null 2>&1 && return 0@| jq -e '(.hasCompletedOnboarding == true) and has("oauthAccount")' >/dev/null 2>\&1 \&\& return 0@
 SED
 try "bugfix_attach_heal_gate_onboarding" "onboarded API-key box" "$CLI" "$EXEC_CLAUDE_BATS"
 
@@ -3254,7 +3268,7 @@ try "fork_prune_stale_markers" "clears a stale marker" "$CLI" "$FORK_BATS"
 # FORK EXCLUDE SAFETY: an absolute or traversing exclude must be refused, or a
 # .cleat in a cloned repo can delete outside the fork.
 cat > "$SED_TMP" << 'SED'
-s@warn "Ignoring unsafe \[fork\] exclude: $e"; continue@:@
+s@warn "Ignoring unsafe \[fork\] exclude: [$](_sanitize_repo_str "[$]e")"; continue@:@
 SED
 try "fork_exclude_path_safety" "traversing exclude is refused" "$CLI" "$FORK_BATS"
 
@@ -4007,10 +4021,12 @@ try "vnext_kit_pane_fits" "fits the picker detail pane" "$CLI" "$KITS_BATS"
 
 # SANITIZER STRIP: _sanitize_repo_str must strip control bytes (ESC/BEL/DEL)
 # before repo-controlled text ever reaches echo -e. Drop the tr -d stage: the
-# strip-bytes assertion must fail.
+# strip-bytes assertion must fail. Since v1.5.4 there are two tr lines, one per
+# locale branch, and this drops both, so the entry holds under a UTF-8 CI
+# locale as well as a C one.
 cat > "$SED_TMP" << 'SED'
 /^_sanitize_repo_str()/,/^}$/{
-s/ | LC_ALL=C tr -d '\\000-\\010\\013-\\037\\177\\200-\\237'//
+s/ | LC_ALL=C tr -d '\\000-\\010\\013-\\037\\177[^']*'//
 }
 SED
 try "vnext_setup_sanitize_strip_ctrl" "strips raw ESC, BEL, and DEL bytes" "$CLI" "$PROVISION_BATS"
@@ -4018,10 +4034,11 @@ try "vnext_setup_sanitize_strip_ctrl" "strips raw ESC, BEL, and DEL bytes" "$CLI
 # SANITIZER BACKSLASH DOUBLING: _sanitize_repo_str must double every
 # backslash so a literal `\033`-style sequence stays literal text once
 # echo -e sees it. Drop the doubling stage: the doubles-backslashes
-# assertion must fail.
+# assertion must fail. The doubling is a parameter expansion since v1.5.4,
+# not a sed.
 cat > "$SED_TMP" << 'SED'
 /^_sanitize_repo_str()/,/^}$/{
-s@ | sed 's/\\\\/\\\\\\\\/g'@@
+s@"[$]{v//\\\\/\\\\\\\\}"@"$v"@
 }
 SED
 try "vnext_setup_sanitize_double_backslash" "doubles backslashes" "$CLI" "$PROVISION_BATS"
@@ -4174,9 +4191,10 @@ try "vnext_trust_target_ctrl_char_guard" "project path containing a tab is refus
 # yellow when its .cleat.<box> hash no longer matches what was approved. Force
 # the comparison to never trip (equal hash): every row stays green, so the
 # "flips green to yellow" assertion (which needs the yellow marker after an
-# edit) must fail.
+# edit) must fail. Retargeted when the marker stopped requiring a .cleat, so a
+# row approved for env-file host variables alone can turn yellow too.
 cat > "$SED_TMP" << 'SED'
-s@if \[\[ -f "\$_cf" && -n "\$_cur" && "\$_stored" != "\$_cur" \]\]; then@if [[ -f "$_cf" \&\& -n "$_cur" \&\& "$_stored" == "$_cur" ]]; then@
+s@if \[\[ -n "\$_cur" && "\$_stored" != "\$_cur" \]\]; then@if [[ -n "$_cur" \&\& "$_stored" == "$_cur" ]]; then@
 SED
 try "vnext_trust_list_box_staleness" "flips green to yellow when its" "$CLI" "$PROVISION_BATS"
 
@@ -4371,12 +4389,14 @@ SED
 try "vnext_config_env_scaffold_offer" "enabling env offers to scaffold" "$CLI" "$CONFIG_BATS"
 
 # WATCHER TERMINAL SAFETY. Every host-side watcher redirects its stdout+stderr
-# to a per-box .watcher-log so a fork-starved watcher's "fork: Resource
+# to a per-box watcher log so a fork-starved watcher's "fork: Resource
 # temporarily unavailable" never corrupts the Claude Code TUI. Strip the
 # redirect from the clipboard watcher spawn: the watcher's stderr leaks onto the
 # caller's fd 2 and the log is never created, so the regression test fails.
+# Retargeted (v1.5.4): the log moved to logs/watcher.log, named by $_watcher_log,
+# and the spawn passes the box name.
 cat > "$SED_TMP" << 'SED'
-s|_clipboard_watcher "\$_CLIP_DIR" "\$clip_cmd" >>"\$_CLIP_DIR/.watcher-log" 2>&1 &|_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" \&|
+s|_clipboard_watcher "[$]_CLIP_DIR" "[$]clip_cmd" "[$]cname" >>"[$]_watcher_log" 2>[&]1 |_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" "$cname" |
 SED
 try "watcher_fd2_redirect" "watchers redirect fork-error stderr"
 
@@ -4408,8 +4428,12 @@ try "vnext_fork_diag_pattern" "explains a fork error logged this session" "$CLI"
 # The diagnostic must read only THIS session's slice of the log (from the start
 # offset), or a stale error from a past session re-triggers it every run. Drop
 # the offset so it scans the whole log: the "ignores a PRIOR session" test fails.
+# Retargeted when the read became _read_bounded, scoped to the function because
+# the hook drop report still has a tail of the same shape.
 cat > "$SED_TMP" << 'SED'
-s@tail -c "+\$(( off + 1 ))"@tail -c "+1"@
+/^_maybe_explain_fork_exhaustion()/,/^}$/{
+  s@_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))"@_read_bounded "$log" "$_BOX_FILE_READ_MAX" 1@
+}
 SED
 try "vnext_fork_diag_offset" "ignores a fork error from a PRIOR session" "$CLI" "$EXEC_CLAUDE_BATS"
 
@@ -4421,14 +4445,17 @@ s@(( sz > 1048576 ))@(( sz > 999999999999 ))@
 SED
 try "vnext_watcher_log_cap" "oversized log is truncated" "$CLI" "$EXEC_CLAUDE_BATS"
 
-# WATCHER LOG CAP: BSD wc padding. macOS `wc -c` emits a space-padded count, so
-# the size must be de-padded before the numeric guard or it drops to 0 (defeating
-# the cap and the offset). Drop the `tr` strip: the padded count fails the regex
-# and the "BSD wc padding is stripped" test fails.
+# WATCHER LOG CAP: BSD stat. macOS stat has no -c, so the size must come from
+# its -f %z form or it reads as 0 (defeating the cap and the offset). Drop the
+# BSD branch: the size falls to 0 and the "sized by BSD stat" test fails.
+# Retargeted (v1.5.4): it was the BSD wc padding strip until the cap stopped
+# opening the log and sized it with _path_size.
 cat > "$SED_TMP" << 'SED'
-/^_cap_watcher_log()/,/^}$/ s@ | tr -d '\[:space:\]'@@
+/^_path_size()/,/^}$/{
+  s@ || stat -L -f %z "[$]1" 2>/dev/null@@
+}
 SED
-try "vnext_watcher_log_bsd_wc" "BSD wc padding is stripped" "$CLI" "$EXEC_CLAUDE_BATS"
+try "vnext_watcher_log_bsd_stat" "sized by BSD stat when GNU stat is absent" "$CLI" "$EXEC_CLAUDE_BATS"
 
 # FORK ADVISORY PLACEMENT. The session-end fork advisory must be emitted after the
 # rc==0 reclaim (which erases the line above it). Delete the call: the advisory
@@ -4753,9 +4780,15 @@ SED
 try "kits_writer_header_trim" "an indented .kits. header is replaced" "$CLI" "$KITS_BATS"
 
 # CONFIG READER READABILITY: an unreadable .cleat reached the redirect and
-# killed every command in the project with a raw bash error.
+# killed every command in the project with a raw bash error. Retargeted when the
+# readers moved to _read_bounded, which fails quiet on its own: the bug needs
+# both the -f-only gate and the plain redirect back, in the reader the test
+# calls.
 cat > "$SED_TMP" << 'SED'
-s@^  \[\[ -r "$file" \]\] || return 0$@  [[ -f "$file" ]] || return 0@
+/^_read_caps_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -f "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
 SED
 try "config_reader_unreadable" "an unreadable file yields nothing instead of crashing the CLI" "$CLI" "$CONFIG_BATS"
 
@@ -4816,9 +4849,13 @@ try "hook_concurrency_bound" "concurrency is bounded so a spool flood" "$CLI" "$
 
 # TRUST HASH BEFORE PROMPT: hashing after the answer records a .cleat the user
 # never saw, so an agent can rewrite it while the prompt is on screen.
+# Retargeted when the hash came from the single-read view: the mutation hashes
+# a fresh read once the answer is back. Retargeted again when the call gained
+# the empty-array guard (a decision on env-file host variables alone has no
+# caps to pass, and bash 3.2 under set -u calls an empty "${a[@]}" unbound).
 cat > "$SED_TMP" << 'SED'
-/# Hash BEFORE the prompt, from the same read that produced the caps we are/,/^    hash="\$(_hash_cleat_caps "\$caps_file" "\$box")"$/{
-  /^    hash="\$(_hash_cleat_caps "\$caps_file" "\$box")"$/d
+/^_resolve_project_trust()/,/^}$/{
+  s#^    if _trust_prompt "[$]project" [$]{req_caps\[@\]+"[$]{req_caps\[@\]}"}; then$#    if _trust_prompt "$project" ${req_caps[@]+"${req_caps[@]}"}; then hash="$(_hash_cleat_caps "$caps_file" "$box")"#
 }
 SED
 try "trust_hash_before_prompt" "recorded hash is the one the user was shown" "$CLI" "$TRUST_BATS"
@@ -4838,9 +4875,12 @@ SED
 try "desktop_settings_engine_gate" "leftover Desktop settings file is ignored" "$CLI" "$REPO_ROOT/test/unit/docker_gate.bats"
 
 # ATOMIC CONFIG WRITE: truncate-then-write destroys the preserved [setup] block
-# if anything fails part way.
+# if anything fails part way. Retargeted when the project writers moved to
+# _config_put: the old unscoped sed then hit only the global-only writers.
 cat > "$SED_TMP" << 'SED'
-s@  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {@  } > "$file" || {@
+/^_write_caps_to_file()/,/^}$/{
+  s@^  } | _config_put "[$]file"$@  } > "$file"@
+}
 SED
 try "config_write_atomic" "replaced by rename, never truncated in place" "$CLI" "$CONFIG_BATS"
 
@@ -4858,9 +4898,12 @@ SED
 try "sweep_stale_marker_cleaned" "marker from a dead session does not pin" "$CLI" "$REPO_ROOT/test/unit/idle_sweep.bats"
 
 # PERSISTED CLAUDE.JSON HEAL: the host file had a corruption guard, the project
-# copy had none, so a truncated one broke the box on every later start.
+# copy had none, so a truncated one broke the box on every later start. Since
+# v1.5.4 the guard reads the bounded snapshot of the copy.
 cat > "$SED_TMP" << 'SED'
-s@    if \[\[ -f "$proj_src" && -s "$proj_src" \]\] && ! _looks_like_json_object "$proj_src"; then@    if false; then@
+/^_build_project_claude_json()/,/^}$/{
+  s@^      elif ! _looks_like_json_object "[$]psnap"; then$@      elif false; then@
+}
 SED
 try "claude_json_persisted_heal" "corrupt PERSISTED project copy is backed up" "$CLI" "$REPO_ROOT/test/unit/claude_json.bats"
 
@@ -5480,6 +5523,39 @@ s@    kill -0 "[$]pid" 2>/dev/null || rm -f "[$]m" 2>/dev/null || true@    :@
 SED
 try "watcher_marker_liveness" "a dead session's watcher marker never latches" "$CLI" "$REGRESSIONS"
 
+# TEARDOWN UNDER ERREXIT (v1.5.4): the box can plant a directory at any name
+# the session teardown removes in its read-write clip dir, and rm -f exits 1 on
+# a directory. Under the binary's set -e that ended the CLI before the terminal
+# restore, the login harvest and the session-end reports. The per-removal
+# entries are caught through the test's `refute_output --partial "rm: "`,
+# because the errexit wrapper absorbs the abort itself. GNU and BSD rm both
+# print a diagnostic for a directory. The .clipboard.* and both .claim.<pid>.*
+# removals are registered with the other v1.5.4 entries further down.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^      rm -f "[$]_CLIP_DIR/[.]host-ready" 2>/dev/null || true$@      rm -f "$_CLIP_DIR/.host-ready"@
+}
+SED
+try "v154_teardown_host_ready_fail_soft" "a directory the box plants in the clip dir"
+
+# Drop the wrapper and any failing teardown step ends the CLI, at the final call
+# and inside the TERM/HUP trap action alike.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _cleanup_session() { _cleanup_session_steps || true; }$@  _cleanup_session() { _cleanup_session_steps; }@
+}
+SED
+try "v154_teardown_errexit_wrapper" "a teardown step that fails still restores the terminal"
+
+# The strict-mode backstop on the real binary. Not registered for the wrapper:
+# the per-removal guards mask it there.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    rm -f "[$]{_CLIP_DIR:?}/[.]clipboard[.]"[*] 2>/dev/null || true$@    rm -f "${_CLIP_DIR:?}/.clipboard."*@
+}
+SED
+try "v154_teardown_strict_smoke" "does not abort the session end" "$CLI" "$SMOKE_BATS"
+
 # BROWSER BRIDGE SYMLINK READ-THROUGH: the same shape as the clipboard payload
 # path, in the consumer that `cat`s the claim. Drop the guard and a planted link
 # has the host read any file it names and hand the contents to the URL opener.
@@ -5540,15 +5616,21 @@ try "int_cname_threads_box" "int_cname threads a box name through" "$SETUP_BASH"
 
 # The clip dir is mounted rw into the box, so every host-side path it can plant
 # a symlink at needs a guard. `>>` and `[ -f ]` both follow links.
+# Retargeted when the bridge log left the clip dir (v1.5.4): the per-claim
+# guard is gone, so the mutation puts the opening line back in the mount.
 cat > "$SED_TMP" << 'SED'
 /^_browser_watcher()/,/^}$/{
-  s|_drop_unless_regular "\$clip_dir/\.proxy-log"|:|
+  s@\(opening URL on host .*\) >> "[$]_bw_log"$@\1 >> "$clip_dir/.proxy-log"@
 }
 SED
 try "vnext_proxy_log_symlink" "cannot append to a host file through a planted proxy log symlink"
 
+# Retargeted (v1.5.4): the watcher now unlinks the old in-mount log at start,
+# never following a link planted there.
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$clip_dir\/\.proxy-log" >\/dev\/null/d
+/^_browser_watcher()/,/^}$/{
+  /^  rm -f "[$]clip_dir\/\.proxy-log" 2>\/dev\/null || true$/d
+}
 SED
 try "vnext_proxy_log_symlink_at_start" "a symlink present at watcher start is dropped too" "$CLI" "$BROWSER_BRIDGE_BATS"
 
@@ -5558,8 +5640,12 @@ s@tr -d '\[:cntrl:\]'@cat@
 SED
 try "vnext_proxy_log_sanitize" "a URL carrying a newline cannot forge its own log line" "$CLI" "$BROWSER_BRIDGE_BATS"
 
+# Retargeted (v1.5.4): the cap runs on the host-only bridge log, and takes the
+# bridge dir as its claim dir.
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$clip_dir\/\.proxy-log" >\/dev\/null/d
+/^_browser_watcher()/,/^}$/{
+  /^    _cap_watcher_log "[$]_bw_log" /d
+}
 SED
 try "vnext_proxy_log_cap" "an oversized log is capped at watcher start" "$CLI" "$BROWSER_BRIDGE_BATS"
 
@@ -5571,9 +5657,13 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_proxy_log_drop_not_overbroad" "a real log is never dropped, only a symlink is" "$CLI" "$BROWSER_BRIDGE_BATS"
 
+# Since v1.5.4 the cap rotates by rename, which moves a link without following
+# it, so dropping the pre-filter alone no longer reaches the target. The
+# mutation also puts back the in-place truncate the pre-filter guarded.
 cat > "$SED_TMP" << 'SED'
 /^_cap_watcher_log()/,/^}$/{
   s|_drop_unless_regular "\$log"|:|
+  s|if mv -f "[$]log" "[$]claimed" 2>/dev/null; then|if : > "$log" 2>/dev/null; then|
 }
 SED
 try "vnext_cap_log_symlink" "cap watcher log does not truncate a host file through a symlink"
@@ -5660,8 +5750,12 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_image_lock_symlink" "a symlinked image lock is dropped, not followed" "$CLI" "$CLIPIMG_BATS"
 
+# Retargeted (v1.5.4): the host no longer writes the sentinel at all. A plain
+# host touch through the planted link is what this test catches.
 cat > "$SED_TMP" << 'SED'
-s|_drop_unless_regular "\$clip_dir/\.host-ready"|:|
+/^_clipboard_watcher()/,/^}$/{
+  s@^    _clip_announce_ready "[$]cname"$@    touch "$clip_dir/.host-ready"@
+}
 SED
 try "vnext_host_ready_symlink" "host-ready sentinel is replaced"
 
@@ -5754,18 +5848,24 @@ SED
 try "v0.6.4_bind_retry" "retries a busy bind"
 
 # Any shape that is not a regular file is dropped, not just a symlink.
+# Retargeted (v1.5.4): the watcher no longer writes in the clip dir, so the
+# FIFO test pins that instead. Every append put back at the old in-mount path
+# blocks on the FIFO the box planted there. The FIFO arm of
+# _drop_unless_regular stays pinned by the two entries below.
 cat > "$SED_TMP" << 'SED'
-/^_drop_unless_regular()/,/^}$/{
-  s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
+/^_browser_watcher()/,/^}$/{
+  s@>> "[$]_bw_log"@>> "$clip_dir/.proxy-log"@
 }
 SED
-try "vnext_drop_fifo_proxy_log" "a FIFO planted mid-session is dropped" "$CLI" "$BROWSER_BRIDGE_BATS"
+try "vnext_drop_fifo_proxy_log" "a FIFO planted at the old in-mount path never blocks the watcher" "$CLI" "$BROWSER_BRIDGE_BATS"
+# Retargeted (v1.5.4): .host-ready is written by the in-box readiness script,
+# which removes whatever shape the box left at the name before it creates the
+# file. Without the rm, a FIFO blocks the create, a directory stays and a link
+# is followed.
 cat > "$SED_TMP" << 'SED'
-/^_drop_unless_regular()/,/^}$/{
-  s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
-}
+/^_CLIP_READY_SH=/s@ rm -rf "[$]1" 2>/dev/null;@@
 SED
-try "vnext_drop_fifo_host_ready" "drops a FIFO planted at .host-ready" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+try "vnext_drop_fifo_host_ready" "turns any shape at" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
 cat > "$SED_TMP" << 'SED'
 /^_drop_unless_regular()/,/^}$/{
   s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
@@ -5799,21 +5899,23 @@ cat > "$SED_TMP" << 'SED'
 s|_browser_teardown_bridge "\$_login_clip_dir"|rm -f "$_login_clip_dir/.browser-open"|
 SED
 try "vnext_teardown_login_site" "login: teardown keeps a FRESH" "$CLI" "$DOCKER_COMMANDS_BATS"
+# Retargeted (v1.5.4): the liveness gate reads clipwatch/ through
+# _clip_watchers_live.
 cat > "$SED_TMP" << 'SED'
 /^_browser_teardown_bridge()/,/^}$/{
-  s|if ls "\$dir"/.watcher.\* >/dev/null 2>&1; then|if true; then|
+  s|if _clip_watchers_live "\$dir"; then|if true; then|
 }
 SED
 try "vnext_teardown_solo_unconditional" "teardown removes even a fresh browser-open" "$CLI" "$HOOKS_BATS"
 
 # cleat shell and cleat login cap the watcher log before spawning, as the
-# session always did.
+# session always did. Retargeted (v1.5.4): the log is host-only.
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$_shell_clip_dir\/\.watcher-log" >\/dev\/null/d
+/_cap_watcher_log "[$]_shell_watcher_log" /d
 SED
 try "vnext_shell_caps_watcher_log" "shell: caps an oversized watcher log" "$CLI" "$DOCKER_COMMANDS_BATS"
 cat > "$SED_TMP" << 'SED'
-/_cap_watcher_log "\$_login_clip_dir\/\.watcher-log" >\/dev\/null/d
+/_cap_watcher_log "[$]_login_watcher_log" /d
 SED
 try "vnext_login_caps_watcher_log" "login: caps an oversized watcher log" "$CLI" "$DOCKER_COMMANDS_BATS"
 
@@ -6570,12 +6672,12 @@ try "vnext_account_clean_scope" "switching from a logged-in account to a new one
 # A credential at the host default umask is readable by anything on the machine
 # and it is live for weeks. BOTH mechanisms are removed here on purpose: the
 # umask subshell and the chmod each produce 0600 on their own, so removing
-# either alone is invisible. What the test pins is the outcome.
+# either alone is invisible. What the test pins is the outcome. Since v1.5.4
+# the staged file is created by that redirect, not by mktemp.
 cat > "$SED_TMP" << 'SED'
 /^_account_write_file_0600()/,/^}$/{
   s#umask 077#umask 022#
   s#^  chmod 600 "[$]tmp" 2>/dev/null .. true$#  :#
-  s#^  tmp="[$](mktemp .*#  tmp="${dest}.tmp.$$"#
 }
 SED
 try "vnext_account_cred_mode" "a new store is 0700 and its credential 0600" "$CLI" "$ACCOUNTS_BATS"
@@ -7063,11 +7165,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_identity_inplace" "the identity delete keeps the file" "$CLI" "$ACCOUNTS_BATS"
 
-# Two guards cooperate and only the OUTCOME is observable, so the mutation
-# removes both: the refusal in the delete and the one in the writer.
+# Three guards cooperate and only the OUTCOME is observable, so the mutation
+# removes all of them: the refusal in the delete, the one in the bounded
+# snapshot it reads (since v1.5.4) and the one in the writer.
 cat > "$SED_TMP" << 'SED'
 /^_claude_json_drop_identity()/,/^}$/{
   s@^  \[\[ -L "[$]f" \]\] && return 0$@  :@
+}
+/^_claude_json_snapshot()/,/^}$/{
+  s@^  \[ -f "[$]src" \] && \[ ! -L "[$]src" \] || return 1$@  [ -f "$src" ] || return 1@
 }
 /^_write_in_place()/,/^}$/{
   s@ && ! -L "[$]dst"@@
@@ -7219,7 +7325,7 @@ try "vnext_account_nojq_launch_clears" "clears the old account from a box switch
 # Without the in-box filter a jq-less host cannot edit the file at all.
 cat > "$SED_TMP" << 'SED'
 /^_claude_json_drop_identity()/,/^}$/{
-  s@^    { \[\[ -n "[$]cname" \]\] && _daemon_up && is_running "[$]cname"; } || return 1$@    return 1@
+  s@^    if ! { \[\[ -n "[$]cname" \]\] && _daemon_up && is_running "[$]cname"; }; then$@    if true; then@
 }
 SED
 try "vnext_account_nojq_inbox_filter" "clears the old account at the switch when the box is running"
@@ -7672,10 +7778,11 @@ try "vnext_account_pin_dir_mode" "the pin directory is not readable by other use
 # symlink. Without that second check a symlink swapped in after the first one
 # has the host read the file it points at. Retargeted when the check moved into
 # _fd_holds_path (the -ef reader never matched on macOS, see
-# v150_snapshot_inode_not_ef).
+# v150_snapshot_inode_not_ef), and again in v1.5.4 when the open moved into a
+# bounded child on fd 8 (see v154_account_snapshot_bounded_open).
 cat > "$SED_TMP" << 'SED'
 /^_account_snapshot_cred()/,/^}$/{
-  s@^         _fd_holds_path 3 "[$]src" || exit 1$@         : || exit 1@
+  s@^_fd_holds_path 8 "[$]1" || exit 1$@: || exit 1@
 }
 SED
 try "vnext_account_snapshot_relink" "a snapshot refuses a symlink swapped in after the regular-file check" "$CLI" "$ACCOUNTS_BATS"
@@ -8381,10 +8488,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_switch_failed_stage_unpins" "a switch from the shared login that cannot stage leaves the box unpinned" "$CLI" "$ACCOUNTS_BATS"
 
-# A rename onto a directory moves the temp INTO it and reports success.
+# A rename onto a directory moves the temp INTO it and reports success. Since
+# v1.5.4 two mechanisms refuse a directory, each on its own: the -d check up
+# front and the rename that names the destination's directory. Both go.
 cat > "$SED_TMP" << 'SED'
 /^_account_write_file_0600()/,/^}$/{
   s/^  \[\[ -d "[$]dest" \]\] && return 1$/  :/
+}
+/^_rename_onto()/,/^}$/{
+  s#^  mv -f "[$]staged" "[$]{dest%/\*}/" 2>/dev/null$#  mv -f "$staged" "$dest" 2>/dev/null#
 }
 SED
 try "vnext_account_stage_refuses_directory" "a switch from the shared login that cannot stage leaves the box unpinned" "$CLI" "$ACCOUNTS_BATS"
@@ -8714,7 +8826,7 @@ try "vnext_bridge_bind_before_open" "a proxy that never binds opens nothing" "$C
 # sed matches the line by its start. The property is unchanged.
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_blocked_opens()/,/^}$/{
-  s@^  lines="[$](tail -c .*$@  lines="" || return 0@
+  s@^  lines="[$](_read_bounded .*$@  lines="" || return 0@
 }
 SED
 try "vnext_bridge_blocked_reported" "names the URL, the bare origin and the command that allows it" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -8723,7 +8835,7 @@ try "vnext_bridge_blocked_reported" "names the URL, the bare origin and the comm
 # on every launch, which is the nagging concept/21 forbids.
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_blocked_opens()/,/^}$/{
-  s@tail -c "+[$](( off + 1 ))" "[$]log"@cat "$log"@
+  s@_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))"@cat "$log"@
 }
 SED
 try "vnext_bridge_blocked_this_session" "only this session, never a previous one" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -8747,10 +8859,10 @@ try "vnext_bridge_claim_bounded" "the claim read is bounded" "$CLI" "$BROWSER_BR
 # ── refusal reporting, 2026-09-13 ───────────────────────────────────────────
 
 # cleat shell runs the browser watcher, so a login from the shell can be
-# refused. Without the report the refusal lives only in the box's own log.
+# refused. Without the report the refusal lives only in the bridge log.
 cat > "$SED_TMP" << 'SED'
 /^cmd_shell()/,/^}$/{
-  /_maybe_report_blocked_opens "[$]_shell_clip_dir\/.proxy-log"/d
+  /_maybe_report_blocked_opens "[$]_shell_proxy_log"/d
 }
 SED
 try "vnext_refusal_shell_reports" "cleat shell reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
@@ -8758,7 +8870,7 @@ try "vnext_refusal_shell_reports" "cleat shell reports a browser open the gate r
 # cleat login promises the browser will open. A refused origin must say why not.
 cat > "$SED_TMP" << 'SED'
 /^cmd_login()/,/^}$/{
-  /_maybe_report_blocked_opens "[$]_login_clip_dir\/.proxy-log"/d
+  /_maybe_report_blocked_opens "[$]_login_proxy_log"/d
 }
 SED
 try "vnext_refusal_login_reports" "cleat login reports a browser open the gate refused" "$CLI" "$REGRESSIONS"
@@ -9363,8 +9475,7 @@ SED
 try "vnext_b6_ledger_future" "a malformed or future ledger entry neither counts nor breaks the count" "$CLI" "$BROWSER_BRIDGE_BATS"
 
 # B6: the watcher's own open count reaches the helper and grows. Without the
-# increment the session cap never closes, and it is the only cap left when the
-# claim dir falls back into the mount.
+# increment the session cap never closes.
 cat > "$SED_TMP" << 'SED'
 /^_browser_watcher()/,/^}$/{
   /_bw_opens=[$](( _bw_opens + 1 ))/d
@@ -9400,7 +9511,7 @@ try "vnext_b6_capped_reported" "names the URL the cap held back and how many" "$
 # B6: only this session's capped opens.
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_capped_opens()/,/^}$/{
-  s@tail -c "+[$](( off + 1 ))" "[$]log"@cat "$log"@
+  s@_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))"@cat "$log"@
 }
 SED
 try "vnext_b6_capped_this_session" "capped report: only this session" "$CLI" "$BROWSER_BRIDGE_BATS"
@@ -9995,7 +10106,7 @@ try "vnext_acp_wait_300" "the socat wait is bounded at 300 seconds" "$CLI" "$BRO
 # captured before the session, not the start of the file.
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
-  /^  _maybe_report_blocked_opens "[$]_CLIP_DIR\/.proxy-log" "[$]_proxy_log_off"$/d
+  /^  _maybe_report_blocked_opens "[$]_proxy_log_file" "[$]_proxy_log_off"$/d
 }
 SED
 try "vnext_session_end_reports_blocked" "a refusal written during the session is reported" "$CLI" "$EXEC_CLAUDE_BATS"
@@ -10009,7 +10120,7 @@ try "vnext_session_end_reports_hook_drops" "a hook drop written during the sessi
 
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
-  s@^  _proxy_log_off="[$](_cap_watcher_log "[$]_CLIP_DIR/.proxy-log")"$@  _proxy_log_off=0@
+  s@^  _proxy_log_off="[$](_cap_watcher_log "[$]_proxy_log_file" .*$@  _proxy_log_off=0@
 }
 SED
 try "vnext_session_end_proxy_log_offset" "a refusal from an earlier session is not repeated" "$CLI" "$EXEC_CLAUDE_BATS"
@@ -10916,18 +11027,18 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_handoff_unknown_status" "refuses an unknown status" "$CLI" "$HANDOFF_BATS"
 
-# Row 18: a shell line refuses (the for loop right after the Row 18 comment).
+# Row 18: a shell line refuses (the check in the for loop over the shell ids).
 cat > "$SED_TMP" << 'SED'
 /^_handoff_classify()/,/^}$/{
-  /Row 18: background shell/{n;d}
+  /^    _handoff_shell_line_ok "[$]sline" "[$]now" "[$]N" || { _HO_VERDICT=R3; return 0; }$/d
 }
 SED
 try "vnext_handoff_shell_line_refuses" "refuses background shell commands even with now" "$CLI" "$HANDOFF_BATS"
 
-# Row 18: a shell status refuses (the while loop two lines after the comment).
+# Row 18: a shell status refuses (the while loop right after the for loop).
 cat > "$SED_TMP" << 'SED'
 /^_handoff_classify()/,/^}$/{
-  /Row 18: background shell/{n;n;d}
+  /== shell \]\] && { _HO_VERDICT=R3; return 0; }; i=/d
 }
 SED
 try "vnext_handoff_shell_status_refuses" "refuses a session with a shell status" "$CLI" "$HANDOFF_BATS"
@@ -11349,9 +11460,14 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v150_snapshot_fd_deref" "a snapshot still refuses a descriptor on another file"
 
+# The symlink refusal. Since the path is listed without following it, a static
+# link is refused twice, by the -L test and by its own inode, so dropping either
+# alone is not observable: the entry reverts both guards (the precedent is
+# v0.6.0_claude_guard).
 cat > "$SED_TMP" << 'SED'
 /^_fd_holds_path()/,/^}$/{
   s@^  \[\[ ! -L "[$]path" \]\] || return 1$@  :@
+  s@ls -di "[$]path"@ls -Ldi "$path"@
 }
 SED
 try "v150_snapshot_symlink_path" "a snapshot refuses a symlinked path and a missing one"
@@ -11553,10 +11669,11 @@ SED
 try "v150_handoff_drains_before_ask" "a keystroke typed before the question is not an answer to it" "$CLI" "$HANDOFF_BATS"
 
 # The rename's temp paths are unguessable, so a link the box plants at a
-# predictable name is never written through.
+# predictable name is never written through. Since v1.5.4 the mtime stamp lives
+# in the host temp dir, so the sidecar temp is the one left in the box's tree.
 cat > "$SED_TMP" << 'SED'
 /^_sessions_rename_write()/,/^}$/{
-  s@^  stamp="[$](mktemp "[$]{sdir}/.cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""$@  stamp="${sdir}/.cleat-mtime.$$"@
+  s@^    tmp="[$](mktemp "[$]{sdir}/[$]{uuid}/[.]custom-title[.]json[.]XXXXXX" 2>/dev/null)" || tmp=""$@    tmp="${sdir}/${uuid}/.custom-title.json.$$"@
 }
 SED
 try "v150_rename_temp_mktemp" "a link planted at the temp path is never written through" "$CLI" "$SESSIONS_BATS"
@@ -11647,24 +11764,6 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_clipimg_claim_host_only" "an image request was moved through a link the box planted"
 
-# The session trash is host-only. Back inside the session dir the box mounts, a
-# link planted at the entry name sends a deleted transcript into a host dir.
-cat > "$SED_TMP" << 'SED'
-/^_sessions_trash_path()/,/^}$/{
-  s@^  printf '%s/session-trash/%s' "[$]CLEAT_CONFIG_DIR" "[$]{1##\*/}"$@  printf '%s/.cleat-trash' "$1"@
-}
-SED
-try "vnext_session_trash_host_only" "a session delete followed a link the box planted in its trash"
-
-# The hook drop report reads the whole log when its offset points past the end,
-# which is what a rotation leaves behind.
-cat > "$SED_TMP" << 'SED'
-/^_maybe_report_hook_drops()/,/^}$/{
-  /^  \[ "[$]off" -le "[$]sz" \] || off=0$/d
-}
-SED
-try "vnext_hook_report_after_rotation" "a rotated hook drop log silenced the session-end report"
-
 # The bridge URL cap counts bytes. ${#url} alone counts characters under the
 # caller's UTF-8 locale, which let a multibyte URL through at several times the
 # bytes the cap allows.
@@ -11674,6 +11773,1819 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_bridge_url_cap_bytes" "the bridge URL cap counted characters, not bytes"
+
+# The auth-shape check caps the ENCODED redirect_uri at 2048 bytes. Widen it to
+# the 8192 bytes the claim reads: only the watcher's refused-origin branch
+# reaches this cap, so every _is_auth_url test stays green. Test A's 2049-byte
+# case catches it. It catches a dropped cap the same way.
+cat > "$SED_TMP" << 'SED'
+/^_is_auth_url_shape()/,/^}$/{
+  s@ -le 2048 ] || return 1$@ -le 8192 ] || return 1@
+}
+SED
+try "v154_auth_shape_redirect_cap" "the auth-shape check caps the encoded redirect_uri at 2048 bytes"
+
+# The same cap counts bytes. Restore the character count it had before the
+# byte fix, the shape of vnext_bridge_url_cap_bytes above.
+cat > "$SED_TMP" << 'SED'
+/^_is_auth_url_shape()/,/^}$/{
+  s@"[$](LC_ALL=C; printf '%s' "[$]{#enc}")"@"${#enc}"@
+}
+SED
+try "v154_auth_shape_redirect_cap_bytes" "the auth-shape redirect_uri cap counts bytes, not characters"
+
+# The session trash is host-only. Back inside the session dir the box mounts, a
+# link planted at the entry name sends a deleted transcript into a host dir.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_path()/,/^}$/{
+  s@^  printf '%s/session-trash/%s' "[$]CLEAT_CONFIG_DIR" "[$]{1##\*/}"$@  printf '%s/.cleat-trash' "$1"@
+}
+SED
+try "v154_session_trash_host_only" "a session delete followed a link the box planted in its trash"
+
+# Restore names the session DIRECTORY with mv -n. Renaming onto the full name
+# lets a link planted there after the check take the sidecar into a host dir.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_restore()/,/^}$/{
+  s@^        mv -n "[$]p" "[$]{sdir}/" 2>/dev/null || true ;;$@        mv "$p" "${sdir}/${base}" 2>/dev/null || true ;;@
+}
+SED
+try "v154_session_restore_names_dir" "a session restore moved through a link the box planted at the session name"
+
+# The old in-mount trash is renamed out whole and only unpacked when it is a
+# real directory. Walking a link unpacks a host dir into the trash.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_dir()/,/^}$/{
+  s@^      if \[\[ -d "[$]staged" && ! -L "[$]staged" \]\]; then$@      if [[ -d "$staged" ]]; then@
+}
+SED
+try "v154_session_trash_legacy_link" "the old in-mount trash was unpacked through a link the box planted"
+
+# The trash entry is created with a plain mkdir. mkdir -p walks through a link
+# already at the entry name and the delete moves the transcript through it.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash()/,/^}$/{
+  s@^  mkdir "[$]dest" 2>/dev/null || return 2$@  mkdir -p "$dest" 2>/dev/null || return 2@
+}
+SED
+try "v154_session_trash_entry_exclusive" "a session delete wrote through a link already at its trash entry name"
+
+# The hook bridge's liveness markers are read from the host-only hookbridge/.
+# Read back from hooks/, the box's read-write mount, a marker the box planted
+# naming any live pid stands the bridge down and no host hook runs.
+cat > "$SED_TMP" << 'SED'
+/^_box_hook_bridge_live()/,/^}$/{
+  s@^  for m in "[$]CLEAT_RUN_DIR/[$]1"/hookbridge/[.]bridge[.][*]; do$@  for m in "$CLEAT_RUN_DIR/$1"/hooks/.bridge.*; do@
+}
+SED
+try "v154_hook_marker_read_host_only" "a bridge marker the box planted in its hooks mount stood the hook bridge down"
+
+# And written there. A plain redirect into hooks/ opens whatever the box left
+# at the name: a dangling link creates a host file, a FIFO hangs the start.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^      ( umask 077; : > "[$]CLEAT_RUN_DIR/[$]{cname}/hookbridge/[.]bridge[.][$][$]" ) 2>/dev/null || true$@      ( umask 077; : > "${hooks_file%/*}/.bridge.$$" ) 2>/dev/null || true@
+}
+SED
+try "v154_hook_marker_write_host_only" "the bridge marker was written through a link the box planted in its hooks mount"
+
+# The marker dir is made before the write. Without it the write fails in
+# silence and the next terminal on the box starts a second bridge.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^      mkdir -p "[$]CLEAT_RUN_DIR/[$]{cname}/hookbridge" 2>/dev/null || true$@      :@
+}
+SED
+try "v154_hook_marker_dir_created" "the bridge marker was written through a link the box planted in its hooks mount"
+
+# The hook spool is bounded while a bridge runs. Both watcher calls become
+# `false`, which leaves the start line a no-op under its `|| true` and never
+# enters the per-poll `then`. The session-entry calls name the spool by its full
+# path through _hook_spool_entry_cap, outside the range.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s|_hook_spool_cap "[$]hooks_file"|false "$hooks_file"|
+}
+SED
+try "v154_hook_spool_cap" "the hook spool grew without bound"
+
+# The bridge's start pass alone. A spool already past the cap when the bridge
+# starts would be claimed by the first poll with nothing counted, because the
+# bridge starts at its end.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^  _hook_spool_cap "[$]hooks_file" "[$]_hb_cname" 0 || true$@  :@
+}
+SED
+try "v154_spool_start_claim" "a spool already past the cap when the bridge starts is claimed and counted whole" \
+    "$CLI" "$HOOKS_BATS"
+
+# And at every session entry, with or without a bridge. The pass itself, then
+# each of its three callers.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_entry_cap()/,/^}$/{
+  s|_hook_spool_cap "[$]CLEAT_RUN_DIR|false "$CLEAT_RUN_DIR|
+}
+SED
+try "v154_hook_spool_entry_cap" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  /^  _hook_spool_entry_cap "[$]cname"$/d
+}
+SED
+try "v154_hook_spool_entry_shell" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  /^  _hook_spool_entry_cap "[$]cname"$/d
+}
+SED
+try "v154_hook_spool_entry_login" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /^  _hook_spool_entry_cap "[$]cname"$/d
+}
+SED
+try "v154_hook_spool_entry_claude" "a hooks box with no bridge kept its spool for its whole life"
+
+# A shell or a login reports what the entry pass discarded, as a Claude session
+# does. Without the report the discard is silent.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  /^  _maybe_report_hook_drops "[$]_shell_drop_log" /d
+}
+SED
+try "v154_hook_report_shell" "a hooks box with no bridge kept its spool for its whole life"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  /^  _maybe_report_hook_drops "[$]_login_drop_log" /d
+}
+SED
+try "v154_hook_report_login" "a hooks box with no bridge kept its spool for its whole life"
+
+# The hook drop report reads the whole log when its offset points past the end,
+# which is what a rotation leaves behind.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  /^  \[ "[$]off" -le "[$]sz" \] || off=0$/d
+}
+SED
+try "v154_hook_report_after_rotation" "a rotated hook drop log silenced the session-end report"
+
+# A spool discard is reported as bytes discarded, never as refused events.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  /[$]3 == "spool"/d
+}
+SED
+try "v154_spool_report_split" "a claimed spool reports the discarded bytes at session end" \
+    "$CLI" "$HOOKS_BATS"
+
+# The spool is claimed by rename. Truncating it through its name writes through
+# a link the box planted after the pre-filter.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_cap()/,/^}$/{
+  s#mv -f "[$]spool" "[$]claimed" 2>/dev/null || return 1#: > "$spool"#
+}
+SED
+try "v154_spool_claim_by_rename" "the spool cap never writes through a link planted at the spool" \
+    "$CLI" "$HOOKS_BATS"
+
+# Sized with a stat. `wc -c <` opens the spool, and a FIFO the box plants after
+# the pre-filter hangs the foreground session-entry pass.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_cap()/,/^}$/{
+  s#size="[$](_path_size "[$]spool")"#size="$(wc -c < "$spool")"#
+}
+SED
+try "v154_spool_size_without_open" "the spool cap never blocks on a FIFO planted at the spool" \
+    "$CLI" "$HOOKS_BATS"
+
+# The claim dir is hooks/'s host-only sibling. A claim dir inside the mount
+# reinstates the race the rename exists to close.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_cap()/,/^}$/{
+  s#claim_dir="[$]{claim_dir%/[*]}/hookclaim"#claim_dir="$claim_dir/.hookclaim"#
+}
+SED
+try "v154_spool_claim_outside_mount" "a missing claim dir skips the cap rather than writing in the hooks dir" \
+    "$CLI" "$HOOKS_BATS"
+
+# The entry pass stands aside for a live bridge, which owns the offset.
+cat > "$SED_TMP" << 'SED'
+/^_hook_spool_entry_cap()/,/^}$/{
+  s#&& ! _box_hook_bridge_live "[$]cname"##
+}
+SED
+try "v154_spool_entry_live_bridge" "a session start leaves the spool alone while another bridge is live" \
+    "$CLI" "$HOOKS_BATS"
+
+# A bridge pass stops at its line budget, so a flood of short lines cannot keep
+# the cap from being checked. Timing based: the flood outlasts the test window
+# only when every line is handled in one pass.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  /\[ "[$]_hb_lines" -le "[$]_HOOK_PASS_LINES" \] || break/d
+}
+SED
+try "v154_spool_pass_budget" "the spool cap still runs while the box floods the spool with short lines" \
+    "$CLI" "$HOOKS_BATS"
+
+# A per-poll claim resets the offset. The box can append past the old offset
+# before the next poll, and the fresh spool's first event would be skipped.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s#then byte_offset=0; _hb_skip=0; fi#then _hb_skip=0; fi#
+}
+SED
+try "v154_spool_offset_reset" "the first events after a per-poll claim are delivered" \
+    "$CLI" "$HOOKS_BATS"
+
+# The size read after a claim is a stat, so a missing spool writes no error to
+# the watcher log on every poll. A redirect opens it and fails out loud there.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s#file_size="[$](_path_size "[$]hooks_file")"#file_size=$(wc -c < "$hooks_file" 2>/dev/null || echo 0)#
+}
+SED
+try "v154_spool_size_read_quiet" "a claimed spool leaves no error in the watcher log" \
+    "$CLI" "$HOOKS_BATS"
+
+# Host reads of names the box can write. A .cleat or .cleat.env reader gates on
+# -f and reads through _read_bounded. Back to -r and a plain redirect, a FIFO
+# .cleat hangs the launch fingerprint, and each other reader, on its own.
+cat > "$SED_TMP" << 'SED'
+/^_read_section_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_fingerprint_reader" "does not hang the launch fingerprint"
+
+cat > "$SED_TMP" << 'SED'
+/^_cleat_section_present()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 1$@  [[ -r "$file" ]] || return 1@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_section_present" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_caps_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_caps" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_setup_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_setup" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_section_all_from_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_section_all" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_warn_unknown_cleat_sections()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_unknown_sections" "reader opens a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_parse_env_file()/,/^}$/{
+  s@^  \[\[ -f "[$]file" && -r "[$]file" \]\] || return 0$@  [[ -r "$file" ]] || return 0@
+  s@^  done < <(_read_bounded "[$]file" "[$]_BOX_FILE_READ_MAX")$@  done < "$file"@
+}
+SED
+try "v154_boxread_env" "reader opens a FIFO"
+
+# The time bound on each branch of _read_bounded. Without it a FIFO swapped in
+# after the -f check blocks the open for good.
+cat > "$SED_TMP" << 'SED'
+/^_read_bounded()/,/^}$/{
+  s@_run_bounded "[$]_BOX_FILE_READ_SECS" head @head @
+}
+SED
+try "v154_boxread_head_timed" "swapped for a FIFO after its check is read under a time bound"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_bounded()/,/^}$/{
+  s@_run_bounded "[$]_BOX_FILE_READ_SECS" tail @tail @
+}
+SED
+try "v154_boxread_tail_timed" "hook spool swapped for a FIFO before the window read"
+
+# The [setup] script is read bounded and refused past 1 MiB. `cat` blocks on a
+# FIFO swapped in after the checks, and without the size check the script is
+# cut at the read bound instead of refused.
+cat > "$SED_TMP" << 'SED'
+/^_build_setup_payload()/,/^}$/{
+  s@^        _read_bounded "[$]full" "[$]_BOX_FILE_READ_MAX"$@        cat "$full"@
+}
+SED
+try "v154_boxread_setup_script" "setup script swapped for a FIFO after its checks"
+
+cat > "$SED_TMP" << 'SED'
+/^_build_setup_payload()/,/^}$/{
+  s@-gt "[$]_BOX_FILE_READ_MAX" \]; then@-lt 0 ]; then@
+}
+SED
+try "v154_boxread_setup_size_cap" "setup script over 1 MiB is refused"
+
+# The hook bridge sizes its spool with a stat, in the loop and for its start
+# offset, and _path_size never opens what it sizes. Any of them opening the
+# spool blocks on a FIFO the box swapped in.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^    file_size="[$](_path_size "[$]hooks_file")"$@    file_size=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)@
+}
+SED
+try "v154_boxread_spool_loop_size" "hook bridge sizes its spool without opening it"
+
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^  byte_offset="[$](_path_size "[$]hooks_file")"$@  byte_offset=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)@
+}
+SED
+try "v154_boxread_spool_entry_size" "hook bridge sizes its spool without opening it"
+
+# The bridge starts at the spool's current end, so a prior session's events
+# never run again. The v0.6.0 test grepped for `wc -c` and drives the bridge
+# now that the start offset is a stat.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@^  byte_offset="[$](_path_size "[$]hooks_file")"$@  byte_offset=0@
+}
+SED
+try "v0.6.0_bridge_start_offset" "hook bridge skips pre-existing events at startup"
+
+cat > "$SED_TMP" << 'SED'
+/^_path_size()/,/^}$/{
+  s@^  z="[$](stat -L -c %s .*$@  z="$(wc -c < "$1" 2>/dev/null || echo "")"@
+}
+SED
+try "v154_boxread_path_size_no_open" "hook bridge sizes its spool without opening it"
+
+# The session list sized each transcript with a stat, not `wc -c <`. Reverting
+# it opens the transcript, so a device or FIFO swapped in after the -f gate
+# hangs or over-reads. The stat stand-in never fires for the opener, so the size
+# comes back off the un-swapped file instead of 0.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_size_kb()/,/^}$/{
+  s@^    bytes="[$](_path_size "[$]{sdir}/[$]{uuid}.jsonl")"$@    bytes="$(wc -c < "${sdir}/${uuid}.jsonl")"@
+}
+SED
+try "v154_session_size_stat_no_open" "a session size read stats the transcript instead of opening it"
+
+# The credential open runs in a child under the time bound now, like
+# _read_unlinked_bounded. Drop the bound and the child's open blocks forever on
+# a FIFO the box swaps in after the -f check.
+cat > "$SED_TMP" << 'SED'
+/^_account_snapshot_cred()/,/^}$/{
+  s@  if ! _run_bounded "[$]_BOX_FILE_READ_SECS" bash -c @  if ! bash -c @
+}
+SED
+try "v154_account_snapshot_bounded_open" "a credential file swapped for a FIFO after its check is read under a time bound"
+
+# And reads each window bounded. An unbounded tail wedges the bridge on a FIFO
+# swapped in between the size read and the open.
+cat > "$SED_TMP" << 'SED'
+/^_hook_bridge_watcher()/,/^}$/{
+  s@done < <(_read_bounded "[$]hooks_file" "[$]_count" "[$]_start")@done < <(tail -c +"$_start" "$hooks_file" 2>/dev/null | head -c "$_count")@
+}
+SED
+try "v154_boxread_hook_window" "hook spool swapped for a FIFO before the window read"
+
+# The four session-end reports read their log bounded. Back to a plain tail,
+# each blocks on a FIFO swapped in after its check.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_explain_fork_exhaustion()/,/^}$/{
+  s@^  _read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep -q@  tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep -q@
+}
+SED
+try "v154_boxread_log_fork_bounded" "session-end reports do not hang on a log swapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_opens()/,/^}$/{
+  s@lines="[$](_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep @lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep @
+}
+SED
+try "v154_boxread_log_capped_bounded" "session-end reports do not hang on a log swapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_nobind_opens()/,/^}$/{
+  s@lines="[$](_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep @lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep @
+}
+SED
+try "v154_boxread_log_nobind_bounded" "session-end reports do not hang on a log swapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@lines="[$](_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" | grep @lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep @
+}
+SED
+try "v154_boxread_log_blocked_bounded" "session-end reports do not hang on a log swapped"
+
+# And none follows a link planted as its log. Each report alone: the refusal
+# report calls the other two first, and they stay silent through the link.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_explain_fork_exhaustion()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_fork_nolink" "session-end reports never follow a link"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_opens()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_capped_nolink" "session-end reports never follow a link"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_nobind_opens()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_nobind_nolink" "session-end reports never follow a link"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_blocked_opens()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "v154_boxread_log_blocked_nolink" "session-end reports never follow a link"
+
+
+# One read decides the project caps. resolve_caps applied its own read of
+# .cleat while the trust check hashed a second, the prompt listed a third and
+# recorded the hash of a fourth, so a box that flips the file between two of
+# them got one set checked and another applied.
+#
+# The check hashes a fresh read again: the box puts back the trusted file for
+# the check while the view it rewrote is applied.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@_is_project_trusted "[$]project" "[$]hash"@_is_project_trusted "$project"@
+}
+SED
+try "v154_caps_apply_same_read" "caps apply from the same read the trust check hashed"
+
+# The session cache holds a bare approval again: a .cleat rewritten between
+# cmd_start's resolve_caps and the recreate's rides the first answer.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@"approved:[$]hash") return 0 ;;@approved:*) return 0 ;;@
+}
+SED
+try "v154_caps_session_cache_hash_bound" "in-process approval does not carry over"
+
+# The prompt lists the view but records the hash of a second read.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@^  local hash="[$]_PCAPS_HASH"$@  local hash; hash="$(_hash_cleat_caps "$caps_file" "$box")"@
+}
+SED
+try "v154_caps_prompt_records_shown" "trust prompt records the caps it showed"
+
+# cleat trust prints "Approved caps" from a read after the one it recorded.
+cat > "$SED_TMP" << 'SED'
+/^cmd_trust()/,/^}$/{
+  s@Approved caps: [$](_sanitize_repo_str "[$]approved_caps")@Approved caps: $(_read_caps_from_file "$caps_file" "$box" | _canonical_caps)@
+}
+SED
+try "v154_cmd_trust_prints_recorded" "cleat trust prints the caps it records"
+
+# Unknown names are hashed again, so the inert line `docker,git` hashes the
+# same as the two real caps and its approval stands for them.
+cat > "$SED_TMP" << 'SED'
+/^_project_caps_view()/,/^}$/{
+  s@if _cap_is_known "[$]c"; then@if true; then@
+}
+SED
+try "v154_caps_unknown_names_dropped" "approved inert cap line cannot later stand"
+
+# The snapshot copy loses its byte cap, so a link to /dev/zero swapped in after
+# the -f check fills the host temp directory.
+cat > "$SED_TMP" << 'SED'
+/^_project_caps_view()/,/^}$/{
+  s@_read_bounded "[$]file" "[$]_PCAPS_READ_MAX" 2>/dev/null >@cat -- "$file" 2>/dev/null >@
+}
+SED
+try "v154_caps_snapshot_bounded" "reads at most 256 KiB" "$CLI" "$TRUST_BATS"
+
+# The snapshot is left in the temp directory after every launch.
+cat > "$SED_TMP" << 'SED'
+/^_project_caps_view()/,/^}$/{
+  s@^  rm -f "[$]snap"$@  :@
+}
+SED
+try "v154_caps_snapshot_cleanup" "the caps snapshot leaves no temp file behind" "$CLI" "$TRUST_BATS"
+
+# The ignored-cap warning prints a box-written name at full length.
+cat > "$SED_TMP" << 'SED'
+/^_warn_unknown_project_caps()/,/^}$/{
+  s@"[$]{n:0:32}"@"$n"@
+}
+SED
+try "v154_caps_unknown_warning_bounded" "warning names at most three names" "$CLI" "$TRUST_BATS"
+
+# Bare names in a project env file behind trust. A bare KEY in .cleat.env
+# copied the host's value into the box with no approval, and the box or a
+# cloned repo picks the names. The set of bare names now joins the project
+# trust decision, read once, and a symlinked env file is never read.
+#
+# A bare name resolves whether or not the decision approved it.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_lines()/,/^}$/{
+  s@^    \[\[ "[$]_PENV_APPROVED" == 1 \]\] || continue$@    :@
+}
+SED
+try "v154_env_bare_names_gated" "a project env file cannot copy a host variable into an untrusted box"
+
+# The names leave the trust hash, so an approval of one name set stands for
+# any other.
+cat > "$SED_TMP" << 'SED'
+/^_trust_decision_hash()/,/^}$/{
+  s@printf 'caps:%s\\nenv:%s' "[$]caps" "[$]names"@printf 'caps:%s\\nenv:' "$caps"@
+}
+SED
+try "v154_env_names_in_trust_hash" "a new host variable in the project env file needs fresh approval"
+
+# Every project hashes the combined form, names or not, so a v1.5.3 caps-only
+# approval no longer matches and nobody's trust survives the upgrade.
+cat > "$SED_TMP" << 'SED'
+/^_trust_decision_hash()/,/^}$/{
+  s@^  if \[\[ -z "[$]names" \]\]; then$@  if false; then@
+}
+/^_resolve_project_trust()/,/^}$/{
+  s@^  \[\[ -z "[$]_PENV_BARE" \]\] || hash=@  hash=@
+}
+SED
+try "v154_env_no_names_same_hash" "a project env file with no host variables keeps its trust hash"
+
+# The env file is read through a plain bounded read that follows a link, with
+# no refusal of a symlinked file.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_view()/,/^}$/{
+  s@^  if \[\[ -L "[$]file" \]\]; then$@  if false; then@
+  s@_read_unlinked_bounded "[$]file"@_read_bounded "$file"@
+}
+SED
+try "v154_env_symlink_not_read" "a symlinked project env file is not read"
+
+# The descriptor is not checked after the open, so a link swapped in after the
+# checks is followed.
+cat > "$SED_TMP" << 'SED'
+/^_read_unlinked_bounded()/,/^}$/{
+  s@^_fd_holds_path 8 "[$]1" || exit 1$@: || exit 1@
+}
+SED
+try "v154_env_read_checked_fd" "a project env file swapped for a link before its open is not read"
+
+# The descriptor check lists the path through the link again.
+cat > "$SED_TMP" << 'SED'
+/^_fd_holds_path()/,/^}$/{
+  s@ls -di "[$]path"@ls -Ldi "$path"@
+}
+SED
+try "v154_fd_check_lstat" "the descriptor check lists the path without following it"
+
+# The values come from a fresh read at apply time that rides the decision taken
+# on the earlier one.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_current()/,/^}$/{
+  s@^  \[\[ "[$]_PENV_OF" == "[$]file|[$]box" \]\] || _project_env_view "[$]file" "[$]box"$@  local _a="$_PENV_APPROVED"; _project_env_view "$file" "$box"; _PENV_APPROVED="$_a"@
+}
+SED
+try "v154_env_apply_same_read" "host variables apply from the same read the trust prompt showed"
+
+# The prompt shows the caps alone while the hash still covers the names.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_project_trust()/,/^}$/{
+  s@^    local _TRUST_PROMPT_VARS="[$]_PENV_BARE"$@    local _TRUST_PROMPT_VARS=""@
+}
+SED
+try "v154_env_names_in_prompt" "env-file host variables change the hash and appear in the prompt" "$CLI" "$TRUST_BATS"
+
+# An approval never reaches the env view, so approved names stay unresolved.
+cat > "$SED_TMP" << 'SED'
+/^resolve_caps()/,/^}$/{
+  s@^        _PENV_APPROVED=1$@        :@
+}
+SED
+try "v154_env_approval_applies" "approves env-file host variables and records them" "$CLI" "$TRUST_BATS"
+
+# cleat trust records the caps hash alone, so the approval it prints never
+# matches the next launch.
+cat > "$SED_TMP" << 'SED'
+/^cmd_trust()/,/^}$/{
+  s@^  \[\[ -z "[$]_PENV_BARE" \]\] || hash=.*$@  :@
+}
+SED
+try "v154_cmd_trust_records_env_names" "cleat trust approves the host variables an env file asks for" "$CLI" "$TRUST_BATS"
+
+# The names are asked about even when no source can turn the env cap on, so a
+# project nobody reads the env file of prompts anyway.
+cat > "$SED_TMP" << 'SED'
+/^resolve_caps()/,/^}$/{
+  s@^    local _env_asks=0 _c$@    local _env_asks=1 _c@
+}
+SED
+try "v154_env_asked_only_with_env_cap" "asked about only when the env cap can be on" "$CLI" "$TRUST_BATS"
+
+# The skipped-names warning prints every box-written name.
+cat > "$SED_TMP" << 'SED'
+/^_warn_project_env_view()/,/^}$/{
+  s@if \[\[ [$]count -le 5 \]\]; then@if true; then@
+}
+SED
+try "v154_env_warning_bounded" "warning names at most five" "$CLI" "$TRUST_BATS"
+
+# The skipped-names warning prints on every resolve of one launch.
+cat > "$SED_TMP" << 'SED'
+/^_warn_project_env_view()/,/^}$/{
+  s@^  case "[$]_WARNED_PROJECT_ENV" in .*esac$@  :@
+}
+SED
+try "v154_env_warning_once" "warning names at most five" "$CLI" "$TRUST_BATS"
+
+# The env snapshot is left in the temp directory after every launch.
+cat > "$SED_TMP" << 'SED'
+/^_project_env_view()/,/^}$/{
+  s@^  rm -f "[$]snap"$@  :@
+}
+SED
+try "v154_env_snapshot_cleanup" "env snapshot leaves no temp file behind" "$CLI" "$TRUST_BATS"
+
+# cleat trust --list compares the caps hash alone, so a row approved for
+# env-file host variables never turns yellow when a name is added.
+cat > "$SED_TMP" << 'SED'
+/^cmd_trust()/,/^}$/{
+  s@_cur="[$](_project_trust_hash "[$]p" "[$]b")"@_cur="$(_hash_cleat_caps "$(_project_caps_file "$p")" "$b")"@
+}
+SED
+try "v154_trust_list_env_rows" "turns yellow when a name is added" "$CLI" "$TRUST_BATS"
+
+# ── v1.5.4: project .cleat writers never go through the workspace ───────────
+# The writers staged the new .cleat beside it as <file>.cleat-tmp.<pid> and
+# <file>.cleat-note.<pid>, where a link the box planted had the host write
+# through it into any host file. Each entry puts one writer's old temp back.
+cat > "$SED_TMP" << 'SED'
+/^_write_caps_to_file()/,/^}$/{
+  s@^  } | _config_put "[$]file"$@  } > "$file.cleat-tmp.$$" \&\& mv -f "$file.cleat-tmp.$$" "$file"@
+}
+SED
+try "v154_c3_caps_temp_link" "edit never writes through a link planted at its temp name"
+
+cat > "$SED_TMP" << 'SED'
+/^_write_resources_to_file()/,/^}$/{
+  s@^  } | _config_put "[$]file"$@  } > "$file.cleat-tmp.$$" \&\& mv -f "$file.cleat-tmp.$$" "$file"@
+}
+SED
+try "v154_c3_resources_temp_link" "edit never writes through a link planted at its temp name"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_note_sections_version()/,/^}$/{
+  s@^  } | _config_put "[$]file" >/dev/null || true$@  } > "${file}.cleat-note.$$" \&\& mv -f "${file}.cleat-note.$$" "$file" || true@
+}
+SED
+try "v154_c3_note_temp_link" "edit never writes through a link planted at its temp name"
+
+# The snapshot reads a project .cleat through a link, and the rename then
+# republishes a host file's bytes in the workspace.
+cat > "$SED_TMP" << 'SED'
+/^_config_snapshot()/,/^}$/{
+  s@^  if \[\[ "[$]src" == "[$]CLEAT_GLOBAL_CONFIG" \]\]; then$@  if true; then@
+}
+SED
+try "v154_c3_snapshot_no_follow" "linked to a host file is refused"
+
+# Generate took a dangling link as fresh and wrote its header through it.
+cat > "$SED_TMP" << 'SED'
+/^_generate_project_cleat()/,/^}$/{
+  s@^  if \[\[ ! -e "[$]file" && ! -L "[$]file" \]\]; then$@  if [[ ! -f "$file" ]]; then@
+  s@^    } | _config_put "[$]file" || return 1$@    } > "$file" || return 1@
+}
+SED
+try "v154_c3_generate_dangling_link" "generate never creates the file a dangling"
+
+# The .cleat.env scaffold wrote its template through a dangling link.
+cat > "$SED_TMP" << 'SED'
+/^_scaffold_cleat_env()/,/^}$/{
+  s@^  if \[\[ -L "[$]env_file" \]\]; then$@  if false; then@
+  s@^  _config_put "[$]env_file" << 'ENVEOF' || return 1$@  cat > "$env_file" << 'ENVEOF'@
+}
+SED
+try "v154_c3_scaffold_dangling_link" "scaffold never creates the file a dangling link names"
+
+# `mv tmp FILE` moves INTO a directory a link at FILE names. The move must name
+# the workspace directory so it renames onto the final name.
+cat > "$SED_TMP" << 'SED'
+/^_config_put()/,/^}$/{
+  s@ "[$](dirname "[$]file")/" 2>/dev/null; then$@ "$file" 2>/dev/null; then@
+}
+SED
+try "v154_c3_put_into_dir" "the rename lands on"
+
+# Every edit leaves an empty stage directory in the config dir.
+cat > "$SED_TMP" << 'SED'
+/^_config_put()/,/^}$/{
+  s@^    rm -rf "[$]stage" 2>/dev/null || true$@    :@
+}
+SED
+try "v154_c3_put_stage_cleanup" "nothing is staged beside" "$CLI" "$CONFIG_BATS"
+
+# The global config is host-only. Refusing a link there breaks every dotfiles
+# setup (stow, chezmoi) for no gain.
+cat > "$SED_TMP" << 'SED'
+/^_config_snapshot()/,/^}$/{
+  s@^  if \[\[ "[$]src" == "[$]CLEAT_GLOBAL_CONFIG" \]\]; then$@  if false; then@
+}
+SED
+try "v154_c3_global_link_followed" "a global config kept as a dotfiles link" "$CLI" "$CONFIG_BATS"
+
+# No bound: a .cleat of any size is copied into the config dir.
+cat > "$SED_TMP" << 'SED'
+s@^_CONFIG_FILE_MAX_BYTES=262144$@_CONFIG_FILE_MAX_BYTES=99999999@
+SED
+try "v154_c3_size_bound" "an oversized" "$CLI" "$CONFIG_BATS"
+
+# A read refused because the name changed around its open comes back empty, and
+# the edit is then written over it, dropping every other section.
+cat > "$SED_TMP" << 'SED'
+/^_config_snapshot()/,/^}$/{
+  s@^    if \[\[ ! -s "[$]tmp" && -s "[$]src" \]\]; then$@    if false; then@
+}
+SED
+try "v154_c3_swap_refused" "refused mid-swap" "$CLI" "$CONFIG_BATS"
+
+# An unwritable config dir is reported as a link in the workspace.
+cat > "$SED_TMP" << 'SED'
+/^_config_refuse()/,/^}$/{
+  s@^  if \[\[ "[$]{2:-1}" -eq 2 \]\]; then$@  if false; then@
+}
+SED
+try "v154_c3_confdir_named" "cannot hold the stage" "$CLI" "$CONFIG_BATS"
+
+# A refused edit still printed its success line in a caller without errexit.
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s#^      _config_write_caps_scoped "[$]config_file" "[$]_sec_caps" "[$]_box_scope" "[$]{current_caps\[@\]}" || exit 1$#      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${current_caps[@]}"#
+}
+SED
+try "v154_c3_enable_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s# "[$]{new_caps\[@\]+"[$]{new_caps\[@\]}"}" || exit 1$# "${new_caps[@]+"${new_caps[@]}"}"#
+}
+SED
+try "v154_c3_disable_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s@ "[$]config_file" "[$]cur_mem" "[$]cur_cpus" || exit 1$@ "$config_file" "$cur_mem" "$cur_cpus"@
+}
+SED
+try "v154_c3_resource_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_write_caps_scoped()/,/^}$/{
+  s#^    _write_caps_to_file "[$]file" "[$]{caps\[@\]+"[$]{caps\[@\]}"}" || return 1$#    _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"#
+}
+SED
+try "v154_c3_scoped_project_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_write_caps_scoped()/,/^}$/{
+  s# _WRITE_EMPTY_SECTION=1 _write_caps_to_file "[$]file" "[$]{caps\[@\]+"[$]{caps\[@\]}"}" || return 1$# _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"#
+}
+SED
+try "v154_c3_scoped_box_stops" "a refused edit exits 1" "$CLI" "$CONFIG_BATS"
+
+# Both writes in the editor save must stop it: either one alone refuses too.
+cat > "$SED_TMP" << 'SED'
+/^_config_editor_save()/,/^}$/{
+  s# "[$]{final_caps\[@\]+"[$]{final_caps\[@\]}"}" || return 1$# "${final_caps[@]+"${final_caps[@]}"}"#
+  s@ "[$]config_file" "[$]mem_w" "[$]cpu_w" || return 1$@ "$config_file" "$mem_w" "$cpu_w"@
+}
+SED
+try "v154_c3_editor_save_stops" "a refused project save or generate" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_generate_project()/,/^}$/{
+  s# "[$]{caps\[@\]+"[$]{caps\[@\]}"}" || return 1$# "${caps[@]+"${caps[@]}"}"#
+}
+SED
+try "v154_c3_generate_stops" "a refused project save or generate" "$CLI" "$CONFIG_BATS"
+# v1.5.4: the project settings overlays were built by a cp, jq or grep that
+# follows a link, so a link at either settings file or at .claude copied any
+# host file the user can read into an overlay mounted into the box. Every arm
+# reads the workspace path again when the snapshot is skipped.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^      _project_settings_snapshot "[$]_workspace" "[$]_base" "[$]_pf_snap" || _pf_rc=[$]?$@      :@
+  s@^      pf="[$]_pf_snap"$@      :@
+}
+SED
+try "v154_settings_link_create" "linked out of the workspace is never copied"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^      _project_settings_snapshot "[$]_workspace" "[$]_base" "[$]_pf_snap" || _pf_rc=[$]?$@      :@
+  s@^      pf="[$]_pf_snap"$@      :@
+}
+SED
+try "v154_settings_link_create_jqless" "jq-less host never copies a linked project settings file" "$CLI" "$HOOKS_BATS"
+
+# .claude is not pinned: the inode compare between the name and the directory
+# the subshell landed in is gone, so a linked .claude is read through.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@^    \[\[ "[$]_c" == "[$]_d" \]\] || exit 1$@    :@
+}
+SED
+try "v154_settings_dir_pin" "directory is never read for project settings"
+
+# The name's inode is read through the link, so it is the target's and the
+# compare passes.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@ls -di "[$]ws/.claude"@ls -Ldi "$ws/.claude"@
+}
+SED
+try "v154_settings_dir_lstat" "directory is never read for project settings"
+
+# The file is read by a plain bounded read, which follows a link swapped in
+# after the checks.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@_read_unlinked_bounded "[.]/[$]base"@_read_bounded "./$base"@
+}
+SED
+try "v154_settings_swap_open" "project settings file swapped for a link before its open"
+
+# The hooks refresh reads the workspace path again.
+cat > "$SED_TMP" << 'SED'
+/^_refresh_settings_overlays()/,/^}$/{
+  s@^        _project_settings_snapshot "[$]_pws" "[$]_base" "[$]_pf_snap" || true$@        :@
+  s@^        pf="[$]_pf_snap"$@        :@
+}
+SED
+try "v154_settings_link_refresh" "hooks refresh writes empty settings for a linked project file"
+
+# A fork box's refresh reads the live tree, not its own copy.
+cat > "$SED_TMP" << 'SED'
+/^_refresh_settings_overlays()/,/^}$/{
+  s@^    if _box_is_fork "[$]cname"; then _pws="[$](_fork_dir "[$]cname")"; fi$@    :@
+}
+SED
+try "v154_settings_refresh_fork" "settings refresh reads its own copy"
+
+# No size bound on the copy.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@^  if \[\[ "[$](_path_size "[$]dst")" -gt "[$]_PROJECT_SETTINGS_MAX_BYTES" \]\]; then$@  if false; then@
+}
+SED
+try "v154_settings_size_cap" "over 1 MB is not copied" "$CLI" "$HOOKS_BATS"
+
+# No regular-file check before the read.
+cat > "$SED_TMP" << 'SED'
+/^_project_settings_snapshot()/,/^}$/{
+  s@^    \[\[ -f "[.]/[$]base" && ! -L "[.]/[$]base" \]\] || exit 1$@    :@
+}
+SED
+try "v154_settings_precheck_fifo" "FIFO at a project settings path" "$CLI" "$HOOKS_BATS"
+
+# ── v1.5.4: input history bind source (host-only store) ─────────────────────
+
+# The history bind comes from the name inside the session dir again.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@-v "[$]{project_history}:/home/coder/.claude/history.jsonl"@-v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"@
+}
+SED
+try "v154_history_bind_host_only" "history bind source is host-only"
+
+# cmd_run touches the name in the session dir again, which follows a link.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^  mkdir -p "[$]project_session_dir"$@  mkdir -p "$project_session_dir"; touch "$project_session_dir/history.jsonl"@
+}
+SED
+try "v154_history_no_touch_through_link" "dangling history link"
+
+# The carry-over reads the old name, which follows a planted link, instead of
+# renaming it.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  s@if mv -f "[$]old" "[$]staged" 2>/dev/null; then@if cat "$old" > "$staged" 2>/dev/null; then@
+}
+SED
+try "v154_history_import_moves_not_reads" "history link planted in the session dir"
+
+# No shape check after the rename: an absolute link lands as the store.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  /^      _drop_unless_regular "[$]staged"$/d
+}
+SED
+try "v154_history_import_drops_shapes" "legacy history path is never imported" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# The carry-over runs on every create, so a name the box writes later
+# replaces the store.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  s@if \[\[ ! -e "[$]f" \]\] && \[\[ -e "[$]old" || -L "[$]old" \]\]; then@if [[ -e "$old" || -L "$old" ]]; then@
+}
+SED
+try "v154_history_import_once" "carries a session-dir history" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# A directory or a link at the store path is kept, so the create stops.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  /^  _drop_unless_regular "[$]f"$/d
+}
+SED
+try "v154_history_store_heals" "at the history store path is replaced" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# The store directory is created and left with the default umask.
+cat > "$SED_TMP" << 'SED'
+/^_project_history_store()/,/^}$/{
+  s@^  ( umask 077; mkdir -p "[$]dir" ) 2>/dev/null || return 1$@  mkdir -p "$dir" 2>/dev/null || return 1@
+  /^  chmod 700 "[$]CLEAT_HISTORY_DIR" "[$]dir"/d
+}
+SED
+try "v154_history_store_private" "history store directory is private" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+# A pre-store box goes straight to docker start.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  s@ || _history_bind_in_session_dir "[$]cname"@@
+}
+SED
+try "v154_legacy_history_recreate_start" "cmd_start recreates a box whose history bind"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  s@ || _history_bind_in_session_dir "[$]cname"@@
+}
+SED
+try "v154_legacy_history_recreate_resume" "cmd_resume recreates a box whose history bind"
+
+# Every box with both mounts reads as legacy, so every start recreates.
+cat > "$SED_TMP" << 'SED'
+/^_history_bind_in_session_dir()/,/^}$/{
+  s@^  case "[$]hist" in "[$]sess"/\*) return 0 ;; esac$@  return 0@
+}
+SED
+try "v154_history_store_no_recreate_loop" "host-only history store restarts"
+
+# The session source is compared as a pattern, not a path.
+cat > "$SED_TMP" << 'SED'
+/^_history_bind_in_session_dir()/,/^}$/{
+  s@^  case "[$]hist" in "[$]sess"/\*) return 0 ;; esac$@  case "$hist" in $sess/*) return 0 ;; esac@
+}
+SED
+try "v154_history_bind_literal" "compare literally" "$CLI" "$START_RESUME_BATS"
+
+# A directory Docker made at a deleted store path is not caught before start.
+cat > "$SED_TMP" << 'SED'
+/^_settings_overlay_intact()/,/^}$/{
+  s@ | "[$]CLEAT_HISTORY_DIR"/\*)@)@
+}
+SED
+try "v154_overlay_intact_history_store" "a directory at the history store source" "$CLI" "$START_RESUME_BATS"
+
+# The nested target is touched again, through a link, at create and at start.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^  _ensure_file_target "[$]{HOME}/.claude/history.jsonl"$@  touch "${HOME}/.claude/history.jsonl"@
+}
+SED
+try "v154_history_target_create_only_run" "nested history target is never touched"
+
+cat > "$SED_TMP" << 'SED'
+/^_ensure_host_mount_targets()/,/^}$/{
+  s@^  _ensure_file_target "[$]{HOME}/.claude/history.jsonl"$@  touch "${HOME}/.claude/history.jsonl"@
+}
+SED
+try "v154_history_target_create_only_start" "nested history target is never touched"
+
+# ── v1.5.4: the bridge log and the proxy's readiness marker leave the mount ──
+
+# The bridge log lived in the clip dir, and every write to it followed a link
+# the box could keep re-planting there faster than any check. Each of these
+# puts one writer back in the mount: the path helper, the watcher's appends and
+# the callback proxy's own log.
+cat > "$SED_TMP" << 'SED'
+/^_browser_proxy_log()/,/^}$/{
+  s@printf '%s/bridge/proxy-log' "[$](dirname "[$]{1:?}")"@printf '%s/.proxy-log' "${1:?}"@
+}
+SED
+try "v154_proxy_log_outside_mount" "a proxy log link the box keeps re-planting never receives a line"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@>> "[$]_bw_log"@>> "$clip_dir/.proxy-log"@
+}
+SED
+try "v154_watcher_appends_outside_mount" "a proxy log link the box keeps re-planting never receives a line"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@_auth_callback_proxy "[$]cb_port" "[$]cname" "[$]_bw_log"@_auth_callback_proxy "$cb_port" "$cname" "$clip_dir/.proxy-log"@
+}
+SED
+try "v154_proxy_child_log_outside_mount" "a proxy log link the box keeps re-planting never receives a line"
+
+# With no host-only dir the readiness marker is never put back in the mount,
+# where the box could fake it or aim it at a host file, and the proxy is
+# refused outright.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@^    _bw_log=/dev/null$@    _bw_log=/dev/null; _bw_ready="$clip_dir/.proxy-ready.$$"@
+}
+SED
+try "v154_ready_marker_never_in_mount" "a faked readiness marker never starts the proxy"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@^            elif \[ -z "[$]_bw_ready" \]; then$@            elif false; then@
+}
+SED
+try "v154_no_state_dir_refuses_proxy" "a faked readiness marker never starts the proxy"
+
+# The session-end reports read the host-only log, never a file in the clip dir
+# the box can write.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _proxy_log_file="[$](_browser_proxy_log "[$]_CLIP_DIR")"$@  _proxy_log_file="$_CLIP_DIR/.proxy-log"@
+}
+SED
+try "v154_session_end_reads_host_log" "a refusal line the box writes into its clip dir"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  s@^  _shell_proxy_log="[$](_browser_proxy_log "[$]_shell_clip_dir")"$@  _shell_proxy_log="$_shell_clip_dir/.proxy-log"@
+}
+SED
+try "v154_shell_reads_host_log" "cleat shell reports a browser open the gate refused"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  s@^  _login_proxy_log="[$](_browser_proxy_log "[$]_login_clip_dir")"$@  _login_proxy_log="$_login_clip_dir/.proxy-log"@
+}
+SED
+try "v154_login_reads_host_log" "cleat login reports a browser open the gate refused"
+
+# ── v1.5.4: the watcher log leaves the mount, and its cap rotates by rename ──
+
+# The cap emptied an oversized log in place, through whatever link the box
+# swapped in after the pre-filter. Put the in-place truncate back.
+cat > "$SED_TMP" << 'SED'
+/^_cap_watcher_log()/,/^}$/{
+  s|if mv -f "[$]log" "[$]claimed" 2>/dev/null; then|if : > "$log" 2>/dev/null; then|
+}
+SED
+try "v154_cap_log_renames_not_truncates" "capping a watcher log never truncates through a link swapped in"
+
+# The size read opened the log, so a FIFO swapped in after the pre-filter hung
+# the caller.
+cat > "$SED_TMP" << 'SED'
+/^_cap_watcher_log()/,/^}$/{
+  s@sz="[$](_path_size "[$]log")"@sz="$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]' || echo 0)"@
+}
+SED
+try "v154_cap_log_size_never_opens" "a FIFO swapped in after the check never blocks"
+
+# Every watcher spawn opened the in-mount name for `>>` with no check, so a
+# link planted after the cap sent watcher output into a host file the box
+# chose. Put the log back in the clip dir, once per caller.
+cat > "$SED_TMP" << 'SED'
+/^_watcher_log_path()/,/^}$/{
+  s|/logs/watcher[.]log|/clip/.watcher-log|
+}
+SED
+try "v154_session_watcher_log_host_only" "session watchers never append through a link"
+try "v154_shell_watcher_log_host_only" "cleat shell never appends watcher output through a link"
+try "v154_login_watcher_log_host_only" "cleat login never appends watcher output through a link"
+
+# ── v1.5.4: the watcher markers leave the mount, .host-ready is written in the box ──
+
+# The session touched .watcher.<pid> in the clip dir, and touch follows a link
+# the box planted at that name. Put the in-mount touch back.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    ( set -C; umask 077; : > "[$]_ec_watch/\.watcher\.[$][$]" ) 2>/dev/null || true$@    touch "$_CLIP_DIR/.watcher.$$"@
+}
+SED
+try "v154_watcher_marker_host_only" "watcher marker name is never followed"
+
+# The watcher dropped a link at .host-ready and then touched the name, and a
+# link renamed in between was followed. Put the released pair back.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  s@^    _clip_announce_ready "[$]cname"$@    _drop_unless_regular "$clip_dir/.host-ready"; touch "$clip_dir/.host-ready"@
+}
+SED
+try "v154_host_ready_in_box" "even when a link lands after its check"
+
+# No announce at all: the shim never sees a watcher and every copy takes OSC 52.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  s@^    _clip_announce_ready "[$]cname"$@    :@
+}
+SED
+try "v154_host_ready_announced" "announces readiness from inside the box" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# Without the box name the watcher has nobody to announce to.
+cat > "$SED_TMP" << 'SED'
+s@_clipboard_watcher "[$]_CLIP_DIR" "[$]clip_cmd" "[$]cname" >>@_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>@
+SED
+try "v154_watcher_gets_box_name" "hands its watcher the box name" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# One attempt only: an exec that lands before the uid remap costs the session
+# its file bridge.
+cat > "$SED_TMP" << 'SED'
+/^_clip_announce_ready()/,/^}$/{
+  s@ && return 0$@; return 0@
+}
+SED
+try "v154_host_ready_retry" "retried while the box cannot write" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# The last session out must drop the sentinel, and a live sibling must keep it.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    if ! _clip_watchers_live "[$]_CLIP_DIR"; then$@    if false; then@
+}
+SED
+try "v154_teardown_drops_host_ready" "removes sentinel when last session exits" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    if ! _clip_watchers_live "[$]_CLIP_DIR"; then$@    if true; then@
+}
+SED
+try "v154_teardown_keeps_for_sibling" "keeps sentinel when other sessions remain" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# The session's own marker must go at teardown, or it reads as a live sibling.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    rm -f "[$](_clip_watch_dir "[$]{_CLIP_DIR:?}")/\.watcher\.[$][$]" 2>/dev/null || true$@    :@
+}
+SED
+try "v154_teardown_drops_own_marker" "cleanup removes session marker" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# ── v1.5.4: claims never fall back into the clip mount ──
+
+# With no host-only clipclaim/ the clipboard watcher claimed inside the clip
+# dir, where the claim, the cap temp and the read all sat on names the box can
+# plant. Put the fallback back: the watcher keeps running, announces readiness
+# and claims in the mount.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  s@^  if ! claim_dir="[$](_host_claim_dir "[$]clip_dir")"; then$@  claim_dir="$(_host_claim_dir "$clip_dir")" || claim_dir="$clip_dir"; if false; then@
+}
+SED
+try "v154_clip_claim_no_mount_fallback" "clipboard bridge claimed inside the box mount"
+try "v154_session_clip_claim_no_mount_fallback" "a session keeps both bridges off" "$CLI" "$SMOKE_BATS"
+
+# The same fallback in the browser watcher: the URL is claimed in the mount and
+# opened.
+cat > "$SED_TMP" << 'SED'
+/^_browser_watcher()/,/^}$/{
+  s@^  if ! _bw_claim_dir="[$](_host_claim_dir "[$]clip_dir")"; then$@  _bw_claim_dir="$(_host_claim_dir "$clip_dir")" || _bw_claim_dir="$clip_dir"; if false; then@
+}
+SED
+try "v154_browser_claim_no_mount_fallback" "browser bridge claimed inside the box mount"
+try "v154_shell_browser_claim_no_mount_fallback" "cleat shell keeps the browser bridge off" "$CLI" "$SMOKE_BATS"
+
+# A link at clipclaim is refused like a missing dir, never followed.
+cat > "$SED_TMP" << 'SED'
+/^_host_claim_dir()/,/^}$/{
+  s@ && [[] ! -L "[$]d" []]@@
+}
+SED
+try "v154_claim_dir_link_refused" "a link at clipclaim is refused" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# The refused clipboard watcher drops a stale .host-ready, or the box's shim
+# keeps writing to a bridge nobody reads instead of taking OSC 52.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  /^    _clip_watchers_live "[$]clip_dir" || rm -f "[$]clip_dir[^"]*host-ready" 2>[^|]*|| true$/d
+}
+SED
+try "v154_clip_refusal_drops_host_ready" "clipboard bridge claimed inside the box mount"
+
+# And its own marker, which as a live watcher holds .host-ready on.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  /^    rm -f "[$](_clip_watch_dir "[$]clip_dir")[^"]*watcher[.][$][$]" 2>[^|]*|| true$/d
+}
+SED
+try "v154_clip_refusal_drops_own_marker" "clipboard bridge claimed inside the box mount"
+
+# With no directory at clipclaim BSD rm -f fails on the teardown's claim unlink,
+# and under errexit the session ended before the terminal came back.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    rm -f "[$](dirname "[$]{_CLIP_DIR:?}")/clipclaim/[.]claim[.][$][$][.]"[*] 2>/dev/null || true$@    rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."*@
+}
+SED
+try "v154_teardown_claim_unlink_fail_soft" "a session keeps both bridges off" "$CLI" "$SMOKE_BATS"
+
+# A rename's sidecar folder is the box's name. Followed as a link, it carried
+# custom-title.json into any host directory the user can write.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  s/^    \[\[ -d "[$]side" && ! -L "[$]side" \]\] || return 1$/    :/
+}
+SED
+try "v154_rename_sidecar_dir_link" "a rename never writes the sidecar through a linked session folder"
+
+# And custom-title.json itself: mv onto a link to a directory moves the temp
+# into that directory.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  s/^    \[\[ -f "[$]side\/custom-title[.]json" && ! -L "[$]side\/custom-title[.]json" \]\] || return 1$/    :/
+}
+SED
+try "v154_rename_sidecar_file_link" "never moves the sidecar into a folder linked at"
+
+# The containment check before the prompt is not the one the write relies on.
+# Without the write-time one, a link swapped in while the user typed is
+# appended to.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  /^  _sessions_path_under_key "[$]f" "[$]sdir" || return 1$/d
+}
+SED
+try "v154_rename_write_time_recheck" "a transcript swapped for a link during the title prompt"
+
+# A running box writes its own rename. Handing it back to the host writer is
+# the v1.5.3 behaviour, where the box could swap names under the host.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_apply()/,/^}$/{
+  s/_sessions_rename_in_box "[$]cname" "[$]uuid" "[$]title"/_sessions_rename_write "$sdir" "$uuid" "$title"/
+}
+SED
+try "v154_rename_running_box_writes" "a rename on a running box is written by the box"
+
+# A docker ps that fails is no answer. Read as "not running" it hands the write
+# to the host while the box may be live.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_box_up()/,/^}$/{
+  s/|| return 2$/|| return 1/
+}
+SED
+try "v154_rename_probe_fails_closed" "a rename refuses when Docker cannot say whether the box is running"
+
+# Claude can start in the box while the user types the title, so the live check
+# runs again after the prompt.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_apply()/,/^}$/{
+  s/_box_has_live_agent "[$]cname" && return 3/:/
+}
+SED
+try "v154_rename_live_recheck" "Claude starting during the prompt stops the write" "$CLI" "$SESSIONS_BATS"
+
+# The host's mtime stamp stays out of the box's session folder.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  s@mktemp "[$]{TMPDIR:-/tmp}/cleat-mtime[.]XXXXXX"@mktemp "${sdir}/.cleat-mtime.XXXXXX"@
+}
+SED
+try "v154_rename_stamp_host_only" "the mtime stamp is kept outside the session folder" "$CLI" "$SESSIONS_BATS"
+
+# The in-box writer puts the transcript mtime back too, or a rename on a
+# running box changes which conversation the next resume continues.
+cat > "$SED_TMP" << 'SED'
+/^_SESSIONS_RENAME_IN_BOX=/,/^exit "[$]r"'$/{
+  s/touch -r "[$]s" "[$]f" 2>\/dev\/null; //
+}
+SED
+try "v154_rename_inbox_keeps_mtime" "the in-box writer appends the record" "$CLI" "$SESSIONS_BATS"
+
+# ── v1.5.4: credentials are built outside the box's dirs and land by one rename ──
+
+# The account writer's temp goes back beside the destination, in the box's own
+# auth dir. A box that swaps it for a link after the create gets the login
+# written over any host file the user can write, then chmodded 600.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  s#^  stage="[$](_host_stage_dir)" .. return 1$#  stage="$(mktemp -d "${dest}.tmp.XXXXXX" 2>/dev/null)" || return 1#
+}
+SED
+try "v154_account_stage_outside_mount" "an attach never writes a login through a link the box swaps in"
+
+# The rename names the destination again instead of its directory. mv onto a
+# link to a directory moves the login INTO that directory.
+cat > "$SED_TMP" << 'SED'
+/^_rename_onto()/,/^}$/{
+  s#^  mv -f "[$]staged" "[$]{dest%/\*}/" 2>/dev/null$#  mv -f "$staged" "$dest" 2>/dev/null#
+}
+SED
+try "v154_account_rename_names_dir" "a box that swaps its staged login for a link to a directory"
+
+# The same rename, proven on the macOS seed on its own.
+cat > "$SED_TMP" << 'SED'
+/^_rename_onto()/,/^}$/{
+  s#^  mv -f "[$]staged" "[$]{dest%/\*}/" 2>/dev/null$#  mv -f "$staged" "$dest" 2>/dev/null#
+}
+SED
+try "v154_seed_rename_names_dir" "the macOS seed keeps the Keychain login in place"
+
+# The macOS seed's temp goes back into ~/.claude, which every box mounts.
+cat > "$SED_TMP" << 'SED'
+/^_seed_macos_credentials()/,/^}$/{
+  s#^  stage="[$](_host_stage_dir)" .. return 0$#  stage="$(mktemp -d "${cred}.tmp.XXXXXX" 2>/dev/null)" || return 0#
+}
+SED
+try "v154_seed_stage_outside_mount" "the macOS seed never writes the Keychain login through a link"
+
+# Without the trailing slash a write whose directory has gone creates a file
+# under that directory's name.
+cat > "$SED_TMP" << 'SED'
+/^_rename_onto()/,/^}$/{
+  s#"[$]{dest%/\*}/"#"${dest%/*}"#
+}
+SED
+try "v154_rename_onto_trailing_slash" "a credential write whose directory has gone creates nothing" "$CLI" "$ACCOUNTS_BATS"
+
+# A refused write keeps its stage dir: a 0600 copy of a login left on the host.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  /^  if ! [$]ok; then$/,/^  fi$/{
+    s#^    rm -rf "[$]stage" 2>/dev/null$#    :#
+  }
+}
+SED
+try "v154_account_stage_removed_on_refusal" "a refused credential write leaves nothing staged on the host" "$CLI" "$ACCOUNTS_BATS"
+
+# ── v1.5.4: untrusted bytes printed raw to the host terminal ────────────────
+
+# The callback-port report prints a URL from a log the box can write.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_nobind_opens()/,/^}$/{
+  s@^    url="[$](_sanitize_repo_str "[$]url")"$@    :@
+}
+SED
+try "v154_render_nobind_sanitized" "a forged callback-port line in the proxy log"
+
+# An invalid [resources] value, project and global, both keys.
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_memory()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in project config@'$v' in project config@
+}
+SED
+try "v154_render_resources_memory_project" "an invalid resources value from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_cpus()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in project config@'$v' in project config@
+}
+SED
+try "v154_render_resources_cpus_project" "an invalid resources value from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_memory()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in global config@'$v' in global config@
+}
+SED
+try "v154_render_resources_memory_global" "an invalid resources value from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_cpus()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in global config@'$v' in global config@
+}
+SED
+try "v154_render_resources_cpus_global" "an invalid resources value from a project"
+
+# cleat config: --list, the arrow-key editor and the text editor.
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s@echo -e "    memory  [$](_sanitize_repo_str "[$]_lm")[$]{_lmsrc}"@echo -e "    memory  ${_lm}${_lmsrc}"@
+}
+SED
+try "v154_render_config_list_memory" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s@echo -e "    cpus    [$](_sanitize_repo_str "[$]_lc")[$]{_lcsrc}"@echo -e "    cpus    ${_lc}${_lcsrc}"@
+}
+SED
+try "v154_render_config_list_cpus" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _mem_d="[$](_sanitize_repo_str "[$]mem")"$@  _mem_d="$mem"@
+}
+SED
+try "v154_render_config_draw_memory" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _cpus_d="[$](_sanitize_repo_str "[$]cpus")"$@  _cpus_d="$cpus"@
+}
+SED
+try "v154_render_config_draw_cpus" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_text()/,/^}$/{
+  s@memory=[$](_sanitize_repo_str "[$]mem")@memory=${mem}@
+}
+SED
+try "v154_render_config_text_memory" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_text()/,/^}$/{
+  s@cpus=[$](_sanitize_repo_str "[$]cpus")@cpus=${cpus}@
+}
+SED
+try "v154_render_config_text_cpus" "cleat config shows a project resources value"
+
+# The three fork-exclude warnings that can carry a byte.
+cat > "$SED_TMP" << 'SED'
+/^_fork_prune_excludes()/,/^}$/{
+  s@Ignoring unsafe \[fork\] exclude: [$](_sanitize_repo_str "[$]e")"@Ignoring unsafe [fork] exclude: $e"@
+}
+SED
+try "v154_render_fork_exclude_unsafe" "a fork exclude from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_prune_excludes()/,/^}$/{
+  s@resolves outside the fork: [$](_sanitize_repo_str "[$]e")"@resolves outside the fork: $e"@
+}
+SED
+try "v154_render_fork_exclude_outside" "a fork exclude from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_prune_excludes()/,/^}$/{
+  s@Could not prune \[fork\] exclude: [$](_sanitize_repo_str "[$]e")"@Could not prune [fork] exclude: $e"@
+}
+SED
+try "v154_render_fork_exclude_prune" "a fork exclude from a project"
+
+# UTF-8-spelled C1 in both render sanitizers, the '?' placeholder that keeps a
+# removal from assembling a fresh pair, and the raw strip outside UTF-8.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_safe_str()/,/^}$/{
+  /for p in "[$]{_C1_UTF8\[@\]}"/d
+}
+SED
+try "v154_render_sessions_c1_stripped" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sessions_safe_str()/,/^}$/{
+  s@v=[$]{v//"[$]p"/?}@v=${v//"$p"/}@
+}
+SED
+try "v154_render_sessions_c1_placeholder" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  /for p in "[$]{_C1_UTF8\[@\]}"/d
+}
+SED
+try "v154_render_repo_c1_stripped" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@v=[$]{v//"[$]p"/?}@v=${v//"$p"/}@
+}
+SED
+try "v154_render_repo_c1_placeholder" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@tr -d '\\000-\\010\\013-\\037\\177\\200-\\237')"$@tr -d '\\000-\\010\\013-\\037\\177')"@
+}
+SED
+try "v154_render_repo_raw_c1_outside_utf8" "a C1 control spelled in UTF-8"
+
+# A UTF-8 locale keeps the continuation bytes of an em dash.
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@tr -d '\\000-\\010\\013-\\037\\177')"$@tr -d '\\000-\\010\\013-\\037\\177\\200-\\237')"@
+}
+SED
+try "v154_render_repo_keeps_utf8" "a setup preview line with a typographic character"
+
+# No sed: BSD sed refuses a non-ASCII byte and the report aborts under set -e.
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@^  printf '%s' "[$]{v//\\\\/\\\\\\\\}"$@  printf '%s' "$v" | sed 's/\\\\/\\\\\\\\/g'@
+}
+SED
+try "v154_render_repo_no_sed" "a post-session browser report survives a non-ASCII URL"
+
+# Teardown globs over box-chosen names in the clip dir.
+cat > "$SED_TMP" << 'SED'
+s@^    rm -f "[$]{_CLIP_DIR:?}/.clipboard."\* 2>/dev/null || true$@    rm -f "${_CLIP_DIR:?}/.clipboard."*@
+SED
+try "v154_render_teardown_clipboard_quiet" "session teardown never prints a box-chosen clip-dir name"
+
+cat > "$SED_TMP" << 'SED'
+s@^    rm -f "[$]{_CLIP_DIR:?}/.claim.[$][$]."\* 2>/dev/null || true$@    rm -f "${_CLIP_DIR:?}/.claim.$$."*@
+SED
+try "v154_render_teardown_claim_quiet" "session teardown never prints a box-chosen clip-dir name"
+
+# Fork copy and delete: cp and rm stderr over a tree the box writes.
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  _run_names_safe cp @  cp @
+}
+SED
+try "v154_render_fork_cp_names_safe" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  _run_names_safe rm -rf "[$]tmp" || return 1$@  rm -rf "$tmp" || return 1@
+}
+SED
+try "v154_render_fork_tmp_names_safe" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  _run_names_safe rm -rf "[$]dst" @  rm -rf "$dst" @
+}
+SED
+try "v154_render_fork_dst_names_safe" "a failing fork copy or delete never prints"
+
+# The staging dir holds the copied tree, so each cleanup of it is quiet: after
+# a failed copy, after a refresh that cannot remove the old copy, and after a
+# failed rename.
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  if \[\[ [$]rc -ne 0 \]\]; then rm -rf "[$]tmp" 2>/dev/null || true; return "[$]rc"; fi$@  if [[ $rc -ne 0 ]]; then rm -rf "$tmp"; return "$rc"; fi@
+}
+SED
+try "v154_render_fork_cp_cleanup_quiet" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  /^  _run_names_safe rm -rf "[$]dst" /s@{ rm -rf "[$]tmp" 2>/dev/null || true; return 1; }$@{ rm -rf "$tmp"; return 1; }@
+}
+SED
+try "v154_render_fork_dst_cleanup_quiet" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  /^  mv "[$]tmp" "[$]dst" /s@{ rm -rf "[$]tmp" 2>/dev/null || true; return 1; }$@{ rm -rf "$tmp"; return 1; }@
+}
+SED
+try "v154_render_fork_mv_cleanup_quiet" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_rm_tree()/,/^}$/{
+  s@^  _run_names_safe rm -rf "[$]target"@  rm -rf "$target"@
+}
+SED
+try "v154_render_fork_rm_names_safe" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_run_names_safe()/,/^}$/{
+  s@[$](_sessions_safe_str "[$]_l")@${_l}@
+}
+SED
+try "v154_render_names_safe_sanitized" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_run_names_safe()/,/^}$/{
+  s@\[\[ "[$]_n" -lt 3 \]\]@[[ "$_n" -lt 1000 ]]@
+}
+SED
+try "v154_render_names_safe_three_lines" "a failing fork copy or delete never prints"
+
+# The session trash sweep, the same shape over a trashed session's tree.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_sweep()/,/^}$/{
+  s@^    rm -rf "[$]d" 2>/dev/null || true$@    rm -rf "$d"@
+}
+SED
+try "v154_render_trash_sweep_quiet" "the session trash sweep never prints"
+
+# v1.5.4: the sibling identity scan skips a file flagged .identity-stale, whose
+# name is waiting to be dropped. Without the skip, a box unpinned while a Claude
+# held its file open hands the old account's name to every shared-login box in
+# another project, after a remove and after a switch back to the shared login.
+cat > "$SED_TMP" << 'SED'
+/^_newest_sibling_identity()/,/^}$/{
+  s@^    [[][[] -e "[$]{f}.identity-stale" []][]] && continue$@    :@
+}
+SED
+try "v154_sibling_skips_flagged" "never spreads from a box whose identity drop is deferred"
+
+cat > "$SED_TMP" << 'SED'
+/^_newest_sibling_identity()/,/^}$/{
+  s@^    [[][[] -e "[$]{f}.identity-stale" []][]] && continue$@    :@
+}
+SED
+try "v154_sibling_skips_flagged_switch" "going back to the shared login while a Claude starts"
+
+# cleat account rm flags each box before it removes the pin, the order the
+# switch keeps (H9). Unflagged, a box built between the unpin and the drop takes
+# the removed account's name.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s@^      : > "[$]CLEAT_PROJECTS_DIR/[$]key/claude.json.identity-stale" 2>/dev/null || true$@      :@
+}
+SED
+try "v154_account_rm_flags_before_unpin" "between the unpin and the drop"
+
+# v1.5.4: the browser claim re-tests its type after the rename. Tested only
+# before it, a FIFO the box renamed in between blocked head forever inside the
+# watcher, and a directory was stranded in the claim dir.
+cat > "$SED_TMP" << 'SED'
+/^_browser_claim_url()/,/^}$/{
+  /^  \[ -f "[$]claim" \] || { rm -rf "[$]claim"/d
+}
+SED
+try "v154_misc_browser_claim_fifo" "a FIFO swapped in before the browser claim hung the watcher"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_claim_url()/,/^}$/{
+  /^  \[ -f "[$]claim" \] || { rm -rf "[$]claim"/d
+}
+SED
+try "v154_misc_browser_claim_dir" "a directory swapped in before the browser claim was stranded"
+
+# v1.5.4: every host read of a box's claude.json goes through one bounded
+# snapshot under a cap. Unbounded, the builder read a file the box sized whole.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_snapshot()/,/^}$/{
+  s/head -c "[$](( cap + 1 ))" < "[$]src"/cat "$src"/
+  /^  \[ "[$](_path_size "[$]dst")" -le "[$]cap" \]/d
+}
+SED
+try "v154_misc_claude_json_project_bounded" "a box-sized project claude"
+
+# The sibling scan skips a sibling over the cap and hands jq a bounded read.
+cat > "$SED_TMP" << 'SED'
+/^_newest_sibling_identity()/,/^}$/{
+  /^    \[ "[$](_path_size "[$]f")" -le "[$]cap" \] || continue$/d
+  s@head -c "[$](( cap + 1 ))" < "[$]f" 2>/dev/null | jq -e '.oauthAccount? != null'@jq -e '.oauthAccount? != null' "$f"@
+}
+SED
+try "v154_misc_sibling_scan_bounded" "the sibling identity scan read an oversized box file whole"
+
+# The in-place writer never pads up to a size the box chose.
+cat > "$SED_TMP" << 'SED'
+/^_write_in_place()/,/^}$/{
+  /^  \[ "[$]old" -le "[$](_claude_json_cap)" \] || return 1$/d
+}
+SED
+try "v154_misc_write_in_place_cap" "the in-place writer padded an oversized box file"
+
+# The same cap, caught at the attach heal of a running box.
+cat > "$SED_TMP" << 'SED'
+/^_write_in_place()/,/^}$/{
+  /^  \[ "[$]old" -le "[$](_claude_json_cap)" \] || return 1$/d
+}
+SED
+try "v154_misc_attach_heal_oversized" "the attach heal leaves an oversized running-box file untouched" "$CLI" "$CLAUDE_JSON_BATS"
+
+# The identity drop reads a bounded snapshot, so an oversized file never
+# reaches jq and the flag stays for the next launch.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_drop_identity()/,/^}$/{
+  s@^  _claude_json_snapshot "[$]f" "[$]snap" "[$]cap" || return 1$@  cp "$f" "$snap"@
+}
+SED
+try "v154_misc_identity_drop_snapshot" "an oversized per-project file is flagged for the next launch" "$CLI" "$ACCOUNTS_BATS"
+
+# The box's own jq is a box binary, so its output is capped before it is used.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_drop_identity()/,/^}$/{
+  s@ | head -c "[$](( cap + 1 ))" > "[$]tmp"@ > "$tmp"@
+  s@&& \[ "[$](_path_size "[$]tmp")" -le "[$]cap" \] &&@\&\&@
+}
+SED
+try "v154_misc_identity_drop_output_cap" "the jq-less identity drop kept unbounded output from the box jq"
+
+# v1.5.4: the hook drop report follows its offset into the rotated file when
+# that file still carries the inode the offset was taken against.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  s/^  if \[ -n "[$]ino" \] && .*; then$/  if false; then/
+}
+SED
+try "v154_misc_hook_report_rotated_generation" "a hook drop log rotated by another box silenced the report"
+
+# A rotation the session makes itself resets the inode with the offset.
+cat > "$SED_TMP" << 'SED'
+/^_hook_drop_log()/,/^}$/{
+  /^      _hook_drop_ino=""$/d
+}
+SED
+try "v154_misc_drops_rotation_resets_ino" "the box cannot grow it without bound" "$CLI" "$HOOKS_BATS"
+
+# v1.5.4: the fork copy pauses every running box that can write the project.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  s/^  _daemon_up || return 0$/  return 0/
+}
+SED
+try "v154_misc_fork_pauses_writers" "a box on the live tree was not paused while the fork copied it"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  s/^  _daemon_up || return 0$/  return 0/
+}
+SED
+try "v154_misc_fork_pauses_writers_smoke" "fork refresh pauses a running box on the same folder" "$CLI" "$SMOKE_BATS"
+
+# A box on a folder above the project can write it too.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  /^      case "[$]tree\/" in "[$]s"\/\*) hit=1; break ;; esac$/d
+}
+SED
+try "v154_misc_fork_writers_ancestor" "the live writers are the project" "$CLI" "$FORK_BATS"
+
+# A fork box mounts its own copy, so it is never paused.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  /^    _box_is_fork "[$]n" && continue$/d
+}
+SED
+try "v154_misc_fork_writers_skip_forks" "the live writers are the project" "$CLI" "$FORK_BATS"
+
+# A listing that fails while the daemon answers refuses the copy.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  s/2>\/dev\/null)" || return 1$/2>\/dev\/null)" || return 0/
+}
+SED
+try "v154_misc_fork_writers_fail_closed" "a listing that fails while the daemon answers refuses the copy" "$CLI" "$FORK_BATS"
+
+# The paused boxes are resumed whatever the copy did.
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_quiesced()/,/^}$/{
+  /^    trap '_fork_unpause "[$]_fq_done"' EXIT$/d
+}
+SED
+try "v154_misc_fork_unpause_on_failure" "a copy that fails still resumes the paused boxes" "$CLI" "$FORK_BATS"
+
+# A pause refusal already said why, so the generic copy hint is not printed.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s/^      if \[\[ [$]_copy_rc -ne 75 \]\]; then$/      if true; then/
+}
+SED
+try "v154_misc_fork_refusal_no_hint" "names the boxes it paused and skips the copy hint" "$CLI" "$FORK_BATS"
+
+# v1.5.4: box-authored text is split with globbing off.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_parse_probe()/,/^}$/{
+  s/set -f; set -- [$]rest; set +f/set -- $rest/
+}
+SED
+try "v154_misc_handoff_probe_noglob" "a probe line glob-expanded against the host filesystem"
+
+cat > "$SED_TMP" << 'SED'
+/^_parse_terminate()/,/^}$/{
+  s/set -f; set -- [$]rest; set +f;/set -- $rest;/
+}
+SED
+try "v154_misc_handoff_terminate_noglob" "a terminate line glob-expanded against the host filesystem"
+
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /^  set -f$/d
+}
+SED
+try "v154_misc_handoff_shells_noglob" "a background shell id glob-expanded against the host filesystem"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_text()/,/^}$/{
+  /^ *set -f$/d
+}
+SED
+try "v154_misc_config_text_noglob" "a star cap glob-expanded into workspace file names in the text editor"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_tui()/,/^}$/{
+  /^ *set -f$/d
+}
+SED
+try "v154_misc_config_tui_noglob" "a star cap glob-expanded into workspace file names in the picker"
 
 # Egress stage one, EGRESS-SPEC 2.1. The browser origin list is never the union
 # with an egress allowlist: pointing its one global read at [egress] is exactly
@@ -11702,17 +13614,6 @@ cat > "$SED_TMP" << 'SED'
 s|_CLIPIMG_RATE_PER_MIN=12|_CLIPIMG_RATE_PER_MIN=100000|
 SED
 try "vnext_clipimg_rate_cap" "the image request channel had no rate cap"
-
-# Egress stage one, EGRESS-SPEC 2.2 H2. The hook spool had no bound. Both
-# watcher calls become `false`, which leaves the start line a no-op under its
-# `|| true` and never enters the per-poll `then`. The session-entry calls name
-# the spool by its full path through _hook_spool_entry_cap, outside the range.
-cat > "$SED_TMP" << 'SED'
-/^_hook_bridge_watcher()/,/^}$/{
-  s|_hook_spool_cap "[$]hooks_file"|false "$hooks_file"|
-}
-SED
-try "vnext_hook_spool_cap" "the hook spool grew without bound"
 
 # Egress stage zero. The stub must answer per container and per format, or no
 # assertion over two fields of one container can fail.

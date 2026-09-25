@@ -1024,6 +1024,72 @@ EOF
   assert_success
 }
 
+@test "parse_env_file: entries mode keeps bare names unresolved in file order" {
+  export TEST_CLEAT_VAR="hello"
+  printf 'A=1\nTEST_CLEAT_VAR\nmy-var\n# c\nB=2\n' > "$TEST_TEMP/envfile"
+  run _parse_env_file "$TEST_TEMP/envfile" entries
+  unset TEST_CLEAT_VAR
+  assert_success
+  assert_output "$(printf 'A=1\nTEST_CLEAT_VAR\nB=2')"
+}
+
+@test "env cap: a bare key in ~/.config/cleat/env inherits with no trust asked" {
+  # The global file is the user's own: its bare keys never need approval, even
+  # while the project is untrusted and nothing can be asked.
+  unset CLEAT_TRUST_PROJECT
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_GLOBAL_BARE\n' > "$CLEAT_GLOBAL_ENV"
+  printf 'R154_PROJECT_BARE\n' > "$TEST_TEMP/project/.cleat.env"
+  export R154_GLOBAL_BARE=global-host-value R154_PROJECT_BARE=project-host-value
+  _is_tty() { return 1; }
+  run cmd_run "$TEST_TEMP/project"
+  unset R154_GLOBAL_BARE R154_PROJECT_BARE
+  assert_success
+  run assert_docker_run_has "$cname" "R154_GLOBAL_BARE=global-host-value"
+  assert_success
+  run assert_docker_run_lacks "$cname" "project-host-value"
+  assert_success
+}
+
+@test "env cap: a symlinked ~/.config/cleat/env is still read" {
+  # Dotfile managers link the global file. Only project env files refuse links.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/dotfiles"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'LINKED_GLOBAL=yes\n' > "$TEST_TEMP/dotfiles/env"
+  rm -f "$CLEAT_GLOBAL_ENV"
+  ln -s "$TEST_TEMP/dotfiles/env" "$CLEAT_GLOBAL_ENV"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$cname" "LINKED_GLOBAL=yes"
+  assert_success
+}
+
+@test "env summary: counts only what the project env file passes" {
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/project"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'A=1\nR154_COUNTED\n' > "$TEST_TEMP/project/.cleat.env"
+  export R154_COUNTED=v
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$TEST_TEMP/project" > "$TEST_TEMP/sum.out" 2>&1
+  run _env_summary_inline "$TEST_TEMP/project"
+  assert_output --partial "1 from .cleat.env"
+  export CLEAT_TRUST_PROJECT=1
+  _TRUST_SESSION_DECISION=""
+  resolve_caps "$TEST_TEMP/project" > "$TEST_TEMP/sum.out" 2>&1
+  run _env_summary_inline "$TEST_TEMP/project"
+  unset R154_COUNTED
+  assert_output --partial "2 from .cleat.env"
+}
+
 # ── --env and --env-file flags ─────────────────────────────────────────────
 
 @test "--env flag: passes KEY=VALUE without env cap" {

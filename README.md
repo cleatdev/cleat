@@ -375,6 +375,12 @@ Worth knowing before you rely on it:
 
 - The copy is a **point-in-time snapshot**. A fork taken an hour ago does not
   have work you did in the live tree since.
+- Every running box that can write the project folder (the project's own boxes
+  plus any box on a folder above or below it) is **paused while the copy runs**
+  and resumed right after. Nothing can swap a folder for a link mid-copy. An
+  attached session in one of those boxes freezes for the copy and one line names
+  what was paused. If a box cannot be paused the fork is refused and nothing is
+  copied.
 - Without copy-on-write (Linux without reflink support, or a fork root on a
   different volume) the copy is real duplicated disk.
 - `cleat storage` does not see fork copies. It measures the Docker store, while
@@ -481,6 +487,15 @@ before these masks existed prints a recreate note on every start with the
 command for that box: `cleat rm && cleat` for the default box,
 `cleat rm <box> && cleat start <box>` for a named one.
 
+Arrow-up prompt history is per project too. It lives in
+`~/.config/cleat/history/<key>/`, outside every folder a box can see, so a box
+can add lines to it but can never swap the file for a link to one of yours. A
+history file an older release kept in the session folder is carried over once.
+A box created before this move is recreated once, with no prompt, the next time
+Cleat starts or resumes it: its old history mount cannot be changed any other
+way. The recreate keeps conversations, logins and trust, then runs `[setup]`
+again. Anything you installed inside the box outside `[setup]` is gone.
+
 ### Accounts: two Claude logins, one command to switch
 
 A Claude Max account has a five-hour window. With two of them the only way to move between them is `/login`, in a browser, both directions, every time one runs out. `cleat account` gives each login a name and pins a box to one of them.
@@ -555,7 +570,7 @@ Deleting moves the conversation to a trash in `~/.config/cleat/session-trash/`, 
 
 Restoring resolves the id against the trash, so the short id the delete printed is the one that works. It never overwrites a conversation that has come back under the same name.
 
-Only a real session id is ever touched. That directory also holds this project's Claude memory and Cleat's own prompt history. Nothing in `cleat session` can reach them.
+Only a real session id is ever touched. That directory also holds this project's Claude memory. Nothing in `cleat session` can reach it.
 
 Listing works with Docker down, which is usually when you want it.
 
@@ -600,7 +615,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 #### Workspace trust
 | Command | Description |
 |---|---|
-| `cleat trust [path] [box]` | Record approval for a project's (or a box's) `.cleat` capabilities and `[setup]` |
+| `cleat trust [path] [box]` | Record approval for a project's (or a box's) `.cleat` capabilities, `[setup]` and env-file host variables |
 | `cleat trust [box]` | Trust a box of the current project (a lone valid box name) |
 | `cleat trust --list` | List trusted projects and boxes (yellow = config changed since approval) |
 | `cleat untrust [path] [box]` | Remove a project's (or a box's) trust entry |
@@ -627,7 +642,7 @@ The editor also has a **generate** row (global scope): it stamps your current ca
 | `--env KEY=VALUE` | Pass environment variable to container |
 | `--env KEY` | Inherit from host environment |
 | `--env-file PATH` | Load env vars from file |
-| `--trust-project` | Auto-approve the current project's `.cleat` caps without prompting |
+| `--trust-project` | Auto-approve the current project's `.cleat` caps and env-file host variables without prompting |
 | `--trust-setup` | Auto-approve the current project's `[setup]` provisioning without prompting |
 | `--desc <text>` | Set the box's description at start (host-side, never recreates) |
 | `--fork` | Give the box its own copy of the project instead of the live tree (create time only) |
@@ -869,8 +884,24 @@ Say yes and the approval is stored at `~/.config/cleat/trust`. Next launch, noth
 
 Approval is keyed on the **canonical list of capabilities** declared in `.cleat`, not the raw file. Comment edits and cap reordering don't invalidate trust. Adding, removing, or changing a cap triggers a re-prompt with an "…has changed since you trusted it" framing.
 
+Only capabilities Cleat knows count. A name it does not know (a typo, a cap this version lacks or a line like `docker,git`) is ignored with a warning and grants nothing. It never appears in the prompt and never counts toward the approval. The same goes for `unsafe-rm`, which a project file can never grant. Cleat reads `.cleat` once per check: the caps it shows you, the caps it records and the caps it applies all come from that one read, so a file rewritten during a launch is checked again.
+
 The hash is per box, so trust rows are keyed on (project, box). Editing one box's
 section re-prompts for that box only. Every other box keeps its approval.
+
+A bare `KEY` line in the project env file (`.cleat.env`, or `.cleat.<box>.env`)
+copies a variable from your shell into the box, so it joins the same approval.
+The prompt lists those names as host variables, never their values:
+
+```
+  ▸ Project .cleat.env asks for host variables: GH_TOKEN (their values go from your shell into the box)
+    Trust this project? (grants what it asks for above, approve once, undo with cleat untrust) [y/N]
+```
+
+A project whose env file names no host variable keeps the approval it had.
+Adding or removing a name asks again. Until approved the names are skipped with
+a warning and the file's `KEY=VALUE` lines still apply. `cleat trust` and
+`CLEAT_TRUST_PROJECT=1` approve them along with the caps.
 
 #### Scripting & CI
 
@@ -904,6 +935,7 @@ cleat untrust ~/proj         # remove a project's trust entry
 | `~/.config/cleat/config` (global) | ✔ always: user's own file |
 | `--cap <name>` CLI flag | ✔ always: affirmative typed action |
 | `<project>/.cleat` | requires approval per-project, per-cap-set |
+| bare `KEY` lines in `<project>/.cleat.env` | requires approval, part of the same decision as the caps |
 | `[setup]` in `<project>/.cleat` | requires approval per-project, a separate consent class from caps |
 
 `cleat status` never prompts: it's read-only and silently omits untrusted project caps when displaying.
@@ -932,7 +964,9 @@ A `script <path>` line inlines a project-relative script file at that position
 instead of writing commands inline. List as many `script` directives as you
 like, mixed with inline commands, in any order. Copy-paste examples live in
 [`examples/setup/`](examples/setup): `dotnet` (inline commands), `python` (one
-script file) and `rust` (two script files).
+script file) and `rust` (two script files). A script must live inside the
+project, must not be a symlink and must be at most 1 MiB. One that breaks any of
+these is refused and setup is skipped for that run.
 
 Setup trust is separate from capability trust. `CLEAT_TRUST_SETUP=1` (or
 `--trust-setup`) approves it non-interactively, `cleat trust` approves both
@@ -1015,6 +1049,15 @@ cleat --env-file .env.local start
 # .cleat.env              ← project-specific
 ```
 
+In an env file, `KEY=VALUE` sets a value and a bare `KEY` copies that variable
+from your shell. Your own sources (`~/.config/cleat/env`, `--env-file` and
+`--env KEY`) do that as they always have. A project env file (`.cleat.env` or
+`.cleat.<box>.env`) sits in the repo, where a clone or the box itself can edit
+it, so its bare names go through workspace trust: the trust prompt lists them as
+the host variables the project asks for and a new name asks again. Until you
+approve, they are skipped with a warning while the file's `KEY=VALUE` lines
+still apply. A project env file that is a symlink is not read at all.
+
 ### Configuration drift detection
 
 When you change **capabilities or env keys** after a container was created, Cleat detects the mismatch the next time you run `cleat`, `cleat resume`, or `cleat claude`. On a TTY it prompts you to recreate (a plain-text line, no box):
@@ -1039,15 +1082,29 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
 ~/.config/cleat/forks/    ← fork workspace copies (default root, moved by [fork] dir)
 <project>/.cleat          ← project capabilities (extends global), [resources], [setup],
                             [fork] exclude, plus any [box.<name>.<kind>] overrides
-<project>/.cleat.env      ← project-level env vars
+<project>/.cleat.env      ← project-level env vars (bare KEY lines need trust)
 <project>/.cleat.<box>.env ← per-box env vars (falls back to .cleat.env)
 ~/.config/cleat/state/hook-drops.log ← hook events the bridge refused and spool discards (hooks cap)
 ~/.config/cleat/state/hook-runs.log  ← hook events handed to your hooks (hooks cap)
+~/.config/cleat/state/stage/         ← a login on its way into a box or an account,
+                                       built outside every mount (empty between writes)
 ```
 
 One project, one `.cleat`. Boxes scope their caps, resources, setup and fork
 excludes into `[box.<name>.<kind>]` sections of that file. Env vars are the
 exception and keep their own sidecar.
+
+A project's `.cleat` and env files count only when they are regular files. A
+FIFO, a socket or a link to a device at either name reads as absent, so a box
+cannot hang a launch by planting one there.
+
+`cleat config` never edits a project file through a link. The project folder is
+the box's workspace, so the new `.cleat` is built under `~/.config/cleat` and
+renamed into the project, where nothing at the final name is followed. A
+`.cleat` that is a symlink, a directory or larger than 256 KB is refused with
+`Refusing to edit`. To edit a shared `.cleat`, edit the file the link points to.
+`.cleat.env` is never created over a link either. Project edits need
+`~/.config/cleat` to be writable.
 
 ---
 
@@ -1100,7 +1157,7 @@ cleat --cap hooks start        # enable for one session
 ### How it works
 
 1. Cleat creates a settings overlay that replaces hook commands with an event forwarder inside the container
-2. Project settings files that exist when the box is created get an overlay too, so their hooks do not run in the container either
+2. Project settings files that exist when the box is created get an overlay too, so their hooks do not run in the container either. Cleat reads each one once and only from a regular file of at most 1 MB inside the project. A link, a file inside a linked `.claude` or a larger file gets no overlay and a warning at start. A fork box's overlays are refreshed from its own copy
 3. A host-side bridge reads forwarded events, looks the event up in `~/.claude/settings.json` and runs the matching commands on the host
 4. Before anything runs, the event is validated and its path fields are rewritten from `/workspace/...` to your real project path (the fork's copy for a fork box). A path has to land inside the project on disk, symlinks included. An event that fails a check is dropped and logged to `~/.config/cleat/state/hook-drops.log`. When the session ends it tells you how many were dropped. Every event handed to your hooks gets a row in `hook-runs.log` beside it
 5. Event JSON is piped to stdin and matchers are respected. The hook runs in the event's working directory, translated the same way. Each command is bounded per event (15s for PreToolUse and PostToolUse, 120s for Stop and SubagentStop, 30s for UserPromptSubmit and anything else), through `timeout`, `gtimeout` or `perl`. A host with none of the three runs it unbounded

@@ -463,3 +463,78 @@ teardown() { _common_teardown; }
   refute_output --partial "corrupt"
   [ ! -e "${proj}.bak" ]
 }
+
+# ── size cap on the box's copy ──────────────────────────────────────────────
+# The box writes its per-project file through a read-write bind, so the host
+# reads it only through a bounded snapshot under a cap of the host file plus a
+# headroom. The tests shrink the headroom to 1 KB.
+
+_cj_pad() { head -c "$1" /dev/zero | tr '\0' x; }
+
+@test "claude.json cap: the headroom sits on top of the host file size" {
+  _CLAUDE_JSON_HEADROOM_BYTES=1000
+  rm -f "$HOST_JSON"
+  run _claude_json_cap
+  assert_output "1000"
+  printf '%s' "$(_cj_pad 500)" > "$HOST_JSON"
+  run _claude_json_cap
+  assert_output "1500"
+}
+
+@test "claude.json snapshot: a file within the cap is copied whole" {
+  printf '{"a":"%s"}\n' "$(_cj_pad 200)" > "$TEST_TEMP/src.json"
+  run _claude_json_snapshot "$TEST_TEMP/src.json" "$TEST_TEMP/snap.json" 1024
+  assert_success
+  run cmp "$TEST_TEMP/src.json" "$TEST_TEMP/snap.json"
+  assert_success
+}
+
+@test "claude.json snapshot: a file over the cap returns 2 and leaves no copy" {
+  printf '{"a":"%s"}\n' "$(_cj_pad 4000)" > "$TEST_TEMP/src.json"
+  run _claude_json_snapshot "$TEST_TEMP/src.json" "$TEST_TEMP/snap.json" 1024
+  [ "$status" -eq 2 ]
+  run test -e "$TEST_TEMP/snap.json"
+  assert_failure
+}
+
+@test "claude.json snapshot: a symlink is refused, never read through" {
+  echo '{"secret":"host"}' > "$TEST_TEMP/target.json"
+  ln -s "$TEST_TEMP/target.json" "$TEST_TEMP/link.json"
+  run _claude_json_snapshot "$TEST_TEMP/link.json" "$TEST_TEMP/snap.json" 1024
+  [ "$status" -eq 1 ]
+  run test -e "$TEST_TEMP/snap.json"
+  assert_failure
+}
+
+@test "claude.json cap: the build leaves no snapshot behind" {
+  command -v jq >/dev/null 2>&1 || skip "needs jq"
+  echo '{"userID":"u1"}' > "$HOST_JSON"
+  mkdir -p "$(dirname "$OUT")"
+  echo '{"projects":{"/workspace":{"x":1}}}' > "$OUT"
+  _build_project_claude_json "$OUT"
+  run bash -c 'ls -A "$1"' _ "$(dirname "$OUT")"
+  assert_output "claude.json"
+  run jq -r '.projects."/workspace".x' "$OUT"
+  assert_output "1"
+}
+
+@test "claude.json cap: the attach heal leaves an oversized running-box file untouched" {
+  command -v jq >/dev/null 2>&1 || skip "needs jq"
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  rm -f "$HOST_JSON"
+  local proj="$TEST_TEMP/project" key f
+  mkdir -p "$proj"
+  key="$(_derive_project_session_key "$proj" main)"
+  f="$CLEAT_PROJECTS_DIR/$key/claude.json"
+  mkdir -p "${f%/*}"
+  # Logged out, so the heal would run, and far past the cap.
+  printf '{"hasCompletedOnboarding":false,"pad":"%s"}\n' "$(_cj_pad 4000)" > "$f"
+  cp "$f" "$TEST_TEMP/f.orig"
+  _box_has_live_agent() { return 1; }
+  _claude_json_clear_stale_identity() { :; }
+  run _refresh_attached_claude_json heal-ctr "$proj" main
+  assert_success
+  assert_output --partial "is over"
+  run cmp "$f" "$TEST_TEMP/f.orig"
+  assert_success
+}

@@ -584,3 +584,331 @@ EOF
   run _trust_list
   assert_output --partial "$proj"
 }
+
+# ── One read, known names only ──────────────────────────────────────────────
+#
+# The caps a project .cleat grants are hashed, shown and applied from a single
+# bounded snapshot, and only names Cleat knows count (see _project_caps_view).
+
+@test "trust: an unknown project cap is warned about and never reaches the prompt" {
+  local p="$TEST_TEMP/unk"
+  mkdir -p "$p"
+  printf '[caps]\ngit\nfoo\n' > "$p/.cleat"
+  _is_tty() { return 0; }
+  _UNK_SHOWN="$TEST_TEMP/unk.shown"
+  _trust_prompt() { shift; printf '%s\n' "$@" > "$_UNK_SHOWN"; return 0; }
+  resolve_caps "$p" > "$TEST_TEMP/unk.out" 2>&1
+  run cat "$_UNK_SHOWN"
+  assert_output "git"
+  run cat "$TEST_TEMP/unk.out"
+  assert_output --partial "Ignoring unknown capability"
+  assert_output --partial "foo"
+  run cap_is_active foo
+  assert_failure
+  run cap_is_active git
+  assert_success
+}
+
+@test "trust: the unknown-cap warning names at most three names of 32 characters" {
+  local p="$TEST_TEMP/unk5" long a32 a33
+  mkdir -p "$p"
+  long="$(printf 'a%.0s' $(seq 1 100))"
+  a32="$(printf 'a%.0s' $(seq 1 32))"
+  a33="${a32}a"
+  printf '[caps]\none\n%s\nthree\nfour\nfive\n' "$long" > "$p/.cleat"
+  _is_tty() { return 1; }
+  run resolve_caps "$p"
+  assert_success
+  assert_output --partial "one, $a32, three"
+  refute_output --partial "$a33"
+  refute_output --partial "four"
+  assert_output --partial "(+2 more)"
+}
+
+@test "trust: the unknown-cap warning prints once per launch" {
+  local p="$TEST_TEMP/unkonce"
+  mkdir -p "$p"
+  printf '[caps]\nfoo\n' > "$p/.cleat"
+  _is_tty() { return 1; }
+  resolve_caps "$p" > "$TEST_TEMP/uo1" 2>&1
+  resolve_caps "$p" > "$TEST_TEMP/uo2" 2>&1
+  run grep -c "Ignoring unknown capability" "$TEST_TEMP/uo1" "$TEST_TEMP/uo2"
+  assert_line "$TEST_TEMP/uo1:1"
+  assert_line "$TEST_TEMP/uo2:0"
+}
+
+@test "trust: a known-only cap set keeps its v1.5.3 hash" {
+  # Upgrading must not re-prompt anyone whose .cleat lists only real caps: the
+  # hash stays md5 of the comma-joined sorted names, as it always was.
+  local p="$TEST_TEMP/stable"
+  mkdir -p "$p"
+  printf '[caps]\nssh\ngit\n' > "$p/.cleat"
+  run _hash_cleat_caps "$p/.cleat" main
+  assert_output "$(printf 'git,ssh' | _md5 | awk '{print $1}')"
+}
+
+@test "trust: unsafe-rm does not count toward the caps trust hash" {
+  # It is never applied from a project file, so it is not part of what the
+  # user approves either.
+  local p="$TEST_TEMP/urmhash" h
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  h="$(_hash_cleat_caps "$p/.cleat" main)"
+  printf '[caps]\ngit\nunsafe-rm\n' > "$p/.cleat"
+  run _hash_cleat_caps "$p/.cleat" main
+  assert_output "$h"
+}
+
+@test "trust: no known cap name can hold the hash separator" {
+  # The trust hash joins names with commas. That is unambiguous only while no
+  # cap name Cleat knows contains a comma or whitespace.
+  local k
+  for k in "${KNOWN_CAPS[@]}"; do
+    run bash -c '[[ "$1" =~ ^[a-z][a-z0-9-]*$ ]]' _ "$k"
+    assert_success
+  done
+}
+
+@test "trust: the caps snapshot reads at most 256 KiB of .cleat" {
+  local p="$TEST_TEMP/big"
+  mkdir -p "$p"
+  { printf '[caps]\ngit\n#'; head -c 262144 /dev/zero | tr '\0' a; printf '\ndocker\n'; } > "$p/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  resolve_caps "$p" > "$TEST_TEMP/big.out" 2>&1
+  run cap_is_active git
+  assert_success
+  run cap_is_active docker
+  assert_failure
+}
+
+@test "trust: the caps snapshot leaves no temp file behind" {
+  local p="$TEST_TEMP/snapclean"
+  mkdir -p "$p" "$TEST_TEMP/tmp"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  TMPDIR="$TEST_TEMP/tmp" resolve_caps "$p" > "$TEST_TEMP/snapclean.out" 2>&1
+  run cap_is_active git
+  assert_success
+  run ls -A "$TEST_TEMP/tmp"
+  assert_output ""
+}
+
+@test "trust: a snapshot that cannot be taken applies no project caps" {
+  local p="$TEST_TEMP/nosnap"
+  mkdir -p "$p"
+  printf '[caps]\ndocker\n' > "$p/.cleat"
+  export CLEAT_TRUST_PROJECT=1
+  TMPDIR="$TEST_TEMP/missing-dir" resolve_caps "$p" > "$TEST_TEMP/nosnap.out" 2>&1
+  run cap_is_active docker
+  assert_failure
+  run cat "$TEST_TEMP/nosnap.out"
+  assert_output --partial "Could not read"
+}
+
+# ── Host variables a project env file asks for ──────────────────────────────
+# A bare KEY in .cleat.env copies a host value into the box, so the set of bare
+# names joins the project trust decision (_trust_decision_hash).
+
+@test "trust: env-file host variables change the hash and appear in the prompt" {
+  local p="$TEST_TEMP/vars"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  printf 'R154_TOKEN\nPLAIN=1\n' > "$p/.cleat.env"
+  run _project_trust_hash "$p" main
+  refute_output "$(_hash_cleat_caps "$p/.cleat" main)"
+  assert_output "$(_trust_decision_hash git R154_TOKEN)"
+  _is_tty() { return 0; }
+  _BOX=main
+  run resolve_caps "$p" <<< "n"
+  assert_output --partial "asks for host variables"
+  assert_output --partial "R154_TOKEN"
+  assert_output --partial "requests host access"
+  refute_output --partial "PLAIN"
+}
+
+@test "trust: the env-file names hash is order and repeat free, the caps hash when empty" {
+  run _trust_decision_hash "git" ""
+  assert_output "$(_caps_list_hash git)"
+  local a b
+  a="$(_trust_decision_hash "git" "$(printf 'B\nA\n')")"
+  b="$(_trust_decision_hash "git" "$(printf 'A\nB\nA\n')")"
+  [[ "$a" == "$b" ]] || fail "the names hash depends on order: $a vs $b"
+  run _trust_decision_hash "git" "C"
+  refute_output "$a"
+}
+
+@test "trust: declining the prompt skips host variables and keeps KEY=VALUE lines" {
+  local p="$TEST_TEMP/declined"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_DECLINED\nLITERAL=kept\n' > "$p/.cleat.env"
+  export R154_DECLINED=host-value
+  _is_tty() { return 0; }
+  _trust_prompt() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/declined.out" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/declined.out" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_DECLINED
+  assert_output --partial "LITERAL=kept"
+  refute_output --partial "host-value"
+  run cat "$TEST_TEMP/declined.out"
+  assert_output --partial "Not passing the host variables"
+  assert_output --partial "R154_DECLINED"
+  run _trust_lookup "$p" main
+  assert_output ""
+}
+
+@test "trust: CLEAT_TRUST_PROJECT=1 approves env-file host variables and records them" {
+  local p="$TEST_TEMP/optin"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_OPTIN\n' > "$p/.cleat.env"
+  export R154_OPTIN=optin-value
+  _is_tty() { return 1; }
+  _BOX=main
+  export CLEAT_TRUST_PROJECT=1
+  resolve_caps "$p" > "$TEST_TEMP/optin.out" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/optin.out" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  assert_output --partial "R154_OPTIN=optin-value"
+  run _trust_lookup "$p" main
+  assert_output "$(_trust_decision_hash "" R154_OPTIN)"
+  # The approval persists: a later non-interactive run with no opt-in passes it.
+  unset CLEAT_TRUST_PROJECT
+  _TRUST_SESSION_DECISION=""
+  resolve_caps "$p" > "$TEST_TEMP/optin.2" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/optin.2" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_OPTIN
+  assert_output --partial "R154_OPTIN=optin-value"
+}
+
+@test "trust: cleat trust approves the host variables an env file asks for" {
+  local p="$TEST_TEMP/cmdtrust"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  printf 'R154_B\nR154_A\n' > "$p/.cleat.env"
+  run cmd_trust "$p"
+  assert_success
+  assert_output --partial "Approved caps: git"
+  assert_output --partial "Approved host variables: R154_A, R154_B"
+  export R154_A=a-value
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/cmdtrust.out" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/cmdtrust.out" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_A
+  assert_output --partial "R154_A=a-value"
+  run cap_is_active git
+  assert_success
+}
+
+@test "trust: cleat trust takes a project whose only request is env-file host variables" {
+  local p="$TEST_TEMP/envonly"
+  mkdir -p "$p"
+  printf 'R154_ONLY\n' > "$p/.cleat.env"
+  run cmd_trust "$p"
+  assert_success
+  assert_output --partial "Approved host variables: R154_ONLY"
+  refute_output --partial "Approved caps"
+  run _trust_lookup "$p" main
+  assert_output "$(_trust_decision_hash "" R154_ONLY)"
+  # KEY=VALUE lines alone are nothing to trust.
+  printf 'PLAIN=1\n' > "$p/.cleat.env"
+  run cmd_trust "$p"
+  assert_failure
+  assert_output --partial "Nothing to trust"
+}
+
+@test "trust: env-file host variables are asked about only when the env cap can be on" {
+  local p="$TEST_TEMP/noenvcap"
+  mkdir -p "$p"
+  printf 'R154_QUIET\n' > "$p/.cleat.env"
+  _is_tty() { return 0; }
+  _trust_prompt() { echo PROMPTED; return 1; }
+  _BOX=main
+  run resolve_caps "$p"
+  refute_output --partial "PROMPTED"
+  _CLI_CAPS=(env)
+  run resolve_caps "$p"
+  assert_output --partial "PROMPTED"
+}
+
+@test "trust: the host-variable warning names at most five, once per launch" {
+  local p="$TEST_TEMP/many"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'V1\nV2\nV3\nV4\nV5\nV6\nV7\n' > "$p/.cleat.env"
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/many.1" 2>&1
+  resolve_env_args "$p" > "$TEST_TEMP/many.2" 2>&1
+  resolve_caps "$p" > "$TEST_TEMP/many.3" 2>&1
+  resolve_env_args "$p" > "$TEST_TEMP/many.4" 2>&1
+  run cat "$TEST_TEMP/many.2"
+  assert_output --partial "V1, V2, V3, V4, V5"
+  assert_output --partial "+2 more"
+  refute_output --partial "V6"
+  run cat "$TEST_TEMP/many.4"
+  refute_output --partial "Not passing"
+}
+
+@test "trust: the env snapshot leaves no temp file behind" {
+  local p="$TEST_TEMP/envclean"
+  mkdir -p "$p" "$TEST_TEMP/tmp"
+  printf 'R154_X\nA=1\n' > "$p/.cleat.env"
+  TMPDIR="$TEST_TEMP/tmp" _project_env_view "$p/.cleat.env" main
+  run printf '%s' "$_PENV_BARE"
+  assert_output "R154_X"
+  run ls -A "$TEST_TEMP/tmp"
+  assert_output ""
+}
+
+@test "trust: a box's own env file is decided for that box alone" {
+  local p="$TEST_TEMP/boxenv"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_MAIN\n' > "$p/.cleat.env"
+  printf 'R154_AZ\n' > "$p/.cleat.az.env"
+  export R154_MAIN=main-value R154_AZ=az-value
+  _is_tty() { return 1; }
+  _BOX=main
+  run cmd_trust "$p"
+  assert_success
+  _BOX=az
+  resolve_caps "$p" > "$TEST_TEMP/boxenv.out" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/boxenv.out" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  refute_output --partial "az-value"
+  refute_output --partial "main-value"
+  run cat "$TEST_TEMP/boxenv.out"
+  assert_output --partial "cleat trust"
+  assert_output --partial " az"
+  _BOX=main
+  _TRUST_SESSION_DECISION=""
+  resolve_caps "$p" > "$TEST_TEMP/boxenv.2" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/boxenv.2" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_MAIN R154_AZ
+  assert_output --partial "R154_MAIN=main-value"
+}
+
+@test "trust --list: a row approved for env-file host variables turns yellow when a name is added" {
+  GREEN='<G>'; YELLOW='<Y>'
+  local p="$TEST_TEMP/listenv"
+  mkdir -p "$p"
+  printf 'R154_LISTED\n' > "$p/.cleat.env"
+  cmd_trust "$p" >/dev/null
+  cmd_trust --list > "$TEST_TEMP/list.1"
+  run grep -F "$p" "$TEST_TEMP/list.1"
+  assert_output --partial "<G>"
+  refute_output --partial "<Y>"
+  printf 'R154_LISTED\nR154_NEW\n' > "$p/.cleat.env"
+  cmd_trust --list > "$TEST_TEMP/list.2"
+  run grep -F "$p" "$TEST_TEMP/list.2"
+  assert_output --partial "<Y>"
+}

@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
-VERSION="1.5.3"
+VERSION="1.5.4"
 # Gates the on-start release highlight (_maybe_show_release_highlight): must
 # equal VERSION to fire. Bump it to the new VERSION at each tag so the
 # maintainer-curated highlight re-surfaces for that release; a mismatch shows
 # nothing (fail-safe). The highlight COPY and its version label are editorial,
 # set by hand below, not derived from VERSION (a big feature stays highlighted
 # across several releases, labelled with the version it shipped in).
-RELEASE_HIGHLIGHT_VERSION="1.5.3"
+RELEASE_HIGHLIGHT_VERSION="1.5.4"
 # How many launches after an upgrade the highlight is shown before going quiet.
 # Bounded repetition aids feature discovery (people miss it the first time)
 # without training the eye to skip the startup block, where drift/update/security
@@ -79,10 +79,11 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 # bind-mount sources out from under it and force a recreate (which would discard
 # the container's writable layer, e.g. an ad-hoc `az` install).
 #   $CLEAT_RUN_DIR/<cname>/{auth,clip,home,hooks,kit,settings}   mount sources
-#   $CLEAT_RUN_DIR/<cname>/{clipclaim,clipimg-stage,hookbridge,hookclaim}   host-only
+#   $CLEAT_RUN_DIR/<cname>/{bridge,clipclaim,clipimg-stage,clipwatch,hookbridge,hookclaim,logs}   host-only
 # The host-only siblings hold what the box must not reach (claims, rate ledgers,
-# staged images), so none of them may ever be mounted. Which mounts are
-# read-only is decided in cmd_run's mount_args, not here.
+# staged images, liveness markers, the browser bridge's log, the watcher log),
+# so none of them may ever be mounted. Which mounts are read-only is decided in
+# cmd_run's mount_args, not here.
 CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 # Host-side per-box descriptions, keyed by container name. NOT Docker labels:
@@ -130,6 +131,16 @@ _SESSIONS_PAGE_LINES=10
 # persist. One file per project: $CLEAT_PROJECTS_DIR/<project_session_key>/claude.json
 CLEAT_PROJECTS_DIR="$CLEAT_CONFIG_DIR/projects"
 
+# Per-project input (arrow-up) history, bind-mounted read-write at
+# ~/.claude/history.jsonl in the box: $CLEAT_HISTORY_DIR/<key>/history.jsonl.
+# Host-only, because a bind source is re-resolved by name on every start. It
+# used to sit in ~/.claude/projects/<key>, the session dir every box of the
+# project mounts read-write, so the box could swap the name for a link and the
+# next start mounted whatever host file the link named. Not $CLEAT_PROJECTS_DIR,
+# which `cleat nuke` wipes while it has always left input history alone, and not
+# the run dir, which every recreate wipes.
+CLEAT_HISTORY_DIR="$CLEAT_CONFIG_DIR/history"
+
 # Known capabilities (order matters for display).
 # Three behavioral categories. See _cap_category for the mapping:
 #   mount   git, ssh, env, hooks, gh   auth/identity bind-mounts (no install)
@@ -153,6 +164,7 @@ _EC_SAID=0
 # _set_box for box-aware verbs; stays "main" for everything else.
 _BOX="main"
 _FORK_REQUESTED=false   # set by --fork; only read when a box is CREATED
+_FORK_PAUSED=""         # boxes the last fork copy paused, see _fork_copy_quiesced
 _FORK_PREFLIGHT_DONE="" # one preflight per process: start/resume run it, then cmd_run
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
@@ -233,11 +245,41 @@ _ask_yn() {
 # echo -e can't interpret anything attacker-supplied. The stripped set is
 # C0 0x00-0x08 and 0x0b-0x1f (this INCLUDES carriage return 0x0d: a lone CR
 # rewinds the cursor to column 0, so a preview line could overwrite itself
-# and hide what actually runs), DEL 0x7f, and C1 0x80-0x9f. Sanitize at
+# and hide what actually runs), DEL 0x7f and the C1 controls. Sanitize at
 # every render site for repo-controlled text.
+#
+# C1 has two spellings and a terminal acts on only one of them. A UTF-8
+# terminal (xterm, VTE) decodes C2 9B as U+009B, which is CSI. It shows a lone
+# raw 0x9b as a replacement glyph. An 8-bit terminal does the opposite. So a
+# UTF-8 locale keeps the raw bytes, which are the continuation bytes of every
+# em dash, curly quote and euro sign. It replaces each encoded C1 with '?'.
+# Any other locale strips the raw bytes as before. '?' rather than nothing, so
+# that removing one pair can never join a lead byte to a later continuation
+# byte and form a fresh pair.
+#
+# No sed, with tr pinned to C. Stripping 0x80-0x9f turned an em dash into a
+# lone 0xe2. BSD sed under a UTF-8 LC_CTYPE exits non-zero on that, so on a Mac
+# a [setup] line with one typographic character showed as a blank row in the
+# consent preview while it still ran. A post-session report aborted the whole
+# exec under set -e. _sessions_safe_str had the same fix in v1.5.0.
 _sanitize_repo_str() {
-  printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177\200-\237' | sed 's/\\/\\\\/g'
+  local v p
+  if _has_unicode; then
+    v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177')"
+  else
+    v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177\200-\237')"
+  fi
+  for p in "${_C1_UTF8[@]}"; do v=${v//"$p"/?}; done
+  printf '%s' "${v//\\/\\\\}"
 }
+
+# The 32 C1 controls U+0080..U+009F in their UTF-8 spelling, C2 80..C2 9F.
+# Matched as whole pairs, never as a bracket range: a range of high bytes means
+# one thing in a UTF-8 locale and another in C. bash 3.2 decides which.
+_C1_UTF8=($'\302\200' $'\302\201' $'\302\202' $'\302\203' $'\302\204' $'\302\205' $'\302\206' $'\302\207'
+          $'\302\210' $'\302\211' $'\302\212' $'\302\213' $'\302\214' $'\302\215' $'\302\216' $'\302\217'
+          $'\302\220' $'\302\221' $'\302\222' $'\302\223' $'\302\224' $'\302\225' $'\302\226' $'\302\227'
+          $'\302\230' $'\302\231' $'\302\232' $'\302\233' $'\302\234' $'\302\235' $'\302\236' $'\302\237')
 
 # ── Spinner ────────────────────────────────────────────────────────────────
 _SPIN_PID=""
@@ -376,8 +418,8 @@ _term_rows() {
 # multi-line text), and a session title is drawn as ONE row: a newline in it
 # would inject an extra physical line, desyncing the fixed-height redraw and
 # letting a title forge a convincing "Delete session X? [y/N]" line of its own.
-# It also strips \200-\237, which eats UTF-8 continuation bytes and mangles any
-# non-ASCII title.
+# Outside a UTF-8 locale it also strips \200-\237, which eats UTF-8
+# continuation bytes and mangles any non-ASCII title.
 #
 # So: drop every C0 control byte INCLUDING newline and carriage return (a lone
 # CR rewinds the cursor to column 0, so a row could overwrite the row above and
@@ -392,8 +434,13 @@ _sessions_safe_str() {
   # in a model-written session title killed the whole picker on a Mac. The
   # backslash doubling is a parameter expansion now, which also drops a fork
   # per rendered row.
-  local v
+  #
+  # Keeping 0x80+ also kept U+0080..U+009F spelled in UTF-8 (C2 9B is CSI, C2 9D
+  # is OSC), which xterm and VTE act on. Each becomes '?', the same way and for
+  # the same reason as in _sanitize_repo_str.
+  local v p
   v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177')"
+  for p in "${_C1_UTF8[@]}"; do v=${v//"$p"/?}; done
   printf '%s' "${v//\\/\\\\}"
 }
 
@@ -2008,6 +2055,37 @@ _oauth_expires_at() {
   return 0
 }
 
+# A fresh private directory for a file on its way into a directory a box can
+# write. It sits in $CLEAT_STATE_DIR, which no box mounts, so the redirect, jq
+# and chmod that reopen the file by name all happen where nothing but this shell
+# can swap it. A temp beside the destination, even under a mktemp name, is one
+# the box sees appear: a link swapped in before the redirect had the host write a
+# login over any file the user can write, then chmod it 600. Only the final
+# rename (_rename_onto) touches the box's directory. The state dir is under
+# $CLEAT_CONFIG_DIR beside run/ and accounts/. In the default layout it is on
+# the same volume as ~/.claude too, so that rename is one rename(2). The caller
+# removes the directory.
+_host_stage_dir() {
+  ( umask 077; mkdir -p "$CLEAT_STATE_DIR/stage" ) 2>/dev/null || return 1
+  mktemp -d "$CLEAT_STATE_DIR/stage/XXXXXX" 2>/dev/null
+}
+
+# Rename STAGED onto DEST, replacing whatever is at that name and never going
+# through it. The target named is DEST's DIRECTORY, not DEST: `mv FILE LINK`
+# moves FILE INTO the directory a link names, GNU and BSD alike, so a box that
+# swapped its credential for a link to a host directory had the login moved
+# there. `mv FILE DIR/` renames it to DIR/<its own name>, which replaces a link
+# or a pipe at that name without following it and fails on a real directory.
+# So STAGED must carry DEST's file name. DIR is never the box's to swap: it is
+# a mount root or host-only. The trailing slash is load-bearing. When DIR has
+# gone, `mv FILE DIR` would create a file under DIR's name. Across volumes mv
+# copies instead, which is still safe but not atomic.
+_rename_onto() {
+  local staged="$1" dest="$2"
+  [[ "$dest" == */* && "${staged##*/}" == "${dest##*/}" ]] || return 1
+  mv -f "$staged" "${dest%/*}/" 2>/dev/null
+}
+
 # On macOS, materialize the Keychain-stored OAuth credential into
 # ~/.claude/.credentials.json (the path Claude reads on Linux), so the box,
 # which only sees the mounted ~/.claude dir, never the Keychain, starts
@@ -2033,7 +2111,9 @@ _oauth_expires_at() {
 #
 # ~/.claude is mounted read-write into every box, so the file is box-writable.
 # Its read is capped and cannot abort the launch when the file is unreadable.
-# The temp file is a mktemp name a box cannot guess and plant a link at.
+# The login is written and checked outside every mount and renamed into place
+# (_host_stage_dir, _rename_onto), so no box can redirect the write or the
+# rename to another host file or directory.
 _SEEDED_CREDS=0
 _seed_macos_credentials() {
   _is_macos || return 0
@@ -2057,13 +2137,14 @@ _seed_macos_credentials() {
     [[ -n "$blob" ]] || return 0
   fi
   mkdir -p "${HOME}/.claude" 2>/dev/null || return 0
-  # mktemp, not "$cred.tmp.$$". A pid is guessable. A box that planted a
-  # symlink at that name had the Keychain login written through it onto any
-  # host file the user can write. mktemp refuses an existing path (symlink or
-  # FIFO included) and creates at 0600 on both BSD and GNU.
-  local tmp
-  tmp="$(mktemp "${cred}.tmp.XXXXXX" 2>/dev/null)" || return 0
-  ( umask 077; printf '%s' "$blob" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  # Never beside $cred. ~/.claude is the box's. A temp there, even under a
+  # mktemp name, can be swapped for a link between its create and the redirect.
+  # No link or directory check on $cred either: the rename replaces a link and
+  # fails on a directory, which leaves nothing seeded and the launch going.
+  local stage tmp
+  stage="$(_host_stage_dir)" || return 0
+  tmp="$stage/.credentials.json"
+  ( umask 077; printf '%s' "$blob" > "$tmp" ) 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 0; }
   # Never write a non-JSON-object (e.g. an error string) into the creds file.
   local ok=false
   if command -v jq &>/dev/null; then
@@ -2073,10 +2154,9 @@ _seed_macos_credentials() {
   fi
   if $ok; then
     chmod 600 "$tmp" 2>/dev/null || true
-    if mv -f "$tmp" "$cred" 2>/dev/null; then _SEEDED_CREDS=1; else rm -f "$tmp" 2>/dev/null; fi
-  else
-    rm -f "$tmp" 2>/dev/null
+    if _rename_onto "$tmp" "$cred"; then _SEEDED_CREDS=1; fi
   fi
+  rm -rf "$stage" 2>/dev/null || true
   return 0
 }
 
@@ -2099,16 +2179,24 @@ _seed_macos_credentials() {
 # substitution. `local out="$(f)"` reports local's status, not f's, so an
 # rc-based declared/absent contract silently reads "declared" every time. Six
 # call sites in this file already use that idiom.
+#
+# The gate is `-f`, not `-r` alone, here and in every .cleat and .cleat.env
+# reader after it. The box can write /workspace/.cleat, and a FIFO or a link to
+# /dev/zero or /dev/tty passes `-r`. The launch fingerprint reads [resources]
+# with no `-f` and no trust check of its own, so a FIFO there hung every launch
+# of the project and a device link never ended. Such a file now reads as
+# absent. The read itself goes through _read_bounded, which bounds a FIFO the
+# box swaps in after the check.
 _cleat_section_present() {
   local file="$1" want="[$2]" line
-  [[ -r "$file" ]] || return 1
+  [[ -f "$file" && -r "$file" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     line="${line#$'\xef\xbb\xbf'}"
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ "$line" == "$want" ]] && return 0
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
   return 1
 }
 
@@ -2135,7 +2223,7 @@ _scoped_section() {
 # Callers that mean the global config (which has no boxes) pass nothing.
 _read_caps_from_file() {
   local file="$1" _box="${2:-}"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local _want; _want="[$(_scoped_section "$file" "$_box" caps)]"
   local in_caps=false
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (common in
@@ -2159,7 +2247,7 @@ _read_caps_from_file() {
     if $in_caps; then
       echo "$line"
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # Read [setup] provisioning lines from a config file. Exact structural
@@ -2170,7 +2258,7 @@ _read_caps_from_file() {
 # use `test`, and _warn_unknown_cleat_sections surfaces the mistake).
 _read_setup_from_file() {
   local file="$1" _box="${2:-}"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local _want; _want="[$(_scoped_section "$file" "$_box" setup)]"
   local in_setup=false
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -2186,7 +2274,89 @@ _read_setup_from_file() {
     if $in_setup; then
       echo "$line"
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
+}
+
+# ── Config files the box can write ──────────────────────────────────────────
+# A project .cleat and .cleat.env sit in the workspace, which the box mounts
+# read-write. It owns those names and every name beside them, at any moment,
+# so nothing here opens a path in that directory for writing. New bytes are
+# built in a fresh host-only directory under $CLEAT_CONFIG_DIR and renamed into
+# place. A rename replaces whatever holds the name, a link included, without
+# following it. Old bytes are read once, through one descriptor that must still
+# be the regular file the name holds (_read_unlinked_bounded).
+#
+# The staged copy used to sit beside the file as <file>.cleat-tmp.<pid>, where
+# a link the box planted at every pid had the host write the new .cleat through
+# it into any file the user can write. The read followed a .cleat linked to a
+# host file, and the rename then republished that file's bytes as a regular
+# .cleat the box could read. The bound is _PCAPS_READ_MAX's, so the trust view
+# reads every byte an edit keeps.
+_CONFIG_FILE_MAX_BYTES=262144
+
+# A host-only copy of FILE's bytes, printed as a path the caller removes. An
+# absent FILE copies as empty. Returns 2 when $CLEAT_CONFIG_DIR cannot hold the
+# copy. Returns 1, printing nothing, when FILE is a link, not a regular file,
+# over the bound or swapped between the check and the open. The global config
+# is host-only and may be a dotfiles link (stow, chezmoi), so it alone is still
+# read through one.
+_config_snapshot() {
+  local src="$1" tmp sz
+  mkdir -p "$CLEAT_CONFIG_DIR" 2>/dev/null || return 2
+  tmp="$(mktemp "$CLEAT_CONFIG_DIR/.snap.XXXXXX" 2>/dev/null)" || return 2
+  if [[ "$src" == "$CLEAT_GLOBAL_CONFIG" ]]; then
+    _read_bounded "$src" "$(( _CONFIG_FILE_MAX_BYTES + 1 ))" > "$tmp"
+  elif [[ -e "$src" || -L "$src" ]]; then
+    if ! [[ -f "$src" && ! -L "$src" ]]; then
+      rm -f "$tmp" 2>/dev/null; return 1
+    fi
+    _read_unlinked_bounded "$src" "$(( _CONFIG_FILE_MAX_BYTES + 1 ))" > "$tmp"
+    # A refused read prints nothing. A name that holds bytes but read as none
+    # was swapped around the open, and an edit written over an empty preamble
+    # would drop every other section. Refuse instead.
+    if [[ ! -s "$tmp" && -s "$src" ]]; then
+      rm -f "$tmp" 2>/dev/null; return 1
+    fi
+  fi
+  sz="$(_path_size "$tmp")"
+  if [[ "$sz" -gt "$_CONFIG_FILE_MAX_BYTES" ]]; then
+    rm -f "$tmp" 2>/dev/null; return 1
+  fi
+  printf '%s' "$tmp"
+}
+
+# Replace FILE with stdin. The bytes land under FILE's name in a new host-only
+# directory, then move into FILE's DIRECTORY. mv into a directory renames onto
+# the final name, so a link there is replaced rather than followed (a plain
+# `mv tmp FILE` moves INTO a directory the link names) and a real directory
+# there fails the move. That directory is the workspace root, which the box
+# cannot swap.
+_config_put() {
+  local file="$1" stage=""
+  mkdir -p "$CLEAT_CONFIG_DIR" 2>/dev/null || true
+  if stage="$(mktemp -d "$CLEAT_CONFIG_DIR/.stage.XXXXXX" 2>/dev/null)" \
+     && cat > "$stage/${file##*/}" \
+     && mv -f "$stage/${file##*/}" "$(dirname "$file")/" 2>/dev/null; then
+    rm -rf "$stage" 2>/dev/null || true
+    return 0
+  fi
+  [[ -z "$stage" ]] || rm -rf "$stage" 2>/dev/null || true
+  error "Could not write ${file/#${HOME}/~}"
+  return 1
+}
+
+# Say why _config_snapshot (its return code in $2) would not take FILE.
+_config_refuse() {
+  local shown="${1/#${HOME}/~}"
+  if [[ "${2:-1}" -eq 2 ]]; then
+    error "Could not write ${shown}: ${CLEAT_CONFIG_DIR/#${HOME}/~} is not writable."
+  elif [[ "$1" == "$CLEAT_GLOBAL_CONFIG" ]]; then
+    error "Refusing to edit ${shown}: it is over 256 KB."
+  else
+    error "Refusing to edit ${shown}: it is a link, a non-regular file or over 256 KB."
+    echo -e "    ${DIM}A box can write that directory, so Cleat never edits through a link there. Replace it with a regular file.${RESET}"
+  fi
+  return 0
 }
 
 # Write capabilities to a config file. Preserves non-[caps] sections.
@@ -2200,9 +2370,11 @@ _write_caps_to_file() {
 
   mkdir -p "$(dirname "$file")"
 
-  # If file exists, preserve everything outside [caps] section
-  local preserved=""
-  if [[ -f "$file" ]]; then
+  # Preserve everything outside [caps], read from one host-only snapshot: a
+  # project .cleat is never read through a link (_config_snapshot).
+  local preserved="" snap
+  snap="$(_config_snapshot "$file")" || { _config_refuse "$file" "$?"; return 1; }
+  if [[ -s "$snap" ]]; then
     local in_caps=false _h
     # `|| [[ -n "$line" ]]` so a project .cleat whose LAST section is hand-written
     # and ends WITHOUT a trailing newline (e.g. a final `[setup]` line) is not
@@ -2235,8 +2407,9 @@ _write_caps_to_file() {
         continue
       fi
       preserved+="$line"$'\n'
-    done < "$file"
+    done < "$snap"
   fi
+  rm -f "$snap" 2>/dev/null
 
   # Write preserved content + new [caps] section
   {
@@ -2255,11 +2428,7 @@ _write_caps_to_file() {
     elif [[ "$_sec" != "caps" && "${_WRITE_EMPTY_SECTION:-0}" == "1" ]]; then
       echo "[$_sec]"
     fi
-  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
-    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
-    error "Could not write ${file/#${HOME}/~}"
-    return 1
-  }
+  } | _config_put "$file"
 }
 
 # Which section the editor writes for a box, resolved exactly the way the
@@ -2289,11 +2458,13 @@ _config_section_for() {
 # reads as the permissive project set on a teammate's older CLI. That fails
 # OPEN, so it is worth saying in the file itself rather than only in the docs.
 _config_note_sections_version() {
-  local file="$1"
-  [[ -r "$file" ]] || return 0
-  grep -q '^# Per-box config' "$file" 2>/dev/null && return 0
-  grep -q '^\[box\.' "$file" 2>/dev/null || return 0
-  local tmp="${file}.cleat-note.$$"
+  local file="$1" snap
+  [[ -f "$file" ]] || return 0
+  snap="$(_config_snapshot "$file")" || return 0
+  if grep -q '^# Per-box config' "$snap" 2>/dev/null || ! grep -q '^\[box\.' "$snap" 2>/dev/null; then
+    rm -f "$snap" 2>/dev/null
+    return 0
+  fi
   {
     # No version number. VERSION is the release being RUN, and at the moment a
     # file first grows a section that is still the last release that CANNOT read
@@ -2301,8 +2472,9 @@ _config_note_sections_version() {
     # then commits. The warning that matters does not need a number.
     echo "# Per-box config: [box.<name>.<kind>] sections, read by newer Cleat."
     echo "# Older versions ignore them and apply [caps] to every box."
-    cat "$file"
-  } > "$tmp" && mv -f "$tmp" "$file" || rm -f "$tmp" 2>/dev/null || true
+    cat "$snap"
+  } | _config_put "$file" >/dev/null || true
+  rm -f "$snap" 2>/dev/null
   return 0
 }
 
@@ -2321,7 +2493,7 @@ _config_write_caps_scoped() {
   local file="$1" sec="$2" box="$3"; shift 3
   local caps=("$@")
   if [[ -z "$box" ]]; then
-    _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+    _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}" || return 1
     # Editing the project default while box `main` DECLARES its own section
     # changes nothing for main, and reporting a bare success reads as if it did.
     if _cleat_section_present "$file" "box.main.caps"; then
@@ -2339,11 +2511,11 @@ _config_write_caps_scoped() {
   # And never on an EMPTY set: a bare [box.B.caps] is an explicit lockdown, and
   # dropping it would let the box inherit whatever the project gains later.
   if [[ "$sec" == box.* && -n "$_mine" && "$_mine" == "$_inherited" ]]; then
-    _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=0 _write_caps_to_file "$file"
+    _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=0 _write_caps_to_file "$file" || return 1
     info "Box ${BOLD}${box}${RESET} now inherits the project capabilities."
     return
   fi
-  _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
+  _WRITE_SECTION="$sec" _WRITE_EMPTY_SECTION=1 _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}" || return 1
   _config_note_sections_version "$file"
 }
 
@@ -2366,8 +2538,9 @@ _write_resources_to_file() {
   case "$memory" in default|all) memory="" ;; esac
   case "$cpus" in default|all) cpus="" ;; esac
 
-  local preserved="" in_res=false line
-  if [[ -f "$file" ]]; then
+  local preserved="" in_res=false line snap
+  snap="$(_config_snapshot "$file")" || { _config_refuse "$file" "$?"; return 1; }
+  if [[ -s "$snap" ]]; then
     # `|| [[ -n "$line" ]]` and the `\r` strip mirror the caps/kits writers: keep a
     # no-trailing-newline final section, and match a CRLF `[resources]\r` header so
     # the old section is REPLACED (not duplicated into two [resources] blocks).
@@ -2392,8 +2565,9 @@ _write_resources_to_file() {
         continue
       fi
       preserved+="$line"$'\n'
-    done < "$file"
+    done < "$snap"
   fi
+  rm -f "$snap" 2>/dev/null
 
   {
     if [[ -n "$preserved" ]]; then
@@ -2408,11 +2582,7 @@ _write_resources_to_file() {
         echo "cpus = $cpus"
       fi
     fi
-  } > "$file.cleat-tmp.$$" && mv -f "$file.cleat-tmp.$$" "$file" || {
-    rm -f "$file.cleat-tmp.$$" 2>/dev/null || true
-    error "Could not write ${file/#${HOME}/~}"
-    return 1
-  }
+  } | _config_put "$file"
 }
 
 # Resolve which project cap file applies to a box (see concept/20-boxes.md):
@@ -2527,9 +2697,19 @@ _build_setup_payload() {
             warn "Project [setup] script escapes the project directory: ${BOLD}${path_disp}${RESET}" >&2
             return 1 ;;
         esac
+        # Refused whole rather than cut at the read bound below: a truncated
+        # script would run as something the user never wrote.
+        if [ "$(_path_size "$full")" -gt "$_BOX_FILE_READ_MAX" ]; then
+          warn "Project [setup] script is larger than 1 MiB: ${BOLD}${path_disp}${RESET}" >&2
+          return 1
+        fi
 
         echo "# cleat setup: begin script $path"
-        cat "$full"
+        # Bounded. The script sits in the box's workspace, so a FIFO swapped in
+        # after the checks above hung the launch on `cat`, and a link to
+        # /dev/zero grew host memory without end. A won race yields nothing, or
+        # at most the cap, and the payload hash then fails the approval match.
+        _read_bounded "$full" "$_BOX_FILE_READ_MAX"
         printf '\n'
         echo "# cleat setup: end script $path"
         ;;
@@ -2557,7 +2737,7 @@ _project_env_file() {
 # comment- and whitespace-tolerant. Prints the value, or nothing when absent.
 _read_section_from_file() {
   local file="$1" section="$2" key="$3"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local in_section=false line k v
   # `|| [[ -n "$line" ]]` so a final line with no trailing newline (a hand-edited
   # `.cleat` ending in `memory = 8g`) is still read; without it `read` returns
@@ -2583,7 +2763,7 @@ _read_section_from_file() {
       echo "$v"
       return 0
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # Back-compat wrapper: every existing [resources] call site keeps its shape.
@@ -2839,7 +3019,7 @@ resolve_box_memory() {
       fi
       return 0
     fi
-    warn "Ignoring invalid memory '$v' in project config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
+    warn "Ignoring invalid memory '$(_sanitize_repo_str "$v")' in project config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
   fi
 
   v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory)"
@@ -2848,7 +3028,7 @@ resolve_box_memory() {
       echo "$v"
       return 0
     fi
-    warn "Ignoring invalid memory '$v' in global config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
+    warn "Ignoring invalid memory '$(_sanitize_repo_str "$v")' in global config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
   fi
 
   _default_box_memory
@@ -2893,7 +3073,7 @@ resolve_box_cpus() {
       fi
       return 0
     fi
-    warn "Ignoring invalid cpus '$v' in project config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
+    warn "Ignoring invalid cpus '$(_sanitize_repo_str "$v")' in project config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
   fi
 
   v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" cpus)"
@@ -2902,7 +3082,7 @@ resolve_box_cpus() {
       echo "$v"
       return 0
     fi
-    warn "Ignoring invalid cpus '$v' in global config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
+    warn "Ignoring invalid cpus '$(_sanitize_repo_str "$v")' in global config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
   fi
 }
 
@@ -4087,6 +4267,23 @@ _box_is_fork()      { [[ -f "$(_fork_marker_file "$1")" ]]; }
 _fork_mark()        { mkdir -p "$CLEAT_BOXES_DIR"; : > "$(_fork_marker_file "$1")"; }
 _fork_unmark()      { rm -f "$(_fork_marker_file "$1")"; }
 
+# Run cp or rm over a tree a box can write, with at most three lines of its
+# stderr printed through the row sanitizer. BSD cp and rm report a failing path
+# raw (warn("%s")) where GNU quotes it, so on a Mac a file name the box chose,
+# escape bytes included, reached the terminal. The capture is a mktemp file in
+# the host temp dir, never a path in the tree. Returns the tool's status.
+_run_names_safe() {
+  local _f _rc=0 _l _n=0
+  _f="$(mktemp "${TMPDIR:-/tmp}/cleat-err.XXXXXX" 2>/dev/null)" || { "$@" 2>/dev/null; return; }
+  "$@" 2>"$_f" || _rc=$?
+  while [[ "$_n" -lt 3 ]] && IFS= read -r _l; do
+    echo -e "    ${DIM}$(_sessions_safe_str "$_l")${RESET}" >&2
+    _n=$(( _n + 1 ))
+  done < "$_f"
+  rm -f "$_f"
+  return "$_rc"
+}
+
 # Delete a fork copy. Every caller passes a path it derived from _fork_dir, but
 # this is an `rm -rf` on a path built from a container name and a configurable
 # root, so it re-checks containment itself rather than trusting the caller. Same
@@ -4112,7 +4309,7 @@ _fork_rm_tree() {
     error "Refusing to delete outside ${root/#${HOME}/~}: $target"
     return 1
   fi
-  rm -rf "$target" || { error "Could not delete ${target/#${HOME}/~}"; return 1; }
+  _run_names_safe rm -rf "$target" || { error "Could not delete ${target/#${HOME}/~}"; return 1; }
   return 0
 }
 
@@ -4205,7 +4402,7 @@ _fork_preflight() {
 # `memory = 8g` and wrong for `exclude = node_modules` repeated N times.
 _read_section_all_from_file() {
   local file="$1" section="$2" key="$3"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   local in_section=false line k v
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
@@ -4224,7 +4421,7 @@ _read_section_all_from_file() {
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
     [[ "$k" == "$key" && -n "$v" ]] && printf '%s\n' "$v"
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
 }
 
 # cp flags, probed ONCE from the cp BINARY and never from `uname -s`. A macOS
@@ -4285,6 +4482,14 @@ _fork_cp_flags() {
 # Copies into a temp dir inside CLEAT_FORKS_DIR and renames, so an interrupted
 # copy never presents a half tree as a workspace, and takes a mkdir lock so two
 # concurrent --fork runs cannot both rm -rf and copy into the same target.
+#
+# And it copies a tree nothing is writing. cp is path based on both BSD and GNU:
+# it checks an entry, then opens it again by its full path. A running box on
+# the live tree could rename a directory into a symlink to ~/.ssh between the
+# two, and cp then copied the key bytes into the fork as real files (reproduced
+# with GNU cp 9.1). So every running box that can write the project folder is
+# paused for the copy (_fork_copy_quiesced). The cgroup freezer stops every
+# process in it, so no rename lands mid-copy.
 _fork_copy_tree() {
   local src="$1" dst="$2" lock rc=0
   local root; root="$(_fork_root)"
@@ -4308,8 +4513,20 @@ _fork_copy_tree() {
     echo -e "    ${DIM}If nothing else is running, remove ${BOLD}${lock/#${HOME}/~}${RESET}${DIM} and retry.${RESET}"
     return 1
   fi
-  _fork_copy_tree_locked "$src" "$dst" || rc=$?
+  _fork_copy_quiesced "$src" "$dst" || rc=$?
   rmdir "$lock" 2>/dev/null || true
+  # 75 is _fork_copy_quiesced refusing: a box that can write the folder could
+  # not be paused, or the running boxes could not be listed at all.
+  if [[ "$rc" -eq 75 ]]; then
+    if [[ -n "$_FORK_PAUSED" ]]; then
+      error "Could not pause a running box that can write this project's folder. Nothing was copied."
+      echo -e "    ${DIM}Stop it and retry: $(_fork_paused_names)${RESET}"
+    else
+      error "Could not list the running boxes, so none could be paused for the copy. Nothing was copied."
+      echo -e "    ${DIM}Check that ${BOLD}docker ps${RESET}${DIM} answers, then retry.${RESET}"
+    fi
+    _FORK_PAUSED=""
+  fi
   return "$rc"
 }
 
@@ -4317,15 +4534,108 @@ _fork_copy_tree_locked() {
   local src="$1" dst="$2" tmp cpflags rc=0 root
   root="$(_fork_root)"
   tmp="$root/.tmp.$$"
-  rm -rf "$tmp" || return 1
+  _run_names_safe rm -rf "$tmp" || return 1
   mkdir -p "$tmp" || return 1
   cpflags="$(_fork_cp_flags)"
   # shellcheck disable=SC2086
-  cp $cpflags "$src/." "$tmp/" || rc=$?
-  if [[ $rc -ne 0 ]]; then rm -rf "$tmp"; return "$rc"; fi
-  rm -rf "$dst" || { rm -rf "$tmp"; return 1; }
-  mv "$tmp" "$dst" || { rm -rf "$tmp"; return 1; }
+  _run_names_safe cp $cpflags "$src/." "$tmp/" || rc=$?
+  if [[ $rc -ne 0 ]]; then rm -rf "$tmp" 2>/dev/null || true; return "$rc"; fi
+  _run_names_safe rm -rf "$dst" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
+  mv "$tmp" "$dst" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
   return 0
+}
+
+# The running Cleat boxes that can write PROJECT, one container name per line.
+# Nothing when Docker is down, because then nothing runs. Non-zero when the
+# daemon answers and the listing fails, so the copy refuses rather than guess.
+#
+# Two matches. By name: the project's own boxes carry its path hash, the
+# portable floor that holds on every engine, WSL2 included. By mount: a box
+# whose read-write bind source is at, below or above the project, which is how
+# a box on a parent or a nested folder can write it too. A fork box mounts its
+# own copy, never the live tree, so it is skipped.
+_fork_live_writers() {
+  local project="$1" names n h tree srcs s hit
+  _daemon_up || return 0
+  names="$(docker ps --filter label=sh.cleat.version --filter status=running --format '{{.Names}}' 2>/dev/null)" || return 1
+  [[ -n "$names" ]] || return 0
+  h="$(printf '%s' "$project" | _md5 | head -c 8)"
+  tree="$(_phys_or_best "$project")"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    _box_is_fork "$n" && continue
+    case "$n" in
+      *-"$h"|*-"$h"-*) printf '%s\n' "$n"; continue ;;
+    esac
+    srcs="$(docker inspect --format '{{range .Mounts}}{{if .RW}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$n" 2>/dev/null)" || continue
+    hit=0
+    while IFS= read -r s; do
+      [[ -n "$s" ]] || continue
+      s="${s#/host_mnt}"
+      s="$(_phys_or_best "$s")"
+      [[ -n "$s" ]] || continue
+      case "$s/" in "$tree"/*) hit=1; break ;; esac
+      case "$tree/" in "$s"/*) hit=1; break ;; esac
+    done <<< "$srcs"
+    [[ $hit -eq 1 ]] && printf '%s\n' "$n"
+  done <<< "$names"
+  return 0
+}
+
+# The boxes in _FORK_PAUSED on one line, for a message. The daemon validates
+# container names, but they are still sanitized like every other name a box can
+# influence.
+_fork_paused_names() {
+  local l
+  l="$(printf '%s' "$_FORK_PAUSED" | tr '\n' ' ')"
+  _sanitize_repo_str "${l% }"
+}
+
+# One dim line after a copy that paused boxes, so a session that froze for it
+# has a reason on screen. Nothing when none were paused.
+_fork_note_paused() {
+  [[ -n "$_FORK_PAUSED" ]] || return 0
+  echo -e "    ${DIM}Paused for the copy and resumed: $(_fork_paused_names)${RESET}"
+  return 0
+}
+
+# Resume every box named in $1 (space or newline separated). Best effort: one
+# that is already running, or gone, is not an error.
+_fork_unpause() {
+  local w
+  for w in $1; do
+    docker unpause "$w" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+# _fork_copy_tree_locked with every box that can write SRC paused around it,
+# see _fork_copy_tree. Sets _FORK_PAUSED to the boxes it paused, for the
+# caller's note. rc 75, with nothing copied, when the boxes cannot be listed or
+# one cannot be paused (rootless Docker on cgroup v1 has no freezer). The
+# pauses live in a subshell whose EXIT trap unpauses what it paused, so a copy
+# that fails, a Ctrl-C and a TERM all resume the boxes. A SIGKILL cannot.
+_fork_copy_quiesced() {
+  local src="$1" dst="$2" writers rc=0
+  _FORK_PAUSED=""
+  writers="$(_fork_live_writers "$src")" || return 75
+  if [[ -z "$writers" ]]; then
+    _fork_copy_tree_locked "$src" "$dst" || rc=$?
+    return "$rc"
+  fi
+  _FORK_PAUSED="$writers"
+  (
+    _fq_done=""
+    trap '_fork_unpause "$_fq_done"' EXIT
+    trap 'exit 130' INT TERM HUP
+    while IFS= read -r _fq_w; do
+      [[ -n "$_fq_w" ]] || continue
+      docker pause "$_fq_w" >/dev/null 2>&1 || exit 75
+      _fq_done="$_fq_done $_fq_w"
+    done <<< "$writers"
+    _fork_copy_tree_locked "$src" "$dst"
+  ) || rc=$?
+  return "$rc"
 }
 
 # Prune configured excludes AFTER the copy. cp has no --exclude, and rsync
@@ -4344,7 +4654,7 @@ _fork_prune_excludes() {
     [[ -n "$e" ]] || continue
     # Cheap syntactic refusals first.
     case "$e" in
-      /*|*..*) warn "Ignoring unsafe [fork] exclude: $e"; continue ;;
+      /*|*..*) warn "Ignoring unsafe [fork] exclude: $(_sanitize_repo_str "$e")"; continue ;;
       # `.` resolves to the fork root itself. It passes the physical-parent
       # check below, and `rm -rf "$dir/."` is refused by rm with a non-zero
       # status, which under set -e would abort the whole run after the copy.
@@ -4361,7 +4671,7 @@ _fork_prune_excludes() {
     _parent="$(cd -P "$(dirname "$_target")" 2>/dev/null && pwd -P)" || continue
     case "$_parent" in
       "$_root"|"$_root"/*) ;;
-      *) warn "Ignoring [fork] exclude that resolves outside the fork: $e"; continue ;;
+      *) warn "Ignoring [fork] exclude that resolves outside the fork: $(_sanitize_repo_str "$e")"; continue ;;
     esac
     # The leaf itself must not be a symlink either: removing it is fine, but
     # only the link, never through it.
@@ -4369,7 +4679,7 @@ _fork_prune_excludes() {
     # box's own passwordless sudo created, for instance) must not take down a
     # copy that already succeeded.
     rm -rf "$_parent/$(basename "$_target")" 2>/dev/null \
-      || warn "Could not prune [fork] exclude: $e"
+      || warn "Could not prune [fork] exclude: $(_sanitize_repo_str "$e")"
   done < <(_read_section_all_from_file "$_exfile" "$(_scoped_section "$_exfile" "$box" fork)" exclude)
 }
 
@@ -4391,18 +4701,137 @@ _canonical_caps() {
   awk 'NF' | LC_ALL=C sort -u | paste -sd, -
 }
 
-# Hash the canonical cap list from a .cleat file. Prints empty when the
-# file is missing or declares no caps (nothing to gate).
+# The trust hash of a cap list, one name per line: canonical form, md5, hex
+# only. An empty list hashes to empty (nothing to gate). The comma join is
+# unambiguous only because every name that reaches it is a KNOWN_CAPS name and
+# none of those holds a comma: _project_caps_view drops anything else. Before
+# that, the one inert line `docker,git` hashed the same as the two real caps.
 # Note: `_md5` passes stdin through `md5sum` on Linux, which appends
 # "  -" (the filename of stdin). Strip that so the stored trust hash is
 # purely hex, otherwise we write malformed tab-separated lines.
+_caps_list_hash() {
+  local caps
+  caps="$(printf '%s\n' "$1" | _canonical_caps)"
+  [[ -z "$caps" ]] && return 0
+  echo -n "$caps" | _md5 | awk '{print $1}'
+}
+
+# Is $1 a capability this Cleat knows? Exact match, no fork.
+_cap_is_known() {
+  local k
+  for k in "${KNOWN_CAPS[@]}"; do
+    [[ "$k" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# Everything the trust gate decides about a project's caps comes from ONE read.
+# .cleat sits in /workspace, which the box rewrites at will, and
+# _read_caps_from_file opens its path twice. Hashing, showing and applying from
+# separate reads let a box get one set checked and another applied. So the file
+# is copied once, bounded, to a private temp file outside every mount and parsed
+# there. Sets:
+#   _PCAPS            caps that can apply, one per line: KNOWN_CAPS names only,
+#                     unsafe-rm removed (concept/42), no repeats
+#   _PCAPS_HASH       the trust hash of exactly that list, empty when it is empty
+#   _PCAPS_UNKNOWN    names dropped as unknown, one per line, raw
+#   _PCAPS_UNSAFE_RM  1 when the section listed unsafe-rm
+#   _PCAPS_OF         "<file>|<box>", what this view describes
+# The copy goes through _read_bounded, so a FIFO or a device the box swaps in
+# after the -f check costs at most its time bound, and the byte cap keeps a link
+# to /dev/zero from filling the host temp directory.
+_PCAPS_READ_MAX=262144
+_PCAPS=""
+_PCAPS_HASH=""
+_PCAPS_UNKNOWN=""
+_PCAPS_UNSAFE_RM=0
+_PCAPS_OF=""
+_project_caps_view() {
+  local file="$1" box="$2" snap raw c seen=","
+  _PCAPS=""; _PCAPS_HASH=""; _PCAPS_UNKNOWN=""; _PCAPS_UNSAFE_RM=0
+  _PCAPS_OF="$file|$box"
+  [[ -f "$file" ]] || return 0
+  snap="$(mktemp "${TMPDIR:-/tmp}/cleat-caps.XXXXXX" 2>/dev/null)" || {
+    warn "Could not read ${BOLD}$(basename "$file")${RESET}: its capabilities are skipped this run" >&2
+    return 0
+  }
+  _read_bounded "$file" "$_PCAPS_READ_MAX" 2>/dev/null > "$snap" || true
+  raw="$(_read_caps_from_file "$snap" "$box")"
+  rm -f "$snap"
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    if [[ "$c" == unsafe-rm ]]; then _PCAPS_UNSAFE_RM=1; continue; fi
+    if _cap_is_known "$c"; then
+      case "$seen" in
+        *",$c,"*) ;;
+        *) seen+="$c,"; _PCAPS+="$c"$'\n' ;;
+      esac
+    else
+      _PCAPS_UNKNOWN+="$c"$'\n'
+    fi
+  done <<< "$raw"
+  _PCAPS_HASH="$(_caps_list_hash "$_PCAPS")"
+}
+
+# The trust hash of a .cleat's caps for one box, from a single read. Empty when
+# the file is missing or declares no cap Cleat can apply. Call it inside $( ):
+# it replaces the current _PCAPS view.
 _hash_cleat_caps() {
   local path="$1" box="${2?_hash_cleat_caps needs a box}"
   [[ -f "$path" ]] || return 0
-  local caps
-  caps="$(_read_caps_from_file "$path" "$box" | _canonical_caps)"
-  [[ -z "$caps" ]] && return 0
-  echo -n "$caps" | _md5 | awk '{print $1}'
+  _project_caps_view "$path" "$box"
+  printf '%s' "$_PCAPS_HASH"
+}
+
+# The trust hash of one project decision: its caps ($1) plus the host variables
+# its env file asks for ($2, bare names), both one per line. With no names it is
+# exactly _caps_list_hash, so a project whose env file asks for nothing keeps
+# the hash it was approved at and nobody is asked again. With names the input
+# gains a newline, which no caps-only input holds (cap names are KNOWN_CAPS
+# names, env names are [A-Za-z0-9_]), so the two can never hash alike. Any change
+# to the name set changes the hash and needs a fresh approval.
+_trust_decision_hash() {
+  local caps names
+  names="$(printf '%s\n' "$2" | _canonical_caps)"
+  if [[ -z "$names" ]]; then
+    _caps_list_hash "$1"
+    return 0
+  fi
+  caps="$(printf '%s\n' "$1" | _canonical_caps)"
+  printf 'caps:%s\nenv:%s' "$caps" "$names" | _md5 | awk '{print $1}'
+}
+
+# The trust hash of a project box from fresh single reads of .cleat and of its
+# env file. Call it inside $( ): it replaces the current views.
+_project_trust_hash() {
+  local project="$1" box="$2"
+  _project_caps_view "$(_project_caps_file "$project")" "$box"
+  _project_env_view "$(_project_env_file "$project" "$box")" "$box"
+  _trust_decision_hash "$_PCAPS" "$_PENV_BARE"
+}
+
+# A project cap name Cleat does not know is dropped (see _project_caps_view).
+# Say so rather than drop it silently: it is a typo or a cap this version
+# lacks. Once per file and box per run, since a launch resolves caps more than
+# once. The names are box-written text: at most three are shown, each cut to 32
+# characters before it is sanitized.
+_WARNED_UNKNOWN_CAPS=""
+_warn_unknown_project_caps() {
+  local file="$1" box="$2" names="$3" n shown="" count=0
+  [[ -n "$names" ]] || return 0
+  case "$_WARNED_UNKNOWN_CAPS" in *"|$file|$box|"*) return 0 ;; esac
+  _WARNED_UNKNOWN_CAPS="${_WARNED_UNKNOWN_CAPS}|$file|$box|"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    count=$((count + 1))
+    if [[ $count -le 3 ]]; then
+      shown="${shown:+$shown, }$(_sanitize_repo_str "${n:0:32}")"
+    fi
+  done <<< "$names"
+  if [[ $count -gt 3 ]]; then
+    shown="$shown ${DIM}(+$((count - 3)) more)${RESET}"
+  fi
+  warn "Ignoring unknown capability in the project .cleat: ${BOLD}${shown}${RESET} ${DIM}(nothing is granted for it)${RESET}"
 }
 
 # Hash a built [setup] payload (see _build_setup_payload) for trust
@@ -4534,16 +4963,22 @@ _trust_list() {
   ' "$CLEAT_TRUST_FILE" 2>/dev/null
 }
 
-# Is a project trusted at its current .cleat caps hash?
-# Returns 0 when trusted, 1 when not (missing entry, stale hash, or no .cleat).
+# Is a project trusted at its current trust hash (its caps plus the host
+# variables its env file asks for, see _trust_decision_hash)?
+# Returns 0 when trusted, 1 when not (missing entry, stale hash, or nothing to
+# trust). $2, when given, is the hash to check: the caller's single-read views
+# (see _project_caps_view, _project_env_view). Without it the hash is taken fresh.
 _is_project_trusted() {
   local project="$1"
   local box="${_BOX:-main}"
-  local caps_file stored current
-  caps_file="$(_project_caps_file "$project")"
+  local stored current
   stored="$(_trust_lookup "$project" "$box")"
   [[ -z "$stored" ]] && return 1
-  current="$(_hash_cleat_caps "$caps_file" "$box")"
+  if [[ $# -ge 2 ]]; then
+    current="$2"
+  else
+    current="$(_project_trust_hash "$project" "$box")"
+  fi
   [[ -z "$current" ]] && return 1
   [[ "$stored" == "$current" ]]
 }
@@ -4569,7 +5004,13 @@ _trust_subject() {
 
 _trust_prompt() {
   local project="$1"; shift
-  local caps=("$@")
+  # No caps at all when the decision is on env-file host variables alone.
+  local -a caps=()
+  if [[ $# -gt 0 ]]; then caps=("$@"); fi
+  # The host variables the project env file asks for, one per line, from the
+  # caller's single-read view (_resolve_project_trust sets this for the call).
+  # Empty for a caps-only decision, which keeps the prompt exactly as it was.
+  local vars="${_TRUST_PROMPT_VARS:-}"
 
   # Detect if this is a re-prompt (stored hash exists but doesn't match).
   local is_reprompt=0
@@ -4579,7 +5020,7 @@ _trust_prompt() {
   # breaks the sandbox. Same aligned startup-prompt style (info + _ask_yn) as the
   # image-rebuild, Claude-update, and recreate prompts, not the old notice box.
   local cap _cap_safe _list=""
-  for cap in "${caps[@]}"; do
+  for cap in ${caps[@]+"${caps[@]}"}; do
     _cap_safe="$(_sanitize_repo_str "$cap")"
     if [[ "$cap" == "docker" ]]; then
       _list="${_list:+$_list, }${AMBER}${_cap_safe}${RESET}"
@@ -4588,16 +5029,38 @@ _trust_prompt() {
     fi
   done
 
-  if [[ $is_reprompt -eq 1 ]]; then
-    info "Project ${BOLD}.cleat${RESET} changed since you trusted it: it now grants ${_list} ${DIM}on your host${RESET}"
+  local ask="Trust this project's .cleat? ${DIM}(applies its caps; approve once, undo with cleat untrust)${RESET} [y/N] "
+  if [[ -z "$vars" ]]; then
+    if [[ $is_reprompt -eq 1 ]]; then
+      info "Project ${BOLD}.cleat${RESET} changed since you trusted it: it now grants ${_list} ${DIM}on your host${RESET}"
+    else
+      info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" caps)${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
+    fi
   else
-    info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" caps)${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
+    # Every name is listed in full: this is what the approval covers. They
+    # passed the env-file name check, so only [A-Za-z0-9_] reaches echo -e.
+    local v _vlist="" env_base
+    while IFS= read -r v; do
+      [[ -n "$v" ]] || continue
+      _vlist="${_vlist:+$_vlist, }${BOLD}${v}${RESET}"
+    done <<< "$vars"
+    env_base="$(basename "$(_project_env_file "$project" "${_BOX:-main}")")"
+    if [[ $is_reprompt -eq 1 && -n "$_list" ]]; then
+      info "Project ${BOLD}.cleat${RESET} or ${BOLD}${env_base}${RESET} changed since you trusted it"
+    elif [[ $is_reprompt -eq 1 ]]; then
+      info "Project ${BOLD}${env_base}${RESET} changed since you trusted it"
+    fi
+    if [[ -n "$_list" ]]; then
+      info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" caps)${RESET} requests host access: ${_list} ${DIM}(beyond the sandbox)${RESET}"
+    fi
+    info "Project ${BOLD}${env_base}${RESET} asks for host variables: ${_vlist} ${DIM}(their values go from your shell into the box)${RESET}"
+    ask="Trust this project? ${DIM}(grants what it asks for above, approve once, undo with cleat untrust)${RESET} [y/N] "
   fi
 
   # Default-DENY ([y/N]): only an explicit yes grants the caps. Empty / EOF / no
   # all decline, so untrusted project input never auto-applies.
   local yn=""
-  _ask_yn yn "Trust this project's .cleat? ${DIM}(applies its caps; approve once, undo with cleat untrust)${RESET} [y/N] "
+  _ask_yn yn "$ask"
   case "$yn" in
     [yY]*) return 0 ;;
     *) return 1 ;;
@@ -4648,7 +5111,7 @@ _setup_trust_prompt() {
 
 # Session-scoped decision cache: avoid prompting twice per invocation when
 # resolve_caps is called from multiple command paths in the same run.
-_TRUST_SESSION_DECISION=""   # "", "approved", "rejected"
+_TRUST_SESSION_DECISION=""   # "", "approved:<caps hash>", "rejected"
 _TRUST_SESSION_PROJECT=""    # the project path we decided on
 _TRUST_SESSION_BOX=""        # the box we decided on (per-box trust)
 
@@ -4679,25 +5142,45 @@ _SETUP_LAST_RC=0
 # _maybe_run_setup. Force runs (the `cleat setup` verb) ignore it.
 _SETUP_ATTEMPTED=""
 
-# Decide whether to apply a project's .cleat caps. Sets _TRUST_SESSION_* on
-# first call for a given project. Returns 0 = apply, 1 = skip.
-# $1 = project path (must have a .cleat with caps; caller's responsibility).
+# Decide whether to apply a project's .cleat caps and resolve the host
+# variables its env file asks for: one decision for both. Sets _TRUST_SESSION_*
+# on first call for a given project. Returns 0 = apply, 1 = skip.
+# $1 = project path (must have caps or env-file host variables to decide on,
+# the caller's responsibility).
 # $2 = "prompt" (default) or "readonly" to forbid interactive prompting.
 _resolve_project_trust() {
   local project="$1"
   local mode="${2:-prompt}"
   local box="${_BOX:-main}"
-  local caps_file
+  local caps_file env_file
   caps_file="$(_project_caps_file "$project")"
+  env_file="$(_project_env_file "$project" "$box")"
 
-  # Cached decision for this session/project/box
+  # Decide on the views resolve_caps just took and will apply, so the set that
+  # is checked, shown and recorded is the set that applies. A caller with no
+  # view for this file and box gets a fresh one, still a single read.
+  [[ "$_PCAPS_OF" == "$caps_file|$box" ]] || _project_caps_view "$caps_file" "$box"
+  [[ "$_PENV_OF" == "$env_file|$box" ]] || _project_env_view "$env_file" "$box"
+  local hash="$_PCAPS_HASH"
+  # The host variables the env file asks for join the same decision. Without
+  # any the hash stays the caps hash (see _trust_decision_hash).
+  [[ -z "$_PENV_BARE" ]] || hash="$(_trust_decision_hash "$_PCAPS" "$_PENV_BARE")"
+  [[ -n "$hash" ]] || return 1
+
+  # Cached decision for this session/project/box. An approval holds only at the
+  # hash it was given for: a .cleat rewritten between two resolve_caps calls in
+  # one process (cmd_start, then a recreate through cmd_run) must not ride an
+  # approval of other caps. Same rule as _SETUP_SESSION_DECISION.
   if [[ -n "$_TRUST_SESSION_DECISION" && "$_TRUST_SESSION_PROJECT" == "$project" && "$_TRUST_SESSION_BOX" == "$box" ]]; then
-    [[ "$_TRUST_SESSION_DECISION" == "approved" ]] && return 0 || return 1
+    case "$_TRUST_SESSION_DECISION" in
+      "approved:$hash") return 0 ;;
+      rejected) return 1 ;;
+    esac
   fi
 
-  # Already approved at the current hash (per box)
-  if _is_project_trusted "$project"; then
-    _TRUST_SESSION_DECISION="approved"
+  # Already approved at this hash (per box)
+  if _is_project_trusted "$project" "$hash"; then
+    _TRUST_SESSION_DECISION="approved:$hash"
     _TRUST_SESSION_PROJECT="$project"
     _TRUST_SESSION_BOX="$box"
     return 0
@@ -4705,13 +5188,11 @@ _resolve_project_trust() {
 
   # Explicit non-interactive opt-in
   if [[ "${CLEAT_TRUST_PROJECT:-}" == "1" || "${_CLI_TRUST_PROJECT:-0}" == "1" ]]; then
-    local hash
-    hash="$(_hash_cleat_caps "$caps_file" "$box")"
     # Preserve any existing [setup] trust (col4): approving caps never
     # creates setup trust, and passing through an empty lookup is exactly
     # that (a no-op 4th arg keeps the row 3-column, see _trust_record).
     _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
-    _TRUST_SESSION_DECISION="approved"
+    _TRUST_SESSION_DECISION="approved:$hash"
     _TRUST_SESSION_PROJECT="$project"
     _TRUST_SESSION_BOX="$box"
     return 0
@@ -4722,29 +5203,31 @@ _resolve_project_trust() {
 
   # Interactive prompt
   if _is_tty; then
+    # The prompt lists the view's caps and a yes records the view's hash, both
+    # from the one read taken before the prompt. Hashing after the answer came
+    # back recorded a .cleat rewritten while the user read the prompt, and a
+    # second read before it could differ from the list on screen. Either way
+    # the user approved one set and the store remembered another, with no
+    # re-prompt next run, and the writer can be the sandboxed agent itself.
     local -a req_caps=()
     local c
-    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done < <(_read_caps_from_file "$caps_file" "$box")
-    # Hash BEFORE the prompt, from the same read that produced the caps we are
-    # about to display. It used to be computed after the answer came back, so a
-    # .cleat rewritten while the user was reading the prompt got recorded as
-    # approved at its NEW hash: the user approved one set of capabilities and
-    # the trust store remembered a different set, with no re-prompt on the next
-    # run. The window is however long someone takes to read a security prompt,
-    # which is exactly the window that matters, and the writer can be the
-    # sandboxed agent itself.
-    local hash
-    hash="$(_hash_cleat_caps "$caps_file" "$box")"
-    if _trust_prompt "$project" "${req_caps[@]}"; then
+    while IFS= read -r c; do [[ -n "$c" ]] && req_caps+=("$c"); done <<< "$_PCAPS"
+    # The prompt lists the env view's host variables too, from the same read.
+    local _TRUST_PROMPT_VARS="$_PENV_BARE"
+    if _trust_prompt "$project" ${req_caps[@]+"${req_caps[@]}"}; then
       # Preserve any existing [setup] trust (col4): see the opt-in branch
       # above, same reasoning.
       _trust_record "$project" "$hash" "$box" "$(_trust_lookup_setup "$project" "$box")" || true
-      _TRUST_SESSION_DECISION="approved"
+      _TRUST_SESSION_DECISION="approved:$hash"
       _TRUST_SESSION_PROJECT="$project"
       _TRUST_SESSION_BOX="$box"
       return 0
     else
-      warn "Project .cleat ignored, not trusted ${DIM}(global config still applied)${RESET}"
+      # A decision on host variables alone says so where they are skipped
+      # (_warn_project_env_view), once.
+      if [[ -n "$_PCAPS" ]]; then
+        warn "Project .cleat ignored, not trusted ${DIM}(global config still applied)${RESET}"
+      fi
       _TRUST_SESSION_DECISION="rejected"
       _TRUST_SESSION_PROJECT="$project"
       _TRUST_SESSION_BOX="$box"
@@ -4753,7 +5236,9 @@ _resolve_project_trust() {
   fi
 
   # Non-TTY, no explicit opt-in: default-deny with an informational warning
-  warn "Project .cleat skipped in non-interactive mode ${DIM}(pass --trust-project or set CLEAT_TRUST_PROJECT=1 to approve)${RESET}"
+  if [[ -n "$_PCAPS" ]]; then
+    warn "Project .cleat skipped in non-interactive mode ${DIM}(pass --trust-project or set CLEAT_TRUST_PROJECT=1 to approve)${RESET}"
+  fi
   _TRUST_SESSION_DECISION="rejected"
   _TRUST_SESSION_PROJECT="$project"
   _TRUST_SESSION_BOX="$box"
@@ -4884,7 +5369,7 @@ _WARNED_UNSAFE_RM_FILES=""
 # as "wrong file" rather than "ignored".
 _warn_unknown_cleat_sections() {
   local file="$1" scope="$2"
-  [[ -r "$file" ]] || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
   case "$_WARNED_SECTIONS_FILES" in
     *"|$file|"*) return 0 ;;
   esac
@@ -4949,7 +5434,7 @@ _warn_unknown_cleat_sections() {
         esac ;;
     esac
     warn "Unknown section [$(_sanitize_repo_str "$name")] in ${base} ${DIM}(ignored)${RESET}"
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
   return 0
 }
 
@@ -4980,20 +5465,22 @@ resolve_caps() {
   # The box's cap file REPLACES .cleat (no merge): .cleat.<box> if present,
   # else .cleat; main always uses .cleat. See concept/20-boxes.md.
   local project_caps=""
+  _PENV_APPROVED=0
   if [[ -n "$project" ]]; then
     local caps_file
     caps_file="$(_project_caps_file "$project")"
     [[ -f "$caps_file" ]] && _warn_unknown_cleat_sections "$caps_file" project || true
+    # One read decides it all: the caps hashed, shown and applied below are
+    # the same bytes (see _project_caps_view). A missing .cleat is an empty view.
+    _project_caps_view "$caps_file" "$box"
     if [[ -f "$caps_file" ]]; then
-      local _raw_project_caps
-      _raw_project_caps="$(_read_caps_from_file "$caps_file" "$box")"
       # unsafe-rm disarms the box's delete-safety guard, and the caged agent can
       # write .cleat in its own workspace. A project file must NEVER grant it, not
-      # even a trusted one: strip it here so the only sources are the user's global
-      # config and the --cap flag. Say so, because a silent drop reads as a bug.
-      if printf '%s\n' "$_raw_project_caps" | grep -qx 'unsafe-rm'; then
+      # even a trusted one: the view strips it, so the only sources are the user's
+      # global config and the --cap flag. Say so, because a silent drop reads as a bug.
+      if [[ "$_PCAPS_UNSAFE_RM" == 1 ]]; then
         # Said once per file per run: a launch resolves caps more than once, and
-        # the warning printed twice. The strip below stays unconditional.
+        # the warning printed twice. The strip in the view stays unconditional.
         case "$_WARNED_UNSAFE_RM_FILES" in
           *"|$caps_file|"*) ;;
           *)
@@ -5001,12 +5488,28 @@ resolve_caps() {
             warn "Ignoring ${BOLD}unsafe-rm${RESET} from the project .cleat: it disarms the delete-safety guard and is accepted only from your global config or ${BOLD}--cap${RESET}."
             ;;
         esac
-        _raw_project_caps="$(printf '%s\n' "$_raw_project_caps" | grep -vx 'unsafe-rm' || true)"
       fi
-      if [[ -n "$_raw_project_caps" ]]; then
-        if _resolve_project_trust "$project" "$trust_mode"; then
-          project_caps="$_raw_project_caps"
-        fi
+      _warn_unknown_project_caps "$caps_file" "$box" "$_PCAPS_UNKNOWN"
+    fi
+    # The host variables the project env file asks for (bare names) are part of
+    # the same decision, from the same kind of single read (_project_env_view).
+    # They count only when the env cap can be on this launch: from the global
+    # config, a --cap flag or these very caps. Otherwise the file is never read
+    # and there is nothing to ask about.
+    _project_env_view "$(_project_env_file "$project" "$box")" "$box"
+    local _env_asks=0 _c
+    if [[ -n "$_PENV_BARE" ]]; then
+      while IFS= read -r _c; do
+        if [[ "$_c" == env ]]; then _env_asks=1; fi
+      done <<< "${global_caps}"$'\n'"${_PCAPS}"
+      for _c in ${_CLI_CAPS[@]+"${_CLI_CAPS[@]}"}; do
+        if [[ "$_c" == env ]]; then _env_asks=1; fi
+      done
+    fi
+    if [[ -n "$_PCAPS" || $_env_asks -eq 1 ]]; then
+      if _resolve_project_trust "$project" "$trust_mode"; then
+        project_caps="$_PCAPS"
+        _PENV_APPROVED=1
       fi
     fi
   fi
@@ -5047,10 +5550,12 @@ cap_is_active() {
 
 # ── Capabilities: env file parsing ─────────────────────────────────────────
 # Parse an env file and output KEY=VALUE lines (resolved).
-# Bare KEY entries are resolved from the host environment.
+# Bare KEY entries are resolved from the host environment. With $2 = entries a
+# bare KEY is printed as the name alone, unresolved, in file order among the
+# KEY=VALUE lines: the project env view decides later whether it may resolve.
 _parse_env_file() {
-  local file="$1"
-  [[ -r "$file" ]] || return 0
+  local file="$1" mode="${2:-}"
+  [[ -f "$file" && -r "$file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip carriage return (CRLF from Windows editors)
     line="${line%$'\r'}"
@@ -5071,12 +5576,120 @@ _parse_env_file() {
       if [[ ! "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
         continue
       fi
+      if [[ "$mode" == entries ]]; then
+        echo "$line"
+        continue
+      fi
       local val="${!line:-}"
       if [[ -n "$val" ]]; then
         echo "${line}=${val}"
       fi
     fi
-  done < "$file"
+  done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
+}
+
+# The project env file (.cleat.env, or .cleat.<box>.env) sits in /workspace,
+# which the box rewrites at will. Git ships whatever a clone brings. Its
+# KEY=VALUE lines are literal values, so they pass as they are. A bare KEY
+# copies a HOST value into the box, so the set of bare names joins the project
+# trust decision (_trust_decision_hash) and resolves only once that decision
+# approved it. Everything comes from ONE read, the same rule as
+# _project_caps_view: the names the prompt lists, the names hashed and the names
+# resolved are the same bytes. The copy is taken through _read_unlinked_bounded,
+# so a symlinked env file is never read. Sets:
+#   _PENV           entries in file order: a KEY=VALUE line as written, or a
+#                   bare NAME (already name-checked by _parse_env_file)
+#   _PENV_BARE      the bare names, sorted, no repeats, one per line
+#   _PENV_LINK      1 when the file is a symlink and was not read
+#   _PENV_APPROVED  1 once resolve_caps' trust decision approved _PENV_BARE
+#   _PENV_OF        "<file>|<box>", what this view describes
+_PENV=""
+_PENV_BARE=""
+_PENV_LINK=0
+_PENV_APPROVED=0
+_PENV_OF=""
+_project_env_view() {
+  local file="$1" box="$2" snap
+  _PENV=""; _PENV_BARE=""; _PENV_LINK=0; _PENV_APPROVED=0
+  _PENV_OF="$file|$box"
+  if [[ -L "$file" ]]; then
+    _PENV_LINK=1
+    return 0
+  fi
+  [[ -f "$file" ]] || return 0
+  snap="$(mktemp "${TMPDIR:-/tmp}/cleat-env.XXXXXX" 2>/dev/null)" || {
+    warn "Could not read ${BOLD}$(basename "$file")${RESET}: its variables are skipped this run" >&2
+    return 0
+  }
+  _read_unlinked_bounded "$file" "$_BOX_FILE_READ_MAX" > "$snap"
+  _PENV="$(_parse_env_file "$snap" entries)"
+  rm -f "$snap"
+  [[ -n "$_PENV" ]] || return 0
+  _PENV_BARE="$(printf '%s\n' "$_PENV" | awk 'NF && index($0, "=") == 0' | LC_ALL=C sort -u)"
+}
+
+# Make sure the env view describes this project's env file for the current box.
+# resolve_caps took it and decided on it. Any other caller gets a fresh view,
+# which nobody approved, so its bare names stay unresolved. Call it in the
+# parent shell, never inside $( ), or the view is lost.
+_project_env_current() {
+  local project="$1" box="${_BOX:-main}" file
+  file="$(_project_env_file "$project" "$box")"
+  [[ "$_PENV_OF" == "$file|$box" ]] || _project_env_view "$file" "$box"
+}
+
+# The env view as KEY=VALUE lines, in file order: literal lines as written plus
+# each bare name with the host value it has, only when the view is approved.
+_project_env_lines() {
+  local e val
+  [[ -n "$_PENV" ]] || return 0
+  while IFS= read -r e; do
+    [[ -n "$e" ]] || continue
+    if [[ "$e" == *=* ]]; then
+      printf '%s\n' "$e"
+      continue
+    fi
+    [[ "$_PENV_APPROVED" == 1 ]] || continue
+    [[ "$e" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || continue
+    val="${!e:-}"
+    if [[ -n "$val" ]]; then
+      printf '%s=%s\n' "$e" "$val"
+    fi
+  done <<< "$_PENV"
+  return 0
+}
+
+# Say what the env view left out, once per file and box per run (a launch
+# resolves env more than once). A symlinked file was not read at all. Bare
+# names the trust decision did not approve were skipped: at most five are
+# named, each cut to 64 characters. They passed the name check, so nothing but
+# [A-Za-z0-9_] reaches echo -e.
+_WARNED_PROJECT_ENV=""
+_warn_project_env_view() {
+  local file="$1" box="$2" base n shown="" count=0 target=""
+  case "$_WARNED_PROJECT_ENV" in *"|$file|$box|"*) return 0 ;; esac
+  base="$(basename "$file")"
+  if [[ "$_PENV_LINK" == 1 ]]; then
+    _WARNED_PROJECT_ENV="${_WARNED_PROJECT_ENV}|$file|$box|"
+    warn "${BOLD}${base}${RESET} is a symlink and was not read ${DIM}(the box can point it at any file you can read)${RESET}"
+    echo -e "    ${DIM}Make it a regular file, or name the file you meant with ${BOLD}--env-file${RESET}${DIM}.${RESET}"
+    return 0
+  fi
+  [[ -n "$_PENV_BARE" && "$_PENV_APPROVED" != 1 ]] || return 0
+  _WARNED_PROJECT_ENV="${_WARNED_PROJECT_ENV}|$file|$box|"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    count=$((count + 1))
+    if [[ $count -le 5 ]]; then
+      shown="${shown:+$shown, }${n:0:64}"
+    fi
+  done <<< "$_PENV_BARE"
+  if [[ $count -gt 5 ]]; then
+    shown="$shown ${DIM}(+$((count - 5)) more)${RESET}"
+  fi
+  [[ "$box" == main ]] || target=" $box"
+  warn "Not passing the host variables ${BOLD}${base}${RESET} asks for: ${BOLD}${shown}${RESET} ${DIM}(the project is not trusted for them)${RESET}"
+  echo -e "    ${DIM}Approve them with ${BOLD}cleat trust${target}${RESET}${DIM} or ${BOLD}--trust-project${RESET}${DIM}. Its KEY=VALUE lines still apply.${RESET}"
 }
 
 # Resolve all env vars to pass to the container.
@@ -5112,15 +5725,17 @@ resolve_env_args() {
       done < <(_parse_env_file "$CLEAT_GLOBAL_ENV")
     fi
 
-    # Project env file, box-aware: .cleat.<box>.env else .cleat.env
-    local _env_file
-    _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
-    if [[ -n "$project" && -f "$_env_file" ]]; then
+    # Project env file, box-aware: .cleat.<box>.env else .cleat.env. Applied
+    # from the view resolve_caps took and decided on (see _project_env_view),
+    # so a bare name resolves only when the trust decision approved it.
+    if [[ -n "$project" ]]; then
+      _project_env_current "$project"
+      _warn_project_env_view "${_PENV_OF%|*}" "${_BOX:-main}"
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         key="${line%%=*}"; val="${line#*=}"
         _env_set "$key" "$val"
-      done < <(_parse_env_file "$_env_file")
+      done < <(_project_env_lines)
     fi
   fi
 
@@ -5180,7 +5795,9 @@ _env_summary() {
     local _env_file
     _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
     if [[ -n "$project" && -f "$_env_file" ]]; then
-      project_count=$(_parse_env_file "$_env_file" | wc -l)
+      # What resolve_env_args passes: the view it applied from.
+      _project_env_current "$project"
+      project_count=$(_project_env_lines | wc -l)
       project_count=$((project_count + 0))
     fi
   fi
@@ -5344,11 +5961,11 @@ _settings_overlay_intact() {
   while IFS= read -r src; do
     [[ -z "$src" ]] && continue
     case "$src" in
-      "$overlay_dir"/* | "$CLEAT_PROJECTS_DIR"/*)
-        # Overlay files and the persistent per-project .claude.json are bind
-        # sources mounted onto file destinations. If one was deleted, Docker
-        # would auto-create it as a directory and the start would fail with an
-        # opaque OCI error; recreate instead.
+      "$overlay_dir"/* | "$CLEAT_PROJECTS_DIR"/* | "$CLEAT_HISTORY_DIR"/*)
+        # Overlay files, the persistent per-project .claude.json and the input
+        # history store are bind sources mounted onto file destinations. If one
+        # was deleted, Docker would auto-create it as a directory and the start
+        # would fail with an opaque OCI error; recreate instead.
         [[ -f "$src" ]] || return 1
         ;;
     esac
@@ -5389,6 +6006,35 @@ _container_bind_sources_present() {
   return 0
 }
 
+# Return success when the box's input history bind source sits inside its
+# session-dir bind source: the layout every box created before the host-only
+# store has baked in. The session dir is mounted read-write, so there the
+# history file is an ordinary name the box can replace with a link, and
+# `docker start` re-resolves that name. A recorded bind source only changes on
+# a recreate, so the caller recreates. It compares the two RECORDED sources
+# with each other rather than rebuilding a host path from HOME and the key, so
+# a translated source form on any engine still compares consistently, and the
+# `eq` filter keeps a `|` or a space in another mount's path out of the parse.
+# Unreadable inspect or either mount missing → not legacy (1), like the
+# siblings above: the start path that follows surfaces any real error.
+_history_bind_in_session_dir() {
+  local cname="$1"
+  local out line
+  local hist=""
+  local sess=""
+  out="$(docker inspect "$cname" --format '{{range .Mounts}}{{if eq .Destination "/home/coder/.claude/history.jsonl"}}H{{.Source}}{{"\n"}}{{end}}{{if eq .Destination "/home/coder/.claude/projects/-workspace"}}S{{.Source}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)" || return 1
+  [[ -n "$out" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      H?*) hist="${line#H}" ;;
+      S?*) sess="${line#S}" ;;
+    esac
+  done <<< "$out"
+  [[ -n "$hist" && -n "$sess" ]] || return 1
+  case "$hist" in "$sess"/*) return 0 ;; esac
+  return 1
+}
+
 # Build a per-project ~/.claude.json for the container, isolated from the shared
 # host file. Mounting the host ~/.claude.json directly (the old behavior) caused
 # two problems, because every container runs at CWD /workspace and writes back
@@ -5424,6 +6070,35 @@ _looks_like_json_object() {
   [[ -n "$content" && "${content:0:1}" == "{" && "${content: -1}" == "}" ]]
 }
 
+# How far past the host ~/.claude.json a box's per-project copy may grow before
+# the host stops reading it. The box writes its copy through a read-write bind,
+# so it picks the size, and every host reader here used to take the file whole:
+# into a shell variable, into jq, into a .bak. A real file is about 28 KB
+# (concept/19), so this is far past anything Claude Code writes.
+_CLAUDE_JSON_HEADROOM_BYTES=16777216
+
+# The cap sits ABOVE the host file, which the user owns, so a large host file
+# can never make every box copy read as oversized.
+_claude_json_cap() {
+  printf '%s' "$(( $(_path_size "$HOME/.claude.json") + _CLAUDE_JSON_HEADROOM_BYTES ))"
+}
+
+# Copy a box's claude.json into a host-only file with ONE bounded read, and
+# have every later step read the copy. The box mounts the single file, never
+# its directory, and a rename over a bind target fails with EBUSY, so the box
+# controls only the size and the content. A size check alone leaves a running
+# box free to grow the file between the check and the read. The copy does not.
+# rc 0 copied, 1 not a regular file (or a link), 2 over the cap. Nothing is
+# left at DST unless rc is 0.
+_claude_json_snapshot() {
+  local src="$1" dst="$2" cap="$3"
+  [ -f "$src" ] && [ ! -L "$src" ] || return 1
+  ( umask 077; head -c "$(( cap + 1 ))" < "$src" > "$dst" ) 2>/dev/null \
+    || { rm -f "$dst" 2>/dev/null || true; return 1; }
+  [ "$(_path_size "$dst")" -le "$cap" ] || { rm -f "$dst" 2>/dev/null || true; return 2; }
+  return 0
+}
+
 # Replace a bind-mounted file's content IN PLACE without ever leaving it empty.
 #
 # The box sees ~/.claude.json through a single-file bind mount, so a new copy
@@ -5457,6 +6132,10 @@ _write_in_place() {
   new="$(wc -c < "$src" 2>/dev/null | tr -d '[:space:]')"
   case "$old" in ''|*[!0-9]*) return 1 ;; esac
   case "$new" in ''|*[!0-9]*) return 1 ;; esac
+  # The padding below is up to the OLD size, which the box chose. A running box
+  # that bloated its own file keeps it until its next stopped start rebuilds it,
+  # rather than the host writing that much again.
+  [ "$old" -le "$(_claude_json_cap)" ] || return 1
   if (( new < old )); then
     printf '%*s' "$(( old - new ))" '' >> "$src" 2>/dev/null || return 1
   fi
@@ -5472,10 +6151,16 @@ _write_in_place() {
 # Prints nothing when no sibling has one. Requires jq (callers only use the
 # result on the jq path). Fail-soft: any unreadable/corrupt sibling is skipped.
 # A sibling whose box is pinned to a named account is skipped as well, see
-# _pinned_project_keys.
+# _pinned_project_keys. So is a sibling flagged .identity-stale, whose name is
+# waiting to be dropped, see _account_invalidate_identity_key.
+# $2 is the size cap (default _claude_json_cap). Each sibling is a file its own
+# box writes, so one over the cap is skipped, and jq only ever sees the first
+# cap + 1 bytes: a sibling that grows after the stat reaches jq cut short and
+# fails to parse.
 _newest_sibling_identity() {
-  local exclude="$1" f best="" best_m=0 m pinned k
+  local exclude="$1" cap="${2:-}" f best="" best_m=0 m pinned k
   command -v jq &>/dev/null || return 0
+  [[ -n "$cap" ]] || cap="$(_claude_json_cap)"
   pinned="$(_pinned_project_keys)"
   for f in "$CLEAT_PROJECTS_DIR"/*/claude.json; do
     [[ -f "$f" ]] || continue
@@ -5487,7 +6172,16 @@ _newest_sibling_identity() {
     k="${f%/claude.json}"
     k="${k##*/}"
     [[ "$pinned" == *":${k}:"* ]] && continue
-    jq -e '.oauthAccount? != null' "$f" >/dev/null 2>&1 || continue
+    # A flagged file holds a name the host has already decided to drop: the box
+    # left an account, or had it removed, while a Claude held the file open, or
+    # the remove has unpinned it and not reached the drop yet. Until that box's
+    # next launch clears it, the name is the old account's, and handing it on is
+    # the leak the drop exists to stop. The flag sits beside the file on the host
+    # only (the box mounts the file, never its directory), so the box can
+    # neither set it nor clear it.
+    [[ -e "${f}.identity-stale" ]] && continue
+    [ "$(_path_size "$f")" -le "$cap" ] || continue
+    head -c "$(( cap + 1 ))" < "$f" 2>/dev/null | jq -e '.oauthAccount? != null' >/dev/null 2>&1 || continue
     m="$(_path_mtime "$f")"
     if (( m > best_m )); then best_m=$m; best="$f"; fi
   done
@@ -5546,22 +6240,40 @@ _build_project_claude_json() {
 
   if command -v jq &>/dev/null; then
     local tmp="${out}.tmp.$$"
-    local hf pf sf sib
+    local hf pf sf sib cap snap_rc
+    local psnap="${out}.proj.$$" ssnap="${out}.sib.$$"
     if [[ -n "$host_src" && -f "$host_src" && -s "$host_src" ]]; then hf="$host_src"; else hf=/dev/null; fi
-    # The PERSISTED project copy gets the same corruption guard as the host
-    # file above. It had none, so a project file truncated by a full disk or a
-    # killed write was fed to jq, jq failed on the whole merge, and the box
-    # came up with a file it could not read. Nothing healed it, so every later
-    # start reproduced it: the box was stuck on the login screen with no
-    # message naming the cause. Backing it up and treating it as absent lets
-    # the merge rebuild from the host file and the sibling identity.
-    if [[ -f "$proj_src" && -s "$proj_src" ]] && ! _looks_like_json_object "$proj_src"; then
-      cp "$proj_src" "${proj_src}.bak" 2>/dev/null || true
-      warn "This project's stored ${BOLD}.claude.json${RESET} was corrupt, backed up alongside it."
-      echo -e "    ${DIM}Rebuilding it from the host file. Session history for this project may be reset.${RESET}"
+    # The box writes its project copy, so its size is the box's to pick, and
+    # the host used to read it whole. Every step below reads a bounded snapshot
+    # of it instead, taken once (_claude_json_snapshot).
+    cap="$(_claude_json_cap)"
+    if [[ -n "$proj_src" && -f "$proj_src" && -s "$proj_src" ]]; then
+      snap_rc=0
+      _claude_json_snapshot "$proj_src" "$psnap" "$cap" || snap_rc=$?
+      if [[ $snap_rc -eq 2 ]]; then
+        # No .bak: that would copy the bloat again.
+        warn "This project's stored ${BOLD}.claude.json${RESET} is over $(_human_bytes "$cap"), far past anything Claude Code writes."
+        echo -e "    ${DIM}Rebuilding it from the host file. Session history for this project may be reset.${RESET}"
+        proj_src=""
+      elif [[ $snap_rc -ne 0 ]]; then
+        proj_src=""
+      # The PERSISTED project copy gets the same corruption guard as the host
+      # file above. It had none, so a project file truncated by a full disk or a
+      # killed write was fed to jq, jq failed on the whole merge, and the box
+      # came up with a file it could not read. Nothing healed it, so every later
+      # start reproduced it: the box was stuck on the login screen with no
+      # message naming the cause. Backing it up and treating it as absent lets
+      # the merge rebuild from the host file and the sibling identity.
+      elif ! _looks_like_json_object "$psnap"; then
+        cp "$psnap" "${proj_src}.bak" 2>/dev/null || true
+        warn "This project's stored ${BOLD}.claude.json${RESET} was corrupt, backed up alongside it."
+        echo -e "    ${DIM}Rebuilding it from the host file. Session history for this project may be reset.${RESET}"
+        proj_src=""
+      fi
+    else
       proj_src=""
     fi
-    if [[ -n "$proj_src" && -f "$proj_src" && -s "$proj_src" ]]; then pf="$proj_src"; else pf=/dev/null; fi
+    if [[ -n "$proj_src" ]]; then pf="$psnap"; else pf=/dev/null; fi
     # Identity gained inside another box (its mounted per-project file is the
     # only place an in-box login lands) fills identity keys that BOTH the host
     # file and this project's own copy lack. Without it, a login done in box A
@@ -5574,8 +6286,12 @@ _build_project_claude_json() {
     # box with the other one's identity. Skipping is strictly safer than
     # guessing: Claude refetches identity from its own profile endpoint.
     if [[ $_bpj_pinned -eq 0 ]]; then
-      sib="$(_newest_sibling_identity "$out")"
-      [[ -n "$sib" && -f "$sib" && -s "$sib" ]] && sf="$sib"
+      sib="$(_newest_sibling_identity "$out" "$cap")"
+      # The sibling is another box's file, so it is read the same bounded way.
+      if [[ -n "$sib" && -f "$sib" && -s "$sib" ]] \
+         && _claude_json_snapshot "$sib" "$ssnap" "$cap"; then
+        sf="$ssnap"
+      fi
     fi
     # slurpfile reads each input fully before output is written, so reading $out
     # while writing $tmp is safe; mv makes the swap atomic.
@@ -5652,6 +6368,7 @@ _build_project_claude_json() {
       # jq failed unexpectedly: keep the persisted copy if present, else start clean.
       [[ -f "$out" && -s "$out" ]] || echo '{}' > "$out"
     fi
+    rm -f "$psnap" "$ssnap" 2>/dev/null || true
   else
     # No jq: best effort. Keep persisted copy, else seed from host, else empty.
     if [[ -f "$out" && -s "$out" ]]; then
@@ -5726,7 +6443,11 @@ _refresh_attached_claude_json() {
   [[ -f "$f" && -s "$f" ]] || return 0
   # Cheap gate first: an onboarded box shows no login screen, nothing to fix,
   # no docker call. Only a logout-poisoned (or never-onboarded) box proceeds.
-  jq -e '.hasCompletedOnboarding == true' "$f" >/dev/null 2>&1 && return 0
+  # Bounded, because the box writes this file: one over the cap reaches jq cut
+  # short and falls through to the build, which warns and leaves it alone.
+  local cap
+  cap="$(_claude_json_cap)"
+  head -c "$(( cap + 1 ))" < "$f" 2>/dev/null | jq -e '.hasCompletedOnboarding == true' >/dev/null 2>&1 && return 0
   _box_has_live_agent "$cname" && return 0
   local tmp="${f}.attach.$$"
   _build_project_claude_json "$tmp" "$f" "$cname"
@@ -6133,7 +6854,9 @@ _env_summary_inline() {
     _env_file="$(_project_env_file "$project" "${_BOX:-main}")"
     if [[ -n "$project" && -f "$_env_file" ]]; then
       project_exists=true
-      project_count=$(_parse_env_file "$_env_file" | wc -l)
+      # What resolve_env_args passes: the view it applied from.
+      _project_env_current "$project"
+      project_count=$(_project_env_lines | wc -l)
       project_count=$((project_count + 0))
     fi
   fi
@@ -6627,16 +7350,29 @@ _clipimg_watcher() {
   done
 }
 
+# Where the clipboard watchers' liveness markers live, given the clip dir: one
+# `.watcher.<host pid>` per session that runs a watcher, in clipwatch/, a
+# host-only sibling of the clip mount like clipclaim/. They used to sit in the
+# mount itself. There the box could read a live host pid off a marker and plant
+# a link at a later session's marker name, and the host's touch followed it,
+# creating or re-stamping a file of the box's choosing anywhere the user can
+# write. Nothing in the box reads these markers.
+_clip_watch_dir() {
+  printf '%s/clipwatch' "$(dirname "${1:?}")"
+}
+
 # Remove .watcher.<pid> markers whose process is gone. Each marker is stamped
 # with the HOST pid of a clipboard watcher, so `kill -0` is the liveness test,
-# the same shape _box_has_attached_session uses for .attached.<pid>.
+# the same shape _box_has_attached_session uses for .attached.<pid>. $1 is the
+# clip dir. The markers sit in _clip_watch_dir.
 #
 # A recycled pid can make a dead marker look live, which only delays the sweep
 # to the next session. The reverse mistake, treating a live watcher as dead,
 # would drop .host-ready out from under a working bridge, so this errs toward
 # keeping a marker.
 _sweep_dead_watcher_markers() {
-  local dir="$1" m pid
+  local dir m pid
+  dir="$(_clip_watch_dir "$1")"
   for m in "$dir"/.watcher.*; do
     [ -e "$m" ] || continue
     pid="${m##*/.watcher.}"
@@ -6645,6 +7381,50 @@ _sweep_dead_watcher_markers() {
     esac
     kill -0 "$pid" 2>/dev/null || rm -f "$m" 2>/dev/null || true
   done
+}
+
+# rc 0 while a clipboard watcher on this box is still alive. $1 is the clip dir.
+# Dead markers are swept first, so a crashed session never counts.
+_clip_watchers_live() {
+  local m
+  _sweep_dead_watcher_markers "$1"
+  for m in "$(_clip_watch_dir "$1")"/.watcher.*; do
+    [ -e "$m" ] && return 0
+  done
+  return 1
+}
+
+# Run INSIDE the box by _clip_announce_ready, with the sentinel path as $1. A
+# regular file already says a watcher is up and is left alone. Anything else at
+# the name (a link, a FIFO, a directory) can only be the box's own, and it is
+# replaced so it cannot hold the bridge off. POSIX sh: the image's /bin/sh is
+# dash. rm runs before any open, so a FIFO there never blocks the create.
+_CLIP_READY_SH='[ -f "$1" ] && [ ! -L "$1" ] && exit 0; rm -rf "$1" 2>/dev/null; : > "$1"'
+
+# Tell the box's shim a host watcher is running. docker/clip takes the file
+# bridge whenever /tmp/cleat-clip/.host-ready is a regular file. The sentinel
+# sits in the read-write clip mount, where the box can rename a link over it at
+# any instant, so the host never writes it. touch and a plain redirect follow
+# that link. So does bash's noclobber: it stats first and opens a name that is
+# not a regular file with O_CREAT and no O_EXCL, and a loop swapping a dangling
+# link in after the stat won about one attempt in twenty on Linux. Written from
+# inside the box instead, as coder, a link resolves in the box's own filesystem
+# and reaches nothing the box could not already write.
+#
+# Retried because an exec that lands before the entrypoint has remapped coder
+# runs as the image's uid, which cannot write a host-owned clip dir on Linux
+# with a host uid other than 1000 or on a rootless engine. Each attempt is
+# bounded, so a box that hangs its own sh cannot hold the watcher here for the
+# rest of the session. Fail-soft: with no sentinel the shim falls back to OSC
+# 52, the path a box with no watcher takes.
+_clip_announce_ready() {
+  local _try
+  for _try in 1 2 3; do
+    _run_bounded 10 docker exec -u coder "${1:?}" sh -c "$_CLIP_READY_SH" sh /tmp/cleat-clip/.host-ready \
+      </dev/null >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 0
 }
 
 # The image type of $1 by magic bytes, or empty. Never trust an extension: this
@@ -6666,9 +7446,29 @@ _image_magic_kind() {
 # a file in the shared clip dir, and the README states the limit as a fact.
 _CLIP_MAX_PAYLOAD=102400          # 100KB
 
+# The host-only claim dir for the clip dir $1: its sibling clipclaim/, created
+# when missing. Prints the path, rc 0, only when it is a real directory and not
+# a link. The clipboard and browser watchers rename box-written names into it.
+# Neither falls back into the mount when this fails: a claim, a cap temp or a
+# rate ledger inside the mount is a name the box can list and plant, which is
+# what this directory exists to prevent. Only clip/ beside it is mounted, so the
+# box cannot race this check. What it turns away is a host-side failure: a full
+# disk, a run dir the user cannot write, or something else left at the name.
+_host_claim_dir() {
+  local d
+  d="$(dirname "${1:?}")/clipclaim"
+  mkdir -p "$d" 2>/dev/null || true
+  if [ -d "$d" ] && [ ! -L "$d" ]; then
+    printf '%s' "$d"
+    return 0
+  fi
+  return 1
+}
+
 _clipboard_watcher() {
   local clip_dir="$1"
   local clip_cmd="$2"
+  local cname="${3:-}"
   trap 'exit 0' TERM INT HUP
   # Same orphan story as _browser_watcher: a watcher whose cleat process died
   # without the cleanup trap (terminal closed, SIGKILL) must not keep writing
@@ -6710,9 +7510,20 @@ _clipboard_watcher() {
   # the run dir itself: the idle sweep measures staleness from the run dir's
   # mtime, so churning claim files directly in it would re-stamp that clock on
   # every copy and quietly hold the box out of the sweep.
+  #
+  # With no such dir the bridge is off for this session. It never claims inside
+  # the mount instead: there the claim, the cap temp and the read below would
+  # all sit on names the box can plant. This session's liveness marker goes, and
+  # so does .host-ready when no live watcher is left, so the box's shim takes
+  # its OSC 52 path rather than writing to a bridge nobody reads. Both are
+  # unlinks, which never follow a link. Readiness is never announced.
   local claim_dir
-  claim_dir="$(dirname "$clip_dir")/clipclaim"
-  mkdir -p "$claim_dir" 2>/dev/null || claim_dir="$clip_dir"
+  if ! claim_dir="$(_host_claim_dir "$clip_dir")"; then
+    echo "[clipboard-watcher $(date +%H:%M:%S)] no claim dir outside the mount, clipboard bridge off this session"
+    rm -f "$(_clip_watch_dir "$clip_dir")/.watcher.$$" 2>/dev/null || true
+    _clip_watchers_live "$clip_dir" || rm -f "$clip_dir/.host-ready" 2>/dev/null || true
+    return 0
+  fi
 
   # Claims stranded by a watcher killed between rename and delivery are the
   # same kind of leftover: same age gate. A live claim is milliseconds old
@@ -6726,10 +7537,11 @@ _clipboard_watcher() {
   done
 
   _sweep_dead_watcher_markers "$clip_dir"
-  # touch FOLLOWS a symlink, so a link planted at this path would have the host
-  # create or re-stamp whatever file it names. Drop it first.
-  _drop_unless_regular "$clip_dir/.host-ready"
-  touch "$clip_dir/.host-ready"
+  # Readiness is written from inside the box, never through the mount (see
+  # _clip_announce_ready). With no box name there is nobody to announce to.
+  if [ -n "$cname" ]; then
+    _clip_announce_ready "$cname"
+  fi
 
   # Consume-on-read, mirroring _browser_claim_url: atomically claim the
   # payload before piping it to the host clipboard, so a delivered copy no
@@ -7589,7 +8401,7 @@ try:
         cli.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\n\r\n"
                     b"<h1>Cleat: callback forwarding failed</h1>"
                     b"<p>Could not reach Claude Code's auth server inside the container.</p>"
-                    b"<p>Check <code>/tmp/cleat-clip/.proxy-log</code> for details.</p>")
+                    b"<p>Details are in <code>bridge/proxy-log</code>, in this box's Cleat run directory on the host.</p>")
     cli.close()
 except socket.timeout:
     _log(f"timeout waiting for callback ({wait_secs}s)")
@@ -7619,7 +8431,8 @@ _browser_claim_url() {
   local bridge_file="$1"
   # Where the claim goes. The watcher passes a directory outside the box's bind
   # mount, which is what stops the box swapping the claim between the rename and
-  # the read. Defaults beside the bridge file so direct callers are unchanged.
+  # the read. It passes nothing else: with no such directory the watcher does
+  # not run. The default beside the bridge file serves direct callers only.
   local claim_dir="${2:-}"
   [ -n "$claim_dir" ] || claim_dir="$(dirname "$bridge_file")"
   # Same shape as the clipboard payload path, same fix. A symlink is never a
@@ -7638,12 +8451,68 @@ _browser_claim_url() {
     rm -f "$claim" 2>/dev/null || true
     return 1
   fi
+  # The rename is the gate. The tests before it are only a fast path: the box
+  # can rename a FIFO or a directory onto the bridge name between them and the
+  # mv. Here the claim sits where the box cannot reach, so this test cannot be
+  # raced. A FIFO is unlinked without ever being opened, which is what keeps
+  # the head below from blocking the watcher forever, and a directory is
+  # removed instead of stranded.
+  [ -f "$claim" ] || { rm -rf "$claim" 2>/dev/null || true; return 1; }
   # Bounded. The box picks the file's size, and an unbounded `cat` here put the
   # whole thing in a shell variable and then on an `echo` into the log. The cap
   # is well above the 2048 _bridge_url_host accepts, so nothing that could ever
   # be opened is cut.
   head -c 8192 "$claim" 2>/dev/null || true
   rm -f "$claim" 2>/dev/null || true
+  return 0
+}
+
+# The most _read_bounded reads, in bytes and in seconds. No real .cleat,
+# .cleat.env, [setup] script or session-end log window comes near either.
+_BOX_FILE_READ_MAX=1048576
+_BOX_FILE_READ_SECS=2
+
+# Print at most $2 bytes of the regular file $1, starting at byte $3 (1-based,
+# default 1), and never block doing it. For a name the box can write: a FIFO
+# there blocks open(2) until something writes to it, and a link to a device
+# like /dev/zero never reaches EOF.
+#
+# `[ -f ]` refuses both when they are already in place, without a fork. The box
+# can still swap one in after that check, so the read itself runs under
+# _run_bounded's time bound and head's byte bound, and a won race costs at most
+# the bound. It follows a link to a regular file, as the redirects it replaced
+# did. A caller that must not follow one tests `[ -L ]` first.
+#
+# Always rc 0. The binary runs under pipefail and errexit, so a producer killed
+# by the bound or by SIGPIPE (a `grep -q` or a `break` that stops reading early)
+# must never mask the reader's answer or abort the caller.
+_read_bounded() {
+  local f="$1" max="$2" from="${3:-1}"
+  [ -f "$f" ] || return 0
+  if [ "$from" -le 1 ]; then
+    _run_bounded "$_BOX_FILE_READ_SECS" head -c "$max" -- "$f" 2>/dev/null || true
+  else
+    _run_bounded "$_BOX_FILE_READ_SECS" tail -c "+$from" -- "$f" 2>/dev/null | head -c "$max" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# _read_bounded for a name whose bytes decide what leaves the host, where a
+# symlink must never be followed. A link there, committed to the repo or planted
+# by the box, has the host read any file the user can read (~/.aws/credentials,
+# a shell rc full of exported keys). So the file is opened ONCE and
+# _fd_holds_path confirms, on the open descriptor, that it is the regular file
+# the path names. A link swapped in and back around the checks fails that.
+# Nothing after it touches the path again. The open runs in a child bash under
+# _run_bounded, so a FIFO swapped in after the -f test costs at most the time
+# bound. Prints nothing when refused. Always rc 0, like _read_bounded.
+_read_unlinked_bounded() {
+  local f="$1" max="$2"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  _run_bounded "$_BOX_FILE_READ_SECS" bash -c "$(declare -f _fd_holds_path)"'
+exec 8<"$1" || exit 1
+_fd_holds_path 8 "$1" || exit 1
+exec head -c "$2" <&8' cleat-read "$f" "$max" 2>/dev/null || true
   return 0
 }
 
@@ -7668,6 +8537,16 @@ _path_mtime() {
   m="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "")"
   case "$m" in ''|*[!0-9]*) m=0 ;; esac
   printf '%s' "$m"
+}
+
+# Inode number of a path, without following a link, or empty when it can't be
+# read. `ls -di` is the reader _fd_holds_path uses: GNU and BSD print the same
+# first column, where the two stat format flags differ.
+_path_ino() {
+  local i
+  i="$(ls -di "$1" 2>/dev/null | awk '{print $1}' || echo "")"
+  case "$i" in ''|*[!0-9]*) i="" ;; esac
+  printf '%s' "$i"
 }
 
 # Same-URL debounce, shared across watchers via per-URL marker dirs in the clip
@@ -7753,9 +8632,10 @@ _BROWSER_CAPPED_MARK="RATE-CAPPED"
 # find it.
 _BROWSER_NOBIND_MARK="CALLBACK-UNAVAILABLE"
 # Returns 0 and records the open when it fits under both caps, 1 when a cap is
-# reached. $1 is the ledger path, empty when the claim dir could not be created
-# outside the mount (then only the session cap applies, because a ledger the box
-# can write is not a cap). $2 is how many opens this watcher has already made.
+# reached. $1 is the ledger path. The watcher always passes one, because with no
+# claim dir outside the mount it does not run at all. Empty, from a direct
+# caller, means only the session cap applies, because a ledger the box can write
+# is not a cap. $2 is how many opens this watcher has already made.
 _browser_rate_take() {
   local ledger="${1:-}" made="${2:-0}"
   case "$made" in ''|*[!0-9]*) made=0 ;; esac
@@ -7815,10 +8695,11 @@ EOF
 #                     allowlisted origin, and the rate cap still applies.
 #   off:              never open a browser. The auth callback proxy still runs
 #                     for an allowlisted origin, and the claimed URL lands in
-#                     the box's .proxy-log. The loopback URL is never printed
-#                     by claude (2.1.191+ hands it only to $BROWSER), so the log
-#                     is where to find it to open by hand. The printed
-#                     code-paste flow needs no proxy.
+#                     the bridge log (bridge/proxy-log in the box's run dir, on
+#                     the host). The loopback URL is never printed by claude
+#                     (2.1.191+ hands it only to $BROWSER), so the log is where
+#                     to find it to open by hand. The printed code-paste flow
+#                     needs no proxy.
 _browser_bridge_mode() {
   case "${CLEAT_BROWSER_BRIDGE:-auto}" in
     always) printf 'always' ;;
@@ -7879,20 +8760,32 @@ _browser_sweep_stale_bridge() {
 }
 
 # Teardown sweep of the bridge file. With another session alive on this box
-# (its .watcher.<pid> marker survives the dead-marker sweep) a FRESH bridge
-# file is a login URL that sibling is about to claim, so only a stale one goes.
-# With no live sibling there is nobody left to claim it, and leaving it behind
-# would hand it to the NEXT session on this box, which would open the previous
-# session's URL, so it goes unconditionally, exactly as it always did.
+# (its .watcher.<pid> marker in clipwatch/ survives the dead-marker sweep) a
+# FRESH bridge file is a login URL that sibling is about to claim, so only a
+# stale one goes. With no live sibling there is nobody left to claim it, and
+# leaving it behind would hand it to the NEXT session on this box, which would
+# open the previous session's URL, so it goes unconditionally, exactly as it
+# always did.
 _browser_teardown_bridge() {
   local dir="${1:?}"
-  _sweep_dead_watcher_markers "$dir"
-  if ls "$dir"/.watcher.* >/dev/null 2>&1; then
+  if _clip_watchers_live "$dir"; then
     _browser_sweep_stale_bridge "$dir"
   elif [ -L "$dir/.browser-open" ] || [ -e "$dir/.browser-open" ]; then
     rm -f "$dir/.browser-open" 2>/dev/null || true
   fi
   return 0
+}
+
+# Where the browser bridge keeps its log: bridge/proxy-log, in a sibling of the
+# clip dir that no bind mount contains. The callback proxy's readiness marker
+# sits beside it. Both used to live in the clip dir, which the box has
+# read-write, and no check there can hold: `>>`, socat's `2>>` and python's
+# open() all follow a link, and a box that renames a fresh link over the path in
+# a loop wins whatever gap a check leaves before the write. Out of the mount,
+# every one of those writes is safe with no guard at all (concept/41). $1 is
+# the clip dir.
+_browser_proxy_log() {
+  printf '%s/bridge/proxy-log' "$(dirname "${1:?}")"
 }
 
 _browser_watcher() {
@@ -7922,28 +8815,40 @@ _browser_watcher() {
   # a FRESH file is a live URL some sibling watcher is about to claim), then
   # the debounce markers that outlived their window.
   _browser_sweep_stale_bridge "$clip_dir"
-  # Cap the proxy log once per session. This bounds what carries over between
-  # sessions and keeps the window the post-session report reads small. It does
-  # NOT bound host disk use, and no cap here could: the clip dir is mounted
-  # read-write, so the box can append to this file directly with no claim at
-  # all, and /workspace is a host directory it can fill besides. Capping on
-  # every append instead would truncate below the byte offset exec_claude
-  # captured, losing this session's refusals from the report (concept/41).
-  # _cap_watcher_log also unlinks a symlink found at that path. The per-claim
-  # guard below is what covers a link planted DURING the session.
-  _cap_watcher_log "$clip_dir/.proxy-log" >/dev/null
+  # The log and the readiness marker live outside the mount (see
+  # _browser_proxy_log), so nothing the watcher or the proxy writes there needs
+  # a guard. With no usable dir the log goes to /dev/null and the callback proxy
+  # is refused (_bw_ready stays empty), never moved back into the mount.
+  local _bw_log _bw_ready=""
+  _bw_log="$(_browser_proxy_log "$clip_dir")"
+  if mkdir -p "${_bw_log%/*}" 2>/dev/null && [ -d "${_bw_log%/*}" ] && [ ! -L "${_bw_log%/*}" ]; then
+    # Cap once per session. This bounds what carries over between sessions and
+    # keeps the window the post-session report reads small. Capping on every
+    # append instead would truncate below the byte offset exec_claude captured,
+    # losing this session's refusals from the report (concept/41). Only here,
+    # on the real file: /dev/null must never reach _cap_watcher_log or
+    # _drop_unless_regular, whose arm for a non-file runs rm -rf.
+    _cap_watcher_log "$_bw_log" "${_bw_log%/*}" >/dev/null
+    _bw_ready="${_bw_log%/*}/.proxy-ready.$$"
+  else
+    echo "[browser-watcher $(date +%H:%M:%S)] no state dir outside the mount, bridge log and callback proxy off this session"
+    _bw_log=/dev/null
+  fi
+  # The log an older Cleat kept in the clip dir. Nothing writes it any more, so
+  # a copy left there would only mislead. rm unlinks a link, never its target.
+  rm -f "$clip_dir/.proxy-log" 2>/dev/null || true
   # Claims land outside the bind mount, same sibling the clipboard bridge uses.
+  # Never inside it: there the claim and the minute ledger below would be names
+  # the box can plant. With no claim dir the bridge is off for this session. A
+  # URL the box writes stays unread in its own clip dir, where the next
+  # session's startup sweep finds it.
   local _bw_claim_dir
-  _bw_claim_dir="$(dirname "$clip_dir")/clipclaim"
-  mkdir -p "$_bw_claim_dir" 2>/dev/null || _bw_claim_dir="$clip_dir"
+  if ! _bw_claim_dir="$(_host_claim_dir "$clip_dir")"; then
+    echo "[browser-watcher $(date +%H:%M:%S)] no claim dir outside the mount, browser bridge off this session"
+    return 0
+  fi
   # The per-box minute ledger for the rate cap, and this session's open count.
-  # No ledger when the claim dir fell back into the mount: see _browser_rate_take.
-  local _bw_ledger="" _bw_opens=0
-  [ "$_bw_claim_dir" != "$clip_dir" ] && _bw_ledger="$_bw_claim_dir/.opens"
-  # Readiness marker for the callback proxy. Outside the bind mount, beside the
-  # claim dir and for the same reason: inside it the box could touch the file
-  # and make the watcher believe a listener exists that does not.
-  local _bw_ready="$_bw_claim_dir/.proxy-ready.$$"
+  local _bw_ledger="$_bw_claim_dir/.opens" _bw_opens=0
   _browser_sweep_stale_markers "$clip_dir"
   while true; do
     # If the session's run dir was removed (cleat rm/clean/nuke), this watcher is
@@ -7978,11 +8883,6 @@ _browser_watcher() {
         # $BROWSER and never prints it), so a shortened one is unusable by hand.
         local _clean_url
         _clean_url="$(printf '%s' "$url" | LC_ALL=C tr -d '[:cntrl:]' 2>/dev/null || printf '%s' "$url" | LC_ALL=C tr -d '\000-\037\177')"
-        # Re-checked on every claimed URL, not just at startup: the clip dir is
-        # mounted rw, so the box can plant the link at any moment mid-session,
-        # and every append below follows one. This runs only when a URL was
-        # actually claimed, so it costs nothing on an idle poll.
-        _drop_unless_regular "$clip_dir/.proxy-log"
         # Both decisions are taken on $_clean_url, the exact bytes handed to
         # $open_cmd below, and never on $url. Stripping control characters can
         # REWRITE an authority: https://claude.ai<CR>.evil.example/ parses as
@@ -8011,7 +8911,6 @@ _browser_watcher() {
         # (concept/41). Still runs in `off` mode for an allowlisted origin, so
         # `cleat login` completes when the user opens the URL by hand.
         if [ -n "$cname" ] && [ "$_is_auth" = 1 ] && [ "$_dest_ok" = 1 ]; then
-          local proxy_log="$clip_dir/.proxy-log"
           # The port comes from _clean_url too: the opener and the forwarder
           # must agree about which URL they are serving.
           cb_port=$(_extract_callback_port "$_clean_url" 2>/dev/null) && {
@@ -8020,12 +8919,18 @@ _browser_watcher() {
               # A host service already holds it. Binding is impossible, and
               # opening the browser now would aim it at THAT service with the
               # host's cookies, for a port the box chose. Refuse both.
-              echo "[browser-watcher $(date +%H:%M:%S)] callback port=$cb_port already in use on the host, not opening" >> "$proxy_log"
+              echo "[browser-watcher $(date +%H:%M:%S)] callback port=$cb_port already in use on the host, not opening" >> "$_bw_log"
+              _bind_failed=1
+            elif [ -z "$_bw_ready" ]; then
+              # No readiness marker outside the mount. One inside it is a marker
+              # the box can fake (an open with no listener) or aim at a host
+              # file, so the proxy does not start and nothing opens.
+              echo "[browser-watcher $(date +%H:%M:%S)] no state dir outside the mount for the callback proxy, not opening" >> "$_bw_log"
               _bind_failed=1
             else
-              echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$proxy_log"
+              echo "[browser-watcher $(date +%H:%M:%S)] extracted callback port=$cb_port from URL" >> "$_bw_log"
               rm -f "$_bw_ready" 2>/dev/null || true
-              _auth_callback_proxy "$cb_port" "$cname" "$proxy_log" "$_bw_ready" &
+              _auth_callback_proxy "$cb_port" "$cname" "$_bw_log" "$_bw_ready" &
               _proxy_pid=$!
               # Wait for the LISTENER, never a fixed sleep. A backgrounded
               # socat's bind is not observable by the parent shell, so the
@@ -8040,12 +8945,12 @@ _browser_watcher() {
                 _bw_w=$(( _bw_w + 1 ))
               done
               if [ ! -f "$_bw_ready" ]; then
-                echo "[browser-watcher $(date +%H:%M:%S)] callback proxy never bound port=$cb_port, not opening" >> "$proxy_log"
+                echo "[browser-watcher $(date +%H:%M:%S)] callback proxy never bound port=$cb_port, not opening" >> "$_bw_log"
                 _bind_failed=1
               fi
             fi
           } || {
-            echo "[browser-watcher $(date +%H:%M:%S)] no redirect_uri port found in URL" >> "$clip_dir/.proxy-log"
+            echo "[browser-watcher $(date +%H:%M:%S)] no redirect_uri port found in URL" >> "$_bw_log"
           }
         fi
         # Open on the host unless the policy defers to the terminal. A plain link
@@ -8060,10 +8965,12 @@ _browser_watcher() {
         # file, so this log is the only place a deferred or off-mode URL still
         # exists. Claude 2.1.191+ hands the loopback authorize URL ONLY to
         # $BROWSER (never the terminal), so without the URL here an off-mode
-        # loopback login would be unrecoverable by hand. Same trust domain as
-        # the bridge file (the box's own run dir), so no new exposure.
+        # loopback login would be unrecoverable by hand. The log is host-only
+        # (see _browser_proxy_log), so the box can neither read it nor choose
+        # where these lines land. The copy in the clip dir that older releases
+        # kept let it do both.
         if [ "$_bind_failed" = 1 ]; then
-          echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_NOBIND_MARK} deferring URL to terminal (callback port unavailable) url=$_clean_url" >> "$clip_dir/.proxy-log"
+          echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_NOBIND_MARK} deferring URL to terminal (callback port unavailable) url=$_clean_url" >> "$_bw_log"
         elif _browser_should_open "$bridge_mode" "$host_opens_clicks" "$_is_auth" "$_dest_ok"; then
           # Every mode, always included: the bypass lifts the destination gate,
           # not the ceiling on how often the host is made to open something.
@@ -8071,28 +8978,27 @@ _browser_watcher() {
           # completed by opening the logged URL by hand, exactly as in off mode.
           if _browser_rate_take "$_bw_ledger" "$_bw_opens"; then
             _bw_opens=$(( _bw_opens + 1 ))
-            echo "[browser-watcher $(date +%H:%M:%S)] opening URL on host (mode=$bridge_mode auth=$_is_auth dest=$_dest_ok) url=$_clean_url" >> "$clip_dir/.proxy-log"
+            echo "[browser-watcher $(date +%H:%M:%S)] opening URL on host (mode=$bridge_mode auth=$_is_auth dest=$_dest_ok) url=$_clean_url" >> "$_bw_log"
             $open_cmd "$_clean_url" >/dev/null 2>&1 || true
           else
             # The marker is what the report at session end reads. The line
             # carries the whole URL, since it is the only copy left.
-            echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_CAPPED_MARK} limit=${_BROWSER_RATE_PER_MIN}/min,${_BROWSER_RATE_PER_SESSION}/session url=$_clean_url" >> "$clip_dir/.proxy-log"
+            echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_CAPPED_MARK} limit=${_BROWSER_RATE_PER_MIN}/min,${_BROWSER_RATE_PER_SESSION}/session url=$_clean_url" >> "$_bw_log"
           fi
         elif [ "$_dest_ok" != 1 ] && [ "$bridge_mode" != "off" ] && _is_auth_url_shape "$_clean_url"; then
           # A REFUSED destination, not a deferral, and it gets its own marker so
           # the foreground can find it after the exec returns. A denial that
-          # exists only in a log inside the box's own clip dir reproduces the
-          # silent-deferral regression that concept/33 blames for being
-          # undiagnosable from the field, and the box can rewrite that log.
+          # exists only in a log file reproduces the silent-deferral regression
+          # that concept/33 blames for being undiagnosable from the field.
           # _BROWSER_BLOCKED_MARK is what the host-side reader greps for.
           #
           # Only a URL that listing its origin would have opened: an OAuth
           # authorize request. A plain link or a device-flow page defers even at
           # a listed origin, so reporting one printed an allow line that could
           # never make it open. Those fall through to the deferral line below.
-          echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_BLOCKED_MARK} origin=${_dest_host:-unparsed} url=$_clean_url" >> "$clip_dir/.proxy-log"
+          echo "[browser-watcher $(date +%H:%M:%S)] ${_BROWSER_BLOCKED_MARK} origin=${_dest_host:-unparsed} url=$_clean_url" >> "$_bw_log"
         else
-          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (mode=$bridge_mode interactive=$host_opens_clicks auth=$_is_auth dest=$_dest_ok) url=$_clean_url" >> "$clip_dir/.proxy-log"
+          echo "[browser-watcher $(date +%H:%M:%S)] deferring URL to terminal (mode=$bridge_mode interactive=$host_opens_clicks auth=$_is_auth dest=$_dest_ok) url=$_clean_url" >> "$_bw_log"
         fi
       fi
     fi
@@ -8319,10 +9225,9 @@ _hook_bridge_watcher() {
   # We track our byte offset to avoid wc -l / tail race conditions.
   # Start from the current end of the file to skip events from prior sessions.
   local byte_offset
-  # Braced so a missing spool's redirect error is silenced too: a claim removes
-  # the spool, and it stays missing until the box's next event.
-  byte_offset=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)
-  byte_offset=$((byte_offset + 0))
+  # Sized with a stat, never opened (see the loop below). A missing spool, which
+  # is what a claim leaves until the box's next event, reads as 0 in silence.
+  byte_offset="$(_path_size "$hooks_file")"
   # Set while the rest of an oversized line is being discarded. Kept across
   # passes, because one line can span two read windows.
   local _hb_skip=0
@@ -8330,6 +9235,14 @@ _hook_bridge_watcher() {
     # Liveness BEFORE processing: an orphaned bridge must not run one last
     # batch of host hooks for a session whose cleat process is already gone.
     kill -0 "$_hb_parent" 2>/dev/null || { _hook_bridge_cleanup; exit 0; }
+    # Sized before the shape check below and without opening the spool. stat
+    # answers a FIFO or a device with 0 at once. `wc -c <` opened it, so a FIFO
+    # the box swapped in after the check blocked the open, and bash holds the
+    # session-end TERM while a command substitution waits: the bridge outlived
+    # its session. Ahead of the check so that the check always sees whatever
+    # this pass sized.
+    local file_size
+    file_size="$(_path_size "$hooks_file")"
     # Re-checked every pass, not just at startup: the box can plant the link at
     # any moment, including between two polls of a live bridge.
     if [ -L "$hooks_file" ] || { [ -e "$hooks_file" ] && [ ! -f "$hooks_file" ]; }; then
@@ -8337,9 +9250,6 @@ _hook_bridge_watcher() {
       _hook_bridge_cleanup
       exit 0
     fi
-    local file_size
-    file_size=$( { wc -c < "$hooks_file"; } 2>/dev/null || echo 0)
-    file_size=$((file_size + 0))
 
     local _win _start _count
     # A spool that shrank starts over, and so does any discard in progress.
@@ -8392,7 +9302,12 @@ _hook_bridge_watcher() {
         # every box whose host settings file is absent or empty: the bridge
         # then died on its first forwarded event, on a Mac only.
         _execute_host_hook_bg "$_HOOK_EV_OUT" "$_HOOK_EV_DIR" "$_hb_ws" "${settings_files[@]+"${settings_files[@]}"}"
-      done < <(tail -c +"$_start" "$hooks_file" 2>/dev/null | head -c "$_count")
+      # Bounded in time as well as bytes. A FIFO the box swaps in between the
+      # size read and this open blocks for the bound at most, and the next pass
+      # sees it and drops it. A read cut short loses nothing: _hook_read_chunk
+      # refuses a partial last line, and the offset moves only past what was
+      # handled.
+      done < <(_read_bounded "$hooks_file" "$_count" "$_start")
 
       # Past the bytes CONSUMED as whole lines, not past everything the window
       # covered. The box appends with `cat >>`, so a poll can land between the
@@ -8460,8 +9375,9 @@ _hook_spool_cap() {
   [ "$size" -ge "$_HOOK_SPOOL_MAX" ] || return 1
   claim_dir="${spool%/*}"
   claim_dir="${claim_dir%/*}/hookclaim"
-  # Never fall back into the hooks directory, as the clipboard claim may: a
-  # claim made inside the mount reinstates the race this exists to close.
+  # Never fall back into the hooks directory, the rule the clipboard and browser
+  # claims follow too: a claim made inside the mount reinstates the race this
+  # exists to close.
   mkdir -p "$claim_dir" 2>/dev/null || return 1
   [ -d "$claim_dir" ] && [ ! -L "$claim_dir" ] || return 1
   claimed="$claim_dir/.spool.$$.$RANDOM"
@@ -9205,7 +10121,10 @@ _hook_drop_log() {
       # The session-end report reads from a byte offset into this file. After a
       # rotation that offset points past the end of a new, shorter file, so it
       # is reset here or the report goes silent for the rest of the session.
+      # The inode goes with it: kept, the report would read the rotated file
+      # from byte 0 and count earlier sessions' rows.
       _hook_drop_off=0
+      _hook_drop_ino=""
     fi
   fi
   local _safe
@@ -10115,7 +11034,17 @@ exec_claude() {
   fi
   printf 'kind=claude exec=%s\n' "$_ec_id" > "$_ec_marker" 2>/dev/null || true
 
-  _cleanup_session() {
+  # The teardown is best-effort. It runs at the final exit and from the
+  # EXIT/INT/TERM/HUP trap. `|| true` suspends errexit for the whole body, so no
+  # step that fails can end the CLI before the terminal restore, the login
+  # harvest and the session-end reports that follow the final call. Several
+  # steps remove names inside the read-write clip dir. The box can plant a
+  # directory at any of them, which `rm -f` refuses with exit 1 on GNU and BSD.
+  # The wrapper sits inside the function rather than at the call site because
+  # errexit stays live inside a trap action: a step failing in the TERM or HUP
+  # handler (a closed terminal window) would still end the CLI there.
+  _cleanup_session() { _cleanup_session_steps || true; }
+  _cleanup_session_steps() {
     # Kill clipboard watcher
     if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
       kill "$_CLIP_WATCHER_PID" 2>/dev/null || true
@@ -10156,14 +11085,21 @@ exec_claude() {
       _HOOK_BRIDGE_PID=""
     fi
     _cleanup_spin
-    rm -f "${_CLIP_DIR:?}/.clipboard."*
+    # Quiet and fail-soft: every name past the prefix is the box's. It can be a
+    # directory, which rm -f refuses with exit 1, and BSD rm prints a name it
+    # cannot remove raw, escape bytes included. A flood of names past ARG_MAX
+    # fails the same way (exit 126), and bash reports that after applying the
+    # redirect, so it stays quiet too.
+    rm -f "${_CLIP_DIR:?}/.clipboard."* 2>/dev/null || true
     # Own claims only: another session's live claim must survive our exit (see
     # _do_copy's claim-name note). Both locations: claims moved out of the bind
     # mount into clipclaim/, and the legacy in-mount path for a watcher started
-    # by an older CLI that is still running against this box.
-    rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."*
-    rm -f "${_CLIP_DIR:?}/.claim.$$."*
-    rm -f "$_CLIP_DIR/.watcher.$$"
+    # by an older CLI that is still running against this box. Fail-soft: with
+    # no directory at clipclaim BSD rm -f still fails (ENOTDIR is not ENOENT),
+    # and under errexit that ended the teardown before the terminal came back.
+    rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."* 2>/dev/null || true
+    rm -f "${_CLIP_DIR:?}/.claim.$$."* 2>/dev/null || true
+    rm -f "$(_clip_watch_dir "${_CLIP_DIR:?}")/.watcher.$$" 2>/dev/null || true
     # After our own marker is gone, so a solo session sweeps unconditionally.
     _browser_teardown_bridge "${_CLIP_DIR:?}"
     # Only a LIVE sibling may hold .host-ready on. Testing mere existence let a
@@ -10172,10 +11108,10 @@ exec_claude() {
     # session with no watcher running wrote its payload to a bridge nobody was
     # reading, the copy was swept as a stale leftover, and the OSC 52 fallback
     # that would have worked was never tried. Found with two markers from two
-    # days earlier still on disk.
-    _sweep_dead_watcher_markers "$_CLIP_DIR"
-    if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
-      rm -f "$_CLIP_DIR/.host-ready"
+    # days earlier still on disk. The unlink never follows a link, so whatever
+    # the box left at the name, only the name goes.
+    if ! _clip_watchers_live "$_CLIP_DIR"; then
+      rm -f "$_CLIP_DIR/.host-ready" 2>/dev/null || true
     fi
     # Re-stamp the run dir on detach so the idle sweep's grace measures time since
     # THIS session let go, not since the container was created (see the attach
@@ -10183,17 +11119,21 @@ exec_claude() {
     touch "$CLEAT_RUN_DIR/${cname}" 2>/dev/null || true
   }
 
-  # The per-box watcher log (target of the redirects below). Cap it on session
-  # start and record the post-cap size, which is this session's read offset for
-  # the end-of-session fork diagnostic.
-  local _watcher_log="$_CLIP_DIR/.watcher-log" _watcher_log_off
-  _watcher_log_off="$(_cap_watcher_log "$_watcher_log")"
+  # The per-box watcher log (target of the redirects below), host-only beside
+  # the clip dir (see _watcher_log_path). Cap it on session start and record the
+  # post-cap size, which is this session's read offset for the end-of-session
+  # fork diagnostic.
+  local _watcher_log _watcher_log_off
+  _watcher_log="$(_watcher_log_path "$cname")"
+  mkdir -p "${_watcher_log%/*}"
+  _watcher_log_off="$(_cap_watcher_log "$_watcher_log" "${_watcher_log%/*}")"
   # The same offset trick for the bridge's own log, so the post-session report
   # names only the URLs THIS session refused. Without the offset a refusal from
   # a previous session re-fires on every run, which is the nagging concept/21
   # forbids.
-  local _proxy_log_off
-  _proxy_log_off="$(_cap_watcher_log "$_CLIP_DIR/.proxy-log")"
+  local _proxy_log_file _proxy_log_off
+  _proxy_log_file="$(_browser_proxy_log "$_CLIP_DIR")"
+  _proxy_log_off="$(_cap_watcher_log "$_proxy_log_file" "${_proxy_log_file%/*}")"
   # Whether ~/.claude/.config.json is there before the box runs, so the end of
   # the session can say it APPEARED. See _maybe_note_host_global_config.
   local _cfgjson_before=0
@@ -10201,17 +11141,27 @@ exec_claude() {
   # The hook bridge's drop log is per INSTALL, not per box: it has to survive
   # the teardown of the box that wrote it, and the box must not be able to
   # induce its deletion. Offset captured the same way.
-  local _hook_drop_log_path="$CLEAT_STATE_DIR/hook-drops.log" _hook_drop_off=0
+  # The inode lets the report follow the offset into the rotated file when a
+  # bridge rotates the log during the session (_maybe_report_hook_drops).
+  local _hook_drop_log_path="$CLEAT_STATE_DIR/hook-drops.log" _hook_drop_off=0 _hook_drop_ino=""
   if [ -f "$_hook_drop_log_path" ]; then
     _hook_drop_off="$(wc -c < "$_hook_drop_log_path" 2>/dev/null | tr -d '[:space:]')"
     case "$_hook_drop_off" in ''|*[!0-9]*) _hook_drop_off=0 ;; esac
+    _hook_drop_ino="$(_path_ino "$_hook_drop_log_path")"
   fi
   _hook_spool_entry_cap "$cname"
 
   local clip_cmd
   clip_cmd="$(_host_clip_cmd)"
   if [ -n "$clip_cmd" ]; then
-    touch "$_CLIP_DIR/.watcher.$$"
+    # This session's liveness marker, outside the mount (see _clip_watch_dir).
+    # noclobber as well, so a run dir the box can reach after all (concept/41,
+    # residual 8) gets a planted link refused rather than written through.
+    # Fail-soft: the released touch could end the session start under errexit.
+    local _ec_watch
+    _ec_watch="$(_clip_watch_dir "$_CLIP_DIR")"
+    mkdir -p "$_ec_watch" 2>/dev/null || true
+    ( set -C; umask 077; : > "$_ec_watch/.watcher.$$" ) 2>/dev/null || true
     # Redirect the watcher's own stdout+stderr to a per-box log, NOT the
     # terminal. Under heavy multi-agent load the host can hit its process cap,
     # and a backgrounded watcher that inherits the interactive terminal's fd 2
@@ -10219,20 +11169,22 @@ exec_claude() {
     # the Claude Code TUI, corrupting it. The watcher never has anything the
     # user should see (it drives pbcopy and marker files, never the terminal),
     # so a log keeps fork spew and any stray output off-screen but debuggable.
-    # `.watcher-log` (hyphen) stays clear of the `.watcher.*` liveness glob.
-    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+    # The log lives outside the clip dir, so the box cannot aim these appends
+    # at a host file. The box name lets the watcher announce readiness from
+    # inside the box (see _clip_announce_ready).
+    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" "$cname" >>"$_watcher_log" 2>&1 &
     _CLIP_WATCHER_PID=$!
     disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
 
     # Native ctrl+v image paste: drop the shim ahead of xclip on PATH, then run
     # a watcher that answers its image requests from the host clipboard. Always
     # on, gated only by CLEAT_NO_CLIPBOARD_IMAGE=1. Reuses the .watcher.$$ marker
-    # already touched above, so .host-ready stays correct. If the drop fails
+    # already written above, so .host-ready stays correct. If the drop fails
     # (a locked-down box, an old daemon), the shim is simply absent and paste
     # falls back to today's "No image found", never an error.
     if [ "${CLEAT_NO_CLIPBOARD_IMAGE:-}" != "1" ]; then
       if _clipimg_drop_shim "$cname"; then
-        _clipimg_watcher "$_CLIP_DIR" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+        _clipimg_watcher "$_CLIP_DIR" "$cname" >>"$_watcher_log" 2>&1 &
         _CLIPIMG_WATCHER_PID=$!
         disown "$_CLIPIMG_WATCHER_PID" 2>/dev/null || true
       fi
@@ -10251,10 +11203,10 @@ exec_claude() {
     local _bw_interactive=0
     _is_tty && _bw_interactive=1
     # Same terminal-safety redirect as the clipboard watcher: this loop opens
-    # URLs (`$open_cmd ... >/dev/null 2>&1`) and logs to .proxy-log, so it never
+    # URLs (`$open_cmd ... >/dev/null 2>&1`) and logs to the bridge log, so it never
     # needs the terminal, and a fork failure under load must not spew into the
     # TUI. Its callback-proxy child inherits these fds, so it is covered too.
-    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" "$(_browser_bridge_mode)" "$_bw_interactive" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+    _browser_watcher "$_CLIP_DIR" "$open_cmd" "$cname" "$(_browser_bridge_mode)" "$_bw_interactive" >>"$_watcher_log" 2>&1 &
     _BROWSER_WATCHER_PID=$!
     disown "$_BROWSER_WATCHER_PID" 2>/dev/null || true
   fi
@@ -10325,7 +11277,7 @@ exec_claude() {
       mkdir -p "$CLEAT_RUN_DIR/${cname}/hookbridge" 2>/dev/null || true
       ( umask 077; : > "$CLEAT_RUN_DIR/${cname}/hookbridge/.bridge.$$" ) 2>/dev/null || true
       _HOOK_BRIDGE_MARK="$CLEAT_RUN_DIR/${cname}/hookbridge/.bridge.$$"
-      _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_CLIP_DIR/.watcher-log" 2>&1 &
+      _hook_bridge_watcher "$hooks_file" "$_hb_ws" "$cname" >>"$_watcher_log" 2>&1 &
       _HOOK_BRIDGE_PID=$!
       disown "$_HOOK_BRIDGE_PID" 2>/dev/null || true
     fi
@@ -10572,9 +11524,9 @@ exec_claude() {
   _maybe_explain_fork_exhaustion "$_watcher_log" "$_watcher_log_off"
   _maybe_report_capped_images "$_watcher_log" "$_watcher_log_off"
   # And the destination gate's refusals. Same placement and the same reason.
-  _maybe_report_blocked_opens "$_CLIP_DIR/.proxy-log" "$_proxy_log_off"
+  _maybe_report_blocked_opens "$_proxy_log_file" "$_proxy_log_off"
   # And the hook events the bridge refused. Same rule: only when non-zero.
-  _maybe_report_hook_drops "$_hook_drop_log_path" "$_hook_drop_off" "$cname"
+  _maybe_report_hook_drops "$_hook_drop_log_path" "$_hook_drop_off" "$cname" "$_hook_drop_ino"
   # And a host global config file that was not there when the session began.
   _maybe_report_host_global_config_appeared "$_cfgjson_before"
   rm -f "$_exec_err"
@@ -10617,23 +11569,6 @@ _maybe_explain_oom() {
   echo -e "    ${DIM}•${RESET} Cap CPU so runners self-limit: add ${BOLD}cpus = 2${RESET} under ${BOLD}[resources]${RESET}"
 }
 
-# During a heavy multi-agent run the HOST (not the box) can exhaust its per-user
-# process table, and any host-side fork then fails with EAGAIN. Cleat's background
-# watchers hit this and bash writes "fork: Resource temporarily unavailable" to
-# the per-box watcher log (redirected off the terminal at the watcher spawns, so
-# it no longer corrupts the Claude TUI). This surfaces ONE plain diagnostic when
-# that happened THIS session, so the raw bash spam in the log gets a human
-# explanation and a fix. It reads only the bytes written after `off` (this
-# session's watcher output), so a stale error from a past session never
-# re-triggers it. The failing fork is host-side (the box has its own pid pool and
-# a working session), so this is guidance for the user's machine, not a box fix.
-# Fail-soft: a missing log or `tail`/`grep` hiccup just prints nothing.
-# Cap the per-box watcher log at ~1 MB and echo its post-cap byte size. Nothing
-# else sweeps this log (it dodges the .watcher.* liveness glob by design), so
-# without the cap a host fork storm, which appends many bash retry lines, could
-# grow it unbounded across a long-lived box. The echoed size is the session's
-# read offset so the end-of-session diagnostic scans only this session's slice.
-# Fail-soft: a missing or unreadable log yields 0 (and no truncation).
 # Remove whatever sits at a box-writable host path unless it is a regular
 # file. The clip dir is mounted read-write, so the box can plant any shape
 # there, and each one defeats a different idiom: a symlink is FOLLOWED by `>>`
@@ -10652,32 +11587,74 @@ _drop_unless_regular() {
   return 0
 }
 
+# Where the per-box watcher log lives: logs/watcher.log in the box's run dir.
+# Every host-side watcher's stdout and stderr go there (see exec_claude). It
+# used to be clip/.watcher-log, inside the clip dir the box has read-write, so
+# the box chose what each `>>` at a watcher spawn opened: a link planted there
+# after the cap sent watcher output into any host file the user can write, and
+# one swapped in under the cap had the cap empty that file. Beside clip/ and
+# never mounted, it needs no guard (concept/41). A subdir rather than the run
+# dir itself, so rotating the log never re-stamps the run dir's mtime, which the
+# idle sweep reads, and _account_hold_run_extras, which reads every regular
+# file at the run dir's top level, never meets it. $1 is the container name.
+_watcher_log_path() {
+  printf '%s/%s/logs/watcher.log' "$CLEAT_RUN_DIR" "$1"
+}
+
+# Cap a watcher or bridge log at ~1 MB and echo its post-cap byte size. Nothing
+# else sweeps these logs, so without the cap a host fork storm, which appends
+# many bash retry lines, could grow one unbounded across a long-lived box. The
+# echoed size is the session's read offset, so the end-of-session reports scan
+# only this session's slice. Fail-soft: a missing or unreadable log yields 0.
+#
+# Both callers' logs are host-only now, and the cap is still safe on a path the
+# box can write. The size is a stat, which opens nothing, so a FIFO there cannot
+# hang the caller. An oversized log is ROTATED BY RENAME into $2, a host-only
+# dir, under a name nobody can predict, then deleted there. It is never emptied
+# in place: `: > "$log"` after a check writes through whatever link was swapped
+# in between. rename(2) moves a link, a FIFO or a directory without following
+# or opening it, on BSD and GNU alike, and the next `>>` makes a fresh log.
+# With no usable $2 the log stays uncapped this session rather than being
+# emptied in place, the rule _hook_spool_cap follows.
 _cap_watcher_log() {
-  local log="$1" sz=0
-  # Anything that is not a regular file is never ours (see
-  # _drop_unless_regular): `[ -f ]` DEREFERENCES a link, so a planted one would
-  # have the truncation below empty whatever host file it names, and a FIFO
-  # would block the caller's later `>>` forever.
+  local log="$1" claim_dir="${2:-}" sz claimed
+  # A cheap pre-filter only (see _drop_unless_regular): whoever can write the
+  # dir can plant a new shape after it returns.
   _drop_unless_regular "$log"
-  [ -f "$log" ] || { echo 0; return 0; }
-  # `tr -d [:space:]` strips BSD wc's leading padding (macOS prints "      6",
-  # not "6"): without it the ^[0-9]+$ guard below rejects the padded string and
-  # forces sz=0, which on macOS would defeat BOTH the cap (never truncates) and
-  # the offset (always 0 -> a stale prior-session fork error re-fires the
-  # advisory every run). Same normalization the hook bridge already does.
-  sz="$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]' || echo 0)"
-  [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
-  if (( sz > 1048576 )); then
-    : > "$log" 2>/dev/null || true
-    sz=0
+  # Sized without opening it. It follows a link, as `wc -c <` did, so a link
+  # swapped in after the pre-filter is renamed away below, never written.
+  sz="$(_path_size "$log")"
+  if (( sz > 1048576 )) && [ -n "$claim_dir" ] && mkdir -p "$claim_dir" 2>/dev/null \
+    && [ -d "$claim_dir" ] && [ ! -L "$claim_dir" ]; then
+    claimed="$claim_dir/.caplog.$$.$RANDOM"
+    if mv -f "$log" "$claimed" 2>/dev/null; then
+      rm -rf "$claimed" 2>/dev/null || true
+      sz=0
+    fi
   fi
   echo "$sz"
 }
 
+# During a heavy multi-agent run the HOST (not the box) can exhaust its per-user
+# process table, and any host-side fork then fails with EAGAIN. Cleat's background
+# watchers hit this and bash writes "fork: Resource temporarily unavailable" to
+# the per-box watcher log (redirected off the terminal at the watcher spawns, so
+# it no longer corrupts the Claude TUI). This surfaces ONE plain diagnostic when
+# that happened THIS session, so the raw bash spam in the log gets a human
+# explanation and a fix. It reads only the bytes written after `off` (this
+# session's watcher output), so a stale error from a past session never
+# re-triggers it. The failing fork is host-side (the box has its own pid pool and
+# a working session), so this is guidance for the user's machine, not a box fix.
+# Fail-soft: a missing log or `tail`/`grep` hiccup just prints nothing.
 _maybe_explain_fork_exhaustion() {
   local log="$1" off="${2:-0}"
-  [ -f "$log" ] || return 0
-  tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep -q "Resource temporarily unavailable" || return 0
+  # The watcher log and the bridge log the three browser reports below read are
+  # both host-only now (logs/ and bridge/). The guards stay as a second layer
+  # and cost nothing: a link is never Cleat's (see _drop_unless_regular), so it
+  # is not followed, and a FIFO or a device swapped in after this check costs
+  # the read bound, not a hang at session end.
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  _read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep -q "Resource temporarily unavailable" || return 0
   echo ""
   warn "${BOLD}Your machine ran low on process slots${RESET} during this session ${DIM}(a host limit, not the box)${RESET}."
   echo -e "    ${DIM}A large multi-agent run can spawn thousands of host processes and hit your per-user cap.${RESET}"
@@ -10730,11 +11707,12 @@ _maybe_report_account_harvest_refused() {
 # from an offset captured in the foreground before the session started. Exactly
 # the shape _maybe_explain_fork_exhaustion uses, and for the same reason.
 #
-# A denial that exists only in a log inside the box's own clip dir is
-# undiagnosable from the field. That is the 2026-07-07 silent-deferral
-# regression concept/33 records, and the box can rewrite that log besides. So
-# every field printed here is sanitized: the URL is box-authored by
-# construction, which is the whole point of printing it.
+# A denial that exists only in a log file is undiagnosable from the field.
+# That is the 2026-07-07 silent-deferral regression concept/33 records. The log
+# is host-only now, but box-chosen bytes still reach it (the URL itself, and the
+# stderr of the forward into the box), so every field printed here is
+# sanitized: the URL is box-authored by construction, which is the whole point
+# of printing it.
 #
 # The line carries three things, because each answers a different question: the
 # full URL so it can be opened by hand, the bare origin so it is
@@ -10753,8 +11731,8 @@ _maybe_report_account_harvest_refused() {
 # because the URL is the only way to finish that login by hand.
 _maybe_report_nobind_opens() {
   local log="$1" off="${2:-0}" lines n=0 l url shown=0
-  [ -f "$log" ] || return 0
-  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_NOBIND_MARK} " 2>/dev/null)" || return 0
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  lines="$(_read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_NOBIND_MARK} " 2>/dev/null)" || return 0
   [ -n "$lines" ] || return 0
   n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
   n="$(printf '%s' "$n" | tr -d '[:space:]')"
@@ -10771,6 +11749,7 @@ _maybe_report_nobind_opens() {
     [ -n "$l" ] || continue
     url="${l#*url=}"
     [ -n "$url" ] || continue
+    url="$(_sanitize_repo_str "$url")"
     echo -e "    ${DIM}${url}${RESET}"
     shown=$(( shown + 1 ))
     [ "$shown" -ge 3 ] && break
@@ -10804,12 +11783,12 @@ _maybe_report_capped_images() {
 
 _maybe_report_blocked_opens() {
   local log="$1" off="${2:-0}" lines n=0 l rest origin url shown=0
-  [ -f "$log" ] || return 0
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
   # A capped open is another refusal the bridge makes, and it is reported from
   # here so every caller of this report gets all three.
   _maybe_report_capped_opens "$log" "$off"
   _maybe_report_nobind_opens "$log" "$off"
-  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_BLOCKED_MARK} origin=[^ ]* url=" 2>/dev/null)" || return 0
+  lines="$(_read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_BLOCKED_MARK} origin=[^ ]* url=" 2>/dev/null)" || return 0
   [ -n "$lines" ] || return 0
   n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
   n="$(printf '%s' "$n" | tr -d '[:space:]')"
@@ -10843,7 +11822,7 @@ _maybe_report_blocked_opens() {
 $lines
 EOF
   if [ "$n" -gt 3 ]; then
-    echo -e "    ${DIM}...and $(( n - 3 )) more. Every one is in ${_CLIP_DIR:-the box run dir}/.proxy-log${RESET}"
+    echo -e "    ${DIM}...and $(( n - 3 )) more. Every one is in ${log}${RESET}"
   fi
   echo -e "    ${DIM}Missing a login worth shipping? ${BOLD}https://github.com/cleatdev/cleat/issues/new${RESET}"
   return 0
@@ -10856,12 +11835,12 @@ EOF
 # never prints a loopback authorize URL, so this line is the only place it shows.
 #
 # The limits in the heading come from the constants, never from the logged
-# field, because the box can write the log. The URL is taken after the FIRST
+# field, because box-chosen bytes reach the log. The URL is taken after the FIRST
 # "/session url=", which the anchor pins inside the watcher's own prefix.
 _maybe_report_capped_opens() {
   local log="$1" off="${2:-0}" lines n=0 l url shown=0
-  [ -f "$log" ] || return 0
-  lines="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_CAPPED_MARK} limit=[0-9]*/min,[0-9]*/session url=" 2>/dev/null)" || return 0
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  lines="$(_read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" | grep "^[[]browser-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_BROWSER_CAPPED_MARK} limit=[0-9]*/min,[0-9]*/session url=" 2>/dev/null)" || return 0
   [ -n "$lines" ] || return 0
   n="$(printf '%s\n' "$lines" | grep -c . 2>/dev/null || echo 0)"
   n="$(printf '%s' "$n" | tr -d '[:space:]')"
@@ -10884,7 +11863,7 @@ _maybe_report_capped_opens() {
 $lines
 EOF
   if [ "$n" -gt 3 ]; then
-    echo -e "    ${DIM}...and $(( n - 3 )) more. Every one is in ${_CLIP_DIR:-the box run dir}/.proxy-log${RESET}"
+    echo -e "    ${DIM}...and $(( n - 3 )) more. Every one is in ${log}${RESET}"
   fi
   echo -e "    ${DIM}Open one by hand if you still need it. A login retried a minute later opens as usual.${RESET}"
   return 0
@@ -10904,18 +11883,31 @@ EOF
 # counted row is a path refusal. An oversized line or a malformed one did not
 # name a path at all, so those get the neutral wording.
 _maybe_report_hook_drops() {
-  local log="$1" off="${2:-0}" cname="${3:-}" counts n np nb sz
+  local log="$1" off="${2:-0}" cname="${3:-}" ino="${4:-}" prev="" counts n np nb sz
   [ -f "$log" ] || return 0
   # The log rotates past 1 MiB, from this process or from a bridge running in
   # the background, and an offset captured before a rotation points past the
   # end of the new file. Read the whole new file then, or the report is silent.
   sz="$(_path_size "$log")"
   case "$off" in ''|*[!0-9]*) off=0 ;; esac
+  # $4 is the inode the log had when the offset was taken. When the rotated
+  # file still carries it, the offset belongs to that file, so the rows written
+  # there after it are read first and then the whole new file. That keeps the
+  # count exact after one rotation from any box's bridge, and never silent for
+  # this box's own flood after more.
+  if [ -n "$ino" ] && [ "$(_path_ino "$log.1")" = "$ino" ]; then
+    prev="$log.1"
+    sz="$(_path_size "$prev")"
+  fi
   [ "$off" -le "$sz" ] || off=0
   # A `spool` row is not a refused event: it is the spool cap discarding queued
   # bytes, and its offset field carries how many. Summed on a line of its own,
   # so a discard never reads as "failed validation".
-  counts="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null \
+  counts="$( { if [ -n "$prev" ]; then
+                 tail -c "+$(( off + 1 ))" "$prev"; cat "$log"
+               else
+                 tail -c "+$(( off + 1 ))" "$log"
+               fi; } 2>/dev/null \
     | awk -F '\t' -v m="$_HOOK_DROP_MARK" -v c="$cname" '
         $2 == m && $4 == c && $3 == "spool" { if ($6 ~ /^[0-9]+$/) b += $6; next }
         $2 == m && $4 == c { n++; if ($3 == "path") p++ }
@@ -11924,6 +12916,52 @@ _inject_unsafe_rm_hook() {
   fi
 }
 
+# Create a missing file bind target, and never write through what is already
+# there. `touch` follows a link: it re-stamps the file a link names, or creates
+# the file a dangling one names. noclobber is O_EXCL, which refuses both.
+_ensure_file_target() {
+  [[ -e "$1" || -L "$1" ]] || ( set -C; : > "$1" ) 2>/dev/null || true
+}
+
+# Print the path of this project's input history store (see CLEAT_HISTORY_DIR),
+# creating it, or return 1. Called only from cmd_run, after this key's container
+# is gone. A history.jsonl left in the session dir by an older release is carried
+# over once, and that directory is the box's: any name in it may be a link, a
+# FIFO or a directory. So the old entry is renamed whole into the host-only dir,
+# which moves a link rather than following it and never opens a FIFO, and only
+# there, out of the box's reach, is it checked. Anything but a regular file is
+# dropped. The store is created with noclobber, never with touch. The directory
+# is 0700 because the file used to live under ~/.claude, and a default-umask
+# ~/.config would leave prompt history readable by other local users.
+_project_history_store() {
+  local key="$1"
+  # One path segment. Not _account_session_key_ok, which would refuse the
+  # non-ASCII legacy-locale keys _derive_project_session_key can still return.
+  case "$key" in ''|.|..|*/*) return 1 ;; esac
+  local dir="$CLEAT_HISTORY_DIR/$key"
+  local f="$dir/history.jsonl"
+  local old="${HOME}/.claude/projects/$key/history.jsonl"
+  local staged
+  mkdir -p "$CLEAT_CONFIG_DIR" 2>/dev/null || return 1
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null || return 1
+  chmod 700 "$CLEAT_HISTORY_DIR" "$dir" 2>/dev/null || true
+  _drop_unless_regular "$f"
+  if [[ ! -e "$f" ]] && [[ -e "$old" || -L "$old" ]]; then
+    staged="$dir/.import.$$.$RANDOM"
+    rm -rf "$staged" 2>/dev/null || true
+    if mv -f "$old" "$staged" 2>/dev/null; then
+      _drop_unless_regular "$staged"
+      if [[ -f "$staged" ]]; then
+        mv -f "$staged" "$f" 2>/dev/null || true
+      fi
+      rm -f "$staged" 2>/dev/null || true
+    fi
+  fi
+  ( set -C; : > "$f" ) 2>/dev/null || true
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  printf '%s' "$f"
+}
+
 cmd_run() {
   local project box
   project="$(resolve_project "${1:-}")"
@@ -12029,14 +13067,18 @@ cmd_run() {
     _fork_copy_tree "$project" "$_fork_path" || _copy_rc=$?
     spin_stop "$_copy_rc" "Workspace copied" "Workspace copy failed"
     if [[ $_copy_rc -ne 0 ]]; then
-      rm -rf "$_fork_path"
+      rm -rf "$_fork_path" 2>/dev/null || true
       error "Could not copy the workspace. The fork was not created."
       # NOT "exclude it with a [fork] exclude line": excludes are pruned AFTER
       # the copy, so they cannot prevent a copy that fails. Pointing at them
       # sent the user to a setting that could never fix what they were seeing.
-      echo -e "    ${DIM}Usually an unreadable file in the project, or no space left. Check permissions and free space, then retry.${RESET}"
+      # And not at all after a pause refusal (75), which already said why.
+      if [[ $_copy_rc -ne 75 ]]; then
+        echo -e "    ${DIM}Usually an unreadable file in the project, or no space left. Check permissions and free space, then retry.${RESET}"
+      fi
       exit 1
     fi
+    _fork_note_paused
     _fork_prune_excludes "$_fork_path" "$project" "$box"
     _fork_mark "$cname"
   fi
@@ -12115,17 +13157,23 @@ cmd_run() {
   # so all containers write to ~/.claude/projects/-workspace/. We overlay
   # that path with a per-project directory so each container sees only its
   # own sessions. Input history (arrow-up) lives in ~/.claude/history.jsonl.
-  # We overlay that too so each project has its own history.
+  # We overlay that too so each project has its own history, from a host-only
+  # store keyed like the session dir (see CLEAT_HISTORY_DIR). Nothing here
+  # writes inside the session dir except creating the dir itself, the box's
+  # mount root: every other name in it is the box's to replace.
   # The base ~/.claude mount provides auth and global config.
   local project_session_key
   project_session_key="$(_derive_project_session_key "$project" "$box")"
   local project_session_dir="${HOME}/.claude/projects/${project_session_key}"
   mkdir -p "$project_session_dir"
-  # Ensure per-project history file exists (Docker needs the source for bind mounts)
-  touch "$project_session_dir/history.jsonl"
+  local project_history
+  if ! project_history="$(_project_history_store "$project_session_key")"; then
+    error "Could not create this project's input history file under ${BOLD}${CLEAT_HISTORY_DIR}${RESET}."
+    exit 1
+  fi
   # Also ensure host history.jsonl exists (macOS virtiofs rejects nested mounts
   # when the target file is missing inside the parent bind mount's source)
-  touch "${HOME}/.claude/history.jsonl"
+  _ensure_file_target "${HOME}/.claude/history.jsonl"
   # Also ensure the overlay target exists in the base mount (Docker needs it)
   mkdir -p "${HOME}/.claude/projects/-workspace"
   # Also ensure the settings-mask target exists in the base mount. Same
@@ -12178,7 +13226,7 @@ cmd_run() {
     -v "$settings_overlay_dir/settings.json:/home/coder/.claude/settings.json"
     -v "$home_overlay/projects:/home/coder/.claude/projects:ro"
     -v "${project_session_dir}:/home/coder/.claude/projects/-workspace"
-    -v "${project_session_dir}/history.jsonl:/home/coder/.claude/history.jsonl"
+    -v "${project_history}:/home/coder/.claude/history.jsonl"
     -v "$CLEAT_RUN_DIR/${cname}/kit/CLAUDE.md:/home/coder/.claude/CLAUDE.md:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/agents:/home/coder/.claude/agents:ro"
     -v "$CLEAT_RUN_DIR/${cname}/kit/commands:/home/coder/.claude/commands:ro"
@@ -12220,12 +13268,30 @@ cmd_run() {
   # target lives inside the copy, and a copy without .claude would fail the
   # mount on macOS VirtioFS with an opaque "create mountpoint" error.
   if [[ -d "$_workspace/.claude" ]]; then
-    local pf
+    local pf _pf_snap _pf_rc
     for pf in "$_workspace/.claude/settings.json" "$_workspace/.claude/settings.local.json"; do
       [[ -f "$pf" ]] || continue
       local _base _overlay_name
       _base="$(basename "$pf")"
       _overlay_name="project-$_base"
+      # Every arm below reads a host-only snapshot, never the workspace path.
+      # The workspace is the box's to write, and `[[ -f ]]`, cp, jq and grep all
+      # follow a link, so a link at either file or at .claude had the host copy
+      # any file the user can read into an overlay mounted into the box. A
+      # refused file gets no overlay and no mount, as a missing one does.
+      _pf_snap="$settings_overlay_dir/.in.$$.$_base"
+      _pf_rc=0
+      _project_settings_snapshot "$_workspace" "$_base" "$_pf_snap" || _pf_rc=$?
+      if [[ $_pf_rc -ne 0 ]]; then
+        if [[ $_pf_rc -eq 2 ]]; then
+          warn "Project ${BOLD}.claude/${_base}${RESET} is larger than 1 MB, so Cleat did not read it."
+        else
+          warn "Project ${BOLD}.claude/${_base}${RESET} is a link or unreadable, so Cleat did not read it."
+        fi
+        echo -e "    ${DIM}Cleat reads project settings only from a regular file of at most 1 MB inside the project. The box sees this one as it is, with no hooks stripped or forwarded.${RESET}"
+        continue
+      fi
+      pf="$_pf_snap"
       # No jq on the host means we can neither rewrite the hook commands into the
       # forwarder nor strip them, and BOTH arms below used to fall through to a
       # verbatim `cp`. That mounted the user's real host hook commands into the
@@ -12274,6 +13340,7 @@ cmd_run() {
           cp "$pf" "$settings_overlay_dir/$_overlay_name"
         fi
       fi
+      rm -f "$_pf_snap" 2>/dev/null || true
       mount_args+=(-v "$settings_overlay_dir/$_overlay_name:/workspace/.claude/$_base")
     done
   fi
@@ -12500,11 +13567,60 @@ cmd_run() {
 _ensure_host_mount_targets() {
   local cname="$1"
   mkdir -p "${HOME}/.claude/projects/-workspace"
-  touch "${HOME}/.claude/history.jsonl"
+  _ensure_file_target "${HOME}/.claude/history.jsonl"
   [[ -f "${HOME}/.claude/settings.json" ]] || echo '{}' > "${HOME}/.claude/settings.json"
   if _container_has_kit_mounts "$cname"; then
     _ensure_kit_mask_targets || exit 1
   fi
+}
+
+# No project settings file needs a megabyte. The cap bounds what one read can
+# copy into the run dir: the box can grow the file, or make it sparse, at will.
+_PROJECT_SETTINGS_MAX_BYTES=1048576
+
+# ONE read of the project settings file BASE in WS/.claude, into DST, a path in
+# the host-only settings dir. rc 0 with DST written. 1 when the file is missing,
+# not a regular file, a link or inside a linked .claude. 2 when it is over the
+# cap. DST is gone on any failure.
+#
+# The workspace is mounted read-write, so every name under it is the box's. A
+# link planted at either settings file, or at .claude itself, had the host copy
+# any file the user can read into an overlay mounted into the box. No cap was
+# needed: a cloned repo that ships the link is enough.
+#
+# So .claude is pinned first. Its inode is read without following a link, then
+# the subshell changes into it and compares that with the directory it landed
+# in. A link has an inode of its own, so a link there, or one swapped in between
+# the two steps, fails the compare. From then on the file is named relative to
+# the pinned directory, where a later swap of .claude reaches nothing. The file
+# goes through _read_unlinked_bounded: one open, the descriptor proven to be the
+# regular file at that name, and a FIFO swapped in after the -f test bounded in
+# time. A file swapped during that read reads as empty, never as another file.
+#
+# The redirect to DST is made before the subshell changes directory, so a
+# relative run dir can never land the snapshot inside the pinned .claude.
+_project_settings_snapshot() {
+  local ws="$1" base="$2" dst="$3" _rc=0
+  rm -f "$dst" 2>/dev/null || true
+  ( _d="$(ls -di "$ws/.claude" 2>/dev/null | awk '{print $1}')"
+    CDPATH='' cd -P "$ws/.claude" >/dev/null 2>&1 || exit 1
+    _c="$(ls -di . 2>/dev/null | awk '{print $1}')"
+    case "$_d" in ''|*[!0-9]*) exit 1 ;; esac
+    [[ "$_c" == "$_d" ]] || exit 1
+    [[ -f "./$base" && ! -L "./$base" ]] || exit 1
+    _read_unlinked_bounded "./$base" "$(( _PROJECT_SETTINGS_MAX_BYTES + 1 ))"
+  ) 2>/dev/null >"$dst" || _rc=$?
+  # Not `if ! ( ... ) >"$dst"`: when that redirect fails, bash skips the `!`
+  # and the refusal branch with it.
+  if [[ $_rc -ne 0 ]]; then
+    rm -f "$dst" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "$(_path_size "$dst")" -gt "$_PROJECT_SETTINGS_MAX_BYTES" ]]; then
+    rm -f "$dst" 2>/dev/null || true
+    return 2
+  fi
+  return 0
 }
 
 # Refresh the settings overlays from the host files (the user may have changed
@@ -12552,13 +13668,22 @@ _refresh_settings_overlays() {
         _inject_unsafe_rm_hook "$settings_overlay_dir/settings.json"
       fi
     fi
-    # Project-level settings overlays (only when .claude/ exists)
-    if cap_is_active hooks && [[ -d "$project/.claude" ]]; then
-      local pf
-      for pf in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+    # Project-level settings overlays (only when .claude/ exists). From the tree
+    # cmd_run built them from: a fork box's own copy, never the live project.
+    local _pws="$project"
+    if _box_is_fork "$cname"; then _pws="$(_fork_dir "$cname")"; fi
+    if cap_is_active hooks && [[ -d "$_pws/.claude" ]]; then
+      local pf _pf_snap
+      for pf in "$_pws/.claude/settings.json" "$_pws/.claude/settings.local.json"; do
         local _base _overlay_name
         _base="$(basename "$pf")"
         _overlay_name="project-$_base"
+        # One guarded read, as on the create path. A file that is missing,
+        # linked, not regular or over the cap leaves no snapshot and lands in
+        # the '{}' arm below.
+        _pf_snap="$settings_overlay_dir/.in.$$.$_base"
+        _project_settings_snapshot "$_pws" "$_base" "$_pf_snap" || true
+        pf="$_pf_snap"
         if [[ -s "$pf" ]] && jq -e '.hooks // empty | length > 0' "$pf" >/dev/null 2>&1; then
           jq '
             if .hooks then
@@ -12574,6 +13699,7 @@ _refresh_settings_overlays() {
         else
           echo '{}' > "$settings_overlay_dir/$_overlay_name"
         fi
+        rm -f "$_pf_snap" 2>/dev/null || true
       done
     fi
   fi
@@ -12630,8 +13756,12 @@ cmd_start() {
       # instead. Two independent classes: a missing/wrong-type settings overlay
       # (_settings_overlay_intact), and any vanished bind source, most often
       # the macOS SSH agent socket, whose launchd path rotates every reboot
-      # (_container_bind_sources_present).
-      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname"; then
+      # (_container_bind_sources_present). A third is forced, once per box:
+      # a box created before the host-only history store mounts its input
+      # history from inside its read-write session dir, where the box can swap
+      # the name for a link that this start would mount
+      # (_history_bind_in_session_dir). Only a recreate changes a bind source.
+      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
         info "Recreating container ${DIM}(host paths changed)"
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
@@ -12751,8 +13881,10 @@ cmd_resume() {
       # settings overlay (_settings_overlay_intact) or any vanished bind source,
       # most often the macOS SSH agent socket, whose launchd path rotates
       # every reboot (_container_bind_sources_present), would otherwise make
-      # `docker start` abort with an opaque OCI error.
-      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname"; then
+      # `docker start` abort with an opaque OCI error. A box created before the
+      # host-only history store is recreated once, as in cmd_start
+      # (_history_bind_in_session_dir).
+      if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
         info "Recreating container ${DIM}(host paths changed)${RESET}"
         docker rm -f "$cname" > /dev/null 2>&1 || true
         cmd_run "$project"
@@ -12919,18 +14051,21 @@ cmd_shell() {
   # nowhere and a loopback login would wait forever on a callback. Same
   # parameters as exec_claude: auto mode defers plain links to this terminal,
   # and an authorize URL at an allowlisted origin opens on the host.
-  local _shell_clip_dir="$CLEAT_RUN_DIR/${cname}/clip"
-  mkdir -p "$_shell_clip_dir"
-  # This shell's byte window of the proxy log, captured before the watcher
+  local _shell_clip_dir="$CLEAT_RUN_DIR/${cname}/clip" _shell_watcher_log
+  _shell_watcher_log="$(_watcher_log_path "$cname")"
+  mkdir -p "$_shell_clip_dir" "${_shell_watcher_log%/*}"
+  # This shell's byte window of the bridge log, captured before the watcher
   # starts, so a refusal from an earlier session is never reported again.
-  local _shell_proxy_off
-  _shell_proxy_off="$(_cap_watcher_log "$_shell_clip_dir/.proxy-log")"
+  local _shell_proxy_log _shell_proxy_off
+  _shell_proxy_log="$(_browser_proxy_log "$_shell_clip_dir")"
+  _shell_proxy_off="$(_cap_watcher_log "$_shell_proxy_log" "${_shell_proxy_log%/*}")"
   # The spool cap's discards are reported like exec_claude's hook drops, from
   # this session's byte window of the per-install drop log.
-  local _shell_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _shell_drop_off=0
+  local _shell_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _shell_drop_off=0 _shell_drop_ino=""
   if [ -f "$_shell_drop_log" ]; then
     _shell_drop_off="$(wc -c < "$_shell_drop_log" 2>/dev/null | tr -d '[:space:]')"
     case "$_shell_drop_off" in ''|*[!0-9]*) _shell_drop_off=0 ;; esac
+    _shell_drop_ino="$(_path_ino "$_shell_drop_log")"
   fi
   _hook_spool_entry_cap "$cname"
   local _shell_open_cmd _shell_bw_pid=""
@@ -12939,9 +14074,9 @@ cmd_shell() {
     local _shell_interactive=0
     _is_tty && _shell_interactive=1
     # Terminal-safety redirect (see exec_claude): keep a fork-starved watcher's
-    # stderr out of this shell's TUI, in a per-box log instead.
-    _cap_watcher_log "$_shell_clip_dir/.watcher-log" >/dev/null
-    _browser_watcher "$_shell_clip_dir" "$_shell_open_cmd" "$cname" "$(_browser_bridge_mode)" "$_shell_interactive" >>"$_shell_clip_dir/.watcher-log" 2>&1 &
+    # stderr out of this shell's TUI, in the host-only per-box log instead.
+    _cap_watcher_log "$_shell_watcher_log" "${_shell_watcher_log%/*}" >/dev/null
+    _browser_watcher "$_shell_clip_dir" "$_shell_open_cmd" "$cname" "$(_browser_bridge_mode)" "$_shell_interactive" >>"$_shell_watcher_log" 2>&1 &
     _shell_bw_pid=$!
     disown "$_shell_bw_pid" 2>/dev/null || true
   fi
@@ -13009,8 +14144,8 @@ cmd_shell() {
   # The destination gate's refusals, as exec_claude reports them. A login run
   # from this shell goes through the same watcher, and a refusal that lives only
   # in the box's log is the silent failure the report exists to end.
-  _CLIP_DIR="$_shell_clip_dir" _maybe_report_blocked_opens "$_shell_clip_dir/.proxy-log" "$_shell_proxy_off"
-  _maybe_report_hook_drops "$_shell_drop_log" "$_shell_drop_off" "$cname"
+  _maybe_report_blocked_opens "$_shell_proxy_log" "$_shell_proxy_off"
+  _maybe_report_hook_drops "$_shell_drop_log" "$_shell_drop_off" "$cname" "$_shell_drop_ino"
   return "$shell_rc"
 }
 
@@ -13034,24 +14169,27 @@ cmd_login() {
   info "Authenticating with your Anthropic team account..."
 
   # Start browser bridge so auth URL opens automatically and callback works
-  local _login_clip_dir="$CLEAT_RUN_DIR/${cname}/clip"
+  local _login_clip_dir="$CLEAT_RUN_DIR/${cname}/clip" _login_watcher_log
+  _login_watcher_log="$(_watcher_log_path "$cname")"
   local _login_browser_pid=""
   local _login_open_cmd
   _login_open_cmd="$(_host_open_cmd)"
-  # This login's byte window of the proxy log (see cmd_shell). A missing log
-  # reads as 0, so it is safe before the clip dir exists.
-  local _login_proxy_off
-  _login_proxy_off="$(_cap_watcher_log "$_login_clip_dir/.proxy-log")"
+  # This login's byte window of the bridge log (see cmd_shell). A missing log
+  # reads as 0, so it is safe before the bridge dir exists.
+  local _login_proxy_log _login_proxy_off
+  _login_proxy_log="$(_browser_proxy_log "$_login_clip_dir")"
+  _login_proxy_off="$(_cap_watcher_log "$_login_proxy_log" "${_login_proxy_log%/*}")"
   # See cmd_shell: the spool cap's discards, reported after the login.
-  local _login_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _login_drop_off=0
+  local _login_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _login_drop_off=0 _login_drop_ino=""
   if [ -f "$_login_drop_log" ]; then
     _login_drop_off="$(wc -c < "$_login_drop_log" 2>/dev/null | tr -d '[:space:]')"
     case "$_login_drop_off" in ''|*[!0-9]*) _login_drop_off=0 ;; esac
+    _login_drop_ino="$(_path_ino "$_login_drop_log")"
   fi
   _hook_spool_entry_cap "$cname"
 
   if [ -n "$_login_open_cmd" ]; then
-    mkdir -p "$_login_clip_dir"
+    mkdir -p "$_login_clip_dir" "${_login_watcher_log%/*}"
     local _login_bridge_mode
     _login_bridge_mode="$(_browser_bridge_mode)"
     # host_opens_clicks=0: this watcher only ever sees the auth URL
@@ -13064,9 +14202,9 @@ cmd_login() {
     # (the callback proxy still runs). An unlisted origin is refused and
     # reported below, after the watcher stops.
     # Terminal-safety redirect (see exec_claude): keep a fork-starved watcher's
-    # stderr out of the login TUI, in a per-box log instead.
-    _cap_watcher_log "$_login_clip_dir/.watcher-log" >/dev/null
-    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" >>"$_login_clip_dir/.watcher-log" 2>&1 &
+    # stderr out of the login TUI, in the host-only per-box log instead.
+    _cap_watcher_log "$_login_watcher_log" "${_login_watcher_log%/*}" >/dev/null
+    _browser_watcher "$_login_clip_dir" "$_login_open_cmd" "$cname" "$_login_bridge_mode" "0" >>"$_login_watcher_log" 2>&1 &
     _login_browser_pid=$!
     disown "$_login_browser_pid" 2>/dev/null || true
     if [ "$_login_bridge_mode" = off ]; then
@@ -13108,8 +14246,8 @@ cmd_login() {
   # A login whose origin the gate refused must say so here. `cleat login`
   # promised the browser would open, and without this line nothing explains
   # why it did not.
-  _CLIP_DIR="$_login_clip_dir" _maybe_report_blocked_opens "$_login_clip_dir/.proxy-log" "$_login_proxy_off"
-  _maybe_report_hook_drops "$_login_drop_log" "$_login_drop_off" "$cname"
+  _maybe_report_blocked_opens "$_login_proxy_log" "$_login_proxy_off"
+  _maybe_report_hook_drops "$_login_drop_log" "$_login_drop_off" "$cname" "$_login_drop_ino"
 
   # A login into a pinned box lands in that box's staged copy. Only a harvest
   # carries it to the account. Without one the account still read "signed out"
@@ -14928,11 +16066,12 @@ cmd_storage() {
 #    the bytes behind. They are always handled as one unit.
 #
 # 2. The directory is NOT a pure session store. It also holds Claude Code's
-#    per-project auto-memory (memory/), cleat's own history.jsonl (created at
-#    cmd_run and bind-mounted live into every box of this project), and whatever
-#    scratch directories agents made. A `*` glob or a subtractive "everything
-#    that is not X" rule would eat the user's memory and orphan a live mount.
-#    Every operation is gated on a strict UUID allowlist instead.
+#    per-project auto-memory (memory/), whatever scratch directories agents
+#    made, and possibly a history.jsonl: cleat's input history lived here, bound
+#    live into every box, until it moved to the host-only CLEAT_HISTORY_DIR. A
+#    name left by an older release, or one the box wrote, can still be there. A
+#    `*` glob or a subtractive "everything that is not X" rule would eat the
+#    user's memory. Every operation is gated on a strict UUID allowlist instead.
 
 # The strict UUID shape, as a `case` glob rather than a regex: bash 3.2 has no
 # {n} repetition in its POSIX ERE, and writing it out leaves nothing to a
@@ -15079,12 +16218,14 @@ _sessions_title_for() {
 # pipefail turned into "0 KB" for real multi-gigabyte trees), and already
 # carries the apparent-size caveat this feature has to repeat in its output.
 _sessions_size_kb() {
-  local sdir="$1" uuid="$2" bytes=0 kb=0 out
+  local sdir="$1" uuid="$2" bytes=0 kb=0
   if [[ -f "${sdir}/${uuid}.jsonl" ]]; then
-    out="$(wc -c < "${sdir}/${uuid}.jsonl" 2>/dev/null || echo 0)"
-    # BSD wc left-pads its output, so take the first field rather than the word.
-    set -- $out
-    case "${1:-}" in ''|*[!0-9]*) bytes=0 ;; *) bytes="$1" ;; esac
+    # Stat, never open. `wc -c <` opened the transcript, so a device symlink
+    # swapped in after the -f check read forever and a FIFO blocked on the open.
+    # _path_size stats the target (a FIFO or a device reads as 0), follows a
+    # link as the old redirect did, and returns a clean integer, so the
+    # BSD-wc-padding dance is no longer needed.
+    bytes="$(_path_size "${sdir}/${uuid}.jsonl")"
   fi
   kb=$(( bytes / 1024 ))
   if [[ -d "${sdir}/${uuid}" ]]; then
@@ -15095,8 +16236,8 @@ _sessions_size_kb() {
 
 # One tab-joined row per session: mtime, size in KB, uuid, title. Sorted by the
 # caller. Only strict-UUID basenames are considered, which is what keeps
-# history.jsonl (same directory, matches *.jsonl, and a LIVE bind source for
-# every running box of this project) out of the list.
+# history.jsonl (same directory, matches *.jsonl, and a live bind source for
+# every box created before the host-only history store) out of the list.
 _sessions_scan() {
   local sdir="$1"
   local f base uuid mt kb title
@@ -15135,9 +16276,9 @@ _sessions_path_under_key() {
   local target="$1" root="$2" base root_p parent_p
   base="${target##*/}"
   # history.jsonl is redundant against the UUID test every caller already ran,
-  # and it is asserted anyway: it is cleat's own file, it matches *.jsonl, and
-  # it is bind-mounted live into every box of this project, so losing it is the
-  # one mistake in this directory that breaks a RUNNING container.
+  # and it is asserted anyway: it matches *.jsonl, and in a box created before
+  # the host-only history store it is still bind-mounted live, so losing it is
+  # the one mistake in this directory that breaks a RUNNING container.
   case "$base" in ''|.|..|history.jsonl) return 1 ;; esac
   case "$target" in "$root"/?*) : ;; *) return 1 ;; esac
   [[ -L "$target" ]] && return 1
@@ -15458,7 +16599,7 @@ _sessions_trash_sweep() {
     _sessions_is_uuid "${base#*-}" || continue
     [[ "$stamp" -lt "$cutoff" ]] || continue
     _sessions_path_under_key "$d" "$tdir" || continue
-    rm -rf "$d"
+    rm -rf "$d" 2>/dev/null || true
   done
 }
 
@@ -15475,7 +16616,14 @@ _sessions_trash() {
   # has to tell them apart or a poisoned trash directory reads as a success.
   tdir="$(_sessions_trash_dir "$sdir")" || return 2
   dest="${tdir}/${now}-${uuid}"
-  mkdir -p "$dest" || return 1
+  # The entry is created here and never reused. Plain mkdir fails on any name
+  # that already exists, a link included, where -p would walk through a link
+  # to a directory. The box cannot write in the host-only trash, but the
+  # carry-out of an old in-mount trash renames whatever that tree held at the
+  # time, so a link can still arrive under an entry name. Refusing is the only
+  # check it cannot race.
+  mkdir -p "$tdir" 2>/dev/null || return 2
+  mkdir "$dest" 2>/dev/null || return 2
   local idx=0 target moved=0
   while IFS= read -r p; do
     idx=$(( idx + 1 ))
@@ -15641,20 +16789,37 @@ _sessions_title_ok() (
 #
 # An `ai-title` record would NOT work: that is Claude's own generated title,
 # ranked below a custom one, so it would simply be outranked.
+#
+# The HOST writer. Only a box Docker has called stopped reaches it (see
+# _sessions_rename_apply): a running box writes its own rename, in its own
+# namespace, through _SESSIONS_RENAME_IN_BOX.
 _sessions_rename_write() {
   local sdir="$1" uuid="$2" title="$3"
-  local f="${sdir}/${uuid}.jsonl" stamp last tmp
+  local f="${sdir}/${uuid}.jsonl" side="${sdir}/${uuid}" stamp last tmp
+  # Every check runs here, at write time, after any prompt and before the first
+  # write. The same containment ran before the prompt, and that was not enough:
+  # a box can plant a link while the user types and then stop. With the box
+  # stopped nothing is left to swap a name between these checks and the writes.
+  _sessions_path_under_key "$f" "$sdir" || return 1
   [[ -f "$f" ]] || return 1
+  # The sidecar folder and its custom-title.json are names the box controls
+  # too. A link at either one would carry the temp file and the mv below into
+  # any host directory the user can write, so anything but a plain folder and a
+  # plain file refuses the whole rename.
+  if [[ -e "$side" || -L "$side" ]]; then
+    [[ -d "$side" && ! -L "$side" ]] || return 1
+  fi
+  if [[ -e "$side/custom-title.json" || -L "$side/custom-title.json" ]]; then
+    [[ -f "$side/custom-title.json" && ! -L "$side/custom-title.json" ]] || return 1
+  fi
 
   # Stamp the mtime so it can be put back. `touch -r` is POSIX and identical on
   # BSD and GNU, unlike `date -r` / `date -d`, and it costs nothing next to
   # copying a 118 MB file to preserve its timestamp.
-  # mktemp, not a $$-named path. This directory is the box's own session tree,
-  # mounted read-write, so a predictable name is one the box can pre-create as
-  # a symlink to any host file the user can write: `touch -r` would then stamp
-  # that file, and the restore below would stamp it again. mktemp refuses an
-  # existing path, link or FIFO included, and creates at 0600.
-  stamp="$(mktemp "${sdir}/.cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""
+  # In the host temp dir, not the session dir. That one is the box's own tree,
+  # mounted read-write, and a stamp there once gave the box a name to plant a
+  # link at. mktemp still, so the name cannot be predicted or pre-created.
+  stamp="$(mktemp "${TMPDIR:-/tmp}/cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""
   [[ -z "$stamp" ]] || touch -r "$f" "$stamp" 2>/dev/null || { rm -f "$stamp" 2>/dev/null; stamp=""; }
 
   # A record appended after a file that does not end in a newline would join the
@@ -15675,8 +16840,9 @@ _sessions_rename_write() {
   # sees a partial file.
   mkdir -p "${sdir}/${uuid}" 2>/dev/null || true
   if [[ -d "${sdir}/${uuid}" ]]; then
-    # Same reason as the stamp above: the box can plant a link at a name it can
-    # predict, and this one is written through.
+    # mktemp, not a $$-named path: the box can pre-create a name it can predict
+    # as a link to any host file the user can write, and this one is written
+    # through. mktemp refuses an existing path, link or FIFO included.
     tmp="$(mktemp "${sdir}/${uuid}/.custom-title.json.XXXXXX" 2>/dev/null)" || tmp=""
     if [[ -n "$tmp" ]] && printf '{"customTitle":"%s"}\n' "$title" > "$tmp" 2>/dev/null; then
       mv "$tmp" "${sdir}/${uuid}/custom-title.json" 2>/dev/null || rm -f "$tmp"
@@ -15688,8 +16854,8 @@ _sessions_rename_write() {
   # Put the mtime back. REQUIRED, not tidiness: `claude --continue` and the
   # /resume picker both order by transcript mtime, so an unrestored rename of
   # the second-newest session silently changes which conversation the next
-  # `cleat resume` continues. Safe to do here only because the live gate above
-  # guarantees nothing else is appending; it would be a bug as a general rule.
+  # `cleat resume` continues. Safe here only because the box is stopped, so
+  # nothing else can be appending. It would be a bug as a general rule.
   if [[ -n "$stamp" ]]; then
     touch -r "$stamp" "$f" 2>/dev/null || true
     rm -f "$stamp" 2>/dev/null || true
@@ -16066,8 +17232,8 @@ _sessions_picker_draw() {
 # So fold the change in instead. This is safe precisely because the CLI is the
 # thing that made the change and knows exactly what it was: a delete removes
 # that row, a rename replaces its title with the text that was just written and
-# leaves the mtime alone (_sessions_rename_write restores it), so the sort order
-# cannot move either.
+# leaves the mtime alone (whichever side writes the rename restores it), so the
+# sort order cannot move either.
 
 # Drop or retitle the row for one session, according to _SESS_ACTED.
 _sessions_row_apply() {
@@ -16205,6 +17371,77 @@ _sessions_action_draw() {
 # rather than inside a TUI function: the gates must be identical either way, and
 # a gate that only exists on the interactive path is not a gate.
 
+# Who writes a rename. The session dir is the box's own tree, mounted
+# read-write, and the key carries the box, so this box is its only writer.
+# While it runs it can swap any name in there between a host check and the
+# write after it, so no check made from the host closes that. What does is
+# changing who writes: a running box writes its own rename inside its own
+# namespace, where a planted link reaches only what the box can already write,
+# and the host writes only once Docker has said the box is not running.
+
+# 0 = the container is running (docker ps lists paused and restarting ones
+# too), 1 = Docker answered and it is not, 2 = no answer. is_running cannot make
+# this call: its grep reads a failed `docker ps` as "not running", and here that
+# answer would hand the write to the host while the box may be live. A read
+# loop rather than a pipe into grep -q, which under pipefail can report a match
+# as a failure when the writer is cut off.
+_sessions_box_up() {
+  local out line
+  out="$(docker ps --filter "name=^${1}$" --format '{{.Names}}' 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    [[ "$line" == "$1" ]] && return 0
+  done <<EOF
+$out
+EOF
+  return 1
+}
+
+# Where the box sees its session dir. Mounted on every box, docker cap
+# included, so the in-box writer needs no recreate.
+_SESSIONS_BOX_SDIR=/home/coder/.claude/projects/-workspace
+# Seconds the in-box rename may take before it counts as not written.
+_SESSIONS_RENAME_BOUND_S=10
+
+# The in-box writer, run as the box user: the same record, the same sidecar and
+# the same mtime restore as _sessions_rename_write. No link checks, on purpose:
+# here a link resolves inside the container. $1 = session dir, $2 = uuid,
+# $3 = title, both already validated on the host and passed as argv, never
+# spliced into the script. POSIX sh, because the image's /bin/sh is dash.
+_SESSIONS_RENAME_IN_BOX='d="$1"; u="$2"; t="$3"; f="$d/$u.jsonl"; r=0
+[ -f "$f" ] || exit 1
+s="$(mktemp "${TMPDIR:-/tmp}/cleat-mtime.XXXXXX" 2>/dev/null)" || s=""
+[ -z "$s" ] || touch -r "$f" "$s" 2>/dev/null || { rm -f "$s"; s=""; }
+if [ -n "$(tail -c 1 "$f" 2>/dev/null)" ]; then printf "\n" >> "$f" || r=1; fi
+[ "$r" -ne 0 ] || printf "{\"type\":\"custom-title\",\"customTitle\":\"%s\",\"sessionId\":\"%s\"}\n" "$t" "$u" >> "$f" || r=1
+if [ "$r" -eq 0 ] && mkdir -p "$d/$u" 2>/dev/null && n="$(mktemp "$d/$u/.custom-title.json.XXXXXX" 2>/dev/null)"; then
+  { printf "{\"customTitle\":\"%s\"}\n" "$t" > "$n" && mv -f "$n" "$d/$u/custom-title.json"; } 2>/dev/null || rm -f "$n"
+fi
+[ -z "$s" ] || { touch -r "$s" "$f" 2>/dev/null; rm -f "$s"; }
+exit "$r"'
+
+# The resume probe's exec form, bounded through _run_bounded (timeout, then
+# gtimeout, then perl on a stock Mac). Only the exit status is used: what the
+# box prints is not read.
+_sessions_rename_in_box() {
+  _run_bounded "$_SESSIONS_RENAME_BOUND_S" docker exec "$1" runuser -u coder -- \
+    sh -c "$_SESSIONS_RENAME_IN_BOX" _ "$_SESSIONS_BOX_SDIR" "$2" "$3" >/dev/null 2>&1
+}
+
+# Decided after the prompt, right before the write, because the box can start,
+# stop or start Claude while the user types. 0 = written, 1 = not written,
+# 2 = Docker did not answer, 3 = Claude came up in the box meanwhile.
+_sessions_rename_apply() {
+  local sdir="$1" uuid="$2" title="$3" cname="$4" rc=0
+  _sessions_box_up "$cname" || rc=$?
+  case "$rc" in
+    0) _box_has_live_agent "$cname" && return 3
+       _sessions_rename_in_box "$cname" "$uuid" "$title" || return 1 ;;
+    1) _sessions_rename_write "$sdir" "$uuid" "$title" || return 1 ;;
+    *) return 2 ;;
+  esac
+  return 0
+}
+
 _sessions_do_rename() {
   local sdir="$1" uuid="$2" box="$3" cname="$4" title="$5"
   _SESS_ACTED=""
@@ -16242,13 +17479,22 @@ _sessions_do_rename() {
     echo -e "    ${DIM}For anything else (emoji, accents) use ${BOLD}/rename${RESET}${DIM} inside the session.${RESET}"
     return 1
   fi
-  if _sessions_rename_write "$sdir" "$uuid" "$title"; then
+  # `|| wrc=$?` so a refusal reaches the case below under the binary's set -e.
+  local wrc=0
+  _sessions_rename_apply "$sdir" "$uuid" "$title" "$cname" || wrc=$?
+  if [[ $wrc -eq 0 ]]; then
     _SESS_ACTED="rename"
     _SESS_ACTED_TITLE="$title"
     success "Renamed ${DIM}${uuid:0:8}${RESET} to ${BOLD}${title}${RESET}"
     return 0
   fi
-  error "Could not write the new title."
+  case "$wrc" in
+    2) error "Docker is not responding, so cleat cannot tell whether ${BOLD}${box}${RESET} is running."
+       echo -e "    ${DIM}Start Docker and try again. Nothing was written.${RESET}" ;;
+    3) error "Box ${BOLD}${box}${RESET} has a live Claude session."
+       echo -e "    ${DIM}Stop it first: ${BOLD}cleat stop ${box}${RESET}${DIM}. Nothing was written.${RESET}" ;;
+    *) error "Could not write the new title." ;;
+  esac
   return 1
 }
 
@@ -17396,30 +18642,30 @@ _account_cred_login() {
 # box's MCP tokens loses them at its next harvest. An empty SRC means "no
 # account keys".
 _account_write_file_0600() {
-  local src="$1" dest="$2" base="${3:-}" tmp ok=false
+  local src="$1" dest="$2" base="${3:-}" stage tmp ok=false
+  # A link already there is refused, so the switch can drop what the box
+  # planted and retry. One swapped in later is replaced by the rename below.
   [[ -L "$dest" ]] && return 1
-  # A directory there would take the temp file INTO it, report success and
-  # leave the box with no credential at all.
+  # A directory there is refused before any work. The rename refuses one too.
   [[ -d "$dest" ]] && return 1
   # A source the BOX can write is capped before it is read, because the next
   # thing that happens to it is a `cat` into a host file and, later, a shell
   # variable. A credential is under 4 KB.
   [[ -z "$src" ]] || _account_cred_sane_size "$src" || return 1
-  # mktemp, not "$dest.tmp.$$". The old name was guessable and unguarded, and
-  # half the destinations live in a directory the box mounts read-write, so a
-  # planted symlink there would have redirected a live credential to any host
-  # file the user can write. mktemp refuses an existing path (symlink or FIFO
-  # included) and creates at 0600 on both BSD and GNU.
-  tmp="$(mktemp "${dest}.tmp.XXXXXX" 2>/dev/null)" || return 1
+  # Never beside dest. Half the destinations are the box's own auth dir, where
+  # even a mktemp name is one the box sees appear and can swap for a link before
+  # the redirect, jq or chmod reopen it. See _host_stage_dir.
+  stage="$(_host_stage_dir)" || return 1
+  tmp="$stage/${dest##*/}"
   # By key, never the whole file. See _account_cred_merge.
-  ( umask 077; _account_cred_merge "$base" "$src" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  ( umask 077; _account_cred_merge "$base" "$src" > "$tmp" ) 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 1; }
   # A store takes exactly the login every reader found in the source. The
   # readers find claudeAiOauth at any depth and the merge copies top-level keys
   # only, so a login a box nested inside another key read as plausible and
   # projected to {}: a harvest of the same grant wrote a store with no login
   # over the account's only copy.
   if [[ -n "$src" && -z "$base" && "$(_account_cred_login "$tmp")" != "$(_account_cred_login "$src")" ]]; then
-    rm -f "$tmp" 2>/dev/null
+    rm -rf "$stage" 2>/dev/null
     return 1
   fi
   if command -v jq &>/dev/null; then
@@ -17428,11 +18674,12 @@ _account_write_file_0600() {
     _looks_like_json_object "$tmp" && ok=true
   fi
   if ! $ok; then
-    rm -f "$tmp" 2>/dev/null
+    rm -rf "$stage" 2>/dev/null
     return 1
   fi
   chmod 600 "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$dest" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  _rename_onto "$tmp" "$dest" || { rm -rf "$stage" 2>/dev/null; return 1; }
+  rm -rf "$stage" 2>/dev/null || true
   return 0
 }
 
@@ -17440,9 +18687,10 @@ _account_write_file_0600() {
 # and writes late, and a `cleat account rm` or a rename in another terminal can
 # move the store away in between. A mkdir -p here put the account back under its
 # old name, empty or refilled, and `restore` then refused. Past this check
-# nothing creates a directory: mktemp, the redirect and mv all fail when the
-# store has gone. The decline returns 1, so the wipe that asked keeps the staged
-# file. The one place that creates a store is the explicit switch to a new name.
+# nothing creates the store. The temp is staged outside it and the rename names
+# the store's directory, which fails when it has gone. The decline returns 1, so
+# the wipe that asked keeps the staged file. The one place that creates a store
+# is the explicit switch to a new name.
 _account_write_cred() {
   local acct="$1" src="$2" gone
   _account_exists "$acct" || return 1
@@ -17489,11 +18737,18 @@ _account_copy_whole_0600() {
 # node). Inode alone is enough because the only writer of the directory this
 # guards is the box, through a bind mount into the host filesystem the path is
 # already on, so it cannot present a same-inode file from anywhere else.
+#
+# The PATH is listed without following it (`ls -d`, no -L: neither GNU nor BSD
+# ls follows a command-line link under -d). The open can go through a link the
+# box then swaps for a regular file to pass the -L test and swaps back before
+# the listing. With -L the listing then named the link's target, the very file
+# the descriptor had opened through it, so the check passed. The -L test stays
+# as the cheap first refusal.
 _fd_holds_path() {
   local fd="$1" path="$2" a b
   [[ ! -L "$path" ]] || return 1
   [[ -f "/dev/fd/$fd" ]] || return 1
-  a="$(ls -Ldi "$path" 2>/dev/null | awk '{print $1}')"
+  a="$(ls -di "$path" 2>/dev/null | awk '{print $1}')"
   b="$(ls -Ldi "/dev/fd/$fd" 2>/dev/null | awk '{print $1}')"
   case "$a" in ''|*[!0-9]*) return 1 ;; esac
   [[ "$a" == "$b" ]]
@@ -17522,10 +18777,17 @@ _account_snapshot_cred() {
   mkdir -p "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || return 1
   chmod 700 "$CLEAT_ACCOUNTS_DIR" 2>/dev/null || true
   tmp="$(mktemp "$CLEAT_ACCOUNTS_DIR/.snap.XXXXXX" 2>/dev/null)" || return 1
-  if ! ( exec 3<"$src" || exit 1
-         _fd_holds_path 3 "$src" || exit 1
-         umask 077
-         head -c $(( _ACCOUNT_CRED_MAX_BYTES + 1 )) <&3 > "$tmp" ) 2>/dev/null; then
+  # The open runs in a child under the time bound, like _read_unlinked_bounded,
+  # so a FIFO the box swaps in after the -f check costs at most the bound rather
+  # than hanging open(2) forever until the account lock's age bound frees the
+  # next command. fd 8, which bats does not own (fd 3 is hers). _fd_holds_path
+  # confirms the descriptor, so a link swapped in and back is refused. $tmp is
+  # already 0600 from mktemp, which truncating it here does not change, so the
+  # old subshell's umask 077 was redundant and is gone.
+  if ! _run_bounded "$_BOX_FILE_READ_SECS" bash -c "$(declare -f _fd_holds_path)"'
+exec 8<"$1" || exit 1
+_fd_holds_path 8 "$1" || exit 1
+exec head -c "$2" <&8' cleat-snap "$src" "$(( _ACCOUNT_CRED_MAX_BYTES + 1 ))" > "$tmp" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     return 1
   fi
@@ -19098,28 +20360,44 @@ _account_invalidate_identity_key() {
 # to borrow one from, or a filter that failed. The caller flags the file and
 # the next launch finishes the job (_claude_json_clear_stale_identity).
 _claude_json_drop_identity() {
-  local f="$1" cname="${2:-}" tmp rc=0
+  local f="$1" cname="${2:-}" tmp snap cap rc=0
   local prog='del(.oauthAccount) | del(.cachedUsageUtilization)'
   [[ -f "$f" && -s "$f" ]] || return 0
   [[ -L "$f" ]] && return 0
   tmp="${f}.acct.$$"
+  snap="${f}.snap.$$"
+  # The box writes this file, so every read below is of one bounded snapshot.
+  # One over the cap is never read or written, and the flag stays.
+  cap="$(_claude_json_cap)"
+  _claude_json_snapshot "$f" "$snap" "$cap" || return 1
   if command -v jq &>/dev/null; then
-    if ! { jq "$prog" "$f" > "$tmp" 2>/dev/null \
+    if ! { jq "$prog" "$snap" > "$tmp" 2>/dev/null \
            && [[ -s "$tmp" ]] && jq -e 'type=="object"' "$tmp" >/dev/null 2>&1; }; then
-      rm -f "$tmp" 2>/dev/null
+      rm -f "$tmp" "$snap" 2>/dev/null
       return 1
     fi
   else
     # Nothing to delete is an answer, and a cheap one: a jq-less host whose
     # file is already clean asks the box nothing and leaves no flag behind.
-    grep -qE '"(oauthAccount|cachedUsageUtilization)"' "$f" 2>/dev/null || return 0
-    { [[ -n "$cname" ]] && _daemon_up && is_running "$cname"; } || return 1
-    if ! { docker exec -i "$cname" jq "$prog" < "$f" > "$tmp" 2>/dev/null \
-           && _looks_like_json_object "$tmp"; }; then
-      rm -f "$tmp" 2>/dev/null
+    if ! grep -qE '"(oauthAccount|cachedUsageUtilization)"' "$snap" 2>/dev/null; then
+      rm -f "$snap" 2>/dev/null
+      return 0
+    fi
+    if ! { [[ -n "$cname" ]] && _daemon_up && is_running "$cname"; }; then
+      rm -f "$snap" 2>/dev/null
+      return 1
+    fi
+    # The box's jq is the box's binary, so what it prints is capped like the
+    # file it came from. The size test decides, with or without pipefail. No
+    # deadline: Ctrl-C ends it, and it can only stall this same box's launch,
+    # like the other execs on that path.
+    if ! { docker exec -i "$cname" jq "$prog" < "$snap" 2>/dev/null | head -c "$(( cap + 1 ))" > "$tmp" \
+           && [ "$(_path_size "$tmp")" -le "$cap" ] && _looks_like_json_object "$tmp"; }; then
+      rm -f "$tmp" "$snap" 2>/dev/null
       return 1
     fi
   fi
+  rm -f "$snap" 2>/dev/null
   _write_in_place "$tmp" "$f" || rc=1
   rm -f "$tmp" 2>/dev/null
   return $rc
@@ -19127,10 +20405,11 @@ _claude_json_drop_identity() {
 
 # The launch half of an identity change the host could not finish by itself:
 # no jq on the host, and no running box to borrow one from at the time. The
-# flag is written by _account_invalidate_identity_key and by the no-jq branch
-# of the builder. It sits next to the file on the HOST only, because the box
-# mounts the file and never its directory, and `cleat nuke` takes it with the
-# projects dir. It needs no lock: the write is idempotent and the clear is
+# flag is written by _account_invalidate_identity_key, by the no-jq branch of
+# the builder, by the switch before the pin moves (H9) and by `cleat account
+# rm` before it unpins. It sits next to the file on the HOST only, because the
+# box mounts the file and never its directory, and `cleat nuke` takes it with
+# the projects dir. It needs no lock: the write is idempotent and the clear is
 # re-checked before every launch.
 #
 # Never edits under a live agent. A config write racing the in-place copy puts
@@ -20096,7 +21375,10 @@ _handoff_parse_probe() {
       args) [[ "$rest" == ok ]] && argsok=1; [[ "$rest" == bad ]] && return 1 ;;
       end) [[ "$rest" == ok ]] && endok=1; [[ "$rest" == abort ]] && return 1 ;;
       claude)
-        set -- $rest
+        # Globbing off for the split. The box writes this line, and a field like
+        # /*/*/*/*/*/*/*/* made the host walk its own filesystem before the
+        # field count below could refuse it.
+        set -f; set -- $rest; set +f
         [[ $# -eq 9 ]] || return 1
         n=${#_HO_PID[@]}
         _HO_PID[$n]="$1"; _HO_PS[$n]="$2"; _HO_STATUS[$n]="$3"; _HO_WAIT[$n]="$4"
@@ -20136,7 +21418,8 @@ _parse_terminate() {
       scan) _PT_SCAN="$rest" ;;
       end) _PT_END="$rest" ;;
       pid)
-        set -- $rest; p="$1"; st="${2:-}"
+        # Box-written, so split with globbing off, as in _handoff_parse_probe.
+        set -f; set -- $rest; set +f; p="$1"; st="${2:-}"
         case "$st" in
           exited) _PT_EXITED="$_PT_EXITED$p " ;;
           alive)  _PT_ALIVE="$_PT_ALIVE$p "; _PT_ANY_ALIVE=1 ;;
@@ -20254,7 +21537,15 @@ _handoff_classify() {
   # Any other shell line refuses. Without --now row 19 already took every busy
   # target, so every shell line refuses here.
   # Row 18: background shell (a shell line, then a shell status).
-  for sline in $_HO_SHELLS; do _handoff_shell_line_ok "$sline" "$now" "$N" || { _HO_VERDICT=R3; return 0; }; done
+  # The shell ids are box-written, so they are split with globbing off. The
+  # list is expanded once, before the first pass, so globbing comes back on at
+  # the top of the body, and after the loop for an empty list.
+  set -f
+  for sline in $_HO_SHELLS; do
+    set +f
+    _handoff_shell_line_ok "$sline" "$now" "$N" || { _HO_VERDICT=R3; return 0; }
+  done
+  set +f
   i=0; while [[ $i -lt $N ]]; do [[ "${_HO_STATUS[$i]}" == shell ]] && { _HO_VERDICT=R3; return 0; }; i=$(( i + 1 )); done
   # Row 20: a question that is not the usage-limit dialog, without --now. The
   # limit question is dialog-open with the transcript confirming a rate limit.
@@ -21333,6 +22624,14 @@ _account_do_remove() {
     # Read BEFORE the pin file goes, because that is where the key lives. The
     # edit itself asks docker, so it waits until the lock is released.
     key="$(_box_account_key "$b" || true)"
+    # Flagged BEFORE the pin goes, the order the switch keeps (H9). From here
+    # to the drop after the unlock, the box is on the shared login with the
+    # removed account's name still in its file, and the sibling scan skips only
+    # a flagged file. A remove cut off in that gap leaves the flag for the box's
+    # next launch rather than nothing. The drop clears it when it finishes.
+    if [[ -n "$key" && -d "$CLEAT_PROJECTS_DIR/$key" ]]; then
+      : > "$CLEAT_PROJECTS_DIR/$key/claude.json.identity-stale" 2>/dev/null || true
+    fi
     unpinned="${unpinned}${b}${tab}${key}
 "
     _box_account_remove "$b"
@@ -22786,14 +24085,20 @@ _cap_description() {
 _scaffold_cleat_env() {
   local project="${1:-$PWD}"
   local env_file="$project/.cleat.env"
-  [[ -f "$env_file" ]] && return 0
-  cat > "$env_file" << 'ENVEOF'
+  # Never through a link: the workspace is the box's, and `cat >` created the
+  # host file a dangling link there named.
+  if [[ -L "$env_file" ]]; then
+    warn "Not creating ${env_file}: a link already holds that name."
+    return 0
+  fi
+  [[ -e "$env_file" ]] && return 0
+  _config_put "$env_file" << 'ENVEOF' || return 1
 # .cleat.env: project environment variables for Cleat
 # Loaded when the "env" capability is enabled.
 # Add to .gitignore: do not commit secrets.
 #
 # KEY=VALUE  set explicitly
-# KEY        inherit from host environment
+# KEY        copy from your shell, once you approve it at the trust prompt
 #
 # Example:
 # GH_TOKEN
@@ -23041,19 +24346,24 @@ _config_picker_draw() {
   done
 
   printf '\033[2K'; echo ""
+  # The value can come from a project .cleat the box can write. Rendered
+  # sanitized, while the raw value stays what the editor saves back.
+  local _mem_d _cpus_d
+  _mem_d="$(_sanitize_repo_str "$mem")"
+  _cpus_d="$(_sanitize_repo_str "$cpus")"
   printf '\033[2K'
   echo -e "  ${DIM}Resources${RESET} ${DIM}(←/→ changes the value)${RESET}"
   printf '\033[2K'
   if [[ $cursor -eq $ncaps ]]; then
-    echo -e "  ${CYAN}▸${RESET} memory  ${BOLD}‹ ${mem} ›${RESET}  ${DIM}(per-box RAM ceiling)${RESET}"
+    echo -e "  ${CYAN}▸${RESET} memory  ${BOLD}‹ ${_mem_d} ›${RESET}  ${DIM}(per-box RAM ceiling)${RESET}"
   else
-    echo -e "    memory  ${mem}  ${DIM}(per-box RAM ceiling)${RESET}"
+    echo -e "    memory  ${_mem_d}  ${DIM}(per-box RAM ceiling)${RESET}"
   fi
   printf '\033[2K'
   if [[ $cursor -eq $((ncaps + 1)) ]]; then
-    echo -e "  ${CYAN}▸${RESET} cpus    ${BOLD}‹ ${cpus} ›${RESET}  ${DIM}(core limit; all = no cap)${RESET}"
+    echo -e "  ${CYAN}▸${RESET} cpus    ${BOLD}‹ ${_cpus_d} ›${RESET}  ${DIM}(core limit; all = no cap)${RESET}"
   else
-    echo -e "    cpus    ${cpus}  ${DIM}(core limit; all = no cap)${RESET}"
+    echo -e "    cpus    ${_cpus_d}  ${DIM}(core limit; all = no cap)${RESET}"
   fi
 
   if [[ "$show_gen" == "1" ]]; then
@@ -23154,8 +24464,8 @@ _config_editor_save() {
   case "$mem_w" in default|all) mem_w="" ;; esac
   case "$cpu_w" in default|all) cpu_w="" ;; esac
 
-  _config_write_caps_scoped "$config_file" "$_esec_caps" "$_ebox" "${final_caps[@]+"${final_caps[@]}"}"
-  _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w"
+  _config_write_caps_scoped "$config_file" "$_esec_caps" "$_ebox" "${final_caps[@]+"${final_caps[@]}"}" || return 1
+  _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w" || return 1
   _config_note_sections_version "$config_file"
   if [[ -n "$_ebox" ]]; then
     success "Saved to ${config_file} ${DIM}(box ${_ebox})${RESET}"
@@ -23268,10 +24578,14 @@ _config_picker_tui() {
             case ",${toggled}," in
               *,"$current_cap",*)
                 local _new="" _c
+                # Globbing off: a `*` in the project's caps line expanded into
+                # the names of the files in the working directory.
+                set -f
                 for _c in $(echo "$toggled" | tr ',' ' '); do
                   [[ "$_c" == "$current_cap" ]] && continue
                   _new="${_new:+${_new},}${_c}"
                 done
+                set +f
                 toggled="$_new" ;;
               *) toggled="${toggled:+${toggled},}${current_cap}" ;;
             esac ;;
@@ -23321,10 +24635,10 @@ _generate_project_cleat() {
   shift 3
   local caps=("$@")
   local file="${project}/.cleat"
-  local fresh=0
-  [[ -f "$file" ]] || fresh=1
 
-  if [[ $fresh -eq 1 ]]; then
+  # Fresh means nothing holds the name. A dangling link is not fresh: the
+  # writers below refuse it, where `> "$file"` created the file it names.
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
     mkdir -p "$project"
     {
       echo "# .cleat: Cleat project config. Commit it so every clone runs in the same cage."
@@ -23332,11 +24646,11 @@ _generate_project_cleat() {
       echo "# [caps] grant host access (off by default). [resources] cap the box."
       echo "# Docs: https://cleat.sh/docs"
       echo ""
-    } > "$file"
+    } | _config_put "$file" || return 1
   fi
 
-  _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}"
-  _write_resources_to_file "$file" "$memory" "$cpus"
+  _write_caps_to_file "$file" "${caps[@]+"${caps[@]}"}" || return 1
+  _write_resources_to_file "$file" "$memory" "$cpus" || return 1
 }
 
 # Confirm and stamp the selections into ./.cleat (global-scope generate row). This
@@ -23407,7 +24721,7 @@ _config_generate_project() {
   local yn=""
   _ask_yn yn "Write this .cleat? ${DIM}[y/N]${RESET} "
   if [[ "$yn" == [yY]* ]]; then
-    _generate_project_cleat "$project" "$memory" "$cpus" "${caps[@]+"${caps[@]}"}"
+    _generate_project_cleat "$project" "$memory" "$cpus" "${caps[@]+"${caps[@]}"}" || return 1
     success "Wrote ${target}"
     info "Its capabilities apply after you approve it on the next run ${DIM}(or cleat trust)${RESET}"
   else
@@ -23469,7 +24783,7 @@ _config_picker_text() {
     echo -e "    [${marker}] ${BOLD}${cap}${RESET}     $(_cap_description "$cap")"
   done
   echo ""
-  echo -e "  ${DIM}Resources: memory=${mem}  cpus=${cpus}${RESET}"
+  echo -e "  ${DIM}Resources: memory=$(_sanitize_repo_str "$mem")  cpus=$(_sanitize_repo_str "$cpus")${RESET}"
 
   echo ""
   echo -e "  ${DIM}Capabilities: type a name to flip. Resources: \"memory 4g\", \"cpus 2\"${RESET}"
@@ -23535,10 +24849,13 @@ _config_picker_text() {
             case ",${_active}," in
               *,"$input",*)
                 local _new_active="" _c
+                # Globbing off, as in _config_picker_tui.
+                set -f
                 for _c in $(echo "$_active" | tr ',' ' '); do
                   [[ "$_c" == "$input" ]] && continue
                   _new_active="${_new_active:+${_new_active},}${_c}"
                 done
+                set +f
                 _active="$_new_active"
                 success "${input} disabled"
                 ;;
@@ -23675,8 +24992,8 @@ cmd_config() {
         && _lcsrc=" ${DIM}(declared)${RESET}" || _lcsrc=" ${DIM}(inherited)${RESET}"
     fi
     echo -e "  ${BOLD}Resources${RESET}"
-    if [[ -n "$_lm" ]]; then echo -e "    memory  ${_lm}${_lmsrc}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
-    if [[ -n "$_lc" ]]; then echo -e "    cpus    ${_lc}${_lcsrc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
+    if [[ -n "$_lm" ]]; then echo -e "    memory  $(_sanitize_repo_str "$_lm")${_lmsrc}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
+    if [[ -n "$_lc" ]]; then echo -e "    cpus    $(_sanitize_repo_str "$_lc")${_lcsrc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
     echo ""
     if [[ -n "$_box_scope" ]]; then
       echo -e "  ${DIM}Config: ${config_file}${RESET}  ${BOLD}box ${_box_scope}${RESET}${_lcapsrc}"
@@ -23713,7 +25030,7 @@ cmd_config() {
     cur_mem="$(_read_section_from_file "$config_file" "$_sec_res" memory || true)"
     cur_cpus="$(_read_section_from_file "$config_file" "$_sec_res" cpus || true)"
     if [[ "$res_key" == "memory" ]]; then cur_mem="$write_val"; else cur_cpus="$write_val"; fi
-    _WRITE_RES_SECTION="$_sec_res" _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus"
+    _WRITE_RES_SECTION="$_sec_res" _write_resources_to_file "$config_file" "$cur_mem" "$cur_cpus" || exit 1
     _config_note_sections_version "$config_file"
     if [[ -n "$write_val" ]]; then
       success "${res_key} set to ${write_val} ${DIM}(${config_file})${RESET}"
@@ -23784,7 +25101,7 @@ cmd_config() {
       if ! $already; then
         current_caps+=("$cap_name")
       fi
-      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${current_caps[@]}"
+      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${current_caps[@]}" || exit 1
       success "${cap_name} enabled"
       echo -e "    ${DIM}$(_cap_description "$cap_name")${RESET}"
 
@@ -23798,7 +25115,7 @@ cmd_config() {
       for cap in "${current_caps[@]+"${current_caps[@]}"}"; do
         [[ "$cap" != "$cap_name" ]] && new_caps+=("$cap")
       done
-      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${new_caps[@]+"${new_caps[@]}"}"
+      _config_write_caps_scoped "$config_file" "$_sec_caps" "$_box_scope" "${new_caps[@]+"${new_caps[@]}"}" || exit 1
       success "${cap_name} disabled"
     fi
     return
@@ -23916,12 +25233,13 @@ cmd_trust() {
       [[ -z "$p" ]] && continue
       [[ -z "$b" ]] && b="main"
       local marker="${GREEN}●${RESET}"
-      # Indicate if the box's cap file has changed since approval
-      local _cf _stored _cur
-      _cf="$(_project_caps_file "$p")"
+      # Indicate if what the box's trust covers (its caps plus the host
+      # variables its env file asks for) has changed since approval. A row for
+      # a project with nothing left to trust stays green, as before.
+      local _stored _cur
       _stored="$(_trust_lookup "$p" "$b")"
-      _cur="$(_hash_cleat_caps "$_cf" "$b")"
-      if [[ -f "$_cf" && -n "$_cur" && "$_stored" != "$_cur" ]]; then
+      _cur="$(_project_trust_hash "$p" "$b")"
+      if [[ -n "$_cur" && "$_stored" != "$_cur" ]]; then
         marker="${YELLOW}●${RESET}"
       fi
       if [[ "$b" == "main" ]]; then
@@ -23931,7 +25249,7 @@ cmd_trust() {
       fi
     done
     echo ""
-    echo -e "  ${DIM}${GREEN}●${DIM} trusted at current caps   ${YELLOW}●${DIM} .cleat changed since approval${RESET}"
+    echo -e "  ${DIM}${GREEN}●${DIM} trusted at current caps   ${YELLOW}●${DIM} .cleat or its env file changed since approval${RESET}"
     return 0
   fi
 
@@ -23947,13 +25265,25 @@ cmd_trust() {
   local caps_file caps_base
   caps_file="$(_project_caps_file "$project")"
   caps_base="$(basename "$caps_file")"
-  if [[ ! -f "$caps_file" ]]; then
+  # The host variables the env file asks for are part of the same decision
+  # (see _trust_decision_hash), so a project with only an env file that names
+  # some is still something to trust.
+  _project_env_view "$(_project_env_file "$project" "$box")" "$box"
+  if [[ ! -f "$caps_file" && -z "$_PENV_BARE" ]]; then
     error "No ${caps_base} file found in ${BOLD}${project}${RESET}"
     echo -e "    ${DIM}Nothing to trust. This box has no capability config.${RESET}"
     exit 1
   fi
-  local hash
-  hash="$(_hash_cleat_caps "$caps_file" "$box")"
+  # One read for the hash recorded and the caps line printed below, so what the
+  # user is told was approved is what was recorded (see _project_caps_view).
+  # Same for the host variables, from the env view just taken.
+  local hash approved_caps approved_vars
+  _project_caps_view "$caps_file" "$box"
+  hash="$_PCAPS_HASH"
+  [[ -z "$_PENV_BARE" ]] || hash="$(_trust_decision_hash "$_PCAPS" "$_PENV_BARE")"
+  approved_caps="$(printf '%s\n' "$_PCAPS" | _canonical_caps)"
+  approved_vars="$(printf '%s\n' "$_PENV_BARE" | awk 'NF { printf "%s%s", (n++ ? ", " : ""), $0 }')"
+  _warn_unknown_project_caps "$caps_file" "$box" "$_PCAPS_UNKNOWN"
   # An explicit `cleat trust` approves the whole file the user is looking
   # at: caps and [setup] both, separate consent classes (concept/16). A
   # caps-less file with a [setup] section is still approvable: setup trust
@@ -23982,10 +25312,11 @@ cmd_trust() {
   else
     success "Trusted ${BOLD}${project}${RESET} ${DIM}[${box}]${RESET}"
   fi
-  if [[ -n "$hash" ]]; then
-    local caps
-    caps="$(_read_caps_from_file "$caps_file" "$box" | _canonical_caps)"
-    echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$caps")${RESET}"
+  if [[ -n "$approved_caps" ]]; then
+    echo -e "    ${DIM}Approved caps: $(_sanitize_repo_str "$approved_caps")${RESET}"
+  fi
+  if [[ -n "$approved_vars" ]]; then
+    echo -e "    ${DIM}Approved host variables: ${approved_vars}${RESET}"
   fi
   if [[ -n "$setup_payload" ]]; then
     echo -e "    ${DIM}Approved setup: ${setup_count} command(s)${RESET}"
@@ -24316,6 +25647,7 @@ cmd_fork() {
       _fork_copy_tree "$project" "$_fp" || _rc=$?
       spin_stop "$_rc" "Workspace copied" "Workspace copy failed"
       [[ "$_rc" -eq 0 ]] || return 1
+      _fork_note_paused
       _fork_prune_excludes "$_fp" "$project" "$box"
       _fork_mark "$cname"
       echo -e "    ${DIM}Next ${BOLD}cleat start ${box} --fork${RESET}${DIM} uses it.${RESET}"

@@ -230,12 +230,18 @@ teardown() { _common_teardown; }
 }
 
 @test "watcher log cap: an oversized log is truncated and the offset resets to 0" {
-  local log="$TEST_TEMP/.watcher-log"
+  local log="$TEST_TEMP/.watcher-log" claim="$TEST_TEMP/claim"
   head -c 1200000 /dev/zero | tr '\0' 'x' > "$log"   # ~1.2 MB, over the 1 MB cap
-  run _cap_watcher_log "$log"
+  run _cap_watcher_log "$log" "$claim"
   assert_success
   assert_output "0"
-  [ ! -s "$log" ]                           # truncated to empty
+  # Rotated by rename, then deleted in the claim dir: the name is free for the
+  # next `>>` to make a fresh log, and nothing is left behind.
+  run test -e "$log"
+  assert_failure
+  run ls -A "$claim"
+  assert_success
+  assert_output ""
 }
 
 @test "watcher log cap: a missing log yields offset 0, creates nothing" {
@@ -245,13 +251,20 @@ teardown() { _common_teardown; }
   [ ! -e "$TEST_TEMP/absent-log" ]
 }
 
-@test "watcher log cap: BSD wc padding is stripped (macOS wc -c emits a padded count)" {
-  # macOS/BSD wc -c right-justifies its count ("      6"), which the ^[0-9]+$
-  # guard would reject and force to 0, defeating both the cap and the offset on
-  # the maintainer's platform. This test simulates that padding on Linux CI.
+@test "watcher log cap: sized by BSD stat when GNU stat is absent" {
+  # macOS stat has no -c. The size must come from its -f %z form, or it reads
+  # as 0 on the maintainer's platform, which defeats both the cap and the
+  # offset (a stale prior-session fork error would re-fire every run). This
+  # simulates BSD stat on Linux CI: -c fails, -L -f %z answers the size.
   local log="$TEST_TEMP/.watcher-log"
   printf 'hello\n' > "$log"                 # 6 bytes
-  wc() { if [ "$1" = "-c" ]; then printf '      %s\n' "$(command wc -c | command tr -d ' ')"; else command wc "$@"; fi; }
+  stat() {
+    case "$1 $2 $3" in
+      "-L -c %s") return 1 ;;
+      "-L -f %z") command wc -c < "$4" | command tr -d '[:space:]' ;;
+      *) command stat "$@" ;;
+    esac
+  }
   run _cap_watcher_log "$log"
   assert_success
   assert_output "6"                          # not "0"
@@ -285,10 +298,13 @@ teardown() { _common_teardown; }
 
 @test "session end: a refusal written during the session is reported" {
   _host_open_cmd() { echo ""; }
+  # No watcher runs here (no opener), so nothing creates the host-only bridge
+  # dir the watcher would log into.
+  mkdir -p "$CLEAT_RUN_DIR/test-ctr/bridge"
   docker() {
     if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
       printf '[browser-watcher 10:00:00] %s origin=auth.example.com url=https://auth.example.com/oauth/authorize?redirect_uri=x\n' \
-        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
     fi
     command docker "$@"
   }
@@ -302,13 +318,13 @@ teardown() { _common_teardown; }
   # forbids. One refusal this session keeps the report on screen, so the test
   # reads what it printed rather than a report that never ran.
   _host_open_cmd() { echo ""; }
-  mkdir -p "$CLEAT_RUN_DIR/test-ctr/clip"
+  mkdir -p "$CLEAT_RUN_DIR/test-ctr/clip" "$CLEAT_RUN_DIR/test-ctr/bridge"
   printf '[browser-watcher 09:00:00] %s origin=old.example.com url=https://old.example.com/oauth/authorize?redirect_uri=x\n' \
-    "$_BROWSER_BLOCKED_MARK" > "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+    "$_BROWSER_BLOCKED_MARK" > "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
   docker() {
     if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
       printf '[browser-watcher 10:00:00] %s origin=new.example.com url=https://new.example.com/oauth/authorize?redirect_uri=x\n' \
-        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
     fi
     command docker "$@"
   }

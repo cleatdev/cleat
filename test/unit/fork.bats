@@ -1540,3 +1540,115 @@ SHIM
   assert_success
   [ -d "$TEST_TEMP/elsewhere" ]
 }
+
+# ── quiescing the live tree ─────────────────────────────────────────────────
+# cp is path based, so a running box renaming a directory into a symlink mid-
+# copy could pull host files into the fork. Every running box that can write
+# the project is paused for the copy.
+
+_fq_last() { local a; for a; do :; done; printf '%s' "$a"; }
+
+@test "fork: the live writers are the project's boxes and boxes on a folder above or below it" {
+  _daemon_up() { return 0; }
+  local own="$CNAME" forkbox parent="cleat-ws-11111111" nested="cleat-src-44444444"
+  local other="cleat-else-22222222" prefix="cleat-projectx-33333333"
+  forkbox="$(container_name_for "$TEST_TEMP/project" feat)"
+  _fork_mark "$forkbox"
+  mkdir -p "$TEST_TEMP/elsewhere" "$TEST_TEMP/project-other"
+  docker() {
+    case "$1" in
+      ps) printf '%s\n' "$own" "$forkbox" "$parent" "$nested" "$other" "$prefix" ;;
+      inspect)
+        case "$(_fq_last "$@")" in
+          "$parent") printf '%s\n' "$TEST_TEMP/cleat-config/run/x" "$TEST_TEMP" ;;
+          "$nested") printf '%s\n' "$TEST_TEMP/project/src" ;;
+          "$other")  printf '%s\n' "$TEST_TEMP/elsewhere" ;;
+          # A sibling whose path only starts with the same letters.
+          "$prefix") printf '%s\n' "$TEST_TEMP/project-other" ;;
+        esac ;;
+    esac
+  }
+  run _fork_live_writers "$TEST_TEMP/project"
+  assert_success
+  assert_output "$(printf '%s\n%s\n%s' "$own" "$parent" "$nested")"
+}
+
+@test "fork: no running boxes, or no daemon, means nothing to pause" {
+  _daemon_up() { return 1; }
+  docker() { echo "docker $*" >> "$TEST_TEMP/dcalls"; }
+  run _fork_live_writers "$TEST_TEMP/project"
+  assert_success
+  assert_output ""
+  run test -e "$TEST_TEMP/dcalls"
+  assert_failure
+}
+
+@test "fork: a listing that fails while the daemon answers refuses the copy" {
+  _daemon_up() { return 0; }
+  docker() { [ "$1" != ps ]; }
+  run _fork_live_writers "$TEST_TEMP/project"
+  assert_failure
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/testbox"
+  assert_equal "$status" 75
+  assert_output --partial "Could not list the running boxes"
+  run test -e "$CLEAT_FORKS_DIR/testbox"
+  assert_failure
+}
+
+@test "fork: a box that cannot be paused refuses the copy and resumes the ones already paused" {
+  _daemon_up() { return 0; }
+  local a="$CNAME" b
+  b="$(container_name_for "$TEST_TEMP/project" two)"
+  docker() {
+    case "$1" in
+      ps) printf '%s\n' "$a" "$b" ;;
+      pause) echo "pause $2" >> "$TEST_TEMP/dlog"; [ "$2" != "$b" ] ;;
+      unpause) echo "unpause $2" >> "$TEST_TEMP/dlog" ;;
+    esac
+  }
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/testbox"
+  assert_equal "$status" 75
+  assert_output --partial "Nothing was copied"
+  run test -e "$CLEAT_FORKS_DIR/testbox"
+  assert_failure
+  run cat "$TEST_TEMP/dlog"
+  assert_output "$(printf 'pause %s\npause %s\nunpause %s' "$a" "$b" "$a")"
+  # The lock is released, so a retry after stopping the box can run.
+  run bash -c 'ls -A "$1" | grep "^.lock" || true' _ "$CLEAT_FORKS_DIR"
+  assert_output ""
+}
+
+@test "fork: a copy that fails still resumes the paused boxes" {
+  _daemon_up() { return 0; }
+  docker() {
+    case "$1" in
+      ps) printf '%s\n' "$CNAME" ;;
+      pause|unpause) echo "$1 $2" >> "$TEST_TEMP/dlog" ;;
+    esac
+  }
+  _fork_copy_tree_locked() { return 1; }
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/testbox"
+  assert_failure
+  run cat "$TEST_TEMP/dlog"
+  assert_output "$(printf 'pause %s\nunpause %s' "$CNAME" "$CNAME")"
+}
+
+@test "fork: cmd_run names the boxes it paused and skips the copy hint on a refusal" {
+  mock_docker_images "cleat"
+  _FORK_REQUESTED=true
+  _BOX=feat
+  _daemon_up() { return 0; }
+  local own="$CNAME"
+  _fork_live_writers() { printf '%s\n' "$own"; }
+  docker() {
+    case "$1" in
+      pause) return 1 ;;
+      *) command docker "$@" ;;
+    esac
+  }
+  run cmd_run "$TEST_TEMP/project" feat
+  assert_failure
+  assert_output --partial "Could not pause a running box"
+  assert_output --partial "$own"
+  refute_output --partial "Usually an unreadable file"
+}

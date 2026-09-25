@@ -1193,10 +1193,12 @@ EOF
   mkdir -p "$CLEAT_RUN_DIR/test-cleanup2/clip"
   printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$CLEAT_RUN_DIR/test-cleanup2/clip/.browser-open"
   # A live SIBLING session: its .watcher.<pid> marker survives the dead-marker
-  # sweep only while that pid is alive, so back it with a real process.
+  # sweep only while that pid is alive, so back it with a real process. The
+  # marker lives in the host-only clipwatch/ beside the clip dir.
   sleep 30 &
   local sib=$!
-  touch "$CLEAT_RUN_DIR/test-cleanup2/clip/.watcher.$sib"
+  mkdir -p "$CLEAT_RUN_DIR/test-cleanup2/clipwatch"
+  touch "$CLEAT_RUN_DIR/test-cleanup2/clipwatch/.watcher.$sib"
 
   _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup2/clip"
   run exec_claude "test-cleanup2" --dangerously-skip-permissions
@@ -1606,7 +1608,8 @@ SCRIPT
   [[ -f "$marker" ]] || { echo "URL was not opened in browser"; return 1; }
   [[ -f "$proxy_marker" ]] || { echo "Callback proxy was not started"; return 1; }
   run cat "$proxy_marker"
-  assert_output "34063 test-container $clip_dir/.proxy-log"
+  # The proxy writes to the host-only bridge log, never into the clip dir.
+  assert_output "34063 test-container $(dirname "$clip_dir")/bridge/proxy-log"
 }
 
 @test "_auth_callback_proxy: writes diagnostic start line to log file" {
@@ -1653,8 +1656,9 @@ SCRIPT
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
 
-  [[ -f "$clip_dir/.proxy-log" ]] || { echo "proxy log was not created"; return 1; }
-  run cat "$clip_dir/.proxy-log"
+  local log="$(dirname "$clip_dir")/bridge/proxy-log"
+  [[ -f "$log" ]] || { echo "proxy log was not created"; return 1; }
+  run cat "$log"
   assert_output --partial "extracted callback port=49152"
 }
 
@@ -3166,6 +3170,70 @@ _host_hook_appends() {
   assert_output --partial "/var/log/cleat/events.jsonl"
 }
 
+# ── project settings read once, never through a link ────────────────────
+@test "run: a project settings file over 1 MB is not copied or mounted" {
+  # The box picks the file's size, and a sparse one costs it nothing, so the
+  # host copy of it into the run dir is bounded.
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project/.claude"
+  head -c 1048577 /dev/zero | tr '\0' ' ' > "$TEST_TEMP/project/.claude/settings.json"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is larger than 1 MB, so Cleat did not read it."
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+  [ ! -e "$CLEAT_RUN_DIR/$cname/settings/project-settings.json" ] || {
+    echo "an overlay was written for the oversized file"; return 1; }
+}
+
+@test "resume: a FIFO at a project settings path neither blocks the refresh nor reaches the box" {
+  # The refresh has no -f pre-filter of its own. A FIFO the box planted there
+  # blocked jq's open, and with it the resume, until something wrote to it.
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  local cname="c2-fifo" dir fifo pid i=0
+  dir="$CLEAT_RUN_DIR/$cname/settings"
+  mkdir -p "$dir" "$TEST_TEMP/project/.claude"
+  printf '{}\n' > "$dir/settings.json"
+  printf '{"old":1}\n' > "$dir/project-settings.json"
+  fifo="$TEST_TEMP/project/.claude/settings.json"
+  mkfifo "$fifo"
+  ACTIVE_CAPS=(hooks)
+  ( _refresh_settings_overlays "$cname" "$TEST_TEMP/project" ) 3>&- >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    # Release the blocked reader so bats does not hang, then fail.
+    : > "$fifo" &
+    wait "$pid" 2>/dev/null || true
+    echo "the refresh blocked on the FIFO"; return 1
+  fi
+  wait "$pid" 2>/dev/null || true
+  run cat "$dir/project-settings.json"
+  assert_output "{}"
+}
+
+@test "run: a jq-less host never copies a linked project settings file" {
+  # With no jq, a file with no hooks text and no \u escape passes through
+  # verbatim. Through a link that was any host file of that shape.
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf 'aws_secret_access_key = FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/credentials"
+  ln -s "$TEST_TEMP/outside/credentials" "$TEST_TEMP/project/.claude/settings.local.json"
+  _hide_jq
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is a link or unreadable"
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.local.json"
+  assert_success
+  run grep -rl FAKE-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+}
+
 @test "hook bridge: a second terminal on the same box does not start a second bridge" {
   # Both bridges tail the same spool, so every host hook ran twice per event:
   # a hook that writes, commits or notifies did it twice, silently.
@@ -3202,6 +3270,7 @@ _host_hook_appends() {
   head -c $(( 1048576 + 4096 )) /dev/zero | tr '\0' 'x' > "$f"
   _HOOK_DROP_LOG_N=0
   _hook_drop_off=999999
+  _hook_drop_ino=12345
 
   _hook_drop_log "size" '{"hook_event_name":"Stop"}' "test-ctr" 0
   run test -f "$f.1"
@@ -3212,6 +3281,44 @@ _host_hook_appends() {
   # And the session's read offset went back to the start, or the end-of-session
   # report would read past the end of the new file and say nothing.
   assert_equal "$_hook_drop_off" 0
+  # The inode goes with it, or the report would read the rotated file from
+  # byte 0 and count earlier sessions' rows as this one's.
+  assert_equal "$_hook_drop_ino" ""
+}
+
+@test "hook drops report: after two rotations it reads the new file only, and still counts this box" {
+  # The inode taken with the offset names the first generation, which a second
+  # rotation has overwritten. The report cannot follow it, so it falls back to
+  # the new file: a lower bound, but never silent for this box's own rows, and
+  # never the rotated file from byte 0.
+  BOLD=''; RESET=''; DIM=''
+  local log="$CLEAT_STATE_DIR/hook-drops.log" off ino i
+  mkdir -p "$CLEAT_STATE_DIR"
+  for i in $(seq 1 50); do printf 'now\t%s\tjson\tbox-a\tmd5\t0\told\n' "$_HOOK_DROP_MARK"; done > "$log"
+  off="$(_path_size "$log")"
+  ino="$(_path_ino "$log")"
+  mv "$log" "$log.1"
+  for i in $(seq 1 100); do printf 'now\t%s\tjson\tbox-a\tmd5\t0\tgen2\n' "$_HOOK_DROP_MARK"; done > "$log"
+  mv -f "$log" "$log.1"
+  for i in 1 2 3; do printf 'now\t%s\tjson\tbox-a\tmd5\t0\tgen3\n' "$_HOOK_DROP_MARK"; done > "$log"
+  run _maybe_report_hook_drops "$log" "$off" box-a "$ino"
+  assert_success
+  assert_output --partial "Dropped 3 hook events"
+}
+
+@test "hook drops report: with no rotation the inode changes nothing" {
+  BOLD=''; RESET=''; DIM=''
+  local log="$CLEAT_STATE_DIR/hook-drops.log" off ino
+  mkdir -p "$CLEAT_STATE_DIR"
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\told\n' "$_HOOK_DROP_MARK" > "$log"
+  off="$(_path_size "$log")"
+  ino="$(_path_ino "$log")"
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\tnew\n' "$_HOOK_DROP_MARK" >> "$log"
+  # A stale .1 from long ago is another file, so it is never read.
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\tancient\n' "$_HOOK_DROP_MARK" > "$log.1"
+  run _maybe_report_hook_drops "$log" "$off" box-a "$ino"
+  assert_success
+  assert_output --partial "Dropped 1 hook event from the box"
 }
 
 @test "hook bridge: it survives a host with no settings file at all" {
@@ -3341,41 +3448,6 @@ _spool_box() {   # makes $CLEAT_RUN_DIR/box-a/hooks/events.jsonl holding $1 byte
   assert_output --regexp '^ *150$'
   run ls -A "$CLEAT_RUN_DIR/box-a/hooks"
   assert_output "events.jsonl"
-}
-
-@test "hooks: a session start claims an oversized spool when no bridge runs" {
-  # The cap is on, a project hook forwards into the spool, the host has no hook
-  # of its own, so no bridge ever starts to read what the box queues.
-  _host_open_cmd() { echo ""; }
-  _HOOK_SPOOL_MAX=100
-  mkdir -p "$TEST_TEMP/project/.claude"
-  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' \
-    > "$TEST_TEMP/project/.claude/settings.json"
-  local cname spool
-  cname="$(container_name_for "$TEST_TEMP/project")"
-  mock_docker_ps "$cname"
-  spool="$CLEAT_RUN_DIR/$cname/hooks/events.jsonl"
-  mkdir -p "${spool%/*}"
-  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
-  run cmd_shell "$TEST_TEMP/project"
-  assert_success
-  assert_output --partial "Discarded"
-  run test -e "$spool"
-  assert_failure
-  run cat "$CLEAT_STATE_DIR/hook-drops.log"
-  assert_output --partial "	spool	$cname	"
-  # The same pass runs at a login and at a Claude session.
-  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
-  run cmd_login "$TEST_TEMP/project"
-  assert_output --partial "Discarded"
-  run test -e "$spool"
-  assert_failure
-  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
-  resolve_caps "$TEST_TEMP/project"
-  run exec_claude "$cname" --dangerously-skip-permissions
-  assert_output --partial "Discarded"
-  run test -e "$spool"
-  assert_failure
 }
 
 @test "hooks: a session start leaves the spool alone while another bridge is live" {

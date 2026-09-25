@@ -298,3 +298,74 @@ EOF
 
   docker rm -f "$cname" >/dev/null 2>&1 || true
 }
+
+# ── v1.5.4: the input history bind source is host-only ──────────────────────
+# The box plants a relative link at the old history name inside its session
+# dir, which it mounts read-write. From there ../../../ is the host $HOME. A
+# plain `docker start` (what a dashboard start runs) re-resolves every recorded
+# bind source, so only a real engine can show the link is inert. The recreate
+# through cleat must not follow it either.
+@test "integration: a history link planted inside the box is inert after stop and start" {
+  cd "$INT_PROJECT"
+  run "$CLI" run
+  assert_success
+  local cname before
+  cname="$(int_cname)"
+  printf 'HOST-CANARY\n' > "$HOME/canary"
+  touch -t 200001010000 "$HOME/canary"
+  before="$(cli_call _path_mtime "$HOME/canary")"
+  run docker exec "$cname" runuser -u coder -- bash -c \
+    'cd /home/coder/.claude/projects/-workspace && rm -f history.jsonl && ln -s ../../../canary history.jsonl'
+  assert_success
+
+  docker stop "$cname" >/dev/null
+  run docker start "$cname"
+  assert_success
+  run docker exec "$cname" cat /home/coder/.claude/history.jsonl
+  refute_output --partial "HOST-CANARY"
+
+  docker stop "$cname" >/dev/null
+  run "$CLI" run
+  assert_success
+  run docker exec "$cname" cat /home/coder/.claude/history.jsonl
+  refute_output --partial "HOST-CANARY"
+
+  run cat "$HOME/canary"
+  assert_output "HOST-CANARY"
+  run cli_call _path_mtime "$HOME/canary"
+  assert_output "$before"
+
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+}
+
+# ── v1.5.4: clipboard readiness is written inside the box ──────────────────
+# The host used to touch .host-ready in the clip dir the box has read-write, so
+# a link renamed over it had the host create or re-stamp a file the box chose.
+# A docker exec as coder writes it now. Only a real engine shows that exec can
+# write the mount as coder and that a planted link is replaced in the box.
+@test "integration: clipboard readiness is written inside the box and a planted link is replaced there" {
+  cd "$INT_PROJECT"
+  run "$CLI" run
+  assert_success
+  local cname clip out
+  cname="$(int_cname)"
+  clip="$HOME/.config/cleat/run/$cname/clip"
+  out="$TEST_TEMP/int-outside"
+  mkdir -p "$out"
+  rm -f "$clip/.host-ready"
+  ln -s "$out/created" "$clip/.host-ready"
+
+  run cli_call _clip_announce_ready "$cname"
+  assert_success
+
+  run test -L "$clip/.host-ready"
+  assert_failure
+  run test -f "$clip/.host-ready"
+  assert_success
+  run test -e "$out/created"
+  assert_failure
+  run docker exec "$cname" test -f /tmp/cleat-clip/.host-ready
+  assert_success
+
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+}

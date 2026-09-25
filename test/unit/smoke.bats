@@ -499,6 +499,49 @@ STUB
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat session rename on a stopped box writes the title under strict mode" {
+  # Docker answers that the box is not running, so the host writes, with its
+  # checks made at write time.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  local proj="$TEST_TEMP/project" uuid="0123abcd-1111-2222-3333-444455556666" key sdir
+  key="project-$(echo -n "$proj" | _md5 | head -c 8)"
+  sdir="$HOME/.claude/projects/$key"
+  mkdir -p "$sdir"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid" > "$sdir/$uuid.jsonl"
+  run cleat_bin_timeout 10 session rename "$uuid" --title "smoke title"
+  refute_output --partial "unbound variable"
+  assert_success
+  run tail -1 "$sdir/$uuid.jsonl"
+  assert_output --partial '"customTitle":"smoke title"'
+}
+
+@test "smoke: cleat session rename on a running box hands the write to the box" {
+  # A running box with no Claude in it passes the live gate, and the rename is
+  # then written by the box through one bounded docker exec, not by the host.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  local proj="$TEST_TEMP/project" uuid="0123abcd-1111-2222-3333-444455556666" key sdir cname
+  key="project-$(echo -n "$proj" | _md5 | head -c 8)"
+  cname="$(_compute_cname "$proj")"
+  sdir="$HOME/.claude/projects/$key"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 10:00 ? 00:00:00 /sbin/docker-init -- sleep infinity\n' \
+    > "$DOCKER_MOCK_DIR/top_output"
+  mkdir -p "$sdir"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid" > "$sdir/$uuid.jsonl"
+  run cleat_bin_timeout 10 session rename "$uuid" --title "box title"
+  refute_output --partial "unbound variable"
+  assert_success
+  run grep -c "box title" "$sdir/$uuid.jsonl"
+  assert_output "0"
+  run grep -c "^docker exec $cname runuser -u coder" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
 @test "smoke: cleat account with no accounts exits cleanly and says how to make one" {
   run cleat_bin_timeout 10 account
   assert_success
@@ -680,6 +723,9 @@ STUB
   refute_output --partial "unbound variable"
   run jq -r '.oauthAccount // "absent"' "$f"
   assert_output "absent"
+  # The flag the remove writes before it unpins is cleared by the finished drop.
+  run test -e "${f}.identity-stale"
+  assert_failure
 }
 
 @test "smoke: cleat account rm with no name asks which one" {
@@ -1018,6 +1064,30 @@ CURL
   assert_failure
 }
 
+@test "smoke: cleat session trash carries an old in-mount trash out under strict mode" {
+  # The trash moved out of the session dir. The first trash command carries the
+  # old <key>/.cleat-trash out, and that code runs here on the real binary,
+  # where set -u would catch a name the sourced tests cannot see.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  local proj="$TEST_TEMP/project" uuid="0123abcd-1111-2222-3333-444455556666"
+  local key sdir entry
+  key="project-$(echo -n "$proj" | _md5 | head -c 8)"
+  sdir="$HOME/.claude/projects/$key"
+  # A fresh stamp, so the sweep that runs first keeps it.
+  entry="$sdir/.cleat-trash/$(date +%s)-$uuid"
+  mkdir -p "$entry"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid" > "$entry/$uuid.jsonl"
+  run cleat_bin_timeout 10 session trash
+  refute_output --partial "unbound variable"
+  assert_success
+  assert_output --partial "0123abcd"
+  run test -e "$sdir/.cleat-trash"
+  assert_failure
+}
+
 @test "smoke: the plural and the short form still reach the session verb" {
   # Nothing has shipped under either name, so this is courtesy rather than
   # compatibility. `cleat sessions` is what fingers type.
@@ -1049,6 +1119,33 @@ CURL
   run cleat_bin_timeout 5 status
   refute_output --partial "unbound variable"
   refute_output --partial "command not found"
+}
+
+@test "smoke: cleat start with a host clipboard keeps watcher markers out of the clip mount (strict mode)" {
+  # A fake pbcopy first on PATH, so the real binary takes the clipboard watcher
+  # branch on every host and never reaches a real clipboard.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/fakeclip"
+  printf '#!/bin/sh\ncat >/dev/null\n' > "$TEST_TEMP/fakeclip/pbcopy"
+  chmod +x "$TEST_TEMP/fakeclip/pbcopy"
+  export PATH="$TEST_TEMP/fakeclip:$PATH"
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 start
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  local cname rd
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  rd="$CLEAT_CONFIG_DIR/run/$cname"
+  run test -d "$rd/clipwatch"
+  assert_success
+  run bash -c "ls -a '$rd/clip' | grep -c '^[.]watcher[.]'"
+  assert_output "0"
+  run grep -s "unbound variable" "$rd/logs/watcher.log"
+  assert_failure
 }
 
 @test "smoke: cleat prune --cache --yes runs non-interactively without crashing" {
@@ -1176,6 +1273,52 @@ CURL
   assert_output --partial "caps memory at"
 }
 
+@test "smoke: cleat config --project --list returns when the project .cleat is a FIFO" {
+  # The box can put a FIFO at /workspace/.cleat. Every reader opened it and
+  # blocked until something wrote to it. Now it reads as absent, under the real
+  # binary's strict mode.
+  mkdir -p "$TEST_TEMP/fifo-project"
+  mkfifo "$TEST_TEMP/fifo-project/.cleat"
+  cd "$TEST_TEMP/fifo-project"
+  run cleat_bin_timeout 20 config --project --list
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Resources"
+}
+
+@test "smoke: cleat config --project --list shows a hostile resources value without its control bytes" {
+  # A project .cleat is repo- or box-written. Its [resources] values are drawn
+  # through echo -e, and the sanitizer's C1 loop runs here under the real
+  # binary's strict mode (bash 3.2 on the macOS legs).
+  local esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  mkdir -p "$TEST_TEMP/hostile-project"
+  printf '[resources]\nmemory = m%s]0;PWN%s\n' "$esc" "$bel" > "$TEST_TEMP/hostile-project/.cleat"
+  cd "$TEST_TEMP/hostile-project"
+  run cleat_bin config --project --list
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "memory  m]0;PWN"
+  refute_output --partial "${esc}]0;PWN"
+}
+
+@test "smoke: cleat config --project refuses a symlinked .cleat under strict mode" {
+  # The edit used to read through the link and rename a copy of the target
+  # into the workspace. Refused now, with no success line after it.
+  mkdir -p "$TEST_TEMP/link-project"
+  printf 'HOSTSECRET\n' > "$TEST_TEMP/secret"
+  ln -s "$TEST_TEMP/secret" "$TEST_TEMP/link-project/.cleat"
+  cd "$TEST_TEMP/link-project"
+  run cleat_bin config --project --enable git
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  refute_output --partial "git enabled"
+  refute_output --partial "unbound variable"
+  [ -L "$TEST_TEMP/link-project/.cleat" ] || { echo ".cleat is no longer the link"; return 1; }
+  run cat "$TEST_TEMP/secret"
+  assert_output "HOSTSECRET"
+}
+
 @test "smoke: cleat config --cpus above the core count exits cleanly" {
   run cleat_bin config --cpus 512
   assert_success
@@ -1213,6 +1356,15 @@ CURL
   run cleat_bin trust --list
   assert_success
   assert_output --partial "$TEST_TEMP/proj"
+}
+
+@test "smoke: cleat trust ignores an unknown project cap and records the known ones" {
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[caps]\ngit\nfoo,bar\n' > "$TEST_TEMP/proj/.cleat"
+  run cleat_bin trust "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Approved caps: git"
+  assert_output --partial "Ignoring unknown capability"
 }
 
 @test "smoke: cleat untrust removes a project's trust entry" {
@@ -1369,6 +1521,38 @@ CURL
   refute_output --partial "syntax error"
 }
 
+@test "smoke: a directory the box plants in the clip dir does not abort the session end (strict mode)" {
+  # The real binary runs under set -euo pipefail from line 2, which is where the
+  # teardown died: rm -f on a box-planted directory exits 1. The stub plays the
+  # box and plants one at the .clipboard.* glob and at .host-ready.
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  local stub="$TEST_TEMP/plantstub"
+  mkdir -p "$stub"
+  cat > "$stub/docker" << STUB
+#!/usr/bin/env bash
+case " \$* " in
+  *" exec "*" runuser "*)
+    for d in "$XDG_CONFIG_HOME"/cleat/run/*/clip; do
+      mkdir -p "\$d/.clipboard.planted"
+      rm -f "\$d/.host-ready"; mkdir -p "\$d/.host-ready"
+    done ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+STUB
+  chmod +x "$stub/docker"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env PATH="$stub:$MOCK_BIN:$PATH" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" DOCKER_EXIT_CODE=0 \
+    "$CLI" start </dev/null
+  assert_success
+  assert_output --partial "Session ended"
+  refute_output --partial "rm: "
+}
+
 @test "smoke: cleat run into existing image exits cleanly" {
   mkdir -p "$TEST_TEMP/project"
   printf '' > "$DOCKER_MOCK_DIR/ps_output"
@@ -1466,6 +1650,25 @@ CURL
   refute_output --partial "unbound variable"
   refute_output --partial "syntax error"
   assert_output --partial "~/.claude/.config.json"
+}
+
+@test "smoke: cleat start with a linked project settings file warns and starts under strict mode" {
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  printf 'FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/secret"
+  ln -s "$TEST_TEMP/outside/secret" "$TEST_TEMP/project/.claude/settings.json"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 start
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  assert_output --partial "is a link or unreadable"
+  run grep -c ':/workspace/.claude/settings.json' "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -rl FAKE-HOST-SECRET "$XDG_CONFIG_HOME/cleat/run"
+  assert_failure
 }
 
 @test "smoke: cleat start fails cleanly when docker run errors" {
@@ -1780,6 +1983,36 @@ EOF
   }
 }
 
+@test "smoke: a bare key in an untrusted .cleat.env warns and stays out of docker run" {
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/project" "$CLEAT_CONFIG_DIR"
+  printf '[caps]\nenv\n' > "$CLEAT_CONFIG_DIR/config"
+  printf 'SMOKE_R154\nSMOKE_LITERAL=1\n' > "$TEST_TEMP/project/.cleat.env"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  cd "$TEST_TEMP/project"
+  export SMOKE_R154=smoke-host-value
+  run cleat_bin_timeout 5 start
+  unset SMOKE_R154
+  refute_output --partial "unbound variable"
+  assert_output --partial "Not passing the host variables"
+  run grep -q 'SMOKE_LITERAL=1' "$DOCKER_CALLS"
+  assert_success
+  run grep -q 'smoke-host-value' "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "smoke: cleat trust approves the host variables a .cleat.env asks for" {
+  unset CLEAT_TRUST_PROJECT
+  mkdir -p "$TEST_TEMP/proj"
+  printf 'SMOKE_R154_TRUST\n' > "$TEST_TEMP/proj/.cleat.env"
+  run cleat_bin trust "$TEST_TEMP/proj"
+  assert_success
+  assert_output --partial "Approved host variables: SMOKE_R154_TRUST"
+  refute_output --partial "unbound variable"
+}
+
 @test "smoke: cleat start with gh cap mounts ~/.config/gh" {
   mkdir -p "$TEST_TEMP/project"
   mkdir -p "$HOME/.config/gh"
@@ -2061,11 +2294,51 @@ EOF
     cat "$DOCKER_CALLS"
     return 1
   }
-  grep -qF -- "${project_key}/history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
-    echo "History overlay source doesn't match project key"
+  # The source is the host-only store, keyed by the project, never a name
+  # inside the session dir the box mounts read-write.
+  grep -qF -- "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
+    echo "History overlay source is not the project's host-only store"
     cat "$DOCKER_CALLS"
     return 1
   }
+  [ -f "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl" ] || {
+    echo "The history store was not created"
+    return 1
+  }
+}
+
+@test "smoke: cleat start recreates a box whose history bind is in its session dir" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname _bn _h project_key s
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+  _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
+  project_key="${_bn}-${_h}"
+  s="$HOME/.claude/projects/$project_key"
+  mkdir -p "$s" "$CLEAT_CONFIG_DIR/run/$cname/settings"
+  echo '{}' > "$CLEAT_CONFIG_DIR/run/$cname/settings/settings.json"
+  printf '{"display":"old-line"}\n' > "$s/history.jsonl"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  printf 'H%s\nS%s\n' "$s/history.jsonl" "$s" > "$DOCKER_MOCK_DIR/inspect_output"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 start
+  refute_output --partial "unbound variable"
+  assert_output --partial "Recreating container"
+  grep -qF -- "docker rm -f $cname" "$DOCKER_CALLS" || {
+    echo "The legacy box was not removed"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  grep -qF -- "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl:/home/coder/.claude/history.jsonl" "$DOCKER_CALLS" || {
+    echo "The recreated box does not mount the host-only store"
+    cat "$DOCKER_CALLS"
+    return 1
+  }
+  run cat "$CLEAT_CONFIG_DIR/history/${project_key}/history.jsonl"
+  assert_output '{"display":"old-line"}'
 }
 
 # ── Config drift and version label ──────────────────────────────────────────
@@ -2490,6 +2763,29 @@ EOF
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: fork refresh pauses a running box on the same folder under strict mode" {
+  # The copy runs over the live tree, so every running box that can write it is
+  # paused around the copy and resumed after. That is two new docker pipelines
+  # on this path, which only the real binary runs under set -euo pipefail.
+  mkdir -p "$TEST_TEMP/project/src"
+  echo code > "$TEST_TEMP/project/src/app.js"
+  cd "$TEST_TEMP/project"
+  local main_cname
+  main_cname="$(_compute_cname "$TEST_TEMP/project")"
+  mkdir -p "$CLEAT_CONFIG_DIR/forks/${main_cname}-feat-a"
+  printf '%s\n' "$main_cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  run cleat_bin fork refresh feat-a <<< "y"
+  assert_success
+  assert_output --partial "Workspace copied"
+  assert_output --partial "Paused for the copy and resumed"
+  refute_output --partial "unbound variable"
+  run grep -nE "^docker (pause|unpause) " "$DOCKER_CALLS"
+  assert_output --regexp "^[0-9]+:docker pause ${main_cname}
+[0-9]+:docker unpause ${main_cname}\$"
+  [ -f "$CLEAT_CONFIG_DIR/forks/${main_cname}-feat-a/src/app.js" ]
+}
+
 @test "smoke: cleat fork path output is capturable, no trailing escapes" {
   # THE bug this subcommand exists to avoid, and it only shows through a real
   # subprocess. `tput cnorm` writes its escape to STDOUT whether or not stdout
@@ -2561,6 +2857,8 @@ _smoke_refused_open() {
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
   local clip="$XDG_CONFIG_HOME/cleat/run/$cname/clip"
+  # The watcher logs to the host-only bridge dir beside the clip dir.
+  local blog="$XDG_CONFIG_HOME/cleat/run/$cname/bridge/proxy-log"
   cat > "$TEST_TEMP/wrap/docker" <<WRAP
 #!/usr/bin/env bash
 case "\$*" in
@@ -2568,7 +2866,7 @@ case "\$*" in
     printf '%s' 'https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback' > "$clip/.browser-open"
     i=0
     while [ "\$i" -lt 100 ]; do
-      grep -q 'BLOCKED-ORIGIN origin=auth.example.com' "$clip/.proxy-log" 2>/dev/null && break
+      grep -q 'BLOCKED-ORIGIN origin=auth.example.com' "$blog" 2>/dev/null && break
       sleep 0.1
       i=\$((i + 1))
     done ;;
@@ -2611,6 +2909,7 @@ WRAP
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
   local clip="$XDG_CONFIG_HOME/cleat/run/$cname/clip"
+  local blog="$XDG_CONFIG_HOME/cleat/run/$cname/bridge/proxy-log"
   local ledger="$XDG_CONFIG_HOME/cleat/run/$cname/clipclaim/.opens"
   cat > "$TEST_TEMP/wrap/docker" <<WRAP
 #!/usr/bin/env bash
@@ -2622,7 +2921,7 @@ case "\$*" in
     printf '%s' 'https://docs.example.org/capped-page' > "$clip/.browser-open"
     i=0
     while [ "\$i" -lt 100 ]; do
-      grep -q 'RATE-CAPPED limit=' "$clip/.proxy-log" 2>/dev/null && break
+      grep -q 'RATE-CAPPED limit=' "$blog" 2>/dev/null && break
       sleep 0.1
       i=\$((i + 1))
     done ;;
@@ -2645,6 +2944,131 @@ WRAP
   assert_output --partial "Did not open"
   assert_output --partial "https://docs.example.org/capped-page"
   refute_output --partial "unbound variable"
+}
+
+# Recording stubs for both host openers, first on PATH, so whichever one
+# _host_open_cmd picks (a Linux runner can carry an `open` too) writes its
+# argument to opened.log and nothing reaches a real browser.
+_smoke_record_openers() {
+  local o
+  for o in open xdg-open; do
+    printf '#!/usr/bin/env bash\necho "$1" >> "%s"\n' "$TEST_TEMP/opened.log" > "$1/$o"
+    chmod +x "$1/$o"
+  done
+}
+
+@test "smoke: cleat shell keeps the browser bridge off under strict mode when clipclaim cannot be made" {
+  # A regular file where the host-only claim dir goes, so it cannot be made.
+  # The watcher turns the bridge off instead of claiming inside the clip mount,
+  # and that branch has to hold under set -euo pipefail. always mode, so no
+  # origin check stands between a claim in the mount and an open.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  local rd="$XDG_CONFIG_HOME/cleat/run/$cname"
+  mkdir -p "$rd/clip"
+  : > "$rd/clipclaim"
+  cat > "$TEST_TEMP/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+  "exec -it "*)
+    printf '%s' 'https://x.example/no-claim-dir' > "$rd/clip/.browser-open"
+    i=0
+    while [ "\$i" -lt 30 ]; do
+      grep -q 'browser bridge off this session' "$rd/logs/watcher.log" 2>/dev/null && break
+      sleep 0.1
+      i=\$((i + 1))
+    done
+    sleep 0.6 ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+WRAP
+  chmod +x "$TEST_TEMP/wrap/docker"
+  _smoke_record_openers "$TEST_TEMP/wrap"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env \
+    PATH="$TEST_TEMP/wrap:$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE=0 \
+    CLEAT_BROWSER_BRIDGE=always \
+    "$CLI" shell
+  assert_success
+  refute_output --partial "unbound variable"
+  run grep -c 'browser bridge off this session' "$rd/logs/watcher.log"
+  assert_output "1"
+  run test -e "$TEST_TEMP/opened.log"
+  assert_failure
+}
+
+@test "smoke: a session keeps both bridges off and still ends cleanly under strict mode when clipclaim cannot be made" {
+  # The session path: a fake pbcopy so the clipboard watcher runs, recording
+  # openers so the browser watcher runs, and a regular file at clipclaim. Both
+  # watchers turn their bridge off, readiness is never announced, and the
+  # teardown still reaches the end. BSD rm -f fails on a path under a regular
+  # file (ENOTDIR is not ENOENT) where GNU rm -f does not, so the rm below
+  # brings every runner to the macOS behaviour.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
+  printf '#!/bin/sh\ncat >/dev/null\n' > "$TEST_TEMP/wrap/pbcopy"
+  chmod +x "$TEST_TEMP/wrap/pbcopy"
+  _smoke_record_openers "$TEST_TEMP/wrap"
+  local real_rm; real_rm="$(command -v rm)"
+  cat > "$TEST_TEMP/wrap/rm" <<RM
+#!/bin/sh
+for a in "\$@"; do
+  case "\$a" in -*) continue ;; esac
+  p="\${a%/*}"
+  if [ "\$p" != "\$a" ] && [ -e "\$p" ] && [ ! -d "\$p" ]; then
+    echo "rm: \$a: Not a directory" >&2
+    exit 1
+  fi
+done
+exec "$real_rm" "\$@"
+RM
+  chmod +x "$TEST_TEMP/wrap/rm"
+  local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  local rd="$XDG_CONFIG_HOME/cleat/run/$cname"
+  mkdir -p "$rd/clip"
+  : > "$rd/clipclaim"
+  cat > "$TEST_TEMP/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+  "exec -it "*)
+    i=0
+    while [ "\$i" -lt 30 ]; do
+      grep -q 'clipboard bridge off this session' "$rd/logs/watcher.log" 2>/dev/null \
+        && grep -q 'browser bridge off this session' "$rd/logs/watcher.log" 2>/dev/null && break
+      sleep 0.1
+      i=\$((i + 1))
+    done ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+WRAP
+  chmod +x "$TEST_TEMP/wrap/docker"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env \
+    PATH="$TEST_TEMP/wrap:$MOCK_BIN:$PATH" \
+    HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    DOCKER_EXIT_CODE=0 \
+    CLEAT_NO_CLIPBOARD_IMAGE=1 \
+    "$CLI" start
+  assert_success
+  refute_output --partial "unbound variable"
+  refute_output --partial "Not a directory"
+  run grep -c 'bridge off this session' "$rd/logs/watcher.log"
+  assert_output "2"
+  run grep -c '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS"
+  assert_output "0"
+  run test -e "$rd/clip/.host-ready"
+  assert_failure
 }
 
 @test "smoke: cleat shell claims an oversized hook spool under strict mode" {
@@ -2685,13 +3109,13 @@ WRAP
 }
 
 @test "smoke: cleat claude reports a rate-capped image paste under strict mode" {
-  # A refused image request leaves one line in the box's watcher log. The
+  # A refused image request leaves one line in the host-only watcher log. The
   # session-end reader counts this session's lines under strict mode.
   mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/wrap"
   local cname; cname="$(_compute_cname "$TEST_TEMP/project")"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
-  local wlog="$CLEAT_CONFIG_DIR/run/$cname/clip/.watcher-log"
+  local wlog="$CLEAT_CONFIG_DIR/run/$cname/logs/watcher.log"
   cat > "$TEST_TEMP/wrap/docker" <<WRAP
 #!/usr/bin/env bash
 case "\$*" in

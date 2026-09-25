@@ -273,6 +273,20 @@ _th_record_setup() {
   refute_output --partial "from-main"
 }
 
+@test "build_setup_payload: a script of exactly 1 MiB is inlined whole" {
+  # The boundary of the size refusal and of the read bound: 1 MiB is allowed
+  # and every byte of it reaches the payload.
+  head -c 1048576 /dev/zero | tr '\0' '#' > "$PROJECT/exact.sh"
+  printf '[setup]\nscript exact.sh\n' > "$PROJECT/.cleat"
+  local rc=0
+  _build_setup_payload "$PROJECT" main > "$TEST_TEMP/payload" 2>&1 || rc=$?
+  run echo "$rc"
+  assert_output "0"
+  local begin="# cleat setup: begin script exact.sh" end="# cleat setup: end script exact.sh"
+  run _path_size "$TEST_TEMP/payload"
+  assert_output "$(( ${#begin} + 1 + 1048576 + 1 + ${#end} + 1 ))"
+}
+
 @test "setup_payload_hash: stable for an identical payload, changes on any inline edit" {
   local h1 h2 h3
   h1="$(_setup_payload_hash "echo one")"
@@ -1162,27 +1176,35 @@ _th_record_setup() {
   assert_output --partial "033"
 }
 
-@test "cmd_status: sanitizes an injected control sequence in the caps display" {
+@test "cmd_status: sanitizes an injected control sequence in an ignored cap name" {
+  # A name Cleat does not know never reaches the caps display. It is named in
+  # the ignored-cap warning instead, which must sanitize it the same way. git
+  # is there so the file still has a cap to trust.
   local cap esc
   esc="$(printf '\x1b')"
   cap="$(printf '\x1bBADESC\\033TAIL')"
-  printf '[caps]\n%s\n' "$cap" > "$PROJECT/.cleat"
+  printf '[caps]\ngit\n%s\n' "$cap" > "$PROJECT/.cleat"
   local h
   h="$(_hash_cleat_caps "$PROJECT/.cleat" "")"
   _trust_record "$PROJECT" "$h" main
   run cmd_status "$PROJECT"
+  assert_output --partial "Ignoring unknown capability"
   assert_output --partial "BADESC"
   refute_output --partial "${esc}BADESC"
   assert_output --partial "033"
 }
 
-@test "cmd_trust: sanitizes an injected control sequence in the Approved caps line" {
+@test "cmd_trust: sanitizes an injected control sequence in an ignored cap name" {
+  # The hostile name is not a cap, so it is never approved: "Approved caps"
+  # names only git, and the name shows up sanitized in the ignored-cap warning.
   local cap esc
   esc="$(printf '\x1b')"
   cap="$(printf '\x1bBADESC\\033TAIL')"
-  printf '[caps]\n%s\n' "$cap" > "$PROJECT/.cleat"
+  printf '[caps]\ngit\n%s\n' "$cap" > "$PROJECT/.cleat"
   run cmd_trust
   assert_success
+  assert_output --partial "Approved caps: git"
+  assert_output --partial "Ignoring unknown capability"
   assert_output --partial "BADESC"
   refute_output --partial "${esc}BADESC"
   assert_output --partial "033"

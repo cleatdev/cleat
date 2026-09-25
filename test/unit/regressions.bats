@@ -9274,3 +9274,267 @@ _c18_third_email() {
   run _c18_third_email
   assert_output "shared@example.com"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the browser claim tested the bridge file's type only BEFORE the
+# rename. The box writes the clip dir, so it could rename a FIFO or a directory
+# onto .browser-open between that test and the mv. A FIFO then reached `head`,
+# which blocked on open forever inside the watcher's command substitution with
+# its TERM trap deferred. A directory was stranded in the claim dir. The mv
+# below does the box's swap at exactly that instant, so the race is won every
+# time.
+@test "regression v1.5.4: a FIFO swapped in before the browser claim hung the watcher" {
+  local bridge="$TEST_TEMP/clip/.browser-open" claimdir="$TEST_TEMP/clipclaim"
+  mkdir -p "$TEST_TEMP/clip" "$claimdir"
+  printf 'https://example.com/x\n' > "$bridge"
+  mv() { rm -f "$bridge"; mkfifo "$bridge"; command mv "$@"; }
+  # Stubbed so a reverted fix fails fast instead of blocking on the FIFO.
+  head() { : > "$TEST_TEMP/head.called"; }
+  run _browser_claim_url "$bridge" "$claimdir"
+  unset -f mv head
+  assert_failure
+  run test -e "$TEST_TEMP/head.called"
+  assert_failure
+  run ls -A "$claimdir"
+  assert_output ""
+}
+
+@test "regression v1.5.4: a directory swapped in before the browser claim was stranded" {
+  local bridge="$TEST_TEMP/clip/.browser-open" claimdir="$TEST_TEMP/clipclaim"
+  mkdir -p "$TEST_TEMP/clip" "$claimdir"
+  printf 'https://example.com/x\n' > "$bridge"
+  mv() { rm -f "$bridge"; mkdir -p "$bridge/sub"; echo x > "$bridge/sub/f"; command mv "$@"; }
+  run _browser_claim_url "$bridge" "$claimdir"
+  unset -f mv
+  assert_failure
+  run ls -A "$claimdir"
+  assert_output ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: host reads of a box's per-project claude.json were unbounded. The box
+# writes that file through a read-write bind, so it picks the size, and the host
+# read it whole into a shell variable, into jq, into a .bak, into the sibling
+# scan of every other box, and padded up to it in place. Every read now goes
+# through a bounded snapshot under a cap of the host file plus a headroom. The
+# tests shrink the headroom to 1 KB so a 4 KB file stands in for a huge one.
+_c19_json_of() {  # SIZE MARKER [KEY:VALUE]: a valid JSON object of about SIZE bytes
+  local pad
+  pad="$(head -c "$1" /dev/zero | tr '\0' x)"
+  printf '{"marker":"%s",%s"pad":"%s"}\n' "$2" "${3:+$3,}" "$pad"
+}
+
+@test "regression v1.5.4: a box-sized project claude.json was read whole by the host" {
+  command -v jq >/dev/null || skip "needs jq"
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/projects"
+  local f="$CLEAT_PROJECTS_DIR/proj-11111111/claude.json"
+  mkdir -p "${f%/*}"
+  rm -f "$HOME/.claude.json"
+  _c19_json_of 4000 BOX-BLOAT-MARKER > "$f"
+  run _build_project_claude_json "$f"
+  assert_success
+  assert_output --partial "is over"
+  run test -e "${f}.bak"
+  assert_failure
+  run grep -c BOX-BLOAT-MARKER "$f"
+  assert_output "0"
+  run jq -r '.hasCompletedOnboarding' "$f"
+  assert_output "true"
+}
+
+@test "regression v1.5.4: the sibling identity scan read an oversized box file whole" {
+  command -v jq >/dev/null || skip "needs jq"
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/projects"
+  _pinned_project_keys() { printf ':'; }
+  local sib="$CLEAT_PROJECTS_DIR/sib-22222222/claude.json"
+  mkdir -p "${sib%/*}"
+  rm -f "$HOME/.claude.json"
+  _c19_json_of 4000 S '"oauthAccount":{"emailAddress":"a@example.com"}' > "$sib"
+  run _newest_sibling_identity "$CLEAT_PROJECTS_DIR/me-33333333/claude.json"
+  assert_success
+  assert_output ""
+}
+
+@test "regression v1.5.4: the in-place writer padded an oversized box file" {
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  rm -f "$HOME/.claude.json"
+  _c19_json_of 4000 BIG > "$TEST_TEMP/dst.json"
+  cp "$TEST_TEMP/dst.json" "$TEST_TEMP/dst.orig"
+  printf '{"small":true}\n' > "$TEST_TEMP/src.json"
+  run _write_in_place "$TEST_TEMP/src.json" "$TEST_TEMP/dst.json"
+  assert_failure
+  run cmp "$TEST_TEMP/dst.json" "$TEST_TEMP/dst.orig"
+  assert_success
+}
+
+@test "regression v1.5.4: the jq-less identity drop kept unbounded output from the box jq" {
+  _hide_jq
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  rm -f "$HOME/.claude.json"
+  _daemon_up() { return 0; }
+  is_running() { return 0; }
+  # The box's jq is the box's own binary, so it can print anything. Here it
+  # prints a valid object far past the cap.
+  docker() {
+    if [ "$1" = exec ]; then
+      cat > /dev/null
+      _c19_json_of 4000 FROM-THE-BOX
+    fi
+  }
+  local f="$TEST_TEMP/proj/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"a@example.com"},"userID":"u"}\n' > "$f"
+  cp "$f" "$TEST_TEMP/f.orig"
+  run _claude_json_drop_identity "$f" box
+  assert_failure
+  run cmp "$f" "$TEST_TEMP/f.orig"
+  assert_success
+  run bash -c 'ls -A "$1" | grep -v -e "^claude.json$"' _ "${f%/*}"
+  assert_output ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the drop log is per install, so another box's bridge can rotate it
+# during this session. The report then read the new file from this session's
+# offset and missed this box's drops written before the rotation. The inode
+# captured with the offset lets it read the rotated file from the offset first.
+@test "regression v1.5.4: a hook drop log rotated by another box silenced the report" {
+  local log="$CLEAT_STATE_DIR/hook-drops.log" off ino i
+  mkdir -p "$CLEAT_STATE_DIR"
+  for i in $(seq 1 50); do
+    printf 'now\t%s\tjson\tbox-a\tmd5\t0\told\n' "$_HOOK_DROP_MARK"
+  done > "$log"
+  off="$(_path_size "$log")"
+  ino="$(_path_ino "$log")"
+  [ -n "$ino" ]
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\tthis-session\n' "$_HOOK_DROP_MARK" >> "$log"
+  mv "$log" "$log.1"
+  for i in $(seq 1 100); do
+    printf 'now\t%s\tjson\tbox-b\tmd5\t0\tsibling\n' "$_HOOK_DROP_MARK"
+  done > "$log"
+  run _maybe_report_hook_drops "$log" "$off" box-a "$ino"
+  assert_success
+  assert_output --partial "hook event from the box"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the fork copy ran over a tree a running box could write. cp is path
+# based on both BSD and GNU, so a box renaming a directory into a symlink to
+# ~/.ssh mid-copy had the key bytes copied into the fork as real files. Every
+# running box that can write the project is now paused around the copy.
+@test "regression v1.5.4: a box on the live tree was not paused while the fork copied it" {
+  local proj="$TEST_TEMP/project" dlog="$TEST_TEMP/order.log" own
+  mkdir -p "$proj/src"
+  echo code > "$proj/src/app.js"
+  CLEAT_FORKS_DIR="$TEST_TEMP/forks"
+  CLEAT_BOXES_DIR="$TEST_TEMP/boxes"
+  own="$(container_name_for "$proj")"
+  _daemon_up() { return 0; }
+  docker() {
+    case "$1" in
+      ps) printf '%s\n' "$own" ;;
+      inspect) printf '%s\n' "$proj" ;;
+      pause|unpause) echo "$1" >> "$dlog" ;;
+    esac
+  }
+  cp() {
+    case " $* " in *" $proj/. "*) echo cp >> "$dlog" ;; esac
+    command cp "$@"
+  }
+  run _fork_copy_tree "$proj" "$(_fork_root)/cleat-fork-test"
+  unset -f cp docker
+  assert_success
+  run cat "$dlog"
+  assert_output "pause
+cp
+unpause"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: box-authored text was word-split with globbing on. The live account
+# switch parses probe and terminate lines the box prints, and a field like
+# /*/*/*/*/*/*/*/* made the host walk its own filesystem before any check.
+# The config editor split a caps line the same way, so a `*` in a project
+# .cleat expanded into the names of the files in the working directory, and a
+# file named docker became the docker cap.
+@test "regression v1.5.4: a probe line glob-expanded against the host filesystem" {
+  local d="$TEST_TEMP/globdir" i cap="$TEST_TEMP/probe.cap"
+  mkdir -p "$d"
+  for i in 1 2 3 4 5 6 7 8 9; do : > "$d/a$i"; done
+  printf 'hb\t1\nargs\tok\nclaude\t%s\nend\tok\n' "$d/a*" > "$cap"
+  run _handoff_parse_probe "$cap"
+  assert_failure
+  _handoff_parse_probe "$cap" || true
+  assert_equal "${#_HO_PID[@]}" 0
+}
+
+@test "regression v1.5.4: a terminate line glob-expanded against the host filesystem" {
+  local d="$TEST_TEMP/globdir" cap="$TEST_TEMP/term.cap"
+  mkdir -p "$d"
+  : > "$d/alive"
+  printf 'hb\t1\nargs\tok\npid\t7 al*\nscan\tok\nend\tok\n' > "$cap"
+  cd "$d"
+  _parse_terminate "$cap" || true
+  assert_equal "$_PT_ANY_ALIVE" 0
+}
+
+@test "regression v1.5.4: a background shell id glob-expanded against the host filesystem" {
+  local d="$TEST_TEMP/globdir"
+  mkdir -p "$d"
+  : > "$d/execA"
+  _handoff_marker_orphans() { :; }
+  _handoff_id_ok() { return 0; }
+  _handoff_marker_live_for_exec() { return 0; }
+  _box_account_read() { printf '%s' "$_ACCOUNT_DEFAULT"; }
+  _sessions_key_dir() { printf '%s' "$TEST_TEMP/sd"; }
+  _sessions_is_uuid() { return 0; }
+  _handoff_sid_has_transcript() { return 0; }
+  _handoff_tail_flags() { echo "0 0"; }
+  _handoff_last_permission_mode() { :; }
+  _resume_model_in_settings() { return 0; }
+  _HO_PID=(7); _HO_PS=(5); _HO_STATUS=(busy); _HO_WAIT=(none); _HO_KIND=(interactive)
+  _HO_EXEC=(execA); _HO_STORE=(default); _HO_SID=(d7b73579-1111-2222-3333-444455556666); _HO_VER=("")
+  _HO_ORPHANS=""
+  _HO_SHELLS=" exe*"
+  cd "$d"
+  _handoff_classify cleat-x-12345678 1 "$TEST_TEMP/proj" "$_ACCOUNT_DEFAULT"
+  assert_equal "$_HO_VERDICT" R3
+}
+
+_c19_star_project() {
+  C19_PROJ="$TEST_TEMP/starproj"
+  mkdir -p "$C19_PROJ"
+  : > "$C19_PROJ/docker"
+  printf '[caps]\n*\ngit\n' > "$C19_PROJ/.cleat"
+  cd "$C19_PROJ"
+}
+
+@test "regression v1.5.4: a star cap glob-expanded into workspace file names in the text editor" {
+  _c19_star_project
+  run _config_picker_text "$C19_PROJ/.cleat" project "$C19_PROJ" <<< $'git\ndone'
+  assert_success
+  run _read_caps_from_file "$C19_PROJ/.cleat"
+  refute_output --partial "docker"
+  refute_output --partial "git"
+}
+
+@test "regression v1.5.4: a star cap glob-expanded into workspace file names in the picker" {
+  _c19_star_project
+  # Cursor starts on the git row: SPACE turns git off, ENTER saves. The key
+  # reader runs in a command substitution, so its position lives in a file.
+  _read_keypress() {
+    local n
+    n="$(cat "$TEST_TEMP/kp" 2>/dev/null || echo 0)"
+    echo $(( n + 1 )) > "$TEST_TEMP/kp"
+    case "$n" in 0) echo SPACE ;; *) echo ENTER ;; esac
+  }
+  run _config_picker_tui "$C19_PROJ/.cleat" project "$C19_PROJ"
+  assert_success
+  run cat "$TEST_TEMP/kp"
+  assert_output "2"
+  run _read_caps_from_file "$C19_PROJ/.cleat"
+  refute_output --partial "docker"
+  refute_output --partial "git"
+}

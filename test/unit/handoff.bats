@@ -842,6 +842,29 @@ t2_named_box() { _m2_mk_account old; _m2_mk_account work; _box_account_write "$C
 
 # ── classification (fixture records, portable) ──────────────────────────────
 
+@test "handoff probe parse keeps a well-formed record whole and leaves globbing on" {
+  # The split runs with globbing off, because the box writes the line. A normal
+  # record still yields its nine fields, and the shell is left as it was.
+  t2_prep; t2_named_box
+  t2_exec "$(t2_rec 7004242 5551 idle none named)"
+  _handoff_probe "$CN"
+  assert_equal "${#_HO_PID[@]}" 1
+  assert_equal "${_HO_PID[0]}" 7004242
+  assert_equal "${_HO_STATUS[0]}" idle
+  assert_equal "${_HO_EXEC[0]}" "$EXECID"
+  assert_equal "${_HO_SID[0]}" "$SID"
+  assert_equal "${_HO_VER[0]}" 2.1.280
+  case $- in *f*) echo "globbing left off after the parse"; return 1 ;; esac
+  printf 'pid\t7 alive\nhb\t1\nargs\tok\nend\tok\n' > "$TEST_TEMP/term.cap"
+  _parse_terminate "$TEST_TEMP/term.cap"
+  assert_equal "$_PT_ANY_ALIVE" 1
+  case $- in *f*) echo "globbing left off after the terminate parse"; return 1 ;; esac
+  # The classify loop over the shell ids, run with none.
+  _handoff_probe "$CN"; _handoff_classify "$CN" 0 "$T2_PROJ" work
+  assert_equal "$_HO_VERDICT" ok
+  case $- in *f*) echo "globbing left off after the classify"; return 1 ;; esac
+}
+
 @test "handoff classify lets an idle relaunchable session go" {
   t2_prep; t2_named_box
   t2_exec "$(t2_rec 7004242 5551 idle none named)"

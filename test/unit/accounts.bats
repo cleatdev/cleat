@@ -4489,6 +4489,36 @@ _unwritable_lock() {
   assert_failure
 }
 
+@test "account: an oversized per-project file is flagged for the next launch and never written" {
+  # The box writes that file, so the drop reads a bounded snapshot of it. One
+  # past the cap is neither read nor rewritten, and the flag stays, so the
+  # launch keeps saying the box carries another account's name.
+  command -v jq >/dev/null 2>&1 || skip "needs jq"
+  _CLAUDE_JSON_HEADROOM_BYTES=1024
+  rm -f "$HOME/.claude.json"
+  local key f
+  key="$(_derive_project_session_key "$TEST_TEMP/idproj" main)"
+  f="$CLEAT_PROJECTS_DIR/${key}/claude.json"
+  mkdir -p "${f%/*}"
+  printf '{"oauthAccount":{"emailAddress":"gone@example.com"},"pad":"%s"}\n' \
+    "$(head -c 4000 /dev/zero | tr '\0' x)" > "$f"
+  cp "$f" "$TEST_TEMP/f.orig"
+  _box_claude_live() { return 1; }
+  # jq never sees it at all, not even the host's own.
+  jq() { : > "$TEST_TEMP/jq.ran"; command jq "$@"; }
+
+  run _account_invalidate_identity_key "$key" "$CN"
+  assert_success
+  run test -e "${f}.identity-stale"
+  assert_success
+  run cmp "$f" "$TEST_TEMP/f.orig"
+  assert_success
+  run test -e "$TEST_TEMP/jq.ran"
+  assert_failure
+  run bash -c 'ls -A "$1"' _ "${f%/*}"
+  assert_output "$(printf 'claude.json\nclaude.json.identity-stale')"
+}
+
 @test "account: the reset clock ignores a file named like the epoch" {
   # `date -r` is an epoch on BSD and a FILE on GNU, and the fallback only fires
   # when the first form printed nothing. In a directory holding a file whose

@@ -160,6 +160,7 @@ _EC_SAID=0
 # _set_box for box-aware verbs; stays "main" for everything else.
 _BOX="main"
 _FORK_REQUESTED=false   # set by --fork; only read when a box is CREATED
+_FORK_PAUSED=""         # boxes the last fork copy paused, see _fork_copy_quiesced
 _FORK_PREFLIGHT_DONE="" # one preflight per process: start/resume run it, then cmd_run
 _CLI_ENVS=()
 _CLI_ENV_FILES=()
@@ -4477,6 +4478,14 @@ _fork_cp_flags() {
 # Copies into a temp dir inside CLEAT_FORKS_DIR and renames, so an interrupted
 # copy never presents a half tree as a workspace, and takes a mkdir lock so two
 # concurrent --fork runs cannot both rm -rf and copy into the same target.
+#
+# And it copies a tree nothing is writing. cp is path based on both BSD and GNU:
+# it checks an entry, then opens it again by its full path. A running box on
+# the live tree could rename a directory into a symlink to ~/.ssh between the
+# two, and cp then copied the key bytes into the fork as real files (reproduced
+# with GNU cp 9.1). So every running box that can write the project folder is
+# paused for the copy (_fork_copy_quiesced). The cgroup freezer stops every
+# process in it, so no rename lands mid-copy.
 _fork_copy_tree() {
   local src="$1" dst="$2" lock rc=0
   local root; root="$(_fork_root)"
@@ -4500,8 +4509,20 @@ _fork_copy_tree() {
     echo -e "    ${DIM}If nothing else is running, remove ${BOLD}${lock/#${HOME}/~}${RESET}${DIM} and retry.${RESET}"
     return 1
   fi
-  _fork_copy_tree_locked "$src" "$dst" || rc=$?
+  _fork_copy_quiesced "$src" "$dst" || rc=$?
   rmdir "$lock" 2>/dev/null || true
+  # 75 is _fork_copy_quiesced refusing: a box that can write the folder could
+  # not be paused, or the running boxes could not be listed at all.
+  if [[ "$rc" -eq 75 ]]; then
+    if [[ -n "$_FORK_PAUSED" ]]; then
+      error "Could not pause a running box that can write this project's folder. Nothing was copied."
+      echo -e "    ${DIM}Stop it and retry: $(_fork_paused_names)${RESET}"
+    else
+      error "Could not list the running boxes, so none could be paused for the copy. Nothing was copied."
+      echo -e "    ${DIM}Check that ${BOLD}docker ps${RESET}${DIM} answers, then retry.${RESET}"
+    fi
+    _FORK_PAUSED=""
+  fi
   return "$rc"
 }
 
@@ -4518,6 +4539,99 @@ _fork_copy_tree_locked() {
   _run_names_safe rm -rf "$dst" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
   mv "$tmp" "$dst" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
   return 0
+}
+
+# The running Cleat boxes that can write PROJECT, one container name per line.
+# Nothing when Docker is down, because then nothing runs. Non-zero when the
+# daemon answers and the listing fails, so the copy refuses rather than guess.
+#
+# Two matches. By name: the project's own boxes carry its path hash, the
+# portable floor that holds on every engine, WSL2 included. By mount: a box
+# whose read-write bind source is at, below or above the project, which is how
+# a box on a parent or a nested folder can write it too. A fork box mounts its
+# own copy, never the live tree, so it is skipped.
+_fork_live_writers() {
+  local project="$1" names n h tree srcs s hit
+  _daemon_up || return 0
+  names="$(docker ps --filter label=sh.cleat.version --filter status=running --format '{{.Names}}' 2>/dev/null)" || return 1
+  [[ -n "$names" ]] || return 0
+  h="$(printf '%s' "$project" | _md5 | head -c 8)"
+  tree="$(_phys_or_best "$project")"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    _box_is_fork "$n" && continue
+    case "$n" in
+      *-"$h"|*-"$h"-*) printf '%s\n' "$n"; continue ;;
+    esac
+    srcs="$(docker inspect --format '{{range .Mounts}}{{if .RW}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$n" 2>/dev/null)" || continue
+    hit=0
+    while IFS= read -r s; do
+      [[ -n "$s" ]] || continue
+      s="${s#/host_mnt}"
+      s="$(_phys_or_best "$s")"
+      [[ -n "$s" ]] || continue
+      case "$s/" in "$tree"/*) hit=1; break ;; esac
+      case "$tree/" in "$s"/*) hit=1; break ;; esac
+    done <<< "$srcs"
+    [[ $hit -eq 1 ]] && printf '%s\n' "$n"
+  done <<< "$names"
+  return 0
+}
+
+# The boxes in _FORK_PAUSED on one line, for a message. The daemon validates
+# container names, but they are still sanitized like every other name a box can
+# influence.
+_fork_paused_names() {
+  local l
+  l="$(printf '%s' "$_FORK_PAUSED" | tr '\n' ' ')"
+  _sanitize_repo_str "${l% }"
+}
+
+# One dim line after a copy that paused boxes, so a session that froze for it
+# has a reason on screen. Nothing when none were paused.
+_fork_note_paused() {
+  [[ -n "$_FORK_PAUSED" ]] || return 0
+  echo -e "    ${DIM}Paused for the copy and resumed: $(_fork_paused_names)${RESET}"
+  return 0
+}
+
+# Resume every box named in $1 (space or newline separated). Best effort: one
+# that is already running, or gone, is not an error.
+_fork_unpause() {
+  local w
+  for w in $1; do
+    docker unpause "$w" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+# _fork_copy_tree_locked with every box that can write SRC paused around it,
+# see _fork_copy_tree. Sets _FORK_PAUSED to the boxes it paused, for the
+# caller's note. rc 75, with nothing copied, when the boxes cannot be listed or
+# one cannot be paused (rootless Docker on cgroup v1 has no freezer). The
+# pauses live in a subshell whose EXIT trap unpauses what it paused, so a copy
+# that fails, a Ctrl-C and a TERM all resume the boxes. A SIGKILL cannot.
+_fork_copy_quiesced() {
+  local src="$1" dst="$2" writers rc=0
+  _FORK_PAUSED=""
+  writers="$(_fork_live_writers "$src")" || return 75
+  if [[ -z "$writers" ]]; then
+    _fork_copy_tree_locked "$src" "$dst" || rc=$?
+    return "$rc"
+  fi
+  _FORK_PAUSED="$writers"
+  (
+    _fq_done=""
+    trap '_fork_unpause "$_fq_done"' EXIT
+    trap 'exit 130' INT TERM HUP
+    while IFS= read -r _fq_w; do
+      [[ -n "$_fq_w" ]] || continue
+      docker pause "$_fq_w" >/dev/null 2>&1 || exit 75
+      _fq_done="$_fq_done $_fq_w"
+    done <<< "$writers"
+    _fork_copy_tree_locked "$src" "$dst"
+  ) || rc=$?
+  return "$rc"
 }
 
 # Prune configured excludes AFTER the copy. cp has no --exclude, and rsync
@@ -5952,6 +6066,35 @@ _looks_like_json_object() {
   [[ -n "$content" && "${content:0:1}" == "{" && "${content: -1}" == "}" ]]
 }
 
+# How far past the host ~/.claude.json a box's per-project copy may grow before
+# the host stops reading it. The box writes its copy through a read-write bind,
+# so it picks the size, and every host reader here used to take the file whole:
+# into a shell variable, into jq, into a .bak. A real file is about 28 KB
+# (concept/19), so this is far past anything Claude Code writes.
+_CLAUDE_JSON_HEADROOM_BYTES=16777216
+
+# The cap sits ABOVE the host file, which the user owns, so a large host file
+# can never make every box copy read as oversized.
+_claude_json_cap() {
+  printf '%s' "$(( $(_path_size "$HOME/.claude.json") + _CLAUDE_JSON_HEADROOM_BYTES ))"
+}
+
+# Copy a box's claude.json into a host-only file with ONE bounded read, and
+# have every later step read the copy. The box mounts the single file, never
+# its directory, and a rename over a bind target fails with EBUSY, so the box
+# controls only the size and the content. A size check alone leaves a running
+# box free to grow the file between the check and the read. The copy does not.
+# rc 0 copied, 1 not a regular file (or a link), 2 over the cap. Nothing is
+# left at DST unless rc is 0.
+_claude_json_snapshot() {
+  local src="$1" dst="$2" cap="$3"
+  [ -f "$src" ] && [ ! -L "$src" ] || return 1
+  ( umask 077; head -c "$(( cap + 1 ))" < "$src" > "$dst" ) 2>/dev/null \
+    || { rm -f "$dst" 2>/dev/null || true; return 1; }
+  [ "$(_path_size "$dst")" -le "$cap" ] || { rm -f "$dst" 2>/dev/null || true; return 2; }
+  return 0
+}
+
 # Replace a bind-mounted file's content IN PLACE without ever leaving it empty.
 #
 # The box sees ~/.claude.json through a single-file bind mount, so a new copy
@@ -5985,6 +6128,10 @@ _write_in_place() {
   new="$(wc -c < "$src" 2>/dev/null | tr -d '[:space:]')"
   case "$old" in ''|*[!0-9]*) return 1 ;; esac
   case "$new" in ''|*[!0-9]*) return 1 ;; esac
+  # The padding below is up to the OLD size, which the box chose. A running box
+  # that bloated its own file keeps it until its next stopped start rebuilds it,
+  # rather than the host writing that much again.
+  [ "$old" -le "$(_claude_json_cap)" ] || return 1
   if (( new < old )); then
     printf '%*s' "$(( old - new ))" '' >> "$src" 2>/dev/null || return 1
   fi
@@ -6002,9 +6149,14 @@ _write_in_place() {
 # A sibling whose box is pinned to a named account is skipped as well, see
 # _pinned_project_keys. So is a sibling flagged .identity-stale, whose name is
 # waiting to be dropped, see _account_invalidate_identity_key.
+# $2 is the size cap (default _claude_json_cap). Each sibling is a file its own
+# box writes, so one over the cap is skipped, and jq only ever sees the first
+# cap + 1 bytes: a sibling that grows after the stat reaches jq cut short and
+# fails to parse.
 _newest_sibling_identity() {
-  local exclude="$1" f best="" best_m=0 m pinned k
+  local exclude="$1" cap="${2:-}" f best="" best_m=0 m pinned k
   command -v jq &>/dev/null || return 0
+  [[ -n "$cap" ]] || cap="$(_claude_json_cap)"
   pinned="$(_pinned_project_keys)"
   for f in "$CLEAT_PROJECTS_DIR"/*/claude.json; do
     [[ -f "$f" ]] || continue
@@ -6024,7 +6176,8 @@ _newest_sibling_identity() {
     # only (the box mounts the file, never its directory), so the box can
     # neither set it nor clear it.
     [[ -e "${f}.identity-stale" ]] && continue
-    jq -e '.oauthAccount? != null' "$f" >/dev/null 2>&1 || continue
+    [ "$(_path_size "$f")" -le "$cap" ] || continue
+    head -c "$(( cap + 1 ))" < "$f" 2>/dev/null | jq -e '.oauthAccount? != null' >/dev/null 2>&1 || continue
     m="$(_path_mtime "$f")"
     if (( m > best_m )); then best_m=$m; best="$f"; fi
   done
@@ -6083,22 +6236,40 @@ _build_project_claude_json() {
 
   if command -v jq &>/dev/null; then
     local tmp="${out}.tmp.$$"
-    local hf pf sf sib
+    local hf pf sf sib cap snap_rc
+    local psnap="${out}.proj.$$" ssnap="${out}.sib.$$"
     if [[ -n "$host_src" && -f "$host_src" && -s "$host_src" ]]; then hf="$host_src"; else hf=/dev/null; fi
-    # The PERSISTED project copy gets the same corruption guard as the host
-    # file above. It had none, so a project file truncated by a full disk or a
-    # killed write was fed to jq, jq failed on the whole merge, and the box
-    # came up with a file it could not read. Nothing healed it, so every later
-    # start reproduced it: the box was stuck on the login screen with no
-    # message naming the cause. Backing it up and treating it as absent lets
-    # the merge rebuild from the host file and the sibling identity.
-    if [[ -f "$proj_src" && -s "$proj_src" ]] && ! _looks_like_json_object "$proj_src"; then
-      cp "$proj_src" "${proj_src}.bak" 2>/dev/null || true
-      warn "This project's stored ${BOLD}.claude.json${RESET} was corrupt, backed up alongside it."
-      echo -e "    ${DIM}Rebuilding it from the host file. Session history for this project may be reset.${RESET}"
+    # The box writes its project copy, so its size is the box's to pick, and
+    # the host used to read it whole. Every step below reads a bounded snapshot
+    # of it instead, taken once (_claude_json_snapshot).
+    cap="$(_claude_json_cap)"
+    if [[ -n "$proj_src" && -f "$proj_src" && -s "$proj_src" ]]; then
+      snap_rc=0
+      _claude_json_snapshot "$proj_src" "$psnap" "$cap" || snap_rc=$?
+      if [[ $snap_rc -eq 2 ]]; then
+        # No .bak: that would copy the bloat again.
+        warn "This project's stored ${BOLD}.claude.json${RESET} is over $(_human_bytes "$cap"), far past anything Claude Code writes."
+        echo -e "    ${DIM}Rebuilding it from the host file. Session history for this project may be reset.${RESET}"
+        proj_src=""
+      elif [[ $snap_rc -ne 0 ]]; then
+        proj_src=""
+      # The PERSISTED project copy gets the same corruption guard as the host
+      # file above. It had none, so a project file truncated by a full disk or a
+      # killed write was fed to jq, jq failed on the whole merge, and the box
+      # came up with a file it could not read. Nothing healed it, so every later
+      # start reproduced it: the box was stuck on the login screen with no
+      # message naming the cause. Backing it up and treating it as absent lets
+      # the merge rebuild from the host file and the sibling identity.
+      elif ! _looks_like_json_object "$psnap"; then
+        cp "$psnap" "${proj_src}.bak" 2>/dev/null || true
+        warn "This project's stored ${BOLD}.claude.json${RESET} was corrupt, backed up alongside it."
+        echo -e "    ${DIM}Rebuilding it from the host file. Session history for this project may be reset.${RESET}"
+        proj_src=""
+      fi
+    else
       proj_src=""
     fi
-    if [[ -n "$proj_src" && -f "$proj_src" && -s "$proj_src" ]]; then pf="$proj_src"; else pf=/dev/null; fi
+    if [[ -n "$proj_src" ]]; then pf="$psnap"; else pf=/dev/null; fi
     # Identity gained inside another box (its mounted per-project file is the
     # only place an in-box login lands) fills identity keys that BOTH the host
     # file and this project's own copy lack. Without it, a login done in box A
@@ -6111,8 +6282,12 @@ _build_project_claude_json() {
     # box with the other one's identity. Skipping is strictly safer than
     # guessing: Claude refetches identity from its own profile endpoint.
     if [[ $_bpj_pinned -eq 0 ]]; then
-      sib="$(_newest_sibling_identity "$out")"
-      [[ -n "$sib" && -f "$sib" && -s "$sib" ]] && sf="$sib"
+      sib="$(_newest_sibling_identity "$out" "$cap")"
+      # The sibling is another box's file, so it is read the same bounded way.
+      if [[ -n "$sib" && -f "$sib" && -s "$sib" ]] \
+         && _claude_json_snapshot "$sib" "$ssnap" "$cap"; then
+        sf="$ssnap"
+      fi
     fi
     # slurpfile reads each input fully before output is written, so reading $out
     # while writing $tmp is safe; mv makes the swap atomic.
@@ -6189,6 +6364,7 @@ _build_project_claude_json() {
       # jq failed unexpectedly: keep the persisted copy if present, else start clean.
       [[ -f "$out" && -s "$out" ]] || echo '{}' > "$out"
     fi
+    rm -f "$psnap" "$ssnap" 2>/dev/null || true
   else
     # No jq: best effort. Keep persisted copy, else seed from host, else empty.
     if [[ -f "$out" && -s "$out" ]]; then
@@ -6263,7 +6439,11 @@ _refresh_attached_claude_json() {
   [[ -f "$f" && -s "$f" ]] || return 0
   # Cheap gate first: an onboarded box shows no login screen, nothing to fix,
   # no docker call. Only a logout-poisoned (or never-onboarded) box proceeds.
-  jq -e '.hasCompletedOnboarding == true' "$f" >/dev/null 2>&1 && return 0
+  # Bounded, because the box writes this file: one over the cap reaches jq cut
+  # short and falls through to the build, which warns and leaves it alone.
+  local cap
+  cap="$(_claude_json_cap)"
+  head -c "$(( cap + 1 ))" < "$f" 2>/dev/null | jq -e '.hasCompletedOnboarding == true' >/dev/null 2>&1 && return 0
   _box_has_live_agent "$cname" && return 0
   local tmp="${f}.attach.$$"
   _build_project_claude_json "$tmp" "$f" "$cname"
@@ -8221,6 +8401,13 @@ _browser_claim_url() {
     rm -f "$claim" 2>/dev/null || true
     return 1
   fi
+  # The rename is the gate. The tests before it are only a fast path: the box
+  # can rename a FIFO or a directory onto the bridge name between them and the
+  # mv. Here the claim sits where the box cannot reach, so this test cannot be
+  # raced. A FIFO is unlinked without ever being opened, which is what keeps
+  # the head below from blocking the watcher forever, and a directory is
+  # removed instead of stranded.
+  [ -f "$claim" ] || { rm -rf "$claim" 2>/dev/null || true; return 1; }
   # Bounded. The box picks the file's size, and an unbounded `cat` here put the
   # whole thing in a shell variable and then on an `echo` into the log. The cap
   # is well above the 2048 _bridge_url_host accepts, so nothing that could ever
@@ -8300,6 +8487,16 @@ _path_mtime() {
   m="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "")"
   case "$m" in ''|*[!0-9]*) m=0 ;; esac
   printf '%s' "$m"
+}
+
+# Inode number of a path, without following a link, or empty when it can't be
+# read. `ls -di` is the reader _fd_holds_path uses: GNU and BSD print the same
+# first column, where the two stat format flags differ.
+_path_ino() {
+  local i
+  i="$(ls -di "$1" 2>/dev/null | awk '{print $1}' || echo "")"
+  case "$i" in ''|*[!0-9]*) i="" ;; esac
+  printf '%s' "$i"
 }
 
 # Same-URL debounce, shared across watchers via per-URL marker dirs in the clip
@@ -9862,7 +10059,10 @@ _hook_drop_log() {
       # The session-end report reads from a byte offset into this file. After a
       # rotation that offset points past the end of a new, shorter file, so it
       # is reset here or the report goes silent for the rest of the session.
+      # The inode goes with it: kept, the report would read the rotated file
+      # from byte 0 and count earlier sessions' rows.
       _hook_drop_off=0
+      _hook_drop_ino=""
     fi
   fi
   local _safe
@@ -10879,10 +11079,13 @@ exec_claude() {
   # The hook bridge's drop log is per INSTALL, not per box: it has to survive
   # the teardown of the box that wrote it, and the box must not be able to
   # induce its deletion. Offset captured the same way.
-  local _hook_drop_log_path="$CLEAT_STATE_DIR/hook-drops.log" _hook_drop_off=0
+  # The inode lets the report follow the offset into the rotated file when a
+  # bridge rotates the log during the session (_maybe_report_hook_drops).
+  local _hook_drop_log_path="$CLEAT_STATE_DIR/hook-drops.log" _hook_drop_off=0 _hook_drop_ino=""
   if [ -f "$_hook_drop_log_path" ]; then
     _hook_drop_off="$(wc -c < "$_hook_drop_log_path" 2>/dev/null | tr -d '[:space:]')"
     case "$_hook_drop_off" in ''|*[!0-9]*) _hook_drop_off=0 ;; esac
+    _hook_drop_ino="$(_path_ino "$_hook_drop_log_path")"
   fi
   _hook_spool_entry_cap "$cname"
 
@@ -11260,7 +11463,7 @@ exec_claude() {
   # And the destination gate's refusals. Same placement and the same reason.
   _maybe_report_blocked_opens "$_proxy_log_file" "$_proxy_log_off"
   # And the hook events the bridge refused. Same rule: only when non-zero.
-  _maybe_report_hook_drops "$_hook_drop_log_path" "$_hook_drop_off" "$cname"
+  _maybe_report_hook_drops "$_hook_drop_log_path" "$_hook_drop_off" "$cname" "$_hook_drop_ino"
   # And a host global config file that was not there when the session began.
   _maybe_report_host_global_config_appeared "$_cfgjson_before"
   rm -f "$_exec_err"
@@ -11595,18 +11798,31 @@ EOF
 # counted row is a path refusal. An oversized line or a malformed one did not
 # name a path at all, so those get the neutral wording.
 _maybe_report_hook_drops() {
-  local log="$1" off="${2:-0}" cname="${3:-}" counts n np nb sz
+  local log="$1" off="${2:-0}" cname="${3:-}" ino="${4:-}" prev="" counts n np nb sz
   [ -f "$log" ] || return 0
   # The log rotates past 1 MiB, from this process or from a bridge running in
   # the background, and an offset captured before a rotation points past the
   # end of the new file. Read the whole new file then, or the report is silent.
   sz="$(_path_size "$log")"
   case "$off" in ''|*[!0-9]*) off=0 ;; esac
+  # $4 is the inode the log had when the offset was taken. When the rotated
+  # file still carries it, the offset belongs to that file, so the rows written
+  # there after it are read first and then the whole new file. That keeps the
+  # count exact after one rotation from any box's bridge, and never silent for
+  # this box's own flood after more.
+  if [ -n "$ino" ] && [ "$(_path_ino "$log.1")" = "$ino" ]; then
+    prev="$log.1"
+    sz="$(_path_size "$prev")"
+  fi
   [ "$off" -le "$sz" ] || off=0
   # A `spool` row is not a refused event: it is the spool cap discarding queued
   # bytes, and its offset field carries how many. Summed on a line of its own,
   # so a discard never reads as "failed validation".
-  counts="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null \
+  counts="$( { if [ -n "$prev" ]; then
+                 tail -c "+$(( off + 1 ))" "$prev"; cat "$log"
+               else
+                 tail -c "+$(( off + 1 ))" "$log"
+               fi; } 2>/dev/null \
     | awk -F '\t' -v m="$_HOOK_DROP_MARK" -v c="$cname" '
         $2 == m && $4 == c && $3 == "spool" { if ($6 ~ /^[0-9]+$/) b += $6; next }
         $2 == m && $4 == c { n++; if ($3 == "path") p++ }
@@ -12771,9 +12987,13 @@ cmd_run() {
       # NOT "exclude it with a [fork] exclude line": excludes are pruned AFTER
       # the copy, so they cannot prevent a copy that fails. Pointing at them
       # sent the user to a setting that could never fix what they were seeing.
-      echo -e "    ${DIM}Usually an unreadable file in the project, or no space left. Check permissions and free space, then retry.${RESET}"
+      # And not at all after a pause refusal (75), which already said why.
+      if [[ $_copy_rc -ne 75 ]]; then
+        echo -e "    ${DIM}Usually an unreadable file in the project, or no space left. Check permissions and free space, then retry.${RESET}"
+      fi
       exit 1
     fi
+    _fork_note_paused
     _fork_prune_excludes "$_fork_path" "$project" "$box"
     _fork_mark "$cname"
   fi
@@ -13756,10 +13976,11 @@ cmd_shell() {
   _shell_proxy_off="$(_cap_watcher_log "$_shell_proxy_log" "${_shell_proxy_log%/*}")"
   # The spool cap's discards are reported like exec_claude's hook drops, from
   # this session's byte window of the per-install drop log.
-  local _shell_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _shell_drop_off=0
+  local _shell_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _shell_drop_off=0 _shell_drop_ino=""
   if [ -f "$_shell_drop_log" ]; then
     _shell_drop_off="$(wc -c < "$_shell_drop_log" 2>/dev/null | tr -d '[:space:]')"
     case "$_shell_drop_off" in ''|*[!0-9]*) _shell_drop_off=0 ;; esac
+    _shell_drop_ino="$(_path_ino "$_shell_drop_log")"
   fi
   _hook_spool_entry_cap "$cname"
   local _shell_open_cmd _shell_bw_pid=""
@@ -13839,7 +14060,7 @@ cmd_shell() {
   # from this shell goes through the same watcher, and a refusal that lives only
   # in the box's log is the silent failure the report exists to end.
   _maybe_report_blocked_opens "$_shell_proxy_log" "$_shell_proxy_off"
-  _maybe_report_hook_drops "$_shell_drop_log" "$_shell_drop_off" "$cname"
+  _maybe_report_hook_drops "$_shell_drop_log" "$_shell_drop_off" "$cname" "$_shell_drop_ino"
   return "$shell_rc"
 }
 
@@ -13874,10 +14095,11 @@ cmd_login() {
   _login_proxy_log="$(_browser_proxy_log "$_login_clip_dir")"
   _login_proxy_off="$(_cap_watcher_log "$_login_proxy_log" "${_login_proxy_log%/*}")"
   # See cmd_shell: the spool cap's discards, reported after the login.
-  local _login_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _login_drop_off=0
+  local _login_drop_log="$CLEAT_STATE_DIR/hook-drops.log" _login_drop_off=0 _login_drop_ino=""
   if [ -f "$_login_drop_log" ]; then
     _login_drop_off="$(wc -c < "$_login_drop_log" 2>/dev/null | tr -d '[:space:]')"
     case "$_login_drop_off" in ''|*[!0-9]*) _login_drop_off=0 ;; esac
+    _login_drop_ino="$(_path_ino "$_login_drop_log")"
   fi
   _hook_spool_entry_cap "$cname"
 
@@ -13940,7 +14162,7 @@ cmd_login() {
   # promised the browser would open, and without this line nothing explains
   # why it did not.
   _maybe_report_blocked_opens "$_login_proxy_log" "$_login_proxy_off"
-  _maybe_report_hook_drops "$_login_drop_log" "$_login_drop_off" "$cname"
+  _maybe_report_hook_drops "$_login_drop_log" "$_login_drop_off" "$cname" "$_login_drop_ino"
 
   # A login into a pinned box lands in that box's staged copy. Only a harvest
   # carries it to the account. Without one the account still read "signed out"
@@ -20044,28 +20266,44 @@ _account_invalidate_identity_key() {
 # to borrow one from, or a filter that failed. The caller flags the file and
 # the next launch finishes the job (_claude_json_clear_stale_identity).
 _claude_json_drop_identity() {
-  local f="$1" cname="${2:-}" tmp rc=0
+  local f="$1" cname="${2:-}" tmp snap cap rc=0
   local prog='del(.oauthAccount) | del(.cachedUsageUtilization)'
   [[ -f "$f" && -s "$f" ]] || return 0
   [[ -L "$f" ]] && return 0
   tmp="${f}.acct.$$"
+  snap="${f}.snap.$$"
+  # The box writes this file, so every read below is of one bounded snapshot.
+  # One over the cap is never read or written, and the flag stays.
+  cap="$(_claude_json_cap)"
+  _claude_json_snapshot "$f" "$snap" "$cap" || return 1
   if command -v jq &>/dev/null; then
-    if ! { jq "$prog" "$f" > "$tmp" 2>/dev/null \
+    if ! { jq "$prog" "$snap" > "$tmp" 2>/dev/null \
            && [[ -s "$tmp" ]] && jq -e 'type=="object"' "$tmp" >/dev/null 2>&1; }; then
-      rm -f "$tmp" 2>/dev/null
+      rm -f "$tmp" "$snap" 2>/dev/null
       return 1
     fi
   else
     # Nothing to delete is an answer, and a cheap one: a jq-less host whose
     # file is already clean asks the box nothing and leaves no flag behind.
-    grep -qE '"(oauthAccount|cachedUsageUtilization)"' "$f" 2>/dev/null || return 0
-    { [[ -n "$cname" ]] && _daemon_up && is_running "$cname"; } || return 1
-    if ! { docker exec -i "$cname" jq "$prog" < "$f" > "$tmp" 2>/dev/null \
-           && _looks_like_json_object "$tmp"; }; then
-      rm -f "$tmp" 2>/dev/null
+    if ! grep -qE '"(oauthAccount|cachedUsageUtilization)"' "$snap" 2>/dev/null; then
+      rm -f "$snap" 2>/dev/null
+      return 0
+    fi
+    if ! { [[ -n "$cname" ]] && _daemon_up && is_running "$cname"; }; then
+      rm -f "$snap" 2>/dev/null
+      return 1
+    fi
+    # The box's jq is the box's binary, so what it prints is capped like the
+    # file it came from. The size test decides, with or without pipefail. No
+    # deadline: Ctrl-C ends it, and it can only stall this same box's launch,
+    # like the other execs on that path.
+    if ! { docker exec -i "$cname" jq "$prog" < "$snap" 2>/dev/null | head -c "$(( cap + 1 ))" > "$tmp" \
+           && [ "$(_path_size "$tmp")" -le "$cap" ] && _looks_like_json_object "$tmp"; }; then
+      rm -f "$tmp" "$snap" 2>/dev/null
       return 1
     fi
   fi
+  rm -f "$snap" 2>/dev/null
   _write_in_place "$tmp" "$f" || rc=1
   rm -f "$tmp" 2>/dev/null
   return $rc
@@ -21043,7 +21281,10 @@ _handoff_parse_probe() {
       args) [[ "$rest" == ok ]] && argsok=1; [[ "$rest" == bad ]] && return 1 ;;
       end) [[ "$rest" == ok ]] && endok=1; [[ "$rest" == abort ]] && return 1 ;;
       claude)
-        set -- $rest
+        # Globbing off for the split. The box writes this line, and a field like
+        # /*/*/*/*/*/*/*/* made the host walk its own filesystem before the
+        # field count below could refuse it.
+        set -f; set -- $rest; set +f
         [[ $# -eq 9 ]] || return 1
         n=${#_HO_PID[@]}
         _HO_PID[$n]="$1"; _HO_PS[$n]="$2"; _HO_STATUS[$n]="$3"; _HO_WAIT[$n]="$4"
@@ -21083,7 +21324,8 @@ _parse_terminate() {
       scan) _PT_SCAN="$rest" ;;
       end) _PT_END="$rest" ;;
       pid)
-        set -- $rest; p="$1"; st="${2:-}"
+        # Box-written, so split with globbing off, as in _handoff_parse_probe.
+        set -f; set -- $rest; set +f; p="$1"; st="${2:-}"
         case "$st" in
           exited) _PT_EXITED="$_PT_EXITED$p " ;;
           alive)  _PT_ALIVE="$_PT_ALIVE$p "; _PT_ANY_ALIVE=1 ;;
@@ -21201,7 +21443,15 @@ _handoff_classify() {
   # Any other shell line refuses. Without --now row 19 already took every busy
   # target, so every shell line refuses here.
   # Row 18: background shell (a shell line, then a shell status).
-  for sline in $_HO_SHELLS; do _handoff_shell_line_ok "$sline" "$now" "$N" || { _HO_VERDICT=R3; return 0; }; done
+  # The shell ids are box-written, so they are split with globbing off. The
+  # list is expanded once, before the first pass, so globbing comes back on at
+  # the top of the body, and after the loop for an empty list.
+  set -f
+  for sline in $_HO_SHELLS; do
+    set +f
+    _handoff_shell_line_ok "$sline" "$now" "$N" || { _HO_VERDICT=R3; return 0; }
+  done
+  set +f
   i=0; while [[ $i -lt $N ]]; do [[ "${_HO_STATUS[$i]}" == shell ]] && { _HO_VERDICT=R3; return 0; }; i=$(( i + 1 )); done
   # Row 20: a question that is not the usage-limit dialog, without --now. The
   # limit question is dialog-open with the transcript confirming a rate limit.
@@ -24234,10 +24484,14 @@ _config_picker_tui() {
             case ",${toggled}," in
               *,"$current_cap",*)
                 local _new="" _c
+                # Globbing off: a `*` in the project's caps line expanded into
+                # the names of the files in the working directory.
+                set -f
                 for _c in $(echo "$toggled" | tr ',' ' '); do
                   [[ "$_c" == "$current_cap" ]] && continue
                   _new="${_new:+${_new},}${_c}"
                 done
+                set +f
                 toggled="$_new" ;;
               *) toggled="${toggled:+${toggled},}${current_cap}" ;;
             esac ;;
@@ -24501,10 +24755,13 @@ _config_picker_text() {
             case ",${_active}," in
               *,"$input",*)
                 local _new_active="" _c
+                # Globbing off, as in _config_picker_tui.
+                set -f
                 for _c in $(echo "$_active" | tr ',' ' '); do
                   [[ "$_c" == "$input" ]] && continue
                   _new_active="${_new_active:+${_new_active},}${_c}"
                 done
+                set +f
                 _active="$_new_active"
                 success "${input} disabled"
                 ;;
@@ -25296,6 +25553,7 @@ cmd_fork() {
       _fork_copy_tree "$project" "$_fp" || _rc=$?
       spin_stop "$_rc" "Workspace copied" "Workspace copy failed"
       [[ "$_rc" -eq 0 ]] || return 1
+      _fork_note_paused
       _fork_prune_excludes "$_fp" "$project" "$box"
       _fork_mark "$cname"
       echo -e "    ${DIM}Next ${BOLD}cleat start ${box} --fork${RESET}${DIM} uses it.${RESET}"

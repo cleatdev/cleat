@@ -2763,9 +2763,10 @@ try "bugfix_identity_attach_heal" "running logged-out box heals" "$CLI" "$REGRES
 # IDENTITY: the attach-heal gate must key on hasCompletedOnboarding ALONE. Add
 # back the oauthAccount clause: an onboarded API-key box (no oauthAccount) then
 # fails the gate and runs the pipeline + docker probe on every attach, so the
-# "onboarded API-key box short-circuits" test sees the probe fire.
+# "onboarded API-key box short-circuits" test sees the probe fire. Since v1.5.4
+# the gate reads a bounded prefix of the file on stdin.
 cat > "$SED_TMP" << 'SED'
-s|jq -e '\.hasCompletedOnboarding == true' "\$f" >/dev/null 2>&1 \&\& return 0|jq -e '(.hasCompletedOnboarding == true) and has("oauthAccount")' "$f" >/dev/null 2>\&1 \&\& return 0|
+s@| jq -e '\.hasCompletedOnboarding == true' >/dev/null 2>&1 && return 0@| jq -e '(.hasCompletedOnboarding == true) and has("oauthAccount")' >/dev/null 2>\&1 \&\& return 0@
 SED
 try "bugfix_attach_heal_gate_onboarding" "onboarded API-key box" "$CLI" "$EXEC_CLAUDE_BATS"
 
@@ -4853,9 +4854,12 @@ SED
 try "sweep_stale_marker_cleaned" "marker from a dead session does not pin" "$CLI" "$REPO_ROOT/test/unit/idle_sweep.bats"
 
 # PERSISTED CLAUDE.JSON HEAL: the host file had a corruption guard, the project
-# copy had none, so a truncated one broke the box on every later start.
+# copy had none, so a truncated one broke the box on every later start. Since
+# v1.5.4 the guard reads the bounded snapshot of the copy.
 cat > "$SED_TMP" << 'SED'
-s@    if \[\[ -f "$proj_src" && -s "$proj_src" \]\] && ! _looks_like_json_object "$proj_src"; then@    if false; then@
+/^_build_project_claude_json()/,/^}$/{
+  s@^      elif ! _looks_like_json_object "[$]psnap"; then$@      elif false; then@
+}
 SED
 try "claude_json_persisted_heal" "corrupt PERSISTED project copy is backed up" "$CLI" "$REPO_ROOT/test/unit/claude_json.bats"
 
@@ -7117,11 +7121,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_identity_inplace" "the identity delete keeps the file" "$CLI" "$ACCOUNTS_BATS"
 
-# Two guards cooperate and only the OUTCOME is observable, so the mutation
-# removes both: the refusal in the delete and the one in the writer.
+# Three guards cooperate and only the OUTCOME is observable, so the mutation
+# removes all of them: the refusal in the delete, the one in the bounded
+# snapshot it reads (since v1.5.4) and the one in the writer.
 cat > "$SED_TMP" << 'SED'
 /^_claude_json_drop_identity()/,/^}$/{
   s@^  \[\[ -L "[$]f" \]\] && return 0$@  :@
+}
+/^_claude_json_snapshot()/,/^}$/{
+  s@^  \[ -f "[$]src" \] && \[ ! -L "[$]src" \] || return 1$@  [ -f "$src" ] || return 1@
 }
 /^_write_in_place()/,/^}$/{
   s@ && ! -L "[$]dst"@@
@@ -7273,7 +7281,7 @@ try "vnext_account_nojq_launch_clears" "clears the old account from a box switch
 # Without the in-box filter a jq-less host cannot edit the file at all.
 cat > "$SED_TMP" << 'SED'
 /^_claude_json_drop_identity()/,/^}$/{
-  s@^    { \[\[ -n "[$]cname" \]\] && _daemon_up && is_running "[$]cname"; } || return 1$@    return 1@
+  s@^    if ! { \[\[ -n "[$]cname" \]\] && _daemon_up && is_running "[$]cname"; }; then$@    if true; then@
 }
 SED
 try "vnext_account_nojq_inbox_filter" "clears the old account at the switch when the box is running"
@@ -10974,18 +10982,18 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_handoff_unknown_status" "refuses an unknown status" "$CLI" "$HANDOFF_BATS"
 
-# Row 18: a shell line refuses (the for loop right after the Row 18 comment).
+# Row 18: a shell line refuses (the check in the for loop over the shell ids).
 cat > "$SED_TMP" << 'SED'
 /^_handoff_classify()/,/^}$/{
-  /Row 18: background shell/{n;d}
+  /^    _handoff_shell_line_ok "[$]sline" "[$]now" "[$]N" || { _HO_VERDICT=R3; return 0; }$/d
 }
 SED
 try "vnext_handoff_shell_line_refuses" "refuses background shell commands even with now" "$CLI" "$HANDOFF_BATS"
 
-# Row 18: a shell status refuses (the while loop two lines after the comment).
+# Row 18: a shell status refuses (the while loop right after the for loop).
 cat > "$SED_TMP" << 'SED'
 /^_handoff_classify()/,/^}$/{
-  /Row 18: background shell/{n;n;d}
+  /== shell \]\] && { _HO_VERDICT=R3; return 0; }; i=/d
 }
 SED
 try "vnext_handoff_shell_status_refuses" "refuses a session with a shell status" "$CLI" "$HANDOFF_BATS"
@@ -13313,6 +13321,184 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_account_rm_flags_before_unpin" "between the unpin and the drop"
+
+# v1.5.4: the browser claim re-tests its type after the rename. Tested only
+# before it, a FIFO the box renamed in between blocked head forever inside the
+# watcher, and a directory was stranded in the claim dir.
+cat > "$SED_TMP" << 'SED'
+/^_browser_claim_url()/,/^}$/{
+  /^  \[ -f "[$]claim" \] || { rm -rf "[$]claim"/d
+}
+SED
+try "v154_misc_browser_claim_fifo" "a FIFO swapped in before the browser claim hung the watcher"
+
+cat > "$SED_TMP" << 'SED'
+/^_browser_claim_url()/,/^}$/{
+  /^  \[ -f "[$]claim" \] || { rm -rf "[$]claim"/d
+}
+SED
+try "v154_misc_browser_claim_dir" "a directory swapped in before the browser claim was stranded"
+
+# v1.5.4: every host read of a box's claude.json goes through one bounded
+# snapshot under a cap. Unbounded, the builder read a file the box sized whole.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_snapshot()/,/^}$/{
+  s/head -c "[$](( cap + 1 ))" < "[$]src"/cat "$src"/
+  /^  \[ "[$](_path_size "[$]dst")" -le "[$]cap" \]/d
+}
+SED
+try "v154_misc_claude_json_project_bounded" "a box-sized project claude"
+
+# The sibling scan skips a sibling over the cap and hands jq a bounded read.
+cat > "$SED_TMP" << 'SED'
+/^_newest_sibling_identity()/,/^}$/{
+  /^    \[ "[$](_path_size "[$]f")" -le "[$]cap" \] || continue$/d
+  s@head -c "[$](( cap + 1 ))" < "[$]f" 2>/dev/null | jq -e '.oauthAccount? != null'@jq -e '.oauthAccount? != null' "$f"@
+}
+SED
+try "v154_misc_sibling_scan_bounded" "the sibling identity scan read an oversized box file whole"
+
+# The in-place writer never pads up to a size the box chose.
+cat > "$SED_TMP" << 'SED'
+/^_write_in_place()/,/^}$/{
+  /^  \[ "[$]old" -le "[$](_claude_json_cap)" \] || return 1$/d
+}
+SED
+try "v154_misc_write_in_place_cap" "the in-place writer padded an oversized box file"
+
+# The same cap, caught at the attach heal of a running box.
+cat > "$SED_TMP" << 'SED'
+/^_write_in_place()/,/^}$/{
+  /^  \[ "[$]old" -le "[$](_claude_json_cap)" \] || return 1$/d
+}
+SED
+try "v154_misc_attach_heal_oversized" "the attach heal leaves an oversized running-box file untouched" "$CLI" "$CLAUDE_JSON_BATS"
+
+# The identity drop reads a bounded snapshot, so an oversized file never
+# reaches jq and the flag stays for the next launch.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_drop_identity()/,/^}$/{
+  s@^  _claude_json_snapshot "[$]f" "[$]snap" "[$]cap" || return 1$@  cp "$f" "$snap"@
+}
+SED
+try "v154_misc_identity_drop_snapshot" "an oversized per-project file is flagged for the next launch" "$CLI" "$ACCOUNTS_BATS"
+
+# The box's own jq is a box binary, so its output is capped before it is used.
+cat > "$SED_TMP" << 'SED'
+/^_claude_json_drop_identity()/,/^}$/{
+  s@ | head -c "[$](( cap + 1 ))" > "[$]tmp"@ > "$tmp"@
+  s@&& \[ "[$](_path_size "[$]tmp")" -le "[$]cap" \] &&@\&\&@
+}
+SED
+try "v154_misc_identity_drop_output_cap" "the jq-less identity drop kept unbounded output from the box jq"
+
+# v1.5.4: the hook drop report follows its offset into the rotated file when
+# that file still carries the inode the offset was taken against.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_hook_drops()/,/^}$/{
+  s/^  if \[ -n "[$]ino" \] && .*; then$/  if false; then/
+}
+SED
+try "v154_misc_hook_report_rotated_generation" "a hook drop log rotated by another box silenced the report"
+
+# A rotation the session makes itself resets the inode with the offset.
+cat > "$SED_TMP" << 'SED'
+/^_hook_drop_log()/,/^}$/{
+  /^      _hook_drop_ino=""$/d
+}
+SED
+try "v154_misc_drops_rotation_resets_ino" "the box cannot grow it without bound" "$CLI" "$HOOKS_BATS"
+
+# v1.5.4: the fork copy pauses every running box that can write the project.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  s/^  _daemon_up || return 0$/  return 0/
+}
+SED
+try "v154_misc_fork_pauses_writers" "a box on the live tree was not paused while the fork copied it"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  s/^  _daemon_up || return 0$/  return 0/
+}
+SED
+try "v154_misc_fork_pauses_writers_smoke" "fork refresh pauses a running box on the same folder" "$CLI" "$SMOKE_BATS"
+
+# A box on a folder above the project can write it too.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  /^      case "[$]tree\/" in "[$]s"\/\*) hit=1; break ;; esac$/d
+}
+SED
+try "v154_misc_fork_writers_ancestor" "the live writers are the project" "$CLI" "$FORK_BATS"
+
+# A fork box mounts its own copy, so it is never paused.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  /^    _box_is_fork "[$]n" && continue$/d
+}
+SED
+try "v154_misc_fork_writers_skip_forks" "the live writers are the project" "$CLI" "$FORK_BATS"
+
+# A listing that fails while the daemon answers refuses the copy.
+cat > "$SED_TMP" << 'SED'
+/^_fork_live_writers()/,/^}$/{
+  s/2>\/dev\/null)" || return 1$/2>\/dev\/null)" || return 0/
+}
+SED
+try "v154_misc_fork_writers_fail_closed" "a listing that fails while the daemon answers refuses the copy" "$CLI" "$FORK_BATS"
+
+# The paused boxes are resumed whatever the copy did.
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_quiesced()/,/^}$/{
+  /^    trap '_fork_unpause "[$]_fq_done"' EXIT$/d
+}
+SED
+try "v154_misc_fork_unpause_on_failure" "a copy that fails still resumes the paused boxes" "$CLI" "$FORK_BATS"
+
+# A pause refusal already said why, so the generic copy hint is not printed.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s/^      if \[\[ [$]_copy_rc -ne 75 \]\]; then$/      if true; then/
+}
+SED
+try "v154_misc_fork_refusal_no_hint" "names the boxes it paused and skips the copy hint" "$CLI" "$FORK_BATS"
+
+# v1.5.4: box-authored text is split with globbing off.
+cat > "$SED_TMP" << 'SED'
+/^_handoff_parse_probe()/,/^}$/{
+  s/set -f; set -- [$]rest; set +f/set -- $rest/
+}
+SED
+try "v154_misc_handoff_probe_noglob" "a probe line glob-expanded against the host filesystem"
+
+cat > "$SED_TMP" << 'SED'
+/^_parse_terminate()/,/^}$/{
+  s/set -f; set -- [$]rest; set +f;/set -- $rest;/
+}
+SED
+try "v154_misc_handoff_terminate_noglob" "a terminate line glob-expanded against the host filesystem"
+
+cat > "$SED_TMP" << 'SED'
+/^_handoff_classify()/,/^}$/{
+  /^  set -f$/d
+}
+SED
+try "v154_misc_handoff_shells_noglob" "a background shell id glob-expanded against the host filesystem"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_text()/,/^}$/{
+  /^ *set -f$/d
+}
+SED
+try "v154_misc_config_text_noglob" "a star cap glob-expanded into workspace file names in the text editor"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_tui()/,/^}$/{
+  /^ *set -f$/d
+}
+SED
+try "v154_misc_config_tui_noglob" "a star cap glob-expanded into workspace file names in the picker"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

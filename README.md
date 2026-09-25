@@ -375,6 +375,12 @@ Worth knowing before you rely on it:
 
 - The copy is a **point-in-time snapshot**. A fork taken an hour ago does not
   have work you did in the live tree since.
+- Every running box that can write the project folder (the project's own boxes
+  plus any box on a folder above or below it) is **paused while the copy runs**
+  and resumed right after. Nothing can swap a folder for a link mid-copy. An
+  attached session in one of those boxes freezes for the copy and one line names
+  what was paused. If a box cannot be paused the fork is refused and nothing is
+  copied.
 - Without copy-on-write (Linux without reflink support, or a fork root on a
   different volume) the copy is real duplicated disk.
 - `cleat storage` does not see fork copies. It measures the Docker store, while

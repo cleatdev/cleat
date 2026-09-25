@@ -2763,6 +2763,29 @@ EOF
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: fork refresh pauses a running box on the same folder under strict mode" {
+  # The copy runs over the live tree, so every running box that can write it is
+  # paused around the copy and resumed after. That is two new docker pipelines
+  # on this path, which only the real binary runs under set -euo pipefail.
+  mkdir -p "$TEST_TEMP/project/src"
+  echo code > "$TEST_TEMP/project/src/app.js"
+  cd "$TEST_TEMP/project"
+  local main_cname
+  main_cname="$(_compute_cname "$TEST_TEMP/project")"
+  mkdir -p "$CLEAT_CONFIG_DIR/forks/${main_cname}-feat-a"
+  printf '%s\n' "$main_cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  run cleat_bin fork refresh feat-a <<< "y"
+  assert_success
+  assert_output --partial "Workspace copied"
+  assert_output --partial "Paused for the copy and resumed"
+  refute_output --partial "unbound variable"
+  run grep -nE "^docker (pause|unpause) " "$DOCKER_CALLS"
+  assert_output --regexp "^[0-9]+:docker pause ${main_cname}
+[0-9]+:docker unpause ${main_cname}\$"
+  [ -f "$CLEAT_CONFIG_DIR/forks/${main_cname}-feat-a/src/app.js" ]
+}
+
 @test "smoke: cleat fork path output is capturable, no trailing escapes" {
   # THE bug this subcommand exists to avoid, and it only shows through a real
   # subprocess. `tput cnorm` writes its escape to STDOUT whether or not stdout

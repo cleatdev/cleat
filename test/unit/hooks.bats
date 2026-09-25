@@ -3270,6 +3270,7 @@ _host_hook_appends() {
   head -c $(( 1048576 + 4096 )) /dev/zero | tr '\0' 'x' > "$f"
   _HOOK_DROP_LOG_N=0
   _hook_drop_off=999999
+  _hook_drop_ino=12345
 
   _hook_drop_log "size" '{"hook_event_name":"Stop"}' "test-ctr" 0
   run test -f "$f.1"
@@ -3280,6 +3281,44 @@ _host_hook_appends() {
   # And the session's read offset went back to the start, or the end-of-session
   # report would read past the end of the new file and say nothing.
   assert_equal "$_hook_drop_off" 0
+  # The inode goes with it, or the report would read the rotated file from
+  # byte 0 and count earlier sessions' rows as this one's.
+  assert_equal "$_hook_drop_ino" ""
+}
+
+@test "hook drops report: after two rotations it reads the new file only, and still counts this box" {
+  # The inode taken with the offset names the first generation, which a second
+  # rotation has overwritten. The report cannot follow it, so it falls back to
+  # the new file: a lower bound, but never silent for this box's own rows, and
+  # never the rotated file from byte 0.
+  BOLD=''; RESET=''; DIM=''
+  local log="$CLEAT_STATE_DIR/hook-drops.log" off ino i
+  mkdir -p "$CLEAT_STATE_DIR"
+  for i in $(seq 1 50); do printf 'now\t%s\tjson\tbox-a\tmd5\t0\told\n' "$_HOOK_DROP_MARK"; done > "$log"
+  off="$(_path_size "$log")"
+  ino="$(_path_ino "$log")"
+  mv "$log" "$log.1"
+  for i in $(seq 1 100); do printf 'now\t%s\tjson\tbox-a\tmd5\t0\tgen2\n' "$_HOOK_DROP_MARK"; done > "$log"
+  mv -f "$log" "$log.1"
+  for i in 1 2 3; do printf 'now\t%s\tjson\tbox-a\tmd5\t0\tgen3\n' "$_HOOK_DROP_MARK"; done > "$log"
+  run _maybe_report_hook_drops "$log" "$off" box-a "$ino"
+  assert_success
+  assert_output --partial "Dropped 3 hook events"
+}
+
+@test "hook drops report: with no rotation the inode changes nothing" {
+  BOLD=''; RESET=''; DIM=''
+  local log="$CLEAT_STATE_DIR/hook-drops.log" off ino
+  mkdir -p "$CLEAT_STATE_DIR"
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\told\n' "$_HOOK_DROP_MARK" > "$log"
+  off="$(_path_size "$log")"
+  ino="$(_path_ino "$log")"
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\tnew\n' "$_HOOK_DROP_MARK" >> "$log"
+  # A stale .1 from long ago is another file, so it is never read.
+  printf 'now\t%s\tjson\tbox-a\tmd5\t0\tancient\n' "$_HOOK_DROP_MARK" > "$log.1"
+  run _maybe_report_hook_drops "$log" "$off" box-a "$ino"
+  assert_success
+  assert_output --partial "Dropped 1 hook event from the box"
 }
 
 @test "hook bridge: it survives a host with no settings file at all" {

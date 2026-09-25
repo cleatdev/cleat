@@ -7660,6 +7660,34 @@ EOF
   assert_success
 }
 
+# vNEXT: the image rate cap report read the watcher log through a plain -f gate
+# and an unbounded tail, the reader the two v1.5.4 tests above replaced in the
+# reports beside it. The log has since moved to logs/, outside the mount, so
+# this hands the report a clip path as those tests do: the guards are the
+# second layer, and they must hold on their own.
+@test "regression vNEXT: the image rate cap report never follows a link or hangs on a FIFO planted as its log" {
+  local clip="$TEST_TEMP/clip-img" host="$TEST_TEMP/host-img-log"
+  mkdir -p "$clip"
+  echo "[clipimg-watcher 12:00:00] ${_CLIPIMG_CAPPED_MARK} limit=${_CLIPIMG_RATE_PER_MIN}/min" > "$host"
+  # The same line in a regular log is reported, so the line matches.
+  cp "$host" "$clip/.watcher-log"
+  run _maybe_report_capped_images "$clip/.watcher-log" 0
+  assert_output --partial "Did not paste"
+  rm -f "$clip/.watcher-log"
+  ln -s "$host" "$clip/.watcher-log"
+  run _maybe_report_capped_images "$clip/.watcher-log" 0
+  assert_success
+  assert_output ""
+  # From past a prior session's line, the tail branch, swapped for a FIFO
+  # after the check.
+  rm -f "$clip/.watcher-log"; echo "prior" > "$clip/.watcher-log"; cat "$host" >> "$clip/.watcher-log"
+  _BOX_FILE_READ_SECS=1
+  _rd_swap_on_open "$clip/.watcher-log"
+  _rd_finishes_within 6 "$clip/.watcher-log" _maybe_report_capped_images "$clip/.watcher-log" 6 \
+    || fail "the image rate cap report blocked on a swapped log"
+  run test -d "$_RD_SWAP_DIR/fired"
+  assert_success
+}
 
 # The session list sized each transcript with `wc -c <`, which opens it, inside
 # a plain -f gate. A device symlink swapped in after the gate read forever and a

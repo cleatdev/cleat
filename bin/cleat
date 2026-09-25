@@ -11760,13 +11760,16 @@ EOF
 }
 
 # Report the image requests the rate cap refused this session, from the
-# session's window of the watcher log. The box can write that log, so this is
-# usability rather than evidence: the limit printed is the constant, never a
-# logged field, and a forged line can only add a notice.
+# session's window of the watcher log. That log is host-only (logs/), so the
+# box can no longer forge a line into it. The guards are the same second layer
+# _maybe_explain_fork_exhaustion keeps on the same file: a link is never
+# followed, and a FIFO or a device swapped in after the check costs the read
+# bound rather than a hang at session end. The limit printed is the constant,
+# never a logged field.
 _maybe_report_capped_images() {
   local log="$1" off="${2:-0}" n
-  [ -f "$log" ] || return 0
-  n="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null \
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  n="$(_read_bounded "$log" "$_BOX_FILE_READ_MAX" "$(( off + 1 ))" \
     | grep -c "^[[]clipimg-watcher [0-9][0-9]:[0-9][0-9]:[0-9][0-9][]] ${_CLIPIMG_CAPPED_MARK} limit=" 2>/dev/null)" || true
   n="$(printf '%s' "$n" | tr -d '[:space:]')"
   case "$n" in ''|*[!0-9]*) return 0 ;; esac

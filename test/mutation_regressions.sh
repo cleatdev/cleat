@@ -12230,6 +12230,22 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v154_boxread_log_blocked_nolink" "session-end reports never follow a link"
 
+# The image rate cap report, main's sibling of the four above. Back to a plain
+# tail it blocks on a FIFO swapped in after its check, and back to a bare -f
+# gate it reads through a link planted as its log.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_images()/,/^}$/{
+  s@n="[$](_read_bounded "[$]log" "[$]_BOX_FILE_READ_MAX" "[$](( off + 1 ))" \\$@n="$(tail -c "+$(( off + 1 ))" "$log" 2>/dev/null \\@
+}
+SED
+try "vnext_capped_images_bounded" "image rate cap report never follows a link or hangs on a FIFO"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_capped_images()/,/^}$/{
+  s@^  \[ -f "[$]log" \] && \[ ! -L "[$]log" \] || return 0$@  [ -f "$log" ] || return 0@
+}
+SED
+try "vnext_capped_images_nolink" "image rate cap report never follows a link or hangs on a FIFO"
 
 # One read decides the project caps. resolve_caps applied its own read of
 # .cleat while the trust check hashed a second, the prompt listed a third and

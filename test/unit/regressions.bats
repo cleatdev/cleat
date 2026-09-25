@@ -3247,6 +3247,80 @@ EOF
   assert_output ""
 }
 
+# v1.5.4: exec_claude under the binary's own strict mode. test/setup.bash strips
+# line 2 when it sources the CLI, and errexit is the defect these tests guard.
+# `run` puts it in a subshell, so the bats process itself stays lenient. -u is
+# left out on purpose: the smoke test covers it on the real binary.
+_strict_exec_claude() { set -eo pipefail; exec_claude "$@"; }
+
+@test "regression v1.5.4: a directory the box plants in the clip dir cannot end the session before its harvest and reports" {
+  # _cleanup_session ran plain `rm -f` on names the box can shape: the
+  # .clipboard.* glob, both .claim.<pid>.* globs and .host-ready. The clip dir
+  # is the box's read-write /tmp/cleat-clip, and rm -f on a directory exits 1
+  # on GNU and BSD. Under the binary's set -e that ended the CLI at the first
+  # one, and the EXIT trap then died on the same line. Skipped: the terminal
+  # restore, the login harvest, "Session ended" and every session-end report,
+  # including the one that says ~/.claude/.config.json appeared. The
+  # clipclaim/ claim is outside the mount, but a watcher killed between its mv
+  # of a planted directory and the rm -rf leaves exactly this behind.
+  _host_open_cmd() { echo ""; }
+  _wait_for_coder_remap() { true; }
+  _account_sync_out() { echo "HARVEST_RAN"; }
+  local run_dir="$CLEAT_RUN_DIR/test-ctr"
+  docker() {
+    case " $* " in
+      *" exec "*" runuser "*)
+        mkdir -p "$run_dir/clip/.clipboard.planted" "$run_dir/clip/.claim.$$.planted" \
+                 "$run_dir/clipclaim/.claim.$$.planted"
+        rm -f "$run_dir/clip/.host-ready"; mkdir "$run_dir/clip/.host-ready"
+        printf '{}\n' > "$HOME/.claude/.config.json" ;;
+    esac
+    command docker "$@"
+  }
+  run _strict_exec_claude test-ctr --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "HARVEST_RAN"
+  assert_output --partial "Session ended"
+  assert_output --partial "appeared during this session"
+  # No rm diagnostic reaches the terminal. On macOS it carried the box's bytes.
+  # This is also what catches a single removal losing its guard, because the
+  # errexit wrapper absorbs the abort itself.
+  refute_output --partial "rm: "
+}
+
+@test "regression v1.5.4: a teardown step that fails still restores the terminal, harvests the login and reports the session" {
+  # Defence in depth for the test above: the teardown is best-effort, so no
+  # step inside it may decide whether the restore, the harvest and the reports
+  # run. Covers both ways the teardown is reached, the final call and the
+  # TERM/HUP trap (a closed terminal window). errexit stays live inside a trap
+  # action, so a guard at the final call site alone would miss the second.
+  _host_open_cmd() { echo ""; }
+  _wait_for_coder_remap() { true; }
+  _account_sync_out() { echo "HARVEST_RAN"; }
+  _restore_terminal() { echo "RESTORE_TERMINAL_CALLED"; }
+  # The stand-in for any teardown step that fails.
+  _browser_teardown_bridge() { return 1; }
+  run _strict_exec_claude test-ctr --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "RESTORE_TERMINAL_CALLED"
+  assert_output --partial "HARVEST_RAN"
+  assert_output --partial "Session ended"
+
+  # The same step failing inside the TERM trap. $PPID of the child is the shell
+  # running exec_claude, so the signal lands on it mid-exec, as a HUP would.
+  # bash runs the trap once the foreground child has exited.
+  docker() {
+    case " $* " in
+      *" exec "*" runuser "*) sh -c 'kill -TERM $PPID' ;;
+    esac
+    command docker "$@"
+  }
+  run _strict_exec_claude test-ctr --dangerously-skip-permissions
+  assert_success
+  assert_output --partial "HARVEST_RAN"
+  assert_output --partial "Session ended"
+}
+
 @test "regression: a symlinked browser-bridge file is never read through" {
   # Same bug, same shared dir, different consumer: _browser_claim_url gated on
   # [ -f ] (dereferences), moved the link with mv (does not), then `cat`ed the

@@ -10763,7 +10763,17 @@ exec_claude() {
   fi
   printf 'kind=claude exec=%s\n' "$_ec_id" > "$_ec_marker" 2>/dev/null || true
 
-  _cleanup_session() {
+  # The teardown is best-effort. It runs at the final exit and from the
+  # EXIT/INT/TERM/HUP trap. `|| true` suspends errexit for the whole body, so no
+  # step that fails can end the CLI before the terminal restore, the login
+  # harvest and the session-end reports that follow the final call. Several
+  # steps remove names inside the read-write clip dir. The box can plant a
+  # directory at any of them, which `rm -f` refuses with exit 1 on GNU and BSD.
+  # The wrapper sits inside the function rather than at the call site because
+  # errexit stays live inside a trap action: a step failing in the TERM or HUP
+  # handler (a closed terminal window) would still end the CLI there.
+  _cleanup_session() { _cleanup_session_steps || true; }
+  _cleanup_session_steps() {
     # Kill clipboard watcher
     if [ -n "${_CLIP_WATCHER_PID:-}" ]; then
       kill "$_CLIP_WATCHER_PID" 2>/dev/null || true
@@ -10804,8 +10814,11 @@ exec_claude() {
       _HOOK_BRIDGE_PID=""
     fi
     _cleanup_spin
-    # Quiet: every name past the prefix is the box's. BSD rm prints a name it
-    # cannot remove (a directory, say) raw, escape bytes included.
+    # Quiet and fail-soft: every name past the prefix is the box's. It can be a
+    # directory, which rm -f refuses with exit 1, and BSD rm prints a name it
+    # cannot remove raw, escape bytes included. A flood of names past ARG_MAX
+    # fails the same way (exit 126), and bash reports that after applying the
+    # redirect, so it stays quiet too.
     rm -f "${_CLIP_DIR:?}/.clipboard."* 2>/dev/null || true
     # Own claims only: another session's live claim must survive our exit (see
     # _do_copy's claim-name note). Both locations: claims moved out of the bind

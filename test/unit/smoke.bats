@@ -1518,6 +1518,38 @@ CURL
   refute_output --partial "syntax error"
 }
 
+@test "smoke: a directory the box plants in the clip dir does not abort the session end (strict mode)" {
+  # The real binary runs under set -euo pipefail from line 2, which is where the
+  # teardown died: rm -f on a box-planted directory exits 1. The stub plays the
+  # box and plants one at the .clipboard.* glob and at .host-ready.
+  mkdir -p "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+  local stub="$TEST_TEMP/plantstub"
+  mkdir -p "$stub"
+  cat > "$stub/docker" << STUB
+#!/usr/bin/env bash
+case " \$* " in
+  *" exec "*" runuser "*)
+    for d in "$XDG_CONFIG_HOME"/cleat/run/*/clip; do
+      mkdir -p "\$d/.clipboard.planted"
+      rm -f "\$d/.host-ready"; mkdir -p "\$d/.host-ready"
+    done ;;
+esac
+exec "$MOCK_BIN/docker" "\$@"
+STUB
+  chmod +x "$stub/docker"
+  cd "$TEST_TEMP/project"
+  run _portable_timeout 30 env PATH="$stub:$MOCK_BIN:$PATH" HOME="$HOME" \
+    XDG_CONFIG_HOME="$XDG_CONFIG_HOME" DOCKER_CALLS="$DOCKER_CALLS" \
+    DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" DOCKER_EXIT_CODE=0 \
+    "$CLI" start </dev/null
+  assert_success
+  assert_output --partial "Session ended"
+  refute_output --partial "rm: "
+}
+
 @test "smoke: cleat run into existing image exits cleanly" {
   mkdir -p "$TEST_TEMP/project"
   printf '' > "$DOCKER_MOCK_DIR/ps_output"

@@ -5475,6 +5475,39 @@ s@    kill -0 "[$]pid" 2>/dev/null || rm -f "[$]m" 2>/dev/null || true@    :@
 SED
 try "watcher_marker_liveness" "a dead session's watcher marker never latches" "$CLI" "$REGRESSIONS"
 
+# TEARDOWN UNDER ERREXIT (v1.5.4): the box can plant a directory at any name
+# the session teardown removes in its read-write clip dir, and rm -f exits 1 on
+# a directory. Under the binary's set -e that ended the CLI before the terminal
+# restore, the login harvest and the session-end reports. The per-removal
+# entries are caught through the test's `refute_output --partial "rm: "`,
+# because the errexit wrapper absorbs the abort itself. GNU and BSD rm both
+# print a diagnostic for a directory. The .clipboard.* and both .claim.<pid>.*
+# removals are registered with the other v1.5.4 entries further down.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^      rm -f "[$]_CLIP_DIR/[.]host-ready" 2>/dev/null || true$@      rm -f "$_CLIP_DIR/.host-ready"@
+}
+SED
+try "v154_teardown_host_ready_fail_soft" "a directory the box plants in the clip dir"
+
+# Drop the wrapper and any failing teardown step ends the CLI, at the final call
+# and inside the TERM/HUP trap action alike.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^  _cleanup_session() { _cleanup_session_steps || true; }$@  _cleanup_session() { _cleanup_session_steps; }@
+}
+SED
+try "v154_teardown_errexit_wrapper" "a teardown step that fails still restores the terminal"
+
+# The strict-mode backstop on the real binary. Not registered for the wrapper:
+# the per-removal guards mask it there.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    rm -f "[$]{_CLIP_DIR:?}/[.]clipboard[.]"[*] 2>/dev/null || true$@    rm -f "${_CLIP_DIR:?}/.clipboard."*@
+}
+SED
+try "v154_teardown_strict_smoke" "does not abort the session end" "$CLI" "$SMOKE_BATS"
+
 # BROWSER BRIDGE SYMLINK READ-THROUGH: the same shape as the clipboard payload
 # path, in the consumer that `cat`s the claim. Drop the guard and a planted link
 # has the host read any file it names and hand the contents to the URL opener.

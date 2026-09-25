@@ -8362,6 +8362,35 @@ _h154_inspect_from_run() {
   refute_output --partial "docker rm -f $H154_CN"
 }
 
+# A box old enough to predate the per-box ~/.claude mounts is also recreated on
+# its first start after the history store move. The note telling the user to
+# recreate it was asked before that decision, so it printed one line above the
+# recreate that made it untrue. It now runs after the decision in both verbs,
+# and can only speak about the container that will actually run.
+_mask_note_before_recreate() {
+  local before="${1%%Recreating container*}"
+  case "$before" in *predates*) return 0 ;; esac
+  return 1
+}
+
+@test "regression vNEXT: cmd_start never prints the recreate note ahead of the recreate that fixes it" {
+  _h154_legacy_box
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  run _mask_note_before_recreate "$output"
+  assert_failure
+}
+
+@test "regression vNEXT: cmd_resume never prints the recreate note ahead of the recreate that fixes it" {
+  _h154_legacy_box
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Recreating container"
+  run _mask_note_before_recreate "$output"
+  assert_failure
+}
+
 # ~/.claude/history.jsonl is the nested bind TARGET, pre-created for VirtioFS.
 # `touch` on it followed a link there, like the source's touch did.
 @test "regression v1.5.4: the nested history target is never touched through a link" {

@@ -13665,6 +13665,26 @@ SED
 try "vnext_run_lacks_needs_a_line" "assert_docker_run_lacks fails when no run line names the container" \
     "$SETUP_BASH" "$STUB_VALIDATION_BATS"
 
+# vNEXT: the recreate note was asked before the recreate decision, so an old
+# box heard "recreate to enable them" one line above the recreate that did it.
+# Put the early call back in each verb: the note then prints ahead of
+# "Recreating container" and the matching test fails.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /^  _maybe_note_host_global_config$/i\
+  _maybe_note_missing_kit_masks "$cname"
+}
+SED
+try "vnext_mask_note_after_recreate_start" "cmd_start never prints the recreate note"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  /^  _maybe_note_host_global_config$/i\
+  _maybe_note_missing_kit_masks "$cname"
+}
+SED
+try "vnext_mask_note_after_recreate_resume" "cmd_resume never prints the recreate note"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

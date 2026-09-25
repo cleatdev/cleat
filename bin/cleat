@@ -13743,7 +13743,6 @@ cmd_start() {
     _generate_kit_overlay "$cname"
     _generate_instr_overlay "$cname"
   fi
-  _maybe_note_missing_kit_masks "$cname"
   _maybe_note_host_global_config
 
   # Settings overlays follow the caps resolved for this launch, so a declined
@@ -13811,6 +13810,12 @@ cmd_start() {
     success "Container started"
   fi
 
+  # After the recreate decision above, never before it. A box created before
+  # the host-only history store is recreated on this start, and the new
+  # container carries every mask. Asked earlier, the note told the user to
+  # recreate a box this very start was about to recreate.
+  _maybe_note_missing_kit_masks "$cname"
+
   _print_auth_line "$(container_name_for "$project" "${_BOX:-main}")"
 
   # The docker cap breaks the sandbox outright: loud warning. The hooks cap's
@@ -13866,7 +13871,6 @@ cmd_resume() {
     _generate_kit_overlay "$cname"
     _generate_instr_overlay "$cname"
   fi
-  _maybe_note_missing_kit_masks "$cname"
   _maybe_note_host_global_config
 
   _refresh_settings_overlays "$cname" "$project"
@@ -13918,6 +13922,12 @@ cmd_resume() {
       cmd_run "$project"
     fi
   fi
+
+  # After the recreate decision above, never before it. A box created before
+  # the host-only history store is recreated on this start, and the new
+  # container carries every mask. Asked earlier, the note told the user to
+  # recreate a box this very start was about to recreate.
+  _maybe_note_missing_kit_masks "$cname"
 
   # The docker cap breaks the sandbox outright: loud warning. The hooks cap's
   # matching line prints from exec_claude, only when a host hook will run.

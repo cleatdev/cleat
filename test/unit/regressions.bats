@@ -9832,3 +9832,15 @@ _c19_star_project() {
   assert_output --partial "More than one mode line"
   assert_output --partial "strict, open"
 }
+
+@test "regression vNEXT: a project cleat file widened the egress policy" {
+  # The caged agent writes /workspace/.cleat, so a policy read from it would be
+  # authored by the thing it restricts (EGRESS-SPEC.md 5.1).
+  mkdir -p "$CLEAT_CONFIG_DIR" "$TEST_TEMP/proj"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nmode = strict\nallow = evil.example\n' > "$TEST_TEMP/proj/.cleat"
+  _RESOLVED_PROJECT="$TEST_TEMP/proj"
+  _egress_resolve cleat-proj-1234abcd
+  run echo "$_EG_HOSTS"
+  refute_output --partial "evil.example"
+}

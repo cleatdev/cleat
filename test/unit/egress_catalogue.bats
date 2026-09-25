@@ -8,6 +8,8 @@
 load "../setup"
 setup() {
   _common_setup
+  # The stub, never the host's daemon: a session-marker read runs docker inspect.
+  use_docker_stub
   source_cli
   PUBLISHED="$BATS_TEST_DIRNAME/../../EGRESS-CATALOGUE.md"
   PROJECT="$TEST_TEMP/proj"
@@ -364,4 +366,137 @@ s3.amazonaws.com"
   run _egress_detect_packs "$PROJECT"
   assert_output "pypi suggested
 rust suggested"
+}
+
+# ── The pin (7.5) ────────────────────────────────────────────────────────────
+
+@test "egress pin: bumping the catalogue rev alone does not change the pin digest" {
+  local pinned before after
+  pinned="$(printf 'api.anthropic.com B\nclaude.ai B\n')"
+  before="$(_egress_pin_digest "$pinned")"
+  _EGRESS_CATALOGUE_REV=99
+  # The shipped expansion gains a host, but the pinned expansion is what the
+  # digest hashes, and nothing re-pinned it.
+  after="$(_egress_pin_digest "$pinned")"
+  assert_equal "$after" "$before"
+  assert_equal "$before" "v1:012a9448696213e5"
+}
+
+@test "egress pin: the pin digest ignores the order the hosts arrive in" {
+  run _egress_pin_digest "$(printf 'claude.ai B\napi.anthropic.com B\nclaude.ai B\n')"
+  assert_output "v1:012a9448696213e5"
+}
+
+@test "egress pin: re-pinning at a new rev changes the digest" {
+  local before after
+  before="$(_egress_pin_digest "$(printf 'api.anthropic.com B\nclaude.ai B\n')")"
+  after="$(_egress_pin_digest "$(printf 'api.anthropic.com B\nclaude.ai B\nnew.example B\n')")"
+  [ "$before" != "$after" ] || { echo "a re-pin with a new host kept the digest"; return 1; }
+}
+
+@test "egress pin: a deny that removes nothing effective does not change the digest" {
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_resolve cleat-app-1234abcd
+  local a="$_EG_HOSTS"
+  printf '[egress]\nmode = strict\npack = npm\ndeny = never-allowed.example\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_resolve cleat-app-1234abcd
+  assert_equal "$(_egress_policy_digest strict "$_EG_HOSTS")" "$(_egress_policy_digest strict "$a")"
+}
+
+@test "egress pin: a class move with no host move changes the digest" {
+  local b c
+  b="$(_egress_pin_digest "raw.githubusercontent.com B")"
+  c="$(_egress_pin_digest "raw.githubusercontent.com C")"
+  [ "$b" != "$c" ] || { echo "a class move kept the digest"; return 1; }
+}
+
+_pin_fixture() {
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-pins"
+  PIN="$CLEAT_CONFIG_DIR/egress-pins/global"
+  _egress_write_pin "$PIN" 1 2026-09-21 v1:0000000000000000 "$@"
+  SHIPPED="$TEST_TEMP/shipped"
+}
+
+@test "egress pin: a class downgrade holds and is named on the launch summary" {
+  _pin_fixture "raw.githubusercontent.com B" "api.anthropic.com B"
+  printf 'raw.githubusercontent.com C\napi.anthropic.com B\n' > "$SHIPPED"
+  run _egress_pin_diff "$PIN" "$SHIPPED"
+  assert_output "weakened	raw.githubusercontent.com	B	C"
+  run _egress_pin_summary "$(_egress_pin_diff "$PIN" "$SHIPPED")"
+  assert_output "1 host you allowed is now shared: raw.githubusercontent.com. Run cleat egress review."
+}
+
+@test "egress pin: a newly set open tenancy flag is a downgrade" {
+  _pin_fixture "huggingface.co B"
+  printf 'huggingface.co B open-tenancy\n' > "$SHIPPED"
+  run _egress_pin_diff "$PIN" "$SHIPPED"
+  assert_output "weakened	huggingface.co	B	B open-tenancy"
+  run _egress_pin_summary "$output"
+  assert_output "1 host you allowed is now open tenancy: huggingface.co. Run cleat egress review."
+}
+
+@test "egress pin: a class upgrade applies with no summary line" {
+  _pin_fixture "debian.osuosl.org B"
+  printf 'debian.osuosl.org A\n' > "$SHIPPED"
+  run _egress_pin_diff "$PIN" "$SHIPPED"
+  assert_output "strengthened	debian.osuosl.org	B	A"
+  run _egress_pin_summary "$output"
+  assert_output ""
+}
+
+@test "egress pin: additions are held and named by pack, removals are counted" {
+  _pin_fixture "github.com B" "api.github.com B" "gone.example B" "gone2.example C"
+  printf 'github.com B\napi.github.com B\ncodeload.github.com B\nuploads.github.com B\nregistry.npmjs.org B\n' > "$SHIPPED"
+  run _egress_pin_summary "$(_egress_pin_diff "$PIN" "$SHIPPED")"
+  assert_output '2 new hosts in pack "github" held. Run cleat egress review.
+1 new host in pack "npm" held. Run cleat egress review.
+2 hosts left the packs you use and no longer reach the box.'
+}
+
+@test "egress pin: an unchanged expansion diffs to nothing" {
+  _pin_fixture "github.com B" "claude.ai B"
+  printf 'claude.ai B\ngithub.com B\n' > "$SHIPPED"
+  run _egress_pin_diff "$PIN" "$SHIPPED"
+  assert_output ""
+}
+
+@test "egress pin: the pin file is its own canonical form" {
+  _pin_fixture "zeta.example B" "alpha.example C" "alpha.example C"
+  run cat "$PIN"
+  assert_output "[pin]
+catalogue_rev = 1
+pinned_at = 2026-09-21
+digest = v1:0000000000000000
+host = alpha.example C
+host = zeta.example B"
+  run _read_section_from_file "$PIN" pin catalogue_rev
+  assert_output "1"
+}
+
+@test "egress pin: the pin writer refuses a pin path that is a symlink to a directory" {
+  mkdir -p "$TEST_TEMP/victim" "$CLEAT_CONFIG_DIR/egress-pins"
+  ln -s "$TEST_TEMP/victim" "$CLEAT_CONFIG_DIR/egress-pins/global"
+  run _egress_write_pin "$CLEAT_CONFIG_DIR/egress-pins/global" 1 2026-09-21 v1:0 "a.example B"
+  assert_failure
+  run ls -A "$TEST_TEMP/victim"
+  assert_output ""
+}
+
+@test "egress pin: the pin writer accepts a pin path that is a symlink to a regular file" {
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-pins"
+  : > "$TEST_TEMP/pinfile"
+  ln -s "$TEST_TEMP/pinfile" "$CLEAT_CONFIG_DIR/egress-pins/global"
+  run _egress_write_pin "$CLEAT_CONFIG_DIR/egress-pins/global" 1 2026-09-21 v1:0 "a.example B"
+  assert_success
+  run _read_section_all_from_file "$CLEAT_CONFIG_DIR/egress-pins/global" pin host
+  assert_output "a.example B"
+}
+
+@test "egress pin: a class key carries open tenancy when the flag is set" {
+  run _egress_pin_class_key huggingface.co
+  assert_output "B open-tenancy"
+  run _egress_pin_class_key github.com
+  assert_output "B"
+  run _egress_pin_class_key not-in-the-catalogue.example
+  assert_output "unaudited"
 }

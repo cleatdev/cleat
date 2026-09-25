@@ -13818,6 +13818,45 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_pretick_unaudited_held" "an unaudited pack is never pre ticked" "$CLI" "$EGRESS_UI_BATS"
 
+# ── Egress stage two, slice two (b): resolution and the pin ──────────────────
+
+# Global only: pointing the global read at the project file folds the project's
+# [egress] back into the resolution, which ruling A1 deletes.
+cat > "$SED_TMP" << 'SED'
+s@_egress_read_file "[$]CLEAT_GLOBAL_CONFIG" egress@_egress_read_file "$(_project_caps_file "$_RESOLVED_PROJECT")" egress@
+SED
+try "vnext_project_cannot_widen" "a project cleat file widened the egress policy" "$CLI"
+
+# The global deny applies before the per-box allows. Keeping the global denies
+# for the per-box pass subtracts a host the per-box file added.
+cat > "$SED_TMP" << 'SED'
+/^_egress_resolve()/,/^}$/{
+  /^  _r_deny=""$/d
+}
+SED
+try "vnext_egress_perbox_order" "a per-box allow overrides a global deny" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# Entries with no mode have no defensible reading, so they refuse.
+cat > "$SED_TMP" << 'SED'
+/^_egress_resolve()/,/^}$/{
+  s@^  if \[ "[$]_g_mode" = absent \] && \[ -n "[$]_entries" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_mode_required" "allow lines with no mode refuse to start" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# A class downgrade must not apply silently. Flipping the token the diff emits
+# sends a downgrade down the upgrade branch, which prints nothing.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_diff()/,/^}$/s|weakened|strengthened|
+SED
+try "vnext_egress_pin_class_downgrade_held" "a class downgrade holds and is named on the launch summary" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The pin writer runs the directory-target guard at its own call site.
+cat > "$SED_TMP" << 'SED'
+/^_egress_write_pin()/,/^}$/s|_egress_path_is_writable_policy|true|
+SED
+try "vnext_egress_pin_writer_dir_target_guard" "the pin writer refuses a pin path that is a symlink to a directory" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

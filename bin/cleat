@@ -9720,6 +9720,380 @@ _egress_detect_packs() {                 # <project>
   done
 }
 
+# ── Egress policy resolution, the policy digest and the pin ────────────────
+# EGRESS-SPEC.md 5.1, 5.4, 5.6 and 7.5. Resolved afresh on every call, never
+# cached across calls: a call can come hours after the verb began, and a
+# resolution cached at its top would compare a newer live policy against an
+# older, wider one.
+
+# Warn once per file per process about keys [egress] does not know. A key
+# that reads as protection and does nothing (`deni = x`) is worse than no key.
+_egress_warn_unknown_keys() {            # <file>
+  local _f="$1" _line _k _seen=""
+  case "$_EG_WARNED_KEY_FILES" in *"|$_f|"*) return 0 ;; esac
+  _EG_WARNED_KEY_FILES="${_EG_WARNED_KEY_FILES}|$_f|"
+  while IFS= read -r _line; do
+    _k="${_line%%=*}"
+    _k="${_k%"${_k##*[![:space:]]}"}"
+    case "$_k" in mode|pack|allow|deny) continue ;; esac
+    case "|$_seen|" in *"|$_k|"*) continue ;; esac
+    _seen="${_seen:+$_seen|}$_k"
+    warn "Unknown key ${BOLD}$(_sanitize_repo_str "$_k")${RESET} in [egress] of ${_f/#${HOME}/~} ${DIM}(ignored: mode, pack, allow and deny are the keys)${RESET}"
+  done < <(_read_bounded "$_f" "$_BOX_FILE_READ_MAX" | awk '
+    NR == 1 { sub(/^\357\273\277/, "") }
+    { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+    /^#/ { next }
+    /^\[.*\]$/ { in_s = ($0 == "[egress]"); next }
+    in_s && /=/ { print }')
+  return 0
+}
+
+# One file's allow, pack and deny values, validated. Appends to the caller's
+# _r_hosts (allowed names, one per line) and _r_deny, and exits 1 on a
+# refusal: an invalid deny or an unknown pack. An invalid allow is dropped
+# with a warning, because dropping it narrows. Called at statement position.
+_egress_take_file() {                    # <file> <label>
+  local _f="$1" _v _h _p _raw _n=0
+  # The shared reader drops an empty value silently. Dropping an allow only
+  # narrows, so it continues, but a user should hear that a line did nothing.
+  _raw=$(_egress_raw_key_count "$_f" egress allow)
+  _n="$(printf '%s' "$_e_vals" | grep -c . || true)"
+  if [ "$_raw" -gt "$_n" ]; then
+    warn "Ignored an empty allow line in ${_f/#${HOME}/~}"
+  fi
+  while IFS= read -r _v; do
+    [ -n "$_v" ] || continue
+    if _h="$(_egress_valid_host "$_v")"; then
+      _r_hosts+="$_h"$'\n'
+    else
+      # The reason is set in the current shell, not in the substitution above.
+      _egress_valid_host "$_v" >/dev/null || true
+      warn "Ignored an allow entry in ${_f/#${HOME}/~} that is not a host name: $(_sanitize_repo_str "$_v") ${DIM}(${_EG_HOST_REASON})${RESET}"
+    fi
+  done <<EOF
+$_e_vals
+EOF
+  while IFS= read -r _p; do
+    [ -n "$_p" ] || continue
+    if ! _egress_pack_ids | grep -qx -- "$_p"; then
+      error "Unknown egress pack in ${_f/#${HOME}/~}: $(_sanitize_repo_str "$_p")"
+      echo -e "  ${DIM}The packs are listed by ${BOLD}cleat egress packs${RESET}${DIM}.${RESET}"
+      exit 1
+    fi
+    _r_hosts+="$(_egress_pack_hosts "$_p")"$'\n'
+  done <<EOF
+$_p_vals
+EOF
+  while IFS= read -r _v; do
+    [ -n "$_v" ] || continue
+    if ! _h="$(_egress_valid_host "$_v")"; then
+      error "A deny entry in ${_f/#${HOME}/~} is not a host name: $(_sanitize_repo_str "$_v")"
+      echo -e "  ${DIM}Dropping it would widen the policy, so nothing starts until it is fixed.${RESET}"
+      exit 1
+    fi
+    _r_deny+="$_h"$'\n'
+  done <<EOF
+$_d_vals
+EOF
+}
+
+# Removes every name in $2 from the name list $1. Prints the rest, one per
+# line, each LF-terminated. The caller appends to it, so the final newline is
+# load-bearing: $(...) strips it and a later append would glue two names into
+# one, so a caller that appends afterwards puts it back.
+_egress_subtract() {                     # <names> <deny>
+  local _n _out=""
+  while IFS= read -r _n; do
+    [ -n "$_n" ] || continue
+    printf '%s\n' "$2" | grep -qxF -- "$_n" && continue
+    _out+="$_n"$'\n'
+  done <<EOF
+$1
+EOF
+  printf '%s' "$_out"
+}
+
+# Resolves the policy for one box into three globals:
+#   _EG_MODE   off, strict or open
+#   _EG_HOSTS  the effective allowed names, sorted and unique, one per line
+#   _EG_WHY    absent (no section anywhere), header (a bare [egress]),
+#              global, perbox or session: which statement set the mode
+# In order: the core pack, the global pack and allow lines, the global deny,
+# the per-box pack and allow lines, the per-box deny, then the session marker,
+# which moves no host and only turns a resolved strict into open. The core
+# pack is always allowed and no later step removes it. A host the global
+# section denies and the per-box file allows ends allowed: both are host-side
+# and the per-box file exists to widen one box. Refusals print and exit 1.
+# Called at statement position.
+_egress_resolve() {                      # <cname>
+  local _cname="$1" _perbox _r_hosts="" _r_deny="" _g_mode _entries
+  local _core
+  _core="$(_egress_pack_hosts claude all)"
+  _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress
+  _g_mode="$_m_mode"
+  _entries="$_e_vals$_p_vals$_d_vals"
+  if [ "$_g_mode" = absent ] && [ -n "$_entries" ]; then
+    error "The [egress] section of ${CLEAT_GLOBAL_CONFIG/#${HOME}/~} lists hosts but no mode."
+    echo -e "  ${DIM}Add ${BOLD}mode = strict${RESET}${DIM} (or open, or off). Nothing starts until it says which.${RESET}"
+    exit 1
+  fi
+  _egress_warn_unknown_keys "$CLEAT_GLOBAL_CONFIG"
+  _egress_take_file "$CLEAT_GLOBAL_CONFIG" global
+  _r_hosts="$(_egress_subtract "$_r_hosts" "$_r_deny")"
+  _r_hosts="${_r_hosts:+$_r_hosts$'\n'}"
+  _r_deny=""
+  case "$_g_mode" in
+    absent)
+      _EG_MODE=off
+      if [ "$(_egress_raw_section_present "$CLEAT_GLOBAL_CONFIG")" = 1 ]; then _EG_WHY=header; else _EG_WHY=absent; fi ;;
+    *) _EG_MODE="$_g_mode"; _EG_WHY=global ;;
+  esac
+  _perbox="$_EGRESS_BOXES_DIR/$_cname"
+  if [ -n "$_cname" ] && { [ -e "$_perbox" ] || [ -L "$_perbox" ]; }; then
+    if ! _egress_path_is_writable_policy "$_perbox"; then exit 1; fi
+    _egress_read_file "$_perbox" egress
+    _egress_warn_unknown_keys "$_perbox"
+    _egress_take_file "$_perbox" perbox
+    _r_hosts="$(_egress_subtract "$_r_hosts" "$_r_deny")"
+    if [ "$_m_mode" != absent ]; then _EG_MODE="$_m_mode"; _EG_WHY=perbox; fi
+  fi
+  if [ "$_EG_MODE" = strict ] && _egress_session_marker_valid "$_cname"; then
+    _EG_MODE=open
+    _EG_WHY=session
+  fi
+  _EG_HOSTS="$(printf '%s\n%s\n' "$_core" "$_r_hosts" | { grep -v '^$' || true; } | LC_ALL=C sort -u)"
+}
+
+# 1 when <file> carries an [egress] header, else 0. Read raw, so a bare header
+# with nothing under it still counts: it is the feature off, recorded.
+_egress_raw_section_present() {          # <file>
+  _read_bounded "$1" "$_BOX_FILE_READ_MAX" | awk '
+    NR == 1 { sub(/^\357\273\277/, "") }
+    { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+    $0 == "[egress]" { f = 1 }
+    END { print f + 0 }' 2>/dev/null || echo 0
+}
+
+# The session marker of `cleat egress open` (6.5): it counts only while the box
+# exists, runs and reports the start time the marker recorded, compared as an
+# opaque string. Any other marker is removed. One docker inspect.
+_egress_session_marker_valid() {         # <cname>
+  local _m="$_EGRESS_BOXES_DIR/$1.session" _want _now
+  [ -n "$1" ] && [ -f "$_m" ] && [ ! -L "$_m" ] || return 1
+  _want="$(_read_unlinked_bounded "$_m" 256 | head -n 1)"
+  _now="$(docker inspect -f '{{if .State.Running}}{{.State.StartedAt}}{{end}}' "$1" 2>/dev/null || true)"
+  if [ -n "$_want" ] && [ "$_now" = "$_want" ]; then
+    return 0
+  fi
+  rm -f "$_m" 2>/dev/null || true
+  return 1
+}
+
+# True when _md5 is a real MD5. It falls back to cksum where neither md5sum nor
+# md5 exists, and a digest the host and the gateway compute two different ways
+# is no change detector, so no policy is enabled on such a host.
+_egress_md5_ok() {
+  command -v md5sum >/dev/null 2>&1 || command -v md5 >/dev/null 2>&1
+}
+
+# The policy digest of 5.6, the one the gateway recomputes and answers over
+# its admin socket: v1: and 16 hex of MD5 over the mode, the port and each
+# host, one per line, every line LF-terminated. The mode is in it because an
+# open gateway renders the same host list while allowing every name.
+_egress_policy_digest() {                # <mode> <hosts>
+  local _hosts
+  _hosts="$(printf '%s\n' "$2" | grep -v '^$' | LC_ALL=C sort -u || true)"
+  { printf '%s\n443\n' "$1"; if [ -n "$_hosts" ]; then printf '%s\n' "$_hosts"; fi; } \
+    | _md5 | head -c 16 | sed 's/^/v1:/'
+}
+
+# ── The pin (7.5) ──
+# egress-pins/global and egress-pins/<cname>, machine-written [pin] sections:
+# catalogue_rev, pinned_at, digest and one `host = <name> <class>[ open-tenancy]`
+# line per pinned host. The class is stored because a host that stays in a
+# pack and moves from B to C is neither an addition nor a removal. The open-
+# tenancy token is stored beside it, because a newly set flag is a downgrade
+# the class letter alone cannot show.
+
+_EGRESS_PINS_DIR="$CLEAT_CONFIG_DIR/egress-pins"
+
+# A pinned host's class key: the letter, plus open-tenancy when set.
+_egress_pin_class_key() {                # <host>
+  local _want="$1" _p _h _c _f
+  while IFS=$'\t' read -r _p _h _c _f _; do
+    if [ "$_h" = "$_want" ]; then
+      case ",$_f," in
+        *,open-tenancy,*) printf '%s open-tenancy' "$(_egress_class_of "$_c")" ;;
+        *) printf '%s' "$(_egress_class_of "$_c")" ;;
+      esac
+      return 0
+    fi
+  done < <(_egress_catalogue_records)
+  printf '%s' "$_EGRESS_CLASS_UNKNOWN"
+}
+
+# The pin digest: v1: and MD5 over the sorted `<host> <class key>` lines, class
+# included, so a class move changes it with no host moving. Never the policy
+# digest: the two are never compared or held in one variable.
+_egress_pin_digest() {                   # <host-with-class lines>
+  { printf '%s\n' "$1" | grep -v '^$' || true; } | LC_ALL=C sort -u | _md5 | head -c 16 | sed 's/^/v1:/'
+}
+
+# Writes a pin: `_egress_write_pin <file> <rev> <date> <digest> <host line>...`.
+# The _write_caps_to_file idiom scoped to [pin]: everything outside the section
+# kept, a temp file beside the target, one mv -f, after the directory-target
+# guard, because mv onto a link to a directory drops the file inside it and
+# still returns 0.
+_egress_write_pin() {
+  local file="$1" rev="$2" date="$3" digest="$4" line _h preserved="" in_sec=false tmp
+  shift 4
+  if ! _egress_path_is_writable_policy "$file"; then return 1; fi
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  if [ -f "$file" ]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      _h="${line%$'\r'}"
+      _h="${_h#$'\xef\xbb\xbf'}"
+      _h="${_h#"${_h%%[![:space:]]*}"}"
+      _h="${_h%"${_h##*[![:space:]]}"}"
+      if [[ "$_h" == "[pin]" ]]; then in_sec=true; continue; fi
+      if $in_sec; then
+        if [[ "$_h" == "["*"]" ]]; then in_sec=false; preserved+="$line"$'\n'; fi
+        continue
+      fi
+      preserved+="${line#$'\xef\xbb\xbf'}"$'\n'
+    done < <(_read_bounded "$file" "$_BOX_FILE_READ_MAX")
+  fi
+  tmp="$file.cleat-tmp.$$"
+  {
+    if [ -n "$preserved" ]; then printf '%s' "$preserved"; fi
+    echo "[pin]"
+    echo "catalogue_rev = $rev"
+    echo "pinned_at = $date"
+    echo "digest = $digest"
+    for line in "$@"; do
+      if [ -n "$line" ]; then printf '%s\n' "$line"; fi
+    done | LC_ALL=C sort -u | while IFS= read -r line; do echo "host = $line"; done
+  } > "$tmp" || { rm -f "$tmp" 2>/dev/null || true; error "Could not write ${file/#${HOME}/~}"; return 1; }
+  mv -f "$tmp" "$file" || { rm -f "$tmp" 2>/dev/null || true; error "Could not write ${file/#${HOME}/~}"; return 1; }
+  chmod 0600 "$file" 2>/dev/null || true
+  return 0
+}
+
+# A class key's rank, strongest first: A, B, C, then open tenancy, then
+# unaudited. Moving up the list is a strengthening, down it a weakening.
+_egress_class_rank() {                   # <class key>
+  case "$1" in
+    *open-tenancy*) printf 4 ;;
+    A) printf 1 ;;
+    B) printf 2 ;;
+    C) printf 3 ;;
+    *) printf 5 ;;
+  esac
+}
+
+# What changed between a pin and a shipped expansion, one line per change:
+# <direction><TAB><host><TAB><old class><TAB><new class>. direction is added,
+# removed, weakened (toward shared, or open tenancy newly set) or
+# strengthened. The shipped file holds `<host> <class key>` lines.
+_egress_pin_diff() {                     # <pin file> <shipped expansion file>
+  local _pin="$1" _shipped="$2" _line _h _old _new _ro _rn
+  local _pinned
+  _pinned="$(_read_section_all_from_file "$_pin" pin host | LC_ALL=C sort -u)"
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    _h="${_line%% *}"
+    _new="${_line#* }"
+    _old="$(printf '%s\n' "$_pinned" | awk -v h="$_h" '$1 == h { $1 = ""; sub(/^ /, ""); print; exit }')"
+    if [ -z "$_old" ]; then
+      printf 'added\t%s\t-\t%s\n' "$_h" "$_new"
+      continue
+    fi
+    [ "$_old" = "$_new" ] && continue
+    _ro="$(_egress_class_rank "$_old")"
+    _rn="$(_egress_class_rank "$_new")"
+    if [ "$_rn" -gt "$_ro" ]; then
+      printf 'weakened\t%s\t%s\t%s\n' "$_h" "$_old" "$_new"
+    elif [ "$_rn" -lt "$_ro" ]; then
+      printf 'strengthened\t%s\t%s\t%s\n' "$_h" "$_old" "$_new"
+    fi
+  done < <(_read_bounded "$_shipped" "$_BOX_FILE_READ_MAX" | LC_ALL=C sort -u)
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    _h="${_line%% *}"
+    if ! _read_bounded "$_shipped" "$_BOX_FILE_READ_MAX" | awk -v h="$_h" '$1 == h { f = 1 } END { exit !f }'; then
+      printf 'removed\t%s\t%s\t-\n' "$_h" "${_line#* }"
+    fi
+  done <<EOF
+$_pinned
+EOF
+}
+
+# The first pack that carries a host, or nothing.
+_egress_host_pack() {                    # <host>
+  local _want="$1" _p _h
+  while IFS=$'\t' read -r _p _h _; do
+    if [ "$_h" = "$_want" ]; then printf '%s' "$_p"; return 0; fi
+  done < <(_egress_catalogue_records)
+}
+
+# The launch summary's lines for a pin diff (7.5). Additions are held and named
+# by pack, a downgrade is held and named with the word it moved to, removals
+# are reported by count and an upgrade prints nothing.
+_egress_pin_summary() {                  # <pin diff lines>
+  local _dir _h _old _new _p _packs="" _n _hosts _word _words="" _removed=0
+  while IFS=$'\t' read -r _dir _h _old _new; do
+    case "$_dir" in
+      added)
+        _p="$(_egress_host_pack "$_h")"
+        case " $_packs " in *" ${_p:--} "*) ;; *) _packs+="${_p:--} " ;; esac ;;
+      weakened)
+        _word="$(_egress_pin_key_word "$_new")"
+        case "|$_words|" in *"|$_word|"*) ;; *) _words="${_words:+$_words|}$_word" ;; esac ;;
+      removed) _removed=$((_removed + 1)) ;;
+    esac
+  done <<EOF2
+$1
+EOF2
+  for _p in $_packs; do
+    _n="$(printf '%s\n' "$1" | awk -F'\t' '$1 == "added" { print $2 }' | while IFS= read -r _h; do
+      [ "$(_egress_host_pack "$_h")" = "$_p" ] && printf '%s\n' "$_h"; done | wc -l | tr -d ' ')"
+    if [ "$_n" = 1 ]; then
+      printf '1 new host in pack "%s" held. Run cleat egress review.\n' "$_p"
+    else
+      printf '%s new hosts in pack "%s" held. Run cleat egress review.\n' "$_n" "$_p"
+    fi
+  done
+  local IFS_save="$IFS"
+  IFS='|'
+  for _word in $_words; do
+    IFS="$IFS_save"
+    _hosts="$(printf '%s\n' "$1" | awk -F'\t' '$1 == "weakened" { print $2 "\t" $4 }' | while IFS=$'\t' read -r _h _new; do
+      [ "$(_egress_pin_key_word "$_new")" = "$_word" ] && printf '%s\n' "$_h"; done)"
+    _n="$(printf '%s\n' "$_hosts" | grep -c . || true)"
+    _hosts="$(printf '%s\n' "$_hosts" | paste -sd, - | sed 's/,/, /g')"
+    if [ "$_n" = 1 ]; then
+      printf '1 host you allowed is now %s: %s. Run cleat egress review.\n' "$_word" "$_hosts"
+    else
+      printf '%s hosts you allowed are now %s: %s. Run cleat egress review.\n' "$_n" "$_word" "$_hosts"
+    fi
+    IFS='|'
+  done
+  IFS="$IFS_save"
+  if [ "$_removed" -eq 1 ]; then
+    printf '1 host left the packs you use and no longer reaches the box.\n'
+  elif [ "$_removed" -gt 1 ]; then
+    printf '%s hosts left the packs you use and no longer reach the box.\n' "$_removed"
+  fi
+}
+
+# The word for a pin class key: the letter's word, or open tenancy.
+_egress_pin_key_word() {                 # <class key>
+  case "$1" in
+    *open-tenancy*) _egress_class_word "${1%% *}" open-tenancy ;;
+    *) _egress_class_word "$1" - ;;
+  esac
+}
+
 # ── Host-side hook bridge ─────────────────────────────────────────────────
 # Tails forwarded events and executes the user's host-defined command hooks.
 # The settings overlay replaces hook commands with an event forwarder inside

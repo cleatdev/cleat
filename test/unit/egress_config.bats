@@ -9,6 +9,8 @@
 load "../setup"
 setup() {
   _common_setup
+  # The stub, never the host's daemon: a session-marker read runs docker inspect.
+  use_docker_stub
   source_cli
   mkdir -p "$CLEAT_CONFIG_DIR"
   CONF="$CLEAT_GLOBAL_CONFIG"
@@ -364,4 +366,287 @@ deny = other.example"
   run _egress_config_is_containable "$TEST_TEMP/proj"
   assert_failure
   assert_output --partial "reached through a symlink"
+}
+
+# ── Resolution (5.1, 5.4) ────────────────────────────────────────────────────
+
+CORE="api.anthropic.com
+claude.ai
+claude.com
+code.claude.com
+platform.claude.com"
+
+@test "egress config: no egress section anywhere resolves to the feature off" {
+  printf '[caps]\nenabled = gh\n' > "$CONF"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "off absent"
+}
+
+@test "egress config: a bare [egress] header is the feature off" {
+  printf '[egress]\n' > "$CONF"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "off header"
+}
+
+@test "egress config: allow lines with no mode refuse to start" {
+  printf '[egress]\nallow = a.example\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_failure
+  assert_output --partial "lists hosts but no mode"
+  printf '[egress]\npack = github\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_failure
+  printf '[egress]\ndeny = a.example\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_failure
+}
+
+@test "egress config: strict with no entries is the core pack and nothing else" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "strict global"
+  run echo "$_EG_HOSTS"
+  assert_output "$CORE"
+}
+
+@test "egress config: packs expand to their default hosts, allows add and denies subtract" {
+  printf '[egress]\nmode = strict\npack = github\nallow = Registry.NPMjs.org.\nallow = extra.example\ndeny = uploads.github.com\ndeny = extra.example\n' > "$CONF"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_HOSTS"
+  assert_output "api.anthropic.com
+api.github.com
+claude.ai
+claude.com
+code.claude.com
+codeload.github.com
+github.com
+platform.claude.com
+registry.npmjs.org"
+}
+
+@test "egress config: the core pack can never be denied away" {
+  printf '[egress]\nmode = strict\ndeny = api.anthropic.com\n' > "$CONF"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_HOSTS"
+  assert_output "$CORE"
+}
+
+@test "egress config: open and off resolve to themselves" {
+  printf '[egress]\nmode = open\n' > "$CONF"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE"
+  assert_output "open"
+  printf '[egress]\nmode = off\nallow = a.example\n' > "$CONF"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "off global"
+}
+
+@test "egress config: an invalid allow is dropped with a warning and the launch continues" {
+  printf '[egress]\nmode = strict\nallow = 1.2.3.4\nallow = ok.example\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_success
+  assert_output --partial "not a host name: 1.2.3.4"
+  assert_output --partial "IP_LITERAL"
+  _egress_resolve cleat-app-1234abcd >/dev/null
+  run echo "$_EG_HOSTS"
+  assert_output --partial "ok.example"
+  refute_output --partial "1.2.3.4"
+}
+
+@test "egress config: an empty allow line is dropped with a warning and the launch continues" {
+  printf '[egress]\nmode = strict\nallow =\nallow = ok.example\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_success
+  assert_output --partial "Ignored an empty allow line"
+}
+
+@test "egress config: an invalid deny refuses to start" {
+  printf '[egress]\nmode = strict\ndeny = not a host\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_failure
+  assert_output --partial "A deny entry"
+  assert_output --partial "would widen"
+}
+
+@test "egress config: an unknown pack refuses to start" {
+  printf '[egress]\nmode = strict\npack = githubb\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_failure
+  assert_output --partial "Unknown egress pack"
+  assert_output --partial "githubb"
+}
+
+@test "egress config: an unknown key inside egress warns once" {
+  printf '[egress]\nmode = strict\ndeni = a.example\ndeni = b.example\n' > "$CONF"
+  run _egress_resolve cleat-app-1234abcd
+  assert_output --partial "Unknown key"
+  assert_output --partial "deni"
+  # Two resolutions in one process print it once.
+  _EG_WARNED_KEY_FILES=""
+  local out
+  out="$( { _egress_resolve cleat-app-1234abcd; _egress_resolve cleat-app-1234abcd; } 2>&1 )"
+  run grep -c "Unknown key" <<< "$out"
+  assert_output "1"
+}
+
+@test "egress config: a per-box allow overrides a global deny" {
+  printf '[egress]\nmode = strict\ndeny = x.example\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '[egress]\nallow = x.example\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_HOSTS"
+  assert_output --partial "x.example"
+}
+
+@test "egress config: a per-box deny subtracts after the per-box allows" {
+  printf '[egress]\nmode = strict\nallow = a.example\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '[egress]\nallow = b.example\ndeny = a.example\ndeny = b.example\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_HOSTS"
+  assert_output "$CORE"
+}
+
+@test "egress config: a per-box mode replaces the global mode" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '[egress]\nmode = off\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "off perbox"
+  # And it can cage a box the global section leaves off.
+  printf '[egress]\nmode = off\n' > "$CONF"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "strict perbox"
+}
+
+@test "egress config: a per-box file with no mode keeps the global mode" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '[egress]\nallow = b.example\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd"
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "strict global"
+}
+
+@test "egress config: a fork does not read the parent box's per-box policy" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '[egress]\nallow = parent-only.example\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd"
+  _egress_resolve cleat-app-1234abcd-review
+  run echo "$_EG_HOSTS"
+  refute_output --partial "parent-only.example"
+}
+
+@test "egress config: a per-box path that is a directory refuses" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd"
+  run _egress_resolve cleat-app-1234abcd
+  assert_failure
+  assert_output --partial "Refusing to write policy to a directory"
+}
+
+@test "egress config: a project cleat file cannot widen the policy" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[egress]\nmode = strict\nallow = evil.example\n' > "$TEST_TEMP/proj/.cleat"
+  _RESOLVED_PROJECT="$TEST_TEMP/proj"
+  _egress_resolve cleat-proj-1234abcd
+  run echo "$_EG_HOSTS"
+  refute_output --partial "evil.example"
+}
+
+# ── The session marker (5.1 step 6) ─────────────────────────────────────────
+
+@test "egress config: a live session marker turns strict into open" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '2026-09-25T10:00:00.1Z\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd.session"
+  mock_docker_inspect_field cleat-app-1234abcd '{{if .State.Running}}{{.State.StartedAt}}{{end}}' '2026-09-25T10:00:00.1Z'
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE $_EG_WHY"
+  assert_output "open session"
+}
+
+@test "egress config: a marker whose start differs is removed and resolves strict" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '2026-09-25T10:00:00.1Z\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd.session"
+  mock_docker_inspect_field cleat-app-1234abcd '{{if .State.Running}}{{.State.StartedAt}}{{end}}' '2026-09-25T11:00:00.1Z'
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE"
+  assert_output "strict"
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd.session" ] || { echo "stale marker kept"; return 1; }
+}
+
+@test "egress config: a marker on a stopped box is removed" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '2026-09-25T10:00:00.1Z\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd.session"
+  mock_docker_inspect_field cleat-app-1234abcd '{{if .State.Running}}{{.State.StartedAt}}{{end}}' ''
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE"
+  assert_output "strict"
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd.session" ] || { echo "marker kept"; return 1; }
+}
+
+@test "egress config: a session marker never turns off into open" {
+  printf '[egress]\nmode = off\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '2026-09-25T10:00:00.1Z\n' > "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd.session"
+  mock_docker_inspect_field cleat-app-1234abcd '{{if .State.Running}}{{.State.StartedAt}}{{end}}' '2026-09-25T10:00:00.1Z'
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE"
+  assert_output "off"
+}
+
+@test "egress config: a linked session marker is never read" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  printf '2026-09-25T10:00:00.1Z\n' > "$TEST_TEMP/elsewhere"
+  ln -s "$TEST_TEMP/elsewhere" "$CLEAT_CONFIG_DIR/egress-boxes/cleat-app-1234abcd.session"
+  mock_docker_inspect_field cleat-app-1234abcd '{{if .State.Running}}{{.State.StartedAt}}{{end}}' '2026-09-25T10:00:00.1Z'
+  _egress_resolve cleat-app-1234abcd
+  run echo "$_EG_MODE"
+  assert_output "strict"
+  # Refused before any read: not even the box is asked.
+  run grep -c 'inspect' "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+# ── The policy digest (5.6) ─────────────────────────────────────────────────
+
+@test "egress config: the policy digest is the one the gateway computes" {
+  # Vectors computed with the gateway's own formula (docker/gateway/gateway.py).
+  run _egress_policy_digest strict "$CORE"
+  assert_output "v1:b204c63413ecaad3"
+  run _egress_policy_digest open "$CORE"
+  assert_output "v1:52a5e335a198bc6a"
+  run _egress_policy_digest strict "$CORE
+registry.npmjs.org"
+  assert_output "v1:ec731f0536661183"
+}
+
+@test "egress config: the policy digest ignores host order and duplicates" {
+  run _egress_policy_digest strict "platform.claude.com
+claude.ai
+api.anthropic.com
+code.claude.com
+claude.com
+claude.ai"
+  assert_output "v1:b204c63413ecaad3"
+}
+
+@test "egress config: a degraded md5 is detected" {
+  run _egress_md5_ok
+  assert_success
+  mkdir -p "$TEST_TEMP/bare-bin"
+  PATH="$TEST_TEMP/bare-bin" run _egress_md5_ok
+  assert_failure
 }

@@ -9,6 +9,8 @@
 load "../setup"
 setup() {
   _common_setup
+  # The stub, never the host's daemon: a session-marker read runs docker inspect.
+  use_docker_stub
   source_cli
   TABLE="$BATS_TEST_DIRNAME/../fixtures/egress_hosts.tsv"
 }

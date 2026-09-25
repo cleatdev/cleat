@@ -13857,6 +13857,69 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_pin_writer_dir_target_guard" "the pin writer refuses a pin path that is a symlink to a directory" "$CLI" "$EGRESS_CATALOGUE_BATS"
 
+# ── Egress stage two, slice three: the verbs and the editor ──────────────────
+
+# The reserved barewords resolve before anything reads $1 as a box. Deleting
+# the bareword case makes `status` a box name.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress()/,/^}$/{
+  /^  case "\${1:-}" in$/,/^  esac$/d
+}
+SED
+try "vnext_egress_bareword_first" "cleat egress status treated status as a box name" "$CLI"
+
+# The browser residual row reads its numbers from the constants.
+cat > "$SED_TMP" << 'SED'
+s|_BROWSER_RATE_PER_SESSION=30|_BROWSER_RATE_PER_SESSION=300|
+SED
+try "vnext_egress_status_browser_residual" "the browser residual row prints the session cap and the origin count" "$CLI" "$EGRESS_UI_BATS"
+
+# The pack viewport is the smaller of what fits and what there is to show.
+cat > "$SED_TMP" << 'SED'
+/^_egress_measure()/,/^}$/{
+  s@^  if \[ "[$]total" -lt "[$]avail" \]; then _EG_PAGE="[$]total"; else _EG_PAGE="[$]avail"; fi@  _EG_PAGE="$total"@
+}
+SED
+try "vnext_egress_measure_min" "26 packs on a 24 row terminal give a page of 2, not 26" "$CLI" "$EGRESS_UI_BATS"
+
+# A window that cannot hold one pack row runs the typed picker.
+cat > "$SED_TMP" << 'SED'
+/^_egress_measure()/,/^}$/{
+  s@^  \[ "[$]avail" -lt 1 \] && return 1@  [ "$avail" -lt 1 ] \&\& avail=1@
+}
+SED
+try "vnext_egress_measure_min_window" "a 22 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
+
+# The chrome budget carries the shell prompt's row, which is never drawn.
+cat > "$SED_TMP" << 'SED'
+s|^_EGRESS_CHROME_LINES=11|_EGRESS_CHROME_LINES=10|
+SED
+try "vnext_egress_chrome_reserves_the_prompt_row" "a saturated page draws one line fewer than the terminal has rows" "$CLI" "$EGRESS_UI_BATS"
+
+# The add row is a member of the list the cursor walks. Taking it out of the
+# rows leaves no arrow path to it. The spec anchored on an _eg_list array;
+# this implementation builds the rows in _egress_editor_rows.
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_rows()/,/^}$/{
+  s@^  printf '%s\\n%s\\n%s\\n' "[$]_EGRESS_ROW_ADD" "[$]_EGRESS_ROW_FILTER" "[$]_EGRESS_ROW_SAVE"@  printf '%s\\n%s\\n' "$_EGRESS_ROW_FILTER" "$_EGRESS_ROW_SAVE"@
+}
+SED
+try "vnext_egress_add_row_present" "the add row is reachable by arrow keys alone" "$CLI" "$EGRESS_UI_BATS"
+
+# The config picker's scope guard. Pinning both pickers' scope to global lets a
+# project .cleat reach a control only the global config may carry.
+cat > "$SED_TMP" << 'SED'
+s@^  local scope="\$2"@  local scope=global@
+SED
+try "vnext_egress_config_row_scope" "the egress row was reachable in project scope" "$CLI"
+
+# The config row's redraw budget: budgeting a line the block never draws makes
+# the blind cursor-up overshoot by a row on every redraw.
+cat > "$SED_TMP" << 'SED'
+s|^_EGRESS_CONFIG_ROW_LINES=2|_EGRESS_CONFIG_ROW_LINES=3|
+SED
+try "vnext_egress_config_row_two_lines" "the config global block grows by exactly two physical lines" "$CLI" "$EGRESS_UI_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

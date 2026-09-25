@@ -9844,3 +9844,23 @@ _c19_star_project() {
   run echo "$_EG_HOSTS"
   refute_output --partial "evil.example"
 }
+
+@test "regression vNEXT: cleat egress status treated status as a box name" {
+  # Every reserved bareword is also a legal box name, so it must be resolved
+  # before anything reads $1 as a box (EGRESS-SPEC.md 6.2).
+  run _run_cleat egress status < /dev/null
+  assert_success
+  refute_output --partial "needs a terminal"
+  refute_output --partial "box status"
+}
+
+@test "regression vNEXT: the egress row was reachable in project scope" {
+  # [egress] is global only (EGRESS-SPEC.md 5.1, 6.8): a project editor never
+  # shows the row, in either of the two arms cmd_config turns into project scope.
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  run _run_cleat config --project <<< "q"
+  refute_output --partial "Egress:"
+  run _run_cleat config review <<< "q"
+  refute_output --partial "Egress:"
+}

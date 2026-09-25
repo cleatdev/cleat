@@ -3286,3 +3286,112 @@ SH
   run test "${var:-0}" -ge "${second:-999999}"
   assert_success
 }
+
+# ── cleat egress (stage two: writes and reads a policy, enforces nothing) ────
+
+@test "smoke: cleat egress with no arguments does not hang on a non-TTY" {
+  run cleat_bin_timeout 20 egress < /dev/null
+  assert_success
+  assert_output --partial "Egress:   off"
+  assert_output --partial "needs a terminal"
+}
+
+@test "smoke: cleat egress status on a machine with no policy says off" {
+  run cleat_bin egress status < /dev/null
+  assert_success
+  assert_output --partial "full network egress"
+}
+
+@test "smoke: cleat egress allow a pack that is not the catalogue's last line" {
+  # A pipe into grep -q under pipefail read github as unknown in the real
+  # binary and as a pack in every sourced test.
+  run cleat_bin egress allow github registry.npmjs.org < /dev/null
+  assert_success
+  assert_output --partial "Saved to"
+  run cat "$XDG_CONFIG_HOME/cleat/config"
+  assert_output "[egress]
+mode = strict
+pack = github
+allow = registry.npmjs.org"
+}
+
+@test "smoke: cleat egress status and --list after a save do not trip set -u" {
+  printf '[egress]\nmode = strict\npack = npm\ndeni = typo.example\n' > "$XDG_CONFIG_HOME/cleat/config"
+  run cleat_bin egress status < /dev/null
+  assert_success
+  assert_output --partial "Policy saved. Enforcement lands in a later release."
+  assert_output --partial "Unknown key"
+  run cleat_bin egress --list < /dev/null
+  assert_success
+  assert_output --partial "registry.npmjs.org"
+}
+
+@test "smoke: cleat egress packs lists every pack" {
+  run cleat_bin egress packs < /dev/null
+  assert_success
+  assert_output --partial "apt-image-extras"
+  assert_output --partial "docs"
+}
+
+@test "smoke: cleat egress deny with no policy writes nothing and exits 1" {
+  run cleat_bin egress deny github.com < /dev/null
+  assert_failure
+  [ ! -e "$XDG_CONFIG_HOME/cleat/config" ] || { cat "$XDG_CONFIG_HOME/cleat/config"; return 1; }
+}
+
+@test "smoke: cleat egress status on a box named status resolves the bareword" {
+  run cleat_bin egress status < /dev/null
+  assert_success
+  refute_output --partial "needs a terminal"
+}
+
+@test "smoke: cleat egress --box status targets the box" {
+  printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
+  run cleat_bin egress --box status --list < /dev/null
+  assert_success
+  assert_output --partial "Egress for box status"
+}
+
+@test "smoke: cleat egress --fork is refused with a message rather than silently accepted" {
+  run cleat_bin egress --fork < /dev/null
+  assert_failure
+  assert_output --partial "--fork"
+}
+
+@test "smoke: cleat egress a box inherit on a pipe" {
+  printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
+  run cleat_bin egress allow --box main extra.example < /dev/null
+  assert_success
+  run cleat_bin egress main --inherit < /dev/null
+  assert_success
+  assert_output --partial "now inherits"
+}
+
+@test "smoke: cleat egress with an unknown flag exits 1" {
+  run cleat_bin egress --bogus < /dev/null
+  assert_failure
+  assert_output --partial "Unknown flag"
+}
+
+@test "smoke: cleat egress why is reserved until enforcement lands" {
+  run cleat_bin egress why github.com < /dev/null
+  assert_failure
+  assert_output --partial "lands with enforcement"
+}
+
+@test "smoke: cleat egress --help prints the verbs" {
+  run cleat_bin egress --help < /dev/null
+  assert_success
+  assert_output --partial "--inherit"
+}
+
+@test "smoke: cleat config --project prints no egress row" {
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  run cleat_bin config --project <<< "q"
+  assert_success
+  refute_output --partial "Egress"
+  run cleat_bin config <<< "q"
+  assert_success
+  assert_output --partial "Egress: off"
+}

@@ -12227,7 +12227,7 @@ cat > "$SED_TMP" << 'SED'
   s@^  rm -f "[$]snap"$@  :@
 }
 SED
-try "v154_caps_snapshot_cleanup" "leaves no temp file behind" "$CLI" "$TRUST_BATS"
+try "v154_caps_snapshot_cleanup" "the caps snapshot leaves no temp file behind" "$CLI" "$TRUST_BATS"
 
 # The ignored-cap warning prints a box-written name at full length.
 cat > "$SED_TMP" << 'SED'

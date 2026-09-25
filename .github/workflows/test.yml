@@ -66,8 +66,11 @@ jobs:
         # are tool-gated (jq alone gates 52 of them). With every tool installed
         # above, this leg must skip NOTHING, so losing a tool fails the job
         # instead of quietly dropping coverage.
+        # CLEAT_GATEWAY_TESTS: this leg also runs the egress gateway corpus
+        # (test/gateway/), python3 and openssl and curl only, no Docker.
         env:
           TEST_MAX_SKIPPED: '0'
+          CLEAT_GATEWAY_TESTS: '1'
         run: |
           rc=0; ./test.sh > "$RUNNER_TEMP/suite.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/suite.log"; exit "$rc"

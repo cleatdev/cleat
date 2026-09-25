@@ -61,8 +61,11 @@ _image_inputs_hash() {
 @test "image spec: the docker build context contains exactly the hashed files" {
   # A new or removed file in docker/ must trip this wire even if the Dockerfile
   # reference is subtle, so the input set can't silently drift from the hash.
+  # gateway/ is the egress gateway image's own build context (EGRESS-SPEC.md
+  # 8.0), never an input of this one. The box Dockerfile copies named files and
+  # is itself hashed, so a COPY of anything under gateway/ still trips the hash.
   local expected actual
-  expected="$(printf '%s\n' CLAUDE.md Dockerfile clip clip-daemon entrypoint.sh open-bridge | sort)"
+  expected="$(printf '%s\n' CLAUDE.md Dockerfile clip clip-daemon entrypoint.sh gateway open-bridge | sort)"
   actual="$(cd "$DOCKER_DIR" && ls -1A | sort)"
   [[ "$actual" == "$expected" ]] || {
     printf '%s\n' \

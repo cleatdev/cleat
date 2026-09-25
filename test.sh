@@ -159,6 +159,16 @@ not ok (harness) bats exited $bats_rc without reporting a failure: the run was k
   fi
 done
 
+# Gateway harness: opt-in, never on the default ./test.sh path. The default
+# path stays bats-only and dependency-free. CI's ubuntu leg sets this.
+if [[ -n "${CLEAT_GATEWAY_TESTS:-}" ]]; then
+  echo ""
+  if ! "$SCRIPT_DIR/test/gateway/run.sh"; then
+    total_fail=$((total_fail + 1))
+    failed_files+=("gateway")
+  fi
+fi
+
 # ── Summary ─────────────────────────────────────────────────────────────────
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))

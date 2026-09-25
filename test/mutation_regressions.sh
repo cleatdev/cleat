@@ -3223,7 +3223,7 @@ try "fork_prune_stale_markers" "clears a stale marker" "$CLI" "$FORK_BATS"
 # FORK EXCLUDE SAFETY: an absolute or traversing exclude must be refused, or a
 # .cleat in a cloned repo can delete outside the fork.
 cat > "$SED_TMP" << 'SED'
-s@warn "Ignoring unsafe \[fork\] exclude: $e"; continue@:@
+s@warn "Ignoring unsafe \[fork\] exclude: [$](_sanitize_repo_str "[$]e")"; continue@:@
 SED
 try "fork_exclude_path_safety" "traversing exclude is refused" "$CLI" "$FORK_BATS"
 
@@ -3976,10 +3976,12 @@ try "vnext_kit_pane_fits" "fits the picker detail pane" "$CLI" "$KITS_BATS"
 
 # SANITIZER STRIP: _sanitize_repo_str must strip control bytes (ESC/BEL/DEL)
 # before repo-controlled text ever reaches echo -e. Drop the tr -d stage: the
-# strip-bytes assertion must fail.
+# strip-bytes assertion must fail. Since v1.5.4 there are two tr lines, one per
+# locale branch, and this drops both, so the entry holds under a UTF-8 CI
+# locale as well as a C one.
 cat > "$SED_TMP" << 'SED'
 /^_sanitize_repo_str()/,/^}$/{
-s/ | LC_ALL=C tr -d '\\000-\\010\\013-\\037\\177\\200-\\237'//
+s/ | LC_ALL=C tr -d '\\000-\\010\\013-\\037\\177[^']*'//
 }
 SED
 try "vnext_setup_sanitize_strip_ctrl" "strips raw ESC, BEL, and DEL bytes" "$CLI" "$PROVISION_BATS"
@@ -3987,10 +3989,11 @@ try "vnext_setup_sanitize_strip_ctrl" "strips raw ESC, BEL, and DEL bytes" "$CLI
 # SANITIZER BACKSLASH DOUBLING: _sanitize_repo_str must double every
 # backslash so a literal `\033`-style sequence stays literal text once
 # echo -e sees it. Drop the doubling stage: the doubles-backslashes
-# assertion must fail.
+# assertion must fail. The doubling is a parameter expansion since v1.5.4,
+# not a sed.
 cat > "$SED_TMP" << 'SED'
 /^_sanitize_repo_str()/,/^}$/{
-s@ | sed 's/\\\\/\\\\\\\\/g'@@
+s@"[$]{v//\\\\/\\\\\\\\}"@"$v"@
 }
 SED
 try "vnext_setup_sanitize_double_backslash" "doubles backslashes" "$CLI" "$PROVISION_BATS"
@@ -13006,6 +13009,249 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_account_stage_removed_on_refusal" "a refused credential write leaves nothing staged on the host" "$CLI" "$ACCOUNTS_BATS"
+
+# ── v1.5.4: untrusted bytes printed raw to the host terminal ────────────────
+
+# The callback-port report prints a URL from a log the box can write.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_nobind_opens()/,/^}$/{
+  s@^    url="[$](_sanitize_repo_str "[$]url")"$@    :@
+}
+SED
+try "v154_render_nobind_sanitized" "a forged callback-port line in the proxy log"
+
+# An invalid [resources] value, project and global, both keys.
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_memory()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in project config@'$v' in project config@
+}
+SED
+try "v154_render_resources_memory_project" "an invalid resources value from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_cpus()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in project config@'$v' in project config@
+}
+SED
+try "v154_render_resources_cpus_project" "an invalid resources value from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_memory()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in global config@'$v' in global config@
+}
+SED
+try "v154_render_resources_memory_global" "an invalid resources value from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^resolve_box_cpus()/,/^}$/{
+  s@'[$](_sanitize_repo_str "[$]v")' in global config@'$v' in global config@
+}
+SED
+try "v154_render_resources_cpus_global" "an invalid resources value from a project"
+
+# cleat config: --list, the arrow-key editor and the text editor.
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s@echo -e "    memory  [$](_sanitize_repo_str "[$]_lm")[$]{_lmsrc}"@echo -e "    memory  ${_lm}${_lmsrc}"@
+}
+SED
+try "v154_render_config_list_memory" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_config()/,/^}$/{
+  s@echo -e "    cpus    [$](_sanitize_repo_str "[$]_lc")[$]{_lcsrc}"@echo -e "    cpus    ${_lc}${_lcsrc}"@
+}
+SED
+try "v154_render_config_list_cpus" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _mem_d="[$](_sanitize_repo_str "[$]mem")"$@  _mem_d="$mem"@
+}
+SED
+try "v154_render_config_draw_memory" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _cpus_d="[$](_sanitize_repo_str "[$]cpus")"$@  _cpus_d="$cpus"@
+}
+SED
+try "v154_render_config_draw_cpus" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_text()/,/^}$/{
+  s@memory=[$](_sanitize_repo_str "[$]mem")@memory=${mem}@
+}
+SED
+try "v154_render_config_text_memory" "cleat config shows a project resources value"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_text()/,/^}$/{
+  s@cpus=[$](_sanitize_repo_str "[$]cpus")@cpus=${cpus}@
+}
+SED
+try "v154_render_config_text_cpus" "cleat config shows a project resources value"
+
+# The three fork-exclude warnings that can carry a byte.
+cat > "$SED_TMP" << 'SED'
+/^_fork_prune_excludes()/,/^}$/{
+  s@Ignoring unsafe \[fork\] exclude: [$](_sanitize_repo_str "[$]e")"@Ignoring unsafe [fork] exclude: $e"@
+}
+SED
+try "v154_render_fork_exclude_unsafe" "a fork exclude from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_prune_excludes()/,/^}$/{
+  s@resolves outside the fork: [$](_sanitize_repo_str "[$]e")"@resolves outside the fork: $e"@
+}
+SED
+try "v154_render_fork_exclude_outside" "a fork exclude from a project"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_prune_excludes()/,/^}$/{
+  s@Could not prune \[fork\] exclude: [$](_sanitize_repo_str "[$]e")"@Could not prune [fork] exclude: $e"@
+}
+SED
+try "v154_render_fork_exclude_prune" "a fork exclude from a project"
+
+# UTF-8-spelled C1 in both render sanitizers, the '?' placeholder that keeps a
+# removal from assembling a fresh pair, and the raw strip outside UTF-8.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_safe_str()/,/^}$/{
+  /for p in "[$]{_C1_UTF8\[@\]}"/d
+}
+SED
+try "v154_render_sessions_c1_stripped" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sessions_safe_str()/,/^}$/{
+  s@v=[$]{v//"[$]p"/?}@v=${v//"$p"/}@
+}
+SED
+try "v154_render_sessions_c1_placeholder" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  /for p in "[$]{_C1_UTF8\[@\]}"/d
+}
+SED
+try "v154_render_repo_c1_stripped" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@v=[$]{v//"[$]p"/?}@v=${v//"$p"/}@
+}
+SED
+try "v154_render_repo_c1_placeholder" "a C1 control spelled in UTF-8"
+
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@tr -d '\\000-\\010\\013-\\037\\177\\200-\\237')"$@tr -d '\\000-\\010\\013-\\037\\177')"@
+}
+SED
+try "v154_render_repo_raw_c1_outside_utf8" "a C1 control spelled in UTF-8"
+
+# A UTF-8 locale keeps the continuation bytes of an em dash.
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@tr -d '\\000-\\010\\013-\\037\\177')"$@tr -d '\\000-\\010\\013-\\037\\177\\200-\\237')"@
+}
+SED
+try "v154_render_repo_keeps_utf8" "a setup preview line with a typographic character"
+
+# No sed: BSD sed refuses a non-ASCII byte and the report aborts under set -e.
+cat > "$SED_TMP" << 'SED'
+/^_sanitize_repo_str()/,/^}$/{
+  s@^  printf '%s' "[$]{v//\\\\/\\\\\\\\}"$@  printf '%s' "$v" | sed 's/\\\\/\\\\\\\\/g'@
+}
+SED
+try "v154_render_repo_no_sed" "a post-session browser report survives a non-ASCII URL"
+
+# Teardown globs over box-chosen names in the clip dir.
+cat > "$SED_TMP" << 'SED'
+s@^    rm -f "[$]{_CLIP_DIR:?}/.clipboard."\* 2>/dev/null || true$@    rm -f "${_CLIP_DIR:?}/.clipboard."*@
+SED
+try "v154_render_teardown_clipboard_quiet" "session teardown never prints a box-chosen clip-dir name"
+
+cat > "$SED_TMP" << 'SED'
+s@^    rm -f "[$]{_CLIP_DIR:?}/.claim.[$][$]."\* 2>/dev/null || true$@    rm -f "${_CLIP_DIR:?}/.claim.$$."*@
+SED
+try "v154_render_teardown_claim_quiet" "session teardown never prints a box-chosen clip-dir name"
+
+# Fork copy and delete: cp and rm stderr over a tree the box writes.
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  _run_names_safe cp @  cp @
+}
+SED
+try "v154_render_fork_cp_names_safe" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  _run_names_safe rm -rf "[$]tmp" || return 1$@  rm -rf "$tmp" || return 1@
+}
+SED
+try "v154_render_fork_tmp_names_safe" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  _run_names_safe rm -rf "[$]dst" @  rm -rf "$dst" @
+}
+SED
+try "v154_render_fork_dst_names_safe" "a failing fork copy or delete never prints"
+
+# The staging dir holds the copied tree, so each cleanup of it is quiet: after
+# a failed copy, after a refresh that cannot remove the old copy, and after a
+# failed rename.
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  s@^  if \[\[ [$]rc -ne 0 \]\]; then rm -rf "[$]tmp" 2>/dev/null || true; return "[$]rc"; fi$@  if [[ $rc -ne 0 ]]; then rm -rf "$tmp"; return "$rc"; fi@
+}
+SED
+try "v154_render_fork_cp_cleanup_quiet" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  /^  _run_names_safe rm -rf "[$]dst" /s@{ rm -rf "[$]tmp" 2>/dev/null || true; return 1; }$@{ rm -rf "$tmp"; return 1; }@
+}
+SED
+try "v154_render_fork_dst_cleanup_quiet" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_copy_tree_locked()/,/^}$/{
+  /^  mv "[$]tmp" "[$]dst" /s@{ rm -rf "[$]tmp" 2>/dev/null || true; return 1; }$@{ rm -rf "$tmp"; return 1; }@
+}
+SED
+try "v154_render_fork_mv_cleanup_quiet" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_fork_rm_tree()/,/^}$/{
+  s@^  _run_names_safe rm -rf "[$]target"@  rm -rf "$target"@
+}
+SED
+try "v154_render_fork_rm_names_safe" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_run_names_safe()/,/^}$/{
+  s@[$](_sessions_safe_str "[$]_l")@${_l}@
+}
+SED
+try "v154_render_names_safe_sanitized" "a failing fork copy or delete never prints"
+
+cat > "$SED_TMP" << 'SED'
+/^_run_names_safe()/,/^}$/{
+  s@\[\[ "[$]_n" -lt 3 \]\]@[[ "$_n" -lt 1000 ]]@
+}
+SED
+try "v154_render_names_safe_three_lines" "a failing fork copy or delete never prints"
+
+# The session trash sweep, the same shape over a trashed session's tree.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_trash_sweep()/,/^}$/{
+  s@^    rm -rf "[$]d" 2>/dev/null || true$@    rm -rf "$d"@
+}
+SED
+try "v154_render_trash_sweep_quiet" "the session trash sweep never prints"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -240,11 +240,41 @@ _ask_yn() {
 # echo -e can't interpret anything attacker-supplied. The stripped set is
 # C0 0x00-0x08 and 0x0b-0x1f (this INCLUDES carriage return 0x0d: a lone CR
 # rewinds the cursor to column 0, so a preview line could overwrite itself
-# and hide what actually runs), DEL 0x7f, and C1 0x80-0x9f. Sanitize at
+# and hide what actually runs), DEL 0x7f and the C1 controls. Sanitize at
 # every render site for repo-controlled text.
+#
+# C1 has two spellings and a terminal acts on only one of them. A UTF-8
+# terminal (xterm, VTE) decodes C2 9B as U+009B, which is CSI. It shows a lone
+# raw 0x9b as a replacement glyph. An 8-bit terminal does the opposite. So a
+# UTF-8 locale keeps the raw bytes, which are the continuation bytes of every
+# em dash, curly quote and euro sign. It replaces each encoded C1 with '?'.
+# Any other locale strips the raw bytes as before. '?' rather than nothing, so
+# that removing one pair can never join a lead byte to a later continuation
+# byte and form a fresh pair.
+#
+# No sed, with tr pinned to C. Stripping 0x80-0x9f turned an em dash into a
+# lone 0xe2. BSD sed under a UTF-8 LC_CTYPE exits non-zero on that, so on a Mac
+# a [setup] line with one typographic character showed as a blank row in the
+# consent preview while it still ran. A post-session report aborted the whole
+# exec under set -e. _sessions_safe_str had the same fix in v1.5.0.
 _sanitize_repo_str() {
-  printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177\200-\237' | sed 's/\\/\\\\/g'
+  local v p
+  if _has_unicode; then
+    v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177')"
+  else
+    v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177\200-\237')"
+  fi
+  for p in "${_C1_UTF8[@]}"; do v=${v//"$p"/?}; done
+  printf '%s' "${v//\\/\\\\}"
 }
+
+# The 32 C1 controls U+0080..U+009F in their UTF-8 spelling, C2 80..C2 9F.
+# Matched as whole pairs, never as a bracket range: a range of high bytes means
+# one thing in a UTF-8 locale and another in C. bash 3.2 decides which.
+_C1_UTF8=($'\302\200' $'\302\201' $'\302\202' $'\302\203' $'\302\204' $'\302\205' $'\302\206' $'\302\207'
+          $'\302\210' $'\302\211' $'\302\212' $'\302\213' $'\302\214' $'\302\215' $'\302\216' $'\302\217'
+          $'\302\220' $'\302\221' $'\302\222' $'\302\223' $'\302\224' $'\302\225' $'\302\226' $'\302\227'
+          $'\302\230' $'\302\231' $'\302\232' $'\302\233' $'\302\234' $'\302\235' $'\302\236' $'\302\237')
 
 # ── Spinner ────────────────────────────────────────────────────────────────
 _SPIN_PID=""
@@ -383,8 +413,8 @@ _term_rows() {
 # multi-line text), and a session title is drawn as ONE row: a newline in it
 # would inject an extra physical line, desyncing the fixed-height redraw and
 # letting a title forge a convincing "Delete session X? [y/N]" line of its own.
-# It also strips \200-\237, which eats UTF-8 continuation bytes and mangles any
-# non-ASCII title.
+# Outside a UTF-8 locale it also strips \200-\237, which eats UTF-8
+# continuation bytes and mangles any non-ASCII title.
 #
 # So: drop every C0 control byte INCLUDING newline and carriage return (a lone
 # CR rewinds the cursor to column 0, so a row could overwrite the row above and
@@ -399,8 +429,13 @@ _sessions_safe_str() {
   # in a model-written session title killed the whole picker on a Mac. The
   # backslash doubling is a parameter expansion now, which also drops a fork
   # per rendered row.
-  local v
+  #
+  # Keeping 0x80+ also kept U+0080..U+009F spelled in UTF-8 (C2 9B is CSI, C2 9D
+  # is OSC), which xterm and VTE act on. Each becomes '?', the same way and for
+  # the same reason as in _sanitize_repo_str.
+  local v p
   v="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177')"
+  for p in "${_C1_UTF8[@]}"; do v=${v//"$p"/?}; done
   printf '%s' "${v//\\/\\\\}"
 }
 
@@ -2979,7 +3014,7 @@ resolve_box_memory() {
       fi
       return 0
     fi
-    warn "Ignoring invalid memory '$v' in project config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
+    warn "Ignoring invalid memory '$(_sanitize_repo_str "$v")' in project config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
   fi
 
   v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" memory)"
@@ -2988,7 +3023,7 @@ resolve_box_memory() {
       echo "$v"
       return 0
     fi
-    warn "Ignoring invalid memory '$v' in global config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
+    warn "Ignoring invalid memory '$(_sanitize_repo_str "$v")' in global config ${DIM}(use e.g. 2g, 4096m)${RESET}" >&2
   fi
 
   _default_box_memory
@@ -3033,7 +3068,7 @@ resolve_box_cpus() {
       fi
       return 0
     fi
-    warn "Ignoring invalid cpus '$v' in project config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
+    warn "Ignoring invalid cpus '$(_sanitize_repo_str "$v")' in project config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
   fi
 
   v="$(_read_resource_from_file "$CLEAT_GLOBAL_CONFIG" cpus)"
@@ -3042,7 +3077,7 @@ resolve_box_cpus() {
       echo "$v"
       return 0
     fi
-    warn "Ignoring invalid cpus '$v' in global config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
+    warn "Ignoring invalid cpus '$(_sanitize_repo_str "$v")' in global config ${DIM}(use e.g. 2, 1.5)${RESET}" >&2
   fi
 }
 
@@ -4227,6 +4262,23 @@ _box_is_fork()      { [[ -f "$(_fork_marker_file "$1")" ]]; }
 _fork_mark()        { mkdir -p "$CLEAT_BOXES_DIR"; : > "$(_fork_marker_file "$1")"; }
 _fork_unmark()      { rm -f "$(_fork_marker_file "$1")"; }
 
+# Run cp or rm over a tree a box can write, with at most three lines of its
+# stderr printed through the row sanitizer. BSD cp and rm report a failing path
+# raw (warn("%s")) where GNU quotes it, so on a Mac a file name the box chose,
+# escape bytes included, reached the terminal. The capture is a mktemp file in
+# the host temp dir, never a path in the tree. Returns the tool's status.
+_run_names_safe() {
+  local _f _rc=0 _l _n=0
+  _f="$(mktemp "${TMPDIR:-/tmp}/cleat-err.XXXXXX" 2>/dev/null)" || { "$@" 2>/dev/null; return; }
+  "$@" 2>"$_f" || _rc=$?
+  while [[ "$_n" -lt 3 ]] && IFS= read -r _l; do
+    echo -e "    ${DIM}$(_sessions_safe_str "$_l")${RESET}" >&2
+    _n=$(( _n + 1 ))
+  done < "$_f"
+  rm -f "$_f"
+  return "$_rc"
+}
+
 # Delete a fork copy. Every caller passes a path it derived from _fork_dir, but
 # this is an `rm -rf` on a path built from a container name and a configurable
 # root, so it re-checks containment itself rather than trusting the caller. Same
@@ -4252,7 +4304,7 @@ _fork_rm_tree() {
     error "Refusing to delete outside ${root/#${HOME}/~}: $target"
     return 1
   fi
-  rm -rf "$target" || { error "Could not delete ${target/#${HOME}/~}"; return 1; }
+  _run_names_safe rm -rf "$target" || { error "Could not delete ${target/#${HOME}/~}"; return 1; }
   return 0
 }
 
@@ -4457,14 +4509,14 @@ _fork_copy_tree_locked() {
   local src="$1" dst="$2" tmp cpflags rc=0 root
   root="$(_fork_root)"
   tmp="$root/.tmp.$$"
-  rm -rf "$tmp" || return 1
+  _run_names_safe rm -rf "$tmp" || return 1
   mkdir -p "$tmp" || return 1
   cpflags="$(_fork_cp_flags)"
   # shellcheck disable=SC2086
-  cp $cpflags "$src/." "$tmp/" || rc=$?
-  if [[ $rc -ne 0 ]]; then rm -rf "$tmp"; return "$rc"; fi
-  rm -rf "$dst" || { rm -rf "$tmp"; return 1; }
-  mv "$tmp" "$dst" || { rm -rf "$tmp"; return 1; }
+  _run_names_safe cp $cpflags "$src/." "$tmp/" || rc=$?
+  if [[ $rc -ne 0 ]]; then rm -rf "$tmp" 2>/dev/null || true; return "$rc"; fi
+  _run_names_safe rm -rf "$dst" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
+  mv "$tmp" "$dst" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
   return 0
 }
 
@@ -4484,7 +4536,7 @@ _fork_prune_excludes() {
     [[ -n "$e" ]] || continue
     # Cheap syntactic refusals first.
     case "$e" in
-      /*|*..*) warn "Ignoring unsafe [fork] exclude: $e"; continue ;;
+      /*|*..*) warn "Ignoring unsafe [fork] exclude: $(_sanitize_repo_str "$e")"; continue ;;
       # `.` resolves to the fork root itself. It passes the physical-parent
       # check below, and `rm -rf "$dir/."` is refused by rm with a non-zero
       # status, which under set -e would abort the whole run after the copy.
@@ -4501,7 +4553,7 @@ _fork_prune_excludes() {
     _parent="$(cd -P "$(dirname "$_target")" 2>/dev/null && pwd -P)" || continue
     case "$_parent" in
       "$_root"|"$_root"/*) ;;
-      *) warn "Ignoring [fork] exclude that resolves outside the fork: $e"; continue ;;
+      *) warn "Ignoring [fork] exclude that resolves outside the fork: $(_sanitize_repo_str "$e")"; continue ;;
     esac
     # The leaf itself must not be a symlink either: removing it is fine, but
     # only the link, never through it.
@@ -4509,7 +4561,7 @@ _fork_prune_excludes() {
     # box's own passwordless sudo created, for instance) must not take down a
     # copy that already succeeded.
     rm -rf "$_parent/$(basename "$_target")" 2>/dev/null \
-      || warn "Could not prune [fork] exclude: $e"
+      || warn "Could not prune [fork] exclude: $(_sanitize_repo_str "$e")"
   done < <(_read_section_all_from_file "$_exfile" "$(_scoped_section "$_exfile" "$box" fork)" exclude)
 }
 
@@ -10752,7 +10804,9 @@ exec_claude() {
       _HOOK_BRIDGE_PID=""
     fi
     _cleanup_spin
-    rm -f "${_CLIP_DIR:?}/.clipboard."*
+    # Quiet: every name past the prefix is the box's. BSD rm prints a name it
+    # cannot remove (a directory, say) raw, escape bytes included.
+    rm -f "${_CLIP_DIR:?}/.clipboard."* 2>/dev/null || true
     # Own claims only: another session's live claim must survive our exit (see
     # _do_copy's claim-name note). Both locations: claims moved out of the bind
     # mount into clipclaim/, and the legacy in-mount path for a watcher started
@@ -10760,7 +10814,7 @@ exec_claude() {
     # no directory at clipclaim BSD rm -f still fails (ENOTDIR is not ENOENT),
     # and under errexit that ended the teardown before the terminal came back.
     rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."* 2>/dev/null || true
-    rm -f "${_CLIP_DIR:?}/.claim.$$."*
+    rm -f "${_CLIP_DIR:?}/.claim.$$."* 2>/dev/null || true
     rm -f "$(_clip_watch_dir "${_CLIP_DIR:?}")/.watcher.$$" 2>/dev/null || true
     # After our own marker is gone, so a solo session sweeps unconditionally.
     _browser_teardown_bridge "${_CLIP_DIR:?}"
@@ -11407,6 +11461,7 @@ _maybe_report_nobind_opens() {
     [ -n "$l" ] || continue
     url="${l#*url=}"
     [ -n "$url" ] || continue
+    url="$(_sanitize_repo_str "$url")"
     echo -e "    ${DIM}${url}${RESET}"
     shown=$(( shown + 1 ))
     [ "$shown" -ge 3 ] && break
@@ -12689,7 +12744,7 @@ cmd_run() {
     _fork_copy_tree "$project" "$_fork_path" || _copy_rc=$?
     spin_stop "$_copy_rc" "Workspace copied" "Workspace copy failed"
     if [[ $_copy_rc -ne 0 ]]; then
-      rm -rf "$_fork_path"
+      rm -rf "$_fork_path" 2>/dev/null || true
       error "Could not copy the workspace. The fork was not created."
       # NOT "exclude it with a [fork] exclude line": excludes are pruned AFTER
       # the copy, so they cannot prevent a copy that fails. Pointing at them
@@ -16213,7 +16268,7 @@ _sessions_trash_sweep() {
     _sessions_is_uuid "${base#*-}" || continue
     [[ "$stamp" -lt "$cutoff" ]] || continue
     _sessions_path_under_key "$d" "$tdir" || continue
-    rm -rf "$d"
+    rm -rf "$d" 2>/dev/null || true
   done
 }
 
@@ -23916,19 +23971,24 @@ _config_picker_draw() {
   done
 
   printf '\033[2K'; echo ""
+  # The value can come from a project .cleat the box can write. Rendered
+  # sanitized, while the raw value stays what the editor saves back.
+  local _mem_d _cpus_d
+  _mem_d="$(_sanitize_repo_str "$mem")"
+  _cpus_d="$(_sanitize_repo_str "$cpus")"
   printf '\033[2K'
   echo -e "  ${DIM}Resources${RESET} ${DIM}(←/→ changes the value)${RESET}"
   printf '\033[2K'
   if [[ $cursor -eq $ncaps ]]; then
-    echo -e "  ${CYAN}▸${RESET} memory  ${BOLD}‹ ${mem} ›${RESET}  ${DIM}(per-box RAM ceiling)${RESET}"
+    echo -e "  ${CYAN}▸${RESET} memory  ${BOLD}‹ ${_mem_d} ›${RESET}  ${DIM}(per-box RAM ceiling)${RESET}"
   else
-    echo -e "    memory  ${mem}  ${DIM}(per-box RAM ceiling)${RESET}"
+    echo -e "    memory  ${_mem_d}  ${DIM}(per-box RAM ceiling)${RESET}"
   fi
   printf '\033[2K'
   if [[ $cursor -eq $((ncaps + 1)) ]]; then
-    echo -e "  ${CYAN}▸${RESET} cpus    ${BOLD}‹ ${cpus} ›${RESET}  ${DIM}(core limit; all = no cap)${RESET}"
+    echo -e "  ${CYAN}▸${RESET} cpus    ${BOLD}‹ ${_cpus_d} ›${RESET}  ${DIM}(core limit; all = no cap)${RESET}"
   else
-    echo -e "    cpus    ${cpus}  ${DIM}(core limit; all = no cap)${RESET}"
+    echo -e "    cpus    ${_cpus_d}  ${DIM}(core limit; all = no cap)${RESET}"
   fi
 
   if [[ "$show_gen" == "1" ]]; then
@@ -24344,7 +24404,7 @@ _config_picker_text() {
     echo -e "    [${marker}] ${BOLD}${cap}${RESET}     $(_cap_description "$cap")"
   done
   echo ""
-  echo -e "  ${DIM}Resources: memory=${mem}  cpus=${cpus}${RESET}"
+  echo -e "  ${DIM}Resources: memory=$(_sanitize_repo_str "$mem")  cpus=$(_sanitize_repo_str "$cpus")${RESET}"
 
   echo ""
   echo -e "  ${DIM}Capabilities: type a name to flip. Resources: \"memory 4g\", \"cpus 2\"${RESET}"
@@ -24550,8 +24610,8 @@ cmd_config() {
         && _lcsrc=" ${DIM}(declared)${RESET}" || _lcsrc=" ${DIM}(inherited)${RESET}"
     fi
     echo -e "  ${BOLD}Resources${RESET}"
-    if [[ -n "$_lm" ]]; then echo -e "    memory  ${_lm}${_lmsrc}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
-    if [[ -n "$_lc" ]]; then echo -e "    cpus    ${_lc}${_lcsrc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
+    if [[ -n "$_lm" ]]; then echo -e "    memory  $(_sanitize_repo_str "$_lm")${_lmsrc}"; else echo -e "    memory  ${DIM}default${RESET}"; fi
+    if [[ -n "$_lc" ]]; then echo -e "    cpus    $(_sanitize_repo_str "$_lc")${_lcsrc}"; else echo -e "    cpus    ${DIM}all (no cap)${RESET}"; fi
     echo ""
     if [[ -n "$_box_scope" ]]; then
       echo -e "  ${DIM}Config: ${config_file}${RESET}  ${BOLD}box ${_box_scope}${RESET}${_lcapsrc}"

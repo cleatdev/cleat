@@ -243,8 +243,8 @@ _tui_keys() {   # last arg is the over-read fallback, so a buggy loop cannot han
 }
 
 @test "sessions: a UTF-8 title survives sanitizing" {
-  # The counter-test to _sanitize_repo_str, which strips \200-\237 and would
-  # eat continuation bytes.
+  # The counter-test to _sanitize_repo_str, which strips \200-\237 outside a
+  # UTF-8 locale and would eat continuation bytes there.
   run _sessions_safe_str "héllo → 日本"
   assert_success
   assert_output "héllo → 日本"

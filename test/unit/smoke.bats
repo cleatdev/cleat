@@ -1283,6 +1283,22 @@ CURL
   assert_output --partial "Resources"
 }
 
+@test "smoke: cleat config --project --list shows a hostile resources value without its control bytes" {
+  # A project .cleat is repo- or box-written. Its [resources] values are drawn
+  # through echo -e, and the sanitizer's C1 loop runs here under the real
+  # binary's strict mode (bash 3.2 on the macOS legs).
+  local esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  mkdir -p "$TEST_TEMP/hostile-project"
+  printf '[resources]\nmemory = m%s]0;PWN%s\n' "$esc" "$bel" > "$TEST_TEMP/hostile-project/.cleat"
+  cd "$TEST_TEMP/hostile-project"
+  run cleat_bin config --project --list
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "memory  m]0;PWN"
+  refute_output --partial "${esc}]0;PWN"
+}
+
 @test "smoke: cleat config --project refuses a symlinked .cleat under strict mode" {
   # The edit used to read through the link and rename a copy of the target
   # into the workspace. Refused now, with no success line after it.

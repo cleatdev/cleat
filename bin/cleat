@@ -6000,7 +6000,8 @@ _write_in_place() {
 # Prints nothing when no sibling has one. Requires jq (callers only use the
 # result on the jq path). Fail-soft: any unreadable/corrupt sibling is skipped.
 # A sibling whose box is pinned to a named account is skipped as well, see
-# _pinned_project_keys.
+# _pinned_project_keys. So is a sibling flagged .identity-stale, whose name is
+# waiting to be dropped, see _account_invalidate_identity_key.
 _newest_sibling_identity() {
   local exclude="$1" f best="" best_m=0 m pinned k
   command -v jq &>/dev/null || return 0
@@ -6015,6 +6016,14 @@ _newest_sibling_identity() {
     k="${f%/claude.json}"
     k="${k##*/}"
     [[ "$pinned" == *":${k}:"* ]] && continue
+    # A flagged file holds a name the host has already decided to drop: the box
+    # left an account, or had it removed, while a Claude held the file open, or
+    # the remove has unpinned it and not reached the drop yet. Until that box's
+    # next launch clears it, the name is the old account's, and handing it on is
+    # the leak the drop exists to stop. The flag sits beside the file on the host
+    # only (the box mounts the file, never its directory), so the box can
+    # neither set it nor clear it.
+    [[ -e "${f}.identity-stale" ]] && continue
     jq -e '.oauthAccount? != null' "$f" >/dev/null 2>&1 || continue
     m="$(_path_mtime "$f")"
     if (( m > best_m )); then best_m=$m; best="$f"; fi
@@ -20064,10 +20073,11 @@ _claude_json_drop_identity() {
 
 # The launch half of an identity change the host could not finish by itself:
 # no jq on the host, and no running box to borrow one from at the time. The
-# flag is written by _account_invalidate_identity_key and by the no-jq branch
-# of the builder. It sits next to the file on the HOST only, because the box
-# mounts the file and never its directory, and `cleat nuke` takes it with the
-# projects dir. It needs no lock: the write is idempotent and the clear is
+# flag is written by _account_invalidate_identity_key, by the no-jq branch of
+# the builder, by the switch before the pin moves (H9) and by `cleat account
+# rm` before it unpins. It sits next to the file on the HOST only, because the
+# box mounts the file and never its directory, and `cleat nuke` takes it with
+# the projects dir. It needs no lock: the write is idempotent and the clear is
 # re-checked before every launch.
 #
 # Never edits under a live agent. A config write racing the in-place copy puts
@@ -22270,6 +22280,14 @@ _account_do_remove() {
     # Read BEFORE the pin file goes, because that is where the key lives. The
     # edit itself asks docker, so it waits until the lock is released.
     key="$(_box_account_key "$b" || true)"
+    # Flagged BEFORE the pin goes, the order the switch keeps (H9). From here
+    # to the drop after the unlock, the box is on the shared login with the
+    # removed account's name still in its file, and the sibling scan skips only
+    # a flagged file. A remove cut off in that gap leaves the flag for the box's
+    # next launch rather than nothing. The drop clears it when it finishes.
+    if [[ -n "$key" && -d "$CLEAT_PROJECTS_DIR/$key" ]]; then
+      : > "$CLEAT_PROJECTS_DIR/$key/claude.json.identity-stale" 2>/dev/null || true
+    fi
     unpinned="${unpinned}${b}${tab}${key}
 "
     _box_account_remove "$b"

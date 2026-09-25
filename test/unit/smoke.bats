@@ -723,6 +723,9 @@ STUB
   refute_output --partial "unbound variable"
   run jq -r '.oauthAccount // "absent"' "$f"
   assert_output "absent"
+  # The flag the remove writes before it unpins is cleared by the finished drop.
+  run test -e "${f}.identity-stale"
+  assert_failure
 }
 
 @test "smoke: cleat account rm with no name asks which one" {

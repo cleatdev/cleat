@@ -9159,3 +9159,118 @@ EOF
   refute_output --partial "${esc}]0;PWN"
   refute_output --partial "gone-NAME"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: the sibling identity scan skipped a pinned box's file and nothing
+# else. When the name drop is deferred (a Claude started in the box after the
+# live gate), the box is already unpinned and its file still holds the removed
+# or left account's oauthAccount, flagged .identity-stale for the next launch.
+# The scan never read that flag, and a running Claude keeps the file's mtime
+# newest, so every box built on the shared login in another project took that
+# account's email and organisation. `cleat account rm` also unpinned before it
+# flagged, so a box built between the unpin and the drop took the name even
+# when the drop was not deferred, and a remove cut off in that gap left the
+# name unflagged for good.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Box A in one project pinned to `work` through the real switch, its file
+# naming work@example.com and newer than an unpinned sibling's shared login.
+# Leaves the box detached and running. The caller says whether a Claude runs.
+_c18_setup() {
+  command -v jq >/dev/null || skip "needs jq"
+  CLEAT_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/accounts"
+  CLEAT_BOX_ACCOUNTS_DIR="$TEST_TEMP/home/.config/cleat/box-accounts"
+  CLEAT_RUN_DIR="$TEST_TEMP/home/.config/cleat/run"
+  CLEAT_PROJECTS_DIR="$TEST_TEMP/home/.config/cleat/projects"
+  mkdir -p "$CLEAT_ACCOUNTS_DIR" "$CLEAT_BOX_ACCOUNTS_DIR" "$CLEAT_RUN_DIR" "$CLEAT_PROJECTS_DIR"
+  _CLEAT_NOW_S=1789000000
+  curl() { cat >/dev/null 2>&1; return 7; }
+  _account_usage_fetch() { return 0; }
+  mkdir -p "$CLEAT_ACCOUNTS_DIR/work" "$TEST_TEMP/proj-a"
+  chmod 700 "$CLEAT_ACCOUNTS_DIR/work"
+  printf '{"claudeAiOauth":{"accessToken":"a-token","refreshToken":"r-token","expiresAt":1789003600000,"subscriptionType":"max"}}\n' \
+    > "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  chmod 600 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json"
+  _daemon_up() { return 1; }
+  container_exists() { return 1; }
+  _box_has_live_agent() { return 1; }
+  _C18_PA="$TEST_TEMP/proj-a"
+  _C18_CA="$(container_name_for "$_C18_PA" main)"
+  run _account_do_switch work main "$_C18_CA" "$_C18_PA"
+  assert_success
+  # The pin carries the key, the only way the remove reaches A's file.
+  run _box_account_key "$_C18_CA"
+  assert_success
+  _C18_FA="$CLEAT_PROJECTS_DIR/$(_derive_project_session_key "$_C18_PA" main)/claude.json"
+  _C18_FS="$CLEAT_PROJECTS_DIR/shared-22222222/claude.json"
+  _C18_OUT="$CLEAT_PROJECTS_DIR/third-33333333/claude.json"
+  mkdir -p "${_C18_FA%/*}" "${_C18_FS%/*}"
+  printf '{"oauthAccount":{"emailAddress":"work@example.com"},"userID":"abc","hasCompletedOnboarding":true}\n' > "$_C18_FA"
+  printf '{"oauthAccount":{"emailAddress":"shared@example.com"},"hasCompletedOnboarding":true}\n' > "$_C18_FS"
+  # A is the NEWEST, so it wins the scan unless something skips it.
+  touch -t 202601010101.01 "$_C18_FS"
+  touch -t 202601010202.02 "$_C18_FA"
+  printf '{"projects":{}}\n' > "$HOME/.claude.json"
+  _daemon_up() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  # No live agent when the gates ask, so the switch and the remove go ahead.
+  _box_has_live_agent() { return 1; }
+  _account_box_ready() { return 0; }
+}
+
+# What a box built on the shared login in a third project is stamped with.
+_c18_third_email() {
+  _build_project_claude_json "$_C18_OUT" > /dev/null 2>&1
+  jq -r '.oauthAccount.emailAddress // "absent"' "$_C18_OUT"
+}
+
+@test "regression v1.5.4: a removed account's name never spreads from a box whose identity drop is deferred" {
+  _c18_setup
+  # A Claude started in A after the live gate, so the drop waits for it.
+  _box_claude_live() { return 0; }
+  run _account_do_remove work 1
+  assert_success
+  run _box_account_read "$_C18_CA"
+  assert_output "default"
+  run test -e "${_C18_FA}.identity-stale"
+  assert_success
+  # Never edited under a live Claude.
+  run jq -r '.oauthAccount.emailAddress' "$_C18_FA"
+  assert_output "work@example.com"
+  run _c18_third_email
+  assert_output "shared@example.com"
+}
+
+@test "regression v1.5.4: a box built while account rm is between the unpin and the drop never takes the removed account's name" {
+  _c18_setup
+  _box_claude_live() { return 1; }
+  # Another terminal builds a box in the moment after the unlock and before
+  # the drop, the window where A is unpinned and still names work.
+  eval "$(declare -f _account_invalidate_identity_key | sed '1s/_account_invalidate_identity_key/_c18_orig_inv/')"
+  _account_invalidate_identity_key() {
+    _build_project_claude_json "$_C18_OUT" > /dev/null 2>&1
+    _c18_orig_inv "$@"
+  }
+  run _account_do_remove work 1
+  assert_success
+  run jq -r '.oauthAccount.emailAddress // "absent"' "$_C18_OUT"
+  assert_output "shared@example.com"
+  # The drop still ran, and cleared the flag the remove wrote.
+  run jq -r '.oauthAccount // "absent"' "$_C18_FA"
+  assert_output "absent"
+  run test -e "${_C18_FA}.identity-stale"
+  assert_failure
+}
+
+@test "regression v1.5.4: going back to the shared login while a Claude starts in the box keeps the old account's name out of other projects" {
+  _c18_setup
+  _box_claude_live() { return 0; }
+  run _account_do_switch default main "$_C18_CA" "$_C18_PA"
+  assert_success
+  assert_output --partial "during the switch"
+  run test -e "${_C18_FA}.identity-stale"
+  assert_success
+  run _c18_third_email
+  assert_output "shared@example.com"
+}

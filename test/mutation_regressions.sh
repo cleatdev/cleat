@@ -13286,6 +13286,34 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v154_render_trash_sweep_quiet" "the session trash sweep never prints"
 
+# v1.5.4: the sibling identity scan skips a file flagged .identity-stale, whose
+# name is waiting to be dropped. Without the skip, a box unpinned while a Claude
+# held its file open hands the old account's name to every shared-login box in
+# another project, after a remove and after a switch back to the shared login.
+cat > "$SED_TMP" << 'SED'
+/^_newest_sibling_identity()/,/^}$/{
+  s@^    [[][[] -e "[$]{f}.identity-stale" []][]] && continue$@    :@
+}
+SED
+try "v154_sibling_skips_flagged" "never spreads from a box whose identity drop is deferred"
+
+cat > "$SED_TMP" << 'SED'
+/^_newest_sibling_identity()/,/^}$/{
+  s@^    [[][[] -e "[$]{f}.identity-stale" []][]] && continue$@    :@
+}
+SED
+try "v154_sibling_skips_flagged_switch" "going back to the shared login while a Claude starts"
+
+# cleat account rm flags each box before it removes the pin, the order the
+# switch keeps (H9). Unflagged, a box built between the unpin and the drop takes
+# the removed account's name.
+cat > "$SED_TMP" << 'SED'
+/^_account_do_remove()/,/^}$/{
+  s@^      : > "[$]CLEAT_PROJECTS_DIR/[$]key/claude.json.identity-stale" 2>/dev/null || true$@      :@
+}
+SED
+try "v154_account_rm_flags_before_unpin" "between the unpin and the drop"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

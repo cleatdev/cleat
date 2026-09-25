@@ -11573,10 +11573,11 @@ SED
 try "v150_handoff_drains_before_ask" "a keystroke typed before the question is not an answer to it" "$CLI" "$HANDOFF_BATS"
 
 # The rename's temp paths are unguessable, so a link the box plants at a
-# predictable name is never written through.
+# predictable name is never written through. Since v1.5.4 the mtime stamp lives
+# in the host temp dir, so the sidecar temp is the one left in the box's tree.
 cat > "$SED_TMP" << 'SED'
 /^_sessions_rename_write()/,/^}$/{
-  s@^  stamp="[$](mktemp "[$]{sdir}/.cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""$@  stamp="${sdir}/.cleat-mtime.$$"@
+  s@^    tmp="[$](mktemp "[$]{sdir}/[$]{uuid}/[.]custom-title[.]json[.]XXXXXX" 2>/dev/null)" || tmp=""$@    tmp="${sdir}/${uuid}/.custom-title.json.$$"@
 }
 SED
 try "v150_rename_temp_mktemp" "a link planted at the temp path is never written through" "$CLI" "$SESSIONS_BATS"
@@ -12870,6 +12871,78 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_teardown_claim_unlink_fail_soft" "a session keeps both bridges off" "$CLI" "$SMOKE_BATS"
+
+# A rename's sidecar folder is the box's name. Followed as a link, it carried
+# custom-title.json into any host directory the user can write.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  s/^    \[\[ -d "[$]side" && ! -L "[$]side" \]\] || return 1$/    :/
+}
+SED
+try "v154_rename_sidecar_dir_link" "a rename never writes the sidecar through a linked session folder"
+
+# And custom-title.json itself: mv onto a link to a directory moves the temp
+# into that directory.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  s/^    \[\[ -f "[$]side\/custom-title[.]json" && ! -L "[$]side\/custom-title[.]json" \]\] || return 1$/    :/
+}
+SED
+try "v154_rename_sidecar_file_link" "never moves the sidecar into a folder linked at"
+
+# The containment check before the prompt is not the one the write relies on.
+# Without the write-time one, a link swapped in while the user typed is
+# appended to.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  /^  _sessions_path_under_key "[$]f" "[$]sdir" || return 1$/d
+}
+SED
+try "v154_rename_write_time_recheck" "a transcript swapped for a link during the title prompt"
+
+# A running box writes its own rename. Handing it back to the host writer is
+# the v1.5.3 behaviour, where the box could swap names under the host.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_apply()/,/^}$/{
+  s/_sessions_rename_in_box "[$]cname" "[$]uuid" "[$]title"/_sessions_rename_write "$sdir" "$uuid" "$title"/
+}
+SED
+try "v154_rename_running_box_writes" "a rename on a running box is written by the box"
+
+# A docker ps that fails is no answer. Read as "not running" it hands the write
+# to the host while the box may be live.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_box_up()/,/^}$/{
+  s/|| return 2$/|| return 1/
+}
+SED
+try "v154_rename_probe_fails_closed" "a rename refuses when Docker cannot say whether the box is running"
+
+# Claude can start in the box while the user types the title, so the live check
+# runs again after the prompt.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_apply()/,/^}$/{
+  s/_box_has_live_agent "[$]cname" && return 3/:/
+}
+SED
+try "v154_rename_live_recheck" "Claude starting during the prompt stops the write" "$CLI" "$SESSIONS_BATS"
+
+# The host's mtime stamp stays out of the box's session folder.
+cat > "$SED_TMP" << 'SED'
+/^_sessions_rename_write()/,/^}$/{
+  s@mktemp "[$]{TMPDIR:-/tmp}/cleat-mtime[.]XXXXXX"@mktemp "${sdir}/.cleat-mtime.XXXXXX"@
+}
+SED
+try "v154_rename_stamp_host_only" "the mtime stamp is kept outside the session folder" "$CLI" "$SESSIONS_BATS"
+
+# The in-box writer puts the transcript mtime back too, or a rename on a
+# running box changes which conversation the next resume continues.
+cat > "$SED_TMP" << 'SED'
+/^_SESSIONS_RENAME_IN_BOX=/,/^exit "[$]r"'$/{
+  s/touch -r "[$]s" "[$]f" 2>\/dev\/null; //
+}
+SED
+try "v154_rename_inbox_keeps_mtime" "the in-box writer appends the record" "$CLI" "$SESSIONS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

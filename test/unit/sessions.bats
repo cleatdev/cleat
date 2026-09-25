@@ -1221,6 +1221,9 @@ _pass_gates() {
   ln -s "$TEST_TEMP/victim" "$SDIR/${U1}.jsonl"
   run _sessions_do_rename "$SDIR" "$U1" "main" "cleat-x" "pwned"
   assert_failure
+  # The pre-prompt check is the one that refuses. The writer checks again at
+  # write time, and without this line that second check would hide the first.
+  assert_output --partial "does not resolve to a file in this project's session directory"
   run cat "$TEST_TEMP/victim"
   assert_output "VICTIM"
 }
@@ -2227,6 +2230,77 @@ _mk_trashed() {   # $1 = uuid, $2 = stamp, $3 = title
   # And the rename still did its job.
   run cat "$sdir/$uuid.jsonl"
   assert_output --partial "renamed"
+}
+
+@test "session rename: Claude starting during the prompt stops the write" {
+  # The live gate runs before the prompt. The box can start Claude while the
+  # user types, so who writes is decided again after it.
+  _daemon_up() { return 0; }
+  mock_docker_ps cleat-x
+  mock_docker_ps_a cleat-x
+  _is_interactive() { return 0; }
+  _box_has_live_agent() { [[ -e "$TEST_TEMP/live" ]]; }
+  _sessions_title_for() { : > "$TEST_TEMP/live"; echo old; }
+  _mk_session "$U1"
+  run _sessions_do_rename "$SDIR" "$U1" main cleat-x "" <<< "newname"
+  assert_failure
+  assert_output --partial "live Claude session"
+  assert_output --partial "Nothing was written"
+  run grep -c '^docker exec' "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -c newname "$SDIR/${U1}.jsonl"
+  assert_output "0"
+}
+
+@test "session rename: the mtime stamp is kept outside the session folder" {
+  # The session folder is the box's tree. The stamp is cleat's own and lives in
+  # the host temp dir, so the box never sees a name of cleat's there.
+  _mk_session "$U1"
+  touch -t 202001010000 "$SDIR/${U1}.jsonl"
+  local before
+  before="$(_path_mtime "$SDIR/${U1}.jsonl")"
+  touch() { printf '%s\n' "$*" >> "$TEST_TEMP/touch.log"; command touch "$@"; }
+  run _sessions_rename_write "$SDIR" "$U1" "renamed"
+  unset -f touch
+  assert_success
+  # Taken and put back: two touches, neither of them on a name in the folder.
+  run grep -c . "$TEST_TEMP/touch.log"
+  assert_output "2"
+  run grep -c -F "$SDIR/." "$TEST_TEMP/touch.log"
+  assert_output "0"
+  run _path_mtime "$SDIR/${U1}.jsonl"
+  assert_output "$before"
+}
+
+@test "session rename: the in-box writer appends the record, writes the sidecar and keeps the mtime" {
+  # The only test that runs the in-box script. The stub hands it the docker
+  # argv: exec cname runuser -u coder -- sh -c SCRIPT _ DIR UUID TITLE, and the
+  # box's session dir is swapped for this one.
+  _daemon_up() { return 0; }
+  mock_docker_ps cleat-x
+  mock_docker_ps_a cleat-x
+  _box_has_live_agent() { return 1; }
+  printf '{"type":"mode","sessionId":"%s"}' "$U1" > "$SDIR/${U1}.jsonl"
+  touch -t 202001010000 "$SDIR/${U1}.jsonl"
+  local before
+  before="$(_path_mtime "$SDIR/${U1}.jsonl")"
+  cat > "$TEST_TEMP/inbox" <<INBOX
+#!/bin/sh
+[ "\$3 \$4 \$5 \$6 \$7 \$8 \${11}" = "runuser -u coder -- sh -c /home/coder/.claude/projects/-workspace" ] || exit 9
+exec sh -c "\$9" _ "$SDIR" "\${12}" "\${13}"
+INBOX
+  chmod +x "$TEST_TEMP/inbox"
+  export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/inbox"
+  run _sessions_do_rename "$SDIR" "$U1" main cleat-x "in box"
+  assert_success
+  run tail -1 "$SDIR/${U1}.jsonl"
+  assert_output '{"type":"custom-title","customTitle":"in box","sessionId":"'"$U1"'"}'
+  run head -1 "$SDIR/${U1}.jsonl"
+  assert_output '{"type":"mode","sessionId":"'"$U1"'"}'
+  run cat "$SDIR/$U1/custom-title.json"
+  assert_output '{"customTitle":"in box"}'
+  run _path_mtime "$SDIR/${U1}.jsonl"
+  assert_output "$before"
 }
 
 @test "sessions: a trash left inside the session dir is carried out to the host-only trash" {

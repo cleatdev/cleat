@@ -8492,3 +8492,114 @@ OPEN
   run cat "$TEST_TEMP/bf-wlog"
   assert_output --partial "browser bridge off this session"
 }
+
+# A session for the rename regressions below, in a key dir under the isolated
+# HOME. No ps_output is written, so Docker answers that the box is not running
+# unless a test says otherwise.
+_c12_session() {
+  C12_SDIR="$HOME/.claude/projects/proj-c12"
+  C12_U="11111111-2222-4333-8444-555555555555"
+  mkdir -p "$C12_SDIR"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$C12_U" > "$C12_SDIR/$C12_U.jsonl"
+}
+
+@test "regression v1.5.4: a rename never writes the sidecar through a linked session folder" {
+  # The session dir is the box's own tree, mounted read-write, so the box can
+  # leave <uuid> behind as a link to any host directory. mkdir -p, the -d test,
+  # mktemp and mv all followed it and custom-title.json landed in that host
+  # directory. No race needed: the link outlives the box.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  _c12_session
+  mkdir -p "$TEST_TEMP/hostdir"
+  ln -s "$TEST_TEMP/hostdir" "$C12_SDIR/$C12_U"
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x pwned
+  assert_failure
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  # Every check runs before the first write, so the transcript is untouched too.
+  run grep -c custom-title "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+}
+
+@test "regression v1.5.4: a rename never moves the sidecar into a folder linked at custom-title.json" {
+  # mv onto a link to a directory moves the temp INTO that directory, so the
+  # box could park .custom-title.json.XXXXXX in any host directory the user can
+  # write by planting custom-title.json as a link.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  _c12_session
+  mkdir -p "$C12_SDIR/$C12_U" "$TEST_TEMP/hostdir"
+  ln -s "$TEST_TEMP/hostdir" "$C12_SDIR/$C12_U/custom-title.json"
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x pwned
+  assert_failure
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run grep -c custom-title "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+}
+
+@test "regression v1.5.4: a transcript swapped for a link during the title prompt is never appended to" {
+  # The containment check ran once, before the prompt, and the writer then
+  # opened the transcript by name. A box running while the user typed could
+  # swap in a link and stop, and the host appended the record to the link's
+  # target, then put its mtime back so nothing looked touched.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  _is_interactive() { return 0; }
+  _c12_session
+  printf 'KEEP\n' > "$TEST_TEMP/victim"
+  touch -t 202001010101 "$TEST_TEMP/victim"
+  local before
+  before="$(_path_mtime "$TEST_TEMP/victim")"
+  # Runs after the first containment check and before the read.
+  _sessions_title_for() {
+    mv "$1/$2.jsonl" "$1/$2.jsonl.moved"
+    ln -s "$TEST_TEMP/victim" "$1/$2.jsonl"
+    echo old
+  }
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x "" <<< "pwned"
+  assert_failure
+  assert_output --partial "Could not write the new title"
+  run cat "$TEST_TEMP/victim"
+  assert_output "KEEP"
+  run _path_mtime "$TEST_TEMP/victim"
+  assert_output "$before"
+}
+
+@test "regression v1.5.4: a rename on a running box is written by the box, never by the host" {
+  # While the box runs it can swap any name in its session dir between a host
+  # check and the write after it, so the host no longer writes there at all.
+  # The box writes its own rename inside its own namespace.
+  _daemon_up() { return 0; }
+  mock_docker_ps cleat-x
+  mock_docker_ps_a cleat-x
+  _box_has_live_agent() { return 1; }
+  _c12_session
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x boxname
+  assert_success
+  run grep -c boxname "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+  run test -e "$C12_SDIR/$C12_U"
+  assert_failure
+  run assert_docker_exec_has "docker exec cleat-x runuser -u coder -- sh -c"
+  assert_success
+  run assert_docker_exec_has "/home/coder/.claude/projects/-workspace $C12_U boxname"
+  assert_success
+}
+
+@test "regression v1.5.4: a rename refuses when Docker cannot say whether the box is running" {
+  # "Not running" is what hands the write to the host, so a docker ps that
+  # fails must not read as it.
+  _daemon_up() { return 0; }
+  container_exists() { return 1; }
+  export DOCKER_EXIT_CODE=1
+  _c12_session
+  run _sessions_do_rename "$C12_SDIR" "$C12_U" main cleat-x newname
+  assert_failure
+  assert_output --partial "cannot tell whether"
+  run grep -c newname "$C12_SDIR/$C12_U.jsonl"
+  assert_output "0"
+  run test -e "$C12_SDIR/$C12_U"
+  assert_failure
+}

@@ -499,6 +499,49 @@ STUB
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat session rename on a stopped box writes the title under strict mode" {
+  # Docker answers that the box is not running, so the host writes, with its
+  # checks made at write time.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  local proj="$TEST_TEMP/project" uuid="0123abcd-1111-2222-3333-444455556666" key sdir
+  key="project-$(echo -n "$proj" | _md5 | head -c 8)"
+  sdir="$HOME/.claude/projects/$key"
+  mkdir -p "$sdir"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid" > "$sdir/$uuid.jsonl"
+  run cleat_bin_timeout 10 session rename "$uuid" --title "smoke title"
+  refute_output --partial "unbound variable"
+  assert_success
+  run tail -1 "$sdir/$uuid.jsonl"
+  assert_output --partial '"customTitle":"smoke title"'
+}
+
+@test "smoke: cleat session rename on a running box hands the write to the box" {
+  # A running box with no Claude in it passes the live gate, and the rename is
+  # then written by the box through one bounded docker exec, not by the host.
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  local proj="$TEST_TEMP/project" uuid="0123abcd-1111-2222-3333-444455556666" key sdir cname
+  key="project-$(echo -n "$proj" | _md5 | head -c 8)"
+  cname="$(_compute_cname "$proj")"
+  sdir="$HOME/.claude/projects/$key"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 10:00 ? 00:00:00 /sbin/docker-init -- sleep infinity\n' \
+    > "$DOCKER_MOCK_DIR/top_output"
+  mkdir -p "$sdir"
+  printf '{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"%s"}\n' "$uuid" > "$sdir/$uuid.jsonl"
+  run cleat_bin_timeout 10 session rename "$uuid" --title "box title"
+  refute_output --partial "unbound variable"
+  assert_success
+  run grep -c "box title" "$sdir/$uuid.jsonl"
+  assert_output "0"
+  run grep -c "^docker exec $cname runuser -u coder" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
 @test "smoke: cleat account with no accounts exits cleanly and says how to make one" {
   run cleat_bin_timeout 10 account
   assert_success

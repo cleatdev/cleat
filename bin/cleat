@@ -16370,20 +16370,37 @@ _sessions_title_ok() (
 #
 # An `ai-title` record would NOT work: that is Claude's own generated title,
 # ranked below a custom one, so it would simply be outranked.
+#
+# The HOST writer. Only a box Docker has called stopped reaches it (see
+# _sessions_rename_apply): a running box writes its own rename, in its own
+# namespace, through _SESSIONS_RENAME_IN_BOX.
 _sessions_rename_write() {
   local sdir="$1" uuid="$2" title="$3"
-  local f="${sdir}/${uuid}.jsonl" stamp last tmp
+  local f="${sdir}/${uuid}.jsonl" side="${sdir}/${uuid}" stamp last tmp
+  # Every check runs here, at write time, after any prompt and before the first
+  # write. The same containment ran before the prompt, and that was not enough:
+  # a box can plant a link while the user types and then stop. With the box
+  # stopped nothing is left to swap a name between these checks and the writes.
+  _sessions_path_under_key "$f" "$sdir" || return 1
   [[ -f "$f" ]] || return 1
+  # The sidecar folder and its custom-title.json are names the box controls
+  # too. A link at either one would carry the temp file and the mv below into
+  # any host directory the user can write, so anything but a plain folder and a
+  # plain file refuses the whole rename.
+  if [[ -e "$side" || -L "$side" ]]; then
+    [[ -d "$side" && ! -L "$side" ]] || return 1
+  fi
+  if [[ -e "$side/custom-title.json" || -L "$side/custom-title.json" ]]; then
+    [[ -f "$side/custom-title.json" && ! -L "$side/custom-title.json" ]] || return 1
+  fi
 
   # Stamp the mtime so it can be put back. `touch -r` is POSIX and identical on
   # BSD and GNU, unlike `date -r` / `date -d`, and it costs nothing next to
   # copying a 118 MB file to preserve its timestamp.
-  # mktemp, not a $$-named path. This directory is the box's own session tree,
-  # mounted read-write, so a predictable name is one the box can pre-create as
-  # a symlink to any host file the user can write: `touch -r` would then stamp
-  # that file, and the restore below would stamp it again. mktemp refuses an
-  # existing path, link or FIFO included, and creates at 0600.
-  stamp="$(mktemp "${sdir}/.cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""
+  # In the host temp dir, not the session dir. That one is the box's own tree,
+  # mounted read-write, and a stamp there once gave the box a name to plant a
+  # link at. mktemp still, so the name cannot be predicted or pre-created.
+  stamp="$(mktemp "${TMPDIR:-/tmp}/cleat-mtime.XXXXXX" 2>/dev/null)" || stamp=""
   [[ -z "$stamp" ]] || touch -r "$f" "$stamp" 2>/dev/null || { rm -f "$stamp" 2>/dev/null; stamp=""; }
 
   # A record appended after a file that does not end in a newline would join the
@@ -16404,8 +16421,9 @@ _sessions_rename_write() {
   # sees a partial file.
   mkdir -p "${sdir}/${uuid}" 2>/dev/null || true
   if [[ -d "${sdir}/${uuid}" ]]; then
-    # Same reason as the stamp above: the box can plant a link at a name it can
-    # predict, and this one is written through.
+    # mktemp, not a $$-named path: the box can pre-create a name it can predict
+    # as a link to any host file the user can write, and this one is written
+    # through. mktemp refuses an existing path, link or FIFO included.
     tmp="$(mktemp "${sdir}/${uuid}/.custom-title.json.XXXXXX" 2>/dev/null)" || tmp=""
     if [[ -n "$tmp" ]] && printf '{"customTitle":"%s"}\n' "$title" > "$tmp" 2>/dev/null; then
       mv "$tmp" "${sdir}/${uuid}/custom-title.json" 2>/dev/null || rm -f "$tmp"
@@ -16417,8 +16435,8 @@ _sessions_rename_write() {
   # Put the mtime back. REQUIRED, not tidiness: `claude --continue` and the
   # /resume picker both order by transcript mtime, so an unrestored rename of
   # the second-newest session silently changes which conversation the next
-  # `cleat resume` continues. Safe to do here only because the live gate above
-  # guarantees nothing else is appending; it would be a bug as a general rule.
+  # `cleat resume` continues. Safe here only because the box is stopped, so
+  # nothing else can be appending. It would be a bug as a general rule.
   if [[ -n "$stamp" ]]; then
     touch -r "$stamp" "$f" 2>/dev/null || true
     rm -f "$stamp" 2>/dev/null || true
@@ -16795,8 +16813,8 @@ _sessions_picker_draw() {
 # So fold the change in instead. This is safe precisely because the CLI is the
 # thing that made the change and knows exactly what it was: a delete removes
 # that row, a rename replaces its title with the text that was just written and
-# leaves the mtime alone (_sessions_rename_write restores it), so the sort order
-# cannot move either.
+# leaves the mtime alone (whichever side writes the rename restores it), so the
+# sort order cannot move either.
 
 # Drop or retitle the row for one session, according to _SESS_ACTED.
 _sessions_row_apply() {
@@ -16934,6 +16952,77 @@ _sessions_action_draw() {
 # rather than inside a TUI function: the gates must be identical either way, and
 # a gate that only exists on the interactive path is not a gate.
 
+# Who writes a rename. The session dir is the box's own tree, mounted
+# read-write, and the key carries the box, so this box is its only writer.
+# While it runs it can swap any name in there between a host check and the
+# write after it, so no check made from the host closes that. What does is
+# changing who writes: a running box writes its own rename inside its own
+# namespace, where a planted link reaches only what the box can already write,
+# and the host writes only once Docker has said the box is not running.
+
+# 0 = the container is running (docker ps lists paused and restarting ones
+# too), 1 = Docker answered and it is not, 2 = no answer. is_running cannot make
+# this call: its grep reads a failed `docker ps` as "not running", and here that
+# answer would hand the write to the host while the box may be live. A read
+# loop rather than a pipe into grep -q, which under pipefail can report a match
+# as a failure when the writer is cut off.
+_sessions_box_up() {
+  local out line
+  out="$(docker ps --filter "name=^${1}$" --format '{{.Names}}' 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    [[ "$line" == "$1" ]] && return 0
+  done <<EOF
+$out
+EOF
+  return 1
+}
+
+# Where the box sees its session dir. Mounted on every box, docker cap
+# included, so the in-box writer needs no recreate.
+_SESSIONS_BOX_SDIR=/home/coder/.claude/projects/-workspace
+# Seconds the in-box rename may take before it counts as not written.
+_SESSIONS_RENAME_BOUND_S=10
+
+# The in-box writer, run as the box user: the same record, the same sidecar and
+# the same mtime restore as _sessions_rename_write. No link checks, on purpose:
+# here a link resolves inside the container. $1 = session dir, $2 = uuid,
+# $3 = title, both already validated on the host and passed as argv, never
+# spliced into the script. POSIX sh, because the image's /bin/sh is dash.
+_SESSIONS_RENAME_IN_BOX='d="$1"; u="$2"; t="$3"; f="$d/$u.jsonl"; r=0
+[ -f "$f" ] || exit 1
+s="$(mktemp "${TMPDIR:-/tmp}/cleat-mtime.XXXXXX" 2>/dev/null)" || s=""
+[ -z "$s" ] || touch -r "$f" "$s" 2>/dev/null || { rm -f "$s"; s=""; }
+if [ -n "$(tail -c 1 "$f" 2>/dev/null)" ]; then printf "\n" >> "$f" || r=1; fi
+[ "$r" -ne 0 ] || printf "{\"type\":\"custom-title\",\"customTitle\":\"%s\",\"sessionId\":\"%s\"}\n" "$t" "$u" >> "$f" || r=1
+if [ "$r" -eq 0 ] && mkdir -p "$d/$u" 2>/dev/null && n="$(mktemp "$d/$u/.custom-title.json.XXXXXX" 2>/dev/null)"; then
+  { printf "{\"customTitle\":\"%s\"}\n" "$t" > "$n" && mv -f "$n" "$d/$u/custom-title.json"; } 2>/dev/null || rm -f "$n"
+fi
+[ -z "$s" ] || { touch -r "$s" "$f" 2>/dev/null; rm -f "$s"; }
+exit "$r"'
+
+# The resume probe's exec form, bounded through _run_bounded (timeout, then
+# gtimeout, then perl on a stock Mac). Only the exit status is used: what the
+# box prints is not read.
+_sessions_rename_in_box() {
+  _run_bounded "$_SESSIONS_RENAME_BOUND_S" docker exec "$1" runuser -u coder -- \
+    sh -c "$_SESSIONS_RENAME_IN_BOX" _ "$_SESSIONS_BOX_SDIR" "$2" "$3" >/dev/null 2>&1
+}
+
+# Decided after the prompt, right before the write, because the box can start,
+# stop or start Claude while the user types. 0 = written, 1 = not written,
+# 2 = Docker did not answer, 3 = Claude came up in the box meanwhile.
+_sessions_rename_apply() {
+  local sdir="$1" uuid="$2" title="$3" cname="$4" rc=0
+  _sessions_box_up "$cname" || rc=$?
+  case "$rc" in
+    0) _box_has_live_agent "$cname" && return 3
+       _sessions_rename_in_box "$cname" "$uuid" "$title" || return 1 ;;
+    1) _sessions_rename_write "$sdir" "$uuid" "$title" || return 1 ;;
+    *) return 2 ;;
+  esac
+  return 0
+}
+
 _sessions_do_rename() {
   local sdir="$1" uuid="$2" box="$3" cname="$4" title="$5"
   _SESS_ACTED=""
@@ -16971,13 +17060,22 @@ _sessions_do_rename() {
     echo -e "    ${DIM}For anything else (emoji, accents) use ${BOLD}/rename${RESET}${DIM} inside the session.${RESET}"
     return 1
   fi
-  if _sessions_rename_write "$sdir" "$uuid" "$title"; then
+  # `|| wrc=$?` so a refusal reaches the case below under the binary's set -e.
+  local wrc=0
+  _sessions_rename_apply "$sdir" "$uuid" "$title" "$cname" || wrc=$?
+  if [[ $wrc -eq 0 ]]; then
     _SESS_ACTED="rename"
     _SESS_ACTED_TITLE="$title"
     success "Renamed ${DIM}${uuid:0:8}${RESET} to ${BOLD}${title}${RESET}"
     return 0
   fi
-  error "Could not write the new title."
+  case "$wrc" in
+    2) error "Docker is not responding, so cleat cannot tell whether ${BOLD}${box}${RESET} is running."
+       echo -e "    ${DIM}Start Docker and try again. Nothing was written.${RESET}" ;;
+    3) error "Box ${BOLD}${box}${RESET} has a live Claude session."
+       echo -e "    ${DIM}Stop it first: ${BOLD}cleat stop ${box}${RESET}${DIM}. Nothing was written.${RESET}" ;;
+    *) error "Could not write the new title." ;;
+  esac
   return 1
 }
 

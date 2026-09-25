@@ -8603,3 +8603,163 @@ _c12_session() {
   run test -e "$C12_SDIR/$C12_U"
   assert_failure
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.5.4: two host writers built a login in a directory a box can write and
+# then used it by name. _account_write_file_0600 made its temp beside the
+# destination, which for a staged login is the box's own read-write auth dir.
+# _seed_macos_credentials made its temp in ~/.claude, which every box mounts
+# read-write. mktemp only made the create safe: the redirect, jq and chmod 600
+# reopened the name afterwards, so a box that swapped it for a link had the host
+# write a login over any host file the user can write and chmod it 600. The
+# final `mv -f tmp dest` moved the temp INTO a directory when dest had been
+# swapped for a link to one. Both now build the file in a host-only stage dir
+# and land it with one rename that names the destination's directory.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The box: whatever the host creates under $1 is subverted at once. A file
+# becomes a link to $C13_VICTIM and a directory gets such a link planted inside
+# it under the name the writer uses.
+_c13_box_mktemp() {
+  C13_BOXDIR="$1"
+  C13_VICTIM="$TEST_TEMP/precious-host-file"
+  printf 'DO-NOT-OVERWRITE\n' > "$C13_VICTIM"
+  chmod 644 "$C13_VICTIM"
+  mktemp() {
+    local p
+    p="$(command mktemp "$@")" || return 1
+    case "$p" in
+      "$C13_BOXDIR"/*)
+        : > "$TEST_TEMP/box.acted"
+        if [ -d "$p" ]; then
+          ln -s "$C13_VICTIM" "$p/.credentials.json"
+        else
+          rm -f "$p"
+          ln -s "$C13_VICTIM" "$p"
+        fi ;;
+    esac
+    printf '%s\n' "$p"
+  }
+}
+
+_c13_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+@test "regression v1.5.4: an attach never writes a login through a link the box swaps in for the staging temp" {
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" auth staged leg
+  auth="$CLEAT_RUN_DIR/$CN/auth"
+  staged="$auth/.credentials.json"
+  _box_account_write "$CN" a
+  _c13_box_mktemp "$auth"
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    # Another box refreshed a since this one ran, so the attach stages.
+    _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 2 1789032400000
+    _acct_race_cred "$staged" A 1 1789028800000
+    run _account_sync_in "$CN"
+    assert_success
+    run cat "$C13_VICTIM"
+    assert_output "DO-NOT-OVERWRITE"
+    run _c13_mode "$C13_VICTIM"
+    assert_output "644"
+    run test -L "$staged"
+    assert_failure
+    run grep -c '"accessToken":"at-A2"' "$staged"
+    assert_output "1"
+  done
+}
+
+@test "regression v1.5.4: a box that swaps its staged login for a link to a directory cannot move the login out" {
+  _acct_race_setup
+  local CN="cleat-race-abcdef12" leg
+  C13_STAGED="$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  C13_LOOT="$TEST_TEMP/loot"
+  mkdir -p "$C13_LOOT"
+  _box_account_write "$CN" a
+  # The merge runs inside the writer, after its link and directory checks and
+  # before its rename: the window a live box has.
+  eval "$(declare -f _account_cred_merge | sed '1s/^_account_cred_merge /_t_orig_merge /')"
+  _account_cred_merge() {
+    if [ ! -L "$C13_STAGED" ]; then
+      rm -f "$C13_STAGED"
+      ln -s "$C13_LOOT" "$C13_STAGED"
+      : > "$TEST_TEMP/box.swapped"
+    fi
+    _t_orig_merge "$@"
+  }
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    rm -f "$TEST_TEMP/box.swapped"
+    _acct_race_cred "$CLEAT_ACCOUNTS_DIR/a/.credentials.json" A 2 1789032400000
+    _acct_race_cred "$C13_STAGED" A 1 1789028800000
+    run _account_sync_in "$CN"
+    assert_success
+    run test -e "$TEST_TEMP/box.swapped"
+    assert_success
+    run ls -A "$C13_LOOT"
+    assert_output ""
+    run test -L "$C13_STAGED"
+    assert_failure
+    run grep -c '"accessToken":"at-A2"' "$C13_STAGED"
+    assert_output "1"
+  done
+}
+
+@test "regression v1.5.4: the macOS seed never writes the Keychain login through a link a box swaps in for its temp" {
+  _is_macos() { return 0; }
+  # seed_blob and not blob: the CLI's own `local blob` would shadow it.
+  local seed_blob='{"claudeAiOauth":{"accessToken":"sk-ant-oat01-KEYCHAIN","refreshToken":"rt","expiresAt":3000000000000}}'
+  _macos_keychain_credentials() { printf '%s' "$seed_blob"; }
+  local cred="$HOME/.claude/.credentials.json" leg
+  mkdir -p "$HOME/.claude"
+  _c13_box_mktemp "$HOME/.claude"
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    rm -f "$cred"
+    _SEEDED_CREDS=0
+    _seed_macos_credentials
+    run cat "$C13_VICTIM"
+    assert_output "DO-NOT-OVERWRITE"
+    run _c13_mode "$C13_VICTIM"
+    assert_output "644"
+    run test -L "$cred"
+    assert_failure
+    run cat "$cred"
+    assert_output "$seed_blob"
+    assert_equal "$leg $_SEEDED_CREDS" "$leg 1"
+  done
+}
+
+@test "regression v1.5.4: the macOS seed keeps the Keychain login in place when a box swaps the file for a link to a directory" {
+  _is_macos() { return 0; }
+  local seed_blob='{"claudeAiOauth":{"accessToken":"KC-FRESH","refreshToken":"rt-kc","expiresAt":3000000000000}}'
+  local cred="$HOME/.claude/.credentials.json" leg
+  C13_LOOT="$TEST_TEMP/loot"
+  mkdir -p "$HOME/.claude" "$C13_LOOT"
+  # The Keychain read sits between the expiry check and the rename, a wide
+  # window for a box that watches its expired file.
+  _macos_keychain_credentials() {
+    rm -f "$HOME/.claude/.credentials.json"
+    ln -s "$C13_LOOT" "$HOME/.claude/.credentials.json"
+    : > "$TEST_TEMP/box.swapped"
+    printf '%s' "$seed_blob"
+  }
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    rm -f "$TEST_TEMP/box.swapped" "$cred"
+    printf '{"claudeAiOauth":{"accessToken":"BOX-EXPIRED","refreshToken":"rt-box","expiresAt":1000}}' > "$cred"
+    _SEEDED_CREDS=0
+    _CLEAT_NOW_S=2000000000 _seed_macos_credentials
+    run test -e "$TEST_TEMP/box.swapped"
+    assert_success
+    run ls -A "$C13_LOOT"
+    assert_output ""
+    run test -L "$cred"
+    assert_failure
+    run cat "$cred"
+    assert_output "$seed_blob"
+    assert_equal "$leg $_SEEDED_CREDS" "$leg 1"
+  done
+}

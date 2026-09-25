@@ -1080,6 +1080,8 @@ Non-TTY runs (CI, scripts) print the notice and continue with the existing conta
 <project>/.cleat.<box>.env ← per-box env vars (falls back to .cleat.env)
 ~/.config/cleat/state/hook-drops.log ← hook events the bridge refused and spool discards (hooks cap)
 ~/.config/cleat/state/hook-runs.log  ← hook events handed to your hooks (hooks cap)
+~/.config/cleat/state/stage/         ← a login on its way into a box or an account,
+                                       built outside every mount (empty between writes)
 ```
 
 One project, one `.cleat`. Boxes scope their caps, resources, setup and fork

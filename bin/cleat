@@ -2015,6 +2015,37 @@ _oauth_expires_at() {
   return 0
 }
 
+# A fresh private directory for a file on its way into a directory a box can
+# write. It sits in $CLEAT_STATE_DIR, which no box mounts, so the redirect, jq
+# and chmod that reopen the file by name all happen where nothing but this shell
+# can swap it. A temp beside the destination, even under a mktemp name, is one
+# the box sees appear: a link swapped in before the redirect had the host write a
+# login over any file the user can write, then chmod it 600. Only the final
+# rename (_rename_onto) touches the box's directory. The state dir is under
+# $CLEAT_CONFIG_DIR beside run/ and accounts/. In the default layout it is on
+# the same volume as ~/.claude too, so that rename is one rename(2). The caller
+# removes the directory.
+_host_stage_dir() {
+  ( umask 077; mkdir -p "$CLEAT_STATE_DIR/stage" ) 2>/dev/null || return 1
+  mktemp -d "$CLEAT_STATE_DIR/stage/XXXXXX" 2>/dev/null
+}
+
+# Rename STAGED onto DEST, replacing whatever is at that name and never going
+# through it. The target named is DEST's DIRECTORY, not DEST: `mv FILE LINK`
+# moves FILE INTO the directory a link names, GNU and BSD alike, so a box that
+# swapped its credential for a link to a host directory had the login moved
+# there. `mv FILE DIR/` renames it to DIR/<its own name>, which replaces a link
+# or a pipe at that name without following it and fails on a real directory.
+# So STAGED must carry DEST's file name. DIR is never the box's to swap: it is
+# a mount root or host-only. The trailing slash is load-bearing. When DIR has
+# gone, `mv FILE DIR` would create a file under DIR's name. Across volumes mv
+# copies instead, which is still safe but not atomic.
+_rename_onto() {
+  local staged="$1" dest="$2"
+  [[ "$dest" == */* && "${staged##*/}" == "${dest##*/}" ]] || return 1
+  mv -f "$staged" "${dest%/*}/" 2>/dev/null
+}
+
 # On macOS, materialize the Keychain-stored OAuth credential into
 # ~/.claude/.credentials.json (the path Claude reads on Linux), so the box,
 # which only sees the mounted ~/.claude dir, never the Keychain, starts
@@ -2040,7 +2071,9 @@ _oauth_expires_at() {
 #
 # ~/.claude is mounted read-write into every box, so the file is box-writable.
 # Its read is capped and cannot abort the launch when the file is unreadable.
-# The temp file is a mktemp name a box cannot guess and plant a link at.
+# The login is written and checked outside every mount and renamed into place
+# (_host_stage_dir, _rename_onto), so no box can redirect the write or the
+# rename to another host file or directory.
 _SEEDED_CREDS=0
 _seed_macos_credentials() {
   _is_macos || return 0
@@ -2064,13 +2097,14 @@ _seed_macos_credentials() {
     [[ -n "$blob" ]] || return 0
   fi
   mkdir -p "${HOME}/.claude" 2>/dev/null || return 0
-  # mktemp, not "$cred.tmp.$$". A pid is guessable. A box that planted a
-  # symlink at that name had the Keychain login written through it onto any
-  # host file the user can write. mktemp refuses an existing path (symlink or
-  # FIFO included) and creates at 0600 on both BSD and GNU.
-  local tmp
-  tmp="$(mktemp "${cred}.tmp.XXXXXX" 2>/dev/null)" || return 0
-  ( umask 077; printf '%s' "$blob" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  # Never beside $cred. ~/.claude is the box's. A temp there, even under a
+  # mktemp name, can be swapped for a link between its create and the redirect.
+  # No link or directory check on $cred either: the rename replaces a link and
+  # fails on a directory, which leaves nothing seeded and the launch going.
+  local stage tmp
+  stage="$(_host_stage_dir)" || return 0
+  tmp="$stage/.credentials.json"
+  ( umask 077; printf '%s' "$blob" > "$tmp" ) 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 0; }
   # Never write a non-JSON-object (e.g. an error string) into the creds file.
   local ok=false
   if command -v jq &>/dev/null; then
@@ -2080,10 +2114,9 @@ _seed_macos_credentials() {
   fi
   if $ok; then
     chmod 600 "$tmp" 2>/dev/null || true
-    if mv -f "$tmp" "$cred" 2>/dev/null; then _SEEDED_CREDS=1; else rm -f "$tmp" 2>/dev/null; fi
-  else
-    rm -f "$tmp" 2>/dev/null
+    if _rename_onto "$tmp" "$cred"; then _SEEDED_CREDS=1; fi
   fi
+  rm -rf "$stage" 2>/dev/null || true
   return 0
 }
 
@@ -18223,30 +18256,30 @@ _account_cred_login() {
 # box's MCP tokens loses them at its next harvest. An empty SRC means "no
 # account keys".
 _account_write_file_0600() {
-  local src="$1" dest="$2" base="${3:-}" tmp ok=false
+  local src="$1" dest="$2" base="${3:-}" stage tmp ok=false
+  # A link already there is refused, so the switch can drop what the box
+  # planted and retry. One swapped in later is replaced by the rename below.
   [[ -L "$dest" ]] && return 1
-  # A directory there would take the temp file INTO it, report success and
-  # leave the box with no credential at all.
+  # A directory there is refused before any work. The rename refuses one too.
   [[ -d "$dest" ]] && return 1
   # A source the BOX can write is capped before it is read, because the next
   # thing that happens to it is a `cat` into a host file and, later, a shell
   # variable. A credential is under 4 KB.
   [[ -z "$src" ]] || _account_cred_sane_size "$src" || return 1
-  # mktemp, not "$dest.tmp.$$". The old name was guessable and unguarded, and
-  # half the destinations live in a directory the box mounts read-write, so a
-  # planted symlink there would have redirected a live credential to any host
-  # file the user can write. mktemp refuses an existing path (symlink or FIFO
-  # included) and creates at 0600 on both BSD and GNU.
-  tmp="$(mktemp "${dest}.tmp.XXXXXX" 2>/dev/null)" || return 1
+  # Never beside dest. Half the destinations are the box's own auth dir, where
+  # even a mktemp name is one the box sees appear and can swap for a link before
+  # the redirect, jq or chmod reopen it. See _host_stage_dir.
+  stage="$(_host_stage_dir)" || return 1
+  tmp="$stage/${dest##*/}"
   # By key, never the whole file. See _account_cred_merge.
-  ( umask 077; _account_cred_merge "$base" "$src" > "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  ( umask 077; _account_cred_merge "$base" "$src" > "$tmp" ) 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 1; }
   # A store takes exactly the login every reader found in the source. The
   # readers find claudeAiOauth at any depth and the merge copies top-level keys
   # only, so a login a box nested inside another key read as plausible and
   # projected to {}: a harvest of the same grant wrote a store with no login
   # over the account's only copy.
   if [[ -n "$src" && -z "$base" && "$(_account_cred_login "$tmp")" != "$(_account_cred_login "$src")" ]]; then
-    rm -f "$tmp" 2>/dev/null
+    rm -rf "$stage" 2>/dev/null
     return 1
   fi
   if command -v jq &>/dev/null; then
@@ -18255,11 +18288,12 @@ _account_write_file_0600() {
     _looks_like_json_object "$tmp" && ok=true
   fi
   if ! $ok; then
-    rm -f "$tmp" 2>/dev/null
+    rm -rf "$stage" 2>/dev/null
     return 1
   fi
   chmod 600 "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$dest" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  _rename_onto "$tmp" "$dest" || { rm -rf "$stage" 2>/dev/null; return 1; }
+  rm -rf "$stage" 2>/dev/null || true
   return 0
 }
 
@@ -18267,9 +18301,10 @@ _account_write_file_0600() {
 # and writes late, and a `cleat account rm` or a rename in another terminal can
 # move the store away in between. A mkdir -p here put the account back under its
 # old name, empty or refilled, and `restore` then refused. Past this check
-# nothing creates a directory: mktemp, the redirect and mv all fail when the
-# store has gone. The decline returns 1, so the wipe that asked keeps the staged
-# file. The one place that creates a store is the explicit switch to a new name.
+# nothing creates the store. The temp is staged outside it and the rename names
+# the store's directory, which fails when it has gone. The decline returns 1, so
+# the wipe that asked keeps the staged file. The one place that creates a store
+# is the explicit switch to a new name.
 _account_write_cred() {
   local acct="$1" src="$2" gone
   _account_exists "$acct" || return 1

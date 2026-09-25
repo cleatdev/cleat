@@ -2563,9 +2563,11 @@ try "v1.4.3_seed_unreadable_no_abort" "an unreadable shared credential file does
 
 # v1.4.3: ~/.claude is mounted read-write into every box. Bring back the
 # guessable pid temp name: a planted symlink there receives the Keychain login.
+# Since v1.5.4 the temp is a fixed name in a host-only stage dir, so the pid
+# name replaces that.
 cat > "$SED_TMP" << 'SED'
 /^_seed_macos_credentials()/,/^}$/{
-  s/^  tmp="[$](mktemp .*$/  tmp="${cred}.tmp.$$"/
+  s/^  tmp="[$]stage\/[.]credentials[.]json"$/  tmp="${cred}.tmp.$$"/
 }
 SED
 try "v1.4.3_seed_temp_mktemp" "macOS seed never writes the token through a planted temp symlink"
@@ -6586,12 +6588,12 @@ try "vnext_account_clean_scope" "switching from a logged-in account to a new one
 # A credential at the host default umask is readable by anything on the machine
 # and it is live for weeks. BOTH mechanisms are removed here on purpose: the
 # umask subshell and the chmod each produce 0600 on their own, so removing
-# either alone is invisible. What the test pins is the outcome.
+# either alone is invisible. What the test pins is the outcome. Since v1.5.4
+# the staged file is created by that redirect, not by mktemp.
 cat > "$SED_TMP" << 'SED'
 /^_account_write_file_0600()/,/^}$/{
   s#umask 077#umask 022#
   s#^  chmod 600 "[$]tmp" 2>/dev/null .. true$#  :#
-  s#^  tmp="[$](mktemp .*#  tmp="${dest}.tmp.$$"#
 }
 SED
 try "vnext_account_cred_mode" "a new store is 0700 and its credential 0600" "$CLI" "$ACCOUNTS_BATS"
@@ -8397,10 +8399,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_account_switch_failed_stage_unpins" "a switch from the shared login that cannot stage leaves the box unpinned" "$CLI" "$ACCOUNTS_BATS"
 
-# A rename onto a directory moves the temp INTO it and reports success.
+# A rename onto a directory moves the temp INTO it and reports success. Since
+# v1.5.4 two mechanisms refuse a directory, each on its own: the -d check up
+# front and the rename that names the destination's directory. Both go.
 cat > "$SED_TMP" << 'SED'
 /^_account_write_file_0600()/,/^}$/{
   s/^  \[\[ -d "[$]dest" \]\] && return 1$/  :/
+}
+/^_rename_onto()/,/^}$/{
+  s#^  mv -f "[$]staged" "[$]{dest%/\*}/" 2>/dev/null$#  mv -f "$staged" "$dest" 2>/dev/null#
 }
 SED
 try "vnext_account_stage_refuses_directory" "a switch from the shared login that cannot stage leaves the box unpinned" "$CLI" "$ACCOUNTS_BATS"
@@ -12943,6 +12950,62 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "v154_rename_inbox_keeps_mtime" "the in-box writer appends the record" "$CLI" "$SESSIONS_BATS"
+
+# ── v1.5.4: credentials are built outside the box's dirs and land by one rename ──
+
+# The account writer's temp goes back beside the destination, in the box's own
+# auth dir. A box that swaps it for a link after the create gets the login
+# written over any host file the user can write, then chmodded 600.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  s#^  stage="[$](_host_stage_dir)" .. return 1$#  stage="$(mktemp -d "${dest}.tmp.XXXXXX" 2>/dev/null)" || return 1#
+}
+SED
+try "v154_account_stage_outside_mount" "an attach never writes a login through a link the box swaps in"
+
+# The rename names the destination again instead of its directory. mv onto a
+# link to a directory moves the login INTO that directory.
+cat > "$SED_TMP" << 'SED'
+/^_rename_onto()/,/^}$/{
+  s#^  mv -f "[$]staged" "[$]{dest%/\*}/" 2>/dev/null$#  mv -f "$staged" "$dest" 2>/dev/null#
+}
+SED
+try "v154_account_rename_names_dir" "a box that swaps its staged login for a link to a directory"
+
+# The same rename, proven on the macOS seed on its own.
+cat > "$SED_TMP" << 'SED'
+/^_rename_onto()/,/^}$/{
+  s#^  mv -f "[$]staged" "[$]{dest%/\*}/" 2>/dev/null$#  mv -f "$staged" "$dest" 2>/dev/null#
+}
+SED
+try "v154_seed_rename_names_dir" "the macOS seed keeps the Keychain login in place"
+
+# The macOS seed's temp goes back into ~/.claude, which every box mounts.
+cat > "$SED_TMP" << 'SED'
+/^_seed_macos_credentials()/,/^}$/{
+  s#^  stage="[$](_host_stage_dir)" .. return 0$#  stage="$(mktemp -d "${cred}.tmp.XXXXXX" 2>/dev/null)" || return 0#
+}
+SED
+try "v154_seed_stage_outside_mount" "the macOS seed never writes the Keychain login through a link"
+
+# Without the trailing slash a write whose directory has gone creates a file
+# under that directory's name.
+cat > "$SED_TMP" << 'SED'
+/^_rename_onto()/,/^}$/{
+  s#"[$]{dest%/\*}/"#"${dest%/*}"#
+}
+SED
+try "v154_rename_onto_trailing_slash" "a credential write whose directory has gone creates nothing" "$CLI" "$ACCOUNTS_BATS"
+
+# A refused write keeps its stage dir: a 0600 copy of a login left on the host.
+cat > "$SED_TMP" << 'SED'
+/^_account_write_file_0600()/,/^}$/{
+  /^  if ! [$]ok; then$/,/^  fi$/{
+    s#^    rm -rf "[$]stage" 2>/dev/null$#    :#
+  }
+}
+SED
+try "v154_account_stage_removed_on_refusal" "a refused credential write leaves nothing staged on the host" "$CLI" "$ACCOUNTS_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

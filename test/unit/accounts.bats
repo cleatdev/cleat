@@ -164,6 +164,107 @@ _profile_says() {
   [ ! -e "$TEST_TEMP/elsewhere.json" ]
 }
 
+@test "account: a credential write whose directory has gone creates nothing in its place" {
+  # The rename names the destination's directory with a trailing slash. Without
+  # it, a write whose box run dir was removed meanwhile would create a file
+  # called auth holding the login.
+  _mk_account work
+  mkdir -p "$CLEAT_RUN_DIR/$CN"
+  run _account_write_file_0600 "$CLEAT_ACCOUNTS_DIR/work/.credentials.json" "$CLEAT_RUN_DIR/$CN/auth/.credentials.json"
+  assert_failure
+  run test -e "$CLEAT_RUN_DIR/$CN/auth"
+  assert_failure
+  run ls -A "$CLEAT_STATE_DIR/stage"
+  assert_output ""
+}
+
+@test "account: a refused credential write leaves nothing staged on the host" {
+  # Every exit of the writer removes its stage dir. A leftover there is a 0600
+  # copy of a login outside the store it belongs to.
+  local auth="$CLEAT_RUN_DIR/$CN/auth"
+  mkdir -p "$auth"
+  _cred_blob > "$TEST_TEMP/good.json"
+  # A source that is not JSON: the merge itself fails.
+  printf 'not json at all\n' > "$TEST_TEMP/bad.json"
+  run _account_write_file_0600 "$TEST_TEMP/bad.json" "$auth/.credentials.json"
+  assert_failure
+  run ls -A "$CLEAT_STATE_DIR/stage"
+  assert_output ""
+  # A login nested under another key: the store would get no login.
+  printf '{"wrap":{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1789003600000}}}\n' > "$TEST_TEMP/nested.json"
+  run _account_write_file_0600 "$TEST_TEMP/nested.json" "$auth/.credentials.json"
+  assert_failure
+  run ls -A "$CLEAT_STATE_DIR/stage"
+  assert_output ""
+  # A write that lands.
+  run _account_write_file_0600 "$TEST_TEMP/good.json" "$auth/.credentials.json"
+  assert_success
+  run ls -A "$CLEAT_STATE_DIR/stage"
+  assert_output ""
+  run ls -A "$auth"
+  assert_output ".credentials.json"
+  # A merge that yields something other than a JSON object, on both legs.
+  _account_cred_merge() { printf '"a string"'; }
+  local leg
+  for leg in jq nojq; do
+    [ "$leg" = nojq ] && _hide_jq
+    run _account_write_file_0600 "" "$auth/.credentials.json"
+    assert_failure
+    run ls -A "$CLEAT_STATE_DIR/stage"
+    assert_output ""
+    run grep -c '"a-token"' "$auth/.credentials.json"
+    assert_output "1"
+  done
+}
+
+@test "account: _rename_onto replaces a link at the name and never goes through it" {
+  local d="$TEST_TEMP/boxdir" s="$TEST_TEMP/stage"
+  mkdir -p "$d" "$s" "$TEST_TEMP/hostdir"
+  printf 'DO-NOT-OVERWRITE\n' > "$TEST_TEMP/victim"
+  # A link to a host file: replaced, the file it names untouched.
+  printf 'staged-1\n' > "$s/f.json"
+  ln -s "$TEST_TEMP/victim" "$d/f.json"
+  run _rename_onto "$s/f.json" "$d/f.json"
+  assert_success
+  run test -L "$d/f.json"
+  assert_failure
+  run cat "$d/f.json"
+  assert_output "staged-1"
+  run cat "$TEST_TEMP/victim"
+  assert_output "DO-NOT-OVERWRITE"
+  # A link to a host directory: replaced, nothing moved into the directory.
+  rm -f "$d/f.json"
+  printf 'staged-2\n' > "$s/f.json"
+  ln -s "$TEST_TEMP/hostdir" "$d/f.json"
+  run _rename_onto "$s/f.json" "$d/f.json"
+  assert_success
+  run ls -A "$TEST_TEMP/hostdir"
+  assert_output ""
+  run cat "$d/f.json"
+  assert_output "staged-2"
+  # A real directory: refused, left empty, the staged file still there for the
+  # caller to remove.
+  rm -f "$d/f.json"
+  mkdir "$d/f.json"
+  printf 'staged-3\n' > "$s/f.json"
+  run _rename_onto "$s/f.json" "$d/f.json"
+  assert_failure
+  run ls -A "$d/f.json"
+  assert_output ""
+  run cat "$s/f.json"
+  assert_output "staged-3"
+  # A staged name that is not the destination's: refused, nothing moved.
+  printf 'staged-4\n' > "$s/other.json"
+  run _rename_onto "$s/other.json" "$d/g.json"
+  assert_failure
+  run test -e "$d/g.json"
+  assert_failure
+  run test -e "$d/other.json"
+  assert_failure
+  run cat "$s/other.json"
+  assert_output "staged-4"
+}
+
 @test "account: the list skips anything that is not a usable account name" {
   _mk_account work
   mkdir -p "$CLEAT_ACCOUNTS_DIR/.trash" "$CLEAT_ACCOUNTS_DIR/Bad" "$CLEAT_ACCOUNTS_DIR/has space"

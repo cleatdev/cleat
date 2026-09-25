@@ -157,9 +157,18 @@ EOF
   _is_macos() { return 0; }
   _macos_keychain_credentials() { printf '%s' 'not json'; }
   rm -f "$CRED"
+  mkdir -p "$HOME/.claude"
+  local before
+  before="$(ls -A "$HOME/.claude")"
   _seed_macos_credentials
   run bash -c "ls ${HOME}/.claude/.credentials.json.tmp.* 2>/dev/null | wc -l | tr -d ' '"
   assert_output "0"
+  # The login is staged outside every mount now, so ~/.claude alone proves
+  # nothing: the stage has to be gone too.
+  run ls -A "$HOME/.claude"
+  assert_output "$before"
+  run ls -A "$CLEAT_STATE_DIR/stage"
+  assert_output ""
 }
 
 # ── _oauth_expires_at ────────────────────────────────────────────────────────

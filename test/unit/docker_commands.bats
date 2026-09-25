@@ -1127,7 +1127,9 @@ EOF
   _browser_watcher() { sleep 30; }
   sleep 30 &
   local sib=$!
-  touch "$clip/.watcher.$sib"
+  # Its liveness marker, in the host-only clipwatch/ beside the clip dir.
+  mkdir -p "$CLEAT_RUN_DIR/$cname/clipwatch"
+  touch "$CLEAT_RUN_DIR/$cname/clipwatch/.watcher.$sib"
   run cmd_shell "$TEST_TEMP/project"
   kill "$sib" 2>/dev/null || true; wait "$sib" 2>/dev/null || true
   assert_success
@@ -1165,7 +1167,9 @@ EOF
   _browser_watcher() { sleep 30; }
   sleep 30 &
   local sib=$!
-  touch "$clip/.watcher.$sib"
+  # Its liveness marker, in the host-only clipwatch/ beside the clip dir.
+  mkdir -p "$CLEAT_RUN_DIR/$cname/clipwatch"
+  touch "$CLEAT_RUN_DIR/$cname/clipwatch/.watcher.$sib"
   run cmd_login "$TEST_TEMP/project"
   kill "$sib" 2>/dev/null || true; wait "$sib" 2>/dev/null || true
   assert_success

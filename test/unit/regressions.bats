@@ -3217,6 +3217,10 @@ EOF
   # two markers from two days earlier sitting next to the current one.
   local dir="$TEST_TEMP/clip"
   mkdir -p "$dir"
+  # Since v1.5.4 the markers live in clipwatch/, the host-only sibling of the
+  # clip dir. The sweep still takes the clip dir.
+  local wdir="$TEST_TEMP/clipwatch"
+  mkdir -p "$wdir"
 
   # No background jobs: a child outliving the test makes bats miscount tests.
   # Live pid = this test's own shell. Dead pid = a subshell that has already
@@ -3226,20 +3230,20 @@ EOF
   local dead
   dead="$(sh -c 'echo $$')"
 
-  touch "$dir/.watcher.$live" "$dir/.watcher.$dead" "$dir/.watcher.notanumber"
+  touch "$wdir/.watcher.$live" "$wdir/.watcher.$dead" "$wdir/.watcher.notanumber"
   _sweep_dead_watcher_markers "$dir"
 
-  [ -e "$dir/.watcher.$live" ] || {
+  [ -e "$wdir/.watcher.$live" ] || {
     echo "REGRESSION: swept a LIVE watcher's marker, which would drop .host-ready under a working bridge"; return 1; }
-  [ ! -e "$dir/.watcher.$dead" ] || {
+  [ ! -e "$wdir/.watcher.$dead" ] || {
     echo "REGRESSION: a dead session's marker survived and will latch .host-ready on"; return 1; }
-  [ ! -e "$dir/.watcher.notanumber" ] || {
+  [ ! -e "$wdir/.watcher.notanumber" ] || {
     echo "REGRESSION: a malformed marker survived"; return 1; }
 
   # Last real watcher gone: nothing may remain to hold the latch on.
-  rm -f "$dir/.watcher.$live"
+  rm -f "$wdir/.watcher.$live"
   _sweep_dead_watcher_markers "$dir"
-  run bash -c "ls '$dir'/.watcher.* 2>/dev/null; true"
+  run bash -c "ls '$wdir'/.watcher.* 2>/dev/null; true"
   assert_output ""
 }
 
@@ -3729,11 +3733,14 @@ EOF
   local clip_dir="$TEST_TEMP/clip-hr"; mkdir -p "$clip_dir"
   local target="$TEST_TEMP/hr-target-must-not-exist"
   ln -s "$target" "$clip_dir/.host-ready"
-  _clipboard_watcher "$clip_dir" "cat > /dev/null" >/dev/null 2>&1 &
+  # Since v1.5.4 the sentinel is written inside the box (a docker exec, stubbed
+  # here), so the watcher's readiness step is over once that call is recorded.
+  _clipboard_watcher "$clip_dir" "cat > /dev/null" test-hr150 >/dev/null 2>&1 &
   local pid=$!
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -f "$clip_dir/.host-ready" ] && [ ! -L "$clip_dir/.host-ready" ] && break
+    [ -e "$target" ] && break
+    grep -q '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS" 2>/dev/null && break
     sleep 0.3
   done
   stop_watcher "$pid" "$clip_dir"
@@ -8351,4 +8358,65 @@ EOF
   assert_failure
   run test -f "$_WL_HOSTLOG"
   assert_success
+}
+
+@test "regression v1.5.4: a link planted at a session's watcher marker name is never followed" {
+  # The session touched .watcher.<its pid> in the clip dir, which the box has
+  # read-write. The box could read a live host pid off the markers there and
+  # plant links at the names a later session would use, and touch followed the
+  # link: the host created, or re-stamped, a file of the box's choosing anywhere
+  # the user can write. The marker lives in the host-only clipwatch/ now.
+  _host_clip_cmd() { echo "true"; }
+  _host_open_cmd() { echo ""; }
+  _clipboard_watcher() { :; }
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  local clip="$CLEAT_RUN_DIR/test-wm154/clip" out="$TEST_TEMP/wm154-outside"
+  mkdir -p "$clip" "$out"
+  # $$ inside `run exec_claude` is this shell's pid, the exact name the session
+  # writes.
+  ln -s "$out/created" "$clip/.watcher.$$"
+  run exec_claude test-wm154 --dangerously-skip-permissions
+  assert_success
+  run test -e "$out/created"
+  assert_failure
+
+  # An existing file is not re-stamped either.
+  echo old > "$out/old"
+  touch -t 200001010000 "$out/old"
+  ln -sfn "$out/old" "$clip/.watcher.$$"
+  run exec_claude test-wm154 --dangerously-skip-permissions
+  assert_success
+  local m; m="$(_path_mtime "$out/old")"
+  [ "$m" -lt 1000000000 ] || {
+    echo "REGRESSION: the session re-stamped the link's target (mtime $m)"; return 1; }
+}
+
+@test "regression v1.5.4: the host never writes .host-ready, even when a link lands after its check" {
+  # The watcher dropped a link at .host-ready and then ran touch. The box can
+  # rename a fresh link over the name in the gap between the two, and touch
+  # follows it. The gap is made deterministic here: every drop of the sentinel
+  # is followed at once by a new link. Since v1.5.4 the host does not write the
+  # name at all. The box writes it, inside the box.
+  local clip_dir="$TEST_TEMP/clip-hr154" out="$TEST_TEMP/hr154-outside"
+  mkdir -p "$clip_dir" "$out"
+  local target="$out/created"
+  ln -s "$target" "$clip_dir/.host-ready"
+  _HR154_TARGET="$target"
+  _drop_unless_regular() {
+    case "$1" in
+      */.host-ready) rm -f "$1" 2>/dev/null; ln -s "$_HR154_TARGET" "$1" ;;
+      *) if [ -L "$1" ]; then rm -f "$1"; fi ;;
+    esac
+    return 0
+  }
+  _clipboard_watcher "$clip_dir" "cat > /dev/null" test-hr154 >/dev/null 2>&1 &
+  local pid=$! i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "$target" ] && break
+    grep -q '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS" 2>/dev/null && break
+    sleep 0.3
+  done
+  stop_watcher "$pid" "$clip_dir"
+  run test -e "$target"
+  assert_failure
 }

@@ -337,3 +337,35 @@ EOF
 
   docker rm -f "$cname" >/dev/null 2>&1 || true
 }
+
+# ── v1.5.4: clipboard readiness is written inside the box ──────────────────
+# The host used to touch .host-ready in the clip dir the box has read-write, so
+# a link renamed over it had the host create or re-stamp a file the box chose.
+# A docker exec as coder writes it now. Only a real engine shows that exec can
+# write the mount as coder and that a planted link is replaced in the box.
+@test "integration: clipboard readiness is written inside the box and a planted link is replaced there" {
+  cd "$INT_PROJECT"
+  run "$CLI" run
+  assert_success
+  local cname clip out
+  cname="$(int_cname)"
+  clip="$HOME/.config/cleat/run/$cname/clip"
+  out="$TEST_TEMP/int-outside"
+  mkdir -p "$out"
+  rm -f "$clip/.host-ready"
+  ln -s "$out/created" "$clip/.host-ready"
+
+  run cli_call _clip_announce_ready "$cname"
+  assert_success
+
+  run test -L "$clip/.host-ready"
+  assert_failure
+  run test -f "$clip/.host-ready"
+  assert_success
+  run test -e "$out/created"
+  assert_failure
+  run docker exec "$cname" test -f /tmp/cleat-clip/.host-ready
+  assert_success
+
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+}

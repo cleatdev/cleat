@@ -1193,10 +1193,12 @@ EOF
   mkdir -p "$CLEAT_RUN_DIR/test-cleanup2/clip"
   printf '%s' "https://claude.ai/oauth?redirect_uri=x" > "$CLEAT_RUN_DIR/test-cleanup2/clip/.browser-open"
   # A live SIBLING session: its .watcher.<pid> marker survives the dead-marker
-  # sweep only while that pid is alive, so back it with a real process.
+  # sweep only while that pid is alive, so back it with a real process. The
+  # marker lives in the host-only clipwatch/ beside the clip dir.
   sleep 30 &
   local sib=$!
-  touch "$CLEAT_RUN_DIR/test-cleanup2/clip/.watcher.$sib"
+  mkdir -p "$CLEAT_RUN_DIR/test-cleanup2/clipwatch"
+  touch "$CLEAT_RUN_DIR/test-cleanup2/clipwatch/.watcher.$sib"
 
   _CLIP_DIR="$CLEAT_RUN_DIR/test-cleanup2/clip"
   run exec_claude "test-cleanup2" --dangerously-skip-permissions

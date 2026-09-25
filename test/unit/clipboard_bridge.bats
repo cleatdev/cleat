@@ -12,17 +12,94 @@ teardown() { _common_teardown; }
 
 # ── _clipboard_watcher ──────────────────────────────────────────────────────
 
-@test "_clipboard_watcher creates .host-ready sentinel" {
+@test "_clipboard_watcher announces readiness from inside the box, as coder" {
+  # The sentinel sits in the box's read-write clip mount, where a link renamed
+  # over it at the right instant had the host's touch create or re-stamp a file
+  # of the box's choosing. The host no longer writes it at all: one docker exec
+  # as coder runs the readiness script inside the box.
+  use_docker_stub
   local clip_dir="$TEST_TEMP/clip"
   mkdir -p "$clip_dir"
 
-  # Start watcher with a no-op clip command, kill it quickly
-  _clipboard_watcher "$clip_dir" "true" &
-  local pid=$!
-  sleep 0.2
+  _clipboard_watcher "$clip_dir" "true" test-ann >/dev/null 2>&1 &
+  local pid=$! i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    grep -q '/tmp/cleat-clip/.host-ready$' "$DOCKER_CALLS" 2>/dev/null && break
+    sleep 0.3
+  done
   stop_watcher "$pid" "$clip_dir"
 
-  [[ -f "$clip_dir/.host-ready" ]]  || return 1
+  run grep -cxF "docker exec -u coder test-ann sh -c $_CLIP_READY_SH sh /tmp/cleat-clip/.host-ready" "$DOCKER_CALLS"
+  assert_output "1"
+  [ ! -e "$clip_dir/.host-ready" ] || { echo "the host wrote the sentinel itself"; return 1; }
+}
+
+@test "readiness is retried while the box cannot write the clip dir yet" {
+  # An exec that lands before the entrypoint remaps coder runs as the image's
+  # uid, which cannot write a host-owned clip dir on Linux with another host uid
+  # or on a rootless engine. One failed attempt must not cost the session its
+  # file bridge.
+  use_docker_stub
+  export DOCKER_EXIT_CODE=1
+  run _clip_announce_ready test-retry
+  assert_success
+  run grep -c '^docker exec -u coder test-retry ' "$DOCKER_CALLS"
+  assert_output "3"
+}
+
+@test "the in-box readiness script turns any shape at .host-ready into a regular file" {
+  # _clip_announce_ready runs this inside the box. Whatever the box left at the
+  # name, it ends as a regular file, a link is never followed and a FIFO never
+  # blocks. A regular file already there is left as it is.
+  local d="$TEST_TEMP/shapes"
+  mkdir -p "$d/dir/sub"
+  echo junk > "$d/dir/sub/f"
+  ln -s "$TEST_TEMP/dangling-target" "$d/dangling"
+  echo keep > "$TEST_TEMP/linked"
+  ln -s "$TEST_TEMP/linked" "$d/tofile"
+  mkfifo "$d/fifo"
+  echo existing > "$d/regular"
+  local shape
+  for shape in absent dir dangling tofile fifo regular; do
+    _portable_timeout 5 sh -c "$_CLIP_READY_SH" sh "$d/$shape" </dev/null >/dev/null 2>&1 || true
+    [ -f "$d/$shape" ] && [ ! -L "$d/$shape" ] || {
+      echo "shape '$shape' is not a regular file at the sentinel afterwards"; ls -la "$d"; return 1; }
+  done
+  [ ! -e "$TEST_TEMP/dangling-target" ] || { echo "the script followed a dangling link"; return 1; }
+  run cat "$TEST_TEMP/linked"
+  assert_output "keep"
+  run cat "$d/regular"
+  assert_output "existing"
+}
+
+@test "exec_claude hands its watcher the box name and keeps its marker outside the clip mount" {
+  # The marker used to be touched in the clip mount, under a name the box could
+  # predict from the markers it saw there, so a link planted at it had the host
+  # touch any file. It lives in the host-only clipwatch/ sibling now.
+  use_docker_stub
+  _host_clip_cmd() { echo "true"; }
+  _host_open_cmd() { echo ""; }
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  _clipboard_watcher() { printf '%s' "$3" > "$TEST_TEMP/seen-cname"; }
+  # Runs synchronously right after the watcher spawn, before any teardown, so
+  # what it lists is where the live session keeps its marker.
+  _clipimg_remove_shim() {
+    ls -a "$CLEAT_RUN_DIR/test-wmark/clip" > "$TEST_TEMP/seen-clip" 2>&1
+    ls -a "$CLEAT_RUN_DIR/test-wmark/clipwatch" > "$TEST_TEMP/seen-watch" 2>&1
+  }
+  run exec_claude test-wmark --dangerously-skip-permissions
+  assert_success
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$TEST_TEMP/seen-cname" ] && break
+    sleep 0.2
+  done
+  run cat "$TEST_TEMP/seen-cname"
+  assert_output "test-wmark"
+  run grep -c '^\.watcher\.' "$TEST_TEMP/seen-clip"
+  assert_output "0"
+  run grep -cxF ".watcher.$$" "$TEST_TEMP/seen-watch"
+  assert_output "1"
 }
 
 @test "_clipboard_watcher from a dead cleat process never copies (orphan guard)" {
@@ -102,65 +179,56 @@ EOF
   assert_success
 }
 
-# ── _cleanup_clipboard ──────────────────────────────────────────────────────
+# ── exec_claude teardown: the marker and the sentinel ───────────────────────
+# These drive exec_claude's real _cleanup_session. They used to define their own
+# copy of the teardown inline and test that, so they passed whatever the real
+# code did.
+
+_teardown_stubs() {
+  use_docker_stub
+  _host_clip_cmd() { echo "true"; }
+  _host_open_cmd() { echo ""; }
+  _clipboard_watcher() { :; }
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+}
 
 @test "cleanup removes session marker" {
-  _CLIP_DIR="$TEST_TEMP/clip"
-  _CLIP_WATCHER_PID=""
-  mkdir -p "$_CLIP_DIR"
-  touch "$_CLIP_DIR/.watcher.$$"
-
-  _cleanup_clipboard() {
-    rm -f "$_CLIP_DIR/.watcher.$$"
-    if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
-      rm -f "$_CLIP_DIR/.host-ready"
-    fi
-  }
-  _cleanup_clipboard
-
-  [[ ! -f "$_CLIP_DIR/.watcher.$$" ]]  || return 1
+  _teardown_stubs
+  run exec_claude test-tdm --dangerously-skip-permissions
+  assert_success
+  [ -d "$CLEAT_RUN_DIR/test-tdm/clipwatch" ] || { echo "the session never made its marker dir"; return 1; }
+  # The marker names this shell's pid, which is alive, so only the teardown's
+  # own unlink can remove it.
+  [ ! -e "$CLEAT_RUN_DIR/test-tdm/clipwatch/.watcher.$$" ] || {
+    echo "the session left its own marker behind"; return 1; }
 }
 
 @test "cleanup removes sentinel when last session exits" {
-  _CLIP_DIR="$TEST_TEMP/clip"
-  _CLIP_WATCHER_PID=""
-  mkdir -p "$_CLIP_DIR"
-  touch "$_CLIP_DIR/.watcher.$$"
-  touch "$_CLIP_DIR/.host-ready"
-
-  # This used to define its own _cleanup_clipboard and call THAT, so it passed
-  # whatever the real code did. Call the real sweep instead. The one-line `ls`
-  # gate is still mirrored here because it lives inside _cleanup_session, which
-  # cannot be invoked in isolation; the sweep is the part that carries the
-  # logic and the part the mutation targets.
-  rm -f "$_CLIP_DIR/.watcher.$$"
-  _sweep_dead_watcher_markers "$_CLIP_DIR"
-  if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
-    rm -f "$_CLIP_DIR/.host-ready"
-  fi
-
-  [[ ! -f "$_CLIP_DIR/.host-ready" ]]  || return 1
+  _teardown_stubs
+  mkdir -p "$CLEAT_RUN_DIR/test-tds/clip"
+  : > "$CLEAT_RUN_DIR/test-tds/clip/.host-ready"
+  run exec_claude test-tds --dangerously-skip-permissions
+  assert_success
+  [ ! -e "$CLEAT_RUN_DIR/test-tds/clip/.host-ready" ] || {
+    echo "the last session out left the sentinel on, so copies go to a bridge nobody reads"; return 1; }
 }
 
 @test "cleanup keeps sentinel when other sessions remain" {
-  _CLIP_DIR="$TEST_TEMP/clip"
-  _CLIP_WATCHER_PID=""
-  mkdir -p "$_CLIP_DIR"
-  touch "$_CLIP_DIR/.watcher.$$"
-  touch "$_CLIP_DIR/.watcher.99999"  # Another session
-  touch "$_CLIP_DIR/.host-ready"
-
-  _cleanup_clipboard() {
-    rm -f "$_CLIP_DIR/.watcher.$$"
-    if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
-      rm -f "$_CLIP_DIR/.host-ready"
-    fi
-  }
-  _cleanup_clipboard
-
-  # Our marker gone, but sentinel stays because .watcher.99999 exists
-  [[ ! -f "$_CLIP_DIR/.watcher.$$" ]]  || return 1
-  [[ -f "$_CLIP_DIR/.host-ready" ]]  || return 1
+  _teardown_stubs
+  mkdir -p "$CLEAT_RUN_DIR/test-tdk/clip" "$CLEAT_RUN_DIR/test-tdk/clipwatch"
+  : > "$CLEAT_RUN_DIR/test-tdk/clip/.host-ready"
+  # A live sibling session, backed by a real process so the dead-marker sweep
+  # keeps its marker.
+  sleep 30 &
+  local sib=$!
+  : > "$CLEAT_RUN_DIR/test-tdk/clipwatch/.watcher.$sib"
+  run exec_claude test-tdk --dangerously-skip-permissions
+  kill "$sib" 2>/dev/null || true; wait "$sib" 2>/dev/null || true
+  assert_success
+  [ -f "$CLEAT_RUN_DIR/test-tdk/clip/.host-ready" ] || {
+    echo "a sibling's live bridge lost its sentinel"; return 1; }
+  [ -e "$CLEAT_RUN_DIR/test-tdk/clipwatch/.watcher.$sib" ] || {
+    echo "the teardown removed a live sibling's marker"; return 1; }
 }
 
 # ── Clipboard priority (already in clipboard_detect.bats, but verify the
@@ -221,22 +289,6 @@ EOF
   stop_watcher "$wpid" "$clip_dir"
   run cat "$out"
   assert_output "hello from the cage"
-}
-
-@test "_clipboard_watcher drops a FIFO planted at .host-ready" {
-  # touch on a FIFO succeeds, so the FIFO would have stayed and the shim would
-  # keep taking the file-bridge path against a sentinel that is not a file.
-  local clip_dir="$TEST_TEMP/clip"; mkdir -p "$clip_dir"
-  mkfifo "$clip_dir/.host-ready"
-  _clipboard_watcher "$clip_dir" "cat > /dev/null" >/dev/null 2>&1 &
-  local wpid=$!
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -f "$clip_dir/.host-ready" ] && [ ! -p "$clip_dir/.host-ready" ] && break
-    sleep 0.3
-  done
-  stop_watcher "$wpid" "$clip_dir"
-  [ -f "$clip_dir/.host-ready" ] && [ ! -p "$clip_dir/.host-ready" ] || { echo "the FIFO survived at .host-ready"; return 1; }
 }
 
 @test "clipboard delivery: a directory planted as the payload is dropped and a later copy still lands" {

@@ -4343,9 +4343,10 @@ try "vnext_config_env_scaffold_offer" "enabling env offers to scaffold" "$CLI" "
 # temporarily unavailable" never corrupts the Claude Code TUI. Strip the
 # redirect from the clipboard watcher spawn: the watcher's stderr leaks onto the
 # caller's fd 2 and the log is never created, so the regression test fails.
-# Retargeted (v1.5.4): the log moved to logs/watcher.log, named by $_watcher_log.
+# Retargeted (v1.5.4): the log moved to logs/watcher.log, named by $_watcher_log,
+# and the spawn passes the box name.
 cat > "$SED_TMP" << 'SED'
-s|_clipboard_watcher "[$]_CLIP_DIR" "[$]clip_cmd" >>"[$]_watcher_log" 2>[&]1 |_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" |
+s|_clipboard_watcher "[$]_CLIP_DIR" "[$]clip_cmd" "[$]cname" >>"[$]_watcher_log" 2>[&]1 |_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" "$cname" |
 SED
 try "watcher_fd2_redirect" "watchers redirect fork-error stderr"
 
@@ -5663,8 +5664,12 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_image_lock_symlink" "a symlinked image lock is dropped, not followed" "$CLI" "$CLIPIMG_BATS"
 
+# Retargeted (v1.5.4): the host no longer writes the sentinel at all. A plain
+# host touch through the planted link is what this test catches.
 cat > "$SED_TMP" << 'SED'
-s|_drop_unless_regular "\$clip_dir/\.host-ready"|:|
+/^_clipboard_watcher()/,/^}$/{
+  s@^    _clip_announce_ready "[$]cname"$@    touch "$clip_dir/.host-ready"@
+}
 SED
 try "vnext_host_ready_symlink" "host-ready sentinel is replaced"
 
@@ -5767,12 +5772,14 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_drop_fifo_proxy_log" "a FIFO planted at the old in-mount path never blocks the watcher" "$CLI" "$BROWSER_BRIDGE_BATS"
+# Retargeted (v1.5.4): .host-ready is written by the in-box readiness script,
+# which removes whatever shape the box left at the name before it creates the
+# file. Without the rm, a FIFO blocks the create, a directory stays and a link
+# is followed.
 cat > "$SED_TMP" << 'SED'
-/^_drop_unless_regular()/,/^}$/{
-  s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
-}
+/^_CLIP_READY_SH=/s@ rm -rf "[$]1" 2>/dev/null;@@
 SED
-try "vnext_drop_fifo_host_ready" "drops a FIFO planted at .host-ready" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+try "vnext_drop_fifo_host_ready" "turns any shape at" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
 cat > "$SED_TMP" << 'SED'
 /^_drop_unless_regular()/,/^}$/{
   s|elif \[ -e "\$p" \] && \[ ! -f "\$p" \]; then|elif false; then|
@@ -5806,9 +5813,11 @@ cat > "$SED_TMP" << 'SED'
 s|_browser_teardown_bridge "\$_login_clip_dir"|rm -f "$_login_clip_dir/.browser-open"|
 SED
 try "vnext_teardown_login_site" "login: teardown keeps a FRESH" "$CLI" "$DOCKER_COMMANDS_BATS"
+# Retargeted (v1.5.4): the liveness gate reads clipwatch/ through
+# _clip_watchers_live.
 cat > "$SED_TMP" << 'SED'
 /^_browser_teardown_bridge()/,/^}$/{
-  s|if ls "\$dir"/.watcher.\* >/dev/null 2>&1; then|if true; then|
+  s|if _clip_watchers_live "\$dir"; then|if true; then|
 }
 SED
 try "vnext_teardown_solo_unconditional" "teardown removes even a fresh browser-open" "$CLI" "$HOOKS_BATS"
@@ -12739,6 +12748,71 @@ SED
 try "v154_session_watcher_log_host_only" "session watchers never append through a link"
 try "v154_shell_watcher_log_host_only" "cleat shell never appends watcher output through a link"
 try "v154_login_watcher_log_host_only" "cleat login never appends watcher output through a link"
+
+# ── v1.5.4: the watcher markers leave the mount, .host-ready is written in the box ──
+
+# The session touched .watcher.<pid> in the clip dir, and touch follows a link
+# the box planted at that name. Put the in-mount touch back.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    ( set -C; umask 077; : > "[$]_ec_watch/\.watcher\.[$][$]" ) 2>/dev/null || true$@    touch "$_CLIP_DIR/.watcher.$$"@
+}
+SED
+try "v154_watcher_marker_host_only" "watcher marker name is never followed"
+
+# The watcher dropped a link at .host-ready and then touched the name, and a
+# link renamed in between was followed. Put the released pair back.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  s@^    _clip_announce_ready "[$]cname"$@    _drop_unless_regular "$clip_dir/.host-ready"; touch "$clip_dir/.host-ready"@
+}
+SED
+try "v154_host_ready_in_box" "even when a link lands after its check"
+
+# No announce at all: the shim never sees a watcher and every copy takes OSC 52.
+cat > "$SED_TMP" << 'SED'
+/^_clipboard_watcher()/,/^}$/{
+  s@^    _clip_announce_ready "[$]cname"$@    :@
+}
+SED
+try "v154_host_ready_announced" "announces readiness from inside the box" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# Without the box name the watcher has nobody to announce to.
+cat > "$SED_TMP" << 'SED'
+s@_clipboard_watcher "[$]_CLIP_DIR" "[$]clip_cmd" "[$]cname" >>@_clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>@
+SED
+try "v154_watcher_gets_box_name" "hands its watcher the box name" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# One attempt only: an exec that lands before the uid remap costs the session
+# its file bridge.
+cat > "$SED_TMP" << 'SED'
+/^_clip_announce_ready()/,/^}$/{
+  s@ && return 0$@; return 0@
+}
+SED
+try "v154_host_ready_retry" "retried while the box cannot write" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# The last session out must drop the sentinel, and a live sibling must keep it.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    if ! _clip_watchers_live "[$]_CLIP_DIR"; then$@    if false; then@
+}
+SED
+try "v154_teardown_drops_host_ready" "removes sentinel when last session exits" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    if ! _clip_watchers_live "[$]_CLIP_DIR"; then$@    if true; then@
+}
+SED
+try "v154_teardown_keeps_for_sibling" "keeps sentinel when other sessions remain" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
+
+# The session's own marker must go at teardown, or it reads as a live sibling.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    rm -f "[$](_clip_watch_dir "[$]{_CLIP_DIR:?}")/\.watcher\.[$][$]" 2>/dev/null || true$@    :@
+}
+SED
+try "v154_teardown_drops_own_marker" "cleanup removes session marker" "$CLI" "$CLIPBOARD_BRIDGE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

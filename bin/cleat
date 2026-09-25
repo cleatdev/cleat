@@ -75,11 +75,11 @@ CLEAT_GLOBAL_ENV="$CLEAT_CONFIG_DIR/env"
 # bind-mount sources out from under it and force a recreate (which would discard
 # the container's writable layer, e.g. an ad-hoc `az` install).
 #   $CLEAT_RUN_DIR/<cname>/{auth,clip,home,hooks,kit,settings}   mount sources
-#   $CLEAT_RUN_DIR/<cname>/{bridge,clipclaim,clipimg-stage,hookbridge,hookclaim,logs}   host-only
+#   $CLEAT_RUN_DIR/<cname>/{bridge,clipclaim,clipimg-stage,clipwatch,hookbridge,hookclaim,logs}   host-only
 # The host-only siblings hold what the box must not reach (claims, rate ledgers,
-# staged images, the browser bridge's log, the watcher log), so none of them may
-# ever be mounted. Which mounts are read-only is decided in cmd_run's
-# mount_args, not here.
+# staged images, liveness markers, the browser bridge's log, the watcher log),
+# so none of them may ever be mounted. Which mounts are read-only is decided in
+# cmd_run's mount_args, not here.
 CLEAT_RUN_DIR="$CLEAT_CONFIG_DIR/run"
 CLEAT_TRUST_FILE="$CLEAT_CONFIG_DIR/trust"
 # Host-side per-box descriptions, keyed by container name. NOT Docker labels:
@@ -7026,16 +7026,29 @@ _clipimg_watcher() {
   done
 }
 
+# Where the clipboard watchers' liveness markers live, given the clip dir: one
+# `.watcher.<host pid>` per session that runs a watcher, in clipwatch/, a
+# host-only sibling of the clip mount like clipclaim/. They used to sit in the
+# mount itself. There the box could read a live host pid off a marker and plant
+# a link at a later session's marker name, and the host's touch followed it,
+# creating or re-stamping a file of the box's choosing anywhere the user can
+# write. Nothing in the box reads these markers.
+_clip_watch_dir() {
+  printf '%s/clipwatch' "$(dirname "${1:?}")"
+}
+
 # Remove .watcher.<pid> markers whose process is gone. Each marker is stamped
 # with the HOST pid of a clipboard watcher, so `kill -0` is the liveness test,
-# the same shape _box_has_attached_session uses for .attached.<pid>.
+# the same shape _box_has_attached_session uses for .attached.<pid>. $1 is the
+# clip dir. The markers sit in _clip_watch_dir.
 #
 # A recycled pid can make a dead marker look live, which only delays the sweep
 # to the next session. The reverse mistake, treating a live watcher as dead,
 # would drop .host-ready out from under a working bridge, so this errs toward
 # keeping a marker.
 _sweep_dead_watcher_markers() {
-  local dir="$1" m pid
+  local dir m pid
+  dir="$(_clip_watch_dir "$1")"
   for m in "$dir"/.watcher.*; do
     [ -e "$m" ] || continue
     pid="${m##*/.watcher.}"
@@ -7044,6 +7057,50 @@ _sweep_dead_watcher_markers() {
     esac
     kill -0 "$pid" 2>/dev/null || rm -f "$m" 2>/dev/null || true
   done
+}
+
+# rc 0 while a clipboard watcher on this box is still alive. $1 is the clip dir.
+# Dead markers are swept first, so a crashed session never counts.
+_clip_watchers_live() {
+  local m
+  _sweep_dead_watcher_markers "$1"
+  for m in "$(_clip_watch_dir "$1")"/.watcher.*; do
+    [ -e "$m" ] && return 0
+  done
+  return 1
+}
+
+# Run INSIDE the box by _clip_announce_ready, with the sentinel path as $1. A
+# regular file already says a watcher is up and is left alone. Anything else at
+# the name (a link, a FIFO, a directory) can only be the box's own, and it is
+# replaced so it cannot hold the bridge off. POSIX sh: the image's /bin/sh is
+# dash. rm runs before any open, so a FIFO there never blocks the create.
+_CLIP_READY_SH='[ -f "$1" ] && [ ! -L "$1" ] && exit 0; rm -rf "$1" 2>/dev/null; : > "$1"'
+
+# Tell the box's shim a host watcher is running. docker/clip takes the file
+# bridge whenever /tmp/cleat-clip/.host-ready is a regular file. The sentinel
+# sits in the read-write clip mount, where the box can rename a link over it at
+# any instant, so the host never writes it. touch and a plain redirect follow
+# that link. So does bash's noclobber: it stats first and opens a name that is
+# not a regular file with O_CREAT and no O_EXCL, and a loop swapping a dangling
+# link in after the stat won about one attempt in twenty on Linux. Written from
+# inside the box instead, as coder, a link resolves in the box's own filesystem
+# and reaches nothing the box could not already write.
+#
+# Retried because an exec that lands before the entrypoint has remapped coder
+# runs as the image's uid, which cannot write a host-owned clip dir on Linux
+# with a host uid other than 1000 or on a rootless engine. Each attempt is
+# bounded, so a box that hangs its own sh cannot hold the watcher here for the
+# rest of the session. Fail-soft: with no sentinel the shim falls back to OSC
+# 52, the path a box with no watcher takes.
+_clip_announce_ready() {
+  local _try
+  for _try in 1 2 3; do
+    _run_bounded 10 docker exec -u coder "${1:?}" sh -c "$_CLIP_READY_SH" sh /tmp/cleat-clip/.host-ready \
+      </dev/null >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 0
 }
 
 # The image type of $1 by magic bytes, or empty. Never trust an extension: this
@@ -7068,6 +7125,7 @@ _CLIP_MAX_PAYLOAD=102400          # 100KB
 _clipboard_watcher() {
   local clip_dir="$1"
   local clip_cmd="$2"
+  local cname="${3:-}"
   trap 'exit 0' TERM INT HUP
   # Same orphan story as _browser_watcher: a watcher whose cleat process died
   # without the cleanup trap (terminal closed, SIGKILL) must not keep writing
@@ -7125,10 +7183,11 @@ _clipboard_watcher() {
   done
 
   _sweep_dead_watcher_markers "$clip_dir"
-  # touch FOLLOWS a symlink, so a link planted at this path would have the host
-  # create or re-stamp whatever file it names. Drop it first.
-  _drop_unless_regular "$clip_dir/.host-ready"
-  touch "$clip_dir/.host-ready"
+  # Readiness is written from inside the box, never through the mount (see
+  # _clip_announce_ready). With no box name there is nobody to announce to.
+  if [ -n "$cname" ]; then
+    _clip_announce_ready "$cname"
+  fi
 
   # Consume-on-read, mirroring _browser_claim_url: atomically claim the
   # payload before piping it to the host clipboard, so a delivered copy no
@@ -8319,15 +8378,15 @@ _browser_sweep_stale_bridge() {
 }
 
 # Teardown sweep of the bridge file. With another session alive on this box
-# (its .watcher.<pid> marker survives the dead-marker sweep) a FRESH bridge
-# file is a login URL that sibling is about to claim, so only a stale one goes.
-# With no live sibling there is nobody left to claim it, and leaving it behind
-# would hand it to the NEXT session on this box, which would open the previous
-# session's URL, so it goes unconditionally, exactly as it always did.
+# (its .watcher.<pid> marker in clipwatch/ survives the dead-marker sweep) a
+# FRESH bridge file is a login URL that sibling is about to claim, so only a
+# stale one goes. With no live sibling there is nobody left to claim it, and
+# leaving it behind would hand it to the NEXT session on this box, which would
+# open the previous session's URL, so it goes unconditionally, exactly as it
+# always did.
 _browser_teardown_bridge() {
   local dir="${1:?}"
-  _sweep_dead_watcher_markers "$dir"
-  if ls "$dir"/.watcher.* >/dev/null 2>&1; then
+  if _clip_watchers_live "$dir"; then
     _browser_sweep_stale_bridge "$dir"
   elif [ -L "$dir/.browser-open" ] || [ -e "$dir/.browser-open" ]; then
     rm -f "$dir/.browser-open" 2>/dev/null || true
@@ -10630,7 +10689,7 @@ exec_claude() {
     # by an older CLI that is still running against this box.
     rm -f "$(dirname "${_CLIP_DIR:?}")/clipclaim/.claim.$$."*
     rm -f "${_CLIP_DIR:?}/.claim.$$."*
-    rm -f "$_CLIP_DIR/.watcher.$$"
+    rm -f "$(_clip_watch_dir "${_CLIP_DIR:?}")/.watcher.$$" 2>/dev/null || true
     # After our own marker is gone, so a solo session sweeps unconditionally.
     _browser_teardown_bridge "${_CLIP_DIR:?}"
     # Only a LIVE sibling may hold .host-ready on. Testing mere existence let a
@@ -10639,10 +10698,10 @@ exec_claude() {
     # session with no watcher running wrote its payload to a bridge nobody was
     # reading, the copy was swept as a stale leftover, and the OSC 52 fallback
     # that would have worked was never tried. Found with two markers from two
-    # days earlier still on disk.
-    _sweep_dead_watcher_markers "$_CLIP_DIR"
-    if ! ls "$_CLIP_DIR"/.watcher.* >/dev/null 2>&1; then
-      rm -f "$_CLIP_DIR/.host-ready"
+    # days earlier still on disk. The unlink never follows a link, so whatever
+    # the box left at the name, only the name goes.
+    if ! _clip_watchers_live "$_CLIP_DIR"; then
+      rm -f "$_CLIP_DIR/.host-ready" 2>/dev/null || true
     fi
     # Re-stamp the run dir on detach so the idle sweep's grace measures time since
     # THIS session let go, not since the container was created (see the attach
@@ -10682,7 +10741,14 @@ exec_claude() {
   local clip_cmd
   clip_cmd="$(_host_clip_cmd)"
   if [ -n "$clip_cmd" ]; then
-    touch "$_CLIP_DIR/.watcher.$$"
+    # This session's liveness marker, outside the mount (see _clip_watch_dir).
+    # noclobber as well, so a run dir the box can reach after all (concept/41,
+    # residual 8) gets a planted link refused rather than written through.
+    # Fail-soft: the released touch could end the session start under errexit.
+    local _ec_watch
+    _ec_watch="$(_clip_watch_dir "$_CLIP_DIR")"
+    mkdir -p "$_ec_watch" 2>/dev/null || true
+    ( set -C; umask 077; : > "$_ec_watch/.watcher.$$" ) 2>/dev/null || true
     # Redirect the watcher's own stdout+stderr to a per-box log, NOT the
     # terminal. Under heavy multi-agent load the host can hit its process cap,
     # and a backgrounded watcher that inherits the interactive terminal's fd 2
@@ -10690,16 +10756,17 @@ exec_claude() {
     # the Claude Code TUI, corrupting it. The watcher never has anything the
     # user should see (it drives pbcopy and marker files, never the terminal),
     # so a log keeps fork spew and any stray output off-screen but debuggable.
-    # The log lives outside the clip dir, so the `.watcher.*` liveness glob
-    # never meets it and the box cannot aim these appends at a host file.
-    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" >>"$_watcher_log" 2>&1 &
+    # The log lives outside the clip dir, so the box cannot aim these appends
+    # at a host file. The box name lets the watcher announce readiness from
+    # inside the box (see _clip_announce_ready).
+    _clipboard_watcher "$_CLIP_DIR" "$clip_cmd" "$cname" >>"$_watcher_log" 2>&1 &
     _CLIP_WATCHER_PID=$!
     disown "$_CLIP_WATCHER_PID" 2>/dev/null || true
 
     # Native ctrl+v image paste: drop the shim ahead of xclip on PATH, then run
     # a watcher that answers its image requests from the host clipboard. Always
     # on, gated only by CLEAT_NO_CLIPBOARD_IMAGE=1. Reuses the .watcher.$$ marker
-    # already touched above, so .host-ready stays correct. If the drop fails
+    # already written above, so .host-ready stays correct. If the drop fails
     # (a locked-down box, an old daemon), the shim is simply absent and paste
     # falls back to today's "No image found", never an error.
     if [ "${CLEAT_NO_CLIPBOARD_IMAGE:-}" != "1" ]; then
@@ -11121,11 +11188,10 @@ _watcher_log_path() {
 }
 
 # Cap a watcher or bridge log at ~1 MB and echo its post-cap byte size. Nothing
-# else sweeps these logs (the watcher log dodges the .watcher.* liveness glob by
-# design), so without the cap a host fork storm, which appends many bash retry
-# lines, could grow one unbounded across a long-lived box. The echoed size is
-# the session's read offset, so the end-of-session reports scan only this
-# session's slice. Fail-soft: a missing or unreadable log yields 0.
+# else sweeps these logs, so without the cap a host fork storm, which appends
+# many bash retry lines, could grow one unbounded across a long-lived box. The
+# echoed size is the session's read offset, so the end-of-session reports scan
+# only this session's slice. Fail-soft: a missing or unreadable log yields 0.
 #
 # Both callers' logs are host-only now, and the cap is still safe on a path the
 # box can write. The size is a stat, which opens nothing, so a FIFO there cannot

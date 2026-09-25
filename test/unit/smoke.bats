@@ -1075,6 +1075,33 @@ CURL
   refute_output --partial "command not found"
 }
 
+@test "smoke: cleat start with a host clipboard keeps watcher markers out of the clip mount (strict mode)" {
+  # A fake pbcopy first on PATH, so the real binary takes the clipboard watcher
+  # branch on every host and never reaches a real clipboard.
+  mkdir -p "$TEST_TEMP/project" "$TEST_TEMP/fakeclip"
+  printf '#!/bin/sh\ncat >/dev/null\n' > "$TEST_TEMP/fakeclip/pbcopy"
+  chmod +x "$TEST_TEMP/fakeclip/pbcopy"
+  export PATH="$TEST_TEMP/fakeclip:$PATH"
+  export CLEAT_NO_CLIPBOARD_IMAGE=1
+  printf '' > "$DOCKER_MOCK_DIR/ps_output"
+  printf '' > "$DOCKER_MOCK_DIR/ps_a_output"
+  printf 'cleat\n' > "$DOCKER_MOCK_DIR/images_output"
+
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 start
+  refute_output --partial "unbound variable"
+  refute_output --partial "syntax error"
+  local cname rd
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  rd="$CLEAT_CONFIG_DIR/run/$cname"
+  run test -d "$rd/clipwatch"
+  assert_success
+  run bash -c "ls -a '$rd/clip' | grep -c '^[.]watcher[.]'"
+  assert_output "0"
+  run grep -s "unbound variable" "$rd/logs/watcher.log"
+  assert_failure
+}
+
 @test "smoke: cleat prune --cache --yes runs non-interactively without crashing" {
   printf '' > "$DOCKER_MOCK_DIR/images_output"
   run cleat_bin prune --cache --yes

@@ -13748,6 +13748,76 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_writer_indented_header" "an indented egress header is replaced not duplicated" "$CLI" "$EGRESS_CONFIG_BATS"
 
+# ── Egress stage two, slice two: the catalogue and the pre-ticks ─────────────
+# EGRESS-SPEC.md 7.1, 7.2, 7.4 and 6.4, roster rows of 11.5.
+
+# An unclassified host must not fall through to a class letter. A letter is the
+# mutation that renders a different word ("contained" would itself fall through).
+cat > "$SED_TMP" << 'SED'
+s|_EGRESS_CLASS_UNKNOWN="unaudited"|_EGRESS_CLASS_UNKNOWN="B"|
+SED
+try "vnext_egress_unaudited_default" "an unclassified host renders as unaudited" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The open tenancy flag must beat a benign class letter. A token from the closed
+# set, so the parse guard does not catch it first.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_catalogue()/,/^}$/s|open-tenancy|no-security|
+SED
+try "vnext_egress_open_tenancy_pretick" "an open tenancy row is never auto-ticked" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The flag vocabulary stays closed: a token outside it refuses the catalogue.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_catalogue()/,/^}$/s|no-security|no-securityy|
+SED
+try "vnext_egress_flag_token_closed_set" "every flag token in the shipped catalogue is in the closed set" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The core pack stays locked as well as complete.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_catalogue()/,/^}$/s|core,locked|core|
+SED
+try "vnext_egress_core_pack_locked" "the core pack holds exactly five hosts" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The git-remote pretick must not include an open-tenancy host.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_catalogue()/,/^}$/s|github-objects|github|
+SED
+try "vnext_egress_github_pretick_hosts" "the github pretick excludes the githubusercontent object hosts" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The image's own apt sources stay covered.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_catalogue()/,/^}$/s|cli.github.com|example.invalid|
+SED
+try "vnext_egress_pack_apt_extras" "apt-image-extras covers every apt source the image configures" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The github-cli host stays a sub-tick. Every value stays inside the closed
+# set, so the only change is whether the host arrives ticked.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_catalogue()/,/^}$/s|sub-tick,open-tenancy|open-tenancy|
+SED
+try "vnext_egress_apt_extras_subtick" "cli.github.com is a sub-tick and never arrives ticked" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The setup pretick must not silently move to the mirror.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_catalogue()/,/^}$/s|apt-debian|debian-mirror|
+SED
+try "vnext_egress_setup_pretick_pack" "the setup pretick resolves to apt-debian and not the mirror" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The pre-tick predicate: a shared class must not answer 0.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pretick_class_ok()/,/^}$/{
+  s@^  \[ "[$]_class" = contained \] || return 2@  return 0@
+}
+SED
+try "vnext_egress_pretick_class_c" "a class C pack arrives unticked" "$CLI" "$EGRESS_UI_BATS"
+
+# The unaudited arm holds even a named exception.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pretick_class_ok()/,/^}$/{
+  s@^  case "[$]_class" in unaudited) return 1 ;; esac@  :@
+}
+SED
+try "vnext_egress_pretick_unaudited_held" "an unaudited pack is never pre ticked" "$CLI" "$EGRESS_UI_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

@@ -54,6 +54,15 @@ REPO_URL="https://github.com/cleatdev/cleat"
 #      baked box notes say an image pasted with ctrl+v reaches Claude Code on
 #      its own, where they used to say reading the clipboard back never works
 _IMAGE_SPEC_VERSION=5
+# The egress catalogue's revision (EGRESS-SPEC.md 7.5). It moves when a pack's
+# host membership or any host's class changes and stays put otherwise, so a
+# version-only release never perturbs a saved policy while a class downgrade
+# cannot slip past unnoticed. Measured 2026-09-21, both protocol legs.
+_EGRESS_CATALOGUE_REV=1
+# What a catalogue class field outside A, B, C and unaudited reads as. Never a
+# class letter: an unrecognised class has one safe reading, which is never
+# ticked and never rendered as a class word (7.1).
+_EGRESS_CLASS_UNKNOWN="unaudited"
 # Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
 # existed, so they carry no spec label): their content is inferred from the
 # version they were built at. v0.16.3 was the LAST docker/ content change before
@@ -9382,6 +9391,333 @@ _egress_config_is_containable() {        # <workspace> [<rw source>...]
     esac
   done
   return 0
+}
+
+# ── Egress catalogue: the packs, their classes and the evidence pre-ticks ───
+# EGRESS-SPEC.md section 7 and the pre-tick rule of 6.4. Baked in and never
+# fetched: a launch that depends on a live catalogue fails on a plane. The
+# published copy is EGRESS-CATALOGUE.md, held to this table row for row by
+# test/unit/egress_catalogue.bats.
+
+# One tab-delimited record per (pack, host), in the field order of 7.1:
+#   pack  host  class  flags  legs  cert_sha256  purpose
+# class is A, B, C or unaudited. flags is a comma list from the closed set of
+# _EGRESS_FLAG_TOKENS in that order, or `-` for none (tab is IFS whitespace, so
+# an empty field would shift every field after it). A host in braces is
+# parameterised: the user types the part in braces, so it is never pre-ticked.
+# Every class and date is the 2026-09-21 two-leg class audit.
+_egress_pack_catalogue() {
+  cat <<'CATALOGUE'
+claude	api.anthropic.com	B	core,locked	h1+h2, 2026-09-21	A0:AC:DE:9E:33:5B:BE:4F:81:53:E4:CB:AD:63:27:CD:E5:B4:F6:D9:07:CE:88:F9:99:46:73:81:8A:E5:3E:38	Model traffic, the WebFetch safety preflight, feature flags
+claude	claude.ai	B	core,locked	h1+h2, 2026-09-21	7D:7A:F3:41:C9:EF:8F:28:9C:55:D5:86:97:52:38:FE:97:B3:13:A3:A2:EF:FE:A7:14:50:8B:5C:3A:B1:F2:70	claude.ai account authentication
+claude	claude.com	B	core,locked	h1+h2, 2026-09-21	2D:58:93:14:2D:D8:EC:69:FA:B4:A4:50:D5:70:18:79:FE:BC:FC:96:94:05:86:52:21:9E:98:B7:A3:18:F7:44	Sign-in origin and pre-approved documentation lookups
+claude	platform.claude.com	B	core,locked	h1+h2, 2026-09-21	8F:45:BB:34:F8:01:3C:A2:51:71:DA:4F:AE:1D:27:96:9D:69:D3:93:DA:E2:15:FB:21:CD:2B:FF:C7:06:AF:74	OAuth token exchange, refresh and revocation
+claude	code.claude.com	B	core,locked	h1+h2, 2026-09-21	7B:67:50:2B:6B:8C:9C:3E:F6:BF:33:8D:45:0E:FB:1A:E9:73:5D:2A:E1:15:54:E7:0E:9B:0F:87:18:D7:61:D2	Documentation lookups by the claude-code-guide agent
+github	github.com	B	-	h1+h2, 2026-09-21	46:B6:01:EE:08:B4:18:CF:8A:3A:1E:BF:E6:70:BA:5C:E4:3B:B0:5A:91:7F:A8:B2:DD:08:7A:30:47:1C:FC:63	git over https, gh and tarballs
+github	api.github.com	B	-	h1+h2, 2026-09-21	06:E6:A4:A0:04:32:99:05:D4:A4:E7:C0:D2:C6:EC:7A:63:2C:56:44:3F:25:64:24:A4:3C:C7:86:95:1B:31:49	git over https, gh and tarballs
+github	codeload.github.com	B	-	h1+h2, 2026-09-21	06:E6:A4:A0:04:32:99:05:D4:A4:E7:C0:D2:C6:EC:7A:63:2C:56:44:3F:25:64:24:A4:3C:C7:86:95:1B:31:49	git over https, gh and tarballs
+github	uploads.github.com	B	-	h1+h2, 2026-09-21	1E:23:AC:36:93:9A:E9:EF:A4:1A:A4:1C:8C:91:90:45:1F:CF:F1:23:77:15:38:51:39:7A:F5:8F:19:30:73:45	git over https, gh and tarballs
+github-objects	objects.githubusercontent.com	C	sub-tick,open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	LFS objects and release-asset downloads, same edge as raw.githubusercontent.com
+github-objects	release-assets.githubusercontent.com	C	sub-tick,open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	LFS objects and release-asset downloads, same edge as raw.githubusercontent.com
+github-objects	github-releases.githubusercontent.com	C	sub-tick,open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	LFS objects and release-asset downloads, same edge as raw.githubusercontent.com
+github-raw	raw.githubusercontent.com	C	open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	Raw files from any public repository
+gitlab	gitlab.com	B	-	h1+h2, 2026-09-21	8E:94:AD:62:FD:33:80:A4:F6:5C:17:C0:94:A8:01:AF:BF:4D:D5:F1:A6:DD:29:C5:F7:A8:AF:60:4C:CE:2D:94	git over https and the GitLab API
+gitlab	registry.gitlab.com	B	sub-tick	h1+h2, 2026-09-21	A8:D7:82:F1:F5:26:DD:23:A2:33:FA:CC:5A:39:11:FA:48:1E:F8:2D:5C:8F:FF:B1:B4:03:16:C7:F8:35:05:2B	The GitLab container registry
+atlassian	id.atlassian.com	B	-	h1+h2, 2026-09-21	F6:D0:9A:79:07:5C:46:E0:8A:F0:24:67:86:1B:DE:87:E0:43:87:68:BB:38:D2:43:CD:5B:A8:C1:BE:D7:F1:F3	Atlassian sign-in
+atlassian	api.atlassian.com	B	-	h1+h2, 2026-09-21	F6:D0:9A:79:07:5C:46:E0:8A:F0:24:67:86:1B:DE:87:E0:43:87:68:BB:38:D2:43:CD:5B:A8:C1:BE:D7:F1:F3	The Atlassian API
+atlassian	{site}.atlassian.net	unaudited	parameterised	unaudited	-	Your Jira or Confluence site, typed by you
+atlassian	bitbucket.org	B	-	h1+h2, 2026-09-21	44:D3:AC:1A:7E:66:FE:FD:DA:AC:5E:2F:6A:9C:35:94:23:D8:3F:C8:35:E7:1E:FA:BA:A6:49:F3:AD:85:DC:DA	Bitbucket repositories
+atlassian	api.bitbucket.org	B	-	h1+h2, 2026-09-21	2D:0B:0B:33:95:1F:BB:73:DF:E3:AB:3B:70:C0:E8:B9:39:D0:9C:DE:F2:3E:69:7C:45:56:09:34:B0:95:5B:51	The Bitbucket API
+azure-devops	dev.azure.com	B	parameterised	h1+h2, 2026-09-21	B1:C1:FB:68:F3:18:E4:3A:33:87:C1:6D:3C:88:16:4C:03:61:31:D8:C6:8C:2A:96:04:B3:83:65:32:86:B1:73	Azure Repos, under the organisation you name
+azure-devops	login.microsoftonline.com	B	-	h1 only, no h2 offered, 2026-09-21	10:FE:9D:3A:CC:A6:7B:75:56:EB:F5:75:09:64:5D:A2:90:44:59:0F:8E:54:E6:C2:A6:D0:C2:F6:52:CD:47:F7	Microsoft sign-in
+azure-devops	vssps.dev.azure.com	B	-	h1+h2, 2026-09-21	E6:FA:9E:22:3C:D1:48:2A:22:76:01:4C:3B:9F:DC:EA:A0:ED:4F:C9:B8:6C:9D:EF:D2:DC:C2:C0:44:F0:E7:80	Azure DevOps identity
+azure-devops	pkgs.dev.azure.com	B	-	h1+h2, 2026-09-21	47:54:75:85:D7:B3:5F:BD:C2:74:D7:92:8E:69:FF:67:A1:5C:BD:CC:82:3E:D1:D5:F8:06:F8:47:1B:18:9B:9F	Azure Artifacts feeds
+aws	sts.amazonaws.com	B	-	h1 only, no h2 offered, 2026-09-21	32:35:70:FE:64:53:32:42:88:7D:EA:34:BF:BA:62:16:40:B1:D4:1C:BE:50:9F:36:18:E3:72:A3:15:02:76:C3	AWS STS, the global endpoint
+aws	sts.{region}.amazonaws.com	unaudited	parameterised	unaudited	-	AWS STS in the region you name
+aws	s3.{region}.amazonaws.com	unaudited	open-tenancy,parameterised	unaudited	-	S3 in the region you name. Any bucket, so any upload destination
+aws	s3.amazonaws.com	B	open-tenancy	h1 only, no h2 offered, 2026-09-21	7E:BF:42:63:5D:C3:2B:CB:97:F6:0E:38:3E:E1:F8:63:39:AA:CE:A2:39:E1:56:B9:8D:74:1C:79:12:67:14:36	S3, the global endpoint. Any bucket, so any upload destination
+gcp	accounts.google.com	C	-	h1+h2, 2026-09-21	74:BB:7D:05:6B:1C:F1:37:1E:0F:13:92:8A:05:90:C6:45:A6:1C:CC:25:8F:AE:71:FA:79:54:03:35:4C:18:32	Google sign-in and APIs on a frontend that honours a foreign Host
+gcp	oauth2.googleapis.com	C	-	h1+h2, 2026-09-21	99:41:52:4A:38:1D:4C:B3:19:1D:AD:0C:91:83:B5:70:FB:2C:08:37:01:B5:0D:75:CF:2D:88:E1:5D:C5:A2:7C	Google sign-in and APIs on a frontend that honours a foreign Host
+gcp	www.googleapis.com	C	-	h1+h2, 2026-09-21	27:EB:1A:85:AA:03:02:5C:92:96:B5:9A:18:1B:65:94:2D:6C:B8:A3:56:3D:E9:F8:5F:E3:62:83:5C:A8:C0:59	Google sign-in and APIs on a frontend that honours a foreign Host
+gcp	storage.googleapis.com	C	sub-tick,open-tenancy	h1+h2, 2026-09-21	1B:36:49:06:14:7D:CA:E7:01:20:63:5F:C5:F5:92:08:0B:02:79:85:E3:EA:B2:2F:21:43:F6:C0:67:0E:31:A8	Google Cloud Storage. Any bucket
+npm	registry.npmjs.org	B	-	h1+h2, 2026-09-21	4C:76:5B:8D:62:2F:F6:00:10:29:D3:E8:5E:20:98:D4:4E:FD:BE:40:90:DC:21:4F:6A:B2:D9:F1:C0:F8:05:B3	npm package metadata and tarballs
+npm	registry.yarnpkg.com	B	sub-tick	h1+h2, 2026-09-21	72:3C:5F:DE:D5:C3:73:92:CF:2D:50:1B:50:F9:0E:8D:84:72:8B:82:CD:A9:DC:7D:8D:C5:21:E8:19:6E:0F:DC	The yarn registry mirror
+npm	nodejs.org	B	sub-tick	h1+h2, 2026-09-21	01:E4:58:71:89:B6:67:39:E4:63:71:D3:17:56:06:9F:C6:92:0D:0E:5D:20:94:F3:C4:7F:D4:76:0C:80:8A:D2	Node.js downloads
+pypi	pypi.org	C	-	h1+h2, 2026-09-21	15:58:1C:41:02:3F:07:89:85:31:4E:7D:4C:4F:8A:CA:BF:05:C7:F6:97:AE:EF:CD:30:24:E0:98:39:E2:0C:E6	pip, uv and poetry, on an edge that serves other sites
+pypi	files.pythonhosted.org	C	-	h1+h2, 2026-09-21	FA:D0:AD:5B:F0:F0:35:3B:F1:D3:77:8E:31:0F:2E:FB:DD:0F:E2:B8:A6:88:69:03:FC:4C:CE:1F:12:D8:31:F1	pip, uv and poetry, on an edge that serves other sites
+apt-debian	deb.debian.org	C	default	h1+h2, 2026-09-21	8B:F3:C0:81:D3:AD:5E:E7:88:CA:85:68:80:A3:08:CD:4E:E7:84:17:02:50:4E:B1:CB:BA:AC:C6:7D:50:B6:A8	Debian's own suites, security included, during [setup]
+apt-image-extras	download.docker.com	B	default	h1+h2, 2026-09-21	11:40:1E:7E:02:B2:44:1A:F7:3A:87:92:B2:CA:33:CF:AE:D4:3A:85:F8:AC:2B:74:0E:02:11:96:67:5F:BF:73	The Docker apt repository the image configures
+apt-image-extras	cli.github.com	C	default,sub-tick,open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	The GitHub CLI apt repository the image configures, same edge as raw.githubusercontent.com
+apt-ubuntu	archive.ubuntu.com	A	-	h1 only, no h2 offered, 2026-09-21	1F:08:25:58:81:9B:DA:BD:02:13:B0:80:D5:24:F3:F5:86:46:2E:B9:5A:1B:4F:7B:8D:06:8F:BA:10:75:F3:F7	apt on an Ubuntu base
+apt-ubuntu	security.ubuntu.com	A	-	h1 only, no h2 offered, 2026-09-21	A4:4D:85:23:A3:B7:5C:AD:FF:FD:DD:17:32:17:7B:E9:C3:F1:03:9F:31:B8:69:8D:8F:4A:78:80:2D:6A:B4:1A	apt on an Ubuntu base
+apt-ubuntu	ports.ubuntu.com	A	-	h1 only, no h2 offered, 2026-09-21	E1:4C:A8:4D:B8:F8:F4:8C:DF:B3:2D:51:8C:62:DA:D0:4F:27:87:6A:77:01:5A:30:34:95:26:A2:B2:13:08:1E	apt on an Ubuntu base
+debian-mirror	debian.osuosl.org	A	no-security	h1 only, no h2 offered, 2026-09-21	53:3D:0E:F8:D8:BE:CF:EF:1D:84:78:C5:81:0B:DC:2C:19:F5:86:A2:BA:E8:16:28:4A:73:86:56:8F:BF:86:6E	bookworm and bookworm-updates from one origin, no security suite
+dotnet	packages.microsoft.com	B	-	h1+h2, 2026-09-21	5A:AF:ED:E1:29:12:DC:1F:18:2B:A3:B8:88:D5:D8:60:59:18:E8:49:1C:E8:26:6C:2B:19:41:26:4A:55:37:3F	The Microsoft package repository
+dotnet	dot.net	B	-	h1+h2, 2026-09-21	DB:06:FC:91:4D:2F:01:41:F3:D1:0E:5A:42:9D:D6:EF:3C:B0:5A:8E:A8:1A:7F:BC:49:01:BF:BD:DD:D4:65:A1	The .NET install script
+astral	astral.sh	B	-	h1+h2, 2026-09-21	B6:08:C2:A0:BD:14:AB:17:22:A1:42:90:AE:BF:E2:67:C1:8F:77:04:21:14:2B:5E:7A:DA:92:2D:94:A0:FF:BF	The uv installer
+azure-cli	packages.microsoft.com	B	-	h1+h2, 2026-09-21	5A:AF:ED:E1:29:12:DC:1F:18:2B:A3:B8:88:D5:D8:60:59:18:E8:49:1C:E8:26:6C:2B:19:41:26:4A:55:37:3F	The azure-cli apt repository
+go	proxy.golang.org	B	-	h1+h2, 2026-09-21	F3:75:54:FE:DB:BE:7F:2C:A6:9E:DB:A3:28:83:E3:54:F7:DD:42:73:A0:DF:CE:B0:51:2B:B6:33:5C:5A:02:06	Go modules through the default GOPROXY
+go	sum.golang.org	B	-	h1+h2, 2026-09-21	F3:75:54:FE:DB:BE:7F:2C:A6:9E:DB:A3:28:83:E3:54:F7:DD:42:73:A0:DF:CE:B0:51:2B:B6:33:5C:5A:02:06	Go modules through the default GOPROXY
+go	index.golang.org	B	-	h1+h2, 2026-09-21	F3:75:54:FE:DB:BE:7F:2C:A6:9E:DB:A3:28:83:E3:54:F7:DD:42:73:A0:DF:CE:B0:51:2B:B6:33:5C:5A:02:06	Go modules through the default GOPROXY
+rust	static.crates.io	C	-	h1+h2, 2026-09-21	EA:DC:4A:B7:B3:DC:D7:9D:08:E5:39:44:DC:23:56:DF:2C:44:EB:BA:D2:EA:CF:C7:88:ED:74:E6:3A:9A:D7:CC	cargo, on an edge that serves other sites
+rust	index.crates.io	C	-	h1+h2, 2026-09-21	D4:48:14:16:1A:31:B2:E3:72:35:5C:8F:29:AD:3A:04:32:CD:5A:6B:F7:A2:B9:F9:41:7C:F9:6F:30:B9:6A:2E	cargo, on an edge that serves other sites
+rust	crates.io	C	-	h1+h2, 2026-09-21	CC:59:F1:A6:5D:CC:59:D3:CB:FD:56:03:F3:57:1B:CD:A7:05:E1:5B:58:80:5F:9B:A1:10:A9:11:BD:A7:96:D1	cargo, on an edge that serves other sites
+rust	sh.rustup.rs	B	sub-tick	h1+h2, 2026-09-21	92:52:30:3E:18:EF:D2:CF:8C:16:76:13:A5:91:CD:5C:0B:89:E4:B0:53:90:D6:46:8C:2B:1E:F5:E5:3D:34:DA	The rustup installer script
+rust	static.rust-lang.org	C	-	h1+h2, 2026-09-21	69:38:F3:88:58:86:8A:4D:0C:BD:31:6A:F0:5F:7C:78:DF:0F:8A:71:89:2D:7B:2A:FD:90:E2:3E:33:64:1F:66	Rust toolchain downloads, on an edge that serves other sites
+ruby	rubygems.org	C	-	h1+h2, 2026-09-21	DD:93:EA:BE:2C:61:21:83:AB:C9:F5:8C:B2:0F:95:DD:48:E0:7D:3E:15:E8:8F:EF:6A:98:76:27:15:57:82:4F	bundler and gem, on an edge that serves other sites
+ruby	index.rubygems.org	C	-	h1+h2, 2026-09-21	DD:93:EA:BE:2C:61:21:83:AB:C9:F5:8C:B2:0F:95:DD:48:E0:7D:3E:15:E8:8F:EF:6A:98:76:27:15:57:82:4F	bundler and gem, on an edge that serves other sites
+maven	repo1.maven.org	B	-	h1+h2, 2026-09-21	3B:62:E2:3C:46:BC:42:7B:25:74:90:0C:4D:EF:A8:01:9A:58:2C:AD:73:7E:34:12:AC:16:28:A3:83:27:CA:40	Maven Central
+maven	plugins.gradle.org	B	-	h1 only, no h2 offered, 2026-09-21	B1:D5:B9:07:D2:53:70:C3:AF:F8:C9:78:95:86:9D:6B:2A:8F:FD:BC:EA:B4:CF:05:AF:EB:DB:DC:DA:EE:5A:69	The Gradle plugin portal
+maven	services.gradle.org	B	-	h1 only, no h2 offered, 2026-09-21	B1:D5:B9:07:D2:53:70:C3:AF:F8:C9:78:95:86:9D:6B:2A:8F:FD:BC:EA:B4:CF:05:AF:EB:DB:DC:DA:EE:5A:69	Gradle distributions
+containers	registry-1.docker.io	B	requires-cap	h1+h2, 2026-09-21	AA:AB:BB:8B:DF:D5:6B:6E:E1:92:AE:FD:D9:89:DD:35:D1:1C:9A:33:7C:78:22:AE:00:DD:3F:D0:68:FA:DF:48	Docker Hub, which needs the docker capability egress control refuses
+containers	auth.docker.io	B	requires-cap	h1+h2, 2026-09-21	D1:80:3D:16:1E:A6:B4:99:57:A6:B4:0B:05:BF:18:59:24:20:E8:92:D8:63:A1:B6:A3:B6:8D:D1:B0:AF:A9:18	Docker Hub, which needs the docker capability egress control refuses
+containers	production.cloudflare.docker.com	B	requires-cap	h1+h2, 2026-09-21	B7:E5:00:E4:5F:B3:79:E0:5E:FF:98:C2:CA:2F:AB:CB:93:D0:92:EB:95:C0:F6:D5:26:02:69:D7:32:99:95:67	Docker Hub, which needs the docker capability egress control refuses
+containers	index.docker.io	B	requires-cap	h1+h2, 2026-09-21	AA:AB:BB:8B:DF:D5:6B:6E:E1:92:AE:FD:D9:89:DD:35:D1:1C:9A:33:7C:78:22:AE:00:DD:3F:D0:68:FA:DF:48	Docker Hub, which needs the docker capability egress control refuses
+containers	ghcr.io	B	requires-cap	h1+h2, 2026-09-21	A8:34:58:AF:8B:8F:AC:89:2E:2E:50:21:4E:75:37:0F:F1:EC:B2:ED:4B:C3:B8:C0:89:6E:2D:48:6A:85:FE:6E	GitHub Container Registry, which needs the docker capability
+containers	pkg-containers.githubusercontent.com	C	open-tenancy,requires-cap	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	GHCR blobs, same edge as raw.githubusercontent.com
+homebrew	formulae.brew.sh	C	open-tenancy	h1+h2, 2026-09-21	C0:CA:FD:C2:FB:47:64:BB:2C:1A:9F:0A:B5:6F:C3:F6:91:AB:FA:C4:46:BF:90:AD:2F:D9:7B:A7:EC:2B:47:8B	Homebrew formulae, on the GitHub Pages edge
+homebrew	ghcr.io	B	-	h1+h2, 2026-09-21	A8:34:58:AF:8B:8F:AC:89:2E:2E:50:21:4E:75:37:0F:F1:EC:B2:ED:4B:C3:B8:C0:89:6E:2D:48:6A:85:FE:6E	Homebrew bottles from GHCR
+homebrew	pkg-containers.githubusercontent.com	C	open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	GHCR blobs, same edge as raw.githubusercontent.com
+huggingface	huggingface.co	B	open-tenancy	h1+h2, 2026-09-21	0E:CA:45:4B:46:A3:61:7C:D2:E8:C2:34:DC:B9:E9:E2:15:C7:1C:3E:16:14:24:CA:E5:05:C8:76:25:0C:38:F1	Model and dataset downloads. Anyone can publish a repository
+huggingface	cas-server.xethub.hf.co	B	open-tenancy	h1 only, no h2 offered, 2026-09-21	A3:6A:BF:39:A1:87:AD:0C:E4:44:33:1F:0B:B5:E9:31:CC:74:AD:17:E2:2B:B1:FB:EA:38:AC:45:67:78:D9:13	Model and dataset downloads. Anyone can publish a repository
+huggingface	transfer.xethub.hf.co	B	open-tenancy	h1 only, no h2 offered, 2026-09-21	12:13:D9:53:D1:44:AC:25:57:29:D9:00:52:91:D1:AA:BF:26:8C:98:8F:FE:39:4D:87:18:26:33:89:63:EB:09	Model and dataset downloads. Anyone can publish a repository
+huggingface	us.aws.cdn.hf.co	B	open-tenancy	h1+h2, 2026-09-21	76:9A:17:E4:28:59:8B:FE:39:F0:8E:9C:82:D0:C2:3C:44:CE:7A:AD:A7:BD:E8:2C:0A:A5:96:59:20:7E:3E:6D	Model and dataset downloads. Anyone can publish a repository
+playwright	cdn.playwright.dev	A	-	h1+h2, 2026-09-21	1F:6E:88:16:E0:31:F2:82:C0:B4:12:F4:BD:D3:8A:59:48:C5:FE:CC:F4:4C:BE:0A:A0:CE:00:B6:23:1E:33:BE	Playwright browser downloads
+playwright	playwright.download.prss.microsoft.com	A	-	h1 only, no h2 offered, 2026-09-21	E9:59:06:6B:DD:D0:17:5B:01:77:C7:B9:10:5F:26:8D:4A:03:22:41:C2:DC:5D:0A:59:F2:C5:E3:C6:28:86:AA	Playwright browser downloads, Microsoft mirror
+docs	developer.mozilla.org	C	-	h1+h2, 2026-09-21	37:8C:C4:5E:B8:A3:C4:4F:45:39:60:F9:8F:2B:C3:85:57:CA:92:11:8F:E9:BF:34:CC:47:BF:29:B6:C8:23:9B	MDN, on an edge that serves other sites
+docs	devdocs.io	B	-	h1+h2, 2026-09-21	BE:E9:4F:E4:CA:AB:13:49:CF:CB:2F:22:D6:BC:AC:A5:09:3F:75:11:DD:43:2F:B7:DC:52:BE:9F:63:70:DE:A9	DevDocs
+docs	stackoverflow.com	B	open-tenancy	h1+h2, 2026-09-21	4D:7D:B1:2B:76:08:EC:99:43:13:E1:38:76:3E:35:E9:01:F1:D4:78:AF:13:56:BA:D7:8F:3A:46:0D:9A:2C:FC	Stack Overflow. Anyone with an account can post
+docs	api.stackexchange.com	B	-	h1+h2, 2026-09-21	29:94:C0:D4:67:BD:ED:9C:D0:D8:55:C4:89:D5:58:92:EB:67:DA:A7:67:AB:87:19:9F:7A:B8:71:E0:A4:5C:D8	The Stack Exchange API
+docs	docs.python.org	C	-	h1+h2, 2026-09-21	A1:62:96:4C:FE:42:09:E3:08:F7:00:E8:80:28:75:7E:B8:3D:22:7B:2B:B3:5F:67:F1:86:A6:E7:0E:1E:20:1A	Python documentation, on an edge that serves other sites
+docs	pkg.go.dev	B	-	h1+h2, 2026-09-21	27:29:D1:9B:86:50:77:E2:5C:2B:87:D4:C2:B4:0A:F2:3C:B3:F5:00:1D:3F:F7:C1:3F:F2:1C:80:A3:7C:C5:CA	Go package documentation
+CATALOGUE
+}
+
+# The flag vocabulary, closed and ordered (7.1). A record's flags follow this
+# order and carry nothing else.
+_EGRESS_FLAG_TOKENS="core locked default sub-tick open-tenancy parameterised no-security requires-cap deprecated"
+
+# Every record, after the one check a reader must make: an unknown flag token
+# refuses the whole catalogue rather than being dropped, because a mistyped
+# open-tenancy that parses as nothing would leave an arbitrary-payload host
+# looking like an ordinary contained row. Prints the records, or an error on
+# stderr and returns 1.
+_egress_catalogue_records() {
+  local _pack _host _cls _flags _legs _cert _why _t _rest
+  local _out=""
+  while IFS=$'\t' read -r _pack _host _cls _flags _legs _cert _why; do
+    [ -n "$_pack" ] || continue
+    if [ "$_flags" != "-" ]; then
+      _rest="$_flags,"
+      while [ -n "$_rest" ]; do
+        _t="${_rest%%,*}"
+        _rest="${_rest#*,}"
+        case " $_EGRESS_FLAG_TOKENS " in
+          *" $_t "*) ;;
+          *) echo "catalogue: unknown flag token \"$(_sanitize_repo_str "$_t")\" on $_pack/$_host" >&2
+             return 1 ;;
+        esac
+      done
+    fi
+    _out+="$_pack"$'\t'"$_host"$'\t'"$_cls"$'\t'"$_flags"$'\t'"$_legs"$'\t'"$_cert"$'\t'"$_why"$'\n'
+  done < <(_egress_pack_catalogue)
+  printf '%s' "$_out"
+}
+
+# A class field as stored: A, B, C or unaudited. Anything else, an empty field
+# included, reads as the one fall-through value, which is never a class letter.
+_egress_class_of() {
+  case "$1" in
+    A|B|C|unaudited) printf '%s' "$1" ;;
+    *) printf '%s' "$_EGRESS_CLASS_UNKNOWN" ;;
+  esac
+}
+
+# The word a user sees. The open-tenancy flag beats any class letter: a host
+# that refuses every foreign Host can still serve what a stranger uploaded.
+_egress_class_word() {                   # <class> <flags>
+  case ",$2," in *,open-tenancy,*) printf 'open tenancy'; return 0 ;; esac
+  case "$(_egress_class_of "$1")" in
+    A) printf 'single origin' ;;
+    B) printf 'contained' ;;
+    C) printf 'shared' ;;
+    *) printf 'unaudited' ;;
+  esac
+}
+
+# The pack ids in catalogue order, the locked core first.
+_egress_pack_ids() {
+  local _p _seen=" "
+  while IFS=$'\t' read -r _p _; do
+    case "$_seen" in *" $_p "*) continue ;; esac
+    _seen+="$_p "
+    printf '%s\n' "$_p"
+  done < <(_egress_catalogue_records)
+}
+
+# The hosts a pack ticks by default, or every host with `all`. A sub-tick is a
+# second decision in its own pane and a parameterised host needs a value the
+# user types, so neither is part of the default set.
+_egress_pack_hosts() {                   # <pack> [all]
+  local _want="$1" _all="${2:-}" _p _h _c _f
+  while IFS=$'\t' read -r _p _h _c _f _; do
+    [ "$_p" = "$_want" ] || continue
+    if [ "$_all" != all ]; then
+      case ",$_f," in *,sub-tick,*|*,parameterised,*) continue ;; esac
+    fi
+    printf '%s\n' "$_h"
+  done < <(_egress_catalogue_records)
+}
+
+# The records a pack's summary is taken over: the hosts it ticks by default,
+# or every host when the whole pack is a second decision (github-objects).
+# class<TAB>flags per line.
+_egress_pack_summary_rows() {            # <pack>
+  local _want="$1" _p _h _c _f _def="" _any=""
+  while IFS=$'\t' read -r _p _h _c _f _; do
+    [ "$_p" = "$_want" ] || continue
+    _any+="$_c"$'\t'"$_f"$'\n'
+    case ",$_f," in *,sub-tick,*|*,parameterised,*) continue ;; esac
+    _def+="$_c"$'\t'"$_f"$'\n'
+  done < <(_egress_catalogue_records)
+  printf '%s' "${_def:-$_any}"
+}
+
+# A pack's class: the weakest among the hosts it ticks by default, never
+# rounded upward, so the pack word is never kinder than the worst host a tick
+# buys without a second decision. Weakest first: unaudited, C, B, A.
+_egress_pack_class() {                   # <pack>
+  local _c _f _rank _best=0 _cls=""
+  while IFS=$'\t' read -r _c _f; do
+    case "$(_egress_class_of "$_c")" in
+      A) _rank=1 ;; B) _rank=2 ;; C) _rank=3 ;; *) _rank=4 ;;
+    esac
+    if [ "$_rank" -gt "$_best" ]; then _best=$_rank; _cls="$(_egress_class_of "$_c")"; fi
+  done < <(_egress_pack_summary_rows "$1")
+  printf '%s' "${_cls:-$_EGRESS_CLASS_UNKNOWN}"
+}
+
+# The union of the flags over the same rows, in the closed-set order.
+_egress_pack_flags() {                   # <pack>
+  local _c _f _all="" _t _out=""
+  while IFS=$'\t' read -r _c _f; do
+    _all+=",$_f,"
+  done < <(_egress_pack_summary_rows "$1")
+  for _t in $_EGRESS_FLAG_TOKENS; do
+    case "$_all" in *",$_t,"*) _out="${_out:+$_out,}$_t" ;; esac
+  done
+  printf '%s' "$_out"
+}
+
+# The word for one host: its first record, since every record of one host
+# carries the same class and the same host flags.
+_egress_host_word() {                    # <host>
+  local _want="$1" _p _h _c _f
+  while IFS=$'\t' read -r _p _h _c _f _; do
+    if [ "$_h" = "$_want" ]; then _egress_class_word "$_c" "$_f"; return 0; fi
+  done < <(_egress_catalogue_records)
+  printf 'unaudited'
+}
+
+# Hosts that present one certificate are one entry for policy purposes: the
+# gateway cannot see a difference that does not exist at the boundary, so a
+# pane offering one of them names the rest and ticks them together.
+_egress_cert_siblings() {                # <host>
+  local _want="$1" _p _h _c _f _l _cert _fp=""
+  while IFS=$'\t' read -r _p _h _c _f _l _cert _; do
+    if [ "$_h" = "$_want" ]; then _fp="$_cert"; break; fi
+  done < <(_egress_catalogue_records)
+  case "$_fp" in ""|-) printf '%s\n' "$_want"; return 0 ;; esac
+  while IFS=$'\t' read -r _p _h _c _f _l _cert _; do
+    [ "$_cert" = "$_fp" ] && printf '%s\n' "$_h"
+  done < <(_egress_catalogue_records) | LC_ALL=C sort -u
+}
+
+# One predicate decides whether a class may arrive ticked (6.4). 1 for
+# unaudited, before anything else, 0 only for contained, 2 for every other
+# class. A named exception may override a 2 and never a 1, which keeps an
+# unmeasured row out of the exception path.
+_egress_pretick_class_ok() {
+  local _class="$1"
+  case "$_class" in unaudited) return 1 ;; esac
+  [ "$_class" = contained ] || return 2
+  return 0
+}
+
+# The tighten and fix pickers' default tick (6.5): a row arrives ticked only
+# when it is contained AND already a member of a shipped pack.
+_egress_default_tick() {
+  local _class="$1" _pack="$2"
+  [ "$_class" = contained ] && [ -n "$_pack" ] && return 0
+  return 1
+}
+
+# The host of every `url =` line in the project's .git/config, lowercased, one
+# per line. Handles https://host/, ssh://user@host:port/ and the scp form
+# user@host:path. Read once through _read_unlinked_bounded, so a linked config
+# is never followed, and git itself never runs on a file the box can write.
+_egress_remote_hosts() {                 # <project>
+  local _line _u _h
+  while IFS= read -r _line; do
+    _line="${_line#"${_line%%[![:space:]]*}"}"
+    case "$_line" in url*=*) ;; *) continue ;; esac
+    _u="${_line#*=}"
+    _u="${_u#"${_u%%[![:space:]]*}"}"
+    case "$_u" in *://*) _u="${_u#*://}" ;; esac
+    case "$_u" in *@*) _u="${_u#*@}" ;; esac
+    _h="${_u%%[/:]*}"
+    [ -n "$_h" ] && printf '%s\n' "$_h" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'
+  done < <(_read_unlinked_bounded "$1/.git/config" 65536)
+}
+
+# First-run evidence (6.4): `<pack> ticked` or `<pack> suggested` lines for a
+# project. Reads file names, the git remote from .git/config and whether a
+# [setup] section is trusted to run, nothing else, because every input is a
+# file the caged agent can edit. A pack arrives ticked only through
+# _egress_pretick_class_ok, and the two named exceptions, apt-debian and
+# apt-image-extras, may override a 2 (shared, open tenancy) and never a 1
+# (unaudited).
+_egress_detect_packs() {                 # <project>
+  local project="$1" _cand="" _c _pack _want _rc _word
+  [ -n "$project" ] && [ -d "$project" ] || return 0
+  if _egress_remote_hosts "$project" | grep -qx 'github.com'; then
+    _cand+="github:tick "
+  fi
+  if [ -f "$project/package.json" ] || [ -f "$project/pnpm-lock.yaml" ] || [ -f "$project/yarn.lock" ]; then
+    _cand+="npm:tick "
+  fi
+  [ -f "$project/go.mod" ] && _cand+="go:tick "
+  if [ -f "$project/pyproject.toml" ] || [ -f "$project/requirements.txt" ]; then
+    _cand+="pypi:suggest "
+  fi
+  [ -f "$project/Cargo.toml" ] && _cand+="rust:suggest "
+  _BOX=main _resolve_setup_trust "$project" readonly || true
+  if [ "${_SETUP_DECLARED:-0}" = 1 ]; then
+    if [ "${_SETUP_TRUSTED:-0}" = 1 ]; then
+      _cand+="apt-debian:tick apt-image-extras:tick "
+    else
+      _cand+="apt-debian:suggest apt-image-extras:suggest "
+    fi
+  fi
+  for _c in $_cand; do
+    _pack="${_c%%:*}"
+    _want="${_c#*:}"
+    if [ "$_want" = tick ]; then
+      _word="$(_egress_class_word "$(_egress_pack_class "$_pack")" "$(_egress_pack_flags "$_pack")")"
+      _rc=0
+      _egress_pretick_class_ok "$_word" || _rc=$?
+      case "$_rc:$_pack" in
+        0:*) ;;
+        2:apt-debian|2:apt-image-extras) ;;
+        *) _want=suggest ;;
+      esac
+    fi
+    if [ "$_want" = tick ]; then
+      printf '%s ticked\n' "$_pack"
+    else
+      printf '%s suggested\n' "$_pack"
+    fi
+  done
 }
 
 # ── Host-side hook bridge ─────────────────────────────────────────────────

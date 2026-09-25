@@ -228,7 +228,7 @@ def policy_doc(mode="strict", hosts=(ALLOWED,), max_tunnels=256, handshake_timeo
 
 
 class GW:
-    def __init__(self, hosts=(ALLOWED,), fixture=None, start=True, policy_text=None, **pol):
+    def __init__(self, hosts=(ALLOWED,), fixture=None, start=True, policy_text=None, peers=None, **pol):
         self.dir = tempfile.mkdtemp(prefix="gw", dir="/tmp")
         self.proxy = os.path.join(self.dir, "proxy.sock")
         self.denials = os.path.join(self.dir, "denials.log")
@@ -240,18 +240,25 @@ class GW:
             fixture = {"allowed.example": [PUB]}
         self.edges = {}
         lines = []
+        self.peers = peers or {}
         for name, entries in fixture.items():
             for entry in entries:
                 addrs = list(entry) if isinstance(entry, (list, tuple)) else [entry]
+                prefix = ""
+                if addrs and addrs[0].startswith("~"):
+                    prefix, addrs = addrs[0] + ",", addrs[1:]
+                if addrs and addrs[0].startswith("!"):
+                    prefix += "!"
+                    addrs = [addrs[0][1:]] + addrs[1:]
                 for a in addrs:
                     if a not in self.edges:
                         self.edges[a] = Edge()
-                lines.append(",".join(addrs) + " " + name)
+                lines.append(prefix + ",".join(addrs) + " " + name)
         with open(self.fixture_path, "w") as f:
             f.write("\n".join(lines) + "\n")
         with open(self.map_path, "w") as f:
             for a, e in self.edges.items():
-                f.write("%s %d\n" % (a, e.port))
+                f.write("%s %d%s\n" % (a, e.port, " " + self.peers[a] if a in self.peers else ""))
         with open(self.policy_path, "w") as f:
             f.write(policy_text if policy_text is not None else policy_doc(hosts=hosts, **pol))
         self.proc = None
@@ -342,6 +349,15 @@ class GW:
         self.err.flush()
         with open(os.path.join(self.dir, "stderr")) as f:
             return f.read()
+
+    def restart(self):
+        """SIGTERM, then a new gateway process over the same socket directory."""
+        self.proc.send_signal(signal.SIGTERM)
+        self.proc.wait(6)
+        self.out.close()
+        self.err.close()
+        os.rename(os.path.join(self.dir, "stderr"), os.path.join(self.dir, "stderr.1"))
+        self.start()
 
     def write_policy(self, text):
         tmp = self.policy_path + ".tmp"
@@ -620,8 +636,11 @@ def _():
     def body(g):
         for t in (b"1.2.3.4:443", b"0177.0.0.1:443", b"0x7f.0x0.0x0.0x1:443",
                   b"0x7f.1:443", b"2130706433:443", b"0x7f000001:443"):
-            refused_before_200(g, t, 403, "policy")
-    with_gw(body)()
+            r = refused_before_200(g, t, 403, "policy")
+            # In open mode no allowlist refuses first: the literal rule does.
+            check("is not a name the allowlist can hold" in r.reason, "%r: %r" % (t, r.reason))
+            check("cleat egress allow" not in r.body.decode(), "%r: the body offers an allow" % t)
+    with_gw(body, mode="open", hosts=())()
 
 
 @row("bracketed IPv6 in CONNECT")
@@ -629,14 +648,33 @@ def _():
     def body(g):
         for t in (b"[::1]:443", b"[::ffff:127.0.0.1]:443", b"[2001:db8::1]:443"):
             refused_before_200(g, t, 403, "policy")
-    with_gw(body)()
+        # Brackets do not excuse a malformed authority.
+        for t in (b"[::1]", b"[::1]:", b"[::1]:0443", b"[::1]:44a", b"[:443", b"[]:443"):
+            refused_before_200(g, t, 400)
+    with_gw(body, mode="open", hosts=())()
 
 
 PRIVATE = ["10.0.0.5", "127.0.0.1", "169.254.169.254", "100.64.0.1", "172.16.0.1",
            "192.168.1.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "198.51.100.7",
            "192.0.2.1", "203.0.113.9", "198.18.0.1", "240.0.0.1", "192.0.0.8",
-           "192.88.99.1", "::ffff:127.0.0.1", "::ffff:10.0.0.5", "::1", "2001:db8::1",
-           "64:ff9b::7f00:1", "2002:7f00:1::", "fe80::1"]
+           "192.88.99.1",
+           # The last and a middle address of every block, so narrowing a
+           # block fails a row rather than only moving its first address.
+           "10.255.255.255", "127.255.255.254", "169.254.255.254", "100.127.255.255",
+           "172.17.0.1", "172.31.255.255", "192.168.255.255", "198.19.255.255",
+           "192.0.0.255", "192.0.2.255", "198.51.100.255", "203.0.113.255",
+           "192.88.99.255", "239.255.255.255", "224.0.0.251", "255.255.255.254",
+           "0.255.255.255",
+           "!::ffff:127.0.0.1", "!::ffff:10.0.0.5", "!::1", "!2001:db8::1",
+           "!64:ff9b::7f00:1", "!2002:7f00:1::", "!fe80::1"]
+
+# Just outside each block: these are ordinary public addresses and must dial.
+PUBLIC_EDGES = ["9.255.255.255", "11.0.0.0", "100.63.255.255", "100.128.0.0",
+                "126.255.255.255", "128.0.0.0", "169.253.255.255", "169.255.0.0",
+                "172.15.255.255", "172.32.0.0", "192.0.1.0", "192.0.3.0",
+                "192.88.98.255", "192.88.100.0", "192.167.255.255", "192.169.0.0",
+                "198.17.255.255", "198.20.0.0", "198.51.99.255", "198.51.101.0",
+                "203.0.112.255", "203.0.114.0", "223.255.255.255", "1.0.0.0"]
 
 
 @row("allowed host resolved to a private or special address is refused after resolve")
@@ -652,8 +690,72 @@ def _():
             expect_alert(s)
             expect_row(g, "address", host=n)
         for a, e in g.edges.items():
-            check(not e.conns, "the listener at %s saw a connection" % a)
+            if a != PUB:
+                check(not e.conns, "the listener at %s saw a connection" % a)
     with_gw(body, hosts=[n.encode() for n in names], fixture=fixture)()
+
+
+@row("an address just outside every hard-deny block is dialled")
+def _():
+    names = ["e%02d.example" % i for i in range(len(PUBLIC_EDGES))]
+    fixture = {n: [a] for n, a in zip(names, PUBLIC_EDGES)}
+
+    def body(g):
+        for n, a in zip(names, PUBLIC_EDGES):
+            s = open_ok(g, n.encode() + b":443")
+            data = rec(0x16, client_hello(sni=n.encode()))
+            s.sendall(data)
+            check(g.edges[a].wait_bytes(len(data)) == data, "%s (%s) was not dialled" % (n, a))
+            s.close()
+    with_gw(body, hosts=[n.encode() for n in names], fixture=fixture)()
+
+
+@row("the resolver is asked for IPv4 only and an IPv6-only name is refused")
+def _():
+    def body(g):
+        s = open_ok(g, b"v6only.example:443")
+        s.sendall(rec(0x16, client_hello(sni=b"v6only.example")))
+        expect_alert(s, ALERT_IE)
+        expect_row(g, "upstream", host="v6only.example")
+        check(g.lookups() == ["v6only.example. %d" % socket.AF_INET],
+              "the lookup was not one AF_INET query: %r" % g.lookups())
+        check(not g.edges["2001:4860::1"].conns, "an IPv6 answer was dialled")
+    with_gw(body, hosts=(b"v6only.example",), fixture={"v6only.example": ["2001:4860::1"]})()
+
+
+@row("a getpeername that fails after connect is upstream, not a security event")
+def _():
+    def body(g):
+        s = open_ok(g)
+        s.sendall(rec(0x16, client_hello()))
+        expect_alert(s, ALERT_IE)
+        expect_row(g, "upstream")
+    with_gw(body, peers={PUB: "!reset"})()
+
+
+@row("concurrent first uses of one name share a single lookup")
+def _():
+    def body(g):
+        socks = [open_ok(g) for _ in range(10)]
+        data = [rec(0x16, client_hello()) for _ in socks]
+        for s, d in zip(socks, data):
+            s.sendall(d)
+        end = time.time() + 5
+        while time.time() < end and len(g.edges[PUB].conns) < 10:
+            time.sleep(0.05)
+        check(len(g.edges[PUB].conns) == 10, "only %d tunnels established" % len(g.edges[PUB].conns))
+        check(len(g.lookups()) == 1, "%d lookups for one name" % len(g.lookups()))
+    with_gw(body, fixture={"allowed.example": [["~1", PUB]]})()
+
+
+@row("getpeername reading back a forbidden address refuses the tunnel")
+def _():
+    def body(g):
+        s = open_ok(g)
+        s.sendall(rec(0x16, client_hello()))
+        expect_alert(s)
+        expect_row(g, "address")
+    with_gw(body, peers={PUB: "127.0.0.1"})()
 
 
 @row("rebinding: one lookup between classification and dial")
@@ -1007,6 +1109,8 @@ def _():
             data, eof = recv_all(s, 6)
             check(data == b"" and eof, "an oversized head got a response: %r" % data[:60])
         check(g.rows() == [], "an oversized head wrote a row")
+        check(g.stderr().count("closed a CONNECT head with no response (cap)") == 3,
+              "not every capped head reached the container log")
         # tunnel() sends a Host line, so 63 more make exactly 64 header lines.
         s, r = tunnel(g, ALLOWED + b":443",
                       headers=b"".join(b"X-%d: 1\r\n" % i for i in range(63)))
@@ -1034,7 +1138,7 @@ def _():
         t0 = time.time()
         expect_alert(s, timeout=12)
         el = time.time() - t0
-        check(4 <= el <= 8, "refused after %.1f s, wanted about 5" % el)
+        check(4.5 <= el <= 6.5, "refused after %.1f s, wanted about 5" % el)
         expect_row(g, "sni", "handshake-timeout")
     with_gw(body)()
 
@@ -1058,7 +1162,7 @@ def _():
         got, _ = recv_all(s, 2)
         el = time.time() - t0
         check(got == ALERT_AD, "wanted the alert, got %r" % got[:20])
-        check(18 <= el <= 25, "reaped after %.1f s, wanted about 20" % el)
+        check(19 <= el <= 22, "reaped after %.1f s, wanted about 20" % el)
         expect_row(g, "sni", "handshake-timeout")
     with_gw(body)()
 
@@ -1073,7 +1177,7 @@ def _():
         got, _ = recv_all(s, 30)
         el = time.time() - t0
         check(got == ALERT_AD, "wanted the alert, got %r" % got[:20])
-        check(18 <= el <= 25, "refused after %.1f s, wanted about 20" % el)
+        check(19.5 <= el <= 21.5, "refused after %.1f s, wanted about 20" % el)
         expect_row(g, "sni", "handshake-timeout")
     with_gw(body)()
 
@@ -1089,7 +1193,7 @@ def _():
             data, eof = recv_all(s, 12)
             el = time.time() - t0
             check(data == b"" and eof, "an incomplete head got %r" % data[:40])
-            check(4 <= el <= 8, "closed after %.1f s, wanted about 5" % el)
+            check(4.5 <= el <= 6.5, "closed after %.1f s, wanted about 5" % el)
         check(g.rows() == [], "an incomplete head wrote a row")
     with_gw(body)()
 
@@ -1106,6 +1210,7 @@ def _():
         check(r.body.decode().split("\n")[0] == r.reason + ".", "429 status and body drifted")
         check(int(r.headers["content-length"]) == len(r.body), "429 Content-Length is wrong")
         check(len(g.rows()) == before, "a 429 wrote a row")
+        check("answered a tunnel past the cap of 3 with 429" in g.stderr(), "the 429 is not in the container log")
         s2, r2 = tunnel(g, SELFTEST + b":443")
         check(r2 is not None and r2.status == 200, "the self-test counted against the cap")
         held[1].close()
@@ -1127,13 +1232,18 @@ def _():
 @row("allowed host resolved once inside the cache lifetime, again after it", slow=True)
 def _():
     def body(g):
+        t0 = time.time()
         for _ in range(5):
             established(g, edge=PUB).close()
             g.edges[PUB].conns.clear()
         check(len(g.lookups()) == 1, "%d lookups inside the lifetime" % len(g.lookups()))
-        time.sleep(61)
+        time.sleep(max(0, 57 - (time.time() - t0)))
+        established(g, edge=PUB).close()
+        g.edges[PUB].conns.clear()
+        check(len(g.lookups()) == 1, "the cache expired before 57 s")
+        time.sleep(max(0, 61.5 - (time.time() - t0)))
         established(g, edge=PUB)
-        check(len(g.lookups()) == 2, "%d lookups after the lifetime" % len(g.lookups()))
+        check(len(g.lookups()) == 2, "the cache outlived 61 s")
     with_gw(body)()
 
 
@@ -1142,6 +1252,8 @@ def _():
     def body(g):
         refused_before_200(g, b"notallowed.example:443", 403, "policy")
         refused_before_200(g, b"sub.allowed.example:443", 403, "policy")
+        # Not only before the 403: a lookup started after it counts too.
+        time.sleep(0.5)
         check(g.lookups() == [], "a denied host reached the resolver")
     with_gw(body, fixture={"allowed.example": [PUB], "notallowed.example": [PUB2]})()
 
@@ -1223,6 +1335,173 @@ def _():
         g.stop()
 
 
+@row("the request line cap is 1 KiB with its CRLF, however the bytes arrive")
+def _():
+    def body(g):
+        def line(n):
+            # A request line of exactly n bytes, its CRLF included.
+            pad = n - len(b"CONNECT :443 HTTP/1.1\r\n") - len(b".example")
+            return b"CONNECT " + b"a" * pad + b".example:443 HTTP/1.1\r\n"
+        for n, want in ((1024, 403), (1025, None)):
+            raw = line(n) + b"\r\n"
+            assert len(line(n)) == n
+            for chunks in ([raw], [raw[:1023], raw[1023:]], [raw[:1022], raw[1022:]],
+                           [bytes([b]) for b in raw[:1030]] + [raw[1030:]]):
+                s = g.connect()
+                for c in chunks:
+                    s.sendall(c)
+                r = read_response(s)
+                got = None if r is None else r.status
+                check(got == want, "%d-byte request line in %d chunks: got %s, wanted %s" % (
+                    n, len(chunks), got, want))
+                s.close()
+        # A line that can no longer fit is closed at once, not at the deadline.
+        s = g.connect()
+        s.sendall(b"CONNECT " + b"a" * 1100)
+        t0 = time.time()
+        data, eof = recv_all(s, 6)
+        check(eof and data == b"", "an overlong request line got %r" % data[:40])
+        check(time.time() - t0 < 1, "an overlong request line waited %.1f s" % (time.time() - t0))
+    with_gw(body)()
+
+
+@row("a restarted gateway starts a new log generation over the same log")
+def _():
+    def body(g):
+        refused_before_200(g, b"notallowed.example:443", 403, "policy")
+        gen1 = g.admin("log-state").split()[2]
+        g.restart()
+        gen2, size = g.admin("log-state").split()[2:]
+        check(gen1 != gen2, "the generation repeated across a restart")
+        check(int(size) > 0 and len(g.rows()) == 1, "the restart lost the log")
+    with_gw(body)()
+
+
+@row("SIGTERM exits within five seconds while a lookup is in flight")
+def _():
+    def body(g):
+        s = open_ok(g)
+        s.sendall(rec(0x16, client_hello()))
+        time.sleep(0.5)          # the gateway is now inside the 10 s lookup
+        t0 = time.time()
+        g.proc.send_signal(signal.SIGTERM)
+        rc = g.proc.wait(8)
+        check(rc == 0, "exit status %d" % rc)
+        check(time.time() - t0 < 5, "took %.1f s with a lookup in flight" % (time.time() - t0))
+    with_gw(body, fixture={"allowed.example": [["~10", PUB]]})()
+
+
+@row("a policy that nests past the parser's depth is refused, never a crash")
+def _():
+    deep = "[" * 200000 + "]" * 200000
+
+    def body(g):
+        g.write_policy(deep)
+        check(g.admin("reload") == "err reload parse", "a deep document was not refused as parse")
+        check(g.admin("policy-digest").startswith("ok policy-digest v1:"), "the gateway stopped answering")
+        g.allow_errors = True     # the refusal is logged on stderr by design
+        check("Traceback" not in g.stderr(), "the reload printed a traceback")
+    with_gw(body)()
+    g = GW(start=False, policy_text=deep)
+    try:
+        g.start(wait=False)
+        rc = g.proc.wait(10)
+        check(rc != 0 and "refusing to start" in g.stderr(), "a deep document started a gateway")
+        check("Traceback" not in g.stderr(), "start printed a traceback")
+    finally:
+        g.stop()
+
+
+@row("a FIFO at the policy path cannot freeze a reload")
+def _():
+    def body(g):
+        os.unlink(g.policy_path)
+        os.mkfifo(g.policy_path)
+        t0 = time.time()
+        check(g.admin("reload", timeout=3) == "err reload parse", "a FIFO policy was not refused")
+        check(time.time() - t0 < 2, "the reload waited on the FIFO")
+        check(g.admin("policy-digest").startswith("ok policy-digest"), "the gateway froze")
+        g.allow_errors = True
+    with_gw(body)()
+
+
+@row("before the first hello only a hello may be in flight")
+def _():
+    def body(g):
+        # A non-hello first message, then application_data before it completes.
+        s = open_ok(g)
+        s.sendall(rec(0x16, b"\x10\x00\x00\x40" + b"\x00" * 8) + app(20))
+        expect_alert(s)
+        expect_row(g, "sni", "bad-clienthello")
+        # A non-hello first message that never completes is refused on its
+        # type byte, not left to wait for the deadline or the close.
+        s = open_ok(g)
+        s.sendall(rec(0x16, b"\x10\x00\x00\x40" + b"\x00" * 8))
+        s.shutdown(socket.SHUT_WR)
+        expect_alert(s)
+        expect_row(g, "sni", "bad-clienthello")
+        # An empty handshake record, then records that are not a hello.
+        for tail in (app(20), CCS):
+            s = open_ok(g)
+            s.sendall(rec(0x16, b"") + tail)
+            expect_alert(s)
+            expect_row(g, "sni", "bad-clienthello")
+        check(not g.edges[PUB].conns, "a record ahead of the first hello reached the edge")
+        # A first hello split around a change_cipher_spec is still fine.
+        s = open_ok(g)
+        ch = client_hello()
+        data = rec(0x16, ch[:60]) + CCS + rec(0x16, ch[60:])
+        s.sendall(data)
+        check(g.edges[PUB].wait_bytes(len(data)) == data, "a split first hello did not establish")
+        expect_no_alert(s)
+    with_gw(body)()
+
+
+@row("more than 16 KiB held in reassembly after the budget stops is handshake-flood")
+def _():
+    def body(g):
+        s = open_ok(g)
+        s.sendall(rec(0x16, client_hello()) + app(100))
+        g.edges[PUB].wait_bytes(1)
+        partial = b"\x0b" + (20000).to_bytes(3, "big") + os.urandom(9000)
+        s.sendall(rec(0x16, partial) + rec(0x16, os.urandom(8000)))
+        expect_alert(s)
+        expect_row(g, "handshake-flood")
+    with_gw(body)()
+
+
+@row("neither handshake deadline applies once the first hello is validated", slow=True)
+def _():
+    def body(g):
+        s = established(g)
+        e = g.edges[PUB]
+        before = len(e.conns[0].data)
+        time.sleep(6.5)          # past the 5 s first-byte and the 2 s hello deadline
+        tail = app(500)
+        s.sendall(tail)
+        got = e.wait_bytes(before + len(tail))
+        check(got.endswith(tail), "an idle established tunnel was reaped")
+        expect_no_alert(s)
+    with_gw(body, handshake_timeout_s=2)()
+
+
+@row("a refusal after the upstream closed its half still logs and closes")
+def _():
+    def body(g):
+        e = g.edges[PUB]
+        s = open_ok(g)
+        ch1 = rec(0x16, client_hello())
+        s.sendall(ch1)
+        e.wait_bytes(len(ch1))
+        e.conns[0].sock.shutdown(socket.SHUT_WR)
+        data, eof = recv_all(s, 2)
+        check(eof, "the upstream half-close did not reach the client")
+        s.sendall(rec(0x16, client_hello(sni=OTHER)))
+        time.sleep(0.5)
+        expect_row(g, "sni", "sni-mismatch", host="other.example")
+    with_gw(body)()
+
+
 # -- section 9.1, the denial response, byte for byte ------------------------
 
 @row("a policy denial's body bytes match the status text")
@@ -1247,6 +1526,9 @@ def _():
         check(r.reason == "cleat egress: %s is not on the allowlist" % target, "status target differs")
         check(r.body.decode().split("\n")[0] == r.reason + ".", "body target differs")
         check(g.last_row()["host"] == target and g.last_row()["trunc"] == "1", "row target differs")
+        # The cut name is never offered as the one to allow.
+        check("cleat egress allow " + target[:10] not in r.body.decode(), "the body offers a cut name")
+        check("cut to 128 bytes" in r.body.decode(), "the body does not say the name was cut")
     with_gw(body)()
 
 
@@ -1283,6 +1565,8 @@ def _():
             check(r.body.decode().split("\n")[0] == r.reason + ".", "%r: 400 body drifted" % h[:40])
         check(g.rows() == [], "a malformed head wrote a row")
         check(g.lookups() == [], "a malformed head reached the resolver")
+        check(g.stderr().count("answered a malformed CONNECT head with 400") == len(heads),
+              "not every 400 reached the container log")
     with_gw(body)()
 
 
@@ -1331,7 +1615,9 @@ def _():
         check(g.admin("counts") == "ok counts 1 2", "counts: " + g.admin("counts"))
         check(g.admin("path_ok") == "ok path_ok true", "path_ok: " + g.admin("path_ok"))
         size = os.path.getsize(g.denials)
-        check(g.admin("log-state") == "ok log-state 0 %d" % size, "log-state: " + g.admin("log-state"))
+        state = g.admin("log-state").split()
+        check(state[:2] == ["ok", "log-state"] and state[2].isdigit() and state[3] == str(size),
+              "log-state: " + " ".join(state))
         check(g.admin("match", "ALLOWED.example.") == "ok match allow", "match does not normalize")
         check(g.admin("match", "1.2.3.4") == "err match bad-argument", "match took an IP")
         check(g.admin("match") == "err match bad-argument", "match took no argument")
@@ -1343,11 +1629,17 @@ def _():
 @row("the denial log is capped in place and its generation moves")
 def _():
     def body(g):
+        start = int(g.admin("log-state").split()[2])
         for i in range(120):
             s, r = tunnel(g, b"n%03d.example:443" % i)
             s.close()
+        check(int(g.admin("log-state").split()[2]) > start, "the generation never moved")
+        gen0 = int(g.admin("log-state").split()[2])
+        for i in range(120, 240):
+            s, r = tunnel(g, b"n%03d.example:443" % i)
+            s.close()
         gen, size = g.admin("log-state").split()[2:]
-        check(int(gen) >= 1, "the generation never moved")
+        check(int(gen) - gen0 >= 1, "the generation stuck after the first wrap")
         check(int(size) <= 4096 and int(size) == os.path.getsize(g.denials), "the log outgrew its cap")
         check(os.listdir(g.dir).count("denials.log.1") == 0, "a second log file appeared")
     with_gw(body, denials_max=4096)()
@@ -1433,6 +1725,30 @@ def _():
     with_gw(body, mode="open", hosts=(), fixture={"anything.example": [PUB]})()
 
 
+@row("normalize_host agrees with the shared hostname table")
+def _():
+    table = os.path.join(HERE, "..", "fixtures", "egress_hosts.tsv")
+    rows = []
+    with open(table, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            rows.append((cols[0], cols[1]))
+    names = sorted({want for _, want in rows if not want.startswith("!")})
+
+    def body(g):
+        bad = []
+        for inp, want in rows:
+            got = g.admin("match", inp) if inp else g.admin("match")
+            ok = got == "ok match allow"
+            if want.startswith("!") == ok:
+                bad.append("%r: wanted %s, got %r" % (inp, want, got))
+        check(not bad, "gateway and host table disagree:\n" + "\n".join(bad))
+        check(len(rows) >= 40, "only %d table rows" % len(rows))
+    with_gw(body, hosts=[n.encode() for n in names])()
+
+
 # -- the fuzz row ---------------------------------------------------------------
 
 def _mutate(rnd, seed):
@@ -1492,59 +1808,246 @@ def _mutate(rnd, seed):
     return bytes(rec_)
 
 
+# An independent reading of sections 4.3b and 4.5, written for this corpus and
+# sharing no code with the gateway. The fuzz row holds every case's outcome to
+# it, so a gateway that accepts a malformed or foreign hello, or refuses with
+# the wrong subcode, fails the row rather than passing as "some reason code".
+# It models a client that sends its bytes and then closes, towards a name that
+# resolves only to a forbidden address, so every hello the gateway accepts ends
+# as `address` and nothing is ever dialled.
+
+def ref_name(raw):
+    if not 0 < len(raw) <= 255 or any(b < 33 or b > 126 for b in raw):
+        return None
+    if any(b in b"/\\?#%@: \t\x00" for b in raw):
+        return None
+    name = raw.decode("ascii").lower()
+    if name.endswith("."):
+        name = name[:-1]
+    if name.endswith(".") or len(name) > 253 or "." not in name:
+        return None
+    parts = name.split(".")
+    for part in parts:
+        if not 1 <= len(part) <= 63 or part[0] == "-" or part[-1] == "-":
+            return None
+        if any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789-" for ch in part):
+            return None
+    if parts[-1].isdigit() or parts[-1].startswith("0x"):
+        return None
+    return name
+
+
+def ref_hello_exts(body):
+    """The extension list of a well-formed hello body, or None."""
+    try:
+        if body[:2] != b"\x03\x03":
+            return None
+        at = 34
+        n = body[at]; at += 1
+        if n > 32:
+            return None
+        at += n
+        n = int.from_bytes(body[at:at + 2], "big"); at += 2
+        at += n
+        n = body[at]; at += 1
+        at += n
+        if at > len(body):
+            return None
+        if at == len(body):
+            return []
+        n = int.from_bytes(body[at:at + 2], "big"); at += 2
+        if at + n != len(body) or len(body[at - 2:at]) != 2:
+            return None
+        exts = []
+        while at < len(body):
+            if at + 4 > len(body):
+                return None
+            t = int.from_bytes(body[at:at + 2], "big")
+            n = int.from_bytes(body[at + 2:at + 4], "big")
+            at += 4
+            if at + n > len(body):
+                return None
+            exts.append((t, body[at:at + n]))
+            at += n
+        return exts
+    except IndexError:
+        return None
+
+
+def ref_hello_verdict(exts, host):
+    """None when the hello names host, else (code, sub)."""
+    sni = [d for t, d in exts if t == 0]
+    if not sni:
+        return ("sni", "no-sni")
+    if len(sni) > 1:
+        return ("sni", "dup-sni")
+    d = sni[0]
+    if len(d) < 2 or int.from_bytes(d[:2], "big") != len(d) - 2:
+        return ("sni", "bad-clienthello")
+    names, at = [], 2
+    while at < len(d):
+        if at + 3 > len(d):
+            return ("sni", "bad-clienthello")
+        n = int.from_bytes(d[at + 1:at + 3], "big")
+        if at + 3 + n > len(d):
+            return ("sni", "bad-clienthello")
+        names.append((d[at], d[at + 3:at + 3 + n]))
+        at += 3 + n
+    if len(names) != 1:
+        return ("sni", "dup-sni")
+    kind, raw = names[0]
+    if not raw:
+        return ("sni", "no-sni")
+    if kind != 0:
+        return ("sni", "bad-clienthello")
+    name = ref_name(raw)
+    if name is None:
+        return ("sni", "bad-clienthello")
+    if name != host:
+        return ("sni", "sni-mismatch")
+    return None
+
+
+def reference_outcome(data, host):
+    """The (code, sub) a gateway must log for this stream, then the client's close."""
+    if not data:
+        return ("sni", "no-clienthello")
+    if data[0] != 0x16:
+        return ("sni", "bad-clienthello")
+    at, hellos, counting, seen, held = 0, 0, True, 0, 0
+    partial = b""
+    while True:
+        if len(data) - at < 5:
+            return ("sni", "no-clienthello")
+        rtype, ln = data[at], int.from_bytes(data[at + 3:at + 5], "big")
+        if ln > 16640:
+            return ("sni", "bad-clienthello")
+        if counting:
+            seen += 5 + ln
+            if seen > 16384:
+                return ("handshake-flood", "-")
+        if rtype not in (0x14, 0x15, 0x16, 0x17):
+            return ("sni", "bad-clienthello")
+        if len(data) - at - 5 < ln:
+            return ("sni", "no-clienthello")
+        frag = data[at + 5:at + 5 + ln]
+        at += 5 + ln
+        in_flight = partial[:1] == b"\x01"
+        if rtype in (0x14, 0x17):
+            if hellos == 0 and not in_flight:
+                return ("sni", "bad-clienthello")
+            if rtype == 0x17:
+                counting = False
+            if not in_flight:
+                partial = b""
+        elif rtype == 0x16:
+            partial += frag
+            if hellos == 0 and partial and partial[0] != 0x01:
+                return ("sni", "bad-clienthello")
+            while len(partial) >= 4:
+                n = int.from_bytes(partial[1:4], "big")
+                if len(partial) < 4 + n:
+                    break
+                mtype, mbody, partial = partial[0], partial[4:4 + n], partial[4 + n:]
+                exts = ref_hello_exts(mbody) if mtype == 1 else None
+                if exts is None:
+                    if hellos == 0:
+                        return ("sni", "bad-clienthello")
+                    continue
+                hellos += 1
+                if hellos > 2:
+                    return ("handshake-flood", "-")
+                verdict = ref_hello_verdict(exts, host)
+                if verdict:
+                    return verdict
+            if len(partial) > 16384:
+                return ("handshake-flood", "-")
+        if hellos == 0:
+            held += 5 + ln
+            if held > 16384:
+                return ("handshake-flood", "-")
+        else:
+            return ("address", "-")
+
+
+@row("the reference validator agrees with the gateway on the corpus's own hellos")
+def _():
+    # The reference must itself be right before it can judge the fuzz: hold it
+    # to hellos whose outcome this corpus already asserts row by row.
+    good = rec(0x16, client_hello(sni=b"fuzz.example"))
+    cases = [
+        (good, ("address", "-")),
+        (rec(0x16, client_hello(sni=b"other.example")), ("sni", "sni-mismatch")),
+        (rec(0x16, client_hello(sni=None)), ("sni", "no-sni")),
+        (rec(0x16, client_hello(sni=b"")), ("sni", "no-sni")),
+        (rec(0x16, client_hello(sni=b"fuzz.example", extra=(sni_ext(b"fuzz.example"),))), ("sni", "dup-sni")),
+        (rec(0x16, _overrun_hello()), ("sni", "bad-clienthello")),
+        (app(10), ("sni", "bad-clienthello")),
+        (good[:3], ("sni", "no-clienthello")),
+        (b"\x16\x03\x01\x4e\x20", ("sni", "bad-clienthello")),
+        (b"", ("sni", "no-clienthello")),
+    ]
+    for data, want in cases:
+        got = reference_outcome(data, "fuzz.example")
+        check(got == want, "reference says %s for a case the corpus says is %s" % (got, want))
+
+
 @row("10,000 ClientHellos mutated from the checked-in fixtures", slow=True)
 def _():
     count = int(os.environ.get("CLEAT_GW_FUZZ_COUNT", "10000"))
     rnd = random.Random(20260925)
-    seeds = []
-    for name in ("curl", "openssl", "node", "python"):
-        seeds.append(fixture_hello(name))
+    seeds = [fixture_hello(n) for n in ("curl", "openssl", "node", "python")]
     cases = []
     for _ in range(count):
         m = _mutate(rnd, rnd.choice(seeds))
-        if rnd.random() < 0.3 and len(m) > 10:
+        if rnd.random() < 0.3 and len(m) > 10 and m[0] == 0x16:
             cut = rnd.randrange(6, len(m))
-            m = hs_records(m[5:], cut - 5) if m[0] == 0x16 and len(m) > cut else m
+            if len(m) > cut:
+                m = hs_records(m[5:], cut - 5)
         cases.append(m)
     g = GW(hosts=(b"fuzz.example",), fixture={"fuzz.example": ["10.0.0.9"]},
            denials_max=67108864, max_tunnels=64)
     problems = []
-
-    def one(data):
-        s = g.connect(timeout=15)
-        try:
-            s.sendall(b"CONNECT fuzz.example:443 HTTP/1.1\r\n\r\n")
-            r = read_response(s)
-            if r is None or r.status != 200:
-                return "no 200"
-            try:
-                s.sendall(data)
-                s.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-            got, eof = recv_all(s, 15)
-            if not eof:
-                return "hang"
-            if got not in (ALERT_AD, ALERT_IE, b""):
-                return "unexpected bytes %r" % got[:20]
-            return None
-        finally:
-            s.close()
-
+    codes = {}
     try:
-        with concurrent.futures.ThreadPoolExecutor(16) as pool:
-            for res in pool.map(one, cases):
-                if res:
-                    problems.append(res)
-        check(not problems, "%d fuzz cases misbehaved, first: %s" % (len(problems), problems[:3]))
-        rows = g.rows()
-        check(len(rows) == count, "%d rows for %d cases" % (len(rows), count))
-        check(not g.edges["10.0.0.9"].conns, "a fuzz case established a tunnel")
-        codes = {}
-        for r in rows:
-            codes[r["code"] + "/" + r["sub"]] = codes.get(r["code"] + "/" + r["sub"], 0) + 1
+        for i, data in enumerate(cases):
+            want = reference_outcome(data, "fuzz.example")
+            before = len(g.rows()) if i == 0 else n_rows
+            s = g.connect(timeout=15)
+            try:
+                s.sendall(b"CONNECT fuzz.example:443 HTTP/1.1\r\n\r\n")
+                r = read_response(s)
+                if r is None or r.status != 200:
+                    problems.append("case %d: no 200" % i)
+                    continue
+                try:
+                    s.sendall(data)
+                    s.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                got, eof = recv_all(s, 15)
+            finally:
+                s.close()
+            rows = g.rows()
+            n_rows = len(rows)
+            if not eof:
+                problems.append("case %d: hang" % i)
+            elif n_rows != before + 1:
+                problems.append("case %d: %d rows" % (i, n_rows - before))
+            else:
+                row_ = rows[-1]
+                seen = (row_["code"], row_["sub"])
+                codes[seen] = codes.get(seen, 0) + 1
+                if seen != want:
+                    problems.append("case %d: gateway %s/%s, reference %s/%s, bytes %s" % (
+                        i, seen[0], seen[1], want[0], want[1], data[:48].hex()))
+            if len(problems) > 20:
+                break
+        check(not problems, "%d fuzz cases disagree, first: %s" % (len(problems), "\n".join(problems[:5])))
+        check(not g.edges["10.0.0.9"].conns, "a fuzz case reached the forbidden address")
+        check(codes.get(("address", "-"), 0) > count // 10, "too few accepted hellos to mean anything: %s" % codes)
         sys.stdout.write("      fuzz outcomes: %s\n" % ", ".join(
-            "%s %d" % kv for kv in sorted(codes.items())))
+            "%s/%s %d" % (k[0], k[1], v) for k, v in sorted(codes.items())))
     finally:
         g.stop()
 

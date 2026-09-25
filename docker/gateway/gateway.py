@@ -36,8 +36,8 @@ RUNTIME_GID = 65532
 
 # CONNECT head (section 4.3a).
 HEAD_DEADLINE_S = 5
-REQUEST_LINE_MAX = 1024
-HEAD_MAX = 8192
+REQUEST_LINE_MAX = 1024     # bytes, its CRLF included
+HEAD_MAX = 8192             # bytes, the terminating CRLF CRLF included
 HEADER_LINES_MAX = 64
 
 # Record scanner (section 4.5).
@@ -136,9 +136,11 @@ def split_authority(a):
     zero beyond a single 0.
     """
     if a[:1] == b"[":
-        tail = a.rpartition(b":")[2]
-        port = int(tail) if 1 <= len(tail) <= 5 and tail.isdigit() else 0
-        return "v6", a.rpartition(b":")[0] or a, port
+        host, sep, port = a.rpartition(b":")
+        if (not sep or len(host) < 3 or host[-1:] != b"]" or not 1 <= len(port) <= 5
+                or not port.isdigit() or (len(port) > 1 and port[:1] == b"0")):
+            return "bad", None, 0
+        return "v6", host, int(port)
     if a.count(b":") != 1:
         return "bad", None, 0
     host, _, port = a.partition(b":")
@@ -185,11 +187,19 @@ _NOT_OUTAGE = ("This is a Cleat policy decision, not a network outage and not an
                "authentication failure.\n")
 
 
-def denial_sentence(kind, target, port=443, max_tunnels=0):
-    """-> (status text, body text). target is already sanitized."""
+def denial_sentence(kind, target, port=443, max_tunnels=0, trunc=0):
+    """-> (status text, body text). target is already sanitized.
+
+    A target that was cut or had a byte replaced is never offered back as the
+    name to allow: that command would allow a different name.
+    """
     if kind == "policy":
         first = "cleat egress: %s is not on the allowlist" % target
-        rest = _NOT_OUTAGE + "Ask the user to run: cleat egress allow %s\n" % target
+        if trunc:
+            rest = _NOT_OUTAGE + ("The name is shown cut to 128 bytes. Ask the user to allow the full\n"
+                                  "name with cleat egress allow.\n")
+        else:
+            rest = _NOT_OUTAGE + "Ask the user to run: cleat egress allow %s\n" % target
     elif kind == "invalid":
         first = "cleat egress: %s is not a name the allowlist can hold" % target
         rest = _NOT_OUTAGE + ("The allowlist holds DNS names only. An IP address or a malformed\n"
@@ -213,8 +223,8 @@ _STATUS = {"policy": 403, "invalid": 403, "port": 403, "tunnels": 429, "malforme
 _REASON_HEADER = {"policy": "policy", "invalid": "policy", "port": "port"}
 
 
-def http_denial(kind, target="-", port=443, max_tunnels=0):
-    sentence, body = denial_sentence(kind, target, port, max_tunnels)
+def http_denial(kind, target="-", port=443, max_tunnels=0, trunc=0):
+    sentence, body = denial_sentence(kind, target, port, max_tunnels, trunc)
     b = body.encode("ascii")
     head = [
         "HTTP/1.1 %d %s" % (_STATUS[kind], sentence),
@@ -247,27 +257,28 @@ async def read_head(reader, deadline):
         if end >= 0:
             end += 4
             if end > HEAD_MAX or buf.count(b"\r\n", 0, end) - 2 > HEADER_LINES_MAX:
-                raise HeadAbort()
-            rl = buf.find(b"\r\n")
-            if rl > REQUEST_LINE_MAX:
-                raise HeadAbort()
+                raise HeadAbort("cap")
+            if buf.find(b"\r\n") + 2 > REQUEST_LINE_MAX:
+                raise HeadAbort("cap")
             return bytes(buf[:end]), bytes(buf[end:])
-        if len(buf) > HEAD_MAX:
-            raise HeadAbort()
+        # No terminator yet. Refuse as soon as one could no longer fit, so the
+        # verdict never depends on how the stream was split into reads.
+        if len(buf) >= HEAD_MAX:
+            raise HeadAbort("cap")
         rl = buf.find(b"\r\n")
-        if (rl < 0 and len(buf) > REQUEST_LINE_MAX) or rl > REQUEST_LINE_MAX:
-            raise HeadAbort()
+        if (rl < 0 and len(buf) >= REQUEST_LINE_MAX) or rl + 2 > REQUEST_LINE_MAX:
+            raise HeadAbort("cap")
         if buf.count(b"\r\n") - 1 > HEADER_LINES_MAX:
-            raise HeadAbort()
+            raise HeadAbort("cap")
         left = deadline - loop.time()
         if left <= 0:
-            raise HeadAbort()
+            raise HeadAbort("deadline")
         try:
             chunk = await asyncio.wait_for(reader.read(4096), left)
         except asyncio.TimeoutError:
-            raise HeadAbort()
+            raise HeadAbort("deadline")
         if not chunk:
-            raise HeadAbort()
+            raise HeadAbort("eof" if buf else "")
         buf += chunk
 
 
@@ -434,6 +445,11 @@ class Scanner:
 
     def body(self, rtype, frag):
         """Scans one record. Returning means the record may be forwarded."""
+        if rtype in (0x14, 0x17) and self.hellos == 0 and not self._hello_in_flight():
+            # Before the first hello the only thing a client may be in the
+            # middle of is that hello. Anything else would reach the upstream
+            # ahead of every check.
+            raise Refusal("sni", "bad-clienthello")
         if rtype == 0x17:
             self.counting = False
             self._reset_unless_hello()
@@ -444,6 +460,9 @@ class Scanner:
         if rtype == 0x15:
             return
         self.partial += frag
+        if self.hellos == 0 and self.partial and self.partial[0] != 0x01:
+            # The first handshake message's type is known from its first byte.
+            raise Refusal("sni", "bad-clienthello")
         while len(self.partial) >= 4:
             n = int.from_bytes(self.partial[1:4], "big")
             if len(self.partial) < 4 + n:
@@ -462,6 +481,9 @@ class Scanner:
             check_client_hello(exts, self.host)
         if len(self.partial) > REASSEMBLY_MAX:
             raise Refusal("handshake-flood")
+
+    def _hello_in_flight(self):
+        return bool(self.partial) and self.partial[0] == 0x01
 
     def _reset_unless_hello(self):
         # A partial that begins with msg_type 0x01 is kept, so a hello split
@@ -537,16 +559,43 @@ def address_allowed(addr):
     return True
 
 
+def dial_target(addr, port):
+    """The socket address a classified address is dialled at. Identity here.
+
+    The harness entry point maps it to a local listener, because the gateway
+    refuses loopback and so could never reach one. Nothing else changes it.
+    """
+    return (addr, port)
+
+
+def peer_address(sockaddr):
+    """The address getpeername reported, as the re-check classifies it.
+
+    Identity here. The harness entry point maps a local listener back to the
+    address it stands for.
+    """
+    return sockaddr[0]
+
+
 async def open_upstream(addr, port):
     """Dials one classified IPv4 literal -> (reader, writer, peer address).
 
     Never handed a hostname: a hostname here would be a second resolution
-    between classification and dial.
+    between classification and dial. The socket is connected by address, so
+    no resolver runs, and the peer is read back with getpeername.
     """
     ipaddress.IPv4Address(addr)
-    reader, writer = await asyncio.open_connection(addr, port, family=socket.AF_INET)
-    peer = writer.get_extra_info("peername")
-    return reader, writer, peer[0] if peer else ""
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setblocking(False)
+    try:
+        await loop.sock_connect(sock, dial_target(addr, port))
+        peer = peer_address(sock.getpeername())
+        reader, writer = await asyncio.open_connection(sock=sock)
+    except BaseException:
+        sock.close()
+        raise
+    return reader, writer, peer
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +635,7 @@ def _int_in(v, lo, hi):
 def load_policy(path):
     """-> Policy. Raises PolicyError. A document it cannot fully verify is refused."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise PolicyError("parse", "not a regular file")
@@ -599,7 +648,7 @@ def load_policy(path):
         raise PolicyError("parse", "larger than %d bytes" % POLICY_MAX_BYTES)
     try:
         doc = json.loads(data.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise PolicyError("parse", "not a JSON document")
     if type(doc) is not dict or set(doc) != POLICY_KEYS:
         raise PolicyError("parse", "unexpected keys")
@@ -672,13 +721,17 @@ class Gateway:
         self.dfd = denials_fd
         self.policy = policy
         self.sock_id = sock_id          # (st_dev, st_ino) recorded at bind
-        self.generation = 0
+        # A reader's mark is <generation>:<offset>. A restart that began again at
+        # 0 over a log it did not truncate could match an old mark and resume
+        # mid-file, so each process starts from its own start time instead.
+        self.generation = time.time_ns() // 1000000
         self.allowed = 0
         self.denied = 0
         self.last_shim = None
         self.tunnels = 0
         self.conns = 0
         self.cache = {}
+        self.inflight = {}              # name -> the lookup already under way
 
     # -- records ----------------------------------------------------------
 
@@ -728,15 +781,19 @@ class Gateway:
         loop = asyncio.get_running_loop()
         try:
             head, pending = await read_head(reader, loop.time() + HEAD_DEADLINE_S)
-        except HeadAbort:
+        except HeadAbort as e:
+            # No response and no denials.log row: the head was never
+            # trustworthy enough to answer. The container log keeps a line.
+            if e.args and e.args[0]:
+                _err("closed a CONNECT head with no response (%s)" % e.args[0])
             return
         try:
             authority, selftest = parse_head(head)
+            kind, raw_host, port = split_authority(authority)
+            if kind == "bad":
+                raise HeadMalformed()
         except HeadMalformed:
-            await self._reply(writer, http_denial("malformed"))
-            return
-        kind, raw_host, port = split_authority(authority)
-        if kind == "bad":
+            _err("answered a malformed CONNECT head with 400")
             await self._reply(writer, http_denial("malformed"))
             return
         pol = self.policy
@@ -758,9 +815,11 @@ class Gateway:
             return
         if pol.mode == "strict" and host not in pol.hosts:
             self.deny_row("policy", "-", host.encode("ascii"), port)
-            await self._reply(writer, http_denial("policy", sanitize(host.encode("ascii"))[0], port))
+            shown, trunc = sanitize(host.encode("ascii"))
+            await self._reply(writer, http_denial("policy", shown, port, trunc=trunc))
             return
         if self.tunnels >= pol.max_tunnels:
+            _err("answered a tunnel past the cap of %d with 429" % pol.max_tunnels)
             await self._reply(writer, http_denial("tunnels", max_tunnels=pol.max_tunnels))
             return
         self.tunnels += 1
@@ -778,7 +837,7 @@ class Gateway:
         try:
             writer.write(r.alert)
             await writer.drain()
-        except (ConnectionError, OSError):
+        except (ConnectionError, OSError, RuntimeError):
             pass
         if upstream is not None:
             await _close(upstream)
@@ -894,11 +953,34 @@ class Gateway:
             await _close(uw)
 
     async def resolve(self, host):
-        """The one resolver. Lazy, allow path only, cached a fixed 60 seconds."""
+        """The one resolver. Lazy, allow path only, cached a fixed 60 seconds.
+
+        Concurrent first uses of one name share a single lookup, so a burst of
+        tunnels to one host is one query rather than a burst of them.
+        """
         now = time.monotonic()
         hit = self.cache.get(host)
         if hit is not None and hit[0] > now:
             return hit[1]
+        fut = self.inflight.get(host)
+        if fut is None:
+            fut = asyncio.ensure_future(self._lookup(host))
+            self.inflight[host] = fut
+            fut.add_done_callback(lambda f, h=host: self._lookup_done(h, f))
+        # shield: a tunnel cancelled mid-lookup must not cancel the lookup the
+        # others share.
+        return await asyncio.shield(fut)
+
+    def _lookup_done(self, host, fut):
+        # Cleared when the lookup ends, whoever is still waiting, so a stale
+        # answer can never outlive it. Reading the exception marks it seen.
+        if self.inflight.get(host) is fut:
+            del self.inflight[host]
+        if not fut.cancelled():
+            fut.exception()
+
+    async def _lookup(self, host):
+        now = time.monotonic()
         loop = asyncio.get_running_loop()
         # Bytes, not str: a str name would pass through Python's idna codec,
         # a second name parser the section 4.3b normalizer already replaces.
@@ -1091,8 +1173,18 @@ def run(cfg):
     except PolicyError as e:
         _err("refusing to start, policy %s: %s" % (e.code, e.why))
         return 1
-    asyncio.run(serve(gw, proxy, admin))
-    return 0
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(serve(gw, proxy, admin))
+    # A getaddrinfo still running in an executor thread cannot be cancelled,
+    # and a normal interpreter exit would wait for it. Nothing is left to
+    # flush but the two streams, so leave now.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except OSError:
+            pass
+    os._exit(0)
 
 
 def _env_id(name):

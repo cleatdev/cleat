@@ -66,7 +66,7 @@ After: `            self.body = lambda rtype, frag: None`
 Why: the first application_data record must not switch the scanner off (spec 4.5 `test_second_hello_after_early_data_refused`).
 
 ## first_message_is_a_hello
-Rows: first handshake message a client_key_exchange
+Rows: session id length 0xff | extension length longer than the remaining buffer
 Before: `                if self.hellos == 0:`
 Before: `                    raise Refusal("sni", "bad-clienthello")`
 After: `                if False:`
@@ -122,3 +122,105 @@ Rows: reload answers the new digest
 Before: `    if doc["digest"] != policy_digest(doc["mode"], doc["port"], hosts):`
 After: `    if doc["digest"] != doc["digest"]:`
 Why: the gateway recomputes the digest, so a readback is evidence rather than an echo (spec 8.2).
+
+## bracket_authority_well_formed
+Rows: bracketed IPv6 in CONNECT
+Before: `        if (not sep or len(host) < 3 or host[-1:] != b"]" or not 1 <= len(port) <= 5`
+After: `        if (False or not 1 <= len(port) <= 5`
+Why: a bracket does not excuse a malformed authority, which is a 400 with no row (4.3a rule 5).
+
+## request_line_counts_crlf
+Rows: the request line cap is 1 KiB with its CRLF
+Before: `        if (rl < 0 and len(buf) >= REQUEST_LINE_MAX) or rl + 2 > REQUEST_LINE_MAX:`
+After: `        if False:`
+Why: a request line that can no longer fit is closed at once rather than held to the deadline.
+
+## truncated_target_not_offered
+Rows: 128-byte-truncated target
+Before: `        if trunc:`
+After: `        if False:`
+Why: an allow command naming a cut name would allow a different name (9.1 rule 5).
+
+## generation_unique_per_process
+Rows: a restarted gateway starts a new log generation
+Before: `        self.generation = time.time_ns() // 1000000`
+After: `        self.generation = 0`
+Why: a restart that reused generation 0 over the same log could match an old reader mark and resume mid-file.
+
+## sigterm_during_lookup
+Rows: SIGTERM exits within five seconds while a lookup is in flight
+Before: `    os._exit(0)`
+After: `    return 0`
+Why: a normal exit waits for the executor thread still inside getaddrinfo.
+
+## deep_json_refused
+Rows: nests past the parser
+Before: `    except (ValueError, UnicodeDecodeError, RecursionError):`
+After: `    except (ValueError, UnicodeDecodeError):`
+Why: a document the parser cannot descend is a parse refusal, never an exception that drops the answer.
+
+## fifo_policy_nonblocking
+Rows: a FIFO at the policy path cannot freeze a reload
+Before: `        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)`
+After: `        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)`
+Why: the open of a FIFO blocks the whole event loop before the regular-file check can run.
+
+## first_message_type_early
+Rows: before the first hello only a hello may be in flight
+Before: `        if self.hellos == 0 and self.partial and self.partial[0] != 0x01:`
+After: `        if False:`
+Why: a non-hello first message dropped by a reset on 0x14 or 0x17 would never be checked.
+
+## no_record_ahead_of_first_hello
+Rows: before the first hello only a hello may be in flight
+Before: `        if rtype in (0x14, 0x17) and self.hellos == 0 and not self._hello_in_flight():`
+After: `        if False:`
+Why: application_data or change_cipher_spec with no hello in flight would reach the upstream ahead of every check.
+
+## reassembly_bound
+Rows: more than 16 KiB held in reassembly
+Before: `        if len(self.partial) > REASSEMBLY_MAX:`
+After: `        if False:`
+Why: once application_data stops the budget, this bound is all that caps a partial message.
+
+## peer_rechecked
+Rows: getpeername reading back a forbidden address
+Before: `        if not address_allowed(peer):`
+After: `        if False:`
+Why: the re-check catches a connect path that diverges from what was classified.
+
+## ipv4_only_query
+Rows: the resolver is asked for IPv4 only
+Before: `                                       family=socket.AF_INET, type=socket.SOCK_STREAM)`
+After: `                                       family=0, type=socket.SOCK_STREAM)`
+Why: the gateway issues no AAAA query, so no IPv6 candidate ever enters the classifier (4.4).
+
+## uncoded_refusals_logged
+Rows: a malformed CONNECT head writes no row
+Before: `            _err("answered a malformed CONNECT head with 400")`
+After: `            pass`
+Why: the three uncoded refusals are recorded only in the container log (9.2).
+
+## lookups_coalesced
+Rows: concurrent first uses of one name share a single lookup
+Before: `        fut = self.inflight.get(host)`
+After: `        fut = None`
+Why: a burst of tunnels to one host must be one query, not a burst of them (4.4).
+
+## failed_peer_read_is_upstream
+Rows: a getpeername that fails after connect
+Before: `            except (OSError, asyncio.TimeoutError, ValueError):`
+After: `            except (asyncio.TimeoutError, ValueError):`
+Why: a peer that resets after connect is an unreachable upstream, never an `address` security event.
+
+## fuzz_catches_lenient_parse
+Rows: 10,000 ClientHellos mutated
+Before: `    if p + el != n:`
+After: `    if p + el > n:`
+Why: the differential fuzz holds every case to an independent reading of 4.5, so a parser that tolerates trailing bytes after the extension block disagrees with it.
+
+## fuzz_catches_budget_drift
+Rows: 10,000 ClientHellos mutated
+Before: `BUDGET = 16384 `
+After: `BUDGET = 1000 `
+Why: the fuzz, not only its named rows, notices a budget that refuses real hellos (the node fixture is 1589 bytes).

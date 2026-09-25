@@ -1842,7 +1842,7 @@ try "bugfix_installmethod_native" "forces installMethod=native even when" "$CLI"
 # macOS keychain → box credential seed must actually write the file. Neuter the
 # move: the "writes the keychain blob" test sees no creds file and fails.
 cat > "$SED_TMP" << 'SED'
-s|mv -f "\$tmp" "\$cred" 2>/dev/null|false|
+s|if _rename_onto "\$tmp" "\$cred"; then _SEEDED_CREDS=1; fi|:|
 SED
 try "bugfix_keychain_seed_write" "writes the keychain blob" "$CLI" "$CREDENTIALS_BATS"
 

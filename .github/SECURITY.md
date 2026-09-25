@@ -15,7 +15,13 @@ weakens the boundary.
 Cleat is maintained by one person. You should get a first reply within a
 few days. If a week passes with no answer, ping again on the same thread.
 There is no bounty programme. Fixes ship in a normal tagged release.
-Credit goes in the release notes unless you ask to stay anonymous.
+
+Every confirmed vulnerability is published as a GitHub security advisory
+on this repository once its fix is released, with a CVE requested through
+GitHub. The advisory names the affected versions, the fixed version and
+any workaround. Credit goes in the advisory and the release notes unless
+you ask to stay anonymous. Published advisories are listed at
+https://github.com/cleatdev/cleat/security/advisories.
 
 ## Supported versions
 

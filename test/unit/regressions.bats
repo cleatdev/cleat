@@ -10144,3 +10144,62 @@ _caged_run_setup() {
   assert_output --partial "Shim not listening"
   assert_output --partial "cleat egress restart --shim"
 }
+
+@test "regression vNEXT: a removal site left a gateway behind" {
+  # cleat rm on a caged box: the gateway is its own container, and a removal
+  # that took only the box left it running with nothing to serve.
+  _caged_run_setup
+  mock_docker_ps ""
+  mock_docker_ps_a "$CN"
+  mkdir -p "$(_egress_policy_dir "$CN")"
+  run cmd_rm "$TEST_TEMP/project"
+  assert_success
+  run grep -c "^docker rm -f $GW\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c "^docker volume rm $VOL\$" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "regression vNEXT: cleat rm left a per-box egress file behind" {
+  # A box given only a per-box policy never had a container. cleat rm is its
+  # documented removal, and the policy, pin and notices marker must go too,
+  # or the next box to take the name inherits them.
+  mkdir -p "$TEST_TEMP/project" "$CLEAT_CONFIG_DIR/egress-boxes" "$CLEAT_CONFIG_DIR/egress-pins"
+  local cn
+  cn="$(container_name_for "$TEST_TEMP/project")"
+  mock_docker_ps ""
+  mock_docker_ps_a ""
+  _daemon_up() { return 0; }
+  printf '[egress]\nallow = docs.example.test\n' > "$CLEAT_CONFIG_DIR/egress-boxes/$cn"
+  printf 'pin\n' > "$CLEAT_CONFIG_DIR/egress-pins/$cn"
+  run cmd_rm "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "No container to remove"
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$cn" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-pins/$cn" ]
+  # Behind a down daemon the box may still exist: its deny list stays.
+  printf '[egress]\ndeny = docs.example.test\n' > "$CLEAT_CONFIG_DIR/egress-boxes/$cn"
+  _daemon_up() { return 1; }
+  run cmd_rm "$TEST_TEMP/project"
+  [ -f "$CLEAT_CONFIG_DIR/egress-boxes/$cn" ]
+}
+
+@test "regression vNEXT: a recreate dropped the per-box egress policy" {
+  # The reaper recreate answers yes by default. Deleting the per-box file there
+  # would hand the recreated box the global policy.
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes"
+  local cn=cleat-x-12345678
+  printf '[egress]\nmode = off\n' > "$CLEAT_CONFIG_DIR/egress-boxes/$cn"
+  mkdir -p "$(_egress_policy_dir "$cn")"
+  _is_tty() { return 0; }
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  mock_docker_inspect '{"Init":false}'
+  run _maybe_prompt_init_recreate "$cn" <<< ""
+  assert_success
+  run grep -c "^docker rm -f $cn\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run cat "$CLEAT_CONFIG_DIR/egress-boxes/$cn"
+  assert_output "[egress]
+mode = off"
+}

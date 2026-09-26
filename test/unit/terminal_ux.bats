@@ -960,3 +960,17 @@ EOF
   assert_output "https://cleat.sh/x"          # the full URL, not the short text
   refute_output --partial "$(printf '\033]8;;')"   # no OSC 8 escapes
 }
+
+@test "egress notices: teardown removes the notices marker with the box" {
+  # The once-per-box notices must reprint for the next box to take this name.
+  mkdir -p "$TEST_TEMP/p1"
+  local cn
+  cn="$(container_name_for "$TEST_TEMP/p1")"
+  mock_docker_ps ""
+  mock_docker_ps_a "$cn"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-notices"
+  printf 'seen\n' > "$CLEAT_CONFIG_DIR/egress-notices/$cn"
+  run cmd_rm "$TEST_TEMP/p1"
+  assert_success
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-notices/$cn" ]
+}

@@ -723,7 +723,7 @@ _hist_fixture() {
   assert_output --partial "cleat storage"
   run docker_calls
   assert_output --partial "docker stop $cname"
-  assert_output --partial "docker rm $cname"
+  assert_output --partial "docker rm -f $cname"
 }
 
 @test "rm: no-op when no container exists" {

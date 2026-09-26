@@ -75,7 +75,7 @@ teardown() { _common_teardown; }
   : > "$CLEAT_RUN_DIR/$CNAME/kit/CLAUDE.md"
   run cmd_rm
   assert_success
-  run grep -q "^docker rm $CNAME" "$DOCKER_CALLS"
+  run grep -q "^docker rm -f $CNAME" "$DOCKER_CALLS"
   assert_success
   [ ! -f "$CLEAT_KITS_DIR/$CNAME" ]
   [ ! -d "$CLEAT_RUN_DIR/$CNAME" ]

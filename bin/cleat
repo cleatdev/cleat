@@ -4442,7 +4442,7 @@ _fork_preflight() {
     # silently re-bind the live tree matters whether or not a container exists.
     if container_exists "$cname"; then
       info "Fork workspace is missing, recreating it"
-      docker rm -f "$cname" > /dev/null 2>&1 || true
+      _egress_teardown "$cname" keep || true
     fi
     return 0
   fi
@@ -6628,7 +6628,8 @@ _resolve_config_drift() {
       if is_running "$cname"; then
         docker stop "$cname" > /dev/null 2>&1 || true
       fi
-      docker rm -f "$cname" > /dev/null 2>&1 || true
+      _egress_stop "$cname"
+      _egress_teardown "$cname" keep || true
       _account_wipe_run_dir "${cname}"
       success "Removed ${BOLD}${cname}${RESET}."
       return 0
@@ -6704,7 +6705,8 @@ _maybe_prompt_image_rebuild() {
     # image (its bind mounts and base layer are baked in at creation time).
     if container_exists "$cname"; then
       is_running "$cname" && docker stop "$cname" > /dev/null 2>&1 || true
-      docker rm -f "$cname" > /dev/null 2>&1 || true
+      _egress_stop "$cname"
+      _egress_teardown "$cname" keep || true
       _account_wipe_run_dir "${cname}"
     fi
   fi
@@ -6737,7 +6739,8 @@ _maybe_prompt_init_recreate() {
   _ask_yn yn "Recreate it now? ${DIM}(project files and Claude state survive; /tmp and apt installs don't)${RESET} [Y/n] "
   if [[ -z "$yn" || "$yn" == [yY]* ]]; then
     is_running "$cname" && { docker stop "$cname" > /dev/null 2>&1 || true; }
-    docker rm -f "$cname" > /dev/null 2>&1 || true
+    _egress_stop "$cname"
+    _egress_teardown "$cname" keep || true
     _account_wipe_run_dir "${cname}"
   fi
 }
@@ -10878,6 +10881,24 @@ _egress_teardown() {                     # <cname> <keep|forget> [force]
   rm -f "$CLEAT_CONFIG_DIR/egress-notices/$cname"
   rm -f "$CLEAT_CONFIG_DIR/egress-boxes/$cname"
   rm -f "$CLEAT_CONFIG_DIR/egress-pins/$cname"
+}
+
+# A stop ends the session cleat egress open began and stops the gateway after
+# its box. Everything a start needs stays: the socket volume, the rendered
+# policy, the box's own files and the create marker. The next start brings the
+# gateway back without a recreate. Only a box with a rendered policy on this
+# host has a gateway to stop, so an off machine gains no docker call. Silent,
+# always 0.
+_egress_stop() {                         # <cname>
+  local cname="$1" bh
+  [ -n "$cname" ] || return 0
+  rm -f "$CLEAT_CONFIG_DIR/egress-boxes/$cname.session"
+  bh="$(_egress_box_hash "$cname")"
+  case "$bh" in ????????????) ;; *) return 0 ;; esac
+  case "$bh" in *[!0-9a-f]*) return 0 ;; esac
+  [ -d "$(_egress_policy_dir "$cname")" ] || return 0
+  docker stop "$(_egress_gateway_name "$cname")" >/dev/null 2>&1 || true
+  return 0
 }
 
 # The create marker (8.2): the window in which the gate waits for a gateway
@@ -16634,7 +16655,8 @@ cmd_upgrade_claude() {
         if is_running "$cname"; then
           docker stop "$cname" > /dev/null 2>&1 || true
         fi
-        docker rm -f "$cname" > /dev/null 2>&1 || true
+        _egress_stop "$cname"
+        _egress_teardown "$cname" keep || true
         _account_wipe_run_dir "${cname}"
         success "Removed ${BOLD}${cname}${RESET}."
         cmd_run "$project"
@@ -16687,7 +16709,7 @@ _upgrade_claude_image() {
 
   local tmp="cleat-claude-upgrade"
   # Self-heal a leftover container from a previously interrupted run.
-  docker rm -f "$tmp" > /dev/null 2>&1 || true
+  _egress_teardown "$tmp" keep || true
 
   local log
   log="$(mktemp 2>/dev/null)" || log="/tmp/cleat-upgrade.$$"
@@ -16728,7 +16750,7 @@ _upgrade_claude_image() {
     [[ -n "$_lbl_ver" ]] && _commit_changes+=(--change "LABEL sh.cleat.version=${_lbl_ver}")
     docker commit "${_commit_changes[@]}" "$tmp" "$IMAGE_NAME" >> "$log" 2>&1 || rc=$?
   fi
-  docker rm -f "$tmp" > /dev/null 2>&1 || true
+  _egress_teardown "$tmp" keep || true
 
   # Fold the version delta straight into the success line so the result is a
   # single row, "Claude Code upgraded (2.1.156 → 2.1.161)", instead of a green
@@ -17781,7 +17803,7 @@ cmd_start() {
       # (_history_bind_in_session_dir). Only a recreate changes a bind source.
       if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
         info "Recreating container ${DIM}(host paths changed)"
-        docker rm -f "$cname" > /dev/null 2>&1 || true
+        _egress_teardown "$cname" keep || true
         cmd_run "$project"
       else
         # Nested mount targets first: a vanished one fails `docker start`.
@@ -17805,7 +17827,7 @@ cmd_start() {
             local yn=""
             _ask_yn yn "Remove container and start fresh? [Y/n] "
             if [[ -z "$yn" || "$yn" == [yY]* ]]; then
-              docker rm -f "$cname" > /dev/null 2>&1 || true
+              _egress_teardown "$cname" keep || true
               success "Removed ${BOLD}$cname${RESET}."
               cmd_run "$project"
             else
@@ -17914,7 +17936,7 @@ cmd_resume() {
       # (_history_bind_in_session_dir).
       if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
         info "Recreating container ${DIM}(host paths changed)${RESET}"
-        docker rm -f "$cname" > /dev/null 2>&1 || true
+        _egress_teardown "$cname" keep || true
         cmd_run "$project"
       else
         # Nested mount targets first, as in cmd_start.
@@ -18012,8 +18034,11 @@ cmd_stop() {
 
   if is_running "$cname"; then
     docker stop "$cname" > /dev/null 2>&1
+    _egress_stop "$cname"
     success "Session ended. Resume with: ${BOLD}cleat resume${RESET}"
   else
+    # A gateway whose box is already down (an orphan) still stops.
+    _egress_stop "$cname"
     info "Container not running."
   fi
 }
@@ -18027,9 +18052,10 @@ cmd_rm() {
 
   if is_running "$cname"; then
     docker stop "$cname" > /dev/null
+    _egress_stop "$cname"
   fi
   if container_exists "$cname"; then
-    docker rm "$cname" > /dev/null
+    _egress_teardown "$cname" forget || { error "Could not remove ${BOLD}${cname}${RESET}."; exit 1; }
     # Clean up this container's runtime dir: sessions on the host are
     # intentionally NOT touched; they live at ~/.claude/projects/<key>/ and
     # survive cleat rm.
@@ -18039,6 +18065,11 @@ cmd_rm() {
     echo -e "    ${DIM}The box's disk layer is freed. Its image and build cache stay in the shared Docker disk: ${RESET}${BOLD}cleat storage${RESET}${DIM} shows what is left.${RESET}"
   else
     info "No container to remove."
+    # A box given only a per-box egress policy, or whose container went some
+    # other way, still has its egress files. Forgotten only when the daemon
+    # answers: behind a down daemon the box may still exist, and forgetting
+    # its deny list would widen it.
+    if _daemon_up; then _egress_teardown "$cname" forget || true; fi
   fi
   # Remove the box's host-side description and kit selection unconditionally:
   # `cleat rm <box>` is the documented removal path even for a box that was
@@ -29973,7 +30004,7 @@ _kit_prekit_offer() {
     local yn=""
     _ask_yn yn "Rebuild now? [y/N] "
     if [[ "$yn" == [yY]* ]]; then
-      docker rm -f "$cname" > /dev/null 2>&1 || true
+      _egress_teardown "$cname" keep || true
       _account_wipe_run_dir "${cname}"
       _box_kit_write "$cname" "$kit"
       success "Kit ${BOLD}${kit}${RESET} enabled for box ${BOLD}${box}${RESET}."

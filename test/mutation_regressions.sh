@@ -3336,7 +3336,9 @@ try "fork_preflight_refuses" "resume refuses when the copy is gone even if the b
 # FORK PREFLIGHT HEAL: an explicit --fork must rebuild rather than refuse. The
 # mount is baked at create, so healing requires dropping the container.
 cat > "$SED_TMP" << 'SED'
-s@    docker rm -f "$cname" > /dev/null 2>&1 || true@    :@
+/^_fork_preflight()/,/^}$/{
+  s@^      _egress_teardown "[$]cname" keep || true$@      :@
+}
 s@    info "Fork workspace is missing, recreating it"@    error "no heal"; exit 1@
 SED
 try "fork_preflight_heals" "explicit fork flag heals a running box" "$CLI" "$FORK_BATS"
@@ -14941,6 +14943,70 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_caged_after_pass" "cleat shell and cleat login into a caged box carry the proxy environment" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# Teardown and stop at the removal and stop sites (8.7).
+cat > "$SED_TMP" << 'SED'
+/^cmd_rm()/,/^}$/{
+  /_egress_teardown/d
+}
+SED
+try "vnext_egress_teardown_site" "a removal site left a gateway behind" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_teardown()/,/^}$/{
+  s@^  rm -f "[$]CLEAT_CONFIG_DIR/egress-boxes/[$]cname"$@  :@
+}
+SED
+try "vnext_egress_rm_perbox" "cmd_rm removes the per-box override" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_teardown()/,/^}$/{
+  s@^  \[ "[$]kind" = forget \] || return 0@  :@
+}
+SED
+try "vnext_egress_recreate_keeps_perbox" "a recreate keeps the per-box policy file and the pin" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_teardown()/,/^}$/{
+  s@^  rm -f "[$]CLEAT_CONFIG_DIR/egress-notices/[$]cname"$@  :@
+}
+SED
+try "vnext_egress_notice_marker_kept" "teardown removes the notices marker with the box" "$CLI" "$TERMINAL_UX_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_rm()/,/^}$/{
+  s@^    if _daemon_up; then _egress_teardown "[$]cname" forget || true; fi$@    _egress_teardown "$cname" forget || true@
+}
+SED
+try "vnext_egress_rm_forget_needs_daemon" "cleat rm left a per-box egress file behind" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_prompt_init_recreate()/,/^}$/{
+  s@^    _egress_teardown "[$]cname" keep || true$@    _egress_teardown "$cname" forget || true@
+}
+SED
+try "vnext_egress_recreate_site_keeps" "a recreate dropped the per-box egress policy" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_stop()/,/^}$/{
+  s@^  docker stop "[$](_egress_gateway_name "[$]cname")" >/dev/null 2>&1 || true$@  :@
+}
+SED
+try "vnext_egress_stop_gateway" "cleat stop stops the gateway after the box" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_stop()/,/^}$/{
+  s@^  rm -f "[$]CLEAT_CONFIG_DIR/egress-boxes/[$]cname.session"$@  :@
+}
+SED
+try "vnext_egress_stop_ends_session" "the session marker is removed on stop" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_stop()/,/^}$/{
+  s@^  \[ -d "[$](_egress_policy_dir "[$]cname")" \] || return 0$@  :@
+}
+SED
+try "vnext_egress_stop_presence_gate" "rm and stop add no docker call for a box with no rendered policy" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.

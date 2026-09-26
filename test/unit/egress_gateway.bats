@@ -751,3 +751,135 @@ proxy_env_on() {                         # <cname>
   [[ "$output" == *"-e HOME=/home/coder -e HTTPS_PROXY=http://127.0.0.1:3128 "* ]]
   [[ "$output" == *"-e no_proxy=localhost,127.0.0.1,::1 -w /workspace "* ]]
 }
+
+# ── Teardown and stop at the removal and stop sites (8.7) ───────────────────
+
+# The recorded order of this box's gateway rm, box rm and volume rm.
+teardown_order() {
+  grep -E "^docker (rm -f|volume rm) " "$DOCKER_CALLS" \
+    | sed -e "s|^docker rm -f $GW\$|gateway|" -e "s|^docker rm -f $CN\$|box|" -e "s|^docker volume rm $VOL\$|volume|" \
+    | tr '\n' ' '
+}
+
+# A caged box, existing and stopped, for the site families below.
+site_box() {
+  teardown_box
+  mock_docker_ps ""
+  mock_docker_ps_a "$CN"
+}
+
+@test "egress: teardown removes the gateway before the box at every removal family" {
+  # A recreate prompt: the config drift accept path on a terminal.
+  site_box
+  _container_config_hash() { echo "v2:old"; }
+  _is_tty() { return 0; }
+  run _resolve_config_drift "$CN" "$TEST_TEMP" <<< "y"
+  assert_success
+  run teardown_order
+  assert_output "gateway box volume "
+  # A host-path recreate: cmd_start on a box whose bind sources moved.
+  site_box
+  : > "$DOCKER_CALLS"
+  mkdir -p "$TEST_TEMP/p1"
+  _container_bind_sources_present() { return 1; }
+  cmd_run() { echo "recreated" >> "$TEST_TEMP/recreated"; }
+  container_name_for() { printf '%s' "$CN"; }
+  _resolve_config_drift() { true; }
+  exec_claude() { true; }
+  run cmd_start "$TEST_TEMP/p1"
+  run teardown_order
+  assert_output "gateway box volume "
+  # Removal for good: cmd_rm.
+  site_box
+  : > "$DOCKER_CALLS"
+  run cmd_rm "$TEST_TEMP/p1"
+  assert_success
+  run teardown_order
+  assert_output "gateway box volume "
+}
+
+@test "egress gateway: cmd_rm removes the per-box override" {
+  site_box
+  mkdir -p "$TEST_TEMP/p1"
+  container_name_for() { printf '%s' "$CN"; }
+  run cmd_rm "$TEST_TEMP/p1"
+  assert_success
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$CN" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$CN.session" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-pins/$CN" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-rendered/$BH" ]
+}
+
+@test "egress gateway: a recreate keeps the per-box policy file and the pin" {
+  site_box
+  local before
+  before="$(cat "$CLEAT_CONFIG_DIR/egress-boxes/$CN" "$CLEAT_CONFIG_DIR/egress-pins/$CN" "$CLEAT_CONFIG_DIR/egress-notices/$CN")"
+  # The drift accept path on a terminal, answered with Enter.
+  _container_config_hash() { echo "v2:old"; }
+  _is_tty() { return 0; }
+  run _resolve_config_drift "$CN" "$TEST_TEMP" <<< ""
+  assert_success
+  assert_output --partial "Removed"
+  run cat "$CLEAT_CONFIG_DIR/egress-boxes/$CN" "$CLEAT_CONFIG_DIR/egress-pins/$CN" "$CLEAT_CONFIG_DIR/egress-notices/$CN"
+  assert_output "$before"
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$CN.session" ]
+  # The host-paths recreate in cmd_start, which asks nothing at all.
+  printf 'started\n' > "$CLEAT_CONFIG_DIR/egress-boxes/$CN.session"
+  mkdir -p "$TEST_TEMP/p1"
+  _container_bind_sources_present() { return 1; }
+  cmd_run() { true; }
+  container_name_for() { printf '%s' "$CN"; }
+  _resolve_config_drift() { true; }
+  exec_claude() { true; }
+  run cmd_start "$TEST_TEMP/p1"
+  run cat "$CLEAT_CONFIG_DIR/egress-boxes/$CN" "$CLEAT_CONFIG_DIR/egress-pins/$CN" "$CLEAT_CONFIG_DIR/egress-notices/$CN"
+  assert_output "$before"
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$CN.session" ]
+}
+
+@test "egress: cleat stop stops the gateway after the box and keeps what a start needs" {
+  teardown_box
+  mock_docker_ps "$CN"
+  mkdir -p "$TEST_TEMP/p1"
+  container_name_for() { printf '%s' "$CN"; }
+  run cmd_stop "$TEST_TEMP/p1"
+  assert_success
+  run grep -n "^docker stop " "$DOCKER_CALLS"
+  assert_output "$(printf '1:docker stop %s\n2:docker stop %s' "$CN" "$GW")"
+  [ -f "$CLEAT_CONFIG_DIR/egress-rendered/$BH/policy.json" ]
+  [ -f "$CLEAT_CONFIG_DIR/egress-boxes/$CN" ]
+  run grep -c "^docker volume rm\|^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
+  # A box already down still has its orphaned gateway stopped.
+  mock_docker_ps ""
+  : > "$DOCKER_CALLS"
+  run cmd_stop "$TEST_TEMP/p1"
+  run cat "$DOCKER_CALLS"
+  assert_output "docker stop $GW"
+}
+
+@test "egress open: the session marker is removed on stop" {
+  teardown_box
+  mock_docker_ps "$CN"
+  mkdir -p "$TEST_TEMP/p1"
+  container_name_for() { printf '%s' "$CN"; }
+  run cmd_stop "$TEST_TEMP/p1"
+  assert_success
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$CN.session" ]
+}
+
+@test "egress: rm and stop add no docker call for a box with no rendered policy" {
+  CN=cleat-demo-3f2a9104
+  egress_box_names
+  mkdir -p "$TEST_TEMP/p1"
+  container_name_for() { printf '%s' "$CN"; }
+  mock_docker_ps "$CN"
+  mock_docker_ps_a "$CN"
+  run cmd_stop "$TEST_TEMP/p1"
+  run cat "$DOCKER_CALLS"
+  assert_output "docker stop $CN"
+  : > "$DOCKER_CALLS"
+  run cmd_rm "$TEST_TEMP/p1"
+  run grep -c "cleat-gw-" "$DOCKER_CALLS"
+  assert_output "0"
+}

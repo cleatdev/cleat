@@ -154,7 +154,8 @@ jobs:
             sleep 10
           done
           cat /tmp/configs
-          grep -q '"sh.cleat.role":"gateway"' /tmp/configs
+          # The inspect output is pretty-printed, so the space after the colon varies.
+          grep -Eq '"sh\.cleat\.role": *"gateway"' /tmp/configs
           if grep -q 'sh.cleat.version' /tmp/configs; then
             echo "::error::the gateway image carries sh.cleat.version (rule GW1)"; exit 1
           fi

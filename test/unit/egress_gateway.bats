@@ -883,3 +883,87 @@ site_box() {
   run grep -c "cleat-gw-" "$DOCKER_CALLS"
   assert_output "0"
 }
+
+# ── The start path (8.7) ────────────────────────────────────────────────────
+
+# A caged box and its gateway, both stopped, whose bind sources are intact:
+# cmd_start and cmd_resume take the docker start branch.
+stopped_caged() {
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  mock_docker_images "cleat"
+  _host_clip_cmd() { echo ""; }
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _settings_overlay_intact() { return 0; }
+  _container_bind_sources_present() { return 0; }
+  _history_bind_in_session_dir() { return 1; }
+  _resolve_config_drift() { true; }
+  exec_claude() { true; }
+}
+
+@test "egress: cleat start on a stopped caged box starts the gateway before the box" {
+  stopped_caged
+  F_HEALTH_SEQ="starting healthy" caged_box
+  run cmd_start "$TEST_TEMP/project"
+  assert_success
+  local g b
+  g="$(grep -n "^docker start $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  b="$(grep -n "^docker start $CN\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  [ -n "$g" ] && [ -n "$b" ] && [ "$g" -lt "$b" ]
+  # The policy was rendered before the gateway started: its bind source.
+  [ -f "$(_egress_policy_dir "$CN")/policy.json" ]
+}
+
+@test "egress: cleat resume on a stopped caged box starts the gateway before the box" {
+  stopped_caged
+  F_HEALTH_SEQ="starting healthy" caged_box
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  local g b
+  g="$(grep -n "^docker start $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  b="$(grep -n "^docker start $CN\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  [ -n "$g" ] && [ -n "$b" ] && [ "$g" -lt "$b" ]
+}
+
+@test "egress: a missing gateway refuses cleat start and names egress restart" {
+  stopped_caged
+  caged_box
+  container_exists() { [ "$1" != "$GW" ]; }
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "its gateway is missing"
+  assert_output --partial "cleat egress restart"
+  run grep -c "^docker start " "$DOCKER_CALLS"
+  assert_output "0"
+  # Never recreated in its place.
+  run docker_run_line_for "$GW"
+  assert_output ""
+}
+
+@test "egress: cleat start leaves a box that never had a gateway to check one" {
+  stopped_caged
+  F_HASH="" caged_box
+  container_exists() { [ "$1" != "$GW" ]; }
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "created before its egress policy"
+  refute_output --partial "cleat egress restart"
+  run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c "^docker start cleat-gw-" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress: cleat claude never starts a gateway stopped under a running box" {
+  stopped_caged
+  F_GW="false|gateway|$BH" caged_box
+  is_running() { [ "$1" = "$CN" ]; }
+  run cmd_claude "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "gateway is missing, stopped or not this box's"
+  run grep -c "^docker start " "$DOCKER_CALLS"
+  assert_output "0"
+}

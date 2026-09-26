@@ -15008,6 +15008,22 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_stop_presence_gate" "rm and stop add no docker call for a box with no rendered policy" "$CLI" "$EGRESS_GATEWAY_BATS"
 
+# The start path (8.7): the gateway starts before its box, and a missing one
+# is refused, never made anew.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /^        _egress_start_gateway "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_start_gateway_first" "cleat start on a stopped caged box starts the gateway before the box" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_start_gateway()/,/^}$/{
+  s@^  if ! container_exists "[$]gw"; then$@  if false; then@
+}
+SED
+try "vnext_egress_start_never_recreates" "a missing gateway refuses cleat start and names egress restart" "$CLI" "$EGRESS_GATEWAY_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

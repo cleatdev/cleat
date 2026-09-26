@@ -10633,6 +10633,41 @@ _egress_wait_healthy() {                 # <cname> <gateway>
   _egress_poll_healthy "$2"
 }
 
+# Starts a caged box's stopped gateway ahead of the box's own docker start
+# (8.7), and never makes one: a gateway that has gone is a refusal, so a box
+# can never come back up with a fresh, unexamined gateway. The policy is
+# rendered first, from this call's resolution: it may have changed while the
+# box was stopped, and it is the gateway's bind source, which Docker would
+# otherwise make as a root-owned directory. A box with no egress label is not
+# this function's to judge: the gate refuses it once it is up. Prints its own
+# refusal. Called guarded, so every step is checked by hand.
+_egress_start_gateway() {                # <cname>
+  local cname="$1" gw
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in strict|open) ;; *) return 0 ;; esac
+  _egress_label_read "$cname" sh.cleat.egress-hash || return 0
+  [ "$_EG_LABEL_SET" = 1 ] || return 0
+  gw="$(_egress_gateway_name "$cname")"
+  if ! container_exists "$gw"; then
+    _egress_refuse gateway "its gateway is missing, so it has no egress at all." "${BOLD}cleat egress restart${RESET}"
+    return 1
+  fi
+  if ! _egress_render_policy "$cname" "$_EG_MODE" "$_EG_HOSTS"; then
+    _egress_refuse gateway "cleat could not write the policy its gateway reads." "${BOLD}cleat egress restart${RESET}"
+    return 1
+  fi
+  if ! is_running "$gw" && ! docker start "$gw" >/dev/null 2>&1; then
+    _egress_refuse gateway "its gateway did not start." "${BOLD}cleat egress restart${RESET}"
+    return 1
+  fi
+  if ! _egress_poll_healthy "$gw"; then
+    _egress_refuse gateway "its gateway did not become healthy." "${BOLD}cleat egress restart${RESET}"
+    return 1
+  fi
+  return 0
+}
+
 # One word for the gateway of a box (8.10): missing, stopped, orphaned,
 # displaced or healthy. Gateway health is never box liveness, so the orphan
 # check answers before the socket check. A gateway that cannot answer reads as
@@ -17814,6 +17849,9 @@ cmd_start() {
         # ~/.claude.json while it is safely stopped (docker start re-resolves
         # the bind source). See _refresh_project_claude_json.
         _refresh_project_claude_json "$project" "$box"
+        # A caged box's gateway first, so its relay's first heartbeat meets a
+        # serving gateway (8.7). Before the spinner: it may refuse.
+        _egress_start_gateway "$cname" || exit 1
         spin "Starting container..."
         local _docker_err="/tmp/cleat-err.$$"
         local start_rc=0
@@ -17944,6 +17982,7 @@ cmd_resume() {
         # Same stopped-container refresh as cmd_start: fold in host changes and
         # logins from other boxes before the bind source is re-resolved.
         _refresh_project_claude_json "$project" "$box"
+        _egress_start_gateway "$cname" || exit 1
         local _docker_err="/tmp/cleat-err.$$"
         local resume_rc=0
         docker start "$cname" > /dev/null 2>"$_docker_err" || resume_rc=$?

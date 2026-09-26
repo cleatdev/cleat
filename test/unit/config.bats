@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 load "../setup"
+load "../lib/egress_fixtures"
 
 setup() {
   _common_setup
@@ -1475,4 +1476,136 @@ EOF
   local a
   a="$(compute_config_fingerprint "$TEST_TEMP")"
   [ "$(CLEAT_EGRESS_ALLOW_HOOKS=1 compute_config_fingerprint "$TEST_TEMP")" = "$a" ]
+}
+
+# v1.5.4's _resolve_config_drift, copied literally. For a box with egress off,
+# the shipped function prints exactly what this printed and makes exactly its
+# docker calls, on every exit.
+_drift_v154() {
+  local cname="$1"
+  local project="${2:-}"
+
+  container_exists "$cname" || return 0
+
+  local stored_hash current_hash
+  stored_hash="$(_container_config_hash "$cname")"
+  [[ "$stored_hash" == "v${_CONFIG_FP_VERSION}:"* ]] || return 0
+  current_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project")"
+  [[ "$stored_hash" == "$current_hash" ]] && return 0
+
+  if _is_tty; then
+    info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created: its capabilities, environment, or resource limits differ from your current setup"
+    local yn=""
+    _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
+    if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+      info "Recreating container..."
+      if is_running "$cname"; then
+        docker stop "$cname" > /dev/null 2>&1 || true
+      fi
+      docker rm -f "$cname" > /dev/null 2>&1 || true
+      _account_wipe_run_dir "${cname}"
+      success "Removed ${BOLD}${cname}${RESET}."
+      return 0
+    fi
+    info "Skipped. Keeping existing container. Run ${BOLD}cleat rm && cleat${RESET} when ready."
+    return 0
+  fi
+
+  info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created. Recreate to apply: ${BOLD}cleat rm && cleat${RESET}"
+}
+
+# Both drift functions over one fixture, on every exit: a match, a drift on a
+# terminal answered yes and no, a drift off a terminal. Fails naming the case.
+_drift_matches_v154() {                  # <cname>
+  local fp stored tty ans new old cnew cold
+  fp="v2:$(compute_config_fingerprint "$TEST_TEMP")"
+  for stored in "$fp" "v2:old"; do
+    for tty in 0 1; do
+      for ans in y n; do
+        eval "_container_config_hash() { echo '$stored'; }"
+        if [ "$tty" = 1 ]; then _is_tty() { return 0; }; else _is_tty() { return 1; }; fi
+        : > "$DOCKER_CALLS"
+        new="$(_resolve_config_drift "$1" "$TEST_TEMP" <<< "$ans" 2>&1)"
+        cnew="$(cat "$DOCKER_CALLS")"
+        : > "$DOCKER_CALLS"
+        old="$(_drift_v154 "$1" "$TEST_TEMP" <<< "$ans" 2>&1)"
+        cold="$(cat "$DOCKER_CALLS")"
+        if [ "$new" != "$old" ] || [ "$cnew" != "$cold" ]; then
+          echo "differs: stored=$stored tty=$tty answer=$ans"
+          printf 'v1.5.4:\n%s\n%s\nnow:\n%s\n%s\n' "$old" "$cold" "$new" "$cnew"
+          return 1
+        fi
+      done
+    done
+  done
+}
+
+@test "config: with egress off the drift advisory is byte-identical to v1.5.0" {
+  ACTIVE_CAPS=(git)
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  # Before and after enforcement ships, with no egress section anywhere.
+  _EGRESS_ENFORCING=0
+  run _drift_matches_v154 cleat-foo-1a2b3c4d
+  assert_success
+  _EGRESS_ENFORCING=1
+  run _drift_matches_v154 cleat-foo-1a2b3c4d
+  assert_success
+}
+
+@test "config: the egress facts enter the fingerprint only under live enforcement" {
+  ACTIVE_CAPS=(git)
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _is_tty() { return 1; }
+  local cn=cleat-foo-1a2b3c4d plain caged
+  plain="v2:$(compute_config_fingerprint "$TEST_TEMP" "$cn")"
+  caged="v2:$(_EGRESS_FP_CAGED=1 compute_config_fingerprint "$TEST_TEMP" "$cn")"
+  [ "$plain" != "$caged" ]
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  # A policy saved before enforcement ships moves nothing.
+  eval "_container_config_hash() { echo '$plain'; }"
+  _EGRESS_ENFORCING=0
+  run _resolve_config_drift "$cn" "$TEST_TEMP"
+  assert_output ""
+  # The upgrade that cages the box is the one drift it meets.
+  _EGRESS_ENFORCING=1
+  run _resolve_config_drift "$cn" "$TEST_TEMP"
+  assert_output --partial "Config changed"
+  # Once caged, a policy edit is a reload and never a recreate.
+  eval "_container_config_hash() { echo '$caged'; }"
+  run _resolve_config_drift "$cn" "$TEST_TEMP"
+  assert_output ""
+  printf '[egress]\nmode = strict\nallow = docs.example.test\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _resolve_config_drift "$cn" "$TEST_TEMP"
+  assert_output ""
+  # A create-time fact is drift: a gateway spec the box was not made for.
+  _GATEWAY_SPEC_VERSION=99
+  run _resolve_config_drift "$cn" "$TEST_TEMP"
+  assert_output --partial "Config changed"
+}
+
+@test "config: a caged box whose policy is gone is left to the gate, never recreated uncaged" {
+  # The default-yes recreate would bring it back with a normal network, unasked.
+  ACTIVE_CAPS=(git)
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _is_tty() { return 0; }
+  _EGRESS_ENFORCING=1
+  local cn=cleat-foo-1a2b3c4d caged
+  caged="v2:$(_EGRESS_FP_CAGED=1 compute_config_fingerprint "$TEST_TEMP" "$cn")"
+  eval "_container_config_hash() { echo '$caged'; }"
+  mkdir -p "$(_egress_policy_dir "$cn")"
+  mock_docker_inspect_field "$cn" "$T_HASH" "LABEL=v1:0123456789abcdef"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  run _resolve_config_drift "$cn" "$TEST_TEMP" <<< "y"
+  assert_success
+  assert_output ""
+  run grep -c "^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
+  # A box that never carried the label drifts as it always did.
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  mock_docker_inspect_field "$cn" "$T_HASH" ""
+  run _resolve_config_drift "$cn" "$TEST_TEMP" <<< "n"
+  assert_output --partial "Config changed"
 }

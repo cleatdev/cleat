@@ -14828,6 +14828,56 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_create_label_round_trip" "the label the create path writes is the one the gate accepts" "$CLI" "$EGRESS_GATEWAY_BATS"
 
+# The fourth fingerprint block (5.5, ruling 1).
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@^  _EGRESS_FP_CAGED=0$@  _EGRESS_FP_CAGED=1@
+}
+SED
+try "vnext_config_drift_unchanged" "with egress off the drift advisory is byte-identical to v1.5.0" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@^  if \[ "[$]_EGRESS_ENFORCING" = 1 \]; then$@  if true; then@
+}
+SED
+try "vnext_config_fp_live_only" "the egress facts enter the fingerprint only under live enforcement" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^compute_config_fingerprint()/,/^}$/{
+  s@^  if \[\[ "[$]{_EGRESS_FP_CAGED:-0}" == 1 \]\]; then$@  if false; then@
+}
+SED
+try "vnext_config_fp_block" "the egress facts enter the fingerprint only under live enforcement" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@^  if \[ "[$]_EGRESS_FP_CAGED" = 0 \] && \[ -d@  if false \&\& [ -d@
+}
+SED
+try "vnext_config_drift_no_downgrade" "a caged box whose policy is gone is left to the gate" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@ && \[ -d "[$](_egress_policy_dir "[$]cname")" \] \\$@ \\@
+}
+SED
+try "vnext_config_drift_off_no_read" "with egress off the drift advisory is byte-identical to v1.5.0" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^  _EGRESS_FP_CAGED="[$]_eg_caged"$@  _EGRESS_FP_CAGED=0@
+}
+SED
+try "vnext_config_fp_caged_at_create" "config hash carries its five egress facts" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^compute_config_fingerprint()/,/^}$/{
+  s@_egress_create_facts "[$]_fp_cname" none@_egress_create_facts "$_fp_cname" "$_GATEWAY_IMAGE"@
+}
+SED
+try "vnext_egress_fp_excludes_gateway_digest" "a gateway image rebuild forced every box to be recreated" "$CLI"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

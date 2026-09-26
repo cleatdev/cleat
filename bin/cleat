@@ -5903,8 +5903,17 @@ _EGRESS_HASH_VERSION=1
 # false recreate prompt on a box the user never touched. The stored hash carries a
 # format-version prefix (_CONFIG_FP_VERSION) so a future formula change is
 # detectable rather than silently mistaken for real drift; see _resolve_config_drift.
+#
+# Egress (EGRESS-SPEC.md 5.5): a box under live enforcement adds a fourth block,
+# its five create-time facts, so a change to one of them is drift. Whether this
+# box is caged reaches here as _EGRESS_FP_CAGED, which each caller sets at
+# statement position on every call: this runs inside $(...), where no policy may
+# be resolved. Every other box hashes exactly what it always did, and the format
+# version does not move.
+_EGRESS_FP_CAGED=0
 compute_config_fingerprint() {
   local project="${1:-}"
+  local _fp_cname="${2:-}"
   local fingerprint_input=""
 
   # Caps (sorted)
@@ -5940,6 +5949,11 @@ compute_config_fingerprint() {
   fingerprint_input+=$'\n'
   fingerprint_input+="resources:cpus=$(_configured_box_cpus "$project" "${_BOX:-main}")"
   fingerprint_input+=$'\n'
+
+  if [[ "${_EGRESS_FP_CAGED:-0}" == 1 ]]; then
+    [[ -n "$_fp_cname" ]] || _fp_cname="$(container_name_for "$project" "${_BOX:-main}")"
+    fingerprint_input+="$(_egress_create_facts "$_fp_cname" none "$(_egress_capdrop_canon "$_EGRESS_BOX_CAPDROP")" "$(_egress_hooks_fact)")"$'\n'
+  fi
 
   if command -v sha256sum &>/dev/null; then
     echo -n "$fingerprint_input" | sha256sum | head -c 16
@@ -6573,14 +6587,29 @@ _notice_box() {
 _resolve_config_drift() {
   local cname="$1"
   local project="${2:-}"
+  _EGRESS_FP_CAGED=0
 
   container_exists "$cname" || return 0
 
   local stored_hash current_hash
   stored_hash="$(_container_config_hash "$cname")"
   [[ "$stored_hash" == "v${_CONFIG_FP_VERSION}:"* ]] || return 0
-  current_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project")"
+  # Caged under live enforcement: the fingerprint carries the egress facts.
+  _egress_resolve "$cname"
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    case "$_EG_MODE" in strict|open) _EGRESS_FP_CAGED=1 ;; esac
+  fi
+  current_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project" "$cname")"
   [[ "$stored_hash" == "$current_hash" ]] && return 0
+  # A caged box whose policy no longer resolves drifts too, and the default-yes
+  # recreate below would bring it back with a normal network, unasked. Leave it
+  # to the gate, which refuses it and names cleat egress off (5.6). Only a box
+  # with a rendered policy on this host is read, so an off machine gains no
+  # docker call here.
+  if [ "$_EGRESS_FP_CAGED" = 0 ] && [ -d "$(_egress_policy_dir "$cname")" ] \
+     && _egress_label_read "$cname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then
+    return 0
+  fi
 
   if _is_tty; then
     info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created: its capabilities, environment, or resource limits differ from your current setup"
@@ -17350,7 +17379,8 @@ cmd_run() {
   # ── Compute config fingerprint and store as label, prefixed with the storage
   # format version so a later formula change is detectable (see _CONFIG_FP_VERSION).
   local config_hash
-  config_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project")"
+  _EGRESS_FP_CAGED="$_eg_caged"
+  config_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project" "$cname")"
 
   local label_args=(
     --label "sh.cleat.config-hash=$config_hash"

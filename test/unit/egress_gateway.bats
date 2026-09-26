@@ -606,3 +606,15 @@ caged_create() {
   run _egress_require "$CN" start
   assert_success
 }
+
+@test "egress gateway: a caged box's config hash carries its five egress facts" {
+  caged_create
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local want plain
+  want="$(_EGRESS_FP_CAGED=1 compute_config_fingerprint "$TEST_TEMP/project" "$CN")"
+  plain="$(_EGRESS_FP_CAGED=0 compute_config_fingerprint "$TEST_TEMP/project" "$CN")"
+  [ "$want" != "$plain" ]
+  run assert_docker_run_has "$CN" "--label sh.cleat.config-hash=v2:$want "
+  assert_success
+}

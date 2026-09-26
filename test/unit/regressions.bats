@@ -10098,3 +10098,37 @@ _caged_run_setup() {
   assert_success
   [ ! -e "$CLEAT_RUN_DIR/$CN/egress/creating" ]
 }
+
+@test "regression vNEXT: adding egress changed config drift for boxes with no policy" {
+  # A box turned off on its own under a machine-wide policy has no policy. Its
+  # fingerprint is the one it was created with, so no recreate prompt, and the
+  # drift check reads nothing of egress from Docker.
+  ACTIVE_CAPS=(git)
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _is_tty() { return 0; }
+  _EGRESS_ENFORCING=1
+  local cn=cleat-foo-1a2b3c4d stored
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")" "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/$cn"
+  stored="v2:$(compute_config_fingerprint "$TEST_TEMP" "$cn")"
+  eval "_container_config_hash() { echo '$stored'; }"
+  run _resolve_config_drift "$cn" "$TEST_TEMP" <<< "y"
+  assert_success
+  assert_output ""
+  run cat "$DOCKER_CALLS"
+  assert_output ""
+}
+
+@test "regression vNEXT: a gateway image rebuild forced every box to be recreated" {
+  # A CVE rebuild moves the gateway digest. Neither the fingerprint nor the
+  # create-time label may move with it, or every caged box would be recreated.
+  ACTIVE_CAPS=(git)
+  local cn=cleat-foo-1a2b3c4d fp label
+  fp="$(_EGRESS_FP_CAGED=1 compute_config_fingerprint "$TEST_TEMP" "$cn")"
+  label="$(_egress_create_digest "$cn" none CAP_NET_RAW 0)"
+  _GATEWAY_IMAGE="ghcr.io/cleatdev/cleat-gw@sha256:$(printf '%064d' 7)"
+  [ "$(_EGRESS_FP_CAGED=1 compute_config_fingerprint "$TEST_TEMP" "$cn")" = "$fp" ]
+  [ "$(_egress_create_digest "$cn" none CAP_NET_RAW 0)" = "$label" ]
+}

@@ -72,6 +72,12 @@ _EGRESS_CATALOGUE_REV=1
 # class letter: an unrecognised class has one safe reading, which is never
 # ticked and never rendered as a class word (7.1).
 _EGRESS_CLASS_UNKNOWN="unaudited"
+# The egress gateway image (8.0), pinned by multi-arch index digest and never
+# by tag. Published by .github/workflows/publish-gateway.yml. A rebuild for a
+# base security advisory moves this digest and leaves _GATEWAY_SPEC_VERSION
+# alone, so it recreates no box. A caged box keeps the image it was created
+# with until it is next created.
+_GATEWAY_IMAGE="ghcr.io/cleatdev/cleat-gw@sha256:c74410085ea86b31b5b3b516fc93a0eb2adbc6c374dfb68139d117147e7faa49"
 # The gateway's spec integer (8.0), one of the five create-time facts in a
 # caged box's hash. It moves when the gateway's contract with the box changes
 # and never on an image rebuild, or one CVE rebuild would demand a recreate of
@@ -87,6 +93,7 @@ _EGRESS_DENIALS_MAX_BYTES=1048576 # 8.4, rendered into policy.json
 _EGRESS_PROBE_BOUND_S=8           # 8.2, 8.5, the bound on one gateway docker exec or inspect
 _EGRESS_MAX_TUNNELS=256           # 8.6, rendered into policy.json
 _EGRESS_HANDSHAKE_TIMEOUT_S=20    # 4.5, the ClientHello deadline, rendered into policy.json
+_EGRESS_PULL_BOUND_S=300          # 8.0, the bound on the one gateway image pull
 # Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
 # existed, so they carry no spec label): their content is inferred from the
 # version they were built at. v0.16.3 was the LAST docker/ content change before
@@ -10564,6 +10571,27 @@ _egress_create_marker_fresh() {          # <cname>
 _egress_wait_healthy() {                 # <cname> <gateway>
   _egress_create_marker_fresh "$1" || return 1
   _egress_poll_healthy "$2"
+}
+
+# ── The gateway image (8.0) ──
+# Made local before anything of a caged box is created, so a slow first pull
+# cannot spend the create window another terminal's sweep reads. An image that
+# is already here costs no network call at all. On a miss, one pull pinned to
+# the daemon's architecture, as the box image's pull is. A failed pull refuses
+# with the gateway code and names the image: never a box without a gateway.
+_egress_gateway_image_ensure() {
+  local arch platform_args=() rc=0
+  docker image inspect "$_GATEWAY_IMAGE" >/dev/null 2>&1 && return 0
+  arch="$(_daemon_arch)"
+  [ -n "$arch" ] && platform_args=(--platform "linux/${arch}")
+  info "Pulling the egress gateway image ${DIM}(${_GATEWAY_IMAGE%%@*}${arch:+, ${arch}})${RESET}"
+  _run_bounded "$_EGRESS_PULL_BOUND_S" docker pull "${platform_args[@]+"${platform_args[@]}"}" "$_GATEWAY_IMAGE" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    _egress_refuse gateway "the egress gateway image could not be pulled: ${_GATEWAY_IMAGE}" \
+      "check the network and that Docker can reach ghcr.io, then re-run cleat"
+    return 1
+  fi
+  success "Egress gateway image ready ${DIM}(${_GATEWAY_IMAGE%%@*})${RESET}"
 }
 
 # ── The rendered policy (8.2) ──

@@ -485,6 +485,16 @@ count_calls() { grep -cF -- "$1" "$DOCKER_CALLS" || true; }
   [ "$(_egress_create_digest "$CN" none CAP_NET_RAW 0)" = "$a" ]
 }
 
+@test "egress fingerprint: the gateway digest is not in the create-time hash and the gateway spec version is" {
+  local a
+  a="$(_egress_create_digest "$CN" none CAP_NET_RAW 0)"
+  # A rebuild for a base advisory moves the digest and must recreate no box.
+  _GATEWAY_IMAGE="ghcr.io/cleatdev/cleat-gw@sha256:$(printf '%064d' 7)"
+  [ "$(_egress_create_digest "$CN" none CAP_NET_RAW 0)" = "$a" ]
+  _GATEWAY_SPEC_VERSION=$(( _GATEWAY_SPEC_VERSION + 1 ))
+  [ "$(_egress_create_digest "$CN" none CAP_NET_RAW 0)" != "$a" ]
+}
+
 @test "egress require: the gateway spec version is in the create-time hash" {
   local a
   a="$(_egress_create_digest "$CN" none CAP_NET_RAW 0)"

@@ -14356,6 +14356,31 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_widening_notice" "a narrowing since the last launch is silent" "$CLI" "$EGRESS_UI_BATS"
 
+# ── Egress stage three ──
+# A gateway image rebuild moves the digest, never the create-time hash (8.0).
+cat > "$SED_TMP" << 'SED'
+/^_egress_create_facts()/,/^}$/{
+  s|"[$]_GATEWAY_SPEC_VERSION"|"$_GATEWAY_IMAGE"|
+}
+SED
+try "vnext_egress_hash_excludes_gateway_digest" "the gateway digest is not in the create-time hash and the gateway spec version is" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A present gateway image costs no network call.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_image_ensure()/,/^}$/{
+  /docker image inspect "\$_GATEWAY_IMAGE" >\/dev\/null 2>&1 && return 0/d
+}
+SED
+try "vnext_egress_gateway_image_cached" "a present gateway image produces no pull" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# A failed pull refuses, never a box without a gateway.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_image_ensure()/,/^}$/{
+  s@^  if \[ "\$rc" -ne 0 \]; then@  if false; then@
+}
+SED
+try "vnext_egress_gateway_image_refuses" "a missing gateway image refuses the launch and names the image" "$CLI" "$EGRESS_GATEWAY_BATS"
+
 # ── Hostile review fixes, 2026-09-26 ──
 # A workspace of / contains every path: the stripped prefix is what makes the
 # pattern match.

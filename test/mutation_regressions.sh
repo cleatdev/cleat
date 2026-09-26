@@ -13976,7 +13976,7 @@ try "vnext_egress_namespaces_asserted" "IpcMode private passes and IpcMode host 
 # Assertion 7, a suffix test on =unconfined.
 cat > "$SED_TMP" << 'SED'
 /^_egress_box_shape()/,/^}$/{
-  s@    "?"|\*'=unconfined"'\*)@    "?")@
+  s@    "?"|\*'=unconfined"'\*|\*':unconfined"'\*)@    "?"|*':unconfined"'*)@
 }
 SED
 try "vnext_egress_seccomp_asserted" "seccomp unconfined refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
@@ -14008,7 +14008,7 @@ try "vnext_egress_docker_sock_asserted" "a docker socket mount refuses" "$CLI" "
 # Assertion 17: narrowed to an exact equality, a path under the directory passes.
 cat > "$SED_TMP" << 'SED'
 /^_egress_box_shape()/,/^}$/{
-  s@    case "\$_d" in /etc/cleat-egress|/etc/cleat-egress/\*)@    case "$_d" in /etc/cleat-egress)@
+  s@^      /etc/cleat-egress|/etc/cleat-egress/\*)@      /etc/cleat-egress)@
 }
 SED
 try "vnext_egress_policy_not_in_box" "no box mount lands on the gateway policy directory" "$CLI" "$EGRESS_REQUIRE_BATS"
@@ -14207,7 +14207,7 @@ try "vnext_egress_hooks_escape" "an active policy refuses the hooks capability u
 # A policy inside the cage is not a policy.
 cat > "$SED_TMP" << 'SED'
 /^_egress_require()/,/^}$/{
-  s@^  if ! _egress_config_is_containable "\$_ws"; then@  if false; then@
+  s@^  if ! _egress_policy_containable "\$_c" "\$_ws"; then@  if false; then@
 }
 SED
 try "vnext_egress_containment_gated" "a config directory inside the box's workspace refuses" "$CLI" "$EGRESS_REQUIRE_BATS"

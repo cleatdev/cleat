@@ -3439,12 +3439,13 @@ allow = registry.npmjs.org"
   cat > "$TEST_TEMP/netbin/curl" <<'SH'
 #!/usr/bin/env bash
 out="" hdr="" host="" ver=1.1 url=""
+printf '%s\n' "$*" >> "${CURL_ARGS_LOG:-/dev/null}"
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -D) hdr="$2"; shift 2 ;;
     -H) host="${2#Host: }"; shift 2 ;;
-    -w|--max-time|--proto) shift 2 ;;
+    -w|--max-time|--proto|--max-filesize) shift 2 ;;
     --http2) ver=2; shift ;;
     --http1.1) ver=1.1; shift ;;
     https://*) url="$1"; shift ;;
@@ -3472,10 +3473,14 @@ case "$1" in
 esac
 SH
   chmod +x "$TEST_TEMP/netbin/curl" "$TEST_TEMP/netbin/openssl"
+  export CURL_ARGS_LOG="$TEST_TEMP/curl.args"
   PATH="$TEST_TEMP/netbin:$PATH" run cleat_bin egress audit docs.example.test < /dev/null
   assert_success
   refute_output --partial "unbound variable"
   assert_output --partial "contained"
   assert_output --partial "h1+h2"
   assert_output --partial "www.example.test"
+  # A remote body is bounded before it is read into one line.
+  run grep -c -- "--max-filesize 1048576" "$CURL_ARGS_LOG"
+  refute_output "0"
 }

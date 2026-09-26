@@ -14419,6 +14419,92 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_seccomp_colon" "a colon separated unconfined profile refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
 
+# ── Hostile review 2 fixes, 2026-09-26 ──
+# Every drawn line is cut to the terminal, so a wrap never desyncs the redraw.
+cat > "$SED_TMP" << 'SED'
+/^_egress_line()/,/^}$/{
+  /^  t="\${t:0:\$w}"$/d
+}
+SED
+try "vnext_egress_editor_fit" "no drawn line is wider than the terminal" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_draw()/,/^}$/{
+  /^      line="\${line:0:\$w}"$/d
+}
+SED
+try "vnext_egress_pack_row_fit" "no drawn line is wider than the terminal" "$CLI" "$EGRESS_UI_BATS"
+
+# The ring's open is never written.
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_screen()/,/^}$/{
+  s@^  if \[ "\$mode_out" = open \]; then@  if false; then@
+}
+SED
+try "vnext_egress_ring_open_not_saved" "landing on open in the global editor does not write mode open" "$CLI" "$EGRESS_UI_BATS"
+
+# The ring's off never commits on a default answer.
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_screen()/,/^}$/{
+  s@^  if \[ "\$mode_out" = off \]; then@  if false; then@
+}
+SED
+try "vnext_egress_ring_off_confirms" "landing on off does not write a policy on a default answer" "$CLI" "$EGRESS_UI_BATS"
+
+# A stranger's page is judged by its body, not by whether it has a title.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_audit()/,/^}$/{
+  s@cut -d'|' -f5)"       # the body length@cut -d'|' -f7)"@
+}
+SED
+try "vnext_egress_audit_titleless_page" "a stranger's page with no title still needs a person" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_audit()/,/^}$/{
+  s@^  if \[ "\$host" = "\$_EGRESS_AUDIT_FOREIGN" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_audit_self" "the probe origin is never audited against itself" "$CLI" "$EGRESS_UI_BATS"
+
+# Only a terminal is a person typing: a name on a pipe meets the origin gate.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_audit()/,/^}$/{
+  s@^    \[\[ -t 0 \]\] && typed=1@    typed=1@
+}
+SED
+try "vnext_egress_audit_pipe_not_typed" "a denied hostname is never dialled from the host" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_audit_fetch()/,/^}$/{
+  /--max-filesize "\$_EGRESS_AUDIT_MAX_BODY"/d
+}
+SED
+try "vnext_egress_audit_max_body" "cleat egress audit classifies a host under strict mode" "$CLI" "$SMOKE_BATS"
+
+# An off launch clears the record, so the launch after it is no widening.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_row()/,/^}$/{
+  /rm -f "\$(_egress_ledger_path "\$_c")"/d
+}
+SED
+try "vnext_egress_ledger_off_clears" "a launch under off leaves no record for the next launch to widen from" "$CLI" "$EGRESS_UI_BATS"
+
+# --inherit deletes, so it never rides along with a reading verb, and a file
+# that does not parse can still be dropped.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress()/,/^}$/{
+  s@^    if \[\[ "\$sub" != editor || "\$want_list" -eq 1 \]\]; then@    if false; then@
+}
+SED
+try "vnext_egress_inherit_stands_alone" "drops a box file that does not parse, and stands alone" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_inherit()/,/^}$/{
+  s@^  if ! ( _egress_resolve "\$cname" ) >/dev/null 2>&1; then@  if false; then@
+}
+SED
+try "vnext_egress_inherit_malformed" "drops a box file that does not parse, and stands alone" "$CLI" "$EGRESS_UI_BATS"
+
 # ── cleat egress audit (7.1, 4.4a) ──
 # A name off a denial row was chosen by the box: it is never dialled from the
 # host until a person retypes it.
@@ -14472,9 +14558,7 @@ try "vnext_egress_audit_no_ref" "with no probe origin nothing can be called cont
 
 # The address classifier names what the gateway refuses.
 cat > "$SED_TMP" << 'SED'
-/^_egress_address_special()/,/^}$/{
-  /\[ "\$o1" -eq 192 \] && \[ "\$o2" -eq 168 \] && return 0/d
-}
+s@ 192\.168\.0\.0/16 @ @
 SED
 try "vnext_egress_audit_private_address" "an address the gateway refuses is named" "$CLI" "$EGRESS_UI_BATS"
 

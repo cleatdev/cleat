@@ -1815,6 +1815,58 @@ def _():
         shutil.rmtree(home, ignore_errors=True)
 
 
+@row("the audit's address rule in bin/cleat agrees with the gateway's, address for address")
+def _():
+    # cleat egress audit tells the user whether the gateway would dial the
+    # address a name resolved to. That is only true while the two rules agree,
+    # so both classify the same addresses: every range edge and its
+    # neighbours, the mapped forms, and a seeded random spread.
+    import ipaddress
+    cli_path = os.path.join(HERE, "..", "..", "bin", "cleat")
+    probe = subprocess.run([sys.executable, "-c",
+                            "import sys; sys.path.insert(0, sys.argv[1]); import gateway; "
+                            "print('\\n'.join('1' if gateway.address_allowed(a) else '0' for a in sys.stdin.read().split()))",
+                            os.path.dirname(SOURCE)], input="", capture_output=True, text=True, timeout=60)
+    check(probe.returncode == 0, "the gateway module did not import: %s" % probe.stderr.strip())
+    addrs = set()
+    for net in ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+                "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
+                "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+                "255.255.255.255/32"):
+        n = ipaddress.IPv4Network(net)
+        for v in (int(n.network_address) - 1, int(n.network_address), int(n.broadcast_address),
+                  int(n.broadcast_address) + 1):
+            if 0 <= v < 2 ** 32:
+                addrs.add(str(ipaddress.IPv4Address(v)))
+    rnd = random.Random(20260926)
+    for _ in range(3000):
+        addrs.add(str(ipaddress.IPv4Address(rnd.getrandbits(32))))
+    for a in list(addrs)[:200]:
+        addrs.add("::ffff:" + a)
+    addrs.update(("::1", "fd00::1", "2606:4700::1111", "::"))
+    order = sorted(addrs)
+    gw = subprocess.run([sys.executable, "-c",
+                         "import sys; sys.path.insert(0, sys.argv[1]); import gateway; "
+                         "print('\\n'.join('1' if gateway.address_allowed(a) else '0' for a in sys.stdin.read().split()))",
+                         os.path.dirname(SOURCE)], input="\n".join(order), capture_output=True, text=True, timeout=120)
+    check(gw.returncode == 0, "gateway classification failed: %s" % gw.stderr.strip())
+    home = tempfile.mkdtemp(prefix="gwaddr", dir="/tmp")
+    try:
+        cli = subprocess.run(["bash", "-c",
+                              'source "$1"; while IFS= read -r a; do '
+                              'if _egress_address_special "$a"; then echo 0; else echo 1; fi; done', "_", cli_path],
+                             input="\n".join(order) + "\n", capture_output=True, text=True, timeout=300,
+                             env={"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+    check(cli.returncode == 0, "the CLI classification failed: %s" % cli.stderr.strip())
+    g = gw.stdout.split()
+    c = cli.stdout.split()
+    check(len(g) == len(order) and len(c) == len(order), "answer counts differ")
+    bad = ["%s gateway=%s cli=%s" % (a, x, y) for a, x, y in zip(order, g, c) if x != y]
+    check(not bad, "the CLI and the gateway disagree on %d addresses:\n%s" % (len(bad), "\n".join(bad[:20])))
+
+
 # -- the fuzz row ---------------------------------------------------------------
 
 def _mutate(rnd, seed):

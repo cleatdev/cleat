@@ -9880,8 +9880,13 @@ _c19_star_project() {
   assert_failure
   assert_output --partial "came from inside the box"
   [ ! -e "$TEST_TEMP/dialled" ]
-  # The same name typed at the prompt is the user's, and it is dialled.
+  # A name arriving on a pipe is a program's, not a person's: refused too.
   PATH="$TEST_TEMP/dialbin:$PATH" run cmd_egress audit <<< "k5rw.exfil.example"
+  assert_failure
+  assert_output --partial "came from inside the box"
+  [ ! -e "$TEST_TEMP/dialled" ]
+  # A name no box chose goes through, on the command line or a pipe.
+  PATH="$TEST_TEMP/dialbin:$PATH" run cmd_egress audit <<< "docs.example.test"
   [ -s "$TEST_TEMP/dialled" ]
 }
 

@@ -360,12 +360,56 @@ mode = strict"
 
 @test "egress typed picker: ticks, adds, sets the mode and saves on done" {
   mkdir -p "$CLEAT_CONFIG_DIR"
-  run _egress_picker_text "" <<< $'npm\ndocs.rs\nmode open\ndone'
+  run _egress_picker_text "" <<< $'npm\ndocs.rs\nmode off\nmode strict\ndone'
   assert_success
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
-  assert_output "mode = open
+  assert_output "mode = strict
 pack = npm
 allow = docs.rs"
+}
+
+@test "egress ring: landing on open in the global editor does not write mode open" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  run _egress_picker_text "" <<< $'mode open\ndone'
+  assert_output --partial "Open is per box and per session"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict"
+  # The drawn ring: open shows its two lines and a save keeps the mode before it.
+  _egress_editor_load ""
+  _egress_mode_step 1
+  [ "$_EGE_MODE" = open ]
+  run _egress_pane_text mode
+  assert_output --partial "cleat egress open <box>"
+  assert_output --partial "keeps mode strict"
+  run _egress_save_screen 1
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict"
+}
+
+@test "egress ring: landing on off does not write a policy on a default answer" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  _egress_mode_step -1
+  [ "$_EGE_MODE" = off ]
+  # Enter, even from the typed form's done, never turns it off.
+  run _egress_save_screen 1 <<< ""
+  assert_failure
+  assert_output --partial "Turn it off? [y/N]"
+  refute_output --partial "Allowed   9 hosts"
+  refute_output --partial "port 443 only"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict
+pack = npm"
+  # And nothing claims Saved before the answer.
+  run _egress_save_screen 1 <<< "n"
+  refute_output --partial "Saved."
+  run _egress_save_screen 1 <<< "y"
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = off
+pack = npm"
 }
 
 @test "egress typed picker: q and end of input save nothing" {
@@ -974,13 +1018,24 @@ _seed_denial() {                         # <host>
   run cmd_egress audit docs.example.test < /dev/null
   output="$(_plain "$output")"
   assert_output --partial "private or special: the gateway refuses to dial it"
+  OWN="200|1.1|2606:4700::6810:85e5|cloudflare|1256|aaaaaaaaaaaa|Example Docs"
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "IPv6: the gateway dials IPv4 only"
   local a
-  for a in 10.1.2.3 127.0.0.1 169.254.169.254 172.16.0.1 172.31.255.255 192.168.0.1 100.64.0.1 \
-           0.0.0.0 224.0.0.1 255.255.255.255 ::1 :: fd00::1 fe80::1 ff02::1 ::ffff:10.0.0.1 64:ff9b::a00:1 2001:db8::1 bogus; do
+  # Every range the gateway refuses, at both edges, plus what it does not dial
+  # at all: IPv6, and anything that is not four plain decimal octets.
+  for a in 0.0.0.0 0.255.255.255 10.0.0.0 10.255.255.255 100.64.0.0 100.127.255.255 \
+           127.0.0.1 169.254.169.254 172.16.0.0 172.31.255.255 192.0.0.1 192.0.2.10 \
+           192.88.99.1 192.168.0.1 198.18.0.0 198.19.255.255 198.51.100.7 203.0.113.9 \
+           224.0.0.1 239.255.255.255 240.0.0.1 255.255.255.255 ::ffff:10.0.0.1 ::FFFF:198.18.0.1 \
+           ::1 fd00::1 2606:4700::1111 010.0.0.1 1.2.3 1.2.3.4.5 256.1.1.1 bogus ""; do
     run _egress_address_special "$a"
     assert_success
   done
-  for a in 93.184.215.14 172.32.0.1 100.128.0.1 11.0.0.1 2606:4700::1111 ::ffff:93.184.215.14; do
+  for a in 93.184.215.14 9.255.255.255 11.0.0.0 100.63.255.255 100.128.0.0 172.15.255.255 \
+           172.32.0.0 192.0.1.255 192.0.3.0 192.88.98.255 192.169.0.0 198.17.255.255 198.20.0.0 \
+           198.51.99.255 203.0.112.255 223.255.255.255 ::ffff:93.184.215.14 1.1.1.1; do
     run _egress_address_special "$a"
     assert_failure
   done
@@ -1044,4 +1099,111 @@ good.example.test
   run cmd_egress audit docs.example.test < /dev/null
   output="$(_plain "$output")"
   refute_output --partial "The catalogue lists it"
+}
+
+@test "egress draw: no drawn line is wider than the terminal, so the redraw never drifts" {
+  local c longest
+  _EGE_BOX=""
+  for c in 80 60; do
+    _rows_of 60
+    eval "_term_cols() { echo $c; }"
+    _egress_editor_load ""
+    _egress_measure 26
+    longest="$(_egress_draw 1 | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+    [ "$longest" -lt "$c" ]
+    # Every pack's detail pane too, the containers pane among them.
+    local r
+    for r in pack:containers pack:docs pack:huggingface pack:atlassian core mode; do
+      longest="$(_egress_pane "$r" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+      [ "$longest" -lt "$c" ]
+    done
+  done
+  # A box editor with a long box name stays inside the width too.
+  eval "_term_cols() { echo 80; }"
+  _egress_editor_load "a-box-with-a-rather-long-name-for-this-screen"
+  _egress_measure 26
+  longest="$(_egress_draw 1 | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+  [ "$longest" -lt 80 ]
+}
+
+@test "egress draw: a class word keeps its colour after the cut" {
+  _rows_of 60
+  eval "_term_cols() { echo 120; }"
+  _egress_editor_load ""
+  _egress_measure 26
+  run bash -c 'cat' < <(_egress_draw 1)
+  assert_output --partial "$(printf '%b' "$AMBER")shared"
+  refute_output --partial '\033'
+}
+
+@test "egress audit: a stranger's page with no title still needs a person" {
+  _audit_stub
+  FOREIGN_ANSWER="200|1.1|93.184.215.14|AmazonS3|412|eeeeeeeeeeee|"
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "Verdict:  unaudited"
+  refute_output --partial "Verdict:  contained"
+}
+
+@test "egress audit: the probe origin is never audited against itself" {
+  _audit_stub
+  run cmd_egress audit imgur.com < /dev/null
+  assert_failure
+  assert_output --partial "cannot audit itself"
+  run cat "$AUDIT_LOG"
+  assert_output ""
+}
+
+@test "egress ui: a launch under off leaves no record for the next launch to widen from" {
+  local cn
+  cn="$(container_name_for "$PROJECT" main)"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_summary_row "$cn" >/dev/null
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_summary_row "$cn" >/dev/null
+  [ ! -e "$(_egress_ledger_path "$cn")" ]
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row "$cn"
+  refute_output --partial "since the last launch"
+}
+
+@test "egress: --inherit drops a box file that does not parse, and stands alone" {
+  local cn
+  cn="$(container_name_for "$PROJECT" main)"
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nmode = strict\nmode = open\n' > "$_EGRESS_BOXES_DIR/$cn"
+  run cmd_egress main --inherit < /dev/null
+  assert_failure
+  assert_output --partial "does not parse"
+  [ -e "$_EGRESS_BOXES_DIR/$cn" ]
+  run cmd_egress main --inherit --yes < /dev/null
+  assert_success
+  [ ! -e "$_EGRESS_BOXES_DIR/$cn" ]
+  # A verb that reads never deletes on the side.
+  printf '[egress]\nallow = docs.rs\n' > "$_EGRESS_BOXES_DIR/$cn"
+  run cmd_egress status main --inherit < /dev/null
+  assert_failure
+  assert_output --partial "stands alone"
+  [ -e "$_EGRESS_BOXES_DIR/$cn" ]
+  run cmd_egress main --list --inherit < /dev/null
+  assert_failure
+  [ -e "$_EGRESS_BOXES_DIR/$cn" ]
+  run cmd_egress --box= status < /dev/null
+  assert_failure
+  assert_output --partial "needs a box name"
+}
+
+@test "egress: allow under open says every host is allowed, and enable names what it kept" {
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress allow docs.rs < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "Now open: every TLS host is allowed"
+  refute_output --partial "port 443 only"
+  printf '[egress]\nmode = off\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_config_enable
+  assert_output --partial "the packs and hosts already saved"
+  refute_output --partial "and nothing else"
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_config_enable
+  assert_output --partial "and nothing else"
 }

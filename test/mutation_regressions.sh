@@ -14291,17 +14291,19 @@ SED
 try "vnext_egress_render_no_link" "the renderer refuses a directory, a link and a host it would have to escape" "$CLI" "$EGRESS_REQUIRE_BATS"
 
 # The engine gate (10.1 to 10.5).
+# Widened with engine-linux, the value someone reaches for to turn CI green
+# before a person has run the Linux checklist (ruling 9).
 cat > "$SED_TMP" << 'SED'
-s|_EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux"|_EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux desktop-windows"|
+s|_EGRESS_VALIDATED_ENGINES="desktop-macos"|_EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux"|
 SED
-try "vnext_egress_validated_set" "the validated set ships as desktop macos and engine linux" "$CLI" "$EGRESS_ENGINE_BATS"
+try "vnext_egress_validated_set" "the validated engine set shipped wider than its checklist rows"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_engine_validated()/,/^}$/{
   /^  case "\$1" in ""|\*\[!a-z-\]\*) return 1 ;; esac$/d
 }
 SED
-try "vnext_egress_validated_one_token" "the validated set ships as desktop macos and engine linux" "$CLI" "$EGRESS_ENGINE_BATS"
+try "vnext_egress_validated_one_token" "the validated set ships as desktop macos alone" "$CLI" "$EGRESS_ENGINE_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_engine_kind()/,/^}$/{
@@ -14368,7 +14370,7 @@ try "vnext_egress_hash_excludes_gateway_digest" "the gateway digest is not in th
 # A present gateway image costs no network call.
 cat > "$SED_TMP" << 'SED'
 /^_egress_gateway_image_ensure()/,/^}$/{
-  /docker image inspect "\$_GATEWAY_IMAGE" >\/dev\/null 2>&1 && return 0/d
+  s@^  if \[ "\${1:-}" != force \] && docker image inspect "\$_GATEWAY_IMAGE" >/dev/null 2>&1; then@  if false; then@
 }
 SED
 try "vnext_egress_gateway_image_cached" "a present gateway image produces no pull" "$CLI" "$EGRESS_GATEWAY_BATS"
@@ -14380,6 +14382,22 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_gateway_image_refuses" "a missing gateway image refuses the launch and names the image" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# One sha256 per machine: stock macOS has shasum, never sha256sum.
+cat > "$SED_TMP" << 'SED'
+/^_sha256()/,/^}$/{
+  s@^  elif command -v shasum >/dev/null 2>&1; then@  elif false; then@
+}
+SED
+try "vnext_egress_sha256_shasum_arm" "the sha256 helper prefers sha256sum, then shasum, then md5" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# restart --pull re-pulls a moved digest on purpose.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_image_ensure()/,/^}$/{
+  s@^  if \[ "\${1:-}" != force \] && docker image inspect@  if docker image inspect@
+}
+SED
+try "vnext_egress_gateway_image_force" "a forced pull pulls a present image" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 # ── Hostile review fixes, 2026-09-26 ──
 # A workspace of / contains every path: the stripped prefix is what makes the

@@ -45,3 +45,18 @@ teardown() { _common_teardown; }
   assert_output --partial "could not be pulled: $_GATEWAY_IMAGE"
   assert_output --partial "This is not a policy denial."
 }
+
+@test "egress: the gateway image pull shows one line off a terminal and a forced pull pulls a present image" {
+  export DOCKER_PULL_EXIT_CODE=0
+  run _egress_gateway_image_ensure
+  assert_success
+  assert_output --partial "Pulling the egress gateway image"
+  run bash -c 'printf "%s\n" "$1" | grep -c .' _ "$output"
+  assert_output "1"
+  printf '%s\n' "$_GATEWAY_IMAGE" > "$DOCKER_MOCK_DIR/cached_images"
+  : > "$DOCKER_CALLS"
+  run _egress_gateway_image_ensure force
+  assert_success
+  run grep -c '^docker pull' "$DOCKER_CALLS"
+  assert_output "1"
+}

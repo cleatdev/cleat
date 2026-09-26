@@ -468,6 +468,25 @@ count_calls() { grep -cF -- "$1" "$DOCKER_CALLS" || true; }
   assert_output "clear"
 }
 
+@test "egress require: the sha256 helper prefers sha256sum, then shasum, then md5" {
+  # A Mac without coreutils has shasum. One that installs coreutils later gets
+  # sha256sum, which prints the same hex, so no caged box's hash moves.
+  mkdir -p "$TEST_TEMP/shabin"
+  printf '#!/usr/bin/env bash\necho "gnu-hex  -"\n' > "$TEST_TEMP/shabin/sha256sum"
+  printf '#!/usr/bin/env bash\n[ "$1 $2" = "-a 256" ] || exit 2\necho "bsd-hex  -"\n' > "$TEST_TEMP/shabin/shasum"
+  chmod +x "$TEST_TEMP/shabin/sha256sum" "$TEST_TEMP/shabin/shasum"
+  PATH="$TEST_TEMP/shabin:$PATH"
+  run _sha256 <<< "x"
+  assert_output "gnu-hex  -"
+  command() { if [ "$1 $2" = "-v sha256sum" ]; then return 1; fi; builtin command "$@"; }
+  run _sha256 <<< "x"
+  assert_output "bsd-hex  -"
+  command() { case "$1 $2" in "-v sha256sum"|"-v shasum") return 1 ;; esac; builtin command "$@"; }
+  run _sha256 <<< "x"
+  assert_output "$(printf 'x\n' | _md5)"
+  unset -f command
+}
+
 @test "egress require: cap-drop spelling does not change the hash" {
   local want s
   want="$(_egress_create_digest "$CN" none "$(_egress_capdrop_canon NET_RAW)" 0)"

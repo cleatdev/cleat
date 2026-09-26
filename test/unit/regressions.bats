@@ -9946,3 +9946,21 @@ _c19_star_project() {
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
   assert_output --partial "deny = docs.example.test"
 }
+
+@test "regression vNEXT: the validated engine set shipped wider than its checklist rows" {
+  # Each engine in the set is licensed by a dated row of the 10.7 checklist in
+  # docs/egress-validation.md, run by a person. An equality on the whole
+  # string, because a membership test passes on a set that has grown.
+  run bash -c 'source "$1"; printf %s "$_EGRESS_VALIDATED_ENGINES"' _ "$CLI"
+  assert_output "desktop-macos"
+}
+
+@test "regression vNEXT: the gateway resolver test seam never reaches a shipped run line" {
+  # The gateway's two harness seams answer DNS from a file and map upstreams to
+  # local listeners. The shipped entry point refuses both, and the CLI must
+  # never pass either to a gateway it creates.
+  run grep -n -- "--resolver-fixture" "$CLI"
+  assert_failure
+  run grep -n -- "--upstream-map" "$CLI"
+  assert_failure
+}

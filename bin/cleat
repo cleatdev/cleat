@@ -22,8 +22,9 @@ RELEASE_HIGHLIGHT_MAX_SHOWS=3
 _EGRESS_ENFORCING=0
 # The engines egress control is validated on, each licensed by a dated row in
 # docs/egress-validation.md (EGRESS-SPEC.md 10.5). No environment override:
-# an escape hatch on a security gate becomes the gate.
-_EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux"
+# an escape hatch on a security gate becomes the gate. macOS alone for the
+# first enforcing release (ruling 9): Linux joins with its own checklist row.
+_EGRESS_VALIDATED_ENGINES="desktop-macos"
 IMAGE_NAME="cleat"
 REGISTRY_BASE="ghcr.io/cleatdev/cleat"
 REGISTRY_IMAGE="${REGISTRY_BASE}:v${VERSION}"
@@ -10304,12 +10305,22 @@ _egress_create_facts() {                 # <cname> <netmode> <capdrop> <hooks>
 _egress_create_digest() {                # <cname> <netmode> <capdrop> <hooks>
   local _facts _h
   _facts="$(_egress_create_facts "$@")"
-  if command -v sha256sum >/dev/null 2>&1; then
-    _h="$(printf '%s' "$_facts" | sha256sum)"
-  else
-    _h="$(printf '%s' "$_facts" | _md5)"
-  fi
+  _h="$(printf '%s' "$_facts" | _sha256)"
   printf 'v%s:%s' "$_EGRESS_HASH_VERSION" "${_h:0:16}"
+}
+
+# SHA-256 of stdin as hex, whichever tool this host has: sha256sum (GNU),
+# shasum -a 256 (stock macOS), and _md5 only when neither exists. One answer
+# per machine, so a Mac that later installs coreutils does not change the hash
+# of every caged box it made.
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  else
+    _md5
+  fi
 }
 
 # One container label into _EG_LABEL_SET (1 when the key exists) and
@@ -10579,19 +10590,26 @@ _egress_wait_healthy() {                 # <cname> <gateway>
 # is already here costs no network call at all. On a miss, one pull pinned to
 # the daemon's architecture, as the box image's pull is. A failed pull refuses
 # with the gateway code and names the image: never a box without a gateway.
-_egress_gateway_image_ensure() {
+# With force, it pulls even when the image is here: cleat egress restart
+# --pull re-pulls a moved digest on purpose.
+_egress_gateway_image_ensure() {         # [force]
   local arch platform_args=() rc=0
-  docker image inspect "$_GATEWAY_IMAGE" >/dev/null 2>&1 && return 0
+  if [ "${1:-}" != force ] && docker image inspect "$_GATEWAY_IMAGE" >/dev/null 2>&1; then
+    return 0
+  fi
   arch="$(_daemon_arch)"
   [ -n "$arch" ] && platform_args=(--platform "linux/${arch}")
-  info "Pulling the egress gateway image ${DIM}(${_GATEWAY_IMAGE%%@*}${arch:+, ${arch}})${RESET}"
+  # A spinner on a terminal, exactly one line off it.
+  spin "Pulling the egress gateway image ${DIM}(${_GATEWAY_IMAGE%%@*}${arch:+, ${arch}})${RESET}"
   _run_bounded "$_EGRESS_PULL_BOUND_S" docker pull "${platform_args[@]+"${platform_args[@]}"}" "$_GATEWAY_IMAGE" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
+    _is_tty && spin_stop "$rc" "" "Egress gateway image pull failed"
     _egress_refuse gateway "the egress gateway image could not be pulled: ${_GATEWAY_IMAGE}" \
       "check the network and that Docker can reach ghcr.io, then re-run cleat"
     return 1
   fi
-  success "Egress gateway image ready ${DIM}(${_GATEWAY_IMAGE%%@*})${RESET}"
+  _is_tty && spin_stop 0 "Egress gateway image ready ${DIM}(${_GATEWAY_IMAGE%%@*})${RESET}"
+  return 0
 }
 
 # ── The rendered policy (8.2) ──

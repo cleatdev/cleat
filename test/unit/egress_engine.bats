@@ -183,17 +183,22 @@ desktop() {
   assert_output "unknown"
 }
 
-@test "egress engine: the validated set ships as desktop macos and engine linux" {
-  [ "$_EGRESS_VALIDATED_ENGINES" = "desktop-macos engine-linux" ]
+@test "egress engine: the validated set ships as desktop macos alone" {
+  assert_equal "$_EGRESS_VALIDATED_ENGINES" "desktop-macos"
   run _egress_engine_validated desktop-macos
   assert_success
-  run _egress_engine_validated engine-linux
-  assert_success
   local k
-  for k in desktop-windows desktop-linux rootless vm-backend unknown engine desktop "" "desktop-macos engine-linux"; do
+  for k in engine-linux desktop-windows desktop-linux rootless vm-backend unknown engine desktop "" "desktop-macos engine-linux"; do
     run _egress_engine_validated "$k"
     assert_failure
   done
+  # With two engines in the set, a kind spanning both is still one token short
+  # of either, and is refused.
+  _EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux"
+  run _egress_engine_validated "desktop-macos engine-linux"
+  assert_failure
+  run _egress_engine_validated engine-linux
+  assert_success
 }
 
 @test "egress engine: no environment variable widens the validated set" {
@@ -222,12 +227,13 @@ desktop() {
 
 @test "egress engine: the Needed line follows the validated set" {
   run _egress_engine_refusal rootless
-  assert_output --partial "Needed:  Docker Desktop on macOS, or Docker Engine on Linux (rootful)"
-  _EGRESS_VALIDATED_ENGINES="desktop-macos"
-  run _egress_engine_refusal rootless
   assert_output --partial "Needed:  Docker Desktop on macOS"
   refute_output --partial "Docker Engine on Linux"
   run _egress_engine_refusal engine-linux
   assert_output --partial "not validated on this Docker engine yet"
   assert_output --partial "validated on Docker Desktop on macOS."
+  # When a Linux row lands, the line names both, from the constant alone.
+  _EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux"
+  run _egress_engine_refusal rootless
+  assert_output --partial "Needed:  Docker Desktop on macOS, or Docker Engine on Linux (rootful)"
 }

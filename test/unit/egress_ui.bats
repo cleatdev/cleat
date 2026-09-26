@@ -131,6 +131,27 @@ _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
   assert_output --regexp '^ *39$'
 }
 
+@test "egress ui: the editor cache agrees with the catalogue helpers for every pack" {
+  # The cache is built in one pass for speed. It must say exactly what the
+  # per-pack helpers say, or the editor draws a class the catalogue does not.
+  # The reference helpers loop over the catalogue once per pack, which bats'
+  # DEBUG trap makes ten times slower, so the trap is off for this test.
+  trap - DEBUG
+  _egress_editor_cache
+  local p i n=0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    i="$(_egress_cache_ix "$p")"
+    assert_equal "${_EGC_HOSTS[i]}" "$(_egress_pack_hosts "$p")"
+    assert_equal "${_EGC_CNT[i]}" "$(_egress_pack_hosts "$p" | grep -c . || true)"
+    assert_equal "${_EGC_FLAGS[i]}" "$(_egress_pack_flags "$p")"
+    assert_equal "${_EGC_WORD[i]}" "$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
+    n=$((n + 1))
+  done < <(_egress_pack_ids)
+  assert_equal "$n" "${#_EGC_P[@]}"
+  assert_equal "$_EGC_IDS" "$(_egress_pack_ids)"
+}
+
 @test "egress draw: the detail pane is always _EGRESS_PANE_LINES lines" {
   _egress_editor_load ""
   local r

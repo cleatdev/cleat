@@ -9217,7 +9217,7 @@ _EG_AUDIT_KIND=""
 # through _read_bounded, the same bounded read the shared reader uses, so the
 # two always see the same bytes.
 _egress_raw_key_count() {
-  _read_bounded "$1" "$_BOX_FILE_READ_MAX" | awk -v sec="[$2]" -v key="$3" '
+  _read_bounded "$1" "$_BOX_FILE_READ_MAX" | LC_ALL=C awk -v sec="[$2]" -v key="$3" '
     NR == 1 { sub(/^\357\273\277/, "") }
     { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
     /^#/ { next }
@@ -9455,14 +9455,17 @@ _write_egress_to_file() {
 # workspace, or under any other read-write bind source passed after it, or
 # reached through a symlinked directory between it and $HOME. Resolving the
 # leaf says nothing about how the walk got there, so every component is
-# checked. `cd -P` in a subshell rather than realpath, which a stock macOS
+# checked. Only a link in a directory the user can write counts: that is a
+# link a process of theirs could have planted or can retarget. A system link
+# like macOS /var (to /private/var) sits in a root-owned directory and is
+# followed. `cd -P` in a subshell rather than realpath, which a stock macOS
 # lacks. Prints the collision. A policy inside the cage is not a policy.
 _egress_config_is_containable() {        # <workspace> [<rw source>...]
   local conf real src rsrc p
   conf="$CLEAT_CONFIG_DIR"
   p="$conf"
   while [ -n "$p" ] && [ "$p" != "/" ] && [ "$p" != "$HOME" ] && [ "$p" != "." ]; do
-    if [ -L "$p" ]; then
+    if [ -L "$p" ] && [ -w "$(dirname "$p")" ]; then
       error "The Cleat config directory is reached through a symlink: ${p/#${HOME}/~}"
       echo -e "  ${DIM}An egress policy must live somewhere a box cannot reach. Point XDG_CONFIG_HOME at a real directory.${RESET}"
       return 1
@@ -9876,7 +9879,7 @@ _egress_warn_unknown_keys() {            # <file>
     case "|$_seen|" in *"|$_k|"*) continue ;; esac
     _seen="${_seen:+$_seen|}$_k"
     warn "Unknown key ${BOLD}$(_sanitize_repo_str "$_k")${RESET} in [egress] of ${_f/#${HOME}/~} ${DIM}(ignored: mode, pack, allow and deny are the keys)${RESET}"
-  done < <(_read_bounded "$_f" "$_BOX_FILE_READ_MAX" | awk '
+  done < <(_read_bounded "$_f" "$_BOX_FILE_READ_MAX" | LC_ALL=C awk '
     NR == 1 { sub(/^\357\273\277/, "") }
     { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
     /^#/ { next }
@@ -10007,7 +10010,7 @@ _egress_resolve() {                      # <cname>
 # 1 when <file> carries an [egress] header, else 0. Read raw, so a bare header
 # with nothing under it still counts: it is the feature off, recorded.
 _egress_raw_section_present() {          # <file>
-  _read_bounded "$1" "$_BOX_FILE_READ_MAX" | awk '
+  _read_bounded "$1" "$_BOX_FILE_READ_MAX" | LC_ALL=C awk '
     NR == 1 { sub(/^\357\273\277/, "") }
     { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
     $0 == "[egress]" { f = 1 }
@@ -11944,25 +11947,63 @@ _EGC_PARAM=()
 _EGC_HOSTS=()
 _EGC_IDS=""
 _egress_editor_cache() {
-  local p i=0 f
+  local recs p h c f ix i last="" last_ix="" rank t out n
+  local defr=() anyr=() deff=() anyf=() ndef=()
   _EGC_P=(); _EGC_CNT=(); _EGC_WORD=(); _EGC_FLAGS=(); _EGC_PARAM=(); _EGC_HOSTS=()
-  _EGC_IDS="$(_egress_pack_ids)"
-  while IFS= read -r p; do
+  _EGC_IDS=""
+  # One pass over the catalogue. Records of a pack sit together, so the last
+  # pack's index is reused and the search runs once per pack.
+  recs="$(_egress_catalogue_records)" || recs=""
+  while IFS=$'\t' read -r p h c f _; do
     [ -n "$p" ] || continue
-    _EGC_P[i]="$p"
-    _EGC_HOSTS[i]="$(_egress_pack_hosts "$p")"
-    _EGC_CNT[i]="$(printf '%s\n' "${_EGC_HOSTS[i]}" | grep -c . || true)"
-    f="$(_egress_pack_flags "$p")"
-    _EGC_FLAGS[i]="$f"
-    _EGC_WORD[i]="$(_egress_class_word "$(_egress_pack_class "$p")" "$f")"
-    case ",$(_egress_catalogue_records | awk -F'\t' -v p="$p" '$1 == p { print $4 }' | tr '\n' ',')," in
-      *,parameterised,*) _EGC_PARAM[i]=1 ;;
-      *) _EGC_PARAM[i]=0 ;;
-    esac
-    i=$((i + 1))
+    if [ "$p" = "$last" ]; then
+      ix="$last_ix"
+    else
+      ix=""
+      i=0
+      while [ "$i" -lt "${#_EGC_P[@]}" ]; do
+        if [ "${_EGC_P[i]}" = "$p" ]; then ix="$i"; break; fi
+        i=$((i + 1))
+      done
+      if [ -z "$ix" ]; then
+        ix="${#_EGC_P[@]}"
+        _EGC_P[ix]="$p"; _EGC_IDS+="$p"$'\n'; _EGC_HOSTS[ix]=""; _EGC_PARAM[ix]=0
+        defr[ix]=0; anyr[ix]=0; deff[ix]=""; anyf[ix]=""; ndef[ix]=0
+      fi
+      last="$p"; last_ix="$ix"
+    fi
+    # The class order of _egress_pack_class, weakest last: A, B, C, unaudited.
+    case "$c" in A) rank=1 ;; B) rank=2 ;; C) rank=3 ;; *) rank=4 ;; esac
+    [ "$rank" -gt "${anyr[ix]}" ] && anyr[ix]="$rank"
+    anyf[ix]+=",$f,"
+    case ",$f," in *,parameterised,*) _EGC_PARAM[ix]=1 ;; esac
+    # A sub-tick and a parameterised host are never in the default set.
+    case ",$f," in *,sub-tick,*|*,parameterised,*) continue ;; esac
+    _EGC_HOSTS[ix]+="$h"$'\n'
+    ndef[ix]=$((ndef[ix] + 1))
+    [ "$rank" -gt "${defr[ix]}" ] && defr[ix]="$rank"
+    deff[ix]+=",$f,"
   done <<EOF
-$_EGC_IDS
+$recs
 EOF
+  _EGC_IDS="${_EGC_IDS%$'\n'}"
+  i=0
+  while [ "$i" -lt "${#_EGC_P[@]}" ]; do
+    n="${ndef[i]}"
+    _EGC_CNT[i]="$n"
+    _EGC_HOSTS[i]="${_EGC_HOSTS[i]%$'\n'}"
+    # The summary is taken over the default hosts, or every host when the
+    # whole pack is a second decision (_egress_pack_summary_rows).
+    if [ "$n" -gt 0 ]; then rank="${defr[i]}"; f="${deff[i]}"; else rank="${anyr[i]}"; f="${anyf[i]}"; fi
+    case "$rank" in 1) c=A ;; 2) c=B ;; 3) c=C ;; *) c="$_EGRESS_CLASS_UNKNOWN" ;; esac
+    out=""
+    for t in $_EGRESS_FLAG_TOKENS; do
+      case "$f" in *",$t,"*) out="${out:+$out,}$t" ;; esac
+    done
+    _EGC_FLAGS[i]="$out"
+    _EGC_WORD[i]="$(_egress_class_word "$c" "$out")"
+    i=$((i + 1))
+  done
 }
 
 # The cache index of a pack, or nothing.

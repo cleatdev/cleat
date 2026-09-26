@@ -730,7 +730,10 @@ rl_dead_pid() { local p; sleep 0.01 & p=$!; wait "$p" 2>/dev/null || true; echo 
 @test "relaunch ends with the stopped waiting line on Ctrl C during the wait" {
   rl_setup
   HB_TICKET_TO="work"
-  _HANDOFF_T1_WAIT_S=1
+  # Long enough never to end the wait first. SECONDS counts whole seconds, so
+  # with 1 the tick could land before the first pause sent the interrupt, and
+  # on a slow fork (WSL2) it often did. The interrupt ends the wait at once.
+  _HANDOFF_T1_WAIT_S=30
   _handoff_t1_pause() {
     if [[ ! -f "$TEST_TEMP/killed" ]]; then : > "$TEST_TEMP/killed"; sh -c 'kill -INT $PPID'; fi
     sleep 0.05

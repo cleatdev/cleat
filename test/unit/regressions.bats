@@ -9964,3 +9964,67 @@ _c19_star_project() {
   run grep -n -- "--upstream-map" "$CLI"
   assert_failure
 }
+
+# A UTF-8 aware awk, the kind macOS ships: outside the C locale an octal escape
+# in a regex names a character, so \357\273\277 is the three characters U+00EF
+# U+00BB U+00BF and never the three bytes of a BOM. The stand-in rewrites the
+# escape to the bytes of those characters and runs the real awk, which is what
+# that awk does. Under LC_ALL=C it runs the real awk untouched.
+_utf8_awk_on_path() {
+  REAL_AWK="$(command -v awk)"
+  export REAL_AWK
+  mkdir -p "$TEST_TEMP/utf8awk"
+  cat > "$TEST_TEMP/utf8awk/awk" <<'SH'
+#!/usr/bin/env bash
+case "${LC_ALL:-}" in C|POSIX) exec "$REAL_AWK" "$@" ;; esac
+pat='\357\273\277'
+rep=$'\xc3\xaf\xc2\xbb\xc2\xbf'
+args=()
+for a in "$@"; do args+=("${a//"$pat"/$rep}"); done
+exec "$REAL_AWK" "${args[@]}"
+SH
+  chmod +x "$TEST_TEMP/utf8awk/awk"
+  PATH="$TEST_TEMP/utf8awk:$PATH"
+}
+
+@test "regression vNEXT: a BOM config lost its egress section under the UTF-8 aware awk macOS ships" {
+  # The egress readers strip a BOM in awk. macOS awk read the octal escape as
+  # characters, so the strip never matched and a BOM before [egress] hid the
+  # whole section: every deny line uncounted, the section absent.
+  _utf8_awk_on_path
+  # The stand-in really does miss the BOM outside the C locale.
+  run bash -c "printf '\357\273\277x\n' | awk 'NR == 1 { sub(/^\357\273\277/, \"\") } { print length(\$0) }'"
+  assert_output "4"
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '\357\273\277[egress]\r\ndeny = i.example\r\ndeny =\r\ndeni = x.example\r\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_raw_key_count "$CLEAT_GLOBAL_CONFIG" egress deny
+  assert_output "2"
+  run _egress_raw_section_present "$CLEAT_GLOBAL_CONFIG"
+  assert_output "1"
+  _EG_WARNED_KEY_FILES=""
+  run _egress_warn_unknown_keys "$CLEAT_GLOBAL_CONFIG"
+  assert_output --partial "Unknown key"
+  assert_output --partial "deni"
+}
+
+@test "regression vNEXT: a system symlink above the config directory refused every launch on macOS" {
+  # macOS /var links to /private/var, so a config directory under it refused
+  # as reached through a symlink. No process of the user's can retarget a link
+  # in a root-owned directory. Only a link in a directory they can write could
+  # have been planted, and that one still refuses.
+  mkdir -p "$TEST_TEMP/sys" "$TEST_TEMP/private/var/cfg/cleat" "$TEST_TEMP/proj"
+  ln -s "$TEST_TEMP/private/var" "$TEST_TEMP/sys/var"
+  CLEAT_CONFIG_DIR="$TEST_TEMP/sys/var/cfg/cleat"
+  chmod 0555 "$TEST_TEMP/sys"
+  run _egress_config_is_containable "$TEST_TEMP/proj"
+  chmod 0755 "$TEST_TEMP/sys"
+  # Root writes anywhere, so for root every link is one that could be planted.
+  if [ "$(id -u)" -ne 0 ]; then
+    assert_success
+  else
+    assert_failure
+  fi
+  run _egress_config_is_containable "$TEST_TEMP/proj"
+  assert_failure
+  assert_output --partial "reached through a symlink: ${TEST_TEMP/#${HOME}/~}/sys/var"
+}

@@ -13715,6 +13715,38 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_containment" "a config dir inside the workspace refuses to enable a policy" "$CLI" "$EGRESS_CONFIG_BATS"
 
+# The symlink walk refuses only a link in a directory the user can write. The
+# regression test runs with the link's parent read-only and expects it followed.
+cat > "$SED_TMP" << 'SED'
+/^_egress_config_is_containable()/,/^}$/{
+  s@    if \[ -L "[$]p" \] && \[ -w "[$](dirname "[$]p")" \]; then@    if [ -L "$p" ]; then@
+}
+SED
+try "vnext_egress_system_link_followed" "a system symlink above the config directory refused every launch" "$CLI"
+
+# The three egress awks that strip a BOM run under LC_ALL=C. The regression
+# test puts a UTF-8 aware awk on PATH, which misses the BOM in any other locale.
+cat > "$SED_TMP" << 'SED'
+/^_egress_raw_key_count()/,/^}$/{
+  s@| LC_ALL=C awk -v sec=@| awk -v sec=@
+}
+SED
+try "vnext_egress_bom_c_locale_count" "a BOM config lost its egress section" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_raw_section_present()/,/^}$/{
+  s@| LC_ALL=C awk '@| awk '@
+}
+SED
+try "vnext_egress_bom_c_locale_present" "a BOM config lost its egress section" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_warn_unknown_keys()/,/^}$/{
+  s@| LC_ALL=C awk '@| awk '@
+}
+SED
+try "vnext_egress_bom_c_locale_unknown" "a BOM config lost its egress section" "$CLI"
+
 # The directory-target guard: without the -d arm a link to a directory falls
 # to the not-a-regular-file arm, and the test asserts the directory refusal.
 cat > "$SED_TMP" << 'SED'

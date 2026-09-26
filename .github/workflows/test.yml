@@ -47,8 +47,10 @@ jobs:
   test-linux:
     name: test (ubuntu, bash 5.x)
     runs-on: ubuntu-latest
-    # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30.
-    timeout-minutes: 40
+    # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30. The
+    # egress tests added about 350 by 2026-09-26 and a run was cancelled at 40,
+    # so 60 until the Linux legs shard the way macOS and WSL2 do.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,8 +86,10 @@ jobs:
   test-linux-2204:
     name: test (ubuntu 22.04, bash 5.1)
     runs-on: ubuntu-22.04
-    # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30.
-    timeout-minutes: 40
+    # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30. The
+    # egress tests added about 350 by 2026-09-26 and a run was cancelled at 40,
+    # so 60 until the Linux legs shard the way macOS and WSL2 do.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -392,7 +396,7 @@ jobs:
     # killed at the old 45 with nothing printed. Four shards like the macOS leg,
     # each about a quarter of that. The step times out before the job so the job
     # survives to print how far it got.
-    timeout-minutes: 35
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -462,7 +466,8 @@ jobs:
           cd "$(wslpath '${{ github.workspace }}')"
           rc=0; bash ./test.sh > /tmp/suite.log 2>&1 < /dev/null || rc=$?
           cat /tmp/suite.log; : > /tmp/suite.printed; exit "$rc"
-        timeout-minutes: 25
+        # 25 cancelled a shard mid regressions.bats on 2026-09-26.
+        timeout-minutes: 40
       # Same reason as the mutation job: the suite writes to a file, so a killed
       # step prints nothing. This runs only when the step above failed, and
       # prints only when it never reached its own cat.

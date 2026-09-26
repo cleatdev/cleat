@@ -1749,6 +1749,72 @@ def _():
     with_gw(body, hosts=[n.encode() for n in names])()
 
 
+@row("the policy bin/cleat renders is the document the gateway loads, digest for digest")
+def _():
+    # The host renders policy.json and the gateway recomputes its digest on
+    # load and refuses a mismatch, so the two formulas must agree byte for byte.
+    # Driven through the shipped shell functions, never a copy of them.
+    cli_path = os.path.join(HERE, "..", "..", "bin", "cleat")
+    home = tempfile.mkdtemp(prefix="gwcli", dir="/tmp")
+
+    def cli(fn, *args):
+        p = subprocess.run(["bash", "-c", 'source "$1"; shift; "$@"', "_", cli_path, fn] + list(args),
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                           env={"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        check(p.returncode == 0, "%s failed: %s" % (fn, p.stderr.strip()))
+        return p.stdout
+
+    table = os.path.join(HERE, "..", "fixtures", "egress_hosts.tsv")
+    names = set()
+    with open(table, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) > 1 and cols[1] and not cols[1].startswith("!"):
+                names.add(cols[1])
+    names = sorted(names)
+    rnd = random.Random(20260926)
+    cases = [("strict", ["claude.ai", "api.anthropic.com", "claude.ai"]), ("open", ["claude.ai"]),
+             ("strict", names)]
+    for _ in range(4):
+        cases.append((rnd.choice(("strict", "open")), rnd.sample(names, rnd.randint(1, min(9, len(names))))))
+    try:
+        for mode, hosts in cases:
+            hs = "\n".join(hosts)
+            doc = cli("_egress_policy_json", mode, hs)
+            want = cli("_egress_policy_digest", mode, hs)
+            check(want == policy_digest(mode, 443, sorted(set(hosts))),
+                  "host digest %s differs from the corpus formula for %s %r" % (want, mode, hosts))
+            g = GW(policy_text=doc)
+            try:
+                got = g.admin("policy-digest")
+                check(got == "ok policy-digest " + want, "gateway enforces %r, host rendered %s" % (got, want))
+                for h in set(hosts):
+                    check(g.admin("match", h) == "ok match allow", "%s not allowed after load" % h)
+                if mode == "strict":
+                    check(g.admin("match", "not-listed.example") == "ok match deny policy",
+                          "an unlisted host was allowed under strict")
+            finally:
+                g.stop()
+        # A reload re-reads the same path and answers the digest it accepted.
+        first = cli("_egress_policy_json", "strict", "claude.ai")
+        second = cli("_egress_policy_json", "strict", "claude.ai\ndocs.rs")
+        want2 = cli("_egress_policy_digest", "strict", "claude.ai\ndocs.rs")
+        g = GW(policy_text=first)
+        try:
+            tmp = g.policy_path + ".new"
+            with open(tmp, "w") as f:
+                f.write(second)
+            os.rename(tmp, g.policy_path)
+            check(g.admin("reload") == "ok reload " + want2, "reload did not answer the host's digest")
+            check(g.admin("policy-digest") == "ok policy-digest " + want2, "reload did not take")
+        finally:
+            g.stop()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 # -- the fuzz row ---------------------------------------------------------------
 
 def _mutate(rnd, seed):

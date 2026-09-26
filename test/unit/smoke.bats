@@ -3395,3 +3395,39 @@ allow = registry.npmjs.org"
   assert_success
   assert_output --partial "Egress: off"
 }
+
+@test "smoke: an egress refusal exits 1 under strict mode" {
+  mkdir -p "$TEST_TEMP/project"
+  local cname
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  # A box created under a policy with no policy behind it now: the one gate
+  # refusal a build that enforces nothing can still reach.
+  mkdir -p "$DOCKER_MOCK_DIR/inspect"
+  printf '%s\t%s\n' '{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}LABEL={{$v}}{{end}}{{end}}' \
+    'LABEL=v1:0123456789abcdef' > "$DOCKER_MOCK_DIR/inspect/$cname"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 shell < /dev/null
+  assert_equal "$status" 1
+  assert_output --partial "Egress refused box"
+  refute_output --partial "unbound variable"
+  run grep -E '^docker exec' "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "smoke: a saved egress policy launches a shell under strict mode" {
+  mkdir -p "$TEST_TEMP/project" "$XDG_CONFIG_HOME/cleat"
+  printf '[egress]\nmode = strict\npack = github\n' > "$XDG_CONFIG_HOME/cleat/config"
+  local cname
+  cname="$(_compute_cname "$TEST_TEMP/project")"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
+  cd "$TEST_TEMP/project"
+  run cleat_bin_timeout 10 shell < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  refute_output --partial "Egress refused"
+  run grep -E '^docker exec -it' "$DOCKER_CALLS"
+  assert_success
+}

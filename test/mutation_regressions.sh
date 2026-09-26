@@ -13920,6 +13920,441 @@ s|^_EGRESS_CONFIG_ROW_LINES=2|_EGRESS_CONFIG_ROW_LINES=3|
 SED
 try "vnext_egress_config_row_two_lines" "the config global block grows by exactly two physical lines" "$CLI" "$EGRESS_UI_BATS"
 
+# ── Egress stage two, slice 4: the gate (EGRESS-SPEC.md 5.5 to 5.7, 10) ─────
+# egress_require.bats runs with _EGRESS_ENFORCING=1, so every assertion is live
+# here. Each sed is scoped to the one function that owns the property.
+
+# Stage two: a saved policy refuses no launch while enforcement has not
+# shipped. The stage-three commit that flips the constant retires this entry.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@      if \[ "\$_EGRESS_ENFORCING" != 1 \]; then return 0; fi ;;@      : ;;@
+}
+SED
+try "vnext_egress_stage_two_inert" "a saved policy does not refuse a launch before enforcement ships" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A down daemon is a daemon error, never an egress refusal.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  /^  _daemon_up || return 0$/d
+}
+SED
+try "vnext_egress_daemon_first" "a down daemon produces the daemon error" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 1, the network mode.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@^  if \[ "\$_v" != none \]; then@  if false; then@
+}
+SED
+try "vnext_egress_netmode_asserted" "a network mode other than none refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 2: one compare line decides it, and assertion 1 stays standing.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@^  if \[ "\$_v" != "none " \]; then@  if false; then@
+}
+SED
+try "vnext_egress_networks_asserted" "NetworkMode none with a second network in Networks refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 3: the CapDrop accept test widened to match everything.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@  case "\$_v" in \*'"CAP_NET_RAW"'\*|\*'"ALL"'\*) ;; \*)@  case "$_v" in *) ;; x-never)@
+}
+SED
+try "vnext_egress_capdrop_asserted" "a missing CAP_NET_RAW refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 5, the namespaces.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@  case "\$_v" in "||private"|"||shareable"|"||") ;; \*)@  case "$_v" in *) ;; x-never)@
+}
+SED
+try "vnext_egress_namespaces_asserted" "IpcMode private passes and IpcMode host refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 7, a suffix test on =unconfined.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@    "?"|\*'=unconfined"'\*)@    "?")@
+}
+SED
+try "vnext_egress_seccomp_asserted" "seccomp unconfined refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 9, privileged.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@^  if \[ "\$_v" != false \]; then@  if false; then@
+}
+SED
+try "vnext_egress_privileged_asserted" "a privileged box refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 10: the name match alone is not evidence, the volume's labels are.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@^  if \[ "\$_v" != "egress-sock \$_bh" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_sock_volume_labels" "an unlabelled auto-created socket volume refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 11, no docker socket.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@^  if \[ -n "\$_v" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_docker_sock_asserted" "a docker socket mount refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 17: narrowed to an exact equality, a path under the directory passes.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@    case "\$_d" in /etc/cleat-egress|/etc/cleat-egress/\*)@    case "$_d" in /etc/cleat-egress)@
+}
+SED
+try "vnext_egress_policy_not_in_box" "no box mount lands on the gateway policy directory" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertions 10 and 11 are range predicates, never an indexed read: the order
+# of .Mounts is not stable on a real daemon.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@'{{range .Mounts}}{{if eq .Destination "/run/cleat-egress"}}{{.Type}} {{.Name}} {{.RW}}{{end}}{{end}}'@'{{(index .Mounts 0).Type}} {{(index .Mounts 0).Name}} {{(index .Mounts 0).RW}}'@
+}
+SED
+try "vnext_mounts_unordered" "the mounts reads are the range predicates" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 14, the engine label.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@^  if ! _egress_label_read "\$_c" sh.cleat.egress-engine || \[ "\$_EG_LABEL" != "\$_kind" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_engine_label_asserted" "a box created on another engine refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 15: the gateway label is the box hash, never the container name.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_ok()/,/^}$/{
+  s@"true|gateway|\$_bh"@"true|gateway|$_c"@
+}
+SED
+try "vnext_egress_gateway_label_hash" "the gateway label is matched by box hash, not container name" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 15: starting is waited for only inside the create window.
+cat > "$SED_TMP" << 'SED'
+/^_egress_wait_healthy()/,/^}$/{
+  /_egress_create_marker_fresh "\$1" || return 1/d
+}
+SED
+try "vnext_egress_health_wait_scoped" "a gateway still starting outside the create window refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The poll breaks early on unhealthy rather than burning the timeout.
+cat > "$SED_TMP" << 'SED'
+/^_egress_poll_healthy()/,/^}$/{
+  s@^      starting) ;;@      starting|unhealthy) ;;@
+}
+SED
+try "vnext_egress_gateway_health_checked" "an unhealthy gateway breaks the wait early" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A cold launch waits out starting instead of refusing on it.
+cat > "$SED_TMP" << 'SED'
+/^_egress_poll_healthy()/,/^}$/{
+  s@^      starting) ;;@      starting) return 1 ;;@
+}
+SED
+try "vnext_egress_cold_launch_waits" "a gateway still starting inside the create window is waited for" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 15: the gateway holds its socket path.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_ok()/,/^}$/{
+  s@^  if \[ "\$_v" != true \]; then@  if false; then@
+}
+SED
+try "vnext_egress_path_ok_asserted" "a gateway that does not hold its socket path refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Admin verbs go to the gateway. A box name here runs a binary the box owns.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_ok()/,/^}$/{
+  s@_egress_admin_read "\$_gw" path_ok@_egress_admin_read "$_c" path_ok@
+}
+SED
+try "vnext_egress_admin_to_gateway" "admin verbs go to the gateway and never to the box" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The selftest crosses the socket's permission check as the box's own identity.
+cat > "$SED_TMP" << 'SED'
+/^_egress_selftest()/,/^}$/{
+  s@docker exec -u "\$2" "\$1"@docker exec "$1"@
+}
+SED
+try "vnext_egress_selftest_identity" "the selftest runs as the box's own uid and gid" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 13: the live digest compared, never assumed.
+cat > "$SED_TMP" << 'SED'
+/^_egress_live_ok()/,/^}$/{
+  s@\[ -n "\$_got" \] && \[ "\$_got" = "\$_want" \] && return 0@return 0@
+}
+SED
+try "vnext_egress_live_digest_asserted" "a live digest that survives one reload refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A live mismatch reloads before it refuses.
+cat > "$SED_TMP" << 'SED'
+/^_egress_live_ok()/,/^}$/{
+  s@^  _got="\$(_egress_reload "\$_gw")" || _got=""@  _got=""@
+}
+SED
+try "vnext_egress_live_reload" "a live-digest mismatch reloads and proceeds" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A policy edit never needs a recreate, so the remedy names reload.
+cat > "$SED_TMP" << 'SED'
+/^_egress_live_ok()/,/^}$/{
+  s@^    "\${BOLD}cleat egress reload\${RESET}"$@    "${BOLD}cleat rm \&\& cleat${RESET}"@
+}
+SED
+try "vnext_egress_reload_never_recreates" "a gateway enforcing a stale policy names reload and never names rm" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The policy digest covers the mode: an open gateway renders the same hosts.
+cat > "$SED_TMP" << 'SED'
+/^_egress_policy_digest()/,/^}$/{
+  s@printf '%s\\n443\\n' "\$1"; if@printf '443\\n'; if@
+}
+SED
+try "vnext_egress_digest_covers_mode" "a gateway enforcing open does not match a strict resolution over the same hosts" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Check one, row two: a removed policy on a policy box refuses.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@^      \[ "\$_EG_LABEL_SET" = 1 \] || return 0@      return 0@
+}
+SED
+try "vnext_egress_drift_label_orphan" "a removed policy on a policy box refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Check one, row three: a box that predates its policy refuses.
+cat > "$SED_TMP" << 'SED'
+/^_egress_create_drift()/,/^}$/{
+  s@^  if \[ "\$_EG_LABEL_SET" != 1 \]; then@  if false; then@
+}
+SED
+try "vnext_egress_drift_label_absent" "a box that predates its policy refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Check one has no TTY branch.
+cat > "$SED_TMP" << 'SED'
+/^_egress_create_drift()/,/^}$/{
+  s@^  local _cname="\$1" _cd _hooks _want _other$@&; _is_tty \&\& return 0@
+}
+SED
+try "vnext_egress_drift_no_tty_branch" "the drift refusal is identical on a non-TTY" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The allowlist is policy, never a create-time fact.
+cat > "$SED_TMP" << 'SED'
+/^_egress_create_facts()/,/^}$/{
+  s@^  printf 'egress:hooks=%s\\n' "\$4"@&; printf 'egress:hosts=%s\\n' "$_EG_HOSTS"@
+}
+SED
+try "vnext_policy_edit_is_reload" "a changed allowlist neither refuses nor asks for a recreate" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The catalogue revision is never a create-time fact.
+cat > "$SED_TMP" << 'SED'
+/^_egress_create_facts()/,/^}$/{
+  s@^  printf 'egress:hooks=%s\\n' "\$4"@&; printf 'egress:rev=%s\\n' "$_EGRESS_CATALOGUE_REV"@
+}
+SED
+try "vnext_egress_hash_pinned_not_shipped" "bumping the catalogue rev alone does not change the hash" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The hash records the daemon's canonical cap spelling, never the flag's.
+cat > "$SED_TMP" << 'SED'
+/^_egress_capdrop_canon()/,/^}$/{
+  s@^    _u="\$(printf '%s' "\$_c" | tr '\[:lower:\]' '\[:upper:\]')"@    _u="$_c"@
+}
+SED
+try "vnext_egress_capdrop_canonical" "cap-drop spelling does not change the hash" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The hooks fact follows the capability, never the export alone.
+cat > "$SED_TMP" << 'SED'
+/^_egress_hooks_fact()/,/^}$/{
+  s@^  if cap_is_active hooks 2>/dev/null && \[@  if [@
+}
+SED
+try "vnext_egress_hooks_fact_needs_cap" "the hooks flag in the environment does not move the hash of a box without the hooks capability" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# Assertion 16: the ssh interlock fires, and only under a live policy.
+cat > "$SED_TMP" << 'SED'
+/^_egress_ssh_conflict()/,/^}$/{
+  s@^  cap_is_active ssh 2>/dev/null || return 1@  return 1@
+}
+SED
+try "vnext_egress_ssh_interlock_fires" "an active policy refuses a box with the ssh capability" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_ssh_conflict()/,/^}$/{
+  s@^  case "\$1" in strict|open) ;; \*) return 1 ;; esac@  :@
+}
+SED
+try "vnext_egress_ssh_interlock_condition" "no policy leaves the ssh capability alone" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_docker_conflict()/,/^}$/{
+  s@^  cap_is_active docker 2>/dev/null || return 1@  return 1@
+}
+SED
+try "vnext_egress_docker_interlock_fires" "an active policy refuses a box with the docker capability" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# CLEAT_EGRESS_ALLOW_HOOKS is the one documented way past the hooks interlock.
+cat > "$SED_TMP" << 'SED'
+/^_egress_hooks_conflict()/,/^}$/{
+  /^  \[ "\${CLEAT_EGRESS_ALLOW_HOOKS:-}" = 1 \] && return 1$/d
+}
+SED
+try "vnext_egress_hooks_escape" "an active policy refuses the hooks capability unless the escape is set" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A policy inside the cage is not a policy.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@^  if ! _egress_config_is_containable "\$_ws"; then@  if false; then@
+}
+SED
+try "vnext_egress_containment_gated" "a config directory inside the box's workspace refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A host whose _md5 fell back to cksum computes a digest the gateway cannot.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@^  if ! _egress_md5_ok; then@  if false; then@
+}
+SED
+try "vnext_egress_md5_refused" "a host whose md5 is the cksum fallback refuses a policy" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The relaunch loop re-checks before each exec after the first.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@^    if \[\[ \$_ec_relaunch -eq 1 \]\] && ! ( _egress_require "\$cname" claude ); then@    if false; then@
+}
+SED
+try "vnext_egress_loop_recheck" "the relaunch loop re-checks before each exec" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# An in-loop refusal leaves by break: a reader that exits must not skip the
+# session end, which is what the subshell buys.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s@! ( _egress_require "\$cname" claude ); then@! _egress_require "$cname" claude; then@
+}
+SED
+try "vnext_egress_loop_break_not_exit" "a refusing reader inside the relaunch loop cannot exit past the session end" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The gate precedes the first exec of each verb. cmd_shell and cmd_login moved
+# resolve_caps above the remap wait for it.
+cat > "$SED_TMP" << 'SED'
+/^cmd_shell()/,/^}$/{
+  /^  _egress_require "\$cname" shell || exit 1$/d
+}
+SED
+try "vnext_egress_gate_shell" "the gate runs before the first docker exec on every fatal verb" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_login()/,/^}$/{
+  /^  _egress_require "\$cname" login || exit 1$/d
+}
+SED
+try "vnext_egress_gate_login" "the gate runs before the first docker exec on every fatal verb" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /^  _egress_require "\$cname" claude || exit 1$/d
+}
+SED
+try "vnext_egress_gate_exec_claude" "the gate runs before the first docker exec on every fatal verb" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_run_setup()/,/^}$/{
+  /^  _egress_require "\$cname" setup || exit 1$/d
+}
+SED
+try "vnext_egress_gate_setup" "the gate runs before the first docker exec on every fatal verb" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  /^  _egress_require "\$cname" run || exit 1$/d
+}
+SED
+try "vnext_egress_gate_run" "cleat run gates right after the box is created" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The rendered policy: 0644 in a 0755 directory, never through a link.
+cat > "$SED_TMP" << 'SED'
+/^_egress_render_policy()/,/^}$/{
+  s@chmod 0644 "\$_tmp"@chmod 0600 "$_tmp"@
+}
+SED
+try "vnext_egress_render_modes" "the rendered policy is a 0644 file in a 0755 directory" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_render_policy()/,/^}$/{
+  /^  if \[ -L "\$_dir" \] || \[ -L "\$_f" \]; then return 1; fi$/d
+}
+SED
+try "vnext_egress_render_no_link" "the renderer refuses a directory, a link and a host it would have to escape" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The engine gate (10.1 to 10.5).
+cat > "$SED_TMP" << 'SED'
+s|_EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux"|_EGRESS_VALIDATED_ENGINES="desktop-macos engine-linux desktop-windows"|
+SED
+try "vnext_egress_validated_set" "the validated set ships as desktop macos and engine linux" "$CLI" "$EGRESS_ENGINE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_engine_validated()/,/^}$/{
+  /^  case "\$1" in ""|\*\[!a-z-\]\*) return 1 ;; esac$/d
+}
+SED
+try "vnext_egress_validated_one_token" "the validated set ships as desktop macos and engine linux" "$CLI" "$EGRESS_ENGINE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_engine_kind()/,/^}$/{
+  /^    if \[ "\$_name" != docker-desktop \]; then printf unknown; return 0; fi$/d
+}
+SED
+try "vnext_egress_engine_exact" "arm A takes exact values" "$CLI" "$EGRESS_ENGINE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_engine_kind()/,/^}$/{
+  /^  case ",\$_sec" in \*,name=rootless,\*) printf rootless; return 0 ;; esac$/d
+}
+SED
+try "vnext_egress_rootless_refused" "rootless refuses by its security option and by its socket" "$CLI" "$EGRESS_ENGINE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_engine_kind()/,/^}$/{
+  /_egress_host_kernel)" \]; then printf vm-backend; return 0; fi$/d
+}
+SED
+try "vnext_egress_kernel_concordance" "a kernel that is not the host's is a VM" "$CLI" "$EGRESS_ENGINE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_api_ok()/,/^}$/{
+  s@-ge 41@-ge 40@
+}
+SED
+try "vnext_egress_api_floor" "the API floor is 1.41" "$CLI" "$EGRESS_ENGINE_BATS"
+
+# The launch summary: the row sits between Caps and Browser, off by default.
+cat > "$SED_TMP" << 'SED'
+/^_print_summary_block()/,/^}$/{
+  /_egress_summary_row/d
+}
+SED
+try "vnext_egress_summary_row_order" "summary: the egress row prints between caps and browser" "$CLI" "$TERMINAL_UX_BATS"
+
+# The default is off: an absent mode resolving open is a default-on build.
+cat > "$SED_TMP" << 'SED'
+/^_egress_read_file()/,/^}$/{
+  s@    0:0) _m_mode=absent ;;@    0:0) _m_mode=open ;;@
+}
+SED
+try "vnext_egress_default_off" "no egress section means the box is created with a normal network" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# Only a widening earns a summary line. Reporting any change of mode would
+# name a narrowing, which needs no consent.
+cat > "$SED_TMP" << 'SED'
+/^_egress_widening()/,/^}$/{
+  s@^  if \[ "\$2" = open \] && \[ "\$_EGL_MODE" != open \]; then _EG_TO_OPEN=1; fi@  if [ "$2" != "$_EGL_MODE" ]; then _EG_TO_OPEN=1; fi@
+}
+SED
+try "vnext_egress_widening_notice" "a narrowing since the last launch is silent" "$CLI" "$EGRESS_UI_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

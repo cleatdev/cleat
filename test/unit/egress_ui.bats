@@ -140,6 +140,15 @@ _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
   done
 }
 
+@test "egress draw: a pane text longer than the pane is cut, never drawn past it" {
+  _egress_pane_text() { local i; for i in 1 2 3 4 5 6 7 8 9; do echo "pane line $i"; done; }
+  run bash -c 'wc -l' < <(_egress_pane mode)
+  assert_output --regexp "^ *${_EGRESS_PANE_LINES}\$"
+  run _egress_pane mode
+  assert_output --partial "pane line ${_EGRESS_PANE_LINES}"
+  refute_output --partial "pane line $((_EGRESS_PANE_LINES + 1))"
+}
+
 @test "egress ui: a label carrying a newline draws one physical row" {
   _rows_of 24
   _egress_editor_load ""
@@ -703,4 +712,104 @@ allow = a.example"
   assert_output "gen"
   run _config_row_kind $(( n + 2 ))
   assert_output "gen"
+}
+
+@test "egress: two box names are too many arguments" {
+  run cmd_egress one two
+  assert_failure
+  assert_output --partial "Too many arguments"
+  run cmd_egress status one two
+  assert_failure
+  assert_output --partial "Too many arguments"
+}
+
+# ── The widening ledger (5.2) and its summary sub-line (6.7) ────────────────
+
+_plain() { printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
+
+@test "egress ui: a first launch with no recorded digest prints no widening sub-line" {
+  local cn
+  cn="$(container_name_for "$PROJECT" main)"
+  printf '[egress]\nmode = strict\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row "$cn"
+  assert_success
+  refute_output --partial "since the last launch"
+  run grep -c '^host ' "$(_egress_ledger_path "$cn")"
+  refute_output "0"
+}
+
+@test "egress ui: a policy that widened since the last launch is named in the summary" {
+  local cn
+  cn="$(container_name_for "$PROJECT" main)"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_summary_row "$cn" >/dev/null
+  printf '[egress]\nmode = strict\nallow = docs.rs\nallow = crates.io\n' > "$CLEAT_GLOBAL_CONFIG"
+  # Status names the hosts the summary only counts, and reading it spends nothing.
+  run cmd_egress status main
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Added since this box last launched: crates.io, docs.rs"
+  run _egress_summary_row "$cn"
+  run _plain "$output"
+  assert_output --partial "2 hosts added since the last launch.  cleat egress status"
+  # The launch that showed it recorded it, so the next one is quiet.
+  run _egress_summary_row "$cn"
+  refute_output --partial "since the last launch"
+}
+
+@test "egress ui: a move to open since the last launch is named in the summary" {
+  local cn
+  cn="$(container_name_for "$PROJECT" main)"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_summary_row "$cn" >/dev/null
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row "$cn"
+  run _plain "$output"
+  assert_output --partial "mode widened to open since the last launch."
+  refute_output --partial "added since"
+  run _egress_summary_row "$cn"
+  refute_output --partial "since the last launch"
+}
+
+@test "egress ui: a narrowing since the last launch is silent" {
+  local cn
+  cn="$(container_name_for "$PROJECT" main)"
+  printf '[egress]\nmode = open\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_summary_row "$cn" >/dev/null
+  printf '[egress]\nmode = strict\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row "$cn"
+  refute_output --partial "since the last launch"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row "$cn"
+  refute_output --partial "since the last launch"
+  run cmd_egress status main
+  refute_output --partial "Added since"
+}
+
+@test "egress ui: the ledger is never written through a link" {
+  local cn d
+  cn="$(container_name_for "$PROJECT" main)"
+  d="$(dirname "$(_egress_ledger_path "$cn")")"
+  mkdir -p "$(dirname "$d")" "$TEST_TEMP/elsewhere"
+  ln -s "$TEST_TEMP/elsewhere" "$d"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row "$cn"
+  assert_success
+  run ls -A "$TEST_TEMP/elsewhere"
+  assert_output ""
+  rm -f "$d"
+  mkdir -p "$d"
+  ln -s "$TEST_TEMP/elsewhere/target" "$d/resolved-digest"
+  : > "$TEST_TEMP/elsewhere/target"
+  _egress_ledger_read "$cn"
+  [ "$_EGL_SET" = 0 ]
+}
+
+@test "egress ui: with no policy the summary reads off and records nothing" {
+  local cn
+  cn="$(container_name_for "$PROJECT" main)"
+  run _egress_summary_row "$cn"
+  run _plain "$output"
+  assert_output "  Egress:     off  ·  full network egress"
+  [ ! -e "$(_egress_ledger_path "$cn")" ]
 }

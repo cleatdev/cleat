@@ -1460,3 +1460,19 @@ EOF
   assert_output --partial "Refusing to edit"
   refute_output --partial "Wrote"
 }
+
+@test "config: a gateway spec bump does not move the fingerprint of a box with egress off" {
+  ACTIVE_CAPS=(git hooks)
+  local a
+  a="$(compute_config_fingerprint "$TEST_TEMP")"
+  _GATEWAY_SPEC_VERSION=99
+  _EGRESS_HASH_VERSION=99
+  [ "$(compute_config_fingerprint "$TEST_TEMP")" = "$a" ]
+}
+
+@test "config: CLEAT_EGRESS_ALLOW_HOOKS does not move the fingerprint of a box with egress off" {
+  ACTIVE_CAPS=(git hooks)
+  local a
+  a="$(compute_config_fingerprint "$TEST_TEMP")"
+  [ "$(CLEAT_EGRESS_ALLOW_HOOKS=1 compute_config_fingerprint "$TEST_TEMP")" = "$a" ]
+}

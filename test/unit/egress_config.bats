@@ -650,3 +650,85 @@ claude.ai"
   PATH="$TEST_TEMP/bare-bin" run _egress_md5_ok
   assert_failure
 }
+
+# ── The default (1.1, 11.3) ─────────────────────────────────────────────────
+
+# A launch driven end to end through the stub: a fresh project, no container.
+_default_launch() {
+  _host_clip_cmd() { echo ""; }
+  check_for_update() { true; }
+  check_drift() { true; }
+  _resolve_config_drift() { true; }
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  run cmd_start "$TEST_TEMP/project"
+}
+
+@test "egress default: no egress section means the box is created with a normal network" {
+  rm -f "$CONF"
+  [ ! -e "$_EGRESS_BOXES_DIR/$CN" ]
+  _default_launch
+  assert_success
+  local launched="$output" runline
+  # Positives first: negatives alone hold when nothing is created at all.
+  run grep -F "{{.HostConfig.NetworkMode}}" "$DOCKER_CALLS"
+  assert_failure
+  run docker_run_line_for "$CN"
+  assert_success
+  [ -n "$output" ]
+  runline="$output"
+  run sed $'s/\033\\[[0-9;]*m//g' <<< "$launched"
+  assert_output --partial "Egress:     off  ·  full network egress"
+  refute_output --partial "saved, not enforced"
+  # Then the negatives.
+  [[ "$runline" != *"--network"* ]]
+  [[ "$runline" != *"--volumes-from"* ]]
+  [[ "$runline" != *"cleat-gw-"* ]]
+  run grep -E '^docker (run|create) .*cleat-gw-' "$DOCKER_CALLS"
+  assert_failure
+  run grep -E '^docker volume create' "$DOCKER_CALLS"
+  assert_failure
+  run grep -E '^docker network' "$DOCKER_CALLS"
+  assert_failure
+  run grep -E '^docker (image inspect|pull) .*cleat-gw' "$DOCKER_CALLS"
+  assert_failure
+  run grep -E 'HTTPS_PROXY=|http_proxy=|NO_PROXY=' "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress default: a saved policy launches the same box and says it is not enforced" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  _default_launch
+  assert_success
+  run sed $'s/\033\\[[0-9;]*m//g' <<< "$output"
+  assert_output --partial "saved, not enforced in this"
+  run grep -F "{{.HostConfig.NetworkMode}}" "$DOCKER_CALLS"
+  assert_failure
+  run docker_run_line_for "$CN"
+  [[ "$output" != *"--network"* ]]
+}
+
+@test "egress config: the resolved digest is recorded outside every mount source" {
+  printf '[egress]\nmode = strict\n' > "$CONF"
+  _default_launch
+  assert_success
+  local ledger src line a
+  ledger="$(_egress_ledger_path "$CN")"
+  [ -f "$ledger" ]
+  run docker_run_line_for "$CN"
+  line="$output"
+  set -f
+  local prev=""
+  for a in $line; do
+    if [ "$prev" = "-v" ]; then
+      src="${a%%:*}"
+      case "$ledger/" in "$src"/*)
+        echo "ledger $ledger is under the mount source $src" >&2
+        set +f
+        return 1 ;;
+      esac
+    fi
+    prev="$a"
+  done
+  set +f
+}

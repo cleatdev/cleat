@@ -365,6 +365,58 @@ MOCK
   refute_output --partial "Browser:"
 }
 
+# The run output with its colour codes removed, so a row reads as the eye sees it.
+_plain_output() { output="$(printf '%s' "$output" | sed $'s/\033\\[[0-9;]*m//g')"; }
+
+# The line number of the first output line carrying the text, 0 when none.
+_summary_line_of() { printf '%s\n' "$output" | grep -nF -- "$1" | head -n 1 | cut -d: -f1; }
+
+@test "summary: the egress row prints between caps and browser" {
+  ACTIVE_CAPS=(git)
+  CLEAT_BROWSER_BRIDGE=always run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  local caps egress browser
+  caps="$(_summary_line_of "Caps:")"
+  egress="$(_summary_line_of "Egress:")"
+  browser="$(_summary_line_of "Browser:")"
+  [ -n "$caps" ] && [ -n "$egress" ] && [ -n "$browser" ]
+  [ "$caps" -lt "$egress" ]
+  [ "$egress" -lt "$browser" ]
+}
+
+@test "summary: the egress row prints when the browser row is silent" {
+  ACTIVE_CAPS=()
+  unset CLEAT_BROWSER_BRIDGE
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  _plain_output
+  assert_output --partial "Egress:     off"
+  assert_output --partial "full network egress"
+  refute_output --partial "Browser:"
+}
+
+@test "summary: a saved policy reads saved and not enforced while enforcement has not shipped" {
+  ACTIVE_CAPS=()
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  _plain_output
+  local n
+  _egress_resolve cleat-test-12345678
+  n="$(printf '%s\n' "$_EG_HOSTS" | grep -c .)"
+  assert_output --partial "Egress:     strict  ·  $n hosts, 2 packs   (saved, not enforced in this"
+  assert_output --partial "release. Nothing is filtered today)"
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  _plain_output
+  assert_output --partial "Egress:     open  ·  every TLS host allowed, every host logged   (saved, not enforced in this"
+  _EGRESS_ENFORCING=1
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  _plain_output
+  assert_output --partial "Egress:     open  ·  every TLS host allowed, every host logged"
+  refute_output --partial "saved, not enforced"
+}
+
 @test "summary block: omits Project line when project is empty" {
   ACTIVE_CAPS=()
   run _print_summary_block "cleat-test-12345678" ""

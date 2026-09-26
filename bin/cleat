@@ -101,6 +101,14 @@ _EGRESS_PROBE_BOUND_S=8           # 8.2, 8.5, the bound on one gateway docker ex
 _EGRESS_MAX_TUNNELS=256           # 8.6, rendered into policy.json
 _EGRESS_HANDSHAKE_TIMEOUT_S=20    # 4.5, the ClientHello deadline, rendered into policy.json
 _EGRESS_PULL_BOUND_S=300          # 8.0, the bound on the one gateway image pull
+_EGRESS_SHIM_STALE=90             # 8.6, three missed 30 second heartbeats
+# Where a caged box's tools find the relay (8.6), and what never goes through
+# it: a dev server in the box. Both cases of each name, because curl reads
+# http_proxy only in lower case and wget reads only lower case.
+_EGRESS_PROXY_URL="http://127.0.0.1:3128"
+_EGRESS_NO_PROXY="localhost,127.0.0.1,::1"
+_EGRESS_PROXY_ENV=(-e "HTTPS_PROXY=$_EGRESS_PROXY_URL" -e "https_proxy=$_EGRESS_PROXY_URL"
+  -e "http_proxy=$_EGRESS_PROXY_URL" -e "NO_PROXY=$_EGRESS_NO_PROXY" -e "no_proxy=$_EGRESS_NO_PROXY")
 # Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
 # existed, so they carry no spec label): their content is inferred from the
 # version they were built at. v0.16.3 was the LAST docker/ content change before
@@ -10552,9 +10560,9 @@ _egress_admin() {                        # <gateway> <verb> [arg]
 
 # The one reader: prints the ok value alone. rc 1 on err, on a malformed line
 # and on no answer. `local` on its own line, so the failure is not swallowed.
-_egress_admin_read() {                   # <gateway> <verb>
+_egress_admin_read() {                   # <gateway> <verb> [arg]
   local line
-  line="$(_egress_admin "$1" "$2")" || return 1
+  line="$(_egress_admin "$1" "$2" "${3:-}")" || return 1
   case "$line" in
     ok\ "$2"\ *) printf '%s' "${line#ok "$2" }" ;;
     *) return 1 ;;
@@ -10620,6 +10628,71 @@ _egress_create_marker_fresh() {          # <cname>
 _egress_wait_healthy() {                 # <cname> <gateway>
   _egress_create_marker_fresh "$1" || return 1
   _egress_poll_healthy "$2"
+}
+
+# One word for the gateway of a box (8.10): missing, stopped, orphaned,
+# displaced or healthy. Gateway health is never box liveness, so the orphan
+# check answers before the socket check. A gateway that cannot answer reads as
+# displaced, the fail-closed word.
+_egress_gateway_state() {
+  local cname="$1" gw
+  gw="$(_egress_gateway_name "$cname")"
+  container_exists "$gw" || { printf missing; return 0; }
+  is_running "$gw" || { printf stopped; return 0; }
+  is_running "$cname" || { printf orphaned; return 0; }
+  [ "$(_egress_admin_read "$gw" path_ok || true)" = true ] || { printf displaced; return 0; }
+  printf healthy
+}
+
+# Whether the box's relay has been heard from lately (8.6). The age is the
+# gateway's own, from its monotonic clock: the host never subtracts two
+# clocks. No answer and -1 (never heard since the gateway started) are both
+# not listening. The raw answer stays in _EG_SHIM_AGE for the note below. A
+# heartbeat comes from inside the box, so this is health, never proof.
+_EG_SHIM_AGE=""
+_egress_shim_alive() {
+  local _age
+  _age="$(_egress_admin_read "$1" last_shim_seen || true)"
+  _EG_SHIM_AGE="$_age"
+  case "$_age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_age" -le "$_EGRESS_SHIM_STALE" ]
+}
+
+# The gate's shim step: advisory, never a refusal. A relay the gateway has
+# never heard is a box or gateway that has just started, so that is waited for
+# (the relay beats every second for its first ten), which keeps [setup] and the
+# first exec from racing it. A stale relay prints the one remedy. Always 0: a
+# heartbeat is the box's word, and cleat shell must still open on a broken box.
+_egress_shim_note() {                    # <cname>
+  local gw ticks=0 max=0
+  gw="$(_egress_gateway_name "$1")"
+  if _egress_shim_alive "$gw"; then return 0; fi
+  if [ "$_EG_SHIM_AGE" = "-1" ]; then
+    max=$(( _EGRESS_HEALTH_WAIT_SECS * 5 ))
+    while [ "$ticks" -lt "$max" ]; do
+      sleep 0.2
+      if _egress_shim_alive "$gw"; then return 0; fi
+      [ "$_EG_SHIM_AGE" = "-1" ] || break
+      ticks=$(( ticks + 1 ))
+    done
+  fi
+  warn "Shim not listening  ${DIM}the in-box relay has not been heard from${RESET}"
+  echo -e "    ${DIM}Requests fail before they reach the policy. This is not a policy denial.${RESET}"
+  echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart --shim${RESET}"
+  return 0
+}
+
+# A caged box's execs carry the relay's address (3.1). Only after a gate that
+# passed, and once however many times it is called. The variables carry no
+# security weight: the box has no network, and a user [env] value that
+# overrides them only cuts the box off.
+_egress_proxy_env_add() {
+  [ "${_EG_CAGED:-0}" = 1 ] || return 0
+  local a
+  for a in "${CLAUDE_ENV[@]+"${CLAUDE_ENV[@]}"}"; do
+    [ "$a" = "HTTPS_PROXY=$_EGRESS_PROXY_URL" ] && return 0
+  done
+  CLAUDE_ENV+=("${_EGRESS_PROXY_ENV[@]}")
 }
 
 # ── The gateway image (8.0) ──
@@ -11164,9 +11237,11 @@ _egress_precreate_check() {              # <cname> <workspace> <mode>
 # assertion passes. Otherwise it prints one refusal and returns 1, and the
 # caller exits 1 (the relaunch loop breaks instead). Runs after the verb's
 # resolve_caps, at statement position, before the verb's first docker exec.
+_EG_CAGED=0
 _egress_require() {                      # <cname> <verb>
   local _c="$1" _kind _ws
   _EG_REFUSED=""
+  _EG_CAGED=0
   # A down daemon is a daemon error, never an egress refusal: the verb fails
   # on its own message and the autopilot gets its chance. Unbounded, as it
   # ships, because _run_bounded cannot run a shell function.
@@ -11199,6 +11274,8 @@ _egress_require() {                      # <cname> <verb>
   fi
   _egress_gateway_ok "$_c" || return 1
   _egress_live_ok "$_c" "$_EG_MODE" "$_EG_HOSTS" || return 1
+  _egress_shim_note "$_c"
+  _EG_CAGED=1
   return 0
 }
 
@@ -14319,7 +14396,11 @@ _maybe_run_setup() {
   docker exec "$cname" runuser -u coder -- rm -f "$runfile" >/dev/null 2>&1 || true
   printf '%s' "$payload" | docker exec -i "$cname" runuser -u coder -- tee "$runfile" >/dev/null 2>&1 || true
   local rc=0
-  docker exec -e HOME=/home/coder -w /workspace "$cname" \
+  # A caged box's [setup] reaches the network through the relay too. The
+  # gate at the top of this function set _EG_CAGED.
+  local _setup_env=(-e HOME=/home/coder)
+  if [ "${_EG_CAGED:-0}" = 1 ]; then _setup_env+=("${_EGRESS_PROXY_ENV[@]}"); fi
+  docker exec "${_setup_env[@]}" -w /workspace "$cname" \
     runuser -u coder -- bash -e "$runfile" || rc=$?
   docker exec "$cname" runuser -u coder -- rm -f "$runfile" >/dev/null 2>&1 || true
 
@@ -14868,6 +14949,7 @@ exec_claude() {
   # also the first iteration's check: the loop below re-checks on every
   # relaunch (EGRESS-SPEC.md 5.7).
   _egress_require "$cname" claude || exit 1
+  _egress_proxy_env_add
 
   _CLIP_DIR="$CLEAT_RUN_DIR/${cname}/clip"
   _CLIP_WATCHER_PID=""
@@ -17998,6 +18080,7 @@ cmd_shell() {
   # host-only (a trust prompt and config reads), so the move adds no docker call.
   resolve_caps "$project"
   _egress_require "$cname" shell || exit 1
+  _egress_proxy_env_add
   _wait_for_coder_remap "$cname"
   # resolve_caps may have just prompted for and approved [setup]; honor it
   # here so entering the box actually provisions (a no-op once the marker is
@@ -18125,6 +18208,7 @@ cmd_login() {
   # can read the resolved caps before the verb's first docker exec.
   resolve_caps "$project"
   _egress_require "$cname" login || exit 1
+  _egress_proxy_env_add
   _wait_for_coder_remap "$cname"
   # Honor a just-approved [setup] so the login prompt to approve it is not
   # shown without effect (no-op once the marker is written).

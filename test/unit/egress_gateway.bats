@@ -618,3 +618,136 @@ caged_create() {
   run assert_docker_run_has "$CN" "--label sh.cleat.config-hash=v2:$want "
   assert_success
 }
+
+# ── Health readers (8.6, 8.10) ──────────────────────────────────────────────
+
+@test "egress: the shim assertion fails when the relay is not listening" {
+  CN=cleat-demo-3f2a9104
+  egress_box_names
+  use_gw_admin_stub
+  local age
+  for age in 12 90; do
+    mock_gw_admin last_shim_seen "ok last_shim_seen $age"
+    run _egress_shim_alive "$GW"
+    assert_success
+  done
+  for age in 91 300 -1; do
+    mock_gw_admin last_shim_seen "ok last_shim_seen $age"
+    run _egress_shim_alive "$GW"
+    assert_failure
+  done
+  # An error line, and no answer at all.
+  mock_gw_admin last_shim_seen "err last_shim_seen not-ready"
+  run _egress_shim_alive "$GW"
+  assert_failure
+  mock_gw_admin last_shim_seen ""
+  run _egress_shim_alive "$GW"
+  assert_failure
+}
+
+@test "egress: a healthy gateway with no running box is reported as orphaned" {
+  CN=cleat-demo-3f2a9104
+  egress_box_names
+  use_gw_admin_stub
+  mock_gw_admin path_ok "ok path_ok true"
+  container_exists() { [ "$1" = "$GW" ]; }
+  is_running() { [ "$1" = "$GW" ]; }
+  run _egress_gateway_state "$CN"
+  assert_output "orphaned"
+}
+
+@test "egress: the gateway state names missing, stopped, displaced and healthy" {
+  CN=cleat-demo-3f2a9104
+  egress_box_names
+  use_gw_admin_stub
+  container_exists() { return 1; }
+  run _egress_gateway_state "$CN"
+  assert_output "missing"
+  container_exists() { return 0; }
+  is_running() { [ "$1" = "$CN" ]; }
+  run _egress_gateway_state "$CN"
+  assert_output "stopped"
+  is_running() { return 0; }
+  mock_gw_admin path_ok "ok path_ok false"
+  run _egress_gateway_state "$CN"
+  assert_output "displaced"
+  # A gateway that cannot answer is displaced too: the fail-closed word.
+  mock_gw_admin path_ok ""
+  run _egress_gateway_state "$CN"
+  assert_output "displaced"
+  mock_gw_admin path_ok "ok path_ok true"
+  run _egress_gateway_state "$CN"
+  assert_output "healthy"
+}
+
+# ── The proxy environment (3.1) ─────────────────────────────────────────────
+
+# A caged box, running, whose gate passes: exec_claude, cmd_shell and
+# cmd_login run against it through the stub.
+caged_running() {
+  caged_create
+  mock_docker_ps "$CN"
+  mock_docker_ps_a "$CN"
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  _is_interactive() { return 0; }
+  _wait_for_coder_remap() { true; }
+}
+
+proxy_env_on() {                         # <cname>
+  local v
+  for v in "HTTPS_PROXY=http://127.0.0.1:3128" "https_proxy=http://127.0.0.1:3128" \
+    "http_proxy=http://127.0.0.1:3128" "NO_PROXY=localhost,127.0.0.1,::1" "no_proxy=localhost,127.0.0.1,::1"; do
+    run assert_docker_exec_has "$1" "-e $v "
+    assert_success
+  done
+}
+
+@test "egress gateway: a caged box's exec carries the proxy environment" {
+  caged_running
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run grep "^docker exec -it .* $CN " "$DOCKER_CALLS"
+  assert_success
+  proxy_env_on "$CN"
+}
+
+@test "egress gateway: cleat shell and cleat login into a caged box carry the proxy environment" {
+  caged_running
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  proxy_env_on "$CN"
+  : > "$DOCKER_CALLS"
+  run cmd_login "$TEST_TEMP/project"
+  proxy_env_on "$CN"
+}
+
+@test "egress gateway: the proxy environment is added once however many gates pass" {
+  caged_running
+  _egress_require "$CN" claude
+  _egress_proxy_env_add
+  _egress_require "$CN" claude
+  _egress_proxy_env_add
+  run bash -c 'printf "%s\n" "$@" | grep -c "^HTTPS_PROXY="' _ "${CLAUDE_ENV[@]}"
+  assert_output "1"
+  # A gate that did not pass adds nothing.
+  CLAUDE_ENV=(-e HOME=/home/coder)
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  _egress_require "$CN" claude || true
+  _egress_proxy_env_add
+  run printf '%s ' "${CLAUDE_ENV[@]}"
+  assert_output "-e HOME=/home/coder "
+}
+
+@test "egress gateway: a caged box's setup payload carries the proxy environment" {
+  caged_running
+  _SETUP_DECLARED=1; _SETUP_TRUSTED=1
+  _build_setup_payload() { printf 'curl -fsS https://docs.example.test\n'; }
+  _setup_payload_hash() { printf 'h1'; }
+  _trust_lookup_setup() { printf 'h1'; }
+  run _maybe_run_setup "$CN" "$TEST_TEMP/project" main 1
+  assert_success
+  run grep "^docker exec .*-w /workspace $CN runuser -u coder -- bash -e" "$DOCKER_CALLS"
+  assert_success
+  [[ "$output" == *"-e HOME=/home/coder -e HTTPS_PROXY=http://127.0.0.1:3128 "* ]]
+  [[ "$output" == *"-e no_proxy=localhost,127.0.0.1,::1 -w /workspace "* ]]
+}

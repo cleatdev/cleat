@@ -934,6 +934,33 @@ egress:hooks=0"
   [ "$output" -ge 3 ]
 }
 
+@test "egress require: a stale shim warns, names restart --shim and never refuses" {
+  caged_box
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  run _egress_require "$CN" shell
+  assert_success
+  assert_output --partial "Shim not listening"
+  assert_output --partial "cleat egress restart --shim"
+  assert_output --partial "This is not a policy denial."
+}
+
+@test "egress require: a shim never seen is waited for" {
+  caged_box
+  mock_gw_admin last_shim_seen "ok last_shim_seen -1" "ok last_shim_seen -1" "ok last_shim_seen 4"
+  run _egress_require "$CN" start
+  assert_success
+  assert_output ""
+  run count_calls "gw-admin last_shim_seen"
+  assert_output "3"
+  # A relay that never comes back is named once the wait is over.
+  _EGRESS_HEALTH_WAIT_SECS=1
+  mock_gw_admin last_shim_seen "ok last_shim_seen -1"
+  : > "$DOCKER_CALLS"
+  run _egress_require "$CN" start
+  assert_success
+  assert_output --partial "Shim not listening"
+}
+
 # ── Placement (5.7): before every exec, on every fatal verb ─────────────────
 
 # A box that predates a strict policy: the gate refuses at its first read.

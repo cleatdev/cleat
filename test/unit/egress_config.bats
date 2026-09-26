@@ -693,7 +693,7 @@ _default_launch() {
   assert_failure
   run grep -E '^docker (image inspect|pull) .*cleat-gw' "$DOCKER_CALLS"
   assert_failure
-  run grep -E 'HTTPS_PROXY=|http_proxy=|NO_PROXY=' "$DOCKER_CALLS"
+  run grep -Ei 'HTTPS_PROXY=|http_proxy=|NO_PROXY=' "$DOCKER_CALLS"
   assert_failure
   # Nothing of a caged box: no dropped capability, no egress label, no socket
   # mount, no gateway exec or copy, no rendered policy on the host.

@@ -10132,3 +10132,15 @@ _caged_run_setup() {
   [ "$(_EGRESS_FP_CAGED=1 compute_config_fingerprint "$TEST_TEMP" "$cn")" = "$fp" ]
   [ "$(_egress_create_digest "$cn" none CAP_NET_RAW 0)" = "$label" ]
 }
+
+@test "regression vNEXT: a dead shim reported healthy" {
+  # A caged launch whose relay has been silent for five minutes: the gateway
+  # is healthy, but nothing in the box reaches it, and the launch must say so.
+  _caged_run_setup
+  caged_box
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Shim not listening"
+  assert_output --partial "cleat egress restart --shim"
+}

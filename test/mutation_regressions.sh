@@ -14878,6 +14878,70 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_fp_excludes_gateway_digest" "a gateway image rebuild forced every box to be recreated" "$CLI"
 
+# Health readers and the gate's shim step (8.6, 8.10).
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_state()/,/^}$/{
+  s@^  is_running "[$]cname" || { printf orphaned; return 0; }@  :@
+}
+SED
+try "vnext_egress_orphan_gateway_state" "a healthy gateway with no running box is reported as orphaned" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_shim_alive()/,/^}$/{
+  s@^  \[ "[$]_age" -le "[$]_EGRESS_SHIM_STALE" \]@  [ -n "$_age" ]@
+}
+SED
+try "vnext_egress_shim_stale_bound" "the shim assertion fails when the relay is not listening" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  /^  _egress_shim_note "[$]_c"$/d
+}
+SED
+try "vnext_egress_dead_shim_named" "a dead shim reported healthy" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_shim_note()/,/^}$/{
+  s@^  if \[ "[$]_EG_SHIM_AGE" = "-1" \]; then$@  if false; then@
+}
+SED
+try "vnext_egress_shim_first_beat_waited" "a shim never seen is waited for" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  /^  _egress_proxy_env_add$/d
+}
+SED
+try "vnext_egress_proxy_env_claude" "a caged box's exec carries the proxy environment" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_proxy_env_add()/,/^}$/{
+  s@^  \[ "[$]{_EG_CAGED:-0}" = 1 \] || return 0$@  :@
+}
+SED
+try "vnext_egress_proxy_env_caged_only" "the proxy environment is added once however many gates pass" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_proxy_env_add()/,/^}$/{
+  s@^    \[ "[$]a" = "HTTPS_PROXY=[$]_EGRESS_PROXY_URL" \] && return 0$@    :@
+}
+SED
+try "vnext_egress_proxy_env_once" "the proxy environment is added once however many gates pass" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_run_setup()/,/^}$/{
+  s@^  if \[ "[$]{_EG_CAGED:-0}" = 1 \]; then _setup_env+=@  if false; then _setup_env+=@
+}
+SED
+try "vnext_egress_proxy_env_setup" "a caged box's setup payload carries the proxy environment" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@^  _EG_CAGED=1$@  _EG_CAGED=0@
+}
+SED
+try "vnext_egress_caged_after_pass" "cleat shell and cleat login into a caged box carry the proxy environment" "$CLI" "$EGRESS_GATEWAY_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

@@ -14355,6 +14355,69 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_widening_notice" "a narrowing since the last launch is silent" "$CLI" "$EGRESS_UI_BATS"
 
+# ── Hostile review fixes, 2026-09-26 ──
+# A workspace of / contains every path: the stripped prefix is what makes the
+# pattern match.
+cat > "$SED_TMP" << 'SED'
+/^_egress_config_is_containable()/,/^}$/{
+  /^    rsrc="\${rsrc%\/}"$/d
+}
+SED
+try "vnext_egress_root_workspace" "a workspace of / passed the containment check" "$CLI"
+
+# A policy file is followed through its links before the containment test.
+cat > "$SED_TMP" << 'SED'
+/^_egress_policy_containable()/,/^}$/{
+  s@^      "\$rsrc"/\*)@      x-never/*)@
+}
+SED
+try "vnext_egress_policy_file_links" "a policy file linked into the workspace passed the containment check" "$CLI"
+
+# The gate runs the per-file check, not the directory check alone.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@_egress_policy_containable "\$_c" "\$_ws"@_egress_config_is_containable "$_ws"@
+}
+SED
+try "vnext_egress_policy_file_gate" "a global config linked into the workspace refuses at the gate" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The editor's save compares against what it loaded.
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_screen()/,/^}$/{
+  s@ "\$_EGE_CANON" || return 1@ || return 1@
+}
+SED
+try "vnext_egress_editor_baseline" "the egress editor save wrote away a deny saved in another terminal" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_write_egress_to_file()/,/^}$/{
+  s@^  if \[ "\${6+x}" = x \] && \[ "\$before" != "\$6" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_writer_baseline" "the egress editor save wrote away a deny saved in another terminal" "$CLI"
+
+# The ssh mounts are read off the box, never inferred from this launch's caps.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@^      /home/coder/.ssh|/home/coder/.ssh/\*|/tmp/ssh-agent.sock)@      x-never)@
+}
+SED
+try "vnext_egress_ssh_mounts" "a box that still has the ssh mounts refuses whatever the launch caps" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@^      /var/run/docker.sock|/run/docker.sock)@      /var/run/docker.sock)@
+}
+SED
+try "vnext_egress_docker_sock_run" "a docker socket at /run refuses like one at /var/run" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@|\*':unconfined"'\*)@)@
+}
+SED
+try "vnext_egress_seccomp_colon" "a colon separated unconfined profile refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
 # ── cleat egress audit (7.1, 4.4a) ──
 # A name off a denial row was chosen by the box: it is never dialled from the
 # host until a person retypes it.

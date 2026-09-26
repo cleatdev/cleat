@@ -9884,3 +9884,60 @@ _c19_star_project() {
   PATH="$TEST_TEMP/dialbin:$PATH" run cmd_egress audit <<< "k5rw.exfil.example"
   [ -s "$TEST_TEMP/dialled" ]
 }
+
+@test "regression vNEXT: a policy file linked into the workspace passed the containment check" {
+  # A dotfiles checkout links ~/.config/cleat/config into a project. Run from
+  # that project, the box could rewrite the policy through /workspace while the
+  # check looked only at the config directory (EGRESS-SPEC.md 5.2).
+  local ws="$TEST_TEMP/dotfiles"
+  mkdir -p "$ws/cleat" "$(dirname "$CLEAT_GLOBAL_CONFIG")" "$TEST_TEMP/elsewhere"
+  printf '[egress]\nmode = strict\n' > "$ws/cleat/config"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  ln -s "$ws/cleat/config" "$CLEAT_GLOBAL_CONFIG"
+  run _egress_policy_containable cleat-demo-3f2a9104 "$ws"
+  assert_failure
+  assert_output --partial "inside a folder a box can write"
+  # The same file linked from outside every project is fine.
+  run _egress_policy_containable cleat-demo-3f2a9104 "$TEST_TEMP/elsewhere"
+  assert_success
+  # A box's own file linked in is refused the same way, through a relative link.
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nallow = docs.rs\n' > "$ws/cleat/box"
+  ln -s "../../../../dotfiles/cleat/box" "$_EGRESS_BOXES_DIR/cleat-demo-3f2a9104"
+  [ -f "$_EGRESS_BOXES_DIR/cleat-demo-3f2a9104" ]
+  run _egress_policy_containable cleat-demo-3f2a9104 "$ws"
+  assert_failure
+  # A link loop is refused rather than followed forever.
+  rm -f "$_EGRESS_BOXES_DIR/cleat-demo-3f2a9104"
+  ln -s "$_EGRESS_BOXES_DIR/cleat-demo-3f2a9104" "$_EGRESS_BOXES_DIR/cleat-demo-3f2a9104"
+  run _egress_policy_containable cleat-demo-3f2a9104 "$TEST_TEMP/elsewhere"
+  assert_failure
+  assert_output --partial "cannot be resolved"
+}
+
+@test "regression vNEXT: a workspace of / passed the containment check" {
+  # cleat run from / mounts the whole host at /workspace. The prefix test
+  # became "//*", which no path matches, so the config read as host-side.
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  run _egress_config_is_containable /
+  assert_failure
+  assert_output --partial "inside a folder a box can write"
+  run _egress_policy_containable cleat-demo-3f2a9104 /
+  assert_failure
+}
+
+@test "regression vNEXT: the egress editor save wrote away a deny saved in another terminal" {
+  # The editor holds what it loaded for minutes. Its save compared against the
+  # file as the write began, so a deny saved meanwhile vanished with no word.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  run _egress_cmd_edit deny "" docs.example.test
+  assert_success
+  run _egress_save_screen 1
+  assert_failure
+  assert_output --partial "changed in another terminal"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output --partial "deny = docs.example.test"
+}

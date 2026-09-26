@@ -857,6 +857,44 @@ egress:hooks=0"
   assert_success
 }
 
+@test "egress require: a global config linked into the workspace refuses at the gate" {
+  mkdir -p "$TEST_TEMP/dotfiles/cleat"
+  printf '[egress]\nmode = strict\n' > "$TEST_TEMP/dotfiles/cleat/config"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  ln -s "$TEST_TEMP/dotfiles/cleat/config" "$CLEAT_GLOBAL_CONFIG"
+  caged_box
+  _RESOLVED_PROJECT="$TEST_TEMP/dotfiles"
+  run _egress_require "$CN" start
+  assert_failure
+  assert_output --partial "An egress policy file lives inside a folder a box can write"
+}
+
+@test "egress require: a box that still has the ssh mounts refuses whatever the launch caps" {
+  ACTIVE_CAPS=()
+  local d
+  for d in '/workspace\n/run/cleat-egress\n/home/coder/.ssh' '/workspace\n/run/cleat-egress\n/tmp/ssh-agent.sock'; do
+    rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+    F_DESTS="$d" caged_box
+    run _egress_require "$CN" shell
+    assert_failure
+    assert_output --partial "ssh keys or agent mounted"
+  done
+}
+
+@test "egress require: a docker socket at /run refuses like one at /var/run" {
+  F_DESTS='/workspace\n/run/cleat-egress\n/run/docker.sock' caged_box
+  run _egress_require "$CN" start
+  assert_failure
+  assert_output --partial "Docker socket is mounted"
+}
+
+@test "egress require: a colon separated unconfined profile refuses" {
+  F_SEC='["seccomp:unconfined","label=disable"]' caged_box
+  run _egress_require "$CN" start
+  assert_failure
+  assert_output --partial "unconfined"
+}
+
 # ── The rendered policy (8.2) ───────────────────────────────────────────────
 
 @test "egress require: the rendered policy is the gateway's document, byte for byte" {

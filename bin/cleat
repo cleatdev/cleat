@@ -9185,6 +9185,7 @@ _EGE_BOX=""
 _EGE_FIRST=0
 _EGE_HFIRST=0
 _EGE_SAVED=0
+_EGE_CANON=""
 _EG_MODE=""
 _EG_HOSTS=""
 _EG_PACKS=""
@@ -9387,6 +9388,15 @@ _write_egress_to_file() {
   if ! _egress_path_is_writable_policy "$file"; then return 1; fi
   mkdir -p "$(dirname "$file")" 2>/dev/null || true
   before="$(_egress_section_canon "$file")"
+  # A sixth argument is the section as the caller read it before deciding
+  # what to write. An editor holds its state for minutes, so the baseline is
+  # the one it loaded, never the one this write starts from: otherwise a deny
+  # saved in another terminal meanwhile is silently written away.
+  if [ "${6+x}" = x ] && [ "$before" != "$6" ]; then
+    error "The policy changed in another terminal.  Nothing was written."
+    echo -e "  ${DIM}Re-run to see the current policy.${RESET}"
+    return 1
+  fi
   if [[ -f "$file" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
       _h="${line%$'\r'}"
@@ -9455,10 +9465,56 @@ _egress_config_is_containable() {        # <workspace> [<rw source>...]
   for src in "$@"; do
     [ -n "$src" ] || continue
     rsrc="$(cd -P "$src" 2>/dev/null && pwd)" || continue
+    # Stripped first: a source of / contains every path, and "//*" matches
+    # none. Into a variable, because bash 5.2 does not match a case pattern
+    # of "${rsrc%/}"/* when the expansion is empty (bash 3.2 does).
+    rsrc="${rsrc%/}"
     case "$real/" in
       "$rsrc"/*)
+        rsrc="${rsrc:-/}"
         error "The Cleat config directory is inside a folder a box can write: ${rsrc/#${HOME}/~}"
         echo -e "  ${DIM}An egress policy there could be rewritten by the agent it restricts. Run Cleat from a project folder instead.${RESET}"
+        return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# The directory a file's bytes really live in, following the file's own
+# links (a dotfiles checkout links ~/.config/cleat/config elsewhere) and then
+# every directory component. rc 1 on a link loop or an unresolvable target.
+_egress_real_dir_of() {                  # <file>
+  local f="$1" t n=0
+  while [ -L "$f" ]; do
+    [ "$n" -lt 16 ] || return 1
+    t="$(readlink "$f")" || return 1
+    case "$t" in /*) f="$t" ;; *) f="$(dirname "$f")/$t" ;; esac
+    n=$((n + 1))
+  done
+  (cd -P "$(dirname "$f")" 2>/dev/null && pwd)
+}
+
+# The containment check for one box: the config directory, then every file
+# its policy is read from, each followed through its links. A policy file
+# that resolves inside the workspace is one the agent can rewrite, whatever
+# path the host reads it by.
+_egress_policy_containable() {           # <cname> <workspace>
+  local f rd rsrc
+  _egress_config_is_containable "$2" || return 1
+  [ -n "$2" ] || return 0
+  rsrc="$(cd -P "$2" 2>/dev/null && pwd)" || return 0
+  rsrc="${rsrc%/}"
+  for f in "$CLEAT_GLOBAL_CONFIG" "$_EGRESS_BOXES_DIR/$1" "$_EGRESS_PINS_DIR/global" "$_EGRESS_PINS_DIR/$1"; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    if ! rd="$(_egress_real_dir_of "$f")" || [ -z "$rd" ]; then
+      error "An egress policy file cannot be resolved: ${f/#${HOME}/~}"
+      echo -e "  ${DIM}Its link does not lead to a real file. Point it at one outside every project.${RESET}"
+      return 1
+    fi
+    case "$rd/" in
+      "$rsrc"/*)
+        error "An egress policy file lives inside a folder a box can write: ${f/#${HOME}/~}"
+        echo -e "  ${DIM}It resolves under ${rsrc:-/}, so the agent it restricts could rewrite it. Move it out of the project.${RESET}"
         return 1 ;;
     esac
   done
@@ -10662,7 +10718,7 @@ _egress_box_shape() {                    # <cname>
   esac
   _v="$(_egress_box_field "$_c" '{{json .HostConfig.SecurityOpt}}')" || _v="?"
   case "$_v" in
-    "?"|*'=unconfined"'*)
+    "?"|*'=unconfined"'*|*':unconfined"'*)
       _egress_refuse box "a security profile is unconfined." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
   esac
   _v="$(_egress_box_field "$_c" '{{.HostConfig.Privileged}}')" || _v="?"
@@ -10691,8 +10747,16 @@ _egress_box_shape() {                    # <cname>
   _v="$(_egress_box_field "$_c" '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}')" || {
     _egress_refuse box "cleat could not read its mounts." "check that Docker is healthy, then re-run cleat"; return 1; }
   while IFS= read -r _d; do
-    case "$_d" in /etc/cleat-egress|/etc/cleat-egress/*)
-      _egress_refuse box "a mount reaches the gateway's policy." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+    case "$_d" in
+      /etc/cleat-egress|/etc/cleat-egress/*)
+        _egress_refuse box "a mount reaches the gateway's policy." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+      # The ssh capability's two mounts are create-time, so a box keeps them
+      # after a launch drops the capability. Read off the box, never the caps.
+      /home/coder/.ssh|/home/coder/.ssh/*|/tmp/ssh-agent.sock)
+        _egress_refuse box "it still has your ssh keys or agent mounted." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+      # /var/run is a link to /run in the image, so either path is the socket.
+      /var/run/docker.sock|/run/docker.sock)
+        _egress_refuse box "the Docker socket is mounted into it." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
     esac
   done <<EOF
 $_v
@@ -10844,12 +10908,12 @@ _egress_require() {                      # <cname> <verb>
         "${BOLD}cleat egress off${RESET} recreates it with a normal network, or restore the [egress] section"
       return 1 ;;
   esac
-  # A policy inside the cage is not a policy: the config directory must not
-  # sit under the workspace this box mounts read-write, nor be reached
-  # through a symlinked directory (5.2). It prints the collision.
+  # A policy inside the cage is not a policy: neither the config directory
+  # nor any policy file, followed through its links, may sit under the
+  # workspace this box mounts read-write (5.2). It prints the collision.
   _ws="${_RESOLVED_PROJECT:-}"
   if _box_is_fork "$_c" 2>/dev/null; then _ws="$(_fork_dir "$_c")"; fi
-  if ! _egress_config_is_containable "$_ws"; then
+  if ! _egress_policy_containable "$_c" "$_ws"; then
     _EG_REFUSED=policy
     return 1
   fi
@@ -11387,7 +11451,7 @@ _egress_list_without() {                 # <list> <value>
 # file's deny list, and denying it takes it off the allow list, so the file
 # always says what the user last asked for.
 _egress_cmd_edit() {                     # <allow|deny> <box or empty> <arg>...
-  local verb="$1" box="$2" file cname a h packs allows denies mode changed=""
+  local verb="$1" box="$2" file cname a h packs allows denies mode changed="" canon
   shift 2
   if [[ -n "$box" ]]; then
     _set_box "$box"
@@ -11425,6 +11489,7 @@ _egress_cmd_edit() {                     # <allow|deny> <box or empty> <arg>...
     return 1
   fi
   _egress_file_state "$file"
+  canon="$(_egress_section_canon "$file")"
   mode="$_f_mode"
   packs="$_f_packs"
   allows="$_f_allows"
@@ -11469,7 +11534,7 @@ _egress_cmd_edit() {                     # <allow|deny> <box or empty> <arg>...
   done
   # A per-box file with no mode of its own keeps the global mode.
   if [[ -n "$box" && "$mode" == absent ]]; then mode=inherit; fi
-  _write_egress_to_file "$file" "$mode" "$packs" "$denies" "$allows" || return 1
+  _write_egress_to_file "$file" "$mode" "$packs" "$denies" "$allows" "$canon" || return 1
   _egress_resolve "$cname"
   success "Saved to ${file/#${HOME}/~}"
   printf '%s' "$changed" | while IFS= read -r a; do
@@ -11715,6 +11780,7 @@ _egress_editor_load() {                  # <box or empty>
     _EGE_FILE="$CLEAT_GLOBAL_CONFIG"
   fi
   _egress_file_state "$_EGE_FILE"
+  _EGE_CANON="$(_egress_section_canon "$_EGE_FILE")"
   _EGE_MODE="$_f_mode"
   if [ -z "$box" ]; then
     case "$_EGE_MODE" in absent) _EGE_MODE=strict ;; esac
@@ -12104,7 +12170,7 @@ _egress_save_screen() {                  # <assume_yes>
     IFS= read -r ans || ans="n"
     case "$ans" in ""|y|Y|yes|YES) ;; *) info "Not saved."; return 1 ;; esac
   fi
-  _write_egress_to_file "$_EGE_FILE" "$_EGE_MODE" "$_EGE_PACKS" "$_EGE_DENIES" "$_EGE_HOSTS" || return 1
+  _write_egress_to_file "$_EGE_FILE" "$_EGE_MODE" "$_EGE_PACKS" "$_EGE_DENIES" "$_EGE_HOSTS" "$_EGE_CANON" || return 1
   _EGE_SAVED=1
   success "Saved to ${_EGE_FILE/#${HOME}/~}"
   return 0
@@ -12343,8 +12409,10 @@ _egress_project_ignored_note() {         # <project .cleat>
 # On: the minimum that means on, through the one writer. mode strict, and any
 # entries already there are kept. Prints what it did.
 _egress_config_enable() {
+  local canon
   _egress_file_state "$CLEAT_GLOBAL_CONFIG"
-  _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" strict "$_f_packs" "$_f_denies" "$_f_allows" || return 1
+  canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
+  _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" strict "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
   success "Saved to ${CLEAT_GLOBAL_CONFIG/#${HOME}/~}"
   echo ""
   echo -e "    Egress control is on, with the Claude Code hosts and nothing else."

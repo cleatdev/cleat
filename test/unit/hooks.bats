@@ -3621,8 +3621,13 @@ _spool_box() {   # makes $CLEAT_RUN_DIR/box-a/hooks/events.jsonl holding $1 byte
   head -c 300 /dev/zero | tr '\0' 'x' > "$spool"
   _hook_bridge_watcher "$spool" "$TEST_TEMP" "box-a" >/dev/null 2>&1 &
   bpid=$!
+  # The claim removes the spool before the discard is logged, so wait for the
+  # log row too: killing the watcher between the two lost the row on a slow
+  # macOS runner.
   i=0
-  while [ -e "$spool" ] && [ "$i" -lt 60 ]; do sleep 0.1; i=$((i+1)); done
+  while { [ -e "$spool" ] || ! grep -q "	spool	" "$CLEAT_STATE_DIR/hook-drops.log" 2>/dev/null; } && [ "$i" -lt 60 ]; do
+    sleep 0.1; i=$((i+1))
+  done
   kill "$bpid" 2>/dev/null || true
   wait "$bpid" 2>/dev/null || true
   run test -e "$spool"

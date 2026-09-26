@@ -9994,9 +9994,11 @@ SH
   # characters, so the strip never matched and a BOM before [egress] hid the
   # whole section: every deny line uncounted, the section absent.
   _utf8_awk_on_path
-  # The stand-in really does miss the BOM outside the C locale.
-  run bash -c "printf '\357\273\277x\n' | awk 'NR == 1 { sub(/^\357\273\277/, \"\") } { print length(\$0) }'"
-  assert_output "4"
+  # The stand-in really does miss the BOM outside the C locale: the line comes
+  # back with its BOM. Compared as bytes, since a UTF-8 awk counts the BOM as
+  # one character and a byte awk as three.
+  run bash -c "printf '\357\273\277x\n' | awk 'NR == 1 { sub(/^\357\273\277/, \"\") } { print }' | od -An -tx1 | tr -d ' \n'"
+  assert_output "efbbbf780a"
   mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
   printf '\357\273\277[egress]\r\ndeny = i.example\r\ndeny =\r\ndeni = x.example\r\n' > "$CLEAT_GLOBAL_CONFIG"
   run _egress_raw_key_count "$CLEAT_GLOBAL_CONFIG" egress deny

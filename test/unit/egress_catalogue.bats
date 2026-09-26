@@ -26,7 +26,9 @@ _trusted_setup_project() {
 }
 
 # One field of the first record for a host: 3 class, 4 flags, 5 legs, 6 cert.
-_field() { _egress_catalogue_records | awk -F'\t' -v h="$1" -v f="$2" '$2 == h { print $f; exit }'; }
+# Reads to the end rather than exiting at the match: an early exit closes the
+# pipe on the records' printf, which some runners report as a write error.
+_field() { _egress_catalogue_records | awk -F'\t' -v h="$1" -v f="$2" '$2 == h && !d { print $f; d = 1 }'; }
 
 # ── Records (7.1) ────────────────────────────────────────────────────────────
 

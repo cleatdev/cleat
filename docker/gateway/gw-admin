@@ -1,0 +1,86 @@
+#!/usr/bin/python3 -I
+# The host's one client for the gateway's admin socket (EGRESS-SPEC.md 8.5).
+# Run as `docker exec <gw> /usr/local/bin/gw-admin <verb> [arg]`. Prints the
+# gateway's one-line answer. Exits 0 on `ok`, 1 on `err`, 2 when no answer
+# arrives inside its own timeout.
+#
+# `selftest` is the one verb the admin socket never sees. It is run as the box's
+# own uid and dials the public proxy socket, so a pass proves the permission
+# path the box's shim uses.
+
+import os
+import socket
+import sys
+
+ADMIN_SOCK = os.environ.get("CLEAT_GW_ADMIN_SOCK", "/run/gw-admin/admin.sock")
+PROXY_SOCK = os.environ.get("CLEAT_GW_PROXY_SOCK", "/run/cleat-egress/proxy.sock")
+TIMEOUT_S = 5
+LINE_MAX = 512
+SELFTEST_REQUEST = (b"CONNECT cleat-gateway.invalid:443 HTTP/1.1\r\n"
+                    b"Host: cleat-gateway.invalid:443\r\n"
+                    b"Cleat-Selftest: 1\r\n\r\n")
+
+
+def _read_line(s):
+    data = b""
+    while b"\n" not in data and len(data) < LINE_MAX:
+        chunk = s.recv(LINE_MAX)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def ask(verb, arg):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(TIMEOUT_S)
+    try:
+        s.connect(ADMIN_SOCK)
+        s.sendall((verb + (" " + arg if arg else "") + "\n").encode("ascii"))
+        data = _read_line(s)
+    finally:
+        s.close()
+    if b"\n" not in data:
+        return None
+    return data.split(b"\n", 1)[0].decode("ascii", "replace")
+
+
+def selftest():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(TIMEOUT_S)
+    try:
+        s.connect(PROXY_SOCK)
+        s.sendall(SELFTEST_REQUEST)
+        data = _read_line(s)
+    finally:
+        s.close()
+    if data.startswith(b"HTTP/1.1 200 "):
+        return "ok selftest cleat-egress-ok"
+    return "err selftest not-ready"
+
+
+def main(argv):
+    if not argv or len(argv) > 2:
+        sys.stderr.write("usage: gw-admin <verb> [arg]\n")
+        return 2
+    verb = argv[0]
+    arg = argv[1] if len(argv) == 2 else ""
+    if not verb or not all(c.isascii() and (c.isalnum() or c in "-_") for c in verb):
+        sys.stderr.write("gw-admin: bad verb\n")
+        return 2
+    if not all(c.isascii() and c.isprintable() and c != " " for c in arg):
+        sys.stderr.write("gw-admin: bad argument\n")
+        return 2
+    try:
+        line = selftest() if verb == "selftest" else ask(verb, arg)
+    except (OSError, UnicodeError):
+        line = None
+    if line is None:
+        sys.stderr.write("gw-admin: no answer\n")
+        return 2
+    print(line)
+    return 0 if line.startswith("ok ") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

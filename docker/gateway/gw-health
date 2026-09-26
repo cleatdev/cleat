@@ -1,0 +1,28 @@
+#!/usr/bin/python3 -I
+# The gateway's HEALTHCHECK (EGRESS-SPEC.md 8.5). Healthy means the admin
+# socket answers and the proxy socket is still the inode the gateway bound, so
+# a second gateway that displaced it turns this one unhealthy.
+
+import os
+import socket
+import sys
+
+ADMIN_SOCK = os.environ.get("CLEAT_GW_ADMIN_SOCK", "/run/gw-admin/admin.sock")
+
+
+def main():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(4)
+    try:
+        s.connect(ADMIN_SOCK)
+        s.sendall(b"path_ok\n")
+        data = s.recv(512)
+    except OSError:
+        return 1
+    finally:
+        s.close()
+    return 0 if data == b"ok path_ok true\n" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

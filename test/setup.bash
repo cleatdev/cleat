@@ -388,6 +388,30 @@ mock_docker_image_cached() {
   printf '%s\n' "$1" >> "$DOCKER_MOCK_DIR/cached_images"
 }
 
+# The answer the stub gives `docker ps` for one set of --filter values, given
+# in the order the code passes them: mock_docker_ps_filter <output> <filter>...
+mock_docker_ps_filter() {
+  local out="$1" pf="" f k
+  shift
+  for f in "$@"; do pf+="$f;"; done
+  k="$(printf '%s' "$pf" | cksum)"
+  k="${k%% *}"
+  mkdir -p "$DOCKER_MOCK_DIR/ps_filter"
+  printf '%s\n' "$out" > "$DOCKER_MOCK_DIR/ps_filter/$k"
+}
+
+# Plant a measured uid answer for this engine (concept/45). The measurement is
+# Linux-only (macOS keeps the host's own ids), so a test that plants one is
+# testing the Linux path. Say so, or the macOS shards would take the gate and
+# never read the plant.
+int_uidmap_write() {
+  _is_macos() { return 1; }
+  mkdir -p "$CLEAT_CONFIG_DIR/state"
+  local ep; ep="$(_docker_context_endpoint)"
+  printf '%s\t%s\t%s\t%s\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
+    "${ep:--}" "$(id -u)" "$1" > "$CLEAT_CONFIG_DIR/state/uidmap"
+}
+
 # A throwaway checkout for the mutation harness: its real script with the
 # registry replaced by the entries in $1, its real lock library, the ten
 # tracked targets as one-line files that read "pristine <path>", and a
@@ -484,7 +508,27 @@ assert_docker_run_lacks() {
   fi
 }
 
+# assert_docker_exec_has <needle> searches every recorded call. With two
+# arguments, <cname> <needle> searches only the first line of the `docker exec`
+# records that name that container as a word, and fails when it has none: a
+# gateway's exec never answers for its box.
 assert_docker_exec_has() {
+  if [[ $# -ge 2 ]]; then
+    local cname="$1" want="$2" line found=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in "docker exec "*) ;; *) continue ;; esac
+      case " $line " in *" $cname "*) ;; *) continue ;; esac
+      found=1
+      [[ "$line" == *"$want"* ]] && return 0
+    done < "$DOCKER_CALLS"
+    if [[ $found -eq 0 ]]; then
+      echo "no docker exec recorded for container '$cname'" >&2
+    else
+      echo "docker exec for '$cname' missing '$want'" >&2
+    fi
+    grep "^docker exec" "$DOCKER_CALLS" >&2 || true
+    exit 1
+  fi
   local needle="$1"
   # Docker exec calls span multiple lines (bash -c with heredoc).
   # Read the entire DOCKER_CALLS file and search for needle.

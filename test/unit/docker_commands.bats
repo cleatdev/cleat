@@ -1225,16 +1225,6 @@ EOF
 # subuids to 1, 2, 3..., so the host's own number picks a subuid there instead
 # of the user. These pin the measured answer being used, not the host's number.
 
-int_uidmap_write() {   # helper: plant a measured answer for this engine
-  # The measurement is Linux-only (macOS keeps the host's own ids), so a test
-  # that plants one is testing the Linux path. Say so, or the macOS shards
-  # would take the gate and never read the plant.
-  _is_macos() { return 1; }
-  mkdir -p "$CLEAT_CONFIG_DIR/state"
-  local ep; ep="$(_docker_context_endpoint)"
-  printf '%s\t%s\t%s\t%s\n' "${DOCKER_HOST:-${DOCKER_CONTEXT:-default}}" \
-    "${ep:--}" "$(id -u)" "$1" > "$CLEAT_CONFIG_DIR/state/uidmap"
-}
 
 @test "uid map: a namespaced engine gets the in-namespace identity, not the host's number" {
   mock_docker_images "cleat"

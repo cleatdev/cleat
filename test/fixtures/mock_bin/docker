@@ -322,6 +322,27 @@ _stub_volume_del() {
 # ─── Subcommand dispatch ───────────────────────────────────────────────────
 case "$1" in
   ps)
+    # A failed enumeration, for code that checks docker ps's status.
+    [[ -n "${DOCKER_PS_EXIT_CODE:-}" ]] && exit "$DOCKER_PS_EXIT_CODE"
+    # Per-filter answers, opt-in by the ps_filter/ directory: the --filter
+    # values, joined in order with ';', pick a file named by their cksum
+    # (mock_docker_ps_filter writes it). No file for the query, or no
+    # directory, and the shipped routing below answers, unchanged.
+    if [[ -d "${DOCKER_MOCK_DIR:-}/ps_filter" ]]; then
+      _pf="" _want=0
+      for _a in "$@"; do
+        if [[ $_want -eq 1 ]]; then _pf+="$_a;"; _want=0; continue; fi
+        case "$_a" in --filter|-f) _want=1 ;; --filter=*) _pf+="${_a#--filter=};" ;; esac
+      done
+      if [[ -n "$_pf" ]]; then
+        _pk="$(printf '%s' "$_pf" | cksum)"
+        _pk="${_pk%% *}"
+        if [[ -f "$DOCKER_MOCK_DIR/ps_filter/$_pk" ]]; then
+          cat "$DOCKER_MOCK_DIR/ps_filter/$_pk"
+          exit 0
+        fi
+      fi
+    fi
     # Token-bounded match for `-a` / `--all`. A naive `*"-a"*` substring
     # match falsely fires when the container name contains '-a' (e.g.
     # `cleat-project-a1b2c3d4`: ~1/16 of random hashes start with 'a'),
@@ -394,13 +415,32 @@ case "$1" in
     # Three live call sites in bin/cleat. A test that sets only the global
     # DOCKER_EXIT_CODE still sees `docker cp` fail through the fallthrough.
     [[ -n "${DOCKER_CP_EXIT_CODE:-}" ]] && exit "$DOCKER_CP_EXIT_CODE"
+    # `docker cp <ctr>:<path> <dest>` copies cp/<ctr>/<basename of path> when
+    # that fixture exists. Without it nothing is written, as before.
+    if [[ "${2:-}" == *:* && -n "${3:-}" ]]; then
+      _cc="${2%%:*}" _cpth="${2#*:}"
+      _cf="${DOCKER_MOCK_DIR:-}/cp/$_cc/${_cpth##*/}"
+      if [[ -f "$_cf" ]]; then
+        if [[ -d "$3" ]]; then cp "$_cf" "$3/"; else cp "$_cf" "$3"; fi
+      fi
+    fi
     ;;
   image)
     # `docker image inspect <ref>` is the only image subcommand currently
     # used. Anything else (e.g. `docker image rm`) falls through to exit 0.
     [[ "${2:-}" == "inspect" ]] && _handle_image_inspect "${@:3}"
     ;;
-  build|start|stop|rm|logs|rmi|builder)
+  logs)
+    # The container is the last argument. logs/<ctr> answers for it,
+    # logs_output for any container, and nothing when neither exists.
+    _lc="${!#}"
+    if [[ -f "${DOCKER_MOCK_DIR:-}/logs/$_lc" ]]; then
+      cat "$DOCKER_MOCK_DIR/logs/$_lc"
+    else
+      _mock "logs_output"
+    fi
+    ;;
+  build|start|stop|rm|rmi|builder)
     ;;
   commit)
     # Tests that need a commit to fail (e.g. upgrade-claude commit failure)

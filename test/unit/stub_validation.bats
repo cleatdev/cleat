@@ -811,3 +811,80 @@ SH
   assert_output --partial "STDIN:payload42"
   assert_equal "$status" 42
 }
+
+# ── Stage three arms: ps per filter, logs, cp out of a container ────────────
+
+@test "stub: docker ps answers per filter and falls back to ps_output when no filter fixture exists" {
+  mock_docker_ps_filter "cleat-gw-aaaaaaaaaaaa" "label=sh.cleat.role=gateway"
+  printf '%s\n' "cleat-box-1" > "$DOCKER_MOCK_DIR/ps_output"
+  run run_docker_stub ps --filter label=sh.cleat.role=gateway --format '{{.Names}}'
+  assert_success
+  assert_output "cleat-gw-aaaaaaaaaaaa"
+  run run_docker_stub ps --filter=label=sh.cleat.role=gateway
+  assert_output "cleat-gw-aaaaaaaaaaaa"
+  # Another filter, or none, reads the shipped files.
+  run run_docker_stub ps --filter label=sh.cleat.version --format '{{.Names}}'
+  assert_output "cleat-box-1"
+  run run_docker_stub ps
+  assert_output "cleat-box-1"
+}
+
+@test "stub: docker ps honours DOCKER_PS_EXIT_CODE" {
+  printf '%s\n' "cleat-box-1" > "$DOCKER_MOCK_DIR/ps_output"
+  DOCKER_PS_EXIT_CODE=1 run env DOCKER_PS_EXIT_CODE=1 DOCKER_CALLS="$DOCKER_CALLS" DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" "$MOCK_BIN/docker" ps
+  assert_failure 1
+  assert_output ""
+}
+
+@test "stub: docker logs prints the fixture for its container" {
+  mkdir -p "$DOCKER_MOCK_DIR/logs"
+  printf 'allow host=a.example\n' > "$DOCKER_MOCK_DIR/logs/cleat-gw-bbbbbbbbbbbb"
+  run run_docker_stub logs --since 10m cleat-gw-bbbbbbbbbbbb
+  assert_output "allow host=a.example"
+  run run_docker_stub logs cleat-other
+  assert_output ""
+  printf 'any\n' > "$DOCKER_MOCK_DIR/logs_output"
+  run run_docker_stub logs cleat-other
+  assert_output "any"
+}
+
+@test "stub: docker cp out of a container writes the fixture" {
+  mkdir -p "$DOCKER_MOCK_DIR/cp/cleat-gw-cccccccccccc" "$TEST_TEMP/dest"
+  printf 'row\n' > "$DOCKER_MOCK_DIR/cp/cleat-gw-cccccccccccc/denials.log"
+  run run_docker_stub cp cleat-gw-cccccccccccc:/run/cleat-egress/denials.log "$TEST_TEMP/dest/copy.log"
+  assert_success
+  run cat "$TEST_TEMP/dest/copy.log"
+  assert_output "row"
+  run run_docker_stub cp cleat-gw-cccccccccccc:/run/cleat-egress/denials.log "$TEST_TEMP/dest"
+  run cat "$TEST_TEMP/dest/denials.log"
+  assert_output "row"
+}
+
+@test "stub: docker cp with no fixture writes nothing" {
+  mkdir -p "$TEST_TEMP/dest"
+  run run_docker_stub cp cleat-gw-dddddddddddd:/run/cleat-egress/denials.log "$TEST_TEMP/dest/copy.log"
+  assert_success
+  [ ! -e "$TEST_TEMP/dest/copy.log" ]
+  run grep -c '^docker cp cleat-gw-dddddddddddd' "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "setup: assert_docker_exec_has with a container ignores another container's exec" {
+  printf 'docker exec cleat-gw-eeeeeeeeeeee /usr/local/bin/gw-admin path_ok\ndocker exec -it -e HTTPS_PROXY=x cleat-demo-12345678 runuser -u coder\n' > "$DOCKER_CALLS"
+  run assert_docker_exec_has cleat-demo-12345678 "HTTPS_PROXY=x"
+  assert_success
+  run assert_docker_exec_has cleat-demo-12345678 "gw-admin"
+  assert_failure
+  run assert_docker_exec_has cleat-gw-eeeeeeeeeeee "gw-admin path_ok"
+  assert_success
+  # The one-argument form is unchanged.
+  run assert_docker_exec_has "gw-admin"
+  assert_success
+}
+
+@test "setup: assert_docker_exec_has with a container fails when that container has no exec" {
+  printf 'docker exec cleat-demo-12345678 true\n' > "$DOCKER_CALLS"
+  run assert_docker_exec_has cleat-demo-1234 "true"
+  assert_failure
+  assert_output --partial "no docker exec recorded for container 'cleat-demo-1234'"
+}

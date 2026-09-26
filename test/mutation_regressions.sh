@@ -10074,7 +10074,7 @@ try "vnext_bridge_origins_no_cwd_read" "the GLOBAL config adds an origin" "$CLI"
 # [browser] is a known section in the global config, where origins live.
 cat > "$SED_TMP" << 'SED'
 /^_warn_unknown_cleat_sections()/,/^}$/{
-  /^          browser) continue ;;$/d
+  s@^          browser|egress) continue ;;$@          egress) continue ;;@
 }
 SED
 try "vnext_browser_section_known_global" "a browser section in the global config" "$CLI" "$PROVISION_BATS"
@@ -11194,7 +11194,7 @@ try "vnext_handoff_reopening_only_exited" "reopens only the sessions that stoppe
 # lock) and prints a "was not saved" line contradicting "Nothing was changed".
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
-  s@^    switching|cancelled) : ;;$@    switching|cancelled) _account_sync_out "$cname" || _harvest=$? ;;@
+  s@^    switching|cancelled|egress) : ;;$@    switching|cancelled|egress) _account_sync_out "$cname" || _harvest=$? ;;@
 }
 SED
 try "vnext_handoff_switching_no_harvest" "switching and the account lock stays busy" "$CLI" "$HANDOFF_BATS"
@@ -14354,6 +14354,74 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_widening_notice" "a narrowing since the last launch is silent" "$CLI" "$EGRESS_UI_BATS"
+
+# ── cleat egress audit (7.1, 4.4a) ──
+# A name off a denial row was chosen by the box: it is never dialled from the
+# host until a person retypes it.
+cat > "$SED_TMP" << 'SED'
+/^_egress_origin_gate()/,/^}$/{
+  s@    box) return 1 ;;@    box) : ;;@
+}
+SED
+try "vnext_egress_audit_origin_gate" "a denied hostname is never dialled from the host" "$CLI"
+
+# Two empty bodies are not one origin.
+cat > "$SED_TMP" << 'SED'
+/^_egress_audit_same_page()/,/^}$/{
+  s@ && \[ "\$_l1" != 0 \]@@
+}
+SED
+try "vnext_egress_audit_empty_body" "the foreign title alone is enough, the status never is" "$CLI" "$EGRESS_UI_BATS"
+
+# The probe origin's page coming back is the evidence that makes a host shared.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_audit()/,/^}$/{
+  s@^        foreign=1@        :@
+}
+SED
+try "vnext_egress_audit_foreign" "a foreign origin's page on either protocol is shared" "$CLI" "$EGRESS_UI_BATS"
+
+# A class is the weakest result across both protocols: a failed HTTP/2 leg
+# never reads as contained.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_audit()/,/^}$/{
+  s@^        h2failed=1@        :@
+}
+SED
+try "vnext_egress_audit_h2_failed" "a failed HTTP/2 request is never contained" "$CLI" "$EGRESS_UI_BATS"
+
+# A stranger's page for a foreign Host is a call for a person, never a pass.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_audit()/,/^}$/{
+  s@case "\$st" in 2??) unclear=1 ;; esac@:@
+}
+SED
+try "vnext_egress_audit_unclear" "a stranger's page for a foreign Host needs a person" "$CLI" "$EGRESS_UI_BATS"
+
+# With no probe origin a foreign page cannot be recognised.
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_audit()/,/^}$/{
+  s@^  if \[ -z "\$ref" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_audit_no_ref" "with no probe origin nothing can be called contained" "$CLI" "$EGRESS_UI_BATS"
+
+# The address classifier names what the gateway refuses.
+cat > "$SED_TMP" << 'SED'
+/^_egress_address_special()/,/^}$/{
+  /\[ "\$o1" -eq 192 \] && \[ "\$o2" -eq 168 \] && return 0/d
+}
+SED
+try "vnext_egress_audit_private_address" "an address the gateway refuses is named" "$CLI" "$EGRESS_UI_BATS"
+
+# Certificate names come from the remote server: any byte, until cut to what
+# a host name can hold.
+cat > "$SED_TMP" << 'SED'
+/^_egress_audit_cert()/,/^}$/{
+  s@grep -E '^\[a-z0-9\*]\[a-z0-9\.\*-]{0,252}$'@grep -E '.'@
+}
+SED
+try "vnext_egress_audit_cert_names_cut" "certificate names are cut to host name characters before use" "$CLI" "$EGRESS_UI_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

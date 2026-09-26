@@ -9864,3 +9864,23 @@ _c19_star_project() {
   run _run_cleat config review <<< "q"
   refute_output --partial "Egress:"
 }
+
+@test "regression vNEXT: a denied hostname is never dialled from the host" {
+  # Every row in a denial log names a host the box chose. cleat egress audit
+  # dials from the host, outside the gateway and the log, so a name copied off
+  # a denial row goes nowhere until a person retypes it (EGRESS-SPEC.md 4.4a).
+  # A curl and an openssl on PATH that record being run stand in for the dial.
+  mkdir -p "$TEST_TEMP/dialbin" "$CLEAT_RUN_DIR/cleat-seed-1234/egress"
+  printf '#!/bin/sh\necho "$0 $*" >> "%s/dialled"\nexit 7\n' "$TEST_TEMP" > "$TEST_TEMP/dialbin/curl"
+  cp "$TEST_TEMP/dialbin/curl" "$TEST_TEMP/dialbin/openssl"
+  chmod +x "$TEST_TEMP/dialbin/curl" "$TEST_TEMP/dialbin/openssl"
+  printf '2026-09-26T00:00:00.000Z code=policy sub=- origin=box host=k5rw.exfil.example port=443 trunc=0\n' \
+    > "$CLEAT_RUN_DIR/cleat-seed-1234/egress/denials.log"
+  PATH="$TEST_TEMP/dialbin:$PATH" run cmd_egress audit k5rw.exfil.example < /dev/null
+  assert_failure
+  assert_output --partial "came from inside the box"
+  [ ! -e "$TEST_TEMP/dialled" ]
+  # The same name typed at the prompt is the user's, and it is dialled.
+  PATH="$TEST_TEMP/dialbin:$PATH" run cmd_egress audit <<< "k5rw.exfil.example"
+  [ -s "$TEST_TEMP/dialled" ]
+}

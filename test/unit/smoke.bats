@@ -3431,3 +3431,51 @@ allow = registry.npmjs.org"
   run grep -E '^docker exec -it' "$DOCKER_CALLS"
   assert_success
 }
+
+@test "smoke: cleat egress audit classifies a host under strict mode" {
+  # A curl and an openssl on PATH answer like a host that refuses a foreign
+  # Host header, so the whole audit runs with no network.
+  mkdir -p "$TEST_TEMP/netbin"
+  cat > "$TEST_TEMP/netbin/curl" <<'SH'
+#!/usr/bin/env bash
+out="" hdr="" host="" ver=1.1 url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -D) hdr="$2"; shift 2 ;;
+    -H) host="${2#Host: }"; shift 2 ;;
+    -w|--max-time|--proto) shift 2 ;;
+    --http2) ver=2; shift ;;
+    --http1.1) ver=1.1; shift ;;
+    https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+case "$url|$host" in
+  https://imgur.com/*) body='<html><title>Imgur: The magic</title>probe</html>'; code=200 ;;
+  *"|docs.example.test"|*"|www.example.test") body='<html><title>Example Docs</title>own</html>'; code=200 ;;
+  *) body=''; code=421 ;;
+esac
+printf 'HTTP/%s %s\r\nServer: nginx\r\n\r\n' "$ver" "$code" > "$hdr"
+printf '%s' "$body" > "$out"
+printf '%s|%s|93.184.215.14' "$code" "$ver"
+SH
+  cat > "$TEST_TEMP/netbin/openssl" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  s_client) printf -- '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n' ;;
+  x509)
+    case " $* " in
+      *" -fingerprint "*) echo "sha256 Fingerprint=AB:CD:EF" ;;
+      *) echo "X509v3 Subject Alternative Name: DNS:docs.example.test, DNS:www.example.test" ;;
+    esac ;;
+esac
+SH
+  chmod +x "$TEST_TEMP/netbin/curl" "$TEST_TEMP/netbin/openssl"
+  PATH="$TEST_TEMP/netbin:$PATH" run cleat_bin egress audit docs.example.test < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "contained"
+  assert_output --partial "h1+h2"
+  assert_output --partial "www.example.test"
+}

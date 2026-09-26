@@ -813,3 +813,235 @@ _plain() { printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
   assert_output "  Egress:     off  ·  full network egress"
   [ ! -e "$(_egress_ledger_path "$cn")" ]
 }
+
+# ── cleat egress audit (7.1, 4.4a) ──────────────────────────────────────────
+
+# A fetch seam answering by the Host header sent. OWN is the host's page,
+# REF the probe origin's. FOREIGN_ANSWER is what the host returns for the
+# foreign Host header. H2 is the version the h2 leg negotiates, or "fail".
+_audit_stub() {
+  OWN="${OWN:-200|1.1|93.184.215.14|nginx|1256|aaaaaaaaaaaa|Example Docs}"
+  REF="${REF:-200|1.1|151.101.0.193|Varnish|5120|bbbbbbbbbbbb|Imgur: The magic of the Internet}"
+  REFUSAL="421|1.1|93.184.215.14|nginx|0|d41d8cd98f00|"
+  FOREIGN_ANSWER="${FOREIGN_ANSWER:-$REFUSAL}"
+  H2="${H2:-2}"
+  _egress_audit_have_curl() { return 0; }
+  export AUDIT_LOG="$TEST_TEMP/audit.calls"
+  : > "$AUDIT_LOG"
+  _egress_audit_fetch() {
+    echo "$1 $2 $3" >> "$AUDIT_LOG"
+    local v=1.1
+    if [ "$3" = h2 ]; then
+      [ "$H2" = fail ] && return 1
+      v="$H2"
+    fi
+    if [ "$1" = imgur.com ]; then printf '%s\n' "$REF"; return 0; fi
+    [ -n "${OWN_FAILS:-}" ] && return 1
+    case "$2" in
+      imgur.com) printf '%s\n' "$FOREIGN_ANSWER" | awk -F'|' -v v="$v" 'BEGIN{OFS="|"} {$2=v; print}' ;;
+      nonexistent.invalid) printf '%s\n' "$REFUSAL" ;;
+      *) printf '%s\n' "$OWN" | awk -F'|' -v v="$v" 'BEGIN{OFS="|"} {$2=v; print}' ;;
+    esac
+  }
+  _egress_audit_cert() { printf 'AB:CD:EF\ndocs.example.test\n*.example.test\nwww.example.test\n'; }
+}
+
+_seed_denial() {                         # <host>
+  mkdir -p "$CLEAT_RUN_DIR/cleat-seed-1234/egress"
+  printf '2026-09-26T00:00:00.000Z code=policy sub=- origin=box host=%s port=443 trunc=0\n' "$1" \
+    > "$CLEAT_RUN_DIR/cleat-seed-1234/egress/denials.log"
+}
+
+@test "egress audit: the denial match is case and trailing dot blind and reads no link" {
+  _seed_denial Exfil.Attacker.Example.
+  run _egress_denial_origin exfil.attacker.example
+  assert_output "box"
+  run _egress_denial_origin other.example
+  assert_output ""
+  rm -f "$CLEAT_RUN_DIR/cleat-seed-1234/egress/denials.log"
+  printf 'x host=exfil.attacker.example\n' > "$TEST_TEMP/elsewhere.log"
+  ln -s "$TEST_TEMP/elsewhere.log" "$CLEAT_RUN_DIR/cleat-seed-1234/egress/denials.log"
+  run _egress_denial_origin exfil.attacker.example
+  assert_output ""
+  run _egress_origin_gate exfil.attacker.example
+  assert_success
+}
+
+@test "egress audit: a host that refuses a foreign Host header is contained" {
+  _audit_stub
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_success
+  assert_output --partial "Verdict:  contained"
+  assert_output --partial "h1+h2"
+  assert_output --partial "Printed, not saved"
+  [ "$(grep -c 'docs.example.test imgur.com' "$AUDIT_LOG")" = 2 ]
+  [ "$(grep -c 'docs.example.test www.example.test' "$AUDIT_LOG")" = 2 ]
+  [ "$(grep -c 'docs.example.test nonexistent.invalid' "$AUDIT_LOG")" = 2 ]
+}
+
+@test "egress audit: a foreign origin's page on either protocol is shared" {
+  _audit_stub
+  FOREIGN_ANSWER="404|1.1|93.184.215.14|Varnish|5120|bbbbbbbbbbbb|Imgur: The magic of the Internet"
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_success
+  assert_output --partial "shared"
+  assert_output --partial "another origin's page"
+  refute_output --partial "Verdict:  contained"
+}
+
+@test "egress audit: the foreign title alone is enough, the status never is" {
+  _audit_stub
+  FOREIGN_ANSWER="500|1.1|93.184.215.14|x|77|cccccccccccc|Imgur: The magic of the Internet"
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "shared"
+  run _egress_audit_same_page "301|1.1|a|s|0|d41d8cd98f00|" "302|1.1|b|t|0|d41d8cd98f00|"
+  assert_failure
+  run _egress_audit_same_page "200|1.1|a|s|10|abc|" "200|1.1|b|t|10|abc|"
+  assert_success
+}
+
+@test "egress audit: a stranger's page for a foreign Host needs a person" {
+  _audit_stub
+  FOREIGN_ANSWER="200|1.1|93.184.215.14|nginx|900|dddddddddddd|Welcome to someone else"
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_success
+  assert_output --partial "Verdict:  unaudited"
+  assert_output --partial "needs a person"
+}
+
+@test "egress audit: an edge with no HTTP/2 is audited on h1 alone and says so" {
+  _audit_stub
+  H2=1.1
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "Verdict:  contained"
+  assert_output --partial "h1 only, no h2 offered"
+  [ "$(grep -c 'docs.example.test imgur.com' "$AUDIT_LOG")" = 1 ]
+}
+
+@test "egress audit: a failed HTTP/2 request is never contained" {
+  _audit_stub
+  H2=fail
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "Verdict:  unaudited"
+  assert_output --partial "HTTP/2 request failed"
+}
+
+@test "egress audit: with no probe origin nothing can be called contained" {
+  _audit_stub
+  REF=" "
+  _egress_audit_fetch_real="$(declare -f _egress_audit_fetch)"
+  eval "_egress_stub_inner() ${_egress_audit_fetch_real#*\(\)}"
+  _egress_audit_fetch() { [ "$1" = imgur.com ] && return 1; _egress_stub_inner "$@"; }
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "Verdict:  unaudited"
+  assert_output --partial "did not answer"
+}
+
+@test "egress audit: an unreachable host exits 1" {
+  _audit_stub
+  OWN_FAILS=1
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_failure
+  assert_output --partial "Could not reach docs.example.test"
+}
+
+@test "egress audit: a name that is not a host refuses before any dial" {
+  _audit_stub
+  local bad
+  for bad in "https://docs.rs/" "10.0.0.1" "*.example.com" "docs.rs:443" ""; do
+    run cmd_egress audit "$bad" < /dev/null
+    assert_failure
+  done
+  run cat "$AUDIT_LOG"
+  assert_output ""
+  run cmd_egress audit one.example two.example < /dev/null
+  output="$(_plain "$output")"
+  assert_failure
+  assert_output --partial "one host at a time"
+}
+
+@test "egress audit: an address the gateway refuses is named" {
+  _audit_stub
+  OWN="200|1.1|192.168.1.20|nginx|1256|aaaaaaaaaaaa|Example Docs"
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "private or special: the gateway refuses to dial it"
+  local a
+  for a in 10.1.2.3 127.0.0.1 169.254.169.254 172.16.0.1 172.31.255.255 192.168.0.1 100.64.0.1 \
+           0.0.0.0 224.0.0.1 255.255.255.255 ::1 :: fd00::1 fe80::1 ff02::1 ::ffff:10.0.0.1 64:ff9b::a00:1 2001:db8::1 bogus; do
+    run _egress_address_special "$a"
+    assert_success
+  done
+  for a in 93.184.215.14 172.32.0.1 100.128.0.1 11.0.0.1 2606:4700::1111 ::ffff:93.184.215.14; do
+    run _egress_address_special "$a"
+    assert_failure
+  done
+}
+
+@test "egress audit: the neighbour is a certificate name that is neither the host nor a wildcard" {
+  run _egress_audit_neighbour docs.example.test $'docs.example.test\n*.example.test\nwww.example.test'
+  assert_output "www.example.test"
+  run _egress_audit_neighbour docs.example.test $'docs.example.test\n*.example.test'
+  assert_output ""
+}
+
+@test "egress audit: nothing is written to the policy" {
+  _audit_stub
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  local before
+  before="$(cat "$CLEAT_GLOBAL_CONFIG")"
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  assert_success
+  [ "$(cat "$CLEAT_GLOBAL_CONFIG")" = "$before" ]
+  [ ! -e "$_EGRESS_PINS_DIR/global" ] || false
+}
+
+@test "egress audit: certificate names are cut to host name characters before use" {
+  mkdir -p "$TEST_TEMP/sslbin"
+  cat > "$TEST_TEMP/sslbin/openssl" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  s_client) printf -- '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n' ;;
+  x509)
+    case " $* " in
+      *" -fingerprint "*) printf 'sha256 Fingerprint=AB:CD\033[31m:EF\n' ;;
+      *) printf 'DNS:good.example.test, DNS:bad\033]0;owned\007.example.test, DNS:*.example.test\n' ;;
+    esac ;;
+esac
+SH
+  chmod +x "$TEST_TEMP/sslbin/openssl"
+  PATH="$TEST_TEMP/sslbin:$PATH" run _egress_audit_cert docs.example.test
+  assert_success
+  assert_output "AB:CD31:EF
+good.example.test
+*.example.test"
+}
+
+@test "egress audit: a machine with no curl is told so and nothing is dialled" {
+  _audit_stub
+  _egress_audit_have_curl() { return 1; }
+  run cmd_egress audit docs.example.test < /dev/null
+  assert_failure
+  assert_output --partial "needs curl"
+  run cat "$AUDIT_LOG"
+  assert_output ""
+}
+
+@test "egress audit: a catalogue host prints the published class beside the verdict" {
+  _audit_stub
+  run cmd_egress audit github.com < /dev/null
+  output="$(_plain "$output")"
+  assert_output --partial "The catalogue lists it as contained."
+  run cmd_egress audit docs.example.test < /dev/null
+  output="$(_plain "$output")"
+  refute_output --partial "The catalogue lists it"
+}

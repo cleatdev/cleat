@@ -9194,6 +9194,7 @@ _EG_TO_OPEN=0
 _EGL_SET=0
 _EGL_MODE=""
 _EGL_HOSTS=""
+_EG_AUDIT_KIND=""
 
 
 # Raw count of `<key> =` lines inside [<section>] of <file>, empty values
@@ -10998,6 +10999,279 @@ _egress_target_cname() {                 # <box or empty>
   container_name_for "$(resolve_project "$PWD")" "$1"
 }
 
+# ── cleat egress audit (7.1, 4.4a) ──
+# The one verb that dials a host from the host. It runs the class audit of
+# section 7.1 on one name the user typed: the certificate and its names, the
+# host's own page, then a foreign Host header, a Host header naming a
+# neighbour on the certificate and one naming nothing, each on HTTP/1.1 and
+# HTTP/2. A foreign origin's page coming back is the only evidence that moves
+# a class, so the verdict is shared on that evidence, contained without it,
+# and never single origin, which no probe can prove. Printed, never saved.
+
+_EGRESS_AUDIT_FOREIGN="imgur.com"        # a name on an edge measured to route a foreign Host (7.1)
+_EGRESS_AUDIT_TIMEOUT_S=10
+
+# box when <host> is a row in any box's host-side copy of its denial log,
+# nothing when it is not. Every row the gateway writes names a host the box
+# chose, and no host-side process dials one of those (4.4a).
+_egress_denial_origin() {                # <host>
+  local _f
+  for _f in "$CLEAT_RUN_DIR"/*/egress/denials.log; do
+    [ -f "$_f" ] && [ ! -L "$_f" ] || continue
+    if _read_unlinked_bounded "$_f" "$_EGRESS_DENIALS_MAX_BYTES" | awk -v h="$1" '
+        { for (i = 1; i <= NF; i++) { v = tolower($i); if (v == "host=" h || v == "host=" h ".") { f = 1 } } }
+        END { exit !f }'; then
+      printf box
+      return 0
+    fi
+  done
+}
+
+# rc 1 refuses, rc 0 proceeds. An origin that reads as anything but empty or
+# user is treated as the box's.
+_egress_origin_gate() {                  # <host>
+  local _origin
+  _origin="$(_egress_denial_origin "$1")"
+  case "$_origin" in
+    box) return 1 ;;
+    "") return 0 ;;
+    user) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Whether the probe can run here. A seam, so a test with its own fetch runs
+# on a machine that has no curl.
+_egress_audit_have_curl() { command -v curl >/dev/null 2>&1; }
+
+# One request to https://<host>/ with SNI <host> and the Host header given,
+# on one protocol. Prints status|version|address|server|length|digest|title.
+# A seam: tests answer it without a network.
+_egress_audit_fetch() {                  # <host> <host header> <h1|h2>
+  local _body _hdr _w _flag _srv _len _dig _title
+  case "$3" in h2) _flag=--http2 ;; *) _flag=--http1.1 ;; esac
+  _body="$(mktemp 2>/dev/null)" || return 1
+  _hdr="$(mktemp 2>/dev/null)" || { rm -f "$_body"; return 1; }
+  _w="$(_run_bounded "$((_EGRESS_AUDIT_TIMEOUT_S + 2))" curl -sS --max-time "$_EGRESS_AUDIT_TIMEOUT_S" \
+    "$_flag" --proto =https -H "Host: $2" -D "$_hdr" -o "$_body" \
+    -w '%{http_code}|%{http_version}|%{remote_ip}' "https://$1/" 2>/dev/null)" || _w=""
+  _srv="$(tr -d '\r' < "$_hdr" | awk 'tolower($1) == "server:" { $1 = ""; s = substr($0, 2) } END { print s }')"
+  _len="$(wc -c < "$_body" | tr -d ' ')"
+  _dig="$(_md5 < "$_body" | cut -c1-12)"
+  _title="$(tr '\r\n' '  ' < "$_body" | grep -o -i '<title>[^<]*' | sed -n 1p | cut -c8- | cut -c1-40)"
+  rm -f "$_body" "$_hdr"
+  [ -n "$_w" ] || return 1
+  printf '%s|%s|%s|%s|%s\n' "$_w" "$(_sessions_safe_str "$_srv" | tr '|' '/')" "$_len" "$_dig" \
+    "$(_sessions_safe_str "$_title" | tr '|' '/')"
+}
+
+# The certificate the host presents for its own name: its SHA-256 fingerprint
+# on the first line, then one DNS name per line. A seam. Nothing when openssl
+# is missing or the handshake fails.
+_egress_audit_cert() {                   # <host>
+  command -v openssl >/dev/null 2>&1 || return 1
+  local _pem _fp
+  _pem="$(_run_bounded "$((_EGRESS_AUDIT_TIMEOUT_S + 2))" openssl s_client -connect "$1:443" -servername "$1" \
+    < /dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p')" || true
+  [ -n "$_pem" ] || return 1
+  # Both come from the remote server, so both are cut to the characters a
+  # fingerprint and a host name can hold before they reach the terminal or a
+  # Host header: a certificate can carry any byte.
+  _fp="$(printf '%s\n' "$_pem" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^[^=]*=//' \
+    | tr -cd '0-9A-Fa-f:')" || _fp=""
+  printf '%s\n' "${_fp:0:95}"
+  printf '%s\n' "$_pem" | openssl x509 -noout -text 2>/dev/null \
+    | grep -o 'DNS:[^,[:space:]]*' | sed 's/^DNS://' | tr '[:upper:]' '[:lower:]' \
+    | grep -E '^[a-z0-9*][a-z0-9.*-]{0,252}$' || true
+}
+
+# Whether an address is one the gateway refuses to dial: private, loopback,
+# link-local, CGNAT, multicast or reserved, v4 or v6, v4-mapped included.
+_egress_address_special() {              # <address>
+  local a="$1" o1 o2
+  case "$a" in
+    ::ffff:*.*) a="${a#::ffff:}" ;;
+    ::FFFF:*.*) a="${a#::FFFF:}" ;;
+  esac
+  case "$a" in
+    *.*.*.*)
+      o1="${a%%.*}"; o2="${a#*.}"; o2="${o2%%.*}"
+      case "$o1$o2" in *[!0-9]*) return 0 ;; esac
+      [ "$o1" -eq 0 ] || [ "$o1" -eq 10 ] || [ "$o1" -eq 127 ] || [ "$o1" -ge 224 ] && return 0
+      [ "$o1" -eq 169 ] && [ "$o2" -eq 254 ] && return 0
+      [ "$o1" -eq 172 ] && [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 0
+      [ "$o1" -eq 192 ] && [ "$o2" -eq 168 ] && return 0
+      [ "$o1" -eq 100 ] && [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 0
+      return 1 ;;
+    *:*)
+      a="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')"
+      case "$a" in
+        ::|::1|fc*|fd*|fe8*|fe9*|fea*|feb*|ff*|64:ff9b:*|2001:db8:*) return 0 ;;
+      esac
+      return 1 ;;
+  esac
+  return 0
+}
+
+# Which Host header the neighbour step sends: the first name on the
+# certificate that is neither the host nor a wildcard. Nothing when none.
+_egress_audit_neighbour() {              # <host> <names>
+  local _n
+  while IFS= read -r _n; do
+    case "$_n" in ""|"$1"|\**) continue ;; esac
+    printf '%s' "$_n"
+    return 0
+  done <<EOF
+$2
+EOF
+}
+
+_egress_audit_row() {                    # <step> <leg> <host header> <fetch line>
+  local _st _ver _ip _srv _len _dig _title
+  IFS='|' read -r _st _ver _ip _srv _len _dig _title <<EOF
+$4
+EOF
+  printf '    %-9s %-3s %-26s %-4s %-14s %s\n' "$1" "$2" "$(printf '%s' "$3" | cut -c1-26)" \
+    "${_st:-  -}" "$(printf '%s' "${_srv:--}" | cut -c1-14)" "${_title:--}"
+}
+
+# Whether two fetch lines carry the same page: the same non-empty body, or
+# the same non-empty title. An empty body never matches, so two bare
+# redirects are not one origin.
+_egress_audit_same_page() {              # <fetch line> <fetch line>
+  local _l1 _d1 _t1 _l2 _d2 _t2
+  IFS='|' read -r _ _ _ _ _l1 _d1 _t1 <<EOF
+$1
+EOF
+  IFS='|' read -r _ _ _ _ _l2 _d2 _t2 <<EOF
+$2
+EOF
+  if [ -n "$_l1" ] && [ "$_l1" != 0 ] && [ -n "$_d1" ] && [ "$_d1" = "$_d2" ]; then return 0; fi
+  if [ -n "$_t1" ] && [ "$_t1" = "$_t2" ]; then return 0; fi
+  return 1
+}
+
+cmd_egress_audit() {                     # [host]
+  local host="${1:-}" typed=0 in cert fp names nb leg step hh line own ref
+  local foreign=0 unclear=0 h2failed=0 legs="" ip st ver kind t
+  if [ -z "$host" ]; then
+    printf '  Host to audit: '
+    IFS= read -r host || host=""
+    typed=1
+  fi
+  if ! in="$(_egress_valid_host "$host")"; then
+    _egress_valid_host "$host" >/dev/null || true
+    error "Not a host name: $(_sanitize_repo_str "$host") ${DIM}(${_EG_HOST_REASON})${RESET}"
+    return 1
+  fi
+  host="$in"
+  case "$host" in *"{"*) error "Type the full name, not the pattern."; return 1 ;; esac
+  # A name passed on the command line may have been copied off a denial row.
+  # The box wrote that row, so the name goes nowhere until a person retypes it.
+  if [ "$typed" -eq 0 ] && ! _egress_origin_gate "$host"; then
+    warn "This hostname came from inside the box. Retype it to audit."
+    if [[ ! -t 0 ]]; then return 1; fi
+    printf '  Host to audit: '
+    IFS= read -r in || in=""
+    if ! host="$(_egress_valid_host "$in")"; then
+      error "Not a host name: $(_sanitize_repo_str "$in")"
+      return 1
+    fi
+  fi
+  _egress_audit_have_curl || { error "cleat egress audit needs curl on this machine."; return 1; }
+  echo ""
+  echo -e "  ${BOLD}Auditing ${host}${RESET}  ${DIM}this dials it from this machine, on HTTP/1.1 and HTTP/2${RESET}"
+  echo ""
+  cert="$(_egress_audit_cert "$host")" || cert=""
+  fp="$(printf '%s\n' "$cert" | sed -n 1p)"
+  names="$(printf '%s\n' "$cert" | sed -n '2,$p')"
+  if [ -n "$fp" ]; then
+    echo -e "    certificate  sha256 ${fp}"
+    echo -e "    names        $(printf '%s' "$names" | paste -sd' ' - | cut -c1-90)"
+  else
+    echo -e "    certificate  ${DIM}not read (no openssl, or no handshake), so the neighbour step is skipped${RESET}"
+  fi
+  if ! own="$(_egress_audit_fetch "$host" "$host" h1)"; then
+    error "Could not reach ${host} on port 443."
+    return 1
+  fi
+  ip="$(printf '%s' "$own" | cut -d'|' -f3)"
+  if [ -n "$ip" ] && _egress_address_special "$ip"; then
+    echo -e "    address      ${ip}  ${AMBER}private or special: the gateway refuses to dial it${RESET}"
+  else
+    echo -e "    address      ${ip:--}  public"
+  fi
+  ref="$(_egress_audit_fetch "$_EGRESS_AUDIT_FOREIGN" "$_EGRESS_AUDIT_FOREIGN" h1)" || ref=""
+  echo ""
+  printf '    %-9s %-3s %-26s %-4s %-14s %s\n' step leg "Host sent" code server title
+  _egress_audit_row own h1 "$host" "$own"
+  nb="$(_egress_audit_neighbour "$host" "$names")"
+  for leg in h1 h2; do
+    if [ "$leg" = h2 ]; then
+      if ! line="$(_egress_audit_fetch "$host" "$host" h2)"; then
+        h2failed=1
+        legs="h1 only, the h2 request failed"
+        break
+      fi
+      ver="$(printf '%s' "$line" | cut -d'|' -f2)"
+      if [ "$ver" != 2 ]; then
+        legs="h1 only, no h2 offered"
+        break
+      fi
+      _egress_audit_row own h2 "$host" "$line"
+    fi
+    for step in foreign neighbour nothing; do
+      case "$step" in
+        foreign) hh="$_EGRESS_AUDIT_FOREIGN" ;;
+        neighbour) hh="$nb"; [ -n "$hh" ] || continue ;;
+        nothing) hh="nonexistent.invalid" ;;
+      esac
+      line="$(_egress_audit_fetch "$host" "$hh" "$leg")" || line=""
+      _egress_audit_row "$step" "$leg" "$hh" "$line"
+      [ "$step" = foreign ] || continue
+      [ -n "$line" ] || continue
+      # Classify on the returned content, never on the status code: the
+      # probe origin's own page is a foreign body whatever the status line.
+      # A 2xx page that is neither this host's nor the probe's is a call
+      # for a person, never a pass.
+      st="$(printf '%s' "$line" | cut -d'|' -f1)"
+      t="$(printf '%s' "$line" | cut -d'|' -f7)"
+      if [ -n "$ref" ] && _egress_audit_same_page "$line" "$ref"; then
+        foreign=1
+      elif ! _egress_audit_same_page "$line" "$own" && [ -n "$t" ]; then
+        case "$st" in 2??) unclear=1 ;; esac
+      fi
+    done
+  done
+  [ -n "$legs" ] || legs="h1+h2"
+  echo ""
+  if [ -z "$ref" ]; then
+    kind=unaudited
+    echo -e "  Verdict:  ${BOLD}unaudited${RESET}  ${DIM}·  the probe origin ${_EGRESS_AUDIT_FOREIGN} did not answer, so a foreign page cannot be recognised${RESET}"
+  elif [ "$foreign" -eq 1 ]; then
+    kind=C
+    echo -e "  Verdict:  ${AMBER}${BOLD}shared${RESET}  ${DIM}·  a foreign Host header got another origin's page, ${legs}, $(date +%Y-%m-%d)${RESET}"
+    echo -e "            ${DIM}Anything on this edge is reachable through this name. Never pre-ticked.${RESET}"
+  elif [ "$h2failed" -eq 1 ]; then
+    kind=unaudited
+    echo -e "  Verdict:  ${BOLD}unaudited${RESET}  ${DIM}·  the HTTP/2 request failed, and a class is the weakest result across both${RESET}"
+  elif [ "$unclear" -eq 1 ]; then
+    kind=unaudited
+    echo -e "  Verdict:  ${BOLD}unaudited${RESET}  ${DIM}·  a foreign Host header got a page that is neither this host's nor the probe's.${RESET}"
+    echo -e "            ${DIM}Read the rows above: that call needs a person.${RESET}"
+  else
+    kind=B
+    echo -e "  Verdict:  ${BOLD}contained${RESET}  ${DIM}·  no foreign page came back, ${legs}, $(date +%Y-%m-%d)${RESET}"
+  fi
+  echo -e "            ${DIM}One vantage, one date. An edge can move without notice.${RESET}"
+  if _egress_in_list "$host" "$(_egress_catalogue_records | cut -f2)"; then
+    echo -e "            ${DIM}The catalogue lists it as $(_egress_host_word "$host").${RESET}"
+  fi
+  echo -e "            ${DIM}Printed, not saved. ${BOLD}cleat egress allow ${host}${RESET}${DIM} adds it if you choose.${RESET}"
+  _EG_AUDIT_KIND="$kind"
+  return 0
+}
+
 _egress_help() {
   echo ""
   echo -e "  ${BOLD}cleat egress${RESET} ${DIM}[box]${RESET}  The hosts a box may reach. Off until you turn it on."
@@ -11008,6 +11282,7 @@ _egress_help() {
   echo -e "    ${GREEN}egress allow${RESET} ${DIM}<pack|host>...${RESET} Add to the policy ${DIM}(turns it on, mode strict)${RESET}"
   echo -e "    ${GREEN}egress deny${RESET} ${DIM}<pack|host>...${RESET}  Take out of the policy"
   echo -e "    ${GREEN}egress${RESET} ${DIM}<box> --inherit${RESET}     Drop a box's own additions ${DIM}(--yes on a pipe if it widens)${RESET}"
+  echo -e "    ${GREEN}egress audit${RESET} ${DIM}[host]${RESET}        Classify a host you type ${DIM}(dials it from this machine)${RESET}"
   echo ""
   echo -e "    ${DIM}--box <name>   target a box whose name is also a subcommand, like status${RESET}"
   echo -e "    ${DIM}The policy lives in ~/.config/cleat/config [egress], never in a project .cleat.${RESET}"
@@ -11018,10 +11293,10 @@ _egress_help() {
 cmd_egress() {
   local sub="editor" want_list=0 inherit=0 assume_yes=0 box=""
   case "${1:-}" in
-    status|packs|allow|deny) sub="$1"; shift ;;
-    why|fix|test|log|reload|restart|review|open|tighten|off|audit)
+    status|packs|allow|deny|audit) sub="$1"; shift ;;
+    why|fix|test|log|reload|restart|review|open|tighten|off)
       error "${BOLD}cleat egress $1${RESET} lands with enforcement, in a later release."
-      echo -e "    ${DIM}Today: cleat egress, --list, status, packs, allow and deny. A box named $1 is ${BOLD}--box $1${RESET}${DIM}.${RESET}"
+      echo -e "    ${DIM}Today: cleat egress, --list, status, packs, allow, deny and audit. A box named $1 is ${BOLD}--box $1${RESET}${DIM}.${RESET}"
       return 1 ;;
   esac
   if [[ "${_FORK_REQUESTED:-false}" == true ]]; then
@@ -11057,6 +11332,13 @@ cmd_egress() {
       _egress_cmd_edit "$sub" "$box" "${rest[@]}"
       return $? ;;
     packs) _egress_cmd_packs; return $? ;;
+    audit)
+      if [[ "${#rest[@]}" -gt 1 ]]; then
+        error "Audit one host at a time: ${DIM}cleat egress audit <host>${RESET}"
+        return 1
+      fi
+      cmd_egress_audit "${rest[0]:-}"
+      return $? ;;
   esac
 
   # Every other form takes at most one box positional.

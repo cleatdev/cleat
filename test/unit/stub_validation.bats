@@ -608,6 +608,32 @@ EOF
   assert_success
 }
 
+@test "harness: MUTATION_MAX_SKIPPED fails a run whose sed matched nothing" {
+  cat > "$TEST_TEMP/registry" << 'EOF'
+cat > "$SED_TMP" << 'SED'
+s/no-such-line/never/
+SED
+try "stale" "probe" "$INSTALLER" "$REPO_ROOT/test/unit/probe.bats"
+EOF
+  mutation_harness_tree "$TEST_TEMP/registry"
+  export HARNESS_OBS="$TEST_TEMP/obs" _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/harness/.lock"
+  # Unset, a skip reads as it always has: reported, not failed.
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX -u MUTATION_MAX_SKIPPED \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_success
+  assert_output --partial "stale: SKIPPED"
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX MUTATION_MAX_SKIPPED=0 \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_failure 1
+  assert_output --partial "  - stale"
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX MUTATION_MAX_SKIPPED=1 \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_success
+  run env -u MUTATION_SHARD_TOTAL -u MUTATION_SHARD_INDEX MUTATION_MAX_SKIPPED=none \
+    "$TEST_TEMP/harness/test/mutation_regressions.sh"
+  assert_failure 2
+}
+
 @test "lock: the suite refuses while the harness holds it" {
   export _CLEAT_TEST_LOCK_DIR="$TEST_TEMP/lock"
   mkdir -p "$_CLEAT_TEST_LOCK_DIR"

@@ -141,6 +141,8 @@ jobs:
         env:
           MUTATION_SHARD_TOTAL: '4'
           MUTATION_SHARD_INDEX: ${{ matrix.shard }}
+          # A sed that matches nothing proves nothing. Fail the shard on one.
+          MUTATION_MAX_SKIPPED: '0'
         run: |
           rc=0; ./test/mutation_regressions.sh > "$RUNNER_TEMP/mutation.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/mutation.log"; : > "$RUNNER_TEMP/mutation.printed"; exit "$rc"

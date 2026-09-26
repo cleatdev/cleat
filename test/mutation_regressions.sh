@@ -290,6 +290,7 @@ caught=0
 missed=0
 skipped=0
 declare -a missed_names=()
+declare -a skipped_names=()
 
 try() {
   local name="$1" test_filter="$2" target="${3:-$CLI}" test_file="${4:-$REGRESSIONS}"
@@ -306,7 +307,7 @@ try() {
   case "$rc" in
     0) caught=$((caught + 1)) ;;
     1) missed=$((missed + 1)); missed_names+=("$name → $test_filter") ;;
-    2) skipped=$((skipped + 1)) ;;
+    2) skipped=$((skipped + 1)); skipped_names+=("$name") ;;
   esac
 }
 
@@ -14503,6 +14504,25 @@ if [[ $missed -gt 0 ]]; then
     echo "  - $n"
   done
   exit 1
+fi
+
+# A SKIPPED entry is a sed that matched nothing, usually because a refactor
+# reshaped the line it anchors on. It reads as green and proves nothing, and
+# two entries sat that way for several commits. MUTATION_MAX_SKIPPED=<n>
+# fails the run past n skips, the way TEST_MAX_SKIPPED does for the suite.
+if [[ -n "${MUTATION_MAX_SKIPPED:-}" ]]; then
+  case "$MUTATION_MAX_SKIPPED" in
+    *[!0-9]*) echo "${RED}MUTATION_MAX_SKIPPED must be a number, not: $MUTATION_MAX_SKIPPED${RESET}" >&2; exit 2 ;;
+  esac
+  if [[ $skipped -gt $MUTATION_MAX_SKIPPED ]]; then
+    echo ""
+    echo "${YELLOW}${BOLD}Skipped mutations (the sed matched nothing, so the test it guards is unproven):${RESET}"
+    for n in "${skipped_names[@]}"; do
+      echo "  - $n"
+    done
+    echo "  ${DIM}More than MUTATION_MAX_SKIPPED=${MUTATION_MAX_SKIPPED}. Re-anchor each on the current line.${RESET}"
+    exit 1
+  fi
 fi
 
 exit 0

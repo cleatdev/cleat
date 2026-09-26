@@ -436,9 +436,10 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "v0.6.5_skip_missing" "cmd_run skips overlay mount for missing"
 
-# v0.6.5: cmd_run must force-remove partial container on failure
+# v0.6.5: cmd_run must force-remove partial container on failure. The removal
+# is the teardown call on the line after this comment in cmd_run.
 cat > "$SED_TMP" << 'SED'
-/docker rm -f "\$cname" > \/dev\/null 2>&1 || true/d
+/# Clean up any partial container state so the next attempt starts fresh/{n;d;}
 SED
 try "v0.6.5_cleanup_fail" "cmd_run cleans up partial container"
 
@@ -14099,7 +14100,7 @@ cat > "$SED_TMP" << 'SED'
   s@^      starting) ;;@      starting) return 1 ;;@
 }
 SED
-try "vnext_egress_cold_launch_waits" "a gateway still starting inside the create window is waited for" "$CLI" "$EGRESS_REQUIRE_BATS"
+try "vnext_egress_cold_launch_waits" "every cold caged launch refused on a gateway that was still starting" "$CLI"
 
 # Assertion 15: the gateway holds its socket path.
 cat > "$SED_TMP" << 'SED'
@@ -14752,6 +14753,80 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_volume_remedy_recreates" "an unlabelled auto-created socket volume refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The caged create in cmd_run (8.2, 8.4, 3.8).
+cat > "$SED_TMP" << 'SED'
+s|:/run/cleat-egress:ro|:/run/cleat-egress|
+SED
+try "vnext_egress_sock_ro_mount" "the socket volume is mounted read-only in the box" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@^  local host_args=()@  local host_args=(--add-host "host.docker.internal:host-gateway")@
+SED
+try "vnext_egress_extrahosts_empty" "a policy box still resolved host.docker.internal" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+s@_sock_uid="[$]_bx_uid"@_sock_uid="$(id -u)"@
+SED
+try "vnext_socket_uid_from_box_identity" "the socket was unreachable at the box uid" "$CLI"
+
+# Every box of a project sharing one gateway: hash the project, not the box.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_hash()/,/^}$/{
+  s@_h="[$](printf '%s' "[$]1" | _md5)"@_h="$(printf '%s' "${_RESOLVED_PROJECT:-$1}" | _md5)"@
+}
+SED
+try "vnext_egress_fork_gateway" "a fork box creates its own gateway" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_policy_dir()/{
+  s@/egress-rendered/@/egress/rendered/@
+}
+SED
+try "vnext_egress_rendered_dir_no_collision" "the rendered policy dir does not collide with the egress config path" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# The checks that need no box run before anything of a caged box exists.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  /^    _egress_precreate_check "[$]cname" "[$]_eg_ws" "[$]_EG_MODE" || exit 1$/d
+}
+SED
+try "vnext_egress_precreate_in_run" "an unvalidated engine creates nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@^_EGRESS_SHIM_IMAGE_SPEC=6@_EGRESS_SHIM_IMAGE_SPEC=5@
+SED
+try "vnext_egress_relay_image_required" "a caged create refuses a box image older than the relay" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# A failed step removes what the create made: never a volume or policy left.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  /^      _egress_teardown "[$]cname" keep force || true$/d
+}
+SED
+try "vnext_egress_create_failure_cleans" "a caged create that cannot make its gateway creates no box" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^    \[ -n "[$]_eg_fail" \] || _egress_mark_creating "[$]cname" || _eg_fail=marker$@    :@
+}
+SED
+try "vnext_egress_marker_before_volume" "the create marker is written before the volume" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  /^  rm -f "[$]CLEAT_RUN_DIR\/[$]cname\/egress\/creating"$/d
+}
+SED
+try "vnext_egress_marker_removed_after_gate" "removed only after the first gate passes" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# The box's labels are the ones the gate recomputes.
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@_egress_create_digest "[$]cname" none@_egress_create_digest "$cname" bridge@
+}
+SED
+try "vnext_egress_create_label_round_trip" "the label the create path writes is the one the gate accepts" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.

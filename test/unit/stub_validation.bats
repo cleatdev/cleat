@@ -650,12 +650,12 @@ EOF
   # Both of those cp over the eleven tracked files, so a refused harness that
   # reached them would perform the very write the lock exists to prevent. A
   # content checksum cannot see a restore that writes the same bytes back, so
-  # the ten targets are backdated and the check is that none of them moved.
+  # the eleven targets are backdated and the check is that none of them moved.
   : > "$TEST_TEMP/registry"
   mutation_harness_tree "$TEST_TEMP/registry"
   local h="$TEST_TEMP/harness" f targets=()
   for f in bin/cleat install.sh docker/entrypoint.sh docker/open-bridge docker/clip-daemon \
-    docker/clip test.sh test/integration/lifecycle.bats test/setup.bash \
+    docker/clip docker/cleat-egress-shim test.sh test/integration/lifecycle.bats test/setup.bash \
     test/fixtures/mock_bin/docker; do
     touch -t 200001010000 "$h/$f"
     targets+=("$h/$f")

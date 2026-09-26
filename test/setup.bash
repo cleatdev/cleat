@@ -413,7 +413,7 @@ int_uidmap_write() {
 }
 
 # A throwaway checkout for the mutation harness: its real script with the
-# registry replaced by the entries in $1, its real lock library, the ten
+# registry replaced by the entries in $1, its real lock library, the eleven
 # tracked targets as one-line files that read "pristine <path>", and a
 # test/unit/probe.bats that appends test/setup.bash and install.sh to
 # $HARNESS_OBS, then fails. Run "$TEST_TEMP/harness/test/mutation_regressions.sh".
@@ -424,7 +424,7 @@ mutation_harness_tree() {
   cp "$PROJECT_ROOT/test/lib/testlock.sh" "$t/test/lib/"
   ln -s "$PROJECT_ROOT/test/bats" "$t/test/bats"
   for f in bin/cleat install.sh docker/entrypoint.sh docker/open-bridge docker/clip-daemon \
-    docker/clip test.sh test/integration/lifecycle.bats test/setup.bash \
+    docker/clip docker/cleat-egress-shim test.sh test/integration/lifecycle.bats test/setup.bash \
     test/fixtures/mock_bin/docker; do
     printf 'pristine %s\n' "$f" > "$t/$f"
   done

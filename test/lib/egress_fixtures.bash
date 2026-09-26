@@ -56,6 +56,8 @@ mock_egress_caged_launch() {
   mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
   printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
   mock_docker_image_cached "$_GATEWAY_IMAGE"
+  # The box image carries the relay (image spec 6).
+  _image_spec_version() { printf 6; }
   _daemon_up() { return 0; }
   _egress_engine_kind() { printf 'desktop-macos'; }
   export DOCKER_STUB_STRICT=1

@@ -620,7 +620,7 @@ _hist_fixture() {
   run cmd_run "$TEST_TEMP/project"
   assert_success
   run docker_calls
-  assert_output --partial "docker rm $cname"
+  assert_output --partial "docker rm -f $cname"
 }
 
 @test "run: auto-builds image if missing" {

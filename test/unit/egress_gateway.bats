@@ -403,3 +403,206 @@ global pin"
   run _egress_box_sock_ids "$CN"
   assert_failure
 }
+
+# ── The caged create through cmd_run (8.2, 8.4, 3.8) ────────────────────────
+#
+# A fresh project under a strict policy with enforcement live: the gateway
+# image present, the engine pinned to the validated one, the stub strict about
+# bind sources and the cleat-gw volume ledger. The box and gateway fixtures the
+# gate reads are planted up front, so a create that makes them passes.
+
+caged_create() {
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  mock_docker_images "cleat"
+  _host_clip_cmd() { echo ""; }
+  caged_box
+}
+
+@test "egress: the socket volume is mounted read-only in the box" {
+  caged_create
+  # And under the macOS mount backend's nested-bind rule, on top of strict.
+  export DOCKER_STUB_SIMULATE_VIRTIOFS=1
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$CN" "-v ${VOL}:/run/cleat-egress:ro "
+  assert_success
+}
+
+@test "egress gateway: a caged box is created with network none, NET_RAW dropped and the three labels" {
+  caged_create
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local want
+  want="$(_egress_create_digest "$CN" none "$(_egress_capdrop_canon NET_RAW)" 0)"
+  run assert_docker_run_has "$CN" "--network none --cap-drop NET_RAW "
+  assert_success
+  run assert_docker_run_has "$CN" "--label sh.cleat.role=box --label sh.cleat.egress-hash=$want --label sh.cleat.egress-engine=desktop-macos "
+  assert_success
+  # The box keeps its setuid transition (sudo, [setup]) and gains nothing.
+  local no
+  for no in no-new-privileges --cap-add --privileged /etc/cleat-egress egress-rendered HTTPS_PROXY; do
+    run assert_docker_run_lacks "$CN" "$no"
+    assert_success
+  done
+}
+
+@test "egress: a box without a policy keeps --add-host on a non-Desktop engine" {
+  caged_create
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  _is_docker_desktop() { return 1; }
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$CN" "--add-host host.docker.internal:host-gateway"
+  assert_success
+}
+
+@test "egress: a caged create makes the volume, the policy, the gateway and the box in that order" {
+  caged_create
+  docker() {
+    if [ "$1" = run ] && [[ " $* " == *" --name $GW "* ]]; then
+      if [ -f "$CLEAT_CONFIG_DIR/egress-rendered/$BH/policy.json" ]; then echo rendered >> "$TEST_TEMP/seen"; fi
+    fi
+    command docker "$@"
+  }
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local order
+  order="$(grep -n "^docker image inspect $_GATEWAY_IMAGE\|^docker volume create\|^docker run -d --name $GW \|^docker run -d --name $CN " "$DOCKER_CALLS" \
+    | sed -e "s|^[0-9]*:docker image inspect.*|image|" -e "s|^[0-9]*:docker volume create.*|volume|" \
+          -e "s|^[0-9]*:docker run -d --name $GW .*|gateway|" -e "s|^[0-9]*:docker run -d --name $CN .*|box|" | tr '\n' ' ')"
+  [ "$order" = "image volume gateway box " ]
+  run cat "$TEST_TEMP/seen"
+  assert_output "rendered"
+}
+
+@test "egress: the create marker is written before the volume and removed only after the first gate passes" {
+  caged_create
+  docker() {
+    if [ "$1" = volume ] && [ "$2" = create ] && [ -f "$CLEAT_RUN_DIR/$CN/egress/creating" ]; then
+      echo marked >> "$TEST_TEMP/seen"
+    fi
+    command docker "$@"
+  }
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run cat "$TEST_TEMP/seen"
+  assert_output "marked"
+  [ ! -e "$CLEAT_RUN_DIR/$CN/egress/creating" ]
+  # A gate that refuses leaves the marker for the teardown its remedy runs.
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+  F_HEALTH_SEQ=unhealthy caged_box
+  : > "$DOCKER_CALLS"
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "gateway is not healthy"
+  [ -f "$CLEAT_RUN_DIR/$CN/egress/creating" ]
+}
+
+@test "egress: a caged create that cannot make its gateway creates no box" {
+  caged_create
+  # The gateway image cannot be pulled: nothing at all is made.
+  rm -f "$DOCKER_MOCK_DIR/cached_images"
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "could not be pulled"
+  run grep -cE "^docker (volume create|run )" "$DOCKER_CALLS"
+  assert_output "0"
+  # The volume cannot be made: no gateway, no box, the marker gone.
+  mock_docker_image_cached "$_GATEWAY_IMAGE"
+  : > "$DOCKER_CALLS"
+  export DOCKER_VOLUME_EXIT_CODE=1
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "could not create its egress socket volume"
+  run grep -c "^docker run " "$DOCKER_CALLS"
+  assert_output "0"
+  [ ! -e "$CLEAT_RUN_DIR/$CN/egress/creating" ]
+  unset DOCKER_VOLUME_EXIT_CODE
+  # The gateway does not start: no box, and the volume and the policy go.
+  : > "$DOCKER_CALLS"
+  docker() {
+    if [ "$1" = run ] && [[ " $* " == *" --name $GW "* ]]; then
+      echo "docker $*" >> "$DOCKER_CALLS"
+      echo "port is already allocated" >&2
+      return 125
+    fi
+    command docker "$@"
+  }
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "its egress gateway did not start"
+  assert_output --partial "port is already allocated"
+  run docker_run_line_for "$CN"
+  assert_output ""
+  # The pre-clear removes the volume once before the create. The cleanup
+  # removes it again after the failed gateway run.
+  local gn vn
+  gn="$(grep -nF -- "--name $GW " "$DOCKER_CALLS" | tail -1 | cut -d: -f1)"
+  vn="$(grep -n "^docker volume rm $VOL" "$DOCKER_CALLS" | tail -1 | cut -d: -f1)"
+  [ "$vn" -gt "$gn" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-rendered/$BH" ]
+}
+
+@test "egress gateway: an unvalidated engine creates nothing" {
+  caged_create
+  _egress_engine_kind() { printf 'engine-linux'; }
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "not validated on this Docker engine"
+  run grep -cE "^docker (image inspect|pull|volume create|run )" "$DOCKER_CALLS"
+  assert_output "0"
+  [ ! -e "$CLEAT_RUN_DIR/$CN/egress/creating" ]
+}
+
+@test "egress: a caged create refuses a box image older than the relay and creates nothing" {
+  caged_create
+  local old
+  for old in 5 "" x; do
+    : > "$DOCKER_CALLS"
+    eval "_image_spec_version() { printf '%s' '$old'; }"
+    run cmd_run "$TEST_TEMP/project"
+    assert_failure
+    assert_output --partial "predates the relay"
+    assert_output --partial "cleat rebuild"
+    run grep -cE "^docker (volume create|run )" "$DOCKER_CALLS"
+    assert_output "0"
+  done
+}
+
+@test "egress gateway: a fork box creates its own gateway" {
+  caged_create
+  local fork_cn fork_bh main_gw
+  main_gw="$GW"
+  fork_cn="$(container_name_for "$TEST_TEMP/project" review)"
+  fork_bh="$(_egress_box_hash "$fork_cn")"
+  [ "$fork_bh" != "$BH" ]
+  CN="$fork_cn"; egress_box_names
+  caged_box
+  _BOX=review
+  _box_is_fork() { return 0; }
+  _fork_dir() { printf '%s' "$TEST_TEMP/forks/review"; }
+  mkdir -p "$TEST_TEMP/forks/review"
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "cleat-gw-$fork_bh" "--label sh.cleat.gateway-for=$fork_bh "
+  assert_success
+  run docker_run_line_for "$main_gw"
+  assert_output ""
+}
+
+@test "egress gateway: the label the create path writes is the one the gate accepts" {
+  caged_create
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  local label
+  label="$(docker_run_line_for "$CN" | grep -o 'sh.cleat.egress-hash=[^ ]*' | cut -d= -f2)"
+  [ -n "$label" ]
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+  F_HASH="LABEL=$label" caged_box
+  run _egress_require "$CN" start
+  assert_success
+}

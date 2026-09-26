@@ -7,6 +7,7 @@
 # writer that rewrites [egress] and keeps everything else, and the refusals
 # that keep a policy out of the cage.
 load "../setup"
+load "../lib/egress_fixtures"
 setup() {
   _common_setup
   # The stub, never the host's daemon: a session-marker read runs docker inspect.
@@ -694,6 +695,32 @@ _default_launch() {
   assert_failure
   run grep -E 'HTTPS_PROXY=|http_proxy=|NO_PROXY=' "$DOCKER_CALLS"
   assert_failure
+  # Nothing of a caged box: no dropped capability, no egress label, no socket
+  # mount, no gateway exec or copy, no rendered policy on the host.
+  local no
+  for no in --cap-drop sh.cleat.egress-hash sh.cleat.egress-engine sh.cleat.role /run/cleat-egress; do
+    [[ "$runline" != *"$no"* ]]
+  done
+  run grep -E '^docker exec .*cleat-gw-' "$DOCKER_CALLS"
+  assert_failure
+  run grep -E '^docker cp ' "$DOCKER_CALLS"
+  assert_failure
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-rendered" ]
+}
+
+@test "egress config: the rendered policy dir does not collide with the egress config path" {
+  # $CLEAT_CONFIG_DIR/egress is reserved as no path at all (5.4): the rendered
+  # policy lives in its own suffixed directory.
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  mock_docker_images "cleat"
+  caged_box
+  _default_launch
+  assert_success
+  [ -f "$(_egress_policy_dir "$CN")/policy.json" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress" ]
 }
 
 @test "egress default: a saved policy launches the same box and says it is not enforced" {

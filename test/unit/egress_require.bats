@@ -920,6 +920,20 @@ egress:hooks=0"
   assert_output "0"
 }
 
+@test "egress require: a cold cleat run passes the gate without a hand-placed marker" {
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  mock_docker_images "cleat"
+  F_HEALTH_SEQ="starting starting healthy" caged_box
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  # The gate read starting and waited, rather than refusing on it.
+  run count_calls "docker inspect -f $T_HEALTH $GW"
+  [ "$output" -ge 3 ]
+}
+
 # ── Placement (5.7): before every exec, on every fatal verb ─────────────────
 
 # A box that predates a strict policy: the gate refuses at its first read.
@@ -929,6 +943,10 @@ placement_box() {
   mock_docker_images "cleat"
   mock_docker_ps "$CN"
   mock_docker_ps_a "$CN"
+  # A create under the policy is caged: it needs the gateway image and a box
+  # image that carries the relay before it makes anything.
+  mock_docker_image_cached "$_GATEWAY_IMAGE"
+  _image_spec_version() { printf 6; }
   check_for_update() { true; }
   check_drift() { true; }
   _resolve_config_drift() { true; }

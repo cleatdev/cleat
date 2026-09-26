@@ -67,6 +67,9 @@ REPO_URL="https://github.com/cleatdev/cleat"
 #      in a caged box only, with the proxy config for apt, pip, npm and git.
 #      Inert in every other box. Released users pay one recreate, 4 to 6
 _IMAGE_SPEC_VERSION=6
+# The first image spec whose entrypoint starts the egress relay. A caged box on
+# an older image has no way out at all, so a caged create refuses below it.
+_EGRESS_SHIM_IMAGE_SPEC=6
 # The egress catalogue's revision (EGRESS-SPEC.md 7.5). It moves when a pack's
 # host membership or any host's class changes and stays put otherwise, so a
 # version-only release never perturbs a saved policy while a class downgrade
@@ -10775,6 +10778,58 @@ _egress_teardown() {                     # <cname> <keep|forget> [force]
   rm -f "$CLEAT_CONFIG_DIR/egress-pins/$cname"
 }
 
+# The create marker (8.2): the window in which the gate waits for a gateway
+# still starting. Re-stamped, never just checked for, so a marker an earlier
+# refused create left behind cannot shorten this one's window. Never through a
+# link.
+_egress_mark_creating() {                # <cname>
+  local _d="$CLEAT_RUN_DIR/$1/egress"
+  if [ -L "$CLEAT_RUN_DIR/$1" ] || [ -L "$_d" ] || [ -L "$_d/creating" ]; then return 1; fi
+  mkdir -p "$_d" 2>/dev/null || return 1
+  [ -L "$_d" ] && return 1
+  [ -d "$_d/creating" ] && return 1
+  : > "$_d/creating" 2>/dev/null
+}
+
+# The relay starts from the box image's entrypoint, so a caged box on an image
+# older than the relay has no way out at all. The refresh prompt is TTY-only
+# and can be declined, so the caged create refuses here instead.
+_egress_image_has_relay() {
+  local _s
+  _s="$(_image_spec_version)"
+  case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+  if [ "$((10#$_s))" -ge "$_EGRESS_SHIM_IMAGE_SPEC" ]; then return 0; fi
+  _egress_refuse box "the cleat image predates the relay a caged box reaches its gateway through." \
+    "${BOLD}cleat rebuild${RESET} refreshes the image, then re-run cleat"
+  return 1
+}
+
+# The refusal for a failed step of the caged create, printed once the spinner
+# has stopped. <step> is clear, marker, volume, render or gateway.
+_egress_create_refusal() {               # <step> <cname> <docker said>
+  local _pd
+  case "$1" in
+    marker)
+      _egress_refuse gateway "cleat could not write its create marker under ${CLEAT_RUN_DIR/#${HOME}/~}/$2/egress." \
+        "check that directory is one you own and is not a link, then re-run cleat" ;;
+    volume)
+      _egress_refuse gateway "cleat could not create its egress socket volume." \
+        "check that Docker is healthy, then re-run cleat" ;;
+    render)
+      _pd="$(_egress_policy_dir "$2")"
+      _egress_refuse gateway "cleat could not write the policy its gateway reads." \
+        "check ${BOLD}${_pd/#${HOME}/~}${RESET} is a directory you own, then re-run cleat" ;;
+    gateway)
+      _egress_refuse gateway "its egress gateway did not start." \
+        "check that Docker is healthy, then re-run cleat"
+      [ -n "$3" ] && printf '%s\n' "$3" ;;
+    *)
+      _egress_refuse gateway "cleat could not clear what an earlier create of this box left behind." \
+        "check that Docker is healthy, then re-run cleat" ;;
+  esac
+  return 0
+}
+
 # ── Refusals ──
 # Every refusal names the box, the reason and the one remedy, under a first
 # line a wrapper can key on. The CLI exits 1 on all of them. _EG_REFUSED holds
@@ -16774,7 +16829,7 @@ cmd_run() {
   fi
 
   if container_exists "$cname"; then
-    docker rm "$cname" > /dev/null
+    _egress_teardown "$cname" keep || { error "Could not remove the stopped container ${BOLD}${cname}${RESET}."; exit 1; }
   fi
 
   if ! image_exists; then
@@ -16809,6 +16864,29 @@ cmd_run() {
   # Resolve capabilities and env for this run
   resolve_caps "$project"
   resolve_env_args "$project"
+
+  # ── Egress (EGRESS-SPEC.md 8.2) ──
+  # One resolution for this create, and the render below uses it: the gateway
+  # enforces the policy resolved in the call that made it. Caged only under
+  # live enforcement and a strict or open mode, so an off machine, or a build
+  # that does not enforce, creates exactly the box it always did. Everything
+  # that can refuse runs here, before the spinner and before anything exists:
+  # a refused engine or interlock must not leave a box behind holding the
+  # Docker socket or the ssh agent.
+  _egress_resolve "$cname"
+  local _eg_caged=0
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    case "$_EG_MODE" in strict|open) _eg_caged=1 ;; esac
+  fi
+  if [ "$_eg_caged" = 1 ]; then
+    local _eg_ws="$project"
+    if [[ "${_FORK_REQUESTED:-false}" == true ]] || _box_is_fork "$cname"; then
+      _eg_ws="$(_fork_dir "$cname")"
+    fi
+    _egress_precreate_check "$cname" "$_eg_ws" "$_EG_MODE" || exit 1
+    _egress_image_has_relay || exit 1
+    _egress_gateway_image_ensure || exit 1
+  fi
 
   # ── Forked workspace ──────────────────────────────────────────────────────
   # A fork box mounts its own COPY at /workspace. $project stays the real path
@@ -17280,9 +17358,10 @@ cmd_run() {
     --label "sh.cleat.box=$box"
   )
 
-  # ── Host connectivity: always-on so user-defined hooks and MCP servers work
+  # ── Host connectivity: always-on so user-defined hooks and MCP servers work.
+  # Never in a caged box: a name for the host is a way around the gateway.
   local host_args=()
-  if ! _is_docker_desktop 2>/dev/null; then
+  if [ "$_eg_caged" != 1 ] && ! _is_docker_desktop 2>/dev/null; then
     host_args+=(--add-host "host.docker.internal:host-gateway")
   fi
 
@@ -17300,6 +17379,37 @@ cmd_run() {
   _bx="$(_box_identity)"; _bx_uid="${_bx%% *}"; _bx_gid="${_bx##* }"
   _claude_env_sandbox_topup "$_bx_uid"
 
+  # ── The caged create (8.2): marker, socket volume, rendered policy, gateway,
+  # then the box, in that order. The gateway's socket is owned by the uid the
+  # box runs as, never the host's id -u. Silent inside the spinner. A failed
+  # step stops the spinner, refuses and removes what it made: never a box
+  # without its gateway.
+  local _sock_uid="$_bx_uid" _sock_gid="$_bx_gid"
+  local egress_args=()
+  if [ "$_eg_caged" = 1 ]; then
+    local _eg_fail="" _eg_err=""
+    _egress_teardown "$cname" keep force || _eg_fail=clear
+    [ -n "$_eg_fail" ] || _egress_mark_creating "$cname" || _eg_fail=marker
+    [ -n "$_eg_fail" ] || _egress_sock_volume_create "$cname" || _eg_fail=volume
+    [ -n "$_eg_fail" ] || _egress_render_policy "$cname" "$_EG_MODE" "$_EG_HOSTS" || _eg_fail=render
+    if [ -z "$_eg_fail" ]; then
+      _eg_err="$(_egress_gateway_run "$cname" "$_sock_uid" "$_sock_gid")" || _eg_fail=gateway
+    fi
+    if [ -n "$_eg_fail" ]; then
+      spin_stop 1 "Container started" "Egress gateway failed to start"
+      _egress_create_refusal "$_eg_fail" "$cname" "$_eg_err"
+      _egress_teardown "$cname" keep force || true
+      exit 1
+    fi
+    egress_args=(--network none --cap-drop "$_EGRESS_BOX_CAPDROP")
+    mount_args+=(-v "$(_egress_sock_volume "$cname"):/run/cleat-egress:ro")
+    label_args+=(
+      --label "sh.cleat.role=box"
+      --label "sh.cleat.egress-hash=$(_egress_create_digest "$cname" none "$(_egress_capdrop_canon "$_EGRESS_BOX_CAPDROP")" "$(_egress_hooks_fact)")"
+      --label "sh.cleat.egress-engine=$_EG_ENGINE_KIND"
+    )
+  fi
+
   local _docker_err="/tmp/cleat-err.$$"
   local run_rc=0
   docker run -d \
@@ -17308,6 +17418,7 @@ cmd_run() {
     "${ssh_args[@]+"${ssh_args[@]}"}" \
     "${docker_args[@]+"${docker_args[@]}"}" \
     "${host_args[@]+"${host_args[@]}"}" \
+    "${egress_args[@]+"${egress_args[@]}"}" \
     -e "BROWSER=/usr/local/bin/open-bridge" \
     "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}" \
     "${label_args[@]}" \
@@ -17329,7 +17440,7 @@ cmd_run() {
     _maybe_explain_enospc "$_docker_err"
     rm -f "$_docker_err"
     # Clean up any partial container state so the next attempt starts fresh
-    docker rm -f "$cname" > /dev/null 2>&1 || true
+    _egress_teardown "$cname" keep || true
     exit 1
   fi
   rm -f "$_docker_err"
@@ -17337,6 +17448,9 @@ cmd_run() {
   # The egress gate (EGRESS-SPEC.md 5.7), right after the box exists and
   # before [setup] or anything else execs into it.
   _egress_require "$cname" run || exit 1
+  # The create window ends with the first gate that passed. A refused gate
+  # leaves the marker for the teardown that the remedy runs.
+  rm -f "$CLEAT_RUN_DIR/$cname/egress/creating"
 
   # A --desc set at creation time (host-side, keyed by cname; never recreates).
   if [[ "${_CLI_DESC_SET:-0}" == "1" ]]; then

@@ -17,6 +17,7 @@
 
 load "../setup"
 load "../lib/handoff_helpers"
+load "../lib/egress_fixtures"
 
 setup() {
   _common_setup
@@ -10046,4 +10047,54 @@ SH
   run bash -c 'grep "^docker run " "$1" | grep -o -- "--name [^ ]*"' _ "$DOCKER_CALLS"
   [[ "$output" =~ ^--name\ cleat-gw-[0-9a-f]{12}$ ]]
   [ "$output" != "--name $box" ]
+}
+
+# A fresh project created under a strict policy with enforcement live, the
+# fixtures the gate reads planted up front.
+_caged_run_setup() {
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  mock_docker_images "cleat"
+  _host_clip_cmd() { echo ""; }
+}
+
+@test "regression vNEXT: the socket was unreachable at the box uid" {
+  # On a user-namespaced engine the box runs as the measured in-namespace uid,
+  # not the host's. A socket chowned to id -u would refuse the box's relay.
+  _caged_run_setup
+  int_uidmap_write "4242 4243"
+  [ "$(id -u)" != 4242 ]
+  F_ENV='HOST_UID=4242\nHOST_GID=4243' caged_box
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_has "$GW" "-e CLEAT_SOCK_UID=4242 -e CLEAT_SOCK_GID=4243 "
+  assert_success
+  run assert_docker_run_has "$CN" "-e HOST_UID=4242 -e HOST_GID=4243 "
+  assert_success
+}
+
+@test "regression vNEXT: a policy box still resolved host.docker.internal" {
+  # --add-host puts the host's address in the box's /etc/hosts: a name for
+  # the host is a way around the gateway.
+  _caged_run_setup
+  caged_box
+  _is_docker_desktop() { return 1; }
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  run assert_docker_run_lacks "$CN" "--add-host"
+  assert_success
+}
+
+@test "regression vNEXT: every cold caged launch refused on a gateway that was still starting" {
+  # The first health read after a gateway starts is always starting. With no
+  # create window the gate refused every cold launch. No hand-placed marker:
+  # the create path writes it.
+  _caged_run_setup
+  F_HEALTH_SEQ="starting starting healthy" caged_box
+  [ ! -e "$CLEAT_RUN_DIR/$CN/egress/creating" ]
+  run cmd_run "$TEST_TEMP/project"
+  assert_success
+  [ ! -e "$CLEAT_RUN_DIR/$CN/egress/creating" ]
 }

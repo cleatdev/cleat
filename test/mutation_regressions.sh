@@ -14245,7 +14245,7 @@ try "vnext_egress_hooks_escape" "an active policy refuses the hooks capability u
 
 # A policy inside the cage is not a policy.
 cat > "$SED_TMP" << 'SED'
-/^_egress_require()/,/^}$/{
+/^_egress_precreate_check()/,/^}$/{
   s@^  if ! _egress_policy_containable "\$_c" "\$_ws"; then@  if false; then@
 }
 SED
@@ -14253,7 +14253,7 @@ try "vnext_egress_containment_gated" "a config directory inside the box's worksp
 
 # A host whose _md5 fell back to cksum computes a digest the gateway cannot.
 cat > "$SED_TMP" << 'SED'
-/^_egress_require()/,/^}$/{
+/^_egress_precreate_check()/,/^}$/{
   s@^  if ! _egress_md5_ok; then@  if false; then@
 }
 SED
@@ -14457,7 +14457,7 @@ try "vnext_egress_policy_file_links" "a policy file linked into the workspace pa
 
 # The gate runs the per-file check, not the directory check alone.
 cat > "$SED_TMP" << 'SED'
-/^_egress_require()/,/^}$/{
+/^_egress_precreate_check()/,/^}$/{
   s@_egress_policy_containable "\$_c" "\$_ws"@_egress_config_is_containable "$_ws"@
 }
 SED
@@ -14651,6 +14651,107 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_audit_cert_names_cut" "certificate names are cut to host name characters before use" "$CLI" "$EGRESS_UI_BATS"
+
+# The gateway run line (8.2). The policy reaches the gateway read-only.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_run()/,/^}$/{
+  s|"[$]pol_dir:/etc/cleat-egress:ro"|"$pol_dir:/etc/cleat-egress"|
+}
+SED
+try "vnext_egress_policy_mount_ro" "the policy directory is mounted read-only in the gateway and in no box" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# The socket volume carries the socket and the denials log, never the policy.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_run()/,/^}$/{
+  s@:/etc/cleat-egress:ro@:/run/cleat-egress/policy:ro@
+}
+SED
+try "vnext_egress_volume_manifest" "the shared volume carries only the socket and the denials log" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_run()/,/^}$/{
+  s@--memory 128m --memory-swap 128m@--memory 1g --memory-swap 1g@
+}
+SED
+try "vnext_egress_gateway_memory_ceiling" "the gateway run line pins the memory ceiling" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_hash()/,/^}$/{
+  s@[$]{_h:0:12}@${_h:0:8}@
+}
+SED
+try "vnext_egress_gateway_hash_width" "the gateway hash is twelve hex characters" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s|cleat-gw-%s|cleat-egress-%s|
+SED
+try "vnext_egress_gateway_name_namespace" "the gateway name collided with a box" "$CLI"
+
+# The selftest names a reserved host the gateway answers itself, so a start
+# needs no resolver.
+cat > "$SED_TMP" << 'SED'
+/^_egress_policy_json()/,/^}$/{
+  s@"selftest_host": "cleat-gateway.invalid"@"selftest_host": "gateway.cleat.sh"@
+}
+SED
+try "vnext_egress_no_resolver_at_start" "start does not require a resolver" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# A missing bind source is a directory Docker makes as root: the run refuses
+# before one exists.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_run()/,/^}$/{
+  /^  if \[ -L "[$]pol_dir" \] || \[ ! -d "[$]pol_dir" \]/,/^  fi$/d
+}
+SED
+try "vnext_egress_gateway_needs_policy" "the gateway is never run before its rendered policy exists" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# A hash that is not twelve hex removes nothing derived from it.
+cat > "$SED_TMP" << 'SED'
+/^_egress_teardown()/,/^}$/{
+  s@^  case "[$]bh" in ????????????) ;; \*) bh="" ;; esac$@  :@
+}
+SED
+try "vnext_egress_teardown_hash_guard" "teardown with a hash that is not twelve hex never reaches egress-rendered" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# A box that survives its removal keeps its files.
+cat > "$SED_TMP" << 'SED'
+/^_egress_teardown()/,/^}$/{
+  s@^  if ! docker rm -f "[$]cname" >/dev/null 2>&1 && container_exists "[$]cname"; then@  if false; then@
+}
+SED
+try "vnext_egress_teardown_box_survives" "teardown stops before the files when the box survives its removal" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# The volume goes after both containers: Docker refuses a volume in use.
+cat > "$SED_TMP" << 'SED'
+/^_egress_teardown()/,/^}$/{
+  s@^    docker rm -f "[$](_egress_gateway_name "[$]cname")" >/dev/null 2>&1 || true@    docker volume rm "$(_egress_sock_volume "$cname")" >/dev/null 2>\&1 || true; docker rm -f "$(_egress_gateway_name "$cname")" >/dev/null 2>\&1 || true@
+}
+SED
+try "vnext_egress_teardown_order" "teardown removes the gateway before the box" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# Off machines gain no docker call on a removal.
+cat > "$SED_TMP" << 'SED'
+/^_egress_teardown()/,/^}$/{
+  s@^    if \[ "[$]force" = force \] ||@    if true ||@
+}
+SED
+try "vnext_egress_teardown_presence_gate" "teardown touches no gateway or volume for a box that never had a policy" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# The re-created gateway's socket owner is the box's, off its frozen env.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_sock_ids()/,/^}$/{
+  s@^  case "[$]_uid:[$]_gid" in \*\[!0-9:\]\*|:\*|\*:) return 1 ;; esac$@  :@
+}
+SED
+try "vnext_egress_box_sock_ids_numeric" "the box's socket owner is read off its frozen environment" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# The unlabelled-volume remedy is a recreate: egress restart never makes one.
+cat > "$SED_TMP" << 'SED'
+/^_egress_box_shape()/,/^}$/{
+  s@"[$]{BOLD}cleat rm && cleat[$]{RESET} recreates it with its socket volume"@"${BOLD}cleat egress restart${RESET}"@
+}
+SED
+try "vnext_egress_volume_remedy_recreates" "an unlabelled auto-created socket volume refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
 
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.

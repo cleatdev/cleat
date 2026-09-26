@@ -225,6 +225,10 @@ teardown() { _common_teardown; }
   assert_failure
   assert_output --partial "socket volume is not the one cleat labelled"
   assert_output --partial "This is not a policy denial."
+  # egress restart never creates a volume, so naming it would loop. Only a
+  # recreate makes the labelled one.
+  assert_output --partial "cleat rm && cleat"
+  refute_output --partial "egress restart"
 }
 
 @test "egress require: a socket volume labelled for another box refuses" {
@@ -892,14 +896,28 @@ egress:hooks=0"
   assert_failure
 }
 
-@test "egress require: the names derive from the box container name, twelve hex" {
-  [[ "$BH" =~ ^[0-9a-f]{12}$ ]]
-  run _egress_gateway_name "$CN"
-  assert_output "cleat-gw-$BH"
-  run _egress_sock_volume "$CN"
-  assert_output "cleat-gw-$BH-sock"
-  [ "$(_egress_box_hash "${CN}x")" != "$BH" ]
-  [ "$(_egress_gateway_name "$CN")" != "$CN" ]
+@test "egress require: the precreate check refuses what the gate refuses, reading no box" {
+  # A caged create runs these before anything exists, so none may read the box.
+  mkdir -p "$TEST_TEMP/ws"
+  run _egress_precreate_check "$CN" "$TEST_TEMP/ws" strict
+  assert_success
+  _egress_engine_kind() { printf 'engine-linux'; }
+  _egress_precreate_check "$CN" "$TEST_TEMP/ws" strict || true
+  [ "$_EG_REFUSED" = engine ]
+  _egress_engine_kind() { printf 'desktop-macos'; }
+  _egress_md5_ok() { return 1; }
+  _egress_precreate_check "$CN" "$TEST_TEMP/ws" strict || true
+  [ "$_EG_REFUSED" = engine ]
+  _egress_md5_ok() { return 0; }
+  ACTIVE_CAPS=(docker)
+  _egress_precreate_check "$CN" "$TEST_TEMP/ws" strict || true
+  [ "$_EG_REFUSED" = interlock ]
+  ACTIVE_CAPS=()
+  _EG_REFUSED=""
+  _egress_precreate_check "$CN" "$CLEAT_CONFIG_DIR" strict || true
+  [ "$_EG_REFUSED" = policy ]
+  run grep -c "^docker inspect" "$DOCKER_CALLS"
+  assert_output "0"
 }
 
 # ── Placement (5.7): before every exec, on every fatal verb ─────────────────

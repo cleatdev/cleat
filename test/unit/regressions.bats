@@ -10029,3 +10029,21 @@ SH
   assert_failure
   assert_output --partial "reached through a symlink: ${TEST_TEMP/#${HOME}/~}/sys/var"
 }
+
+@test "regression vNEXT: the gateway name collided with a box" {
+  # A project folder named gw gives a box cleat-gw-<8 hex>, the gateway's
+  # naive grammar. Two containers would race for one name, and a teardown
+  # could remove the user's box. Twelve hex is unreachable from the box names.
+  mkdir -p "$TEST_TEMP/gw" "$CLEAT_CONFIG_DIR"
+  local box gw
+  box="$(container_name_for "$TEST_TEMP/gw")"
+  [[ "$box" =~ ^cleat-gw-[0-9a-f]{8}$ ]]
+  gw="$(_egress_gateway_name "$box")"
+  [ "$gw" != "$box" ]
+  _egress_render_policy "$box" strict claude.ai
+  run _egress_gateway_run "$box" 501 20
+  assert_success
+  run bash -c 'grep "^docker run " "$1" | grep -o -- "--name [^ ]*"' _ "$DOCKER_CALLS"
+  [[ "$output" =~ ^--name\ cleat-gw-[0-9a-f]{12}$ ]]
+  [ "$output" != "--name $box" ]
+}

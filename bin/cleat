@@ -10675,6 +10675,106 @@ EOF
   fi
 }
 
+# ── Creation and teardown (8.2, 8.7) ──
+# The socket volume, created explicitly with both labels before anything
+# mounts it. A volume Docker auto-creates at a mount has no labels, and
+# assertion 10 refuses it, so a name match is never evidence.
+_egress_sock_volume_create() {           # <cname>
+  docker volume create --label sh.cleat.role=egress-sock \
+    --label "sh.cleat.gateway-for=$(_egress_box_hash "$1")" \
+    "$(_egress_sock_volume "$1")" >/dev/null 2>&1
+}
+
+# The gateway, exactly 8.2's run line. No --network (the default bridge), no
+# --user (the gateway drops to 65532 itself after binding its socket), no
+# --init, no health flags (the image carries its HEALTHCHECK), no box label and
+# no version label, and nothing after the image. docker run, never create. The
+# rendered policy must already be there: a missing bind source is a directory
+# Docker makes as root, so this refuses rather than let it. Prints what Docker
+# said on a failure. The caller refuses with the gateway code and tears down.
+_egress_gateway_run() {                  # <cname> <sock uid> <sock gid>
+  local gw bh sock_vol pol_dir _sock_uid="$2" _sock_gid="$3"
+  local _err="" _rc=0 _l
+  gw="$(_egress_gateway_name "$1")"
+  bh="$(_egress_box_hash "$1")"
+  sock_vol="$(_egress_sock_volume "$1")"
+  pol_dir="$(_egress_policy_dir "$1")"
+  case "$_sock_uid:$_sock_gid" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
+  if [ -L "$pol_dir" ] || [ ! -d "$pol_dir" ] || [ -L "$pol_dir/policy.json" ] || [ ! -f "$pol_dir/policy.json" ]; then
+    return 1
+  fi
+  _err="$(mktemp "${TMPDIR:-/tmp}/cleat-gw-run.XXXXXX" 2>/dev/null)" || _err=""
+  docker run -d --name "$gw" \
+    --label sh.cleat.role=gateway \
+    --label "sh.cleat.gateway-for=$bh" \
+    --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges \
+    --read-only \
+    --tmpfs /run/gw-admin:rw,noexec,nosuid,nodev,size=1m \
+    -v "$sock_vol:/run/cleat-egress" \
+    -v "$pol_dir:/etc/cleat-egress:ro" \
+    --memory 128m --memory-swap 128m --pids-limit 128 --cpus 1.0 \
+    --restart on-failure:3 --stop-timeout 5 \
+    --log-driver json-file --log-opt max-size=2m --log-opt max-file=3 \
+    -e "CLEAT_SOCK_UID=$_sock_uid" -e "CLEAT_SOCK_GID=$_sock_gid" \
+    "$_GATEWAY_IMAGE" >/dev/null 2>"${_err:-/dev/null}" || _rc=$?
+  if [ "$_rc" -ne 0 ] && [ -n "$_err" ] && [ -s "$_err" ]; then
+    while IFS= read -r _l; do
+      echo -e "    ${DIM}$(_sanitize_repo_str "$_l")${RESET}"
+    done < <(head -n 5 "$_err")
+  fi
+  if [ -n "$_err" ]; then rm -f "$_err" 2>/dev/null || true; fi
+  [ "$_rc" -eq 0 ]
+}
+
+# The one teardown every removal site goes through: the gateway, then the box,
+# then the socket volume (a volume in use cannot be removed) and the rendered
+# policy. keep is every recreate: the box's own policy file, pin and notices
+# marker survive it. Only the literal forget (cmd_rm, cmd_nuke) deletes them.
+# Never the global section or the global pin. Silent, and 0 when there is
+# nothing to remove. 1 only when the box is still there after its removal, so
+# a caller never forgets the files of a box that survived. The gateway and the
+# volume are touched only when this box has a rendered policy or a create in
+# flight, so a machine that never turned egress on gains no docker call. force
+# skips that check, for the pre-clear before a caged create. A hash that is not
+# twelve hex (a host whose _md5 is the cksum fallback, which can never create a
+# caged box) removes the box and nothing derived from the hash, so rm -rf can
+# never reach egress-rendered/ itself.
+_egress_teardown() {                     # <cname> <keep|forget> [force]
+  local cname="$1" kind="${2:-}"
+  local force="${3:-}"
+  local bh
+  local present=0
+  [ -n "$cname" ] || return 0
+  bh="$(_egress_box_hash "$cname")"
+  case "$bh" in ????????????) ;; *) bh="" ;; esac
+  case "$bh" in *[!0-9a-f]*) bh="" ;; esac
+  if [ -n "$bh" ]; then
+    if [ "$force" = force ] || [ -d "$(_egress_policy_dir "$cname")" ] \
+       || [ -e "$CLEAT_RUN_DIR/$cname/egress/creating" ]; then
+      present=1
+    fi
+  fi
+  if [ "$present" = 1 ]; then
+    docker rm -f "$(_egress_gateway_name "$cname")" >/dev/null 2>&1 || true
+  fi
+  if ! docker rm -f "$cname" >/dev/null 2>&1 && container_exists "$cname"; then
+    return 1
+  fi
+  if [ "$present" = 1 ]; then
+    docker volume rm "$(_egress_sock_volume "$cname")" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$bh" ]; then
+    rm -rf "$(_egress_policy_dir "$cname")"
+  fi
+  rm -f "$CLEAT_RUN_DIR/$cname/egress/creating"
+  rm -f "$CLEAT_CONFIG_DIR/egress-boxes/$cname.session"
+  [ "$kind" = forget ] || return 0
+  rm -f "$CLEAT_CONFIG_DIR/egress-notices/$cname"
+  rm -f "$CLEAT_CONFIG_DIR/egress-boxes/$cname"
+  rm -f "$CLEAT_CONFIG_DIR/egress-pins/$cname"
+}
+
 # ── Refusals ──
 # Every refusal names the box, the reason and the one remedy, under a first
 # line a wrapper can key on. The CLI exits 1 on all of them. _EG_REFUSED holds
@@ -10788,8 +10888,10 @@ _egress_box_shape() {                    # <cname>
   _v="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker volume inspect --format \
     '{{index .Labels "sh.cleat.role"}} {{index .Labels "sh.cleat.gateway-for"}}' "$(_egress_sock_volume "$_c")" 2>/dev/null)" || _v="?"
   if [ "$_v" != "egress-sock $_bh" ]; then
+    # Not egress restart, which never creates a volume: only a recreate
+    # makes the labelled one.
     _egress_refuse gateway "its egress socket volume is not the one cleat labelled for it, so the socket may be empty." \
-      "${BOLD}cleat egress restart${RESET}"; return 1
+      "${BOLD}cleat rm && cleat${RESET} recreates it with its socket volume"; return 1
   fi
   # 11: no docker socket, in any position of .Mounts.
   _v="$(_egress_box_field "$_c" '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}FOUND{{end}}{{end}}')" || _v="?"
@@ -10865,11 +10967,30 @@ _egress_interlocks() {                   # <mode>
   return 0
 }
 
+# The box's own uid:gid, off its frozen .Config.Env (the HOST_UID and HOST_GID
+# its create passed), never the host's id -u. rc 1 when either is missing or
+# not a number. The selftest dials as it and a re-created gateway chowns its
+# socket to it.
+_egress_box_sock_ids() {                 # <cname>
+  local _env _uid="" _gid="" _l
+  _env="$(_egress_box_field "$1" '{{range .Config.Env}}{{println .}}{{end}}')" || return 1
+  while IFS= read -r _l; do
+    case "$_l" in
+      HOST_UID=*) _uid="${_l#HOST_UID=}" ;;
+      HOST_GID=*) _gid="${_l#HOST_GID=}" ;;
+    esac
+  done <<EOF
+$_env
+EOF
+  case "$_uid:$_gid" in *[!0-9:]*|:*|*:) return 1 ;; esac
+  printf '%s:%s' "$_uid" "$_gid"
+}
+
 # Assertion 15: the gateway exists, runs, is this box's, is healthy (waited
 # for only inside the create window), holds its socket path and answers the
 # selftest as the box's own identity.
 _egress_gateway_ok() {                   # <cname>
-  local _c="$1" _gw _bh _v _env _uid="" _gid="" _l
+  local _c="$1" _gw _bh _v _ids
   _gw="$(_egress_gateway_name "$_c")"
   _bh="$(_egress_box_hash "$_c")"
   _v="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect --format \
@@ -10893,17 +11014,8 @@ _egress_gateway_ok() {                   # <cname>
     _egress_refuse gateway "its gateway does not hold the socket the box dials." "${BOLD}cleat egress restart${RESET}"
     return 1
   fi
-  _env="$(_egress_box_field "$_c" '{{range .Config.Env}}{{println .}}{{end}}')" || _env=""
-  while IFS= read -r _l; do
-    case "$_l" in
-      HOST_UID=*) _uid="${_l#HOST_UID=}" ;;
-      HOST_GID=*) _gid="${_l#HOST_GID=}" ;;
-    esac
-  done <<EOF
-$_env
-EOF
-  case "$_uid:$_gid" in *[!0-9:]*|:*|*:) _uid="" ;; esac
-  if [ -z "$_uid" ] || ! _egress_selftest "$_gw" "$_uid:$_gid"; then
+  _ids="$(_egress_box_sock_ids "$_c")" || _ids=""
+  if [ -z "$_ids" ] || ! _egress_selftest "$_gw" "$_ids"; then
     _egress_refuse gateway "its gateway did not answer the box's own connection." "${BOLD}cleat egress restart${RESET}"
     return 1
   fi
@@ -10931,6 +11043,35 @@ _egress_live_ok() {                      # <cname> <mode> <hosts>
   _egress_refuse gateway "its gateway is enforcing a different policy from the one saved, and a reload did not fix it." \
     "${BOLD}cleat egress reload${RESET}"
   return 1
+}
+
+# The checks that need no box: containment, the digest tool, the engine and
+# the capability interlocks. The gate runs them before its box reads, and a
+# caged create runs them before it makes anything, with the same refusals.
+# Leaves the engine kind in _EG_ENGINE_KIND for the gate's label compare.
+_EG_ENGINE_KIND=""
+_egress_precreate_check() {              # <cname> <workspace> <mode>
+  local _c="$1" _ws="$2"
+  # A policy inside the cage is not a policy: neither the config directory
+  # nor any policy file, followed through its links, may sit under the
+  # workspace this box mounts read-write (5.2). It prints the collision.
+  if ! _egress_policy_containable "$_c" "$_ws"; then
+    _EG_REFUSED=policy
+    return 1
+  fi
+  if ! _egress_md5_ok; then
+    _egress_refuse engine "this host has no md5sum or md5, so cleat cannot compute the policy digest the gateway checks." \
+      "install md5sum (coreutils), or ${BOLD}cleat egress off${RESET}"
+    return 1
+  fi
+  _EG_ENGINE_KIND="$(_egress_engine_kind)"
+  if ! _egress_engine_validated "$_EG_ENGINE_KIND"; then
+    _EG_REFUSED=engine
+    _egress_engine_refusal "$_EG_ENGINE_KIND"
+    return 1
+  fi
+  _egress_interlocks "$3" || return 1
+  return 0
 }
 
 # The gate. Returns 0 when the feature is off for this box (no policy resolves
@@ -10961,27 +11102,10 @@ _egress_require() {                      # <cname> <verb>
         "${BOLD}cleat egress off${RESET} recreates it with a normal network, or restore the [egress] section"
       return 1 ;;
   esac
-  # A policy inside the cage is not a policy: neither the config directory
-  # nor any policy file, followed through its links, may sit under the
-  # workspace this box mounts read-write (5.2). It prints the collision.
   _ws="${_RESOLVED_PROJECT:-}"
   if _box_is_fork "$_c" 2>/dev/null; then _ws="$(_fork_dir "$_c")"; fi
-  if ! _egress_policy_containable "$_c" "$_ws"; then
-    _EG_REFUSED=policy
-    return 1
-  fi
-  if ! _egress_md5_ok; then
-    _egress_refuse engine "this host has no md5sum or md5, so cleat cannot compute the policy digest the gateway checks." \
-      "install md5sum (coreutils), or ${BOLD}cleat egress off${RESET}"
-    return 1
-  fi
-  _kind="$(_egress_engine_kind)"
-  if ! _egress_engine_validated "$_kind"; then
-    _EG_REFUSED=engine
-    _egress_engine_refusal "$_kind"
-    return 1
-  fi
-  _egress_interlocks "$_EG_MODE" || return 1
+  _egress_precreate_check "$_c" "$_ws" "$_EG_MODE" || return 1
+  _kind="$_EG_ENGINE_KIND"
   _egress_create_drift "$_c" || return 1
   _egress_box_shape "$_c" || return 1
   if ! _egress_label_read "$_c" sh.cleat.egress-engine || [ "$_EG_LABEL" != "$_kind" ]; then

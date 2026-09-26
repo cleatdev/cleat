@@ -1480,7 +1480,8 @@ EOF
     "$PROJECT_ROOT/docker/entrypoint.sh" \
     "$PROJECT_ROOT/docker/open-bridge" \
     "$PROJECT_ROOT/docker/clip" \
-    "$PROJECT_ROOT/docker/clip-daemon"
+    "$PROJECT_ROOT/docker/clip-daemon" \
+    "$PROJECT_ROOT/docker/cleat-egress-shim"
   assert_failure
 }
 

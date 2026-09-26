@@ -92,6 +92,7 @@ ENTRYPOINT_BATS="$REPO_ROOT/test/unit/entrypoint.bats"
 OPENBRIDGE="$REPO_ROOT/docker/open-bridge"
 CLIP_DAEMON="$REPO_ROOT/docker/clip-daemon"
 CLIP_SHIM="$REPO_ROOT/docker/clip"
+EGRESS_SHIM="$REPO_ROOT/docker/cleat-egress-shim"
 TEST_SH="$REPO_ROOT/test.sh"
 MOCK_DOCKER="$REPO_ROOT/test/fixtures/mock_bin/docker"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
@@ -100,6 +101,7 @@ ENTRYPOINT_BACKUP="/tmp/cleat-regression-mutation-entrypoint-backup-$$"
 OPENBRIDGE_BACKUP="/tmp/cleat-regression-mutation-openbridge-backup-$$"
 CLIP_DAEMON_BACKUP="/tmp/cleat-regression-mutation-clipdaemon-backup-$$"
 CLIP_SHIM_BACKUP="/tmp/cleat-regression-mutation-clipshim-backup-$$"
+EGRESS_SHIM_BACKUP="/tmp/cleat-regression-mutation-egressshim-backup-$$"
 TEST_SH_BACKUP="/tmp/cleat-regression-mutation-testsh-backup-$$"
 INT_LIFECYCLE_BACKUP="/tmp/cleat-regression-mutation-intlifecycle-backup-$$"
 SETUP_BASH_BACKUP="/tmp/cleat-regression-mutation-setupbash-backup-$$"
@@ -113,7 +115,7 @@ DIM=$'\033[2m'
 RESET=$'\033[0m'
 
 # Mutual exclusion, taken BEFORE the backups and BEFORE the cleanup trap. Both
-# of those WRITE the ten tracked files this lock exists to protect, so a run
+# of those WRITE the eleven tracked files this lock exists to protect, so a run
 # that is correctly refused must not have reached them.
 _CLEAT_TEST_LOCK_ROOT="$REPO_ROOT"
 # Optional sharding for CI, the same shape test.sh uses: MUTATION_SHARD_TOTAL=N
@@ -149,6 +151,7 @@ _restore_targets() {
   [[ -f "$OPENBRIDGE_BACKUP" ]] && cp "$OPENBRIDGE_BACKUP" "$OPENBRIDGE"
   [[ -f "$CLIP_DAEMON_BACKUP" ]] && cp "$CLIP_DAEMON_BACKUP" "$CLIP_DAEMON"
   [[ -f "$CLIP_SHIM_BACKUP" ]] && cp "$CLIP_SHIM_BACKUP" "$CLIP_SHIM"
+  [[ -f "$EGRESS_SHIM_BACKUP" ]] && cp "$EGRESS_SHIM_BACKUP" "$EGRESS_SHIM"
   [[ -f "$TEST_SH_BACKUP" ]] && cp "$TEST_SH_BACKUP" "$TEST_SH"
   [[ -f "$INT_LIFECYCLE_BACKUP" ]] && cp "$INT_LIFECYCLE_BACKUP" "$INT_LIFECYCLE_BATS"
   [[ -f "$SETUP_BASH_BACKUP" ]] && cp "$SETUP_BASH_BACKUP" "$SETUP_BASH"
@@ -159,7 +162,7 @@ _restore_targets() {
 cleanup() {
   _restore_targets
   rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP" \
-        "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$TEST_SH_BACKUP" \
+        "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$EGRESS_SHIM_BACKUP" "$TEST_SH_BACKUP" \
         "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP" "$MOCK_DOCKER_BACKUP"
 }
 # A signal only exits, and the EXIT trap does the restoring, exactly once. A
@@ -176,6 +179,7 @@ cp "$ENTRYPOINT" "$ENTRYPOINT_BACKUP"
 cp "$OPENBRIDGE" "$OPENBRIDGE_BACKUP"
 cp "$CLIP_DAEMON" "$CLIP_DAEMON_BACKUP"
 cp "$CLIP_SHIM" "$CLIP_SHIM_BACKUP"
+cp "$EGRESS_SHIM" "$EGRESS_SHIM_BACKUP"
 cp "$TEST_SH" "$TEST_SH_BACKUP"
 cp "$INT_LIFECYCLE_BATS" "$INT_LIFECYCLE_BACKUP"
 cp "$SETUP_BASH" "$SETUP_BASH_BACKUP"
@@ -184,7 +188,7 @@ filter="${1:-}"
 
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
-# Target file defaults to $CLI; pass another of the ten tracked targets
+# Target file defaults to $CLI; pass another of the eleven tracked targets
 # ($INSTALLER, $SETUP_BASH, $MOCK_DOCKER, ...) to mutate a companion file. A
 # path with no backup is refused rather than mutated, because nothing could
 # restore it. Returns 0 if mutation caught, 1 if missed, 2 if skipped.
@@ -200,6 +204,8 @@ run_mutation() {
     backup="$CLIP_DAEMON_BACKUP"
   elif [[ "$target" == "$CLIP_SHIM" ]]; then
     backup="$CLIP_SHIM_BACKUP"
+  elif [[ "$target" == "$EGRESS_SHIM" ]]; then
+    backup="$EGRESS_SHIM_BACKUP"
   elif [[ "$target" == "$TEST_SH" ]]; then
     backup="$TEST_SH_BACKUP"
   elif [[ "$target" == "$INT_LIFECYCLE_BATS" ]]; then
@@ -14645,6 +14651,43 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_audit_cert_names_cut" "certificate names are cut to host name characters before use" "$CLI" "$EGRESS_UI_BATS"
+
+# The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
+# socket sees the uid the host chose.
+cat > "$SED_TMP" << 'SED'
+s@runuser -u coder -- /usr/local/bin/cleat-egress-shim@/usr/local/bin/cleat-egress-shim@
+SED
+try "vnext_egress_relay_drops_to_coder" "starts the egress relay as coder when the socket volume is mounted" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# Root hands the relay's log to coder without following a link in its place.
+cat > "$SED_TMP" << 'SED'
+s@chown -h "[$]HOST_UID:[$]HOST_GID" /tmp/cleat-egress-shim.log@chown "$HOST_UID:$HOST_GID" /tmp/cleat-egress-shim.log@
+SED
+try "vnext_egress_relay_log_no_follow" "without following a link" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# Neither child keeps the lock descriptor, or a dead supervisor's relay keeps
+# every later start out.
+cat > "$SED_TMP" << 'SED'
+s@"UNIX-CONNECT:[$]SOCK" 9>&- &@"UNIX-CONNECT:$SOCK" \&@
+SED
+try "vnext_egress_shim_relay_drops_lock" "inherits the lock descriptor" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@_shim_beats "[$]relay" 9>&- &@_shim_beats "$relay" \&@
+SED
+try "vnext_egress_shim_beats_drop_lock" "inherits the lock descriptor" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+# A heartbeat that claimed to be a selftest would never count, and a selftest
+# could then make a dead relay look alive.
+cat > "$SED_TMP" << 'SED'
+s@Host: cleat-gateway.invalid:443\\r\\n\\r\\n@Host: cleat-gateway.invalid:443\\r\\nCleat-Selftest: 1\\r\\n\\r\\n@
+SED
+try "vnext_egress_shim_beat_not_selftest" "never as a selftest" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@flock -n 9 || exit 0@flock -n 9 || true@
+SED
+try "vnext_egress_shim_one_supervisor" "second supervisor exits" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

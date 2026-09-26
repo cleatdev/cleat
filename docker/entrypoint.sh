@@ -105,6 +105,31 @@ fi
 # legacy bare paths used before v0.13.1.
 rm -rf /tmp/cleat-run-* /tmp/clip.sock /tmp/clip-daemon.pid /tmp/clip-handler 2>/dev/null || true
 
+# A caged box (concept/46): only a box created under an egress policy has the
+# gateway's socket volume mounted at /run/cleat-egress, and the image never
+# creates that directory, so the mount is the signal. Box root cannot fake a
+# mount without CAP_SYS_ADMIN. Nothing here carries security weight: the box
+# has no network, and these only point its tools at the relay. Every write is
+# `|| true`, so none can block a start. The relay starts after the uid remap,
+# as coder, on every start of the box. The apt sources are never touched and
+# NODE_OPTIONS is never set.
+if mountpoint -q /run/cleat-egress 2>/dev/null; then
+  printf 'Acquire::https::Proxy "http://127.0.0.1:3128";\nAcquire::http::Proxy "http://127.0.0.1:3128";\n' \
+    | tee /etc/apt/apt.conf.d/99cleat-egress-proxy >/dev/null 2>&1 || true
+  mkdir -p /etc/xdg/pip /usr/local/etc 2>/dev/null || true
+  printf '[global]\nproxy = http://127.0.0.1:3128\n' | tee /etc/xdg/pip/pip.conf >/dev/null 2>&1 || true
+  printf 'https-proxy=http://127.0.0.1:3128\nproxy=http://127.0.0.1:3128\n' \
+    | tee /usr/local/etc/npmrc >/dev/null 2>&1 || true
+  git config --system http.proxy http://127.0.0.1:3128 2>/dev/null || true
+  # The relay's lock and log sit in the sticky /tmp, which survives a stop.
+  # A lock left by the last run would make the new relay exit as a duplicate.
+  # The log is the relay's own, opened as coder: -h, so a link planted in its
+  # place is never followed as root.
+  rm -f /tmp/cleat-egress-shim.lock 2>/dev/null || true
+  chown -h "$HOST_UID:$HOST_GID" /tmp/cleat-egress-shim.log 2>/dev/null || true
+  runuser -u coder -- /usr/local/bin/cleat-egress-shim </dev/null >/dev/null 2>&1 &
+fi
+
 if [ $# -eq 0 ]; then
   exec su -s /bin/bash coder
 else

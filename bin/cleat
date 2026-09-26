@@ -63,7 +63,10 @@ REPO_URL="https://github.com/cleatdev/cleat"
 #      egress gateway that only ever sees TLS can serve apt at all, and the
 #      baked box notes say an image pasted with ctrl+v reaches Claude Code on
 #      its own, where they used to say reading the clipboard back never works
-_IMAGE_SPEC_VERSION=5
+#   6  the egress relay (docker/cleat-egress-shim), started by the entrypoint
+#      in a caged box only, with the proxy config for apt, pip, npm and git.
+#      Inert in every other box. Released users pay one recreate, 4 to 6
+_IMAGE_SPEC_VERSION=6
 # The egress catalogue's revision (EGRESS-SPEC.md 7.5). It moves when a pack's
 # host membership or any host's class changes and stays put otherwise, so a
 # version-only release never perturbs a saved policy while a class downgrade

@@ -1,7 +1,7 @@
 # Mutual exclusion for everything that reads or executes the working tree while
 # the mutation harness is rewriting it.
 #
-# WHY THIS EXISTS. The harness rewrites ten tracked files IN PLACE (bin/cleat,
+# WHY THIS EXISTS. The harness rewrites eleven tracked files IN PLACE (bin/cleat,
 # install.sh, test.sh, test/setup.bash, test/fixtures/mock_bin/docker,
 # test/integration/lifecycle.bats and the four docker/ shims), mutation by
 # mutation. Anything reading them meanwhile sees sabotaged or half-written
@@ -38,7 +38,7 @@ _tl_refuse() {   # owner-record
   echo "" >&2
   echo "  Refusing to start: ${owner:-another run} holds the test lock." >&2
   echo "" >&2
-  echo "  The mutation harness rewrites ten tracked files (bin/cleat, the shipped" >&2
+  echo "  The mutation harness rewrites eleven tracked files (bin/cleat, the shipped" >&2
   echo "  scripts and four test files) in place, so running anything against" >&2
   echo "  this checkout at the same time makes BOTH report failures that are not" >&2
   echo "  real. This checkout may be shared with a container or another machine," >&2

@@ -28,7 +28,7 @@ teardown() { _common_teardown; }
 _image_inputs_hash() {
   local docker_dir="$1"
   local f paths=()
-  for f in Dockerfile clip clip-daemon entrypoint.sh open-bridge CLAUDE.md; do
+  for f in Dockerfile clip clip-daemon cleat-egress-shim entrypoint.sh open-bridge CLAUDE.md; do
     paths+=("$docker_dir/$f")
   done
   if command -v sha256sum >/dev/null 2>&1; then
@@ -41,7 +41,7 @@ _image_inputs_hash() {
 }
 
 @test "image spec: build inputs match the recorded hash for this _IMAGE_SPEC_VERSION" {
-  local expected="af053e7786e31a6514addc7866ffda39ddddf3b9611398cf96245a748d10b067"
+  local expected="394a6bd2b4caaf08cf53d9e1038ceb17ad64822c334c4d6062f0c48fd4268c3c"
   local actual
   actual="$(_image_inputs_hash "$DOCKER_DIR")"
   [[ "$actual" == "$expected" ]] || {
@@ -65,7 +65,7 @@ _image_inputs_hash() {
   # 8.0), never an input of this one. The box Dockerfile copies named files and
   # is itself hashed, so a COPY of anything under gateway/ still trips the hash.
   local expected actual
-  expected="$(printf '%s\n' CLAUDE.md Dockerfile clip clip-daemon entrypoint.sh gateway open-bridge | sort)"
+  expected="$(printf '%s\n' CLAUDE.md Dockerfile clip clip-daemon cleat-egress-shim entrypoint.sh gateway open-bridge | sort)"
   actual="$(cd "$DOCKER_DIR" && ls -1A | sort)"
   [[ "$actual" == "$expected" ]] || {
     printf '%s\n' \

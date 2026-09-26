@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# The egress relay inside a caged box (EGRESS-SPEC.md 8.6, concept/46).
+#
+# A caged box has no network. Its tools reach the outside through
+# http://127.0.0.1:3128, and this relay carries each connection to the gateway's
+# unix socket on the read-only volume at /run/cleat-egress. The relay decides
+# nothing: the gateway enforces the policy, and a box that kills this relay has
+# only cut itself off.
+#
+# No argument: the supervisor. The entrypoint starts it as coder in a caged box
+# only. It keeps socat listening, starts it again about a second after it
+# dies, and sends heartbeats so the host can tell the relay is alive (a health
+# signal with no security weight). One supervisor per box, by a lock.
+#
+# --beat: one heartbeat, no lock. cleat egress restart uses it so the gateway's
+# last_shim_seen is fresh at once.
+#
+# It never writes under /run/cleat-egress, and it never runs as root.
+
+LOG=/tmp/cleat-egress-shim.log
+LOCK=/tmp/cleat-egress-shim.lock
+SOCK=/run/cleat-egress/proxy.sock
+
+# A CONNECT for the gateway's reserved target, which answers without dialling.
+# Never with the Cleat-Selftest header: the gateway counts a heartbeat only
+# without it, so a host-side selftest can never make a dead relay look alive.
+_shim_heartbeat() {
+  printf 'CONNECT cleat-gateway.invalid:443 HTTP/1.1\r\nHost: cleat-gateway.invalid:443\r\n\r\n' \
+    | timeout 3 socat - TCP:127.0.0.1:3128 >/dev/null 2>&1 || return 0
+  return 0
+}
+
+_shim_stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Beats every second for the first ten after a (re)start, so a gate waiting for
+# the first one is not kept waiting, then every thirty. Stops with its relay.
+_shim_beats() {
+  local relay="$1" n=0
+  while kill -0 "$relay" 2>/dev/null; do
+    _shim_heartbeat
+    if [ "$n" -lt 10 ]; then
+      n=$((n + 1))
+      sleep 1 & wait $!
+    else
+      sleep 30 & wait $!
+    fi
+  done
+}
+
+if [ "${1:-}" = --beat ]; then
+  _shim_heartbeat
+  exit 0
+fi
+
+exec 9>>"$LOCK" || exit 1
+flock -n 9 || exit 0
+exec </dev/null >>"$LOG" 2>&1
+
+while :; do
+  # socat logs one line per failed connection while the gateway is down, so
+  # the log is capped rather than left to grow for the life of the box.
+  if [ "$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')" -gt 1048576 ] 2>/dev/null; then
+    : > "$LOG"
+  fi
+  # Both children close fd 9. A relay that kept the lock would outlive a dead
+  # supervisor and make every later start exit as already running, with
+  # nothing supervising.
+  socat -T 900 "TCP-LISTEN:3128,fork,max-children=128,backlog=256,reuseaddr,bind=127.0.0.1" \
+    "UNIX-CONNECT:$SOCK" 9>&- &
+  relay=$!
+  echo "$(_shim_stamp) relay started pid=$relay"
+  _shim_beats "$relay" 9>&- &
+  beats=$!
+  rc=0
+  wait "$relay" || rc=$?
+  echo "$(_shim_stamp) relay exited rc=$rc"
+  kill "$beats" 2>/dev/null || true
+  wait "$beats" 2>/dev/null || true
+  sleep 1
+done

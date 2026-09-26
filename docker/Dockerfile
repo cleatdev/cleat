@@ -94,6 +94,12 @@ RUN chmod +x /usr/local/bin/open-bridge && \
 # it on recreate.
 ENV BROWSER=/usr/local/bin/open-bridge
 
+# The egress relay (concept/46). Started by the entrypoint in a caged box only,
+# where the gateway's socket volume is mounted at /run/cleat-egress. Idle and
+# unused in every other box.
+COPY cleat-egress-shim /usr/local/bin/cleat-egress-shim
+RUN chmod +x /usr/local/bin/cleat-egress-shim
+
 # Hook event forwarder directory (used when hooks capability is active)
 RUN mkdir -p /var/log/cleat && chown coder:coder /var/log/cleat
 

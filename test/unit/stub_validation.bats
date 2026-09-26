@@ -540,7 +540,7 @@ EOF
 }
 
 # ── The suite and the mutation harness must never run at once ───────────────
-# The harness rewrites ten tracked files in place. Anything reading or
+# The harness rewrites eleven tracked files in place. Anything reading or
 # EXECUTING them meanwhile fails for reasons unrelated to any change, and the
 # harness reports false MISSED against source someone else restored. Both
 # happened for real, including ACROSS MACHINES: a run inside a Cleat box and a
@@ -647,7 +647,7 @@ EOF
 
 @test "lock: the harness refuses while the suite holds it, WITHOUT writing anything" {
   # The refusal path must run before the backups and before the cleanup trap.
-  # Both of those cp over the ten tracked files, so a refused harness that
+  # Both of those cp over the eleven tracked files, so a refused harness that
   # reached them would perform the very write the lock exists to prevent. A
   # content checksum cannot see a restore that writes the same bytes back, so
   # the ten targets are backdated and the check is that none of them moved.

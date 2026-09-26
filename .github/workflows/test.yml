@@ -36,6 +36,8 @@ jobs:
         run: shellcheck --severity=error --shell=bash docker/entrypoint.sh
       - name: Lint install.sh (errors only)
         run: shellcheck --severity=error --shell=bash install.sh
+      - name: Lint docker/cleat-egress-shim (errors only)
+        run: shellcheck --severity=error --shell=bash docker/cleat-egress-shim
 
   # ── Full test suite on Linux ──────────────────────────────────────────────
   # Suite and mutation output goes to a file, then cat. The runner holds a step

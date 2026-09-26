@@ -544,6 +544,26 @@ def established(g, target=ALLOWED + b":443", hello=None, edge=PUB):
     return s
 
 
+@row("a real captured Chromium ClientHello, GREASE and all, establishes")
+def _():
+    # 11.6's mandatory row. A browser GREASEs cipher suites, extensions and
+    # groups, and a validator that treats an unknown codepoint as an attack
+    # would refuse every browser in a playwright pack. The record is sent as
+    # captured, in one piece.
+    data = fixture_hello("chromium")
+    check(data[0] == 0x16 and len(data) == 5 + int.from_bytes(data[3:5], "big"),
+          "the fixture is not exactly one TLS record")
+
+    def body(g):
+        s = open_ok(g, ALLOWED + b":443")
+        s.sendall(data)
+        got = g.edges[PUB].wait_bytes(len(data))
+        check(got == data, "edge received different bytes than the client sent")
+        expect_no_alert(s)
+        s.close()
+    with_gw(body)()
+
+
 @row("trailing dot in CONNECT, normalized SNI")
 def _():
     with_gw(lambda g: established(g, b"allowed.example.:443"))()

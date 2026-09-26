@@ -15,3 +15,7 @@ concept
 coverage/
 .test-suite.lock*
 __pycache__/
+
+# Real-Docker scratch for egress tests: the one host bind the tests use. It
+# lives in the checkout so the path exists on the Mac and in a box alike.
+.egress-scratch/

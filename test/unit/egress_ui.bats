@@ -1611,3 +1611,265 @@ plain_status() { run cmd_egress status; run _plain "$output"; }
   run _plain "$output"
   assert_output --partial "! gateway missing. This is not a policy denial."
 }
+
+# ── cleat egress why, log and test (6.2, 9.3) ───────────────────────────────
+
+# A caged box with a gateway whose denial log holds <rows>, as docker cp copies
+# it out, with a saved mark at the start of the log.
+why_box() {                              # <rows>
+  status_caged
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW" "$CLEAT_RUN_DIR/$CN/egress"
+  printf '%b' "${1:-}" > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+  printf '1:0\n' > "$CLEAT_RUN_DIR/$CN/egress/denials-mark"
+  mock_gw_admin log-state "ok log-state 1 0"
+}
+plain() { run _plain "$output"; }
+
+@test "egress why: an argument the host validator rejects is read as a package name" {
+  why_box
+  run cmd_egress why left-pad
+  assert_success
+  plain
+  assert_output --partial "? left-pad is not a hostname, so this reads as a package name."
+  assert_output --partial "npm    registry.npmjs.org"
+  refute_output --partial "Denied"
+  refute_output --partial "Allowed"
+}
+
+@test "egress why: a name that is both a host and a package prints both answers" {
+  why_box
+  run cmd_egress why zope.interface
+  assert_success
+  plain
+  assert_output --partial "x Denied   zope.interface:443"
+  assert_output --partial "? zope.interface is also a package name."
+  # A host the catalogue ships is a host only.
+  run cmd_egress why download.docker.com
+  plain
+  refute_output --partial "package name"
+}
+
+@test "egress why: the package answer reads the denial window and dials nothing" {
+  why_box '2026-09-26T10:00:00Z code=policy sub=- origin=box host=registry.npmjs.org port=443 trunc=0\n'
+  local real
+  real="$(declare -f _egress_denials_window)"
+  eval "${real/_egress_denials_window/_egress_denials_window_real}"
+  _egress_denials_window() { echo x >> "$TEST_TEMP/windows"; _egress_denials_window_real "$@"; }
+  mkdir -p "$TEST_TEMP/bin"
+  printf '#!/bin/sh\necho dialled >> "%s/dialled"\n' "$TEST_TEMP" > "$TEST_TEMP/bin/curl"
+  chmod +x "$TEST_TEMP/bin/curl"
+  PATH="$TEST_TEMP/bin:$PATH" run cmd_egress why left-pad
+  assert_success
+  plain
+  assert_output --partial "1 denials this session"
+  run wc -l < "$TEST_TEMP/windows"
+  [ "$(printf '%s' "$output" | tr -d ' ')" = 1 ]
+  [ ! -e "$TEST_TEMP/dialled" ]
+  run grep -c "^docker run" "$DOCKER_CALLS"
+  assert_output "0"
+  # The installer with denials sorts first.
+  run cmd_egress why left-pad
+  plain
+  run bash -c 'printf "%s\n" "$1" | grep -m1 -E "^    [a-z]+ +[a-z]"' _ "$output"
+  assert_output --partial "npm"
+}
+
+@test "egress why: an allowed host names its pack, and the core pack is always on" {
+  why_box
+  run cmd_egress why pypi.org
+  plain
+  assert_output --partial "v Allowed  pypi.org:443"
+  assert_output --partial "via pack  pypi   2 hosts, shared"
+  run cmd_egress why api.anthropic.com
+  plain
+  assert_output --partial "via the core pack claude, always on"
+}
+
+@test "egress why: a host in a shared pack gives the command under a caution" {
+  why_box
+  run cmd_egress why deb.debian.org
+  plain
+  assert_output --partial "! Allowing apt-debian lets the box reach any tenant behind that terminator"
+  assert_output --partial "Allow anyway:     cleat egress allow apt-debian"
+  run cmd_egress why github.com
+  plain
+  assert_output --partial "Allow it:         cleat egress allow github"
+  refute_output --partial "Allow anyway"
+}
+
+@test "egress why: port 80 is never allowable" {
+  why_box
+  run cmd_egress why deb.debian.org:80
+  plain
+  assert_output --partial "x Denied   deb.debian.org:80"
+  assert_output --partial "Cleat never allows port 80 in any mode."
+  assert_output --partial "apt reaches the same mirror over https"
+  refute_output --partial "cleat egress allow"
+  run cmd_egress why example.test:8443
+  plain
+  assert_output --partial "Only port 443 is allowed, in every mode."
+}
+
+@test "egress why: a refused handshake is never offered as an allow" {
+  why_box '2026-09-26T10:00:05Z code=sni sub=sni-mismatch origin=box host=paste.example port=443 trunc=0\n2026-09-26T10:00:06Z code=address sub=- origin=box host=metadata.example port=443 trunc=0\n'
+  run cmd_egress why paste.example
+  plain
+  assert_output --partial "x Refused  paste.example:443"
+  assert_output --partial "not a policy denial"
+  assert_output --partial "Your policy did not cause this."
+  assert_output --partial "cleat egress log --refused"
+  refute_output --partial "cleat egress allow paste.example"
+  refute_output --partial "Allow it:"
+  refute_output --partial "Allow anyway:"
+  run cmd_egress why metadata.example
+  plain
+  assert_output --partial "private, loopback or link-local"
+  refute_output --partial "cleat egress allow metadata.example"
+  refute_output --partial "Allow it:"
+}
+
+@test "egress why: works with the gateway stopped and with Docker down" {
+  why_box '2026-09-26T10:00:00Z code=policy sub=- origin=box host=x.example port=443 trunc=0\n'
+  container_exists() { [ "$1" != "$GW" ]; }
+  run cmd_egress why x.example
+  assert_success
+  plain
+  assert_output --partial "x Denied   x.example:443"
+  assert_output --partial "The gateway is not serving right now (missing). This is not a policy denial."
+  _daemon_up() { return 1; }
+  run cmd_egress why x.example
+  assert_success
+  plain
+  assert_output --partial "x Denied   x.example:443"
+  refute_output --partial "Seen "
+}
+
+@test "egress log: --refused shows the three security codes and no policy rows" {
+  why_box '2026-09-26T10:00:00Z code=policy sub=- origin=box host=a.example port=443 trunc=0\n2026-09-26T10:00:01Z code=port sub=- origin=box host=b.example port=80 trunc=0\n2026-09-26T10:00:02Z code=sni sub=sni-mismatch origin=box host=c.example port=443 trunc=0\n2026-09-26T10:00:03Z code=handshake-flood sub=- origin=box host=d.example port=443 trunc=0\n2026-09-26T10:00:04Z code=address sub=- origin=box host=e.example port=443 trunc=0\n'
+  mkdir -p "$DOCKER_MOCK_DIR/logs"
+  printf '2026-09-26T10:00:00Z allow host=pypi.org port=443 trunc=0\n' > "$DOCKER_MOCK_DIR/logs/$GW"
+  run cmd_egress log --refused
+  assert_success
+  plain
+  assert_output --partial "x refused   c.example:443   sni sni-mismatch"
+  assert_output --partial "x refused   d.example:443   handshake-flood"
+  assert_output --partial "x refused   e.example:443   address"
+  refute_output --partial "a.example"
+  refute_output --partial "b.example"
+  refute_output --partial "allowed"
+}
+
+@test "egress log: plain log shows allowed and denied rows in time order" {
+  why_box '2026-09-26T10:00:02Z code=policy sub=- origin=box host=a.example port=443 trunc=0\n2026-09-26T10:00:04Z code=port sub=- origin=box host=b.example port=80 trunc=1\n'
+  mkdir -p "$DOCKER_MOCK_DIR/logs"
+  printf '2026-09-26T10:00:03Z allow host=pypi.org port=443 trunc=0\n2026-09-26T10:00:01Z allow host=api.anthropic.com port=443 trunc=0\n' > "$DOCKER_MOCK_DIR/logs/$GW"
+  run cmd_egress log
+  assert_success
+  plain
+  run bash -c 'printf "%s\n" "$1" | grep -E "^  2026" | awk "{print \$1, \$3, \$4}"' _ "$output"
+  assert_output "2026-09-26T10:00:01Z allowed api.anthropic.com:443
+2026-09-26T10:00:02Z denied a.example:443
+2026-09-26T10:00:03Z allowed pypi.org:443
+2026-09-26T10:00:04Z denied b.example:80"
+  run cmd_egress log
+  plain
+  assert_output --partial "b.example:80   not port 443, which is never allowed in any mode   (cut or altered)"
+  assert_output --partial "4 rows."
+}
+
+@test "egress log: works with the gateway stopped" {
+  why_box '2026-09-26T10:00:02Z code=policy sub=- origin=box host=a.example port=443 trunc=0\n'
+  is_running() { [ "$1" = "$CN" ]; }
+  run cmd_egress log
+  assert_success
+  plain
+  assert_output --partial "x denied    a.example:443"
+}
+
+@test "egress log: a down daemon is a daemon error, and a missing gateway says so" {
+  why_box
+  _daemon_up() { return 1; }
+  run cmd_egress log
+  assert_failure
+  plain
+  assert_output --partial "Docker is not running, so the gateway's log cannot be read."
+  refute_output --partial "Egress refused"
+  _daemon_up() { return 0; }
+  container_exists() { [ "$1" != "$GW" ]; }
+  run cmd_egress log
+  assert_failure
+  plain
+  assert_output --partial "x Gateway missing"
+  # No policy and no label: nothing is logged, and that is not an error.
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  run cmd_egress log
+  assert_success
+  plain
+  assert_output --partial "Egress control is off for box main, so nothing is logged."
+}
+
+@test "egress log: an allowed connection is never written to the shared volume" {
+  # An allow is the gateway's stdout. A line shaped like one in the denial
+  # copy is not a denial row, and nothing renders it as one.
+  why_box '2026-09-26T10:00:00Z allow host=pypi.org port=443 trunc=0\n'
+  _egress_denials_copy "$CN"
+  run _egress_denials_rows "$CLEAT_RUN_DIR/$CN/egress/denials.log" 0
+  assert_output ""
+}
+
+@test "egress test: asks the gateway matcher and prints the pack beside the verdict" {
+  why_box
+  mock_gw_admin match "ok match allow"
+  run cmd_egress test pypi.org
+  assert_success
+  plain
+  assert_output --partial "v allow   pypi.org:443   the gateway's matcher, box main"
+  assert_output --partial "via pack pypi (shared)"
+  run grep -c "^docker exec $GW /usr/local/bin/gw-admin match pypi.org" "$DOCKER_CALLS"
+  assert_output "1"
+  mock_gw_admin match "ok match deny policy"
+  run cmd_egress test github.com
+  assert_failure
+  plain
+  assert_output --partial "x deny    github.com:443"
+  assert_output --partial "Allow it:  cleat egress allow github"
+}
+
+@test "egress test: an invalid host refuses before any admin call" {
+  why_box
+  : > "$DOCKER_CALLS"
+  run cmd_egress test 'bad_host!'
+  assert_failure
+  run grep -c "gw-admin" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress test: a gateway that is not healthy says it is not a policy denial" {
+  why_box
+  container_exists() { [ "$1" != "$GW" ]; }
+  run cmd_egress test pypi.org
+  assert_failure
+  plain
+  assert_output --partial "This is not a policy denial."
+  run grep -c "gw-admin match" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress test: a saved allow the gateway denies names reload" {
+  why_box
+  mock_gw_admin match "ok match deny policy"
+  run cmd_egress test pypi.org
+  assert_failure
+  plain
+  assert_output --partial "The saved policy says allow. The gateway enforces a different policy:  cleat egress reload"
+}
+
+@test "egress test: off says every host is reachable and exits 0" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress test pypi.org
+  assert_success
+  plain
+  assert_output --partial "every host is reachable and nothing checks it"
+}

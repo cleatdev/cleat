@@ -12059,9 +12059,371 @@ _egress_help() {
 # is named (main), the box every 9.3 screen shows. Each is built in its own
 # step and answers as not built yet until then.
 _egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <shim> <pull> <always>
-  local verb="$1"
+  local verb="$1" cname
+  _set_box "${2:-main}"
+  cname="$(_egress_target_cname "$_BOX")"
+  case "$verb" in
+    why) _egress_cmd_why "$3" "$cname"; return $? ;;
+    test) _egress_cmd_test "$3" "$cname"; return $? ;;
+    log) _egress_cmd_log "$cname" "$5"; return $? ;;
+  esac
   error "${BOLD}cleat egress $verb${RESET} is not built yet."
   return 1
+}
+
+# ── why, log and test (6.2, 9.3) ──
+# All three render from the host: the resolved policy, the shipped catalogue,
+# the copied denial log and the gateway's own answers. None dials a name, the
+# argument or a row's (4.4a). Times are the gateway's UTC stamps, never
+# converted.
+
+# The installers a package name could mean, each to the pack whose hosts it
+# reaches. Cleat has no package index: this is all it knows about a package.
+_EGRESS_INSTALLERS="apt:apt-debian apt:apt-image-extras npm:npm pip:pypi cargo:rust gem:ruby go:go maven:maven"
+
+_egress_why_is_host() {
+  _egress_valid_host "$1"
+}
+
+# A name legal as a package, and not a host the catalogue ships.
+_egress_why_is_package() {               # <name>
+  case "$1" in ''|*[!a-z0-9+._-]*) return 1 ;; [!a-z0-9]*) return 1 ;; esac
+  [ "${#1}" -le 128 ] || return 1
+  [ -z "$(_egress_host_pack "$1")" ]
+}
+
+# This session's denial rows for a box: the copy, then the rows since the
+# saved mark, or the whole file with all or with no mark. Nothing when Docker
+# or the gateway is not there to ask.
+_egress_session_rows() {                 # <cname> [all]
+  local cname="$1" gw f mark off=0
+  gw="$(_egress_gateway_name "$cname")"
+  f="$CLEAT_RUN_DIR/$cname/egress/denials.log"
+  _daemon_up || return 0
+  _egress_denials_copy "$cname" || return 0
+  if [ "${2:-}" != all ]; then
+    mark="$(_egress_denials_mark_read "$cname")"
+    if [ -n "$mark" ]; then off="$(_egress_denials_window "$gw" "$mark" "$f")"; fi
+  fi
+  _egress_denials_rows "$f" "$off"
+}
+
+# How many rows name a host with a code, and the last one's clock time.
+_egress_rows_seen() {                    # <rows> <host> <code or empty for any>
+  printf '%s\n' "$1" | awk -v h="host=$2" -v c="$3" '
+    $5 == h && (c == "" || $2 == "code=" c) { n++; t = $1 }
+    END { if (n) { sub(/^.*T/, "", t); print n, t } }'
+}
+
+_egress_cmd_why() {                      # <arg> <cname>
+  local arg="$1" cname="$2" name port=443 h="" rows ishost=0 ispkg=0
+  name="$arg"
+  case "$arg" in
+    *:[0-9]|*:[0-9][0-9]|*:[0-9][0-9][0-9]|*:[0-9][0-9][0-9][0-9]|*:[0-9][0-9][0-9][0-9][0-9])
+      name="${arg%:*}"; port="${arg##*:}" ;;
+  esac
+  if h="$(_egress_why_is_host "$name")"; then ishost=1; fi
+  if [ "$port" = 443 ] && _egress_why_is_package "$arg"; then ispkg=1; fi
+  if [ "$ishost" = 0 ] && [ "$ispkg" = 0 ]; then
+    error "Not a host or a package name: ${BOLD}$(_sanitize_repo_str "$arg")${RESET}"
+    return 1
+  fi
+  _egress_resolve "$cname"
+  rows="$(_egress_session_rows "$cname")"
+  echo ""
+  if [ "$ishost" = 1 ]; then _egress_why_host "$h" "$port" "$rows" "$cname"; fi
+  if [ "$ispkg" = 1 ]; then _egress_why_package "$arg" "$rows" "$ishost"; fi
+  echo ""
+  return 0
+}
+
+_egress_why_host() {                     # <host> <port> <rows> <cname>
+  local h="$1" port="$2" rows="$3" cname="$4" sh p cls flags word n seen c sec="" allows t state
+  sh="$(_sanitize_repo_str "$h")"
+  if [ "$port" != 443 ]; then
+    echo -e "  ${RED}x${RESET} Denied   ${sh}:${port}"
+    if [ "$port" = 80 ]; then
+      echo -e "    Port 80 carries no ClientHello, so nothing on it can be verified."
+      echo -e "    Cleat never allows port 80 in any mode."
+      case "$(_egress_host_pack "$h")" in
+        apt-*|debian-mirror) echo -e "    apt reaches the same mirror over https with no extra packages." ;;
+      esac
+    else
+      echo -e "    Only port 443 is allowed, in every mode."
+    fi
+    return 0
+  fi
+  # A security event names no allow: offering one would offer to allow it.
+  for c in sni handshake-flood address; do
+    seen="$(_egress_rows_seen "$rows" "$h" "$c")"
+    [ -n "$seen" ] || continue
+    sec=1
+    echo -e "  ${RED}x${RESET} Refused  ${sh}:443                            ${DIM}not a policy denial${RESET}"
+    echo -e "    $(_egress_reason_text "$c")."
+    case "$c" in
+      sni|handshake-flood) echo -e "    Your policy did not cause this. Something in the box used an allowed name to try to reach a different one." ;;
+    esac
+    echo -e "    Seen ${seen%% *} times, last ${seen##* }."
+    echo -e "    ${DIM}Detail:${RESET}  ${BOLD}cleat egress log --refused${RESET}"
+  done
+  seen="$(_egress_rows_seen "$rows" "$h" upstream)"
+  if [ -n "$seen" ]; then
+    echo -e "  ${AMBER}!${RESET} Unreachable ${sh}:443   $(_egress_reason_text upstream). Not a policy denial."
+  fi
+  n="$(printf '%s\n' "$_EG_HOSTS" | grep -c . || true)"
+  if [ "$_EG_MODE" = open ] || _egress_in_list "$h" "$_EG_HOSTS"; then
+    echo -e "  ${GREEN}v${RESET} Allowed  ${sh}:443"
+    if _egress_in_list "$h" "$(_egress_pack_hosts claude all)"; then
+      echo -e "    via the core pack claude, always on"
+    else
+      p=""
+      while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        if _egress_in_list "$h" "$(_egress_pack_hosts "$c" all)"; then p="$c"; break; fi
+      done <<EOF
+$_EG_PACKS
+EOF
+      if [ -n "$p" ]; then
+        word="$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
+        echo -e "    via pack  ${p}   $(_egress_plural "$(_egress_pack_hosts "$p" | grep -c . || true)" host), ${word}"
+      elif _egress_in_list "$h" "$_EG_HOSTS"; then
+        echo -e "    via a host you allowed"
+      fi
+    fi
+    if [ "$(_egress_host_word "$h")" = contained ]; then
+      echo -e "    ${DIM}This name reaches its operator's edge. What that edge does with a foreign Host${RESET}"
+      echo -e "    ${DIM}header is the operator's business, not something Cleat verifies.${RESET}"
+    fi
+    if [ "$_EG_MODE" = open ]; then
+      echo -e "    Mode is open: every TLS name is allowed and logged. This is a log, not a boundary."
+    fi
+    if _daemon_up && container_exists "$(_egress_gateway_name "$cname")"; then
+      allows="$(_egress_allow_rows "$cname")"
+      t="$(printf '%s\n' "$allows" | awk -v h="host=$h" '$3 == h { n++; t = $1 } END { if (n) { sub(/^.*T/, "", t); print n, t } }')"
+      if [ -n "$t" ]; then echo -e "    ${t%% *} tunnels in the gateway's log, last ${t##* }."; fi
+    fi
+  elif [ -z "$sec" ]; then
+    echo -e "  ${RED}x${RESET} Denied   ${sh}:443"
+    echo -e "    Not in policy. Mode is ${_EG_MODE}, $(_egress_plural "$n" host) allowed."
+    seen="$(_egress_rows_seen "$rows" "$h" policy)"
+    if [ -n "$seen" ]; then
+      echo -e "    Seen ${seen%% *} times, last ${seen##* }.                      ${DIM}came from inside the box${RESET}"
+    fi
+    p="$(_egress_host_pack "$h")"
+    if [ -n "$p" ]; then
+      flags="$(_egress_pack_flags "$p")"
+      cls="$(_egress_pack_class "$p")"
+      word="$(_egress_class_word "$cls" "$flags")"
+      if ! _egress_in_list "$h" "$(_egress_pack_hosts "$p")"; then
+        echo -e "    A sub-tick of pack ${p}, off by default"
+        echo -e "    ${DIM}Allow it:${RESET}         ${BOLD}cleat egress allow ${sh}${RESET}"
+      else
+        echo -e "    Covered by pack   ${p}   $(_egress_plural "$(_egress_pack_hosts "$p" | grep -c . || true)" host), ${word}"
+        case "$word" in
+          shared|"open tenancy")
+            echo -e "  ${AMBER}!${RESET} Allowing ${p} lets the box reach any tenant behind that terminator that does not"
+            echo -e "    pin its own Host header, paste and image hosts included."
+            echo -e "    ${DIM}Allow anyway:${RESET}     ${BOLD}cleat egress allow ${p}${RESET}" ;;
+          *) echo -e "    ${DIM}Allow it:${RESET}         ${BOLD}cleat egress allow ${p}${RESET}" ;;
+        esac
+      fi
+    else
+      echo -e "    ${DIM}Allow it:${RESET}         ${BOLD}cleat egress allow ${sh}${RESET}"
+    fi
+  fi
+  if [ "$_EGRESS_ENFORCING" = 1 ] && _daemon_up && container_exists "$cname"; then
+    state="$(_egress_gateway_state "$cname")"
+    if [ "$state" != healthy ]; then
+      echo -e "    ${AMBER}!${RESET} The gateway is not serving right now (${state}). This is not a policy denial.  ${BOLD}cleat egress status${RESET}"
+    fi
+  fi
+  return 0
+}
+
+_egress_why_package() {                  # <name> <rows> <also a host>
+  local name="$1" rows="$2" pair inst p hosts h allowed seen line first word lines_d="" lines_n=""
+  echo ""
+  if [ "$3" = 1 ]; then
+    echo -e "  ${DIM}?${RESET} $(_sanitize_repo_str "$name") is also a package name."
+  else
+    echo -e "  ${DIM}?${RESET} $(_sanitize_repo_str "$name") is not a hostname, so this reads as a package name."
+  fi
+  echo -e "    Cleat has no package index. It knows which hosts an installer reaches."
+  echo ""
+  for pair in $_EGRESS_INSTALLERS; do
+    inst="${pair%%:*}"; p="${pair#*:}"
+    hosts="$(_egress_pack_hosts "$p")"
+    [ -n "$hosts" ] || continue
+    allowed=allowed; seen=0; first=""
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      [ -n "$first" ] || first="$h"
+      if [ "$_EG_MODE" != open ] && ! _egress_in_list "$h" "$_EG_HOSTS"; then allowed=denied; fi
+      line="$(_egress_rows_seen "$rows" "$h" "")"
+      if [ -n "$line" ]; then seen=$(( seen + ${line%% *} )); fi
+    done <<EOF
+$hosts
+EOF
+    word="$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
+    line="$(printf '    %-6s %-40s %-8s pack %s' "$inst" "$(printf '%s' "$hosts" | paste -sd' ' -)" "$allowed" "$p")"
+    if [ "$seen" -gt 0 ]; then
+      line+=$'\n'"$(printf '                 %s denials this session' "$seen")"
+    fi
+    case "$word" in
+      shared|"open tenancy") line+=$'\n'"                 shared front door. Read the caution: cleat egress why ${first}" ;;
+    esac
+    if [ "$seen" -gt 0 ]; then lines_d+="$line"$'\n'; else lines_n+="$line"$'\n'; fi
+  done
+  printf '%s%s' "$lines_d" "$lines_n"
+  echo ""
+  echo -e "    ${DIM}Allow the installer you need:${RESET}  ${BOLD}cleat egress allow <pack>${RESET}"
+}
+
+# The log: every decision, denials from the copied log and allows from the
+# gateway's output, merged on the stamp. --refused keeps the three security
+# codes, asked of the one selector.
+_egress_cmd_log() {                      # <cname> <refused>
+  local cname="$1" refused="${2:-0}" gw box="${_BOX:-main}" f rows="" allows="" keep="" c rt="" merged
+  gw="$(_egress_gateway_name "$cname")"
+  f="$CLEAT_RUN_DIR/$cname/egress/denials.log"
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in
+    strict|open) ;;
+    *)
+      if ! _egress_label_read "$cname" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then
+        info "Egress control is off for box ${BOLD}$(_sessions_safe_str "$box")${RESET}, so nothing is logged."
+        return 0
+      fi ;;
+  esac
+  if ! _daemon_up; then
+    error "Docker is not running, so the gateway's log cannot be read."
+    return 1
+  fi
+  if ! container_exists "$gw"; then
+    _egress_status_gateway_row "$cname" "$gw" missing
+    return 1
+  fi
+  _egress_denials_copy "$cname" || true
+  rows="$(_egress_denials_rows "$f" 0)"
+  for c in $(printf '%s\n' "$rows" | awk '{ c = $2; sub(/^code=/, "", c); if (c != "" && !s[c]++) print c }'); do
+    if [ "$refused" = 1 ]; then
+      _egress_log_is_security_code "$c" && keep="$keep $c"
+    else
+      keep="$keep $c"
+    fi
+    rt+="$c	$(_egress_reason_text "$c")"$'\n'
+  done
+  if [ "$refused" != 1 ]; then allows="$(_egress_allow_rows "$cname")"; fi
+  echo ""
+  echo -e "  ${BOLD}Egress log for box $(_sessions_safe_str "$box")${RESET}   ${DIM}gateway ${gw}   times in UTC${RESET}"
+  merged="$(printf '%s\n%s\n' "$rows" "$allows" | grep -v '^$' | LC_ALL=C sort -s -k1,1 || true)"
+  _EG_RT="$rt" printf '%s\n' "$merged" | _EG_RT="$rt" LC_ALL=C awk -v keep=" $keep " '
+    BEGIN { n = split(ENVIRON["_EG_RT"], L, "\n"); for (i = 1; i <= n; i++) { t = index(L[i], "\t"); if (t) R[substr(L[i], 1, t - 1)] = substr(L[i], t + 1) } }
+    $2 == "allow" {
+      h = substr($3, 6); p = substr($4, 6)
+      cut = ($5 == "trunc=1") ? "   (cut or altered)" : ""
+      printf "  %s  v allowed   %s:%s%s\n", $1, h, p, cut; shown++; next
+    }
+    $2 ~ /^code=/ {
+      c = substr($2, 6)
+      if (index(keep, " " c " ") == 0) next
+      h = substr($5, 6); p = substr($6, 6); s = substr($3, 5)
+      cut = ($7 == "trunc=1") ? "   (cut or altered)" : ""
+      if (c == "sni" || c == "handshake-flood" || c == "address")
+        printf "  %s  x refused   %s:%s   %s %s   %s%s\n", $1, h, p, c, s, R[c], cut
+      else
+        printf "  %s  x denied    %s:%s   %s%s\n", $1, h, p, R[c], cut
+      shown++
+    }
+    END { if (!shown) print "EMPTY"; else printf "SHOWN %d\n", shown }
+  ' | {
+    while IFS= read -r line; do
+      case "$line" in
+        EMPTY)
+          if [ "$refused" = 1 ]; then
+            echo -e "  No refused connections in box $(_sessions_safe_str "$box")'s log."
+          else
+            echo -e "  Nothing in box $(_sessions_safe_str "$box")'s log yet."
+          fi ;;
+        "SHOWN "*) echo ""; echo -e "  ${DIM}${line#SHOWN } rows.  Why one was denied:${RESET}  ${BOLD}cleat egress why <host>${RESET}" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done
+  }
+  echo ""
+  return 0
+}
+
+# test: what the gateway's own matcher answers for one name, with the pack the
+# host side knows beside it. Refuses rather than passing vacuously.
+_egress_cmd_test() {                     # <host> <cname>
+  local host="$1" cname="$2" h gw kind state ans saved verdict p word box="${_BOX:-main}" sh
+  if ! h="$(_egress_valid_host "$host")"; then
+    _egress_valid_host "$host" >/dev/null || true
+    error "Not a host name: ${BOLD}$(_sanitize_repo_str "$host")${RESET} ${DIM}(${_EG_HOST_REASON})${RESET}"
+    return 1
+  fi
+  sh="$(_sanitize_repo_str "$h")"
+  gw="$(_egress_gateway_name "$cname")"
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in
+    strict|open) ;;
+    *)
+      info "Egress control is off for box ${BOLD}$(_sessions_safe_str "$box")${RESET}: every host is reachable and nothing checks it."
+      return 0 ;;
+  esac
+  if ! _daemon_up; then
+    error "Docker is not running, so the gateway cannot be asked."
+    return 1
+  fi
+  kind="$(_egress_engine_kind)"
+  if ! _egress_engine_validated "$kind"; then
+    _egress_engine_refusal "$kind"
+    return 1
+  fi
+  state="$(_egress_gateway_state "$cname")"
+  if [ "$state" != healthy ]; then
+    _egress_status_gateway_row "$cname" "$gw" "$state"
+    return 1
+  fi
+  if ! ans="$(_egress_admin_read "$gw" match "$h")"; then
+    error "The gateway did not answer. This is not a policy denial."
+    echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart${RESET}"
+    return 1
+  fi
+  if [ "$_EG_MODE" = open ] || _egress_in_list "$h" "$_EG_HOSTS"; then saved=allow; else saved=deny; fi
+  echo ""
+  case "$ans" in
+    allow)
+      verdict=allow
+      echo -e "  ${GREEN}v${RESET} allow   ${sh}:443   ${DIM}the gateway's matcher, box $(_sessions_safe_str "$box")${RESET}"
+      if [ "$_EG_MODE" = open ]; then
+        echo -e "            every TLS name is allowed in open mode"
+      elif _egress_in_list "$h" "$(_egress_pack_hosts claude all)"; then
+        echo -e "            via the core pack"
+      else
+        p="$(_egress_host_pack "$h")"
+        if [ -n "$p" ] && _egress_in_list "$p" "$_EG_PACKS"; then
+          word="$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
+          echo -e "            via pack ${p} (${word})"
+        else
+          echo -e "            via a host you allowed"
+        fi
+      fi
+      echo -e "            ${DIM}A name that resolves to a private, loopback or link-local address is${RESET}"
+      echo -e "            ${DIM}still refused at connect, in every mode.${RESET}" ;;
+    *)
+      verdict=deny
+      echo -e "  ${RED}x${RESET} deny    ${sh}:443   ${DIM}the gateway's matcher, box $(_sessions_safe_str "$box")${RESET}"
+      echo -e "            not in the policy the gateway enforces"
+      p="$(_egress_host_pack "$h")"
+      echo -e "            ${DIM}Allow it:${RESET}  ${BOLD}cleat egress allow ${p:-$sh}${RESET}" ;;
+  esac
+  if [ "$saved" != "$verdict" ]; then
+    echo -e "  ${AMBER}!${RESET} The saved policy says ${saved}. The gateway enforces a different policy:  ${BOLD}cleat egress reload${RESET}"
+  fi
+  echo ""
+  [ "$verdict" = allow ]
 }
 
 cmd_egress() {

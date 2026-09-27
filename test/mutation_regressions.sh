@@ -15262,6 +15262,63 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_status_egress_row" "the cleat status egress row reads off with no policy" "$CLI" "$EGRESS_UI_BATS"
 
+# why, log and test (6.2, 9.3).
+cat > "$SED_TMP" << 'SED'
+/^_egress_why_is_host()/,/^}$/{
+  s@^  _egress_valid_host "[$]1"@  return 0@
+}
+SED
+try "vnext_egress_why_package_split" "an argument the host validator rejects is read as a package name" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_log_is_security_code()/,/^}$/{
+  s@^  case "[$]1" in sni|handshake-flood|address) return 0 ;; esac@  case "$1" in sni|address) return 0 ;; esac@
+}
+SED
+try "vnext_egress_log_refused_codes" "--refused shows the three security codes and no policy rows" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_why_host()/,/^}$/{
+  s@^  elif \[ -z "[$]sec" \]; then$@  else@
+}
+SED
+try "vnext_egress_why_no_allow_on_refusal" "a refused handshake is never offered as an allow" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_why_host()/,/^}$/{
+  s@^  if \[ "[$]port" != 443 \]; then$@  if false; then@
+}
+SED
+try "vnext_egress_why_port_80" "port 80 is never allowable" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_log()/,/^}$/{
+  s@ | LC_ALL=C sort -s -k1,1 || true)"@ || true)"@
+}
+SED
+try "vnext_egress_log_time_order" "plain log shows allowed and denied rows in time order" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_test()/,/^}$/{
+  s@^  if \[ "[$]saved" != "[$]verdict" \]; then$@  if false; then@
+}
+SED
+try "vnext_egress_test_names_drift" "a saved allow the gateway denies names reload" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_test()/,/^}$/{
+  s@^  if \[ "[$]state" != healthy \]; then$@  if false; then@
+}
+SED
+try "vnext_egress_test_needs_gateway" "a gateway that is not healthy says it is not a policy denial" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_test()/,/^}$/{
+  s@^  if ! _egress_engine_validated "[$]kind"; then$@  if false; then@
+}
+SED
+try "vnext_egress_test_refused_engine" "a refused engine refuses rather than asking" "$CLI" "$EGRESS_ENGINE_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

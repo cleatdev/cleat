@@ -237,3 +237,16 @@ desktop() {
   run _egress_engine_refusal rootless
   assert_output --partial "Needed:  Docker Desktop on macOS, or Docker Engine on Linux (rootful)"
 }
+
+@test "egress test: a refused engine refuses rather than asking" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf engine-linux; }
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress test pypi.org
+  assert_failure
+  assert_output --partial "not validated on this Docker engine"
+  run grep -c "gw-admin" "$DOCKER_CALLS"
+  assert_output "0"
+}

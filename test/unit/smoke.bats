@@ -3496,3 +3496,22 @@ SH
   refute_output --partial "unbound variable"
   assert_output --partial "Not covered by egress policy"
 }
+
+@test "smoke: cleat egress why, test and log run on the real binary" {
+  mkdir -p "$XDG_CONFIG_HOME/cleat"
+  printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
+  run cleat_bin egress why github.com < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "github.com:443"
+  run cleat_bin egress why left-pad < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  run cleat_bin egress test github.com < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+  run cleat_bin egress log < /dev/null
+  refute_output --partial "unbound variable"
+  run cleat_bin egress log --refused < /dev/null
+  refute_output --partial "unbound variable"
+}

@@ -1302,3 +1302,164 @@ ${ROW2%\\n}"
   run _egress_origin_gate docs.example.test
   assert_success
 }
+
+# ── Applying a policy (6.3, 9.4) ────────────────────────────────────────────
+
+# A caged box, running, whose gateway takes a reload.
+reload_box() {
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project" main)"
+  egress_box_names
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+}
+
+@test "egress: a reload records one admin-socket reload and no docker cp" {
+  reload_box
+  run _egress_apply_mode "$CN" strict
+  assert_success
+  run grep -c "^docker exec $GW /usr/local/bin/gw-admin reload" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -cE "^docker (cp|kill|rm|run|stop|start)" "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -c "^docker exec $CN " "$DOCKER_CALLS"
+  assert_output "0"
+  [ -f "$(_egress_policy_dir "$CN")/policy.json" ]
+}
+
+@test "egress mode: strict to open removes no container" {
+  reload_box
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  mock_gw_admin policy-digest "ok policy-digest $(current_digest)"
+  run _egress_apply_mode "$CN" open
+  assert_success
+  run grep -cE "^docker (rm|run)" "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -c "^docker exec $GW /usr/local/bin/gw-admin reload" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "egress mode: off to strict recreates the box" {
+  reload_box
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  cmd_run() { echo "recreated $1" >> "$TEST_TEMP/recreated"; }
+  run _egress_apply_mode "$CN" strict
+  assert_success
+  run grep -c "^docker rm -f $CN\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run cat "$TEST_TEMP/recreated"
+  assert_output "recreated $TEST_TEMP/project"
+}
+
+@test "egress: the global confirmation recreates nothing" {
+  reload_box
+  : > "$DOCKER_CALLS"
+  run _egress_apply_mode "" off
+  assert_success
+  run cat "$DOCKER_CALLS"
+  assert_output ""
+}
+
+@test "egress: a reload that the gateway does not take fails, and a stopped box reloads nothing" {
+  reload_box
+  mock_gw_admin policy-digest "ok policy-digest v1:0000000000000000"
+  run _egress_apply_mode "$CN" strict
+  assert_failure
+  is_running() { return 1; }
+  : > "$DOCKER_CALLS"
+  run _egress_apply_mode "$CN" strict
+  assert_success
+  run grep -c "gw-admin reload" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress reload: the verb reloads a running caged box and names what it enforces" {
+  reload_box
+  run cmd_egress reload
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Box main reloaded: its gateway now enforces strict, 5 hosts."
+  # A stopped box reloads nothing and says why.
+  is_running() { return 1; }
+  : > "$DOCKER_CALLS"
+  run cmd_egress reload
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Box main is stopped. Its gateway reads the policy when it starts."
+  run grep -c "gw-admin reload" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress reload: a gateway that does not take it names the remedy and is not a denial" {
+  reload_box
+  mock_gw_admin policy-digest "ok policy-digest v1:0000000000000000"
+  run cmd_egress reload
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "its gateway did not take the policy."
+  assert_output --partial "This is not a policy denial."
+  assert_output --partial "cleat egress restart"
+}
+
+@test "egress reload: no policy, no box and a box without the label each say so" {
+  reload_box
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress reload
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "there is no gateway to reload"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  container_exists() { return 1; }
+  run cmd_egress reload
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "No box yet"
+  container_exists() { return 0; }
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  run cmd_egress reload
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "created without egress control"
+}
+
+# The digest the gateway answers once it has taken the allow of <host>.
+digest_after_allow() {                   # <host>
+  cp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/config.bak"
+  printf 'allow = %s\n' "$1" >> "$CLEAT_GLOBAL_CONFIG"
+  mock_gw_admin policy-digest "ok policy-digest $(current_digest)"
+  mv "$TEST_TEMP/config.bak" "$CLEAT_GLOBAL_CONFIG"
+}
+
+@test "egress allow: a running caged box reloads with no recreate" {
+  reload_box
+  mock_docker_ps_filter "$CN" "label=sh.cleat.egress-hash"
+  digest_after_allow docs.example.test
+  run cmd_egress allow docs.example.test
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Applied to $CN: its gateway reloaded."
+  run grep -cE "^docker (rm|run)" "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -c "^docker exec $GW /usr/local/bin/gw-admin reload" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "egress allow: a global allow reloads every running caged box and no other" {
+  reload_box
+  local other=cleat-other-11111111
+  # Two running boxes, and the label filter answers the caged one only.
+  mock_docker_ps_filter "$CN" "label=sh.cleat.egress-hash"
+  digest_after_allow docs.example.test
+  run cmd_egress allow docs.example.test
+  assert_success
+  run grep -c "gw-admin reload" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c "cleat-gw-$(_egress_box_hash "$other")" "$DOCKER_CALLS"
+  assert_output "0"
+}

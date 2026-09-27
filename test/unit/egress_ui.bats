@@ -798,7 +798,6 @@ allow = a.example"
 
 # ── The widening ledger (5.2) and its summary sub-line (6.7) ────────────────
 
-_plain() { printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
 
 @test "egress ui: a first launch with no recorded digest prints no widening sub-line" {
   local cn
@@ -1346,7 +1345,8 @@ good.example.test
   assert_output --partial "Engine   not validated, a caged box will not start here: Docker Engine"
   run _egress_save_screen 1
   assert_success
-  assert_output --partial "a box under this policy will not start here"
+  run _plain "$output"
+  assert_output --partial "Saved. Boxes on this machine will refuse to start until you switch engine or run"
   assert_output --partial "cleat egress off"
   # A validated engine says a save applies at the next launch.
   _EGE_ENGINE=""
@@ -1872,4 +1872,67 @@ plain() { run _plain "$output"; }
   assert_success
   plain
   assert_output --partial "every host is reachable and nothing checks it"
+}
+
+@test "egress save: under enforcement the final line names what the save does" {
+  status_caged
+  _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }
+  # A running caged box: the global save reaches it now.
+  mock_docker_ps_filter "$CN" "label=sh.cleat.egress-hash"
+  _egress_editor_load ""
+  run _egress_save_screen 1
+  run _plain "$output"
+  assert_output --partial "Applied to $CN: its gateway reloaded."
+  assert_output --partial "Applies immediately. No restart, no rebuild."
+  # No box running: the next box takes it.
+  mock_docker_ps_filter "" "label=sh.cleat.egress-hash"
+  _egress_editor_load ""
+  run _egress_save_screen 1
+  run _plain "$output"
+  assert_output --partial "Applies to the next box you start."
+  refute_output --partial "recreates"
+  refute_output --partial "Enforcement lands"
+}
+
+@test "egress save: a first global policy names every box that will refuse" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf 'cleat-a-11111111\ncleat-b-22222222\ncleat-c-33333333\ncleat-gw-0123456789ab\n' > "$DOCKER_MOCK_DIR/ps_a_output"
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}'
+  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a"
+  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b"
+  # A box already caged, and a gateway, are not in the list.
+  mock_docker_inspect_field cleat-c-33333333 "$fmt" "|HASH|/work/c"
+  mock_docker_inspect_field cleat-gw-0123456789ab "$fmt" "ROLE=gateway||"
+  _egress_editor_load ""
+  run _egress_save_screen 1
+  run _plain "$output"
+  assert_output --partial "2 boxes were created without egress control. Each refuses to start"
+  assert_output --partial "cleat-a-11111111   cleat rm && cleat   /work/a"
+  assert_output --partial "cleat-b-22222222   cleat rm && cleat   /work/b"
+  refute_output --partial "cleat-c-33333333"
+  refute_output --partial "cleat-gw-0123456789ab"
+  refute_output --partial "Applies"
+}
+
+@test "egress writer: a policy write refuses a box with the ssh capability and names the way out" {
+  _EGRESS_ENFORCING=1
+  mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT"
+  cd "$PROJECT"
+  printf '[caps]\nssh\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress allow docs.example.test
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "the ssh capability mounts your agent"
+  assert_output --partial "cleat egress off"
+  # Nothing was written.
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output ""
+  # No policy result, no refusal: a deny that leaves egress off is fine.
+  _EGRESS_ENFORCING=0
+  run cmd_egress allow docs.example.test
+  assert_success
 }

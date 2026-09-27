@@ -145,3 +145,6 @@ current_digest() {
 
 # How many times the stub recorded a docker call carrying this text.
 count_calls() { grep -cF -- "$1" "$DOCKER_CALLS" || true; }
+
+# Output with its colour codes removed, for assertions on the words.
+_plain() { printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }

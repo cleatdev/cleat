@@ -3515,3 +3515,14 @@ SH
   run cleat_bin egress log --refused < /dev/null
   refute_output --partial "unbound variable"
 }
+
+@test "smoke: cleat egress reload runs on the real binary" {
+  run cleat_bin egress reload < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "no gateway to reload"
+  mkdir -p "$XDG_CONFIG_HOME/cleat"
+  printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
+  run cleat_bin egress reload < /dev/null
+  refute_output --partial "unbound variable"
+}

@@ -12066,10 +12066,179 @@ _egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <s
     why) _egress_cmd_why "$3" "$cname"; return $? ;;
     test) _egress_cmd_test "$3" "$cname"; return $? ;;
     log) _egress_cmd_log "$cname" "$5"; return $? ;;
+    reload) _egress_cmd_reload "$cname"; return $? ;;
   esac
   error "${BOLD}cleat egress $verb${RESET} is not built yet."
   return 1
 }
+
+# The interlocks at the writer (3, 5.7 assertion 16): a write that would put
+# the directory's box under a policy while it has the docker, ssh or hooks
+# capability is refused here, not only at its next launch. Live enforcement
+# only, and only when the write leaves the box strict or open.
+_egress_writer_interlock() {             # <effective mode>
+  local project
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  case "$1" in strict|open) ;; *) return 0 ;; esac
+  project="$(resolve_project "$PWD" 2>/dev/null)" || return 0
+  resolve_caps "$project" readonly >/dev/null 2>&1 || return 0
+  _egress_interlocks "$1"
+}
+
+# The mode a box would run under once <file mode> is written: a box file that
+# sets none takes the global one. In a subshell: a reader that refuses exits.
+_egress_effective_mode() {               # <file mode>
+  case "$1" in
+    inherit|absent) ( _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress >/dev/null 2>&1 && printf '%s' "$_m_mode" ) || printf off ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ── Applying a policy to a box (6.3, 9.4) ──
+# The one function that applies a change to a box. Its caller has already
+# written the file or the marker. Crossing off, in either direction, is the
+# only path that recreates, and its caller has confirmed it. Anything else is
+# a reload of a running caged box's gateway: the policy rendered from a fresh
+# resolution, pushed over the admin socket (never a copy into the read-only
+# mount, never a signal), then read back. A box that is not running returns
+# 0: its gateway renders the policy again when it starts.
+_egress_apply_mode() {                   # <cname> <mode>
+  local cname="$1" mode="$2" _gw _got _want _lbl=0
+  [ -z "$cname" ] && return 0
+  if _egress_label_read "$cname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then _lbl=1; fi
+  case "$_lbl:$mode" in
+    1:off|0:strict|0:open)
+      _egress_teardown "$cname" keep || return 1
+      _account_wipe_run_dir "$cname"
+      cmd_run "$(resolve_project "$PWD")"
+      return $? ;;
+  esac
+  is_running "$cname" || return 0
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in strict|open) ;; *) return 1 ;; esac
+  _egress_render_policy "$cname" "$_EG_MODE" "$_EG_HOSTS" || return 1
+  _gw="$(_egress_gateway_name "$cname")"
+  _egress_reload "$(_egress_gateway_name "$cname")" >/dev/null || return 1
+  _got="$(_egress_live_digest "$_gw")" || _got=""
+  _want="$(_egress_policy_digest "$_EG_MODE" "$_EG_HOSTS")"
+  if [ -z "$_got" ] || [ "$_got" != "$_want" ]; then return 1; fi
+  # What the agent is told follows the policy it now runs under (9.4).
+  if _container_has_kit_mounts "$cname"; then _generate_kit_overlay "$cname"; fi
+  return 0
+}
+
+# cleat egress reload [box]: push the saved policy to a running caged box.
+_egress_cmd_reload() {                   # <cname>
+  local cname="$1" box="${_BOX:-main}" kind ws n
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in
+    strict|open) ;;
+    *)
+      error "Egress control is off for box ${BOLD}$(_sessions_safe_str "$box")${RESET}: there is no gateway to reload."
+      return 1 ;;
+  esac
+  if ! _daemon_up; then error "Docker is not running."; return 1; fi
+  kind="$(_egress_engine_kind)"
+  if ! _egress_engine_validated "$kind"; then _egress_engine_refusal "$kind"; return 1; fi
+  if ! container_exists "$cname"; then
+    echo -e "  ${DIM}○${RESET} No box yet. Its gateway is created with it on the next launch."
+    return 1
+  fi
+  if ! _egress_label_read "$cname" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then
+    echo -e "  ${RED}x${RESET} This box was created without egress control"
+    echo -e "    It refuses to start until it is recreated:  $(_egress_recreate_words "$cname")"
+    return 1
+  fi
+  if ! is_running "$cname"; then
+    info "Box ${BOLD}$(_sessions_safe_str "$box")${RESET} is stopped. Its gateway reads the policy when it starts."
+    return 0
+  fi
+  # A policy inside the cage is never pushed (5.2).
+  ws="${_RESOLVED_PROJECT:-$(resolve_project "$PWD")}"
+  if _box_is_fork "$cname" 2>/dev/null; then ws="$(_fork_dir "$cname")"; fi
+  _egress_policy_containable "$cname" "$ws" || return 1
+  if _egress_apply_mode "$cname" "$_EG_MODE"; then
+    _egress_resolve "$cname"
+    n="$(printf '%s\n' "$_EG_HOSTS" | grep -c . || true)"
+    success "Box ${BOLD}$(_sessions_safe_str "$box")${RESET} reloaded: its gateway now enforces ${_EG_MODE}, $(_egress_plural "$n" host)."
+    return 0
+  fi
+  _egress_refuse gateway "its gateway did not take the policy." "${BOLD}cleat egress reload${RESET}, or ${BOLD}cleat egress restart${RESET}"
+  return 1
+}
+
+# After a policy write, once enforcement is live: every running caged box the
+# write reaches takes it now. A box's own write reaches that box. A global
+# write reaches every running box that carries the egress label, and never
+# recreates one: a crossing is confirmed, and only by its own verb. A reload
+# that fails never fails the write. _EG_APPLIED counts the boxes that took it.
+_EG_APPLIED=0
+_egress_apply_now() {                    # <cname or empty>
+  local list n ok=0
+  _EG_APPLIED=0
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  _daemon_up || return 0
+  if [ -n "$1" ]; then
+    list="$1"
+  else
+    list="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker ps --filter label=sh.cleat.egress-hash --format '{{.Names}}' 2>/dev/null)" || list=""
+  fi
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    is_running "$n" || continue
+    if ! _egress_label_read "$n" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then continue; fi
+    ( _egress_resolve "$n" ) >/dev/null 2>&1 || continue
+    _egress_resolve "$n"
+    case "$_EG_MODE" in strict|open) ;; *) continue ;; esac
+    if _egress_apply_mode "$n" "$_EG_MODE"; then
+      ok=$((ok + 1))
+      echo -e "    ${DIM}Applied to ${n}: its gateway reloaded.${RESET}"
+    else
+      echo -e "    ${AMBER}!${RESET} ${n}'s gateway did not take the change. This is not a policy denial.  ${DIM}Fix:${RESET} ${BOLD}cleat egress reload${RESET}"
+    fi
+  done <<EOF
+$list
+EOF
+  _EG_APPLIED="$ok"
+  return 0
+}
+
+# Once a machine-wide policy is live, every box made without egress control
+# refuses to start until it is recreated. Named now, at the write, rather
+# than one at a time at each launch. Each with where its project is, since
+# the recreate runs from there.
+_egress_refusing_boxes_note() {
+  local kind n meta role lbl src rows="" count=0
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  _daemon_up || return 0
+  kind="$(_egress_engine_kind)"
+  _egress_engine_validated "$kind" || return 0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect --format \
+      '{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' "$n" 2>/dev/null)" || continue
+    role="${meta%%|*}"; meta="${meta#*|}"
+    lbl="${meta%%|*}"; src="${meta#*|}"
+    case "$role" in ROLE=|ROLE=box|"") ;; *) continue ;; esac
+    [ "$lbl" = HASH ] && continue
+    # A box its own file turns off is not asked to change.
+    ( _egress_resolve "$n" ) >/dev/null 2>&1 || continue
+    _egress_resolve "$n"
+    case "$_EG_MODE" in strict|open) ;; *) continue ;; esac
+    count=$((count + 1))
+    rows+="      $(_sessions_safe_str "$n")   $(_egress_recreate_words "$n")   ${DIM}$(_sessions_safe_str "${src/#${HOME}/~}")${RESET}"$'\n'
+  done < <(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null || true)
+  [ "$count" -gt 0 ] || return 0
+  if [ "$count" -eq 1 ]; then
+    echo -e "    1 box was created without egress control. It refuses to start"
+  else
+    echo -e "    ${count} boxes were created without egress control. Each refuses to start"
+  fi
+  echo -e "    until it is recreated:"
+  printf '%b' "$rows"
+  _EG_REFUSING=$count
+}
+_EG_REFUSING=0
 
 # ── why, log and test (6.2, 9.3) ──
 # All three render from the host: the resolved policy, the shipped catalogue,
@@ -12648,6 +12817,7 @@ _egress_cmd_edit() {                     # <allow|deny> <box or empty> <arg>...
   done
   # A per-box file with no mode of its own keeps the global mode.
   if [[ -n "$box" && "$mode" == absent ]]; then mode=inherit; fi
+  _egress_writer_interlock "$(_egress_effective_mode "$mode")" || return 1
   _write_egress_to_file "$file" "$mode" "$packs" "$denies" "$allows" "$canon" || return 1
   _egress_resolve "$cname"
   success "Saved to ${file/#${HOME}/~}"
@@ -12659,7 +12829,14 @@ _egress_cmd_edit() {                     # <allow|deny> <box or empty> <arg>...
     off) echo -e "  ${DIM}Now off: nothing restricts egress. The list is kept for when it is turned on.${RESET}" ;;
     *) echo -e "  ${DIM}Now ${_EG_MODE}, $(printf '%s\n' "$_EG_HOSTS" | grep -c .) hosts allowed, port 443 only.${RESET}" ;;
   esac
-  _egress_not_enforced_lines
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    _egress_apply_now "$cname"
+    # A write that turned the policy on names every box that will refuse.
+    if [ -z "$box" ] && [[ "$changed" == *"(the policy was off)"* ]]; then _egress_refusing_boxes_note; fi
+    _egress_unmeasured_line
+  else
+    _egress_not_enforced_lines
+  fi
 }
 
 # --list: the effective policy, and which file said what.
@@ -13133,6 +13310,7 @@ _egress_cmd_inherit() {                  # <box> <assume_yes>
   fi
   rm -f "$file" "$pin" 2>/dev/null || true
   success "Box ${BOLD}${box}${RESET} now inherits the global egress policy."
+  _egress_apply_now "$cname"
 }
 
 # ── The editor (6.1, 6.4) ──────────────────────────────────────────────────
@@ -13757,11 +13935,12 @@ _egress_save_screen() {                  # <assume_yes>
     IFS= read -r ans || ans="n"
     case "$ans" in ""|y|Y|yes|YES) ;; *) info "Not saved."; return 1 ;; esac
   fi
+  _egress_writer_interlock "$(_egress_effective_mode "$mode_out")" || return 1
   _write_egress_to_file "$_EGE_FILE" "$mode_out" "$_EGE_PACKS" "$_EGE_DENIES" "$_EGE_HOSTS" "$_EGE_CANON" || return 1
   _EGE_SAVED=1
   success "Saved to ${_EGE_FILE/#${HOME}/~}"
   if [ "$_EGRESS_ENFORCING" = 1 ]; then
-    _egress_save_consequence
+    _egress_save_consequence "$mode_out"
   else
     echo -e "    Saved. Enforcement lands in a later release. Nothing is filtered today."
   fi
@@ -13791,15 +13970,47 @@ _egress_editor_verdict() {
   esac
 }
 
-# What a save means on this engine, once enforcement is live.
-_egress_save_consequence() {
+# What a save means, once enforcement is live (6.4 Screen 5): one line, the
+# first that holds. A running caged box takes the change now.
+_egress_save_consequence() {             # <saved mode>
+  local cname="" lbl=0
   _egress_editor_engine
-  if [ "$_EGE_ENGINE" = down ] || _egress_engine_validated "$_EGE_ENGINE"; then
-    echo -e "    A box takes it at its next launch."
+  if [ "$_EGE_ENGINE" != down ] && ! _egress_engine_validated "$_EGE_ENGINE"; then
+    echo -e "    ${AMBER}Saved. Boxes on this machine will refuse to start until you switch engine or run${RESET}"
+    echo -e "    ${AMBER}cleat egress off.${RESET} ${DIM}Validated: $(_egress_engine_words "${_EGRESS_VALIDATED_ENGINES%% *}").${RESET}"
     return 0
   fi
-  echo -e "    ${AMBER}This engine is not validated, so a box under this policy will not start here.${RESET}"
-  echo -e "    ${DIM}Switch to $(_egress_engine_words "${_EGRESS_VALIDATED_ENGINES%% *}"), or ${BOLD}cleat egress off${RESET}${DIM}.${RESET}"
+  if [ -n "$_EGE_BOX" ]; then
+    cname="$(_egress_target_cname "$_EGE_BOX")"
+    if _egress_label_read "$cname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then lbl=1; fi
+  fi
+  if [ "$_EGE_MODE" = open ] && [ -n "$cname" ]; then
+    echo -e "    Open is per box and per session:  ${BOLD}cleat egress open $(_sessions_safe_str "$_EGE_BOX")${RESET}"
+  fi
+  if [ "$1" = off ]; then
+    if [ -n "$cname" ] && [ "$lbl" = 1 ]; then
+      echo -e "    Box $(_sessions_safe_str "$_EGE_BOX") keeps its cage until it is recreated:  ${BOLD}cleat egress off $(_sessions_safe_str "$_EGE_BOX")${RESET}"
+    elif [ -z "$cname" ] && _daemon_up && [ -n "$(docker ps -a --filter label=sh.cleat.egress-hash --format '{{.Names}}' 2>/dev/null | head -n 1)" ]; then
+      echo -e "    Boxes already caged keep their cage until each is recreated:  ${BOLD}cleat egress off <box>${RESET}"
+    fi
+    return 0
+  fi
+  if [ -n "$cname" ] && [ "$lbl" = 0 ] && container_exists "$cname"; then
+    echo -e "    Box $(_sessions_safe_str "$_EGE_BOX") was created without egress control and refuses to start until"
+    echo -e "    it is recreated:  $(_egress_recreate_words "$cname")"
+    return 0
+  fi
+  _egress_apply_now "$cname"
+  if [ -z "$cname" ]; then
+    _EG_REFUSING=0
+    _egress_refusing_boxes_note
+    [ "$_EG_REFUSING" -gt 0 ] && return 0
+  fi
+  if [ "$_EG_APPLIED" -gt 0 ]; then
+    echo -e "    Applies immediately. No restart, no rebuild."
+  else
+    echo -e "    Applies to the next box you start."
+  fi
 }
 
 # The action screen for a pack or host row: arrows and enter, back last.
@@ -14073,6 +14284,8 @@ _egress_config_enable() {
   echo -e "    Choose what boxes on this machine may reach on the next screen."
   if [ "$_EGRESS_ENFORCING" != 1 ]; then
     echo -e "    ${DIM}Enforcement lands in a later release. Nothing is filtered today.${RESET}"
+  else
+    _egress_refusing_boxes_note
   fi
 }
 

@@ -15319,6 +15319,77 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_test_refused_engine" "a refused engine refuses rather than asking" "$CLI" "$EGRESS_ENGINE_BATS"
 
+# Applying a policy (6.3, 9.4).
+cat > "$SED_TMP" << 'SED'
+/^_egress_apply_mode()/,/^}$/{
+  s@^  _egress_reload "[$](_egress_gateway_name "[$]cname")"@  docker rm -f "$cname"@
+}
+SED
+try "vnext_egress_open_is_a_reload" "strict to open removes no container" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_apply_mode()/,/^}$/{
+  s@^  \[ -z "[$]cname" \] && return 0@  :@
+}
+SED
+try "vnext_egress_off_global_no_recreate" "the global confirmation recreates nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_reload()/,/^}$/{
+  s|_egress_admin "[$]1" reload|docker cp "$tmp" "$1:/etc/cleat-egress/policy.json"|
+}
+SED
+try "vnext_egress_reload_is_not_a_copy" "a reload records one admin-socket reload and no docker cp" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_reload()/,/^}$/{
+  s|_egress_admin "[$]1" reload|docker cp "$tmp" "$1:/etc/cleat-egress/policy.json"|
+}
+SED
+try "vnext_egress_reload_never_copies" "a policy reload copied a file into a read-only mount" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_apply_mode()/,/^}$/{
+  s@^  if \[ -z "[$]_got" \] || \[ "[$]_got" != "[$]_want" \]; then return 1; fi$@  :@
+}
+SED
+try "vnext_egress_reload_reads_back" "a reload that the gateway does not take fails" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_edit()/,/^}$/{
+  /^    _egress_apply_now "[$]cname"$/d
+}
+SED
+try "vnext_egress_allow_applies_now" "a running caged box reloads with no recreate" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_apply_now()/,/^}$/{
+  s@docker ps --filter label=sh.cleat.egress-hash --format@docker ps --format@
+}
+SED
+try "vnext_egress_apply_now_caged_only" "a global allow reloads every running caged box and no other" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  s@^    \[ "[$]lbl" = HASH \] && continue$@    :@
+}
+SED
+try "vnext_egress_refusing_note_unlabelled_only" "a first global policy names every box that will refuse" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_reload()/,/^}$/{
+  s@^  if ! _egress_engine_validated "[$]kind"; then _egress_engine_refusal "[$]kind"; return 1; fi$@  :@
+}
+SED
+try "vnext_egress_reload_refused_engine" "an unvalidated engine refuses" "$CLI" "$EGRESS_ENGINE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_edit()/,/^}$/{
+  /^  _egress_writer_interlock "[$](_egress_effective_mode "[$]mode")" || return 1$/d
+}
+SED
+try "vnext_egress_writer_ssh_interlock" "a policy write refuses a box with the ssh capability" "$CLI" "$EGRESS_UI_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

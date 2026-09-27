@@ -10301,3 +10301,24 @@ mode = off"
   run bash -c 'printf "%s\n" "$1" | grep "Pinned:"' _ "$output"
   [ "$(grep -o 'docs.example.test' <<< "$output" | wc -l | tr -d ' ')" = 1 ]
 }
+
+@test "regression vNEXT: a policy reload copied a file into a read-only mount" {
+  # The gateway's policy mount is read-only: a docker cp into it fails, or
+  # worse, lands a file the gateway never reads. A reload renders on the host
+  # and asks the gateway over its admin socket.
+  _caged_run_setup
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project" main)"
+  egress_box_names
+  caged_box
+  run cmd_egress reload
+  assert_success
+  run grep -c "^docker cp" "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -c "^docker exec $GW /usr/local/bin/gw-admin reload" "$DOCKER_CALLS"
+  assert_output "1"
+}

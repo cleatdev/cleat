@@ -10633,6 +10633,155 @@ _egress_wait_healthy() {                 # <cname> <gateway>
   _egress_poll_healthy "$2"
 }
 
+# ── The denial log, read host-side (8.4) ──
+# A gateway appends one row per denial to denials.log in its socket volume.
+# The host reads it one way only, docker cp out of the gateway: never an exec
+# into the box, never a path into the volume. A partial first line after the
+# log wraps, and anything that is not a whole row, is skipped.
+_EGRESS_DENY_MARK="origin=box"
+
+# Copies the log to this box's host-only egress dir: a temp name, then a
+# rename, so a partial copy is never read and the rename replaces rather than
+# follows. That copy is also what the audit's origin gate reads. rc 1 when
+# nothing could be copied (no gateway, a down daemon): no rows, never an error.
+_egress_denials_copy() {                 # <cname>
+  local cname="$1" d tmp gw
+  gw="$(_egress_gateway_name "$cname")"
+  d="$CLEAT_RUN_DIR/$cname/egress"
+  if [ -L "$CLEAT_RUN_DIR/$cname" ] || [ -L "$d" ]; then return 1; fi
+  mkdir -p "$d" 2>/dev/null || return 1
+  [ -L "$d" ] && return 1
+  tmp="$d/.denials.$$"
+  rm -rf "$tmp" 2>/dev/null || true
+  if ! _run_bounded "$_EGRESS_PROBE_BOUND_S" docker cp "$gw:/run/cleat-egress/denials.log" "$tmp" >/dev/null 2>&1; then
+    rm -rf "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if [ -L "$tmp" ] || [ ! -f "$tmp" ]; then rm -rf "$tmp" 2>/dev/null || true; return 1; fi
+  mv -f "$tmp" "$d/denials.log" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+}
+
+# The byte offset to read from, given a mark taken earlier as <gen>:<off>.
+# 0 rereads the whole file: the gateway's generation moved (the log wrapped
+# or the gateway restarted), or the mark is past the end (8.4-R2, R3).
+_egress_denials_window() {
+  local _mark_gen _mark_off _size _state _gen
+  _mark_gen="${2%%:*}"
+  _mark_off="${2##*:}"
+  case "$_mark_off" in ''|*[!0-9]*) _mark_off=0 ;; esac
+  _size="$(_path_size "$3")"
+  _state="$(_egress_admin_read "$1" log-state || true)"
+  _gen="${_state%% *}"
+  [ "$_gen" = "$_mark_gen" ] || { printf 0; return 0; }
+  [ "$_mark_off" -le "$_size" ] || { printf 0; return 0; }
+  printf '%s' "$_mark_off"
+}
+
+# The whole rows of a copy from <offset> on, each as the gateway wrote it:
+# <stamp> code=<c> sub=<s> origin=box host=<h> port=<n> trunc=<0|1>. Every
+# byte outside printable ASCII, and every host byte outside the gateway's own
+# set, becomes '?', and a row with a replaced byte reads as truncated: the
+# last check before a terminal. An origin the row does not name as the box is
+# still the box's (4.4a). A code this CLI does not know is kept.
+_egress_denials_rows() {                 # <copy> <offset>
+  local off="${2:-0}"
+  case "$off" in ''|*[!0-9]*) off=0 ;; esac
+  [ -f "$1" ] && [ ! -L "$1" ] || return 0
+  _read_unlinked_bounded "$1" "$_EGRESS_DENIALS_MAX_BYTES" | tail -c "+$((off + 1))" \
+    | LC_ALL=C awk -v mark="$_EGRESS_DENY_MARK" '
+    {
+      t = 0
+      if (gsub(/[^ -~]/, "?")) t = 1
+      if ($0 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z /) next
+      if (NF != 7) next
+      if ($2 !~ /^code=[a-z][a-z-]*$/) next
+      if ($3 !~ /^sub=[a-z-][a-z-]*$/) next
+      if ($4 !~ /^origin=[a-z]*$/) next
+      if ($5 !~ /^host=./) next
+      if ($6 !~ /^port=[0-9][0-9]*$/ || length($6) > 10) next
+      if ($7 !~ /^trunc=[01]$/) next
+      h = substr($5, 6)
+      if (length(h) > 128) { h = substr(h, 1, 128); t = 1 }
+      if (gsub(/[^a-z0-9.:_?-]/, "?", h)) t = 1
+      if (t) $7 = "trunc=1"
+      print $1, $2, $3, mark, "host=" h, $6, $7
+    }'
+}
+
+# The mark "this session" counts from: one log-state read into _EG_MARK_GEN
+# and _EG_MARK_OFF, saved beside the copy for a later reader. Anything that is
+# not two numbers leaves no mark, and a reader without one reads everything.
+_EG_MARK_GEN=""
+_EG_MARK_OFF=0
+_egress_denials_mark() {                 # <cname>
+  local st g o d tmp
+  _EG_MARK_GEN=""; _EG_MARK_OFF=0
+  st="$(_egress_admin_read "$(_egress_gateway_name "$1")" log-state || true)"
+  g="${st%% *}"; o="${st##* }"
+  case "$g" in ''|*[!0-9]*) return 0 ;; esac
+  case "$o" in ''|*[!0-9]*) return 0 ;; esac
+  _EG_MARK_GEN="$g"; _EG_MARK_OFF="$o"
+  d="$CLEAT_RUN_DIR/$1/egress"
+  if [ -L "$CLEAT_RUN_DIR/$1" ] || [ -L "$d" ]; then return 0; fi
+  mkdir -p "$d" 2>/dev/null || return 0
+  tmp="$d/.denials-mark.$$"
+  printf '%s:%s\n' "$g" "$o" > "$tmp" 2>/dev/null && mv -f "$tmp" "$d/denials-mark" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# The saved mark as <gen>:<off>, or nothing.
+_egress_denials_mark_read() {            # <cname>
+  local l
+  l="$(_read_unlinked_bounded "$CLEAT_RUN_DIR/$1/egress/denials-mark" 64 | head -n 1)"
+  case "$l" in [0-9]*:[0-9]*) ;; *) return 0 ;; esac
+  case "${l%%:*}${l##*:}" in *[!0-9]*) return 0 ;; esac
+  printf '%s' "$l"
+}
+
+# The allowed connections, from the gateway's own stdout: an allow is never
+# written where the box can read it. stderr carries the gateway's own events
+# and is dropped. Each row is <stamp> allow host=<h> port=<n> trunc=<t>.
+_egress_allow_rows() {                   # <cname> [since]
+  local gw
+  gw="$(_egress_gateway_name "$1")"
+  if [ -n "${2:-}" ]; then
+    _run_bounded "$_EGRESS_PROBE_BOUND_S" docker logs --since "$2" "$gw" 2>/dev/null
+  else
+    _run_bounded "$_EGRESS_PROBE_BOUND_S" docker logs "$gw" 2>/dev/null
+  fi | LC_ALL=C awk '
+    {
+      t = 0
+      if (gsub(/[^ -~]/, "?")) t = 1
+      if ($0 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z allow /) next
+      if (NF != 5 || $3 !~ /^host=./ || $4 !~ /^port=[0-9][0-9]*$/ || $5 !~ /^trunc=[01]$/) next
+      h = substr($3, 6)
+      if (length(h) > 128) { h = substr(h, 1, 128); t = 1 }
+      if (gsub(/[^a-z0-9.:_?-]/, "?", h)) t = 1
+      if (t) $5 = "trunc=1"
+      print $1, $2, "host=" h, $4, $5
+    }' || true
+}
+
+# What the socket volume holds, listed by the gateway itself (it has no
+# shell): the socket and the denial log, and nothing else. A third name is a
+# volume someone else wrote into. The listing is one name per line.
+_egress_volume_manifest() {              # <gateway>
+  _run_bounded "$_EGRESS_PROBE_BOUND_S" docker exec "$1" python3 -I -c \
+    'import os; print("\n".join(sorted(os.listdir("/run/cleat-egress"))))' 2>/dev/null
+}
+_egress_volume_manifest_ok() {           # <listing>
+  local l n=0 seen=""
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    case "$l" in denials.log|proxy.sock) ;; *) return 1 ;; esac
+    case " $seen " in *" $l "*) return 1 ;; esac
+    seen="$seen $l"; n=$((n + 1))
+  done <<EOF
+$1
+EOF
+  [ "$n" -eq 2 ]
+}
+
 # Starts a caged box's stopped gateway ahead of the box's own docker start
 # (8.7), and never makes one: a gateway that has gone is a refusal, so a box
 # can never come back up with a fresh, unexamined gateway. The policy is

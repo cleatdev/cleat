@@ -1128,3 +1128,177 @@ acted() { grep -cE "^docker (stop|rm -f|volume rm) (cleat-gw-|$VOL)" "$DOCKER_CA
   run cat "$DOCKER_CALLS"
   assert_output "docker ps -a --filter label=sh.cleat.role=gateway --format {{.Names}}|{{.Label \"sh.cleat.gateway-for\"}}|{{.State}}"
 }
+
+# ── The denial log, read host-side (8.4) ────────────────────────────────────
+
+# A gateway whose denial log holds <rows>, as docker cp would copy it out.
+seed_denials() {                         # <rows>
+  CN=cleat-demo-3f2a9104
+  egress_box_names
+  use_gw_admin_stub
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW"
+  printf '%b' "$1" > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+}
+ROW1='2026-09-26T10:00:00Z code=policy sub=- origin=box host=pastebin.example port=443 trunc=0\n'
+ROW2='2026-09-26T10:00:05Z code=sni sub=sni-mismatch origin=box host=github.com port=443 trunc=0\n'
+
+@test "egress log: the denial log is read by docker cp out of the gateway" {
+  seed_denials "$ROW1"
+  run _egress_denials_copy "$CN"
+  assert_success
+  run grep -c "^docker cp $GW:/run/cleat-egress/denials.log " "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c "^docker exec" "$DOCKER_CALLS"
+  assert_output "0"
+  run cat "$CLEAT_RUN_DIR/$CN/egress/denials.log"
+  assert_output "${ROW1%\\n}"
+  # No temp copy is left behind.
+  run bash -c 'ls -A "$1" | grep -c "^\.denials"' _ "$CLEAT_RUN_DIR/$CN/egress"
+  assert_output "0"
+}
+
+@test "egress log: a copy is never written through a link" {
+  seed_denials "$ROW1"
+  mkdir -p "$TEST_TEMP/elsewhere" "$CLEAT_RUN_DIR/$CN"
+  ln -s "$TEST_TEMP/elsewhere" "$CLEAT_RUN_DIR/$CN/egress"
+  run _egress_denials_copy "$CN"
+  assert_failure
+  run ls -A "$TEST_TEMP/elsewhere"
+  assert_output ""
+  # The box's whole run dir a link: the egress dir made under it would be real.
+  rm -f "$CLEAT_RUN_DIR/$CN/egress"
+  rmdir "$CLEAT_RUN_DIR/$CN"
+  ln -s "$TEST_TEMP/elsewhere" "$CLEAT_RUN_DIR/$CN"
+  run _egress_denials_copy "$CN"
+  assert_failure
+  run ls -A "$TEST_TEMP/elsewhere"
+  assert_output ""
+}
+
+@test "egress log: a down daemon or a missing gateway reads as no rows" {
+  seed_denials "$ROW1"
+  export DOCKER_CP_EXIT_CODE=1
+  run _egress_denials_copy "$CN"
+  assert_failure
+  assert_output ""
+  [ ! -e "$CLEAT_RUN_DIR/$CN/egress/denials.log" ]
+  run _egress_denials_rows "$CLEAT_RUN_DIR/$CN/egress/denials.log" 0
+  assert_success
+  assert_output ""
+}
+
+@test "egress log: a line with no leading timestamp is skipped" {
+  seed_denials "junk line\n${ROW1}code=policy host=x.example\n10:00:00Z code=policy sub=- origin=box host=y.example port=443 trunc=0\n${ROW2}"
+  _egress_denials_copy "$CN"
+  run _egress_denials_rows "$CLEAT_RUN_DIR/$CN/egress/denials.log" 0
+  assert_output "${ROW1%\\n}
+${ROW2%\\n}"
+}
+
+@test "egress log: a row with a replaced byte renders as truncated" {
+  seed_denials '2026-09-26T10:00:00Z code=policy sub=- origin=box host=pa\xc3\xa9stebin.example port=443 trunc=0\n2026-09-26T10:00:01Z code=policy sub=- origin=box host=UP.example port=443 trunc=0\n2026-09-26T10:00:02Z code=policy sub=- origin=box host=a\033[31m.example port=443 trunc=0\n'
+  _egress_denials_copy "$CN"
+  run _egress_denials_rows "$CLEAT_RUN_DIR/$CN/egress/denials.log" 0
+  assert_line --index 0 "2026-09-26T10:00:00Z code=policy sub=- origin=box host=pa??stebin.example port=443 trunc=1"
+  assert_line --index 1 "2026-09-26T10:00:01Z code=policy sub=- origin=box host=??.example port=443 trunc=1"
+  refute_output --partial $'\033'
+}
+
+@test "egress log: a row that names another origin is still the box's" {
+  seed_denials '2026-09-26T10:00:00Z code=policy sub=- origin=user host=x.example port=443 trunc=0\n2026-09-26T10:00:01Z code=newcode sub=- origin=box host=y.example port=443 trunc=0\n'
+  _egress_denials_copy "$CN"
+  run _egress_denials_rows "$CLEAT_RUN_DIR/$CN/egress/denials.log" 0
+  assert_line --index 0 "2026-09-26T10:00:00Z code=policy sub=- origin=box host=x.example port=443 trunc=0"
+  # A code this CLI does not know is kept, so it renders as itself.
+  assert_line --index 1 --partial "code=newcode"
+}
+
+@test "egress log: an offset past the end of the file rereads from zero" {
+  seed_denials "$ROW1$ROW2"
+  _egress_denials_copy "$CN"
+  local f="$CLEAT_RUN_DIR/$CN/egress/denials.log" size
+  size="$(_path_size "$f")"
+  mock_gw_admin log-state "ok log-state 7 $size"
+  run _egress_denials_window "$GW" "7:$(( size + 50 ))" "$f"
+  assert_output "0"
+  # Inside the file, at the same generation, the mark stands.
+  run _egress_denials_window "$GW" "7:10" "$f"
+  assert_output "10"
+}
+
+@test "egress log: a generation change rereads from zero" {
+  seed_denials "$ROW1$ROW2"
+  _egress_denials_copy "$CN"
+  local f="$CLEAT_RUN_DIR/$CN/egress/denials.log"
+  # A higher generation with a size above the mark: the log wrapped and grew.
+  mock_gw_admin log-state "ok log-state 8 9999"
+  run _egress_denials_window "$GW" "7:10" "$f"
+  assert_output "0"
+  run _egress_denials_rows "$f" "$output"
+  assert_output "${ROW1%\\n}
+${ROW2%\\n}"
+  # An admin socket that cannot answer rereads too: duplicates, never silence.
+  mock_gw_admin log-state ""
+  run _egress_denials_window "$GW" "7:10" "$f"
+  assert_output "0"
+}
+
+@test "egress log: the session mark is one log-state read, saved beside the copy" {
+  CN=cleat-demo-3f2a9104
+  egress_box_names
+  use_gw_admin_stub
+  mock_gw_admin log-state "ok log-state 1790000000123 512"
+  _egress_denials_mark "$CN"
+  [ "$_EG_MARK_GEN" = 1790000000123 ] && [ "$_EG_MARK_OFF" = 512 ]
+  run _egress_denials_mark_read "$CN"
+  assert_output "1790000000123:512"
+  run count_calls "gw-admin log-state"
+  assert_output "1"
+  # Anything but two numbers leaves no mark, and a reader then reads all.
+  mock_gw_admin log-state "ok log-state x 512"
+  _egress_denials_mark "$CN"
+  [ -z "$_EG_MARK_GEN" ] && [ "$_EG_MARK_OFF" = 0 ]
+}
+
+@test "egress log: allowed connections come from the gateway's own output" {
+  CN=cleat-demo-3f2a9104
+  egress_box_names
+  mkdir -p "$DOCKER_MOCK_DIR/logs"
+  printf '%s\n' "cleat-gw: serving v1:abc, mode strict, 5 hosts" \
+    "2026-09-26T10:00:00Z allow host=api.anthropic.com port=443 trunc=0" \
+    "2026-09-26T10:00:01Z allow host=x\"y.example port=443 trunc=0" \
+    "not a row" > "$DOCKER_MOCK_DIR/logs/$GW"
+  run _egress_allow_rows "$CN"
+  assert_output "2026-09-26T10:00:00Z allow host=api.anthropic.com port=443 trunc=0
+2026-09-26T10:00:01Z allow host=x?y.example port=443 trunc=1"
+  run grep -c "^docker logs $GW" "$DOCKER_CALLS"
+  assert_output "1"
+  : > "$DOCKER_CALLS"
+  run _egress_allow_rows "$CN" "2026-09-26T09:00:00Z"
+  run grep -c "^docker logs --since 2026-09-26T09:00:00Z $GW" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "egress: the shared volume manifest rejects a third path" {
+  run _egress_volume_manifest_ok "$(printf 'denials.log\nproxy.sock\n')"
+  assert_success
+  local bad
+  for bad in "$(printf 'denials.log\nproxy.sock\npolicy.json\n')" "$(printf 'proxy.sock\n')" \
+    "$(printf 'proxy.sock\npolicy.json\n')" \
+    "$(printf 'denials.log\ndenials.log\n')" "$(printf 'denials.log\nproxy.sock\n.hidden\n')" ""; do
+    run _egress_volume_manifest_ok "$bad"
+    assert_failure
+  done
+}
+
+@test "egress audit: the origin gate reads the copy the reader wrote" {
+  # A name that came off a denial row is the box's choice: it meets the gate.
+  seed_denials "$ROW1"
+  run _egress_origin_gate pastebin.example
+  assert_success
+  _egress_denials_copy "$CN"
+  run _egress_origin_gate pastebin.example
+  assert_failure
+  run _egress_origin_gate docs.example.test
+  assert_success
+}

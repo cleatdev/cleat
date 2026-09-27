@@ -15157,6 +15157,49 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_editor_names_engine" "the editor still opens on a refused engine" "$CLI" "$EGRESS_UI_BATS"
 
+# The host-side denial reader (8.4).
+cat > "$SED_TMP" << 'SED'
+/^_egress_denials_window()/,/^}$/{
+  s@^  \[ "[$]_gen" = "[$]_mark_gen" \] || { printf 0; return 0; }@  :@
+}
+SED
+try "vnext_egress_denials_generation" "a generation change rereads from zero" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_denials_window()/,/^}$/{
+  s@^  \[ "[$]_mark_off" -le "[$]_size" \] || { printf 0; return 0; }@  :@
+}
+SED
+try "vnext_egress_denials_offset_past_end" "an offset past the end of the file rereads from zero" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_denials_rows()/,/^}$/{
+  s@^      if (\$0 !~ /^\[0-9\]\[0-9\]\[0-9\]\[0-9\]-\[0-9\]\[0-9\]-\[0-9\]\[0-9\]T\[0-9\]\[0-9\]:\[0-9\]\[0-9\]:\[0-9\]\[0-9\]Z /) next$@      :@
+}
+SED
+try "vnext_egress_denials_stamp_first" "a line with no leading timestamp is skipped" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_denials_rows()/,/^}$/{
+  s@^      if (gsub(/\[^a-z0-9.:_?-\]/, "?", h)) t = 1$@      :@
+}
+SED
+try "vnext_egress_denials_host_sanitised" "a row with a replaced byte renders as truncated" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_denials_copy()/,/^}$/{
+  s@^  if \[ -L "[$]CLEAT_RUN_DIR/[$]cname" \] || \[ -L "[$]d" \]; then return 1; fi$@  :@
+}
+SED
+try "vnext_egress_denials_copy_no_link" "a copy is never written through a link" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_volume_manifest_ok()/,/^}$/{
+  s@^    case "[$]l" in denials.log|proxy.sock) ;; \*) return 1 ;; esac$@    :@
+}
+SED
+try "vnext_egress_volume_manifest_closed" "the shared volume manifest rejects a third path" "$CLI" "$EGRESS_GATEWAY_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

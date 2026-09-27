@@ -10668,6 +10668,93 @@ _egress_start_gateway() {                # <cname>
   return 0
 }
 
+# One label of a container through the marker template, so an unreadable
+# container, or a canned answer that is not a label, reads as no label.
+_container_label() {                     # <cname> <key>
+  _egress_label_read "$1" "$2" || return 0
+  if [ "$_EG_LABEL_SET" = 1 ]; then printf '%s' "$_EG_LABEL"; fi
+  return 0
+}
+
+# The idle sweep's gateway pass (8.8, 8.9). A gateway maps to its box only
+# through sh.cleat.gateway-for against the hash of each candidate box name,
+# never through its own name, and a value that is not twelve hex is not ours.
+# Both enumerations are direct and checked: one that fails acts on nothing.
+# Left alone: the gateway of a running box, of the box being launched, one
+# still starting and one inside a create window. Stopped: one whose box is
+# stopped. Removed with its volume and rendered policy: one with no box,
+# outside the window. Then dangling socket volumes outside the window go.
+# Prints nothing. A machine with no gateway pays the first docker ps.
+_egress_sweep_gateways() {               # <now> <self cname>
+  local self="${2:-}" gws boxes vols cands="" self_bh=""
+  local gw gfor gst n st bh c m bcn bst crt health v
+  gws="$(docker ps -a --filter label=sh.cleat.role=gateway \
+    --format '{{.Names}}|{{.Label "sh.cleat.gateway-for"}}|{{.State}}' 2>/dev/null)" || return 0
+  [ -n "$gws" ] || return 0
+  boxes="$(docker ps -a --filter label=sh.cleat.version --format '{{.Names}}|{{.State}}' 2>/dev/null)" || return 0
+  while IFS='|' read -r n st; do
+    [ -n "$n" ] || continue
+    cands+="$(_egress_box_hash "$n")|$n|$st"$'\n'
+  done <<EOF
+$boxes
+EOF
+  # A box still being created has a run dir and a marker, and no container.
+  for m in "$CLEAT_RUN_DIR"/*/egress/creating; do
+    [ -f "$m" ] || continue
+    c="${m%/egress/creating}"; c="${c##*/}"
+    cands+="$(_egress_box_hash "$c")|$c|creating"$'\n'
+  done
+  if [ -n "$self" ]; then self_bh="$(_egress_box_hash "$self")"; fi
+  while IFS='|' read -r gw gfor gst; do
+    [ -n "$gw" ] || continue
+    case "$gfor" in ????????????) ;; *) continue ;; esac
+    case "$gfor" in *[!0-9a-f]*) continue ;; esac
+    if [ -n "$self_bh" ] && [ "$gfor" = "$self_bh" ]; then continue; fi
+    bcn=""; bst=""; crt=""
+    while IFS='|' read -r bh c st; do
+      [ "$bh" = "$gfor" ] || continue
+      if [ "$st" = creating ]; then crt="$c"; else bcn="$c"; bst="$st"; fi
+    done <<EOF
+$cands
+EOF
+    if [ -n "$bcn" ]; then
+      case "$bst" in exited|created|dead) ;; *) continue ;; esac
+      [ "$gst" = running ] || continue
+      health="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect -f '{{.State.Health.Status}}' "$gw" 2>/dev/null)" || health=""
+      [ "$health" = starting ] && continue
+      rm -f "$CLEAT_CONFIG_DIR/egress-boxes/$bcn.session"
+      docker stop "$gw" >/dev/null 2>&1 || true
+      continue
+    fi
+    if [ -n "$crt" ] && _egress_create_marker_fresh "$crt"; then continue; fi
+    docker rm -f "$gw" >/dev/null 2>&1 || true
+    docker volume rm "cleat-gw-$gfor-sock" >/dev/null 2>&1 || true
+    rm -rf "$CLEAT_CONFIG_DIR/egress-rendered/$gfor"
+    if [ -n "$crt" ]; then rm -f "$CLEAT_RUN_DIR/$crt/egress/creating"; fi
+  done <<EOF
+$gws
+EOF
+  vols="$(docker volume ls --filter label=sh.cleat.role=egress-sock --filter dangling=true \
+    --format '{{.Name}}|{{.Label "sh.cleat.gateway-for"}}' 2>/dev/null)" || return 0
+  while IFS='|' read -r v gfor; do
+    [ -n "$v" ] || continue
+    case "$gfor" in ????????????) ;; *) continue ;; esac
+    case "$gfor" in *[!0-9a-f]*) continue ;; esac
+    [ "$v" = "cleat-gw-$gfor-sock" ] || continue
+    crt=""
+    while IFS='|' read -r bh c st; do
+      if [ "$bh" = "$gfor" ] && [ "$st" = creating ]; then crt="$c"; fi
+    done <<EOF
+$cands
+EOF
+    if [ -n "$crt" ] && _egress_create_marker_fresh "$crt"; then continue; fi
+    docker volume rm "$v" >/dev/null 2>&1 || true
+  done <<EOF
+$vols
+EOF
+  return 0
+}
+
 # One word for the gateway of a box (8.10): missing, stopped, orphaned,
 # displaced or healthy. Gateway health is never box liveness, so the orphan
 # check answers before the socket check. A gateway that cannot answer reads as
@@ -18464,8 +18551,7 @@ cmd_ps() {
   local found=false
   while IFS= read -r line; do
     if [[ -n "$line" ]]; then
-      found=true
-      local name status project_path color meta box_label running rest
+      local name status project_path color meta box_label running rest _role _fmt_role=""
       name="$(echo "$line" | awk -F'\t' '{print $1}' | xargs)"
       status="$(echo "$line" | awk -F'\t' '{print $2}' | xargs)"
 
@@ -18479,7 +18565,16 @@ cmd_ps() {
       # Field order is box|running|path so a literal '|' in the project path
       # (legal on disk) falls into the trailing field and can't corrupt the
       # parse of the two fixed-charset fields ahead of it.
-      meta="$(docker inspect "$name" --format '{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)"
+      # The role leads, through the marker template, so a reply that is not a
+      # label never reads as one. A gateway is not a box: its own row lives in
+      # cleat egress status.
+      _fmt_role='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}'
+      meta="$(docker inspect "$name" --format "${_fmt_role}|"'{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)"
+      _role="${meta%%|*}"
+      meta="${meta#*|}"
+      case "$_role" in ROLE=*) _role="${_role#ROLE=}" ;; *) _role="" ;; esac
+      case "$_role" in ""|box) ;; *) continue ;; esac
+      found=true
       box_label="${meta%%|*}"
       rest="${meta#*|}"
       running="${rest%%|*}"
@@ -18519,13 +18614,22 @@ cmd_stop_all() {
   info "Stopping all Cleat containers..."
   local containers
   containers=$(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null)
-  if [[ -z "$containers" ]]; then
+  # Boxes only. A gateway goes inside its box's teardown, after the box stops,
+  # never as a row of its own.
+  local _c _role="" _boxes=""
+  while IFS= read -r _c; do
+    [[ -n "$_c" ]] || continue
+    _role="$(_container_label "$_c" sh.cleat.role)"
+    case "$_role" in ""|box) _boxes+="$_c"$'\n' ;; esac
+  done <<< "$containers"
+  if [[ -z "$_boxes" ]]; then
     info "Nothing to stop."
     return
   fi
-  echo "$containers" | while read -r c; do
+  printf '%s' "$_boxes" | while read -r c; do
     docker stop "$c" > /dev/null 2>&1 || true
-    docker rm "$c" > /dev/null 2>&1 || true
+    _egress_stop "$c"
+    _egress_teardown "$c" keep || true
     echo -e "    ${DIM}removed ${c}${RESET}"
   done
   # Box descriptions are keyed by container name; drop any whose container is now
@@ -18715,6 +18819,7 @@ cmd_status() {
     if [[ -n "$_desc" ]]; then printf '        %b%s%b\n' "$DIM" "$_desc" "$RESET"; fi
   }
   _status_box_row "main" "$_main_cname"
+  local _role="" _fmt_role=""
   while IFS= read -r _n; do
     [[ -z "$_n" ]] && continue
     # Cheap pre-filter on the invariant hash; the mount-source check below is
@@ -18723,7 +18828,13 @@ cmd_status() {
     # One inspect per candidate yields label|running|workspace-source. Field
     # order keeps the (possibly '|'-bearing) path trailing so it can't corrupt
     # the parse of the two fixed-charset fields ahead of it.
-    _meta="$(docker inspect "$_n" --format '{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+    # The role leads, as in cmd_ps: a gateway is never a box row.
+    _fmt_role='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}'
+    _meta="$(docker inspect "$_n" --format "${_fmt_role}|"'{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+    _role="${_meta%%|*}"
+    _meta="${_meta#*|}"
+    case "$_role" in ROLE=*) _role="${_role#ROLE=}" ;; *) _role="" ;; esac
+    case "$_role" in ""|box) ;; *) continue ;; esac
     _b="${_meta%%|*}"
     _rest="${_meta#*|}"
     _running="${_rest%%|*}"
@@ -18841,6 +18952,29 @@ _dangling_cleat_images() {
   docker images -f dangling=true -f label=sh.cleat.version -q 2>/dev/null || true
 }
 
+# The egress gateway images and socket volumes on this daemon, one per line.
+# Seams, for cleat storage's counts.
+_gateway_image_ids() {
+  docker images --no-trunc --filter label=sh.cleat.role=gateway --format '{{.ID}}' 2>/dev/null | sort -u || true
+}
+_egress_sock_volumes() {
+  docker volume ls -q --filter label=sh.cleat.role=egress-sock 2>/dev/null || true
+}
+
+# Gateway images a prune may offer: every image labelled as a gateway but the
+# one this CLI pins, which stays so a caged launch never needs the network
+# (8.0). An image a gateway still uses is kept by docker rmi itself, and the
+# offer skips it the same way it skips a box's. Seam.
+_gateway_image_candidates() {
+  local keep id
+  keep="$(docker image inspect "$_GATEWAY_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    [[ -n "$keep" && "$id" == "$keep" ]] && continue
+    printf '%s\n' "$id"
+  done < <(docker images --no-trunc --filter label=sh.cleat.role=gateway --format '{{.ID}}' 2>/dev/null | sort -u || true)
+}
+
 # Prints "tag<TAB>size" per prebuilt image (size used by the stats helper).
 _prebuilt_image_tags() {
   docker images "$REGISTRY_BASE" --format '{{.Repository}}:{{.Tag}}	{{.Size}}' 2>/dev/null || true
@@ -18897,7 +19031,7 @@ _cleat_prunable_stats() {
       _image_referenced_by_container "$id" "$referenced" && continue
       # Unsizeable still counts: the artifact exists even if inspect hiccups.
       docker image inspect "$id" --format '{{.Size}}B' 2>/dev/null || echo "0B"
-    done < <(_dangling_cleat_images)
+    done < <(_dangling_cleat_images; _gateway_image_candidates)
 
     local line tag
     while IFS= read -r line; do
@@ -18976,7 +19110,7 @@ cmd_prune() {
     else
       failed=$((failed + 1))
     fi
-  done < <(_dangling_cleat_images)
+  done < <(_dangling_cleat_images; _gateway_image_candidates)
 
   if (( removed > 0 )); then
     success "Pruned ${removed} stale cleat image$( (( removed != 1 )) && echo s )."
@@ -19281,9 +19415,12 @@ _sweep_idle_boxes() {
     [[ "$mem" =~ ^[0-9]+$ ]] && (( mem > 0 )) && freed=$(( freed + mem ))
     victims+=("$name")
   done < <(_running_cleat_boxes)
+  _egress_sweep_gateways "$now" "$self"
 
   [[ ${#victims[@]} -gt 0 ]] || return 0
   docker stop "${victims[@]}" >/dev/null 2>&1 || true
+  local _v
+  for _v in "${victims[@]}"; do _egress_stop "$_v"; done
   local n=${#victims[@]} gb=$(( (freed + 536870912) / 1073741824 )) freed_note=""
   (( gb > 0 )) && freed_note=", freed ${gb} GB"
   echo ""
@@ -19950,18 +20087,43 @@ cmd_nuke() {
 
   local containers
   containers=$(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null)
-  if [[ -n "$containers" ]]; then
+  # Gateways first, with no row of their own, then every box through its
+  # forget teardown, then what only a gateway used: the socket volumes, the
+  # rendered policies and the gateway images. Never the global egress section
+  # or the global pin: they are the user's, not any box's.
+  local _c _role="" _gws="" _boxes=""
+  while IFS= read -r _c; do
+    [[ -n "$_c" ]] || continue
+    _role="$(_container_label "$_c" sh.cleat.role)"
+    case "$_role" in ""|box) _boxes+="$_c"$'\n' ;; *) _gws+="$_c"$'\n' ;; esac
+  done <<< "$containers"
+  if [[ -n "$_gws$_boxes" ]]; then
     info "Removing containers..."
-    echo "$containers" | while read -r c; do
-      docker rm -f "$c" > /dev/null 2>&1
+    while IFS= read -r _c; do
+      [[ -n "$_c" ]] && { docker rm -f "$_c" > /dev/null 2>&1 || true; }
+    done <<< "$_gws"
+    printf '%s' "$_boxes" | while read -r c; do
+      _egress_teardown "$c" forget || true
       echo -e "    ${DIM}removed ${c}${RESET}"
     done
+  fi
+  local _v
+  while IFS= read -r _v; do
+    [[ -n "$_v" ]] && { docker volume rm "$_v" > /dev/null 2>&1 || true; }
+  done < <(docker volume ls -q --filter label=sh.cleat.role=egress-sock 2>/dev/null || true)
+  if [[ -d "$CLEAT_CONFIG_DIR/egress-rendered" ]]; then
+    _nuke_wipe_dir "$CLEAT_CONFIG_DIR/egress-rendered"
   fi
 
   if image_exists; then
     info "Removing image..."
     docker rmi -f "$IMAGE_NAME" > /dev/null 2>&1
   fi
+  # The gateway images, the current pin included: the next caged launch pulls.
+  local _gi
+  while IFS= read -r _gi; do
+    [[ -n "$_gi" ]] && { docker rmi -f "$_gi" > /dev/null 2>&1 || true; }
+  done < <(docker images -q --filter label=sh.cleat.role=gateway 2>/dev/null | sort -u || true)
 
   # Per-container runtime dirs (overlays / clipboard / hook spool) are persistent
   # now, so /tmp rotation won't reclaim them: wipe them explicitly.
@@ -20154,8 +20316,18 @@ cmd_storage() {
   mb="${stats##*	}"
   [[ "$mb" =~ ^[0-9]+$ ]] && cleat_reclaim_b=$(( mb * 1048576 ))
 
+  # Egress control's own objects, counted apart because a gateway is never a
+  # box and its image carries no version label. Only when there are any, so a
+  # machine with egress off sees exactly what it always did.
+  local gw_img_n=0 sock_n=0
+  gw_img_n="$(_gateway_image_ids | grep -c . || true)"
+  sock_n="$(_egress_sock_volumes | grep -c . || true)"
+
   echo -e "  ${BOLD}Cleat's share${RESET}"
   printf "    %-20s %2s image%s, %s box%s\n" "" "$cleat_img_n" "$( (( cleat_img_n != 1 )) && printf s )" "$cleat_box_n" "$( (( cleat_box_n != 1 )) && printf es )"
+  if (( gw_img_n > 0 || sock_n > 0 )); then
+    printf "    %-20s %2s egress gateway image%s, %s egress socket volume%s\n" "" "$gw_img_n" "$( (( gw_img_n != 1 )) && printf s )" "$sock_n" "$( (( sock_n != 1 )) && printf s )"
+  fi
   echo ""
   echo -e "  ${BOLD}Cleat can reclaim${RESET}"
   echo -e "    ${GREEN}$(_fmt_gb "$cleat_reclaim_b")${RESET}   ${DIM}stale cleat images${RESET}      ${BOLD}cleat prune${RESET}"

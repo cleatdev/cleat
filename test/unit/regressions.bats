@@ -10205,3 +10205,56 @@ _caged_run_setup() {
   assert_output "[egress]
 mode = off"
 }
+
+@test "regression vNEXT: cleat ps showed a gateway as a box" {
+  # A gateway has no /workspace mount and no sh.cleat.box label, so without its
+  # role it rendered as a main box.
+  local gw=cleat-gw-0123456789ab
+  printf '%s\tUp 1 minute (healthy)\n' "$gw" > "$DOCKER_MOCK_DIR/ps_a_output"
+  mock_docker_inspect_field "$gw" "$T_PSMETA" "ROLE=gateway||true|"
+  run cmd_ps
+  assert_success
+  refute_output --partial "$gw"
+  assert_output --partial "No containers found."
+}
+
+@test "regression vNEXT: a superseded gateway image was never reclaimed" {
+  # A gateway image carries no version label, so the dangling-image prune never
+  # saw one: every gateway digest bump left the old image behind for good.
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  _gateway_image_candidates() { printf 'sha256:superseded\n'; }
+  run cmd_prune
+  assert_success
+  assert_output --partial "Pruned 1 stale cleat image"
+  run grep -c "^docker rmi sha256:superseded\$" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "regression vNEXT: the idle sweep leaves a gateway running forever" {
+  # A gateway whose box was removed outside cleat had nothing to stop it: the
+  # sweep walks boxes, and a gateway is not one.
+  CN=cleat-proj-abcdef12
+  egress_box_names
+  _running_cleat_boxes() { :; }
+  mock_docker_ps_filter "$GW|$BH|running" "label=sh.cleat.role=gateway"
+  mock_docker_ps_filter "" "label=sh.cleat.version"
+  run _sweep_idle_boxes ""
+  run grep -c "^docker rm -f $GW\$" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "regression vNEXT: a concurrent sweep reaped a gateway mid-create" {
+  # Another terminal's sweep saw a gateway whose box did not exist yet and
+  # removed it under the create. The create marker's window protects it.
+  CN=cleat-proj-abcdef12
+  egress_box_names
+  _running_cleat_boxes() { :; }
+  mock_docker_ps_filter "$GW|$BH|running" "label=sh.cleat.role=gateway"
+  mock_docker_ps_filter "" "label=sh.cleat.version"
+  mkdir -p "$CLEAT_RUN_DIR/$CN/egress"
+  : > "$CLEAT_RUN_DIR/$CN/egress/creating"
+  run _sweep_idle_boxes ""
+  run grep -c "^docker rm -f $GW\$" "$DOCKER_CALLS"
+  assert_output "0"
+}

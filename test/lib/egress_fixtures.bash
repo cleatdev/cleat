@@ -86,6 +86,10 @@ T_ENV='{{range .Config.Env}}{{println .}}{{end}}'
 T_VOL='{{index .Labels "sh.cleat.role"}} {{index .Labels "sh.cleat.gateway-for"}}'
 T_GW='{{.State.Running}}|{{index .Config.Labels "sh.cleat.role"}}|{{index .Config.Labels "sh.cleat.gateway-for"}}'
 T_HEALTH='{{.State.Health.Status}}'
+# The role read the stop-all and nuke loops make, and the combined inspect of
+# cmd_ps and cmd_status, which leads with the role.
+T_ROLE='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}LABEL={{$v}}{{end}}{{end}}'
+T_PSMETA='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}'
 
 # A caged box and its gateway that pass every assertion. Each F_ variable is
 # one field: a test sets one before calling this to break exactly that field.

@@ -240,7 +240,7 @@ teardown() { _common_teardown; }
   local az_cname
   az_cname="$(container_name_for "$TEST_TEMP/project" az)"
   printf '%s\n' "$az_cname" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  printf '|az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$TEST_TEMP/project"
   assert_success
   assert_output --partial "az"
@@ -259,7 +259,7 @@ teardown() { _common_teardown; }
   # Only meaningful if truncation actually diverges (az not under main's prefix).
   [[ "$az_cname" == "${main_cname}-"* ]] && skip "dir too short to exercise truncation divergence"
   printf '%s\n' "$az_cname" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'az|true|%s\n' "$proj" > "$DOCKER_MOCK_DIR/inspect_output"
+  printf '|az|true|%s\n' "$proj" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$proj"
   assert_success
   assert_output --partial "az"
@@ -272,7 +272,7 @@ teardown() { _common_teardown; }
   local hash
   hash="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   printf '%s\n' "cleat-sibling-${hash}-zzz-99999999" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'zzz|true|/some/other/project\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  printf '|zzz|true|/some/other/project\n' > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$TEST_TEMP/project"
   assert_success
   refute_output --partial "zzz"
@@ -299,7 +299,7 @@ teardown() { _common_teardown; }
   az_cname="$(container_name_for "$TEST_TEMP/project" az)"
   printf '%s\n' "$main_cname" > "$DOCKER_MOCK_DIR/ps_output"
   printf '%s\n' "$az_cname"   > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  printf '|az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$TEST_TEMP/project"
   assert_success
   assert_output --partial "az"
@@ -309,8 +309,8 @@ teardown() { _common_teardown; }
 @test "box ps: shows the box column from the sh.cleat.box label" {
   local cname="cleat-proj-abcdef12-az"
   printf '%s\t%s\n' "$cname" "Up 1 minute" > "$DOCKER_MOCK_DIR/ps_a_output"
-  # cmd_ps does ONE combined inspect per row: box|running|workspace-source.
-  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  # cmd_ps does ONE combined inspect per row: role|box|running|workspace-source.
+  printf '|az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_ps
   assert_success
   assert_output --partial "box: az"
@@ -321,7 +321,7 @@ teardown() { _common_teardown; }
   # workspace path from a SINGLE inspect per container, not 2 inspects + a ps.
   local cname="cleat-proj-abcdef12-az"
   printf '%s\t%s\n' "$cname" "Up 1 minute" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
+  printf '|az|true|%s\n' "$TEST_TEMP/project" > "$DOCKER_MOCK_DIR/inspect_output"
   : > "$DOCKER_CALLS"
   cmd_ps >/dev/null
   local n_inspect n_ps
@@ -337,7 +337,7 @@ teardown() { _common_teardown; }
   # disk) lands in the trailing field and is shown verbatim, not truncated.
   local cname="cleat-proj-abcdef12"
   printf '%s\t%s\n' "$cname" "Up 1 minute" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'main|true|/home/me/weird|dir\n' > "$DOCKER_MOCK_DIR/inspect_output"
+  printf '|main|true|/home/me/weird|dir\n' > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_ps
   assert_success
   assert_output --partial "/home/me/weird|dir"

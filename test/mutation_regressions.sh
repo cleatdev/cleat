@@ -4823,7 +4823,7 @@ try "fork_verb_session_preflight" "fork run reaches the session preflights" "$CL
 cat > "$SED_TMP" << 'SED'
 s@      _fork_mark "$_nc"@      :@
 SED
-try "nuke_keeps_fork_markers" "fork marker whose copy survives is kept" "$CLI" "$REPO_ROOT/test/unit/nuke.bats"
+try "nuke_keeps_fork_markers" "fork marker whose copy survives is kept" "$CLI" "$NUKE_BATS"
 
 # FORK ROOT OWNERSHIP: the fork root is user-settable, so only cleat-named
 # directories are workspace copies. Drop the filter and prune deletes anything
@@ -4942,14 +4942,14 @@ try "memory_dockerd_floor" "below dockerd.s 6 MB floor is rejected" "$CLI" "$REP
 cat > "$SED_TMP" << 'SED'
 s@  read -rp "  Type 'nuke' to confirm: " confirm || confirm=""@  read -rp "  Type '"'"'nuke'"'"' to confirm: " confirm@
 SED
-try "nuke_stdin_fallback" "closed stdin aborts instead of dying" "$CLI" "$REPO_ROOT/test/unit/nuke.bats"
+try "nuke_stdin_fallback" "closed stdin aborts instead of dying" "$CLI" "$NUKE_BATS"
 
 # STATUS BOX POSITIONAL: forwarded into cmd_status's PROJECT slot, so
 # `cleat status feat-a` reported a phantom project.
 cat > "$SED_TMP" << 'SED'
 s@  if \[\[ -n "$_arg" && ! -d "$_arg" \]\]; then@  if false; then@
 SED
-try "status_box_positional" "box positional is a BOX, not a phantom project" "$CLI" "$REPO_ROOT/test/unit/docker_commands.bats"
+try "status_box_positional" "box positional is a BOX, not a phantom project" "$CLI" "$DOCKER_COMMANDS_BATS"
 
 # CONFIG BOM: an editor's BOM voided the first section in silence.
 cat > "$SED_TMP" << 'SED'
@@ -5831,7 +5831,7 @@ SED
 try "vnext_add_host_present" "adds --add-host when not Docker Desktop" "$CLI" "$HOOKS_BATS"
 
 cat > "$SED_TMP" << 'SED'
-s@  if ! _is_docker_desktop 2>\/dev\/null; then@  if _is_docker_desktop 2>\/dev\/null; then@
+s@  if \[ "[$]_eg_caged" != 1 \] && ! _is_docker_desktop 2>\/dev\/null; then@  if [ "$_eg_caged" != 1 ] \&\& _is_docker_desktop 2>\/dev\/null; then@
 SED
 try "vnext_add_host_desktop_gate" "adds --add-host when not Docker Desktop" "$CLI" "$HOOKS_BATS"
 
@@ -15023,6 +15023,103 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_start_never_recreates" "a missing gateway refuses cleat start and names egress restart" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# Gateways are never boxes (8.8, 8.9).
+cat > "$SED_TMP" << 'SED'
+/^cmd_ps()/,/^}$/{
+  /sh.cleat.role/d
+}
+SED
+try "vnext_ps_excludes_gateway" "cleat ps showed a gateway as a box" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_status()/,/^}$/{
+  /sh.cleat.role/d
+}
+SED
+try "vnext_status_excludes_gateway" "cleat status never lists a gateway as a box" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_stop_all()/,/^}$/{
+  s@^    _role="[$](_container_label "[$]_c" sh.cleat.role)"$@    _role=""@
+}
+SED
+try "vnext_stop_all_excludes_gateway" "cleat stop-all stops a gateway after its box" "$CLI" "$DOCKER_COMMANDS_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_nuke()/,/^}$/{
+  s@^    _role="[$](_container_label "[$]_c" sh.cleat.role)"$@    _role=""@
+}
+SED
+try "vnext_nuke_gateways_first" "removes gateways, then boxes, then socket volumes" "$CLI" "$NUKE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_sweep_idle_boxes()/,/^}$/{
+  /_egress_sweep_gateways/d
+}
+SED
+try "vnext_egress_sweep_gateway_pass" "the idle sweep leaves a gateway running forever" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+s|^_EGRESS_CREATE_GRACE_SECS=60|_EGRESS_CREATE_GRACE_SECS=0|
+SED
+try "vnext_egress_create_window_guard" "a concurrent sweep reaped a gateway mid-create" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_sweep_gateways()/,/^}$/{
+  s@^    if \[ -n "[$]self_bh" \] && \[ "[$]gfor" = "[$]self_bh" \]; then continue; fi$@    :@
+}
+SED
+try "vnext_egress_sweep_spares_self" "the idle sweep never stops the gateway of the box being launched" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_sweep_gateways()/,/^}$/{
+  s@^      \[ "[$]health" = starting \] && continue$@      :@
+}
+SED
+try "vnext_egress_sweep_spares_starting" "the idle sweep never stops a starting gateway whose box is stopped" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_sweep_gateways()/,/^}$/{
+  s@--format '{{.Names}}|{{.State}}' 2>/dev/null)" || return 0@--format '{{.Names}}|{{.State}}' 2>/dev/null)" || :@
+}
+SED
+try "vnext_egress_sweep_enumeration_checked" "the idle sweep acts on nothing when an enumeration fails" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_sweep_gateways()/,/^}$/{
+  s@^    case "[$]gfor" in ????????????) ;; \*) continue ;; esac$@    :@
+}
+SED
+try "vnext_egress_sweep_hash_only" "the idle sweep ignores a gateway label that is not a box hash" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_sweep_gateways()/,/^}$/{
+  s@^    if \[ -n "[$]crt" \] && _egress_create_marker_fresh "[$]crt"; then continue; fi$@    :@
+}
+SED
+try "vnext_egress_sweep_volume_window" "keeps one inside it" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_prune()/,/^}$/{
+  s@; _gateway_image_candidates)@)@
+}
+SED
+try "vnext_egress_gateway_image_reclaimed" "a superseded gateway image was never reclaimed" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_gateway_image_candidates()/,/^}$/{
+  s@^    \[\[ -n "[$]keep" && "[$]id" == "[$]keep" \]\] && continue$@    :@
+}
+SED
+try "vnext_egress_prune_keeps_pin" "a dangling gateway image with no gateway is offered" "$CLI" "$PRUNE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_storage()/,/^}$/{
+  s@^  if (( gw_img_n > 0 || sock_n > 0 )); then$@  if true; then@
+}
+SED
+try "vnext_storage_egress_lines_only_when_used" "gateway images are reported on their own line" "$CLI" "$STORAGE_BATS"
 
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.

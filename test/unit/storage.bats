@@ -158,3 +158,23 @@ _stub_storage_docker() {
   run _fmt_gb 32212254720
   assert_output "30 GB"
 }
+
+@test "storage: gateway images are reported on their own line" {
+  _gateway_image_ids() { printf 'sha256:aaa\nsha256:bbb\n'; }
+  _egress_sock_volumes() { :; }
+  run cmd_storage
+  assert_success
+  assert_output --partial " 2 egress gateway images, 0 egress socket volumes"
+  # With egress off there is no such line at all.
+  _gateway_image_ids() { :; }
+  run cmd_storage
+  refute_output --partial "egress gateway"
+}
+
+@test "storage: gateway volumes are reported on their own line" {
+  _gateway_image_ids() { printf 'sha256:aaa\n'; }
+  _egress_sock_volumes() { printf 'cleat-gw-0123456789ab-sock\n'; }
+  run cmd_storage
+  assert_success
+  assert_output --partial " 1 egress gateway image, 1 egress socket volume"
+}

@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 load "../setup"
+load "../lib/egress_fixtures"
 setup() {
   _common_setup
   use_docker_stub
@@ -911,7 +912,7 @@ EOF
   assert_success
   run docker_calls
   assert_output --partial "docker stop cleat-a-111"
-  assert_output --partial "docker rm cleat-a-111"
+  assert_output --partial "docker rm -f cleat-a-111"
 }
 
 @test "clean: removes image" {
@@ -1455,4 +1456,66 @@ SH
   assert_output "$(id -u) $(id -g)"
   run grep -c 'cleat-uidmap' "$DOCKER_CALLS"
   assert_output "0"
+}
+
+# ── A gateway is never a box (8.9) ──────────────────────────────────────────
+
+@test "docker commands: cleat ps never lists a gateway as a box" {
+  local box=cleat-proj-abcdef12 gw=cleat-gw-0123456789ab
+  printf '%s\tUp 1 minute\n%s\tUp 1 minute (healthy)\n' "$box" "$gw" > "$DOCKER_MOCK_DIR/ps_a_output"
+  mock_docker_inspect_field "$box" "$T_PSMETA" "|main|true|$TEST_TEMP/project"
+  mock_docker_inspect_field "$gw" "$T_PSMETA" "ROLE=gateway||true|"
+  run cmd_ps
+  assert_success
+  assert_output --partial "$box"
+  refute_output --partial "$gw"
+  # Only gateways: still no box.
+  printf '%s\tUp 1 minute (healthy)\n' "$gw" > "$DOCKER_MOCK_DIR/ps_a_output"
+  run cmd_ps
+  assert_output --partial "No containers found."
+}
+
+@test "docker commands: cleat status never lists a gateway as a box" {
+  # The fixture defeats both implicit filters: the name carries the project
+  # hash and /workspace is the project, so only the role keeps it out.
+  mkdir -p "$TEST_TEMP/project"
+  local main hash impostor
+  main="$(container_name_for "$TEST_TEMP/project")"
+  hash="${main##*-}"
+  impostor="cleat-gw-x-$hash-relay"
+  printf '%s\n%s\n' "$main" "$impostor" > "$DOCKER_MOCK_DIR/ps_a_output"
+  mock_docker_inspect_field "$main" "$T_PSMETA" "|main|true|$TEST_TEMP/project"
+  mock_docker_inspect_field "$impostor" "$T_PSMETA" "ROLE=gateway|relay|true|$TEST_TEMP/project"
+  mock_docker_ps "$main"
+  run cmd_status "$TEST_TEMP/project"
+  refute_output --partial "relay"
+  # The same row without the role is a box, so the fixture is not vacuous.
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  mock_docker_inspect_field "$main" "$T_PSMETA" "|main|true|$TEST_TEMP/project"
+  mock_docker_inspect_field "$impostor" "$T_PSMETA" "|relay|true|$TEST_TEMP/project"
+  run cmd_status "$TEST_TEMP/project"
+  assert_output --partial "relay"
+}
+
+@test "docker commands: cleat stop-all stops a gateway after its box" {
+  CN=cleat-proj-abcdef12
+  egress_box_names
+  printf '%s\n%s\n' "$CN" "$GW" > "$DOCKER_MOCK_DIR/ps_a_output"
+  mock_docker_inspect_field "$CN" "$T_ROLE" ""
+  mock_docker_inspect_field "$GW" "$T_ROLE" "LABEL=gateway"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-rendered/$BH"
+  run cmd_stop_all
+  assert_success
+  assert_output --partial "removed $CN"
+  refute_output --partial "removed $GW"
+  local bs gs gr
+  bs="$(grep -n "^docker stop $CN\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  gs="$(grep -n "^docker stop $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  gr="$(grep -n "^docker rm -f $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  [ -n "$bs" ] && [ -n "$gs" ] && [ -n "$gr" ]
+  [ "$bs" -lt "$gs" ] && [ "$gs" -lt "$gr" ]
+  # A daemon with only gateways has nothing to stop.
+  printf '%s\n' "$GW" > "$DOCKER_MOCK_DIR/ps_a_output"
+  run cmd_stop_all
+  assert_output --partial "Nothing to stop."
 }

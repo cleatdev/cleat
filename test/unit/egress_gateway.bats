@@ -967,3 +967,164 @@ stopped_caged() {
   run grep -c "^docker start " "$DOCKER_CALLS"
   assert_output "0"
 }
+
+# ── The idle sweep's gateway pass (8.8, 8.9) ────────────────────────────────
+
+# A box's gateway as the two enumerations answer it, each for its own filter,
+# and no running box for the sweep's own loop.
+sweep_setup() {
+  CN=cleat-proj-abcdef12
+  egress_box_names
+  _running_cleat_boxes() { :; }
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-rendered/$BH"
+  mock_docker_inspect_field "$GW" "$T_HEALTH" healthy
+}
+sweep_gws() { mock_docker_ps_filter "$1" "label=sh.cleat.role=gateway"; }
+sweep_boxes() { mock_docker_ps_filter "$1" "label=sh.cleat.version"; }
+acted() { grep -cE "^docker (stop|rm -f|volume rm) (cleat-gw-|$VOL)" "$DOCKER_CALLS" || true; }
+
+@test "egress: the idle sweep stops a gateway whose box is stopped" {
+  sweep_setup
+  sweep_gws "$GW|$BH|running"
+  sweep_boxes "$CN|exited"
+  run _sweep_idle_boxes ""
+  assert_success
+  assert_output ""
+  run grep -c "^docker stop $GW\$" "$DOCKER_CALLS"
+  assert_output "1"
+  # Stopped, never removed: a start brings it back.
+  run grep -c "^docker rm -f $GW\|^docker volume rm" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress: the idle sweep never stops a gateway whose box is running" {
+  sweep_setup
+  sweep_gws "$GW|$BH|running"
+  local st
+  for st in running restarting paused; do
+    sweep_boxes "$CN|$st"
+    : > "$DOCKER_CALLS"
+    run _sweep_idle_boxes ""
+    run acted
+    assert_output "0"
+  done
+}
+
+@test "egress: the idle sweep never stops a starting gateway whose box is stopped" {
+  sweep_setup
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  mock_docker_inspect_field "$GW" "$T_HEALTH" starting
+  sweep_gws "$GW|$BH|running"
+  sweep_boxes "$CN|exited"
+  run _sweep_idle_boxes ""
+  run acted
+  assert_output "0"
+}
+
+@test "egress: the idle sweep never stops the gateway of the box being launched" {
+  sweep_setup
+  sweep_gws "$GW|$BH|running"
+  sweep_boxes "$CN|exited"
+  run _sweep_idle_boxes "$CN"
+  run acted
+  assert_output "0"
+  # And with no box at all yet: the launch is creating it.
+  sweep_boxes ""
+  run _sweep_idle_boxes "$CN"
+  run acted
+  assert_output "0"
+}
+
+@test "egress: the idle sweep skips a gateway inside the create window" {
+  sweep_setup
+  sweep_gws "$GW|$BH|running"
+  sweep_boxes ""
+  mkdir -p "$CLEAT_RUN_DIR/$CN/egress"
+  : > "$CLEAT_RUN_DIR/$CN/egress/creating"
+  run _sweep_idle_boxes ""
+  run acted
+  assert_output "0"
+  [ -d "$CLEAT_CONFIG_DIR/egress-rendered/$BH" ]
+}
+
+@test "egress: the idle sweep removes an orphaned gateway with its volume" {
+  sweep_setup
+  sweep_gws "$GW|$BH|running"
+  sweep_boxes ""
+  run _sweep_idle_boxes ""
+  assert_output ""
+  run grep -c "^docker rm -f $GW\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c "^docker volume rm $VOL\$" "$DOCKER_CALLS"
+  assert_output "1"
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-rendered/$BH" ]
+}
+
+@test "egress: the idle sweep finds a creating box's marker through its run dir" {
+  # A marker older than the window is an orphan like any other, and goes with it.
+  sweep_setup
+  sweep_gws "$GW|$BH|running"
+  sweep_boxes ""
+  mkdir -p "$CLEAT_RUN_DIR/$CN/egress"
+  touch -t 200001010000 "$CLEAT_RUN_DIR/$CN/egress/creating"
+  run _sweep_idle_boxes ""
+  run grep -c "^docker rm -f $GW\$" "$DOCKER_CALLS"
+  assert_output "1"
+  [ ! -e "$CLEAT_RUN_DIR/$CN/egress/creating" ]
+}
+
+@test "egress: the idle sweep acts on nothing when an enumeration fails" {
+  sweep_setup
+  sweep_gws "$GW|$BH|running"
+  sweep_boxes ""
+  export DOCKER_PS_EXIT_CODE=1
+  run _sweep_idle_boxes ""
+  run acted
+  assert_output "0"
+  unset DOCKER_PS_EXIT_CODE
+  # Only the box list failing: a gateway that looks orphaned is not removed.
+  docker() {
+    if [ "$1" = ps ] && [[ " $* " == *" label=sh.cleat.version "* ]]; then return 1; fi
+    command docker "$@"
+  }
+  : > "$DOCKER_CALLS"
+  run _sweep_idle_boxes ""
+  run acted
+  assert_output "0"
+}
+
+@test "egress: the idle sweep ignores a gateway label that is not a box hash" {
+  # Every container run from the gateway image inherits its role label, a
+  # hand-run debug container included.
+  sweep_setup
+  sweep_gws "$(printf 'cleat-gw-debug||running\ncleat-gw-x|NOT12HEX|running')"
+  sweep_boxes ""
+  run _sweep_idle_boxes ""
+  run grep -c "^docker rm -f\|^docker stop" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress: the idle sweep removes a dangling socket volume outside the create window and keeps one inside it" {
+  sweep_setup
+  sweep_gws "cleat-gw-ffffffffffff|ffffffffffff|running"
+  sweep_boxes "cleat-other-11111111|running"
+  printf '%s|%s\n' "$VOL" "$BH" > "$DOCKER_MOCK_DIR/volume_ls_output"
+  mkdir -p "$CLEAT_RUN_DIR/$CN/egress"
+  : > "$CLEAT_RUN_DIR/$CN/egress/creating"
+  run _sweep_idle_boxes ""
+  run grep -c "^docker volume rm $VOL\$" "$DOCKER_CALLS"
+  assert_output "0"
+  rm -f "$CLEAT_RUN_DIR/$CN/egress/creating"
+  : > "$DOCKER_CALLS"
+  run _sweep_idle_boxes ""
+  run grep -c "^docker volume rm $VOL\$" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "egress: a sweep on a machine with no gateway makes one docker call" {
+  _running_cleat_boxes() { :; }
+  : > "$DOCKER_CALLS"
+  run _sweep_idle_boxes ""
+  run cat "$DOCKER_CALLS"
+  assert_output "docker ps -a --filter label=sh.cleat.role=gateway --format {{.Names}}|{{.Label \"sh.cleat.gateway-for\"}}|{{.State}}"
+}

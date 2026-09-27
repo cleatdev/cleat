@@ -74,6 +74,7 @@ teardown() { _common_teardown; }
 @test "prune: an image kept by docker (in use) is counted, not forced" {
   _prebuilt_image_tags() { printf '%s\t1GB\n' "${REGISTRY_BASE}:v0.12.2"; }
   _dangling_cleat_images() { :; }
+  _gateway_image_candidates() { :; }
   export DOCKER_EXIT_CODE=1   # rmi refuses (image in use)
   run cmd_prune
   assert_success
@@ -1347,4 +1348,44 @@ teardown() { _common_teardown; }
   assert_success
   assert_output --partial "No reclaimable build cache"
   refute_output --partial "Reclaimed 0B"
+}
+
+# ── Gateway images (8.9 rule GW3) ───────────────────────────────────────────
+
+# The gateway-labelled image IDs and the pinned image's ID, answered per call.
+_gw_images() {                           # <pinned id> <labelled ids...>
+  GWPIN="$1"; shift
+  GWIDS="$(printf '%s\n' "$@")"
+  docker() {
+    if [ "$1" = image ] && [ "$2" = inspect ]; then printf '%s\n' "$GWPIN"; return 0; fi
+    if [ "$1" = images ] && [[ " $* " == *" label=sh.cleat.role=gateway "* ]]; then
+      echo "docker $*" >> "$DOCKER_CALLS"; printf '%s\n' "$GWIDS"; return 0
+    fi
+    command docker "$@"
+  }
+}
+
+@test "prune: a dangling gateway image with no gateway is offered" {
+  _gw_images sha256:pinned sha256:pinned sha256:superseded
+  run _gateway_image_candidates
+  assert_output "sha256:superseded"
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  run cmd_prune
+  assert_success
+  run grep -c "^docker rmi sha256:superseded\$" "$DOCKER_CALLS"
+  assert_output "1"
+  # The pinned image itself is never removed.
+  run grep -c "^docker rmi sha256:pinned" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "prune: a gateway image pinned by a running gateway is not offered" {
+  _gw_images sha256:pinned sha256:pinned sha256:inuse
+  _prebuilt_image_tags() { :; }
+  _dangling_cleat_images() { :; }
+  _container_image_ids() { printf 'sha256:inuse\n'; }
+  _image_id_of() { printf '%s' "$1"; }
+  run _cleat_prunable_stats
+  assert_output "$(printf '0\t0')"
 }

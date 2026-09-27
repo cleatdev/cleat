@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 load "../setup"
+load "../lib/egress_fixtures"
 setup() {
   _common_setup
   use_docker_stub
@@ -101,4 +102,48 @@ _run_nuke_with_input() {
   run bash -c 'set -euo pipefail; export PATH="'"$MOCK_BIN"':$PATH"; source "'"$CLI"'"; cmd_nuke < /dev/null'
   assert_success
   assert_output --partial "Aborted"
+}
+
+# A box and its gateway, with the egress state a caged box leaves on the host.
+_nuke_caged() {
+  CN=cleat-proj-abcdef12
+  egress_box_names
+  printf '%s\n%s\n' "$CN" "$GW" > "$DOCKER_MOCK_DIR/ps_a_output"
+  mock_docker_inspect_field "$CN" "$T_ROLE" ""
+  mock_docker_inspect_field "$GW" "$T_ROLE" "LABEL=gateway"
+  printf '%s\n' "$VOL" > "$DOCKER_MOCK_DIR/volume_ls_output"
+  printf 'sha256:0000000000000000000000000000000000000000000000000000000000000abc\n' > "$DOCKER_MOCK_DIR/images_output"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-rendered/$BH" "$CLEAT_CONFIG_DIR/egress-boxes" "$CLEAT_CONFIG_DIR/egress-pins"
+  printf '[egress]\nmode = off\n' > "$CLEAT_CONFIG_DIR/egress-boxes/$CN"
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'global pin\n' > "$CLEAT_CONFIG_DIR/egress-pins/global"
+}
+
+@test "nuke: removes gateways, then boxes, then socket volumes, then rendered policy directories and gateway images" {
+  _nuke_caged
+  run cmd_nuke <<< "nuke"
+  assert_success
+  assert_output --partial "removed $CN"
+  refute_output --partial "removed $GW"
+  local g b v
+  g="$(grep -n "^docker rm -f $GW\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  b="$(grep -n "^docker rm -f $CN\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  v="$(grep -n "^docker volume rm $VOL\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  [ -n "$g" ] && [ -n "$b" ] && [ -n "$v" ]
+  [ "$g" -lt "$b" ] && [ "$b" -lt "$v" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-rendered" ]
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$CN" ]
+  run grep -c "^docker rmi -f sha256:0000000000000000000000000000000000000000000000000000000000000abc\$" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "nuke: keeps the global egress section and the global pin" {
+  _nuke_caged
+  run cmd_nuke <<< "nuke"
+  assert_success
+  run cat "$CLEAT_GLOBAL_CONFIG" "$CLEAT_CONFIG_DIR/egress-pins/global"
+  assert_output "[egress]
+mode = strict
+global pin"
 }

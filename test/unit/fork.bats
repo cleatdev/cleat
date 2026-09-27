@@ -270,7 +270,7 @@ teardown() { _common_teardown; }
   hash="$(echo -n "$TEST_TEMP/project" | _md5 | head -c 8)"
   bname="cleat-project-${hash}-feat"
   printf '%s\n' "$bname" > "$DOCKER_MOCK_DIR/ps_a_output"
-  printf 'feat|true|%s\n' "$CLEAT_FORKS_DIR/$bname" > "$DOCKER_MOCK_DIR/inspect_output"
+  printf '|feat|true|%s\n' "$CLEAT_FORKS_DIR/$bname" > "$DOCKER_MOCK_DIR/inspect_output"
   run cmd_status "$TEST_TEMP/project"
   assert_success
   assert_output --partial "feat"

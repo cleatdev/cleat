@@ -263,3 +263,18 @@ desktop() {
   run grep -c "gw-admin" "$DOCKER_CALLS"
   assert_output "0"
 }
+
+@test "egress restart: an unvalidated engine refuses" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf engine-linux; }
+  container_exists() { return 0; }
+  _egress_label_read() { _EG_LABEL_SET=1; _EG_LABEL=v1:0000000000000000; return 0; }
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress restart
+  assert_failure
+  assert_output --partial "not validated on this Docker engine"
+  run grep -cE "^docker (run|rm)" "$DOCKER_CALLS"
+  assert_output "0"
+}

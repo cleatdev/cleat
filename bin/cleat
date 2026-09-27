@@ -10941,8 +10941,11 @@ _egress_shim_alive() {
 # (the relay beats every second for its first ten), which keeps [setup] and the
 # first exec from racing it. A stale relay prints the one remedy. Always 0: a
 # heartbeat is the box's word, and cleat shell must still open on a broken box.
+_EG_SKIP_SHIM_NOTE=0
 _egress_shim_note() {                    # <cname>
   local gw ticks=0 max=0
+  # restart --shim runs the gate first and is itself the remedy.
+  [ "$_EG_SKIP_SHIM_NOTE" = 1 ] && return 0
   gw="$(_egress_gateway_name "$1")"
   if _egress_shim_alive "$gw"; then return 0; fi
   if [ "$_EG_SHIM_AGE" = "-1" ]; then
@@ -12062,11 +12065,14 @@ _egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <s
   local verb="$1" cname
   _set_box "${2:-main}"
   cname="$(_egress_target_cname "$_BOX")"
+  # The workspace the gate's containment check reads.
+  _RESOLVED_PROJECT="${_RESOLVED_PROJECT:-$(resolve_project "$PWD")}"
   case "$verb" in
     why) _egress_cmd_why "$3" "$cname"; return $? ;;
     test) _egress_cmd_test "$3" "$cname"; return $? ;;
     log) _egress_cmd_log "$cname" "$5"; return $? ;;
     reload) _egress_cmd_reload "$cname"; return $? ;;
+    restart) _egress_cmd_restart "$cname" "$6" "$7"; return $? ;;
   esac
   error "${BOLD}cleat egress $verb${RESET} is not built yet."
   return 1
@@ -12239,6 +12245,121 @@ _egress_refusing_boxes_note() {
   _EG_REFUSING=$count
 }
 _EG_REFUSING=0
+
+# cleat egress restart [box]: replace the gateway of a box that stays. The
+# remedy for a gateway missing, stopped under a running box or displaced. It
+# never creates the socket volume (a volume that has gone is a recreate, not
+# a restart), removes the old gateway before the new one runs, takes the
+# socket owner from the box's own frozen environment, and heals a live session
+# with no box restart. --pull pulls the pinned image first. --shim restarts
+# the in-box relay instead and leaves the gateway alone.
+_egress_cmd_restart() {                  # <cname> <shim> <pull>
+  local cname="$1" shim="${2:-0}" pull="${3:-0}" gw bh v kind ids err sb
+  sb="$(_sessions_safe_str "${_BOX:-main}")"
+  gw="$(_egress_gateway_name "$cname")"
+  bh="$(_egress_box_hash "$cname")"
+  if [ "$shim" = 1 ] && [ "$pull" = 1 ]; then
+    error "${BOLD}--pull${RESET} applies to the gateway, not the in-box relay."
+    return 1
+  fi
+  if ! _daemon_up; then error "Docker is not running."; return 1; fi
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in
+    strict|open) ;;
+    *)
+      error "Egress control is off for box ${BOLD}${sb}${RESET}, so it has no gateway."
+      echo -e "    ${DIM}Turn it on:${RESET}  ${BOLD}cleat egress${RESET}"
+      return 1 ;;
+  esac
+  if ! container_exists "$cname"; then
+    error "Box ${BOLD}${sb}${RESET} does not exist yet. Its gateway is created with it:  ${BOLD}cleat${RESET}"
+    return 1
+  fi
+  if ! _egress_label_read "$cname" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then
+    error "Box ${BOLD}${sb}${RESET} was created without egress control, so it has no gateway to restart."
+    echo -e "    It refuses to start until it is recreated:  $(_egress_recreate_words "$cname")"
+    return 1
+  fi
+  kind="$(_egress_engine_kind)"
+  if ! _egress_engine_validated "$kind"; then _egress_engine_refusal "$kind"; return 1; fi
+  if [ "$shim" = 1 ]; then _egress_restart_shim "$cname"; return $?; fi
+  v="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker volume inspect --format \
+    '{{index .Labels "sh.cleat.role"}} {{index .Labels "sh.cleat.gateway-for"}}' "$(_egress_sock_volume "$cname")" 2>/dev/null)" || v=""
+  if [ "$v" != "egress-sock $bh" ]; then
+    _egress_refuse gateway "its socket volume is gone, and a restart never makes one." \
+      "$(_egress_recreate_words "$cname") recreates the box with it"
+    return 1
+  fi
+  if [ "$pull" = 1 ]; then
+    _egress_gateway_image_ensure force || return 1
+  else
+    _egress_gateway_image_ensure || return 1
+  fi
+  if ! _egress_render_policy "$cname" "$_EG_MODE" "$_EG_HOSTS"; then
+    _egress_create_refusal render "$cname" ""
+    return 1
+  fi
+  if ! ids="$(_egress_box_sock_ids "$cname")"; then
+    _egress_refuse box "cleat could not read the uid the box runs as." "check that Docker is healthy, then re-run ${BOLD}cleat egress restart${RESET}"
+    return 1
+  fi
+  # No new gateway before the old one is gone (8.5).
+  docker rm -f "$gw" >/dev/null 2>&1 || true
+  if ! err="$(_egress_gateway_run "$cname" "${ids%%:*}" "${ids##*:}")"; then
+    _egress_refuse gateway "its gateway did not start." "check that Docker is healthy, then re-run ${BOLD}cleat egress restart${RESET}"
+    if [ -n "$err" ]; then printf '%s\n' "$err"; fi
+    return 1
+  fi
+  if ! _egress_poll_healthy "$gw"; then
+    _egress_refuse gateway "its gateway did not come back healthy." "${BOLD}docker logs ${gw}${RESET} shows why"
+    return 1
+  fi
+  if is_running "$cname"; then
+    # A heartbeat now, so the next gate reads a fresh relay and not -1.
+    _run_bounded "$_EGRESS_PROBE_BOUND_S" docker exec -u "$ids" "$cname" /usr/local/bin/cleat-egress-shim --beat >/dev/null 2>&1 || true
+    if _container_has_kit_mounts "$cname"; then _generate_kit_overlay "$cname"; fi
+    success "Box ${BOLD}${sb}${RESET}'s gateway restarted and healthy."
+  else
+    docker stop "$gw" >/dev/null 2>&1 || true
+    info "Box ${BOLD}${sb}${RESET}'s gateway is ready. Start the box:  ${BOLD}cleat start${RESET}"
+  fi
+  return 0
+}
+
+# restart --shim: start the in-box relay again, as coder, and never touch the
+# gateway. A supervisor that is still alive holds its lock, and the new copy
+# exits. The verdict is the gateway's, never anything the box prints.
+_egress_restart_shim() {                 # <cname>
+  local cname="$1" gw ids ticks=0 max=0 sb
+  sb="$(_sessions_safe_str "${_BOX:-main}")"
+  gw="$(_egress_gateway_name "$cname")"
+  if ! is_running "$cname"; then
+    error "Box ${BOLD}${sb}${RESET} is not running, so it has no relay to restart."
+    echo -e "    ${DIM}Start it:${RESET}  ${BOLD}cleat start${RESET}"
+    return 1
+  fi
+  resolve_caps "$_RESOLVED_PROJECT" readonly >/dev/null 2>&1 || true
+  _EG_SKIP_SHIM_NOTE=1
+  if ! _egress_require "$cname" restart; then _EG_SKIP_SHIM_NOTE=0; return 1; fi
+  _EG_SKIP_SHIM_NOTE=0
+  ids="$(_egress_box_sock_ids "$cname")" || ids=""
+  docker exec -d "$cname" runuser -u coder -- /usr/local/bin/cleat-egress-shim >/dev/null 2>&1 || true
+  if [ -n "$ids" ]; then
+    _run_bounded "$_EGRESS_PROBE_BOUND_S" docker exec -u "$ids" "$cname" /usr/local/bin/cleat-egress-shim --beat >/dev/null 2>&1 || true
+  fi
+  max=$(( _EGRESS_HEALTH_WAIT_SECS * 5 ))
+  while [ "$ticks" -lt "$max" ]; do
+    if _egress_shim_alive "$gw" && [ "$_EG_SHIM_AGE" -lt 5 ]; then
+      success "The in-box relay answered."
+      return 0
+    fi
+    sleep 0.2
+    ticks=$(( ticks + 1 ))
+  done
+  error "The relay started, but the gateway heard no heartbeat. This is not a policy denial."
+  echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart${RESET}"
+  return 1
+}
 
 # ── why, log and test (6.2, 9.3) ──
 # All three render from the host: the resolved policy, the shipped catalogue,

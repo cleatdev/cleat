@@ -130,8 +130,11 @@ _nuke_caged() {
   g="$(grep -n "^docker rm -f $GW\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
   b="$(grep -n "^docker rm -f $CN\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
   v="$(grep -n "^docker volume rm $VOL\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
-  [ -n "$g" ] && [ -n "$b" ] && [ -n "$v" ]
-  [ "$g" -lt "$b" ] && [ "$b" -lt "$v" ]
+  [ -n "$g" ]
+  [ -n "$b" ]
+  [ -n "$v" ]
+  [ "$g" -lt "$b" ]
+  [ "$b" -lt "$v" ]
   [ ! -e "$CLEAT_CONFIG_DIR/egress-rendered" ]
   [ ! -e "$CLEAT_CONFIG_DIR/egress-boxes/$CN" ]
   run grep -c "^docker rmi -f sha256:0000000000000000000000000000000000000000000000000000000000000abc\$" "$DOCKER_CALLS"

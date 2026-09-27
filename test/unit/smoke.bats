@@ -3526,3 +3526,13 @@ SH
   run cleat_bin egress reload < /dev/null
   refute_output --partial "unbound variable"
 }
+
+@test "smoke: cleat egress restart and restart --shim on a box with no policy exit 1 cleanly" {
+  run cleat_bin egress restart < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "so it has no gateway"
+  run cleat_bin egress restart --shim < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+}

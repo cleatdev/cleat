@@ -912,7 +912,9 @@ stopped_caged() {
   local g b
   g="$(grep -n "^docker start $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
   b="$(grep -n "^docker start $CN\$" "$DOCKER_CALLS" | cut -d: -f1)"
-  [ -n "$g" ] && [ -n "$b" ] && [ "$g" -lt "$b" ]
+  [ -n "$g" ]
+  [ -n "$b" ]
+  [ "$g" -lt "$b" ]
   # The policy was rendered before the gateway started: its bind source.
   [ -f "$(_egress_policy_dir "$CN")/policy.json" ]
 }
@@ -925,7 +927,9 @@ stopped_caged() {
   local g b
   g="$(grep -n "^docker start $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
   b="$(grep -n "^docker start $CN\$" "$DOCKER_CALLS" | cut -d: -f1)"
-  [ -n "$g" ] && [ -n "$b" ] && [ "$g" -lt "$b" ]
+  [ -n "$g" ]
+  [ -n "$b" ]
+  [ "$g" -lt "$b" ]
 }
 
 @test "egress: a missing gateway refuses cleat start and names egress restart" {
@@ -1249,7 +1253,8 @@ ${ROW2%\\n}"
   use_gw_admin_stub
   mock_gw_admin log-state "ok log-state 1790000000123 512"
   _egress_denials_mark "$CN"
-  [ "$_EG_MARK_GEN" = 1790000000123 ] && [ "$_EG_MARK_OFF" = 512 ]
+  [ "$_EG_MARK_GEN" = 1790000000123 ]
+  [ "$_EG_MARK_OFF" = 512 ]
   run _egress_denials_mark_read "$CN"
   assert_output "1790000000123:512"
   run count_calls "gw-admin log-state"
@@ -1257,7 +1262,8 @@ ${ROW2%\\n}"
   # Anything but two numbers leaves no mark, and a reader then reads all.
   mock_gw_admin log-state "ok log-state x 512"
   _egress_denials_mark "$CN"
-  [ -z "$_EG_MARK_GEN" ] && [ "$_EG_MARK_OFF" = 0 ]
+  [ -z "$_EG_MARK_GEN" ]
+  [ "$_EG_MARK_OFF" = 0 ]
 }
 
 @test "egress log: allowed connections come from the gateway's own output" {
@@ -1462,4 +1468,140 @@ digest_after_allow() {                   # <host>
   assert_output "1"
   run grep -c "cleat-gw-$(_egress_box_hash "$other")" "$DOCKER_CALLS"
   assert_output "0"
+}
+
+# ── cleat egress restart (8.7, 8.10) ────────────────────────────────────────
+
+# A caged box, running, whose gateway is gone, ready for a restart: the
+# labelled socket volume live, the gateway image present.
+restart_box() {
+  reload_box
+  mock_docker_volume_inspect_field "$VOL" "$T_VOL" "egress-sock $BH"
+  printf '%s\n' "$VOL" >> "$DOCKER_MOCK_DIR/volumes"
+}
+
+@test "egress: a re-created gateway takes the socket uid from its box's Config.Env" {
+  restart_box
+  int_uidmap_write "4242 4243"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_ENV='HOME=/home/coder\nHOST_UID=5151\nHOST_GID=5152' caged_box
+  mock_docker_volume_inspect_field "$VOL" "$T_VOL" "egress-sock $BH"
+  run cmd_egress restart
+  assert_success
+  run assert_docker_run_has "$GW" "-e CLEAT_SOCK_UID=5151 -e CLEAT_SOCK_GID=5152 "
+  assert_success
+  run _plain "$output"
+}
+
+@test "egress restart: removes the old gateway before running the new one" {
+  restart_box
+  run cmd_egress restart
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Box main's gateway restarted and healthy."
+  local r n
+  r="$(grep -n "^docker rm -f $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
+  n="$(grep -nF -- "--name $GW " "$DOCKER_CALLS" | cut -d: -f1)"
+  [ -n "$r" ]
+  [ -n "$n" ]
+  [ "$r" -lt "$n" ]
+  # The relay is nudged as the box's own uid, so the next gate reads it fresh.
+  run grep -c "^docker exec -u 501:20 $CN /usr/local/bin/cleat-egress-shim --beat" "$DOCKER_CALLS"
+  assert_output "1"
+}
+
+@test "egress restart: never creates the socket volume" {
+  restart_box
+  run cmd_egress restart
+  run grep -c "^docker volume create" "$DOCKER_CALLS"
+  assert_output "0"
+  # A volume that has gone, or lost its labels, is a recreate.
+  rm -rf "$DOCKER_MOCK_DIR/volume_inspect"
+  mock_docker_volume_inspect_field "$VOL" "$T_VOL" " "
+  : > "$DOCKER_CALLS"
+  run cmd_egress restart
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "its socket volume is gone, and a restart never makes one."
+  assert_output --partial "cleat rm && cleat"
+  run grep -cE "^docker (volume create|run)" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress restart: --pull pulls the pinned image first" {
+  restart_box
+  export DOCKER_PULL_EXIT_CODE=0
+  run cmd_egress restart --pull
+  assert_success
+  local p n
+  p="$(grep -n "^docker pull .*$_GATEWAY_IMAGE" "$DOCKER_CALLS" | cut -d: -f1)"
+  n="$(grep -nF -- "--name $GW " "$DOCKER_CALLS" | cut -d: -f1)"
+  [ -n "$p" ]
+  [ "$p" -lt "$n" ]
+  # Without --pull, a present image is not pulled again.
+  : > "$DOCKER_CALLS"
+  run cmd_egress restart
+  run grep -c "^docker pull" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress restart: a box with no egress label refuses with the recreate remedy" {
+  restart_box
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  run cmd_egress restart
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "was created without egress control, so it has no gateway to restart."
+  assert_output --partial "cleat rm && cleat"
+  run grep -c "^docker run" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress restart: a stopped box gets its gateway ready and stopped, and names cleat start" {
+  restart_box
+  is_running() { return 1; }
+  run cmd_egress restart
+  assert_success
+  run _plain "$output"
+  assert_output --partial "gateway is ready. Start the box:  cleat start"
+  run grep -c "^docker stop $GW\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c "cleat-egress-shim --beat" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress restart --shim: starts the relay as coder and never replaces the gateway" {
+  restart_box
+  mock_gw_admin last_shim_seen "ok last_shim_seen 200" "ok last_shim_seen 0"
+  run cmd_egress restart --shim
+  assert_success
+  run _plain "$output"
+  assert_output --partial "The in-box relay answered."
+  refute_output --partial "Shim not listening"
+  run grep -c "^docker exec -d $CN runuser -u coder -- /usr/local/bin/cleat-egress-shim\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -cE "^docker (run|rm).*cleat-gw-" "$DOCKER_CALLS"
+  assert_output "0"
+  run cmd_egress restart --shim --pull
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "--pull applies to the gateway, not the in-box relay."
+}
+
+@test "egress restart --shim: a relay the gateway never hears exits 1 and names egress restart" {
+  restart_box
+  _EGRESS_HEALTH_WAIT_SECS=1
+  mock_gw_admin last_shim_seen "ok last_shim_seen 200"
+  run cmd_egress restart --shim
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "the gateway heard no heartbeat. This is not a policy denial."
+  assert_output --partial "Fix:  cleat egress restart"
+  # A stopped box has no relay to restart.
+  is_running() { return 1; }
+  run cmd_egress restart --shim
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "is not running, so it has no relay to restart."
 }

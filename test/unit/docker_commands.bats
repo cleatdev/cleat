@@ -1512,8 +1512,11 @@ SH
   bs="$(grep -n "^docker stop $CN\$" "$DOCKER_CALLS" | cut -d: -f1)"
   gs="$(grep -n "^docker stop $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
   gr="$(grep -n "^docker rm -f $GW\$" "$DOCKER_CALLS" | cut -d: -f1)"
-  [ -n "$bs" ] && [ -n "$gs" ] && [ -n "$gr" ]
-  [ "$bs" -lt "$gs" ] && [ "$gs" -lt "$gr" ]
+  [ -n "$bs" ]
+  [ -n "$gs" ]
+  [ -n "$gr" ]
+  [ "$bs" -lt "$gs" ]
+  [ "$gs" -lt "$gr" ]
   # A daemon with only gateways has nothing to stop.
   printf '%s\n' "$GW" > "$DOCKER_MOCK_DIR/ps_a_output"
   run cmd_stop_all

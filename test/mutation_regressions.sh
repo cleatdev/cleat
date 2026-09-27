@@ -15390,6 +15390,42 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_writer_ssh_interlock" "a policy write refuses a box with the ssh capability" "$CLI" "$EGRESS_UI_BATS"
 
+# cleat egress restart (8.7).
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_restart()/,/^}$/{
+  s@^  docker rm -f "[$]gw" >/dev/null 2>&1 || true$@  :@
+}
+SED
+try "vnext_egress_restart_removes_first" "removes the old gateway before running the new one" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_restart()/,/^}$/{
+  s@^  if \[ "[$]v" != "egress-sock [$]bh" \]; then$@  if false; then@
+}
+SED
+try "vnext_egress_restart_needs_volume" "egress restart: never creates the socket volume" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_restart()/,/^}$/{
+  s@_egress_gateway_image_ensure force || return 1@_egress_gateway_image_ensure || return 1@
+}
+SED
+try "vnext_egress_restart_pull_forces" "--pull pulls the pinned image first" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_restart()/,/^}$/{
+  s@if ! ids="[$](_egress_box_sock_ids "[$]cname")"; then@if ! ids="$(id -u):$(id -g)"; then@
+}
+SED
+try "vnext_egress_restart_uid_from_box" "a re-created gateway takes the socket uid from its box" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_restart_shim()/,/^}$/{
+  s@docker exec -d "[$]cname" runuser -u coder -- /usr/local/bin/cleat-egress-shim@docker exec -d "$cname" /usr/local/bin/cleat-egress-shim@
+}
+SED
+try "vnext_egress_restart_shim_as_coder" "starts the relay as coder and never replaces the gateway" "$CLI" "$EGRESS_GATEWAY_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

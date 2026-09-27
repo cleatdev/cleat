@@ -3373,10 +3373,11 @@ allow = registry.npmjs.org"
   assert_output --partial "Unknown flag"
 }
 
-@test "smoke: cleat egress why is reserved until enforcement lands" {
-  run cleat_bin egress why github.com < /dev/null
+@test "smoke: cleat egress why with no argument names its form" {
+  run cleat_bin egress why < /dev/null
   assert_failure
-  assert_output --partial "lands with enforcement"
+  refute_output --partial "unbound variable"
+  assert_output --partial "cleat egress why <host|package> [box]"
 }
 
 @test "smoke: cleat egress --help prints the verbs" {

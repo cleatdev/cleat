@@ -334,6 +334,7 @@ pack = github"
 
 @test "egress save: the applies-now line matches the mode transition" {
   mkdir -p "$CLEAT_CONFIG_DIR"
+  _EGRESS_ENFORCING=0
   _egress_editor_load ""
   run _egress_save_screen 1
   assert_success
@@ -597,6 +598,7 @@ mode = strict"
 
 @test "egress status: a saved policy says it is not enforced, in two lines" {
   mkdir -p "$CLEAT_CONFIG_DIR"
+  _EGRESS_ENFORCING=0
   printf '[egress]\nmode = strict\npack = pypi\n' > "$CLEAT_GLOBAL_CONFIG"
   run cmd_egress status
   assert_output --partial "Policy saved. Enforcement lands in a later release."
@@ -1227,4 +1229,122 @@ good.example.test
   printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
   run _egress_config_enable
   assert_output --partial "and nothing else"
+}
+
+# ── Stage three: the verbs, the reason registry, truthful copy ──────────────
+
+@test "egress ui: a verb flag given to another verb is an error" {
+  local pair verb flag owner
+  for pair in "status --refused log" "log --shim restart" "open --pull restart" "restart --always open" "why --refused log"; do
+    set -- $pair
+    verb="$1"; flag="$2"; owner="$3"
+    run cmd_egress "$verb" "$flag"
+    assert_failure
+    run sed $'s/\033\\[[0-9;]*m//g' <<< "$output"
+    assert_output --partial "$flag belongs to cleat egress $owner."
+  done
+}
+
+@test "egress ui: why and test need their argument and take at most a box after it" {
+  run cmd_egress why
+  assert_failure
+  assert_output --partial "Which host or package?"
+  run cmd_egress test
+  assert_failure
+  assert_output --partial "Which host?"
+  run cmd_egress why github.com main extra
+  assert_failure
+  assert_output --partial "Too many arguments"
+}
+
+@test "egress ui: fix and tighten name what works today" {
+  local v
+  for v in fix tighten; do
+    run cmd_egress "$v"
+    assert_failure
+    run sed $'s/\033\\[[0-9;]*m//g' <<< "$output"
+    assert_output --partial "cleat egress $v lands in a later release."
+    assert_output --partial "cleat egress why <host>"
+  done
+}
+
+@test "egress ui: the sni subcode list is closed at six and handshake flood is not one of them" {
+  run bash -c 'set -f; set -- $1; echo $#' _ "$_EGRESS_SNI_SUBCODES"
+  assert_output "6"
+  [[ " $_EGRESS_SNI_SUBCODES " != *" handshake-flood "* ]]
+  [[ " $_EGRESS_REASON_CODES " == *" handshake-flood "* ]]
+  # Exactly the three security codes, and no other code is one.
+  local c
+  for c in $_EGRESS_REASON_CODES; do
+    case "$c" in
+      sni|handshake-flood|address) _egress_log_is_security_code "$c" ;;
+      *) ! _egress_log_is_security_code "$c" ;;
+    esac
+  done
+}
+
+@test "egress ui: a reason code a newer gateway sends prints as itself" {
+  run _egress_reason_text "future-code"
+  assert_output "future-code"
+  run _egress_reason_text $'bad\033[31mcode'
+  refute_output --partial $'\033'
+  # sni and gateway name no command. gateway says it is not a denial.
+  run _egress_reason_text sni
+  refute_output --partial "cleat "
+  run _egress_reason_text gateway
+  assert_output --partial "This is not a policy denial."
+}
+
+@test "egress ui: with enforcement live no surface says it lands later" {
+  _EGRESS_ENFORCING=1
+  _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = pypi\n' > "$CLEAT_GLOBAL_CONFIG"
+  local out=""
+  out+="$(cmd_egress status 2>&1)"
+  out+="$(cmd_egress --list 2>&1)"
+  out+="$(_egress_help 2>&1)"
+  out+="$(cmd_help 2>&1)"
+  _rows_of 40
+  _egress_editor_load ""
+  _egress_measure 26
+  out+="$(_egress_save_screen 1 2>&1)"
+  out+="$(_egress_draw 0 2>&1)"
+  _EGE_RING_BACK=strict
+  _EGE_MODE=open
+  out+="$(_egress_pane_text mode 2>&1)"
+  out+="$(_egress_config_enable 2>&1)"
+  run printf '%s' "$out"
+  refute_output --partial "lands with enforcement"
+  refute_output --partial "land with enforcement"
+  refute_output --partial "Enforcement lands"
+  refute_output --partial "not enforced yet"
+  refute_output --partial "Nothing is filtered today"
+  refute_output --partial "nothing is filtered yet"
+  # The unmeasured-core line stays until the maintainer's measurement.
+  assert_output --partial "not yet been validated against a real Claude Code session"
+}
+
+@test "egress require: the editor still opens on a refused engine" {
+  # Policy is portable: a user may write one here to run elsewhere. Only a
+  # launch refuses, and the editor says so on its engine line.
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf engine-linux; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 40
+  _egress_editor_load ""
+  _egress_measure 26
+  run _egress_draw 0
+  assert_success
+  assert_output --partial "Engine   not validated, a caged box will not start here: Docker Engine"
+  run _egress_save_screen 1
+  assert_success
+  assert_output --partial "a box under this policy will not start here"
+  assert_output --partial "cleat egress off"
+  # A validated engine says a save applies at the next launch.
+  _EGE_ENGINE=""
+  _egress_engine_kind() { printf desktop-macos; }
+  run _egress_draw 0
+  assert_output --partial "Engine   validated, a save applies at the next launch: Docker Desktop"
 }

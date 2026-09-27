@@ -15121,6 +15121,42 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_storage_egress_lines_only_when_used" "gateway images are reported on their own line" "$CLI" "$STORAGE_BATS"
 
+# The reason registry and the security-code selector (9.2, 6.2).
+cat > "$SED_TMP" << 'SED'
+/^_egress_reason_text()/,/^}$/{
+  s|handshake-flood)|hs-flood-unreachable)|
+}
+SED
+try "vnext_egress_reason_registry" "a denial reason code had no rendering in the interface" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_log_is_security_code()/,/^}$/{
+  s@^  case "[$]1" in sni|handshake-flood|address) return 0 ;; esac@  case "$1" in sni|address) return 0 ;; esac@
+}
+SED
+try "vnext_egress_security_codes_closed" "the sni subcode list is closed at six" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress()/,/^}$/{
+  s@^      --refused) \[\[ "[$]sub" == log \]\] || @      --refused) true || @
+}
+SED
+try "vnext_egress_verb_flag_owner" "a verb flag given to another verb is an error" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_not_enforced_lines()/,/^}$/{
+  s@^  if \[ "[$]_EGRESS_ENFORCING" != 1 \]; then$@  if true; then@
+}
+SED
+try "vnext_egress_copy_truthful_when_live" "with enforcement live no surface says it lands later" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_verdict()/,/^}$/{
+  s@not validated, a caged box will not start here: @validated, a save applies at the next launch: @
+}
+SED
+try "vnext_egress_editor_names_engine" "the editor still opens on a refused engine" "$CLI" "$EGRESS_UI_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

@@ -10258,3 +10258,14 @@ mode = off"
   run grep -c "^docker rm -f $GW\$" "$DOCKER_CALLS"
   assert_output "0"
 }
+
+@test "regression vNEXT: a denial reason code had no rendering in the interface" {
+  # A row whose code has no words prints as a bare token, which reads as a
+  # bug to the user it is meant to explain.
+  local c
+  for c in $_EGRESS_REASON_CODES; do
+    run _egress_reason_text "$c"
+    [ -n "$output" ]
+    [ "$output" != "$c" ] || { echo "no words for reason code $c"; return 1; }
+  done
+}

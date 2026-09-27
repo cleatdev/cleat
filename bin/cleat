@@ -10657,9 +10657,13 @@ _egress_start_gateway() {                # <cname>
     _egress_refuse gateway "cleat could not write the policy its gateway reads." "${BOLD}cleat egress restart${RESET}"
     return 1
   fi
-  if ! is_running "$gw" && ! docker start "$gw" >/dev/null 2>&1; then
-    _egress_refuse gateway "its gateway did not start." "${BOLD}cleat egress restart${RESET}"
-    return 1
+  if ! is_running "$gw"; then
+    local _rc=0
+    docker start "$gw" >/dev/null 2>&1 || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      _egress_refuse gateway "its gateway did not start." "${BOLD}cleat egress restart${RESET}"
+      return 1
+    fi
   fi
   if ! _egress_poll_healthy "$gw"; then
     _egress_refuse gateway "its gateway did not become healthy." "${BOLD}cleat egress restart${RESET}"
@@ -11534,10 +11538,43 @@ _egress_summary_row() {                  # <cname>
 # fix, test, log, reload, restart, review, open, tighten, off) are reserved
 # barewords that say when they land.
 
-# The two sentences every stage-two surface prints under a saved policy.
+# The sentences a saved policy prints. The first only while enforcement has
+# not shipped. The second stays until the core pack is measured against a real
+# Claude Code session (12.5).
 _egress_not_enforced_lines() {
-  echo -e "  ${AMBER}Policy saved. Enforcement lands in a later release.${RESET}"
+  if [ "$_EGRESS_ENFORCING" != 1 ]; then
+    echo -e "  ${AMBER}Policy saved. Enforcement lands in a later release.${RESET}"
+  fi
+  _egress_unmeasured_line
+}
+_egress_unmeasured_line() {
   echo -e "  ${DIM}The core pack has not yet been validated against a real Claude Code session.${RESET}"
+}
+
+# The reason codes a denial row carries (9.2), and the only place one becomes
+# words. A code a newer gateway sends that this CLI does not know prints as
+# itself, sanitised, so a row never vanishes. sni names no command: it is a
+# security event, never something to allow.
+_EGRESS_REASON_CODES="policy port sni handshake-flood address upstream gateway"
+_EGRESS_SNI_SUBCODES="no-sni dup-sni sni-mismatch bad-clienthello handshake-timeout no-clienthello"
+_egress_reason_text() {                  # <code>
+  case "$1" in
+    policy) printf 'not in the policy' ;;
+    port) printf 'not port 443, which is never allowed in any mode' ;;
+    sni) printf 'the TLS handshake asked for a different name than the tunnel. A security event, not a policy denial' ;;
+    handshake-flood) printf 'a client rewrote its handshake inside a tunnel already granted. A security event, not a policy denial' ;;
+    address) printf 'the name resolved to a private, loopback or link-local address, refused in every mode' ;;
+    upstream) printf 'allowed, resolved within the last 60 seconds and unreachable' ;;
+    gateway) printf 'the gateway is not serving. This is not a policy denial.' ;;
+    *) printf '%s' "$(_sanitize_repo_str "$1")" ;;
+  esac
+}
+
+# The three codes that are security events rather than policy decisions. The
+# only place they are listed: every filter asks this.
+_egress_log_is_security_code() {
+  case "$1" in sni|handshake-flood|address) return 0 ;; esac
+  return 1
 }
 
 # The box a verb targets: the container name for this project and _BOX, or
@@ -11863,17 +11900,29 @@ _egress_help() {
   echo ""
   echo -e "    ${DIM}--box <name>   target a box whose name is also a subcommand, like status${RESET}"
   echo -e "    ${DIM}The policy lives in ~/.config/cleat/config [egress], never in a project .cleat.${RESET}"
-  echo -e "    ${DIM}Nothing enforces it yet: enforcement lands in a later release.${RESET}"
+  if [ "$_EGRESS_ENFORCING" != 1 ]; then
+    echo -e "    ${DIM}Nothing enforces it yet: enforcement lands in a later release.${RESET}"
+  fi
   echo ""
+}
+
+# The verbs that need a gateway. They act on the directory's box when no box
+# is named (main), the box every 9.3 screen shows. Each is built in its own
+# step and answers as not built yet until then.
+_egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <shim> <pull> <always>
+  local verb="$1"
+  error "${BOLD}cleat egress $verb${RESET} is not built yet."
+  return 1
 }
 
 cmd_egress() {
   local sub="editor" want_list=0 inherit=0 assume_yes=0 box=""
+  local refused=0 shim=0 pull=0 always=0 arg=""
   case "${1:-}" in
-    status|packs|allow|deny|audit) sub="$1"; shift ;;
-    why|fix|test|log|reload|restart|review|open|tighten|off)
-      error "${BOLD}cleat egress $1${RESET} lands with enforcement, in a later release."
-      echo -e "    ${DIM}Today: cleat egress, --list, status, packs, allow, deny and audit. A box named $1 is ${BOLD}--box $1${RESET}${DIM}.${RESET}"
+    status|packs|allow|deny|audit|why|test|log|reload|restart|review|open|off) sub="$1"; shift ;;
+    fix|tighten)
+      error "${BOLD}cleat egress $1${RESET} lands in a later release."
+      echo -e "    ${DIM}Today: ${BOLD}cleat egress why <host>${RESET}${DIM} names the fix for one denial, and ${BOLD}cleat egress allow${RESET}${DIM} applies it.${RESET}"
       return 1 ;;
   esac
   if [[ "${_FORK_REQUESTED:-false}" == true ]]; then
@@ -11887,6 +11936,12 @@ cmd_egress() {
       --list) want_list=1; shift ;;
       --inherit) inherit=1; shift ;;
       --yes|-y) assume_yes=1; shift ;;
+      # Each of these belongs to one verb, and anywhere else is an error that
+      # names it, never a flag quietly ignored.
+      --refused) [[ "$sub" == log ]] || { error "${BOLD}--refused${RESET} belongs to cleat egress log."; return 1; }; refused=1; shift ;;
+      --shim) [[ "$sub" == restart ]] || { error "${BOLD}--shim${RESET} belongs to cleat egress restart."; return 1; }; shim=1; shift ;;
+      --pull) [[ "$sub" == restart ]] || { error "${BOLD}--pull${RESET} belongs to cleat egress restart."; return 1; }; pull=1; shift ;;
+      --always) [[ "$sub" == open ]] || { error "${BOLD}--always${RESET} belongs to cleat egress open."; return 1; }; always=1; shift ;;
       --box)
         if [[ $# -lt 2 || -z "${2:-}" ]]; then error "${BOLD}--box${RESET} needs a box name."; return 1; fi
         box="$2"; shift 2 ;;
@@ -11919,6 +11974,23 @@ cmd_egress() {
       fi
       cmd_egress_audit "${rest[0]:-}"
       return $? ;;
+    why|test)
+      # An argument, then at most a box.
+      if [[ "${#rest[@]}" -gt 2 ]]; then
+        error "Too many arguments: ${BOLD}$(_sanitize_repo_str "${rest[*]}")${RESET}"
+        return 1
+      fi
+      arg="${rest[0]:-}"
+      if [[ -z "$arg" ]]; then
+        if [[ "$sub" == why ]]; then
+          error "Which host or package? ${DIM}cleat egress why <host|package> [box]${RESET}"
+        else
+          error "Which host? ${DIM}cleat egress test <host> [box]${RESET}"
+        fi
+        return 1
+      fi
+      if [[ -z "$box" ]]; then box="${rest[1]:-}"; fi
+      rest=() ;;
   esac
 
   # Every other form takes at most one box positional.
@@ -11941,6 +12013,11 @@ cmd_egress() {
   fi
   if [[ "$want_list" -eq 1 ]]; then _egress_cmd_list "$box"; return $?; fi
   if [[ "$sub" == status ]]; then _egress_cmd_status "$box"; return $?; fi
+  case "$sub" in
+    why|test|log|reload|restart|review|open|off)
+      _egress_verb "$sub" "$box" "$arg" "$assume_yes" "$refused" "$shim" "$pull" "$always"
+      return $? ;;
+  esac
 
   # The editor needs a terminal. On a pipe it prints status and writes nothing.
   if [[ ! -t 0 || ! -t 1 ]]; then
@@ -12518,7 +12595,11 @@ _egress_pane_text() {                    # <row>
           else
             printf 'Open is per box and per session: cleat egress open <box>.\n'
           fi
-          printf 'To pin it for every box, type cleat egress open --always.\nBoth land with enforcement. A save here keeps mode %s.\n' "$_EGE_RING_BACK" ;;
+          if [ "$_EGRESS_ENFORCING" = 1 ]; then
+            printf 'To pin it for every box, type cleat egress open --always.\nA save here keeps mode %s.\n' "$_EGE_RING_BACK"
+          else
+            printf 'To pin it for every box, type cleat egress open --always.\nBoth land with enforcement. A save here keeps mode %s.\n' "$_EGE_RING_BACK"
+          fi ;;
         off) printf 'mode off. Full network egress, as with no policy at all.\n' ;;
         inherit) printf 'inherit. This box keeps the global mode and adds or removes\nhosts through its own file.\n' ;;
       esac
@@ -12625,7 +12706,11 @@ _egress_draw() {                         # <cursor index>
     _egress_line "  Cleat egress   hosts every box may reach" "$BOLD"
     _egress_line "  Scope    global   $(_sessions_safe_str "${_EGE_FILE/#${HOME}/~}") [egress]"
   fi
-  _egress_line "  Saving writes the policy. Enforcement lands in a later release." "$AMBER"
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    _egress_line "  $(_egress_editor_verdict)" "$AMBER"
+  else
+    _egress_line "  Saving writes the policy. Enforcement lands in a later release." "$AMBER"
+  fi
   mark=" "; [ "$cur" -eq 0 ] && mark=">"
   _egress_line "$mark Mode     $_EGE_MODE"
   mark=" "; [ "$cur" -eq 1 ] && mark=">"
@@ -12689,7 +12774,11 @@ _egress_draw() {                         # <cursor index>
   _egress_line "$mark [/] filter               $(_sessions_safe_str "${_EGE_FILTER:-none}")"
   _egress_pane "${rows[cur]}"
   mark=" "; [ "$cur" -eq $((nrows - 1)) ] && mark=">"
-  _egress_line "$mark [>] save                 writes the section, nothing is filtered yet"
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    _egress_line "$mark [>] save                 writes the section"
+  else
+    _egress_line "$mark [>] save                 writes the section, nothing is filtered yet"
+  fi
   _egress_editor_effective
   _egress_line "  ^/v move   space tick   </> mode   enter open   q cancel"
 }
@@ -12887,8 +12976,46 @@ _egress_save_screen() {                  # <assume_yes>
   _write_egress_to_file "$_EGE_FILE" "$mode_out" "$_EGE_PACKS" "$_EGE_DENIES" "$_EGE_HOSTS" "$_EGE_CANON" || return 1
   _EGE_SAVED=1
   success "Saved to ${_EGE_FILE/#${HOME}/~}"
-  echo -e "    Saved. Enforcement lands in a later release. Nothing is filtered today."
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    _egress_save_consequence
+  else
+    echo -e "    Saved. Enforcement lands in a later release. Nothing is filtered today."
+  fi
   return 0
+}
+
+# The editor's engine line (10.6): the verdict on this engine, in every state,
+# measured once per editor. The editor opens, edits and saves on any engine:
+# policy is portable, and only a launch refuses.
+_EGE_ENGINE=""
+_egress_editor_engine() {
+  if [ -z "$_EGE_ENGINE" ]; then
+    if _daemon_up; then _EGE_ENGINE="$(_egress_engine_kind)"; else _EGE_ENGINE=down; fi
+  fi
+}
+_egress_editor_verdict() {
+  _egress_editor_engine
+  # The verdict first: a narrow terminal cuts the engine's name, never it.
+  case "$_EGE_ENGINE" in
+    down) printf 'Engine   checked at launch: Docker is not running' ;;
+    *)
+      if _egress_engine_validated "$_EGE_ENGINE"; then
+        printf 'Engine   validated, a save applies at the next launch: %s' "$(_egress_engine_words "$_EGE_ENGINE")"
+      else
+        printf 'Engine   not validated, a caged box will not start here: %s' "$(_egress_engine_words "$_EGE_ENGINE")"
+      fi ;;
+  esac
+}
+
+# What a save means on this engine, once enforcement is live.
+_egress_save_consequence() {
+  _egress_editor_engine
+  if [ "$_EGE_ENGINE" = down ] || _egress_engine_validated "$_EGE_ENGINE"; then
+    echo -e "    A box takes it at its next launch."
+    return 0
+  fi
+  echo -e "    ${AMBER}This engine is not validated, so a box under this policy will not start here.${RESET}"
+  echo -e "    ${DIM}Switch to $(_egress_engine_words "${_EGRESS_VALIDATED_ENGINES%% *}"), or ${BOLD}cleat egress off${RESET}${DIM}.${RESET}"
 }
 
 # The action screen for a pack or host row: arrows and enter, back last.
@@ -13006,7 +13133,11 @@ _egress_picker_text() {                  # <box or empty>
   [ -n "${_EGE_FILE:-}" ] || _egress_editor_load "$box"
   echo ""
   echo -e "  ${BOLD}Cleat egress${RESET} ${DIM}(typed)${RESET}   ${DIM}${_EGE_FILE/#${HOME}/~} [egress]${RESET}"
-  echo -e "  ${AMBER}Saving writes the policy. Enforcement lands in a later release.${RESET}"
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    echo -e "  ${AMBER}$(_egress_editor_verdict)${RESET}"
+  else
+    echo -e "  ${AMBER}Saving writes the policy. Enforcement lands in a later release.${RESET}"
+  fi
   while :; do
     echo ""
     echo -e "  Mode: ${_EGE_MODE}"
@@ -13031,7 +13162,12 @@ EOF
         case "$p" in
           strict|off) _EGE_MODE="$p" ;;
           # Never saved from the editor, typed or drawn (6.3).
-          open) warn "Open is per box and per session: cleat egress open. It lands with enforcement." ;;
+          open)
+            if [ "$_EGRESS_ENFORCING" = 1 ]; then
+              warn "Open is per box and per session: cleat egress open."
+            else
+              warn "Open is per box and per session: cleat egress open. It lands with enforcement."
+            fi ;;
           inherit) if [ -n "$_EGE_BOX" ]; then _EGE_MODE=inherit; else warn "Only a box can inherit."; fi ;;
           *) warn "The modes are strict, open and off." ;;
         esac ;;
@@ -13151,7 +13287,9 @@ _egress_config_enable() {
     echo -e "    Egress control is on, with the Claude Code hosts and nothing else."
   fi
   echo -e "    Choose what boxes on this machine may reach on the next screen."
-  echo -e "    ${DIM}Enforcement lands in a later release. Nothing is filtered today.${RESET}"
+  if [ "$_EGRESS_ENFORCING" != 1 ]; then
+    echo -e "    ${DIM}Enforcement lands in a later release. Nothing is filtered today.${RESET}"
+  fi
 }
 
 # Whether a full-screen editor can open here. A function, so a test can say yes.
@@ -18966,13 +19104,16 @@ _egress_sock_volumes() {
 # (8.0). An image a gateway still uses is kept by docker rmi itself, and the
 # offer skips it the same way it skips a box's. Seam.
 _gateway_image_candidates() {
-  local keep id
+  local keep="" id ids
+  ids="$(docker images --no-trunc --filter label=sh.cleat.role=gateway --format '{{.ID}}' 2>/dev/null | sort -u || true)"
+  # No gateway image, no second call: an off machine pays one listing.
+  [[ -n "$ids" ]] || return 0
   keep="$(docker image inspect "$_GATEWAY_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     [[ -n "$keep" && "$id" == "$keep" ]] && continue
     printf '%s\n' "$id"
-  done < <(docker images --no-trunc --filter label=sh.cleat.role=gateway --format '{{.ID}}' 2>/dev/null | sort -u || true)
+  done <<< "$ids"
 }
 
 # Prints "tag<TAB>size" per prebuilt image (size used by the stats helper).
@@ -31047,7 +31188,11 @@ cmd_help() {
   echo -e "    ${GREEN}session${RESET} ${DIM}[box]${RESET}        List, rename, delete or restore this box's Claude sessions"
   echo -e "    ${GREEN}account${RESET} ${DIM}[name] [box]${RESET} Switch this box between named Claude logins"
   echo -e "    ${GREEN}browser${RESET} ${DIM}origins${RESET}      Origins a box may ask your host to open"
-  echo -e "    ${GREEN}egress${RESET}  ${DIM}[box]${RESET}        Hosts a box may reach ${DIM}(off by default, no box = every box, not enforced yet)${RESET}"
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    echo -e "    ${GREEN}egress${RESET}  ${DIM}[box]${RESET}        Hosts a box may reach ${DIM}(off by default, no box = every box)${RESET}"
+  else
+    echo -e "    ${GREEN}egress${RESET}  ${DIM}[box]${RESET}        Hosts a box may reach ${DIM}(off by default, no box = every box, not enforced yet)${RESET}"
+  fi
   echo ""
   echo -e "  ${BOLD}SETUP${RESET}"
   echo -e "    ${GREEN}update${RESET}             Check for updates and install the latest version"

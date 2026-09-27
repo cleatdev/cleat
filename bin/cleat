@@ -12161,7 +12161,11 @@ cmd_egress() {
     return $?
   fi
   if [[ "$want_list" -eq 1 ]]; then _egress_cmd_list "$box"; return $?; fi
-  if [[ "$sub" == status ]]; then _egress_cmd_status "$box"; return $?; fi
+  if [[ "$sub" == status ]]; then
+    _set_box "${box:-main}"
+    _egress_status_render "$(_egress_target_cname "$_BOX")"
+    return $?
+  fi
   case "$sub" in
     why|test|log|reload|restart|review|open|off)
       _egress_verb "$sub" "$box" "$arg" "$assume_yes" "$refused" "$shim" "$pull" "$always"
@@ -12170,7 +12174,8 @@ cmd_egress() {
 
   # The editor needs a terminal. On a pipe it prints status and writes nothing.
   if [[ ! -t 0 || ! -t 1 ]]; then
-    _egress_cmd_status "$box"
+    _set_box "${box:-main}"
+    _egress_status_render "$(_egress_target_cname "$_BOX")"
     echo -e "  ${DIM}The egress editor needs a terminal, so this printed status. Use ${BOLD}cleat egress allow${RESET}${DIM} on a pipe.${RESET}"
     return 0
   fi
@@ -12367,24 +12372,155 @@ _egress_cmd_packs() {
 
 # status: stage two has no gateway, so this is the saved policy, what it does
 # not cover and the two not-enforced sentences.
-_egress_cmd_status() {                   # <box or empty>
-  local box="$1" cname n shared h word
-  cname="$(_egress_target_cname "$box")"
+# The recreate words for a box whose create-time facts are wrong (9.3): a box
+# with its own egress file keeps it across a recreate, and cleat rm would
+# forget it, so such a box is told to recreate through a launch.
+_egress_recreate_words() {               # <cname>
+  if [ -e "$_EGRESS_BOXES_DIR/$1" ] || [ -L "$_EGRESS_BOXES_DIR/$1" ]; then
+    printf '%s' "${BOLD}cleat${RESET}, then accept the recreate"
+  else
+    printf '%s' "${BOLD}cleat rm && cleat${RESET}"
+  fi
+}
+
+# The one generator of the claim-void and claim-unverifiable sentences, which
+# status and the session-end report both print. Nothing when the claim holds.
+_egress_claim_void_line() {              # <cname>
+  local r
+  r="$(_egress_claim_void "$1")"
+  case "$r" in
+    void)
+      echo -e "  ${AMBER}!${RESET} ${BOLD}The claim is void for this box${RESET}   CLEAT_EGRESS_ALLOW_HOOKS=1 was set at create time"
+      echo -e "      A host hook runs host commands at times the box picks."
+      echo -e "      Drop the flag and recreate to restore it:  $(_egress_recreate_words "$1")" ;;
+    unknown)
+      echo -e "  ${AMBER}!${RESET} ${BOLD}Claim cannot be verified${RESET}    this box was created by an older cleat"
+      echo -e "      Its create-time facts no longer match, so the hooks escape cannot be"
+      echo -e "      read back. The next launch refuses until the box is recreated."
+      echo -e "      Treat the claim as void until then:  $(_egress_recreate_words "$1")" ;;
+  esac
+  return 0
+}
+
+# 1284 as 1,284, for the counters. awk, never printf's locale flag.
+_egress_thousands() {                    # <n>
+  printf '%s' "$1" | awk '{ n = $0; s = ""; while (length(n) > 3) { s = "," substr(n, length(n) - 2) s; n = substr(n, 1, length(n) - 3) } print n s }'
+}
+
+# An age in whole seconds, as the gateway measured it, in words.
+_egress_age_words() {                    # <secs>
+  local a="$1"
+  case "$a" in ''|*[!0-9]*) printf '?'; return 0 ;; esac
+  if [ "$a" -lt 60 ]; then printf '%ss' "$a"
+  elif [ "$a" -lt 3600 ]; then printf '%sm%02ds' "$((a / 60))" "$((a % 60))"
+  elif [ "$a" -lt 86400 ]; then printf '%sh%02dm' "$((a / 3600))" "$(((a % 3600) / 60))"
+  else printf '%sd%sh' "$((a / 86400))" "$(((a % 86400) / 3600))"
+  fi
+}
+
+# cleat egress status (9.3): what a box's policy is, whether its gateway and
+# relay are serving, and what no policy covers. Read host-side only: the box's
+# inspect, the gateway's admin socket and the host's resolution, never a
+# command in the box. It runs on a refused engine, with the gateway down and
+# with Docker down, and never probes the engine when no policy resolves.
+_egress_status_render() {                # <cname>
+  local cname="$1" lbl=0 kind="" gw="" state="" live=0 n packs pinned="" shared h word p bx
+  local box="${_BOX:-main}" meta rc_n oom img ups age want got counts
   _egress_resolve "$cname"
+  gw="$(_egress_gateway_name "$cname")"
+  if [ -n "$cname" ] && _egress_label_read "$cname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then lbl=1; fi
+  bx="$(_sessions_safe_str "$box")"
   echo ""
   case "$_EG_MODE" in
-    off)
-      echo -e "  Egress:   off  ${DIM}·  full network egress${RESET}"
-      echo -e "  ${DIM}Nothing restricts where a box connects. Turn it on with ${BOLD}cleat egress${RESET}${DIM} or the${RESET}"
-      echo -e "  ${DIM}Egress row of ${BOLD}cleat config${RESET}${DIM}.${RESET}"
+    strict|open) ;;
+    *)
+      if [ "$lbl" = 1 ]; then
+        echo -e "  ${RED}x${RESET} Box ${BOLD}${bx}${RESET} was created under an egress policy that no longer resolves."
+        echo -e "    It refuses every launch until it is recreated with a normal network."
+        echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress off${RESET}"
+      else
+        echo -e "  ${DIM}○${RESET} Egress control is off for this box"
+        echo -e "    Full network egress, which is what every box on this machine has today."
+        echo ""
+        echo -e "  Turn it on:   ${BOLD}cleat egress${RESET}      the editor"
+        echo -e "                ${BOLD}cleat config${RESET}      the Egress row, which opens the same editor"
+      fi
       echo ""
+      _egress_status_channels
       return 0 ;;
   esac
+
+  # Live rows: only once enforcement ships, and only where they can be read.
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    [ "$lbl" = 1 ] && _egress_claim_void_line "$cname"
+    if [ "$_EG_MODE" = open ]; then
+      if [ "$_EG_WHY" = session ]; then
+        echo -e "  ${AMBER}!${RESET} ${BOLD}Open egress${RESET}: every TLS host is allowed and every destination is logged, until box ${bx} stops."
+      else
+        echo -e "  ${AMBER}!${RESET} ${BOLD}Open egress${RESET}: every TLS host is allowed and every destination is logged."
+      fi
+      echo -e "    This is a log, not a boundary."
+    fi
+    if ! _daemon_up; then
+      echo -e "  ${DIM}○${RESET} Docker is not running, so the gateway cannot be asked."
+    else
+      kind="$(_egress_engine_kind)"
+      if ! _egress_engine_validated "$kind"; then
+        echo -e "  ${RED}x${RESET} Egress control is not available on $(_egress_engine_words "$kind")"
+        echo -e "    Boxes with a policy refuse to start here.  Run without it:  ${BOLD}cleat egress off${RESET}"
+      elif ! container_exists "$cname"; then
+        echo -e "  ${DIM}○${RESET} No box yet. Its gateway is created with it on the next launch."
+      elif [ "$lbl" != 1 ]; then
+        echo -e "  ${RED}x${RESET} This box was created without egress control"
+        echo -e "    It refuses to start until it is recreated:  $(_egress_recreate_words "$cname")"
+      else
+        state="$(_egress_gateway_state "$cname")"
+        _egress_status_gateway_row "$cname" "$gw" "$state"
+        if [ "$state" = healthy ]; then
+          live=1
+          _egress_status_shim_row "$gw"
+        fi
+      fi
+    fi
+    echo ""
+  fi
+
   n="$(printf '%s\n' "$_EG_HOSTS" | grep -c . || true)"
-  echo -e "  Mode:     ${_EG_MODE}  ${DIM}·  resolved on the host, $(_egress_why_text)${RESET}"
-  echo -e "  Policy:   ${CLEAT_GLOBAL_CONFIG/#${HOME}/~} [egress]  ${DIM}host-side, the box cannot read or write it${RESET}"
-  if [[ "$_EG_MODE" == strict ]]; then
-    echo -e "  Allowed:  ${n} hosts, port 443 only"
+  packs="$(printf '%s\n' "$_EG_PACKS" | grep -v '^$' | paste -sd' ' - | sed 's/ /, /g')"
+  want="$(_egress_policy_digest "$_EG_MODE" "$_EG_HOSTS")"
+  if [ "$live" = 1 ]; then
+    got="$(_egress_live_digest "$gw")" || got=""
+    if [ -n "$got" ] && [ "$got" = "$want" ]; then
+      echo -e "  Mode:      ${_EG_MODE}  ${DIM}·  live, read from the gateway${RESET}"
+    else
+      echo -e "  Mode:      ${_EG_MODE}  ${AMBER}·  saved. The gateway enforces a different policy:${RESET} ${BOLD}cleat egress reload${RESET}"
+    fi
+  else
+    echo -e "  Mode:      ${_EG_MODE}  ${DIM}·  resolved on the host, $(_egress_why_text)${RESET}"
+  fi
+  echo -e "  Policy:    ${CLEAT_GLOBAL_CONFIG/#${HOME}/~} [egress]  ${DIM}host-side, the box cannot read or write it${RESET}"
+  if [ -n "$cname" ] && { [ -e "$_EGRESS_BOXES_DIR/$cname" ] || [ -L "$_EGRESS_BOXES_DIR/$cname" ]; }; then
+    echo -e "             ${DIM}and this box's own file, ${_EGRESS_BOXES_DIR/#${HOME}/~}/${cname}${RESET}"
+  fi
+  if [ "$_EG_MODE" = strict ]; then
+    echo -e "  Packs:     ${packs:-none}"
+    # The hosts no pack brought: the ones typed in directly.
+    local inpacks="" pk
+    while IFS= read -r pk; do
+      [ -n "$pk" ] || continue
+      inpacks+="$(_egress_pack_hosts "$pk" all)"$'\n'
+    done <<EOF
+$_EG_PACKS
+EOF
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      _egress_in_list "$h" "$inpacks" || pinned+="$h, "
+    done <<EOF
+$_EG_HOSTS
+EOF
+    if [ -n "$pinned" ]; then pinned="${pinned%, }"; else pinned=none; fi
+    echo -e "  Pinned:    ${pinned}"
+    echo -e "  Allowed:   ${n} hosts, port 443 only"
     shared=""
     while IFS= read -r h; do
       [ -n "$h" ] || continue
@@ -12393,9 +12529,10 @@ _egress_cmd_status() {                   # <box or empty>
     done <<EOF
 $_EG_HOSTS
 EOF
-    echo -e "  Shared:   ${shared:+${shared%, }}${shared:-none}"
+    if [ -n "$shared" ]; then shared="${shared%, }"; else shared=none; fi
+    echo -e "  Shared:    ${shared}"
   else
-    echo -e "  Allowed:  any name on port 443 ${DIM}(open)${RESET}"
+    echo -e "  Allowed:   any name on port 443 ${DIM}(open)${RESET}"
   fi
   # What the launch summary counted: the hosts that arrived since this box
   # last launched, named here where the summary only had room for a number.
@@ -12408,9 +12545,145 @@ EOF
       echo -e "  ${AMBER}Mode widened to open since this box last launched.${RESET}"
     fi
   fi
+  if [ "$_EGRESS_ENFORCING" = 1 ] && [ "$lbl" = 1 ] && [ -n "$kind" ] && _egress_engine_validated "$kind"; then
+    if ( _egress_box_shape "$cname" ) >/dev/null 2>&1; then
+      echo -e "  Box:       ${cname}   network=none  cap-drop=NET_RAW  ${GREEN}verified${RESET}"
+    else
+      echo -e "  Box:       ${cname}   ${AMBER}not verified, the next launch refuses${RESET}"
+    fi
+    echo -e "  Socket:    $(_egress_sock_volume "$cname")   /run/cleat-egress/proxy.sock   ro in box"
+  fi
+  if [ "$live" = 1 ]; then
+    counts="$(_egress_admin_read "$gw" counts || true)"
+    case "$counts" in
+      [0-9]*" "[0-9]*)
+        echo -e "  Session:   $(_egress_thousands "${counts%% *}") allowed · $(_egress_thousands "${counts##* }") denied    ${BOLD}cleat egress log${RESET}" ;;
+    esac
+    # Only a listing that came back and is wrong: a gateway that did not
+    # answer says nothing here, the gateway row speaks for it.
+    local manifest
+    manifest="$(_egress_volume_manifest "$gw")" || manifest=""
+    if [ -n "$manifest" ] && ! _egress_volume_manifest_ok "$manifest"; then
+      echo -e "  ${AMBER}!${RESET} The socket volume holds something besides the socket and the denial log."
+    fi
+  fi
   echo ""
   _egress_not_enforced_lines
   echo ""
+  _egress_status_channels
+  echo -e "  ${DIM}cleat account's own calls to api.anthropic.com run on the host, outside this${RESET}"
+  echo -e "  ${DIM}policy, so they never appear in the log above.${RESET}"
+  echo ""
+}
+
+# The one Egress row of cleat status (6.5): advisory, never a refusal, and no
+# engine probe when no policy resolves. A policy that does not parse says so
+# here and leaves the rest of the status screen standing.
+_egress_status_summary_row() {           # <cname>
+  local n np state
+  if ! ( _egress_resolve "$1" ) >/dev/null 2>&1; then
+    echo -e "  ${BOLD}Egress:${RESET}    ${AMBER}the policy does not parse${RESET}  ${DIM}cleat egress status${RESET}"
+    return 0
+  fi
+  _egress_resolve "$1"
+  case "$_EG_MODE" in
+    strict)
+      n="$(printf '%s\n' "$_EG_HOSTS" | grep -c . || true)"
+      np="$(printf '%s\n' "$_EG_PACKS" | grep -c . || true)"
+      echo -e "  ${BOLD}Egress:${RESET}    strict  ${DIM}·  $(_egress_plural "$n" host), $(_egress_plural "$np" pack)${RESET}" ;;
+    open)
+      echo -e "  ${BOLD}Egress:${RESET}    open  ${DIM}·  every TLS host allowed and logged, a log, not a boundary${RESET}" ;;
+    *)
+      echo -e "  ${BOLD}Egress:${RESET}    off  ${DIM}·  full network egress${RESET}"
+      return 0 ;;
+  esac
+  if [ "$_EGRESS_ENFORCING" = 1 ] && _daemon_up && container_exists "$1" \
+     && _egress_label_read "$1" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then
+    state="$(_egress_gateway_state "$1")"
+    if [ "$state" != healthy ]; then
+      echo -e "             ${AMBER}! gateway ${state}. This is not a policy denial.${RESET}  ${DIM}cleat egress status${RESET}"
+    fi
+  fi
+  return 0
+}
+
+# The gateway row of status, one per state (9.3). Every anomaly says the box
+# has no egress and that it is not a policy denial.
+_egress_status_gateway_row() {           # <cname> <gateway> <state>
+  local cname="$1" gw="$2" meta rc_n oom img ups
+  case "$3" in
+    healthy)
+      meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect -f '{{.RestartCount}}|{{.State.OOMKilled}}|{{.Config.Image}}' "$gw" 2>/dev/null)" || meta=""
+      rc_n="${meta%%|*}"; img="${meta##*|}"
+      case "$rc_n" in ''|*[!0-9]*) rc_n="?" ;; esac
+      ups="$(docker ps -a --filter "name=^${gw}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
+      ups="${ups%% (*}"
+      echo -e "  ${GREEN}●${RESET} Gateway healthy       ${gw}   $(printf '%s' "$ups" | tr 'U' 'u')   ${rc_n} restarts"
+      if [ -n "$img" ]; then
+        echo -e "                          ${DIM}image $(_sessions_safe_str "${img:0:60}")${RESET}"
+        if [ "$img" != "$_GATEWAY_IMAGE" ]; then
+          echo -e "                          ${AMBER}superseded by this cleat:${RESET} ${BOLD}cleat egress restart${RESET}"
+        fi
+      fi ;;
+    displaced)
+      echo -e "  ${RED}x${RESET} Gateway displaced     socket taken by another gateway (path_ok false)"
+      echo -e "    The box has no egress at all right now. This is not a policy denial."
+      echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart${RESET}" ;;
+    stopped)
+      meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect -f '{{.RestartCount}}|{{.State.OOMKilled}}' "$gw" 2>/dev/null)" || meta=""
+      rc_n="${meta%%|*}"; oom="${meta##*|}"
+      case "$rc_n" in ''|*[!0-9]*) rc_n="?" ;; esac
+      if is_running "$cname"; then
+        if [ "$oom" = true ]; then
+          echo -e "  ${RED}x${RESET} Gateway stopped       exited, ${rc_n} restarts, out of memory"
+        else
+          echo -e "  ${RED}x${RESET} Gateway stopped       exited, ${rc_n} restarts"
+        fi
+        echo -e "    The box has no egress at all right now. This is not a policy denial."
+        if [ "$oom" = true ]; then
+          echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart${RESET}      ${DIM}Report this: it should not run out of memory.${RESET}"
+        else
+          echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart${RESET}"
+        fi
+      else
+        echo -e "  ${DIM}○${RESET} Gateway stopped       its box is stopped too"
+        echo -e "    Nothing is running in this box, so there is nothing to serve."
+        echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat start${RESET}"
+      fi ;;
+    orphaned)
+      echo -e "  ${AMBER}!${RESET} Gateway orphaned      running, but its box is not"
+      echo -e "    Its box stopped while the gateway kept running, or the Docker daemon"
+      echo -e "    restarted uncleanly, so nothing is using this gateway. Not a policy denial."
+      echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat start${RESET}      or   ${BOLD}cleat egress restart${RESET}" ;;
+    *)
+      echo -e "  ${RED}x${RESET} Gateway missing       no gateway container for this box"
+      echo -e "    The box has no egress at all right now. This is not a policy denial."
+      echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart${RESET}" ;;
+  esac
+}
+
+# The relay row of status. A heartbeat comes from inside the box, so the row
+# is health only and says so in both shapes.
+_egress_status_shim_row() {              # <gateway>
+  local seen
+  if _egress_shim_alive "$1"; then
+    echo -e "  ${GREEN}●${RESET} Shim listening        127.0.0.1:3128 inside the box   last seen $(_egress_age_words "$_EG_SHIM_AGE") ago"
+    echo -e "                          ${DIM}(health only, not proof)${RESET}"
+    return 0
+  fi
+  case "$_EG_SHIM_AGE" in
+    -1) seen="never seen by this gateway" ;;
+    ''|*[!0-9]*) seen="the gateway did not answer" ;;
+    *) seen="last seen $(_egress_age_words "$_EG_SHIM_AGE") ago, the in-box relay did not come back" ;;
+  esac
+  echo -e "  ${AMBER}!${RESET} Shim not listening    ${seen}"
+  echo -e "                          ${DIM}(health only, not proof)${RESET}"
+  echo -e "    Requests fail before they reach policy. Not a policy denial."
+  echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart --shim${RESET}"
+}
+
+# What no egress policy covers, on every status screen.
+_egress_status_channels() {
   echo -e "  Not covered by egress policy"
   case "$(_browser_bridge_mode)" in
     always)
@@ -19001,6 +19274,7 @@ cmd_status() {
   else
     echo -e "  ${BOLD}Status:${RESET}    ${DIM}○ not created${RESET}"
   fi
+  _egress_status_summary_row "$cname"
 
   if image_exists; then
     local size iarch darch

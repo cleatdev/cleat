@@ -15200,6 +15200,68 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_volume_manifest_closed" "the shared volume manifest rejects a third path" "$CLI" "$EGRESS_GATEWAY_BATS"
 
+# cleat egress status (9.3).
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  /_egress_claim_void_line/d
+}
+SED
+try "vnext_egress_claim_void_row" "the hooks escape prints a claim void row in status" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+s@_ACCOUNT_BOX_DIR="/home/coder/.cleat-auth"@_ACCOUNT_BOX_DIR="/home/coder/.cleat-elsewhere"@
+SED
+try "vnext_egress_status_auth_channel" "the auth mount is enumerated as an uncovered channel" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_shim_alive()/,/^}$/{
+  s@^  \[ "[$]_age" -le "[$]_EGRESS_SHIM_STALE" \]@  [ -n "$_age" ]@
+}
+SED
+try "vnext_egress_shim_staleness_checked" "a stale last shim seen renders shim not listening" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  s@^    if \[ -n "[$]shared" \]; then shared="[$]{shared%, }"; else shared=none; fi$@    shared="${shared:+${shared%, }}${shared:-none}"@
+}
+SED
+try "vnext_egress_status_list_once" "cleat egress status printed its shared hosts twice" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_gateway_row()/,/^}$/{
+  s@The box has no egress at all right now. This is not a policy denial.@The box has no egress at all right now.@
+}
+SED
+try "vnext_egress_status_not_a_denial" "every anomaly says it is not a policy denial" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  s@^  gw="[$](_egress_gateway_name "[$]cname")"$@  gw="$(_egress_gateway_name "$cname")"; _egress_engine_kind >/dev/null@
+}
+SED
+try "vnext_egress_status_off_no_probe" "status on a box with no policy runs no engine probe" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  s@^    if \[ -n "[$]manifest" \] && ! _egress_volume_manifest_ok "[$]manifest"; then$@    if ! _egress_volume_manifest_ok "$manifest"; then@
+}
+SED
+try "vnext_egress_status_manifest_answered" "a silent gateway is not" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  s@The gateway enforces a different policy:[$]{RESET} [$]{BOLD}cleat egress reload@The gateway enforces a different policy:${RESET} ${BOLD}cleat rm \&\& cleat@
+}
+SED
+try "vnext_egress_status_stale_names_reload" "a gateway enforcing a stale policy names reload and never rm" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_status()/,/^}$/{
+  /_egress_status_summary_row/d
+}
+SED
+try "vnext_status_egress_row" "the cleat status egress row reads off with no policy" "$CLI" "$EGRESS_UI_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

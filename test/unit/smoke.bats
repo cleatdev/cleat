@@ -3292,14 +3292,16 @@ SH
 @test "smoke: cleat egress with no arguments does not hang on a non-TTY" {
   run cleat_bin_timeout 20 egress < /dev/null
   assert_success
-  assert_output --partial "Egress:   off"
+  assert_output --partial "Egress control is off for this box"
   assert_output --partial "needs a terminal"
 }
 
 @test "smoke: cleat egress status on a machine with no policy says off" {
   run cleat_bin egress status < /dev/null
   assert_success
-  assert_output --partial "full network egress"
+  assert_output --partial "Egress control is off for this box"
+  assert_output --partial "Full network egress"
+  assert_output --partial "Not covered by egress policy"
 }
 
 @test "smoke: cleat egress allow a pack that is not the catalogue's last line" {
@@ -3484,4 +3486,13 @@ SH
   # A remote body is bounded before it is read into one line.
   run grep -c -- "--max-filesize 1048576" "$CURL_ARGS_LOG"
   refute_output "0"
+}
+
+@test "smoke: cleat egress status runs on a refused engine" {
+  mkdir -p "$XDG_CONFIG_HOME/cleat"
+  printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
+  run cleat_bin egress status < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Not covered by egress policy"
 }

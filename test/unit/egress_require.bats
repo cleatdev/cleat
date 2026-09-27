@@ -961,6 +961,25 @@ egress:hooks=0"
   assert_output --partial "Shim not listening"
 }
 
+@test "egress status: a stale last shim seen renders shim not listening" {
+  caged_box
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  run _egress_status_shim_row "$GW"
+  run bash -c 'printf "%s" "$1" | sed $'"'"'s/\x1b\[[0-9;]*m//g'"'"'' _ "$output"
+  assert_output --partial "! Shim not listening    last seen 5m00s ago, the in-box relay did not come back"
+  assert_output --partial "cleat egress restart --shim"
+}
+
+@test "egress status: the shim row never claims proof" {
+  caged_box
+  local a
+  for a in "ok last_shim_seen 3" "ok last_shim_seen 300" "ok last_shim_seen -1" ""; do
+    mock_gw_admin last_shim_seen "$a"
+    run _egress_status_shim_row "$GW"
+    assert_output --partial "health only, not proof"
+  done
+}
+
 # ── Placement (5.7): before every exec, on every fatal verb ─────────────────
 
 # A box that predates a strict policy: the gate refuses at its first read.

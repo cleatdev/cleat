@@ -6,6 +6,7 @@
 # only for contained, 2 for every other class. The two named exceptions,
 # apt-debian and apt-image-extras, may override a 2 and never a 1.
 load "../setup"
+load "../lib/egress_fixtures"
 setup() {
   _common_setup
   # The stub, never the host's daemon: a session-marker read runs docker inspect.
@@ -588,12 +589,17 @@ mode = strict"
   assert_output --partial "cleat browser origins"
 }
 
-@test "egress status: the auth mount is named as a channel no policy reaches" {
+@test "egress status: the auth mount is enumerated as an uncovered channel" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
   run cmd_egress status
   assert_output --partial "/home/coder/.cleat-auth"
   assert_output --partial "refresh token"
+  # And with no policy at all: the channels print in every state.
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress status
+  assert_output --partial "Not covered by egress policy"
+  assert_output --partial "/home/coder/.cleat-auth"
 }
 
 @test "egress status: a saved policy says it is not enforced, in two lines" {
@@ -1347,4 +1353,261 @@ good.example.test
   _egress_engine_kind() { printf desktop-macos; }
   run _egress_draw 0
   assert_output --partial "Engine   validated, a save applies at the next launch: Docker Desktop"
+}
+
+# ── cleat egress status (9.3) ───────────────────────────────────────────────
+
+# A caged box, running, with a healthy gateway, as status reads it: its
+# inspect fields, the gateway's admin answers and its ps status line.
+status_caged() {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT"
+  printf '[egress]\nmode = strict\npack = pypi\n' > "$CLEAT_GLOBAL_CONFIG"
+  cd "$PROJECT"
+  CN="$(container_name_for "$PROJECT" main)"
+  egress_box_names
+  use_gw_admin_stub
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  mock_docker_inspect_field "$GW" '{{.RestartCount}}|{{.State.OOMKilled}}|{{.Config.Image}}' "0|false|$_GATEWAY_IMAGE"
+  mock_docker_inspect_field "$GW" '{{.RestartCount}}|{{.State.OOMKilled}}' "3|true"
+  mock_docker_ps_filter "Up 4 hours (healthy)" "name=^${GW}$"
+  mock_gw_admin counts "ok counts 1284 3"
+  mock_gw_admin path_ok "ok path_ok true"
+  mkdir -p "$DOCKER_MOCK_DIR/gwadmin"
+}
+plain_status() { run cmd_egress status; run _plain "$output"; }
+
+@test "egress status: a caged box shows its gateway, relay, policy and counters" {
+  status_caged
+  plain_status
+  assert_output --partial "● Gateway healthy       $GW   up 4 hours   0 restarts"
+  assert_output --partial "● Shim listening        127.0.0.1:3128 inside the box   last seen 3s ago"
+  assert_output --partial "Mode:      strict  ·  live, read from the gateway"
+  assert_output --partial "Box:       $CN   network=none  cap-drop=NET_RAW  verified"
+  assert_output --partial "Socket:    $VOL   /run/cleat-egress/proxy.sock   ro in box"
+  assert_output --partial "Session:   1,284 allowed · 3 denied    cleat egress log"
+  assert_output --partial "Not covered by egress policy"
+  assert_output --partial "run on the host, outside this"
+  # Read host-side only: never a command in the box.
+  run grep -c "^docker exec $CN\b\|^docker exec -[a-z]* [^ ]* $CN " "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress status: status counts hosts from the resolved set and not from a literal" {
+  status_caged
+  _egress_resolve "$CN"
+  local n
+  n="$(printf '%s\n' "$_EG_HOSTS" | grep -c .)"
+  plain_status
+  assert_output --partial "Allowed:   $n hosts, port 443 only"
+  printf '[egress]\nmode = strict\npack = pypi\nallow = docs.example.test\n' > "$CLEAT_GLOBAL_CONFIG"
+  plain_status
+  assert_output --partial "Allowed:   $(( n + 1 )) hosts, port 443 only"
+  assert_output --partial "Pinned:    docs.example.test"
+}
+
+@test "egress status: the allowed count comes from the counters and not from the log" {
+  status_caged
+  mock_gw_admin counts "ok counts 7 0"
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW"
+  printf '2026-09-26T10:00:00Z code=policy sub=- origin=box host=x.example port=443 trunc=0\n' > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+  plain_status
+  assert_output --partial "Session:   7 allowed · 0 denied"
+}
+
+@test "egress status: a gateway enforcing a stale policy names reload and never rm" {
+  status_caged
+  mock_gw_admin policy-digest "ok policy-digest v1:0000000000000000"
+  plain_status
+  assert_output --partial "The gateway enforces a different policy: cleat egress reload"
+  refute_output --partial "cleat rm"
+}
+
+@test "egress status: each gateway state has its own row, and every anomaly says it is not a policy denial" {
+  status_caged
+  gw_row() { run _egress_status_gateway_row "$CN" "$GW" "$1"; run _plain "$output"; }
+  gw_row missing
+  assert_output --partial "x Gateway missing       no gateway container for this box"
+  assert_output --partial "This is not a policy denial."
+  assert_output --partial "Fix:  cleat egress restart"
+  gw_row displaced
+  assert_output --partial "x Gateway displaced"
+  assert_output --partial "This is not a policy denial."
+  gw_row stopped
+  assert_output --partial "x Gateway stopped       exited, 3 restarts, out of memory"
+  assert_output --partial "This is not a policy denial."
+  assert_output --partial "should not run out of memory"
+  is_running() { return 1; }
+  gw_row stopped
+  assert_output --partial "○ Gateway stopped       its box is stopped too"
+  assert_output --partial "Fix:  cleat start"
+  gw_row orphaned
+  assert_output --partial "! Gateway orphaned"
+  assert_output --partial "Not a policy denial."
+  # A gateway from an older pin says so and names the one remedy.
+  is_running() { return 0; }
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  caged_box
+  mock_docker_inspect_field "$GW" '{{.RestartCount}}|{{.State.OOMKilled}}|{{.Config.Image}}' "0|false|ghcr.io/cleatdev/cleat-gw@sha256:old"
+  gw_row healthy
+  assert_output --partial "superseded by this cleat: cleat egress restart"
+}
+
+@test "egress status: status on a box with no policy names both ways to turn it on" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  plain_status
+  assert_output --partial "○ Egress control is off for this box"
+  assert_output --partial "Turn it on:   cleat egress      the editor"
+  assert_output --partial "cleat config      the Egress row"
+}
+
+@test "egress status: status on a box with no policy runs no engine probe" {
+  _EGRESS_ENFORCING=1
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  _egress_info_probe() { echo probed >> "$TEST_TEMP/probed"; }
+  _egress_version_probe() { echo probed >> "$TEST_TEMP/probed"; }
+  run cmd_egress status
+  assert_success
+  [ ! -e "$TEST_TEMP/probed" ]
+  run grep -c "^docker info" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress status: the hooks escape prints a claim void row in status" {
+  status_caged
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HOOKS=1 caged_box
+  plain_status
+  assert_output --partial "! The claim is void for this box   CLEAT_EGRESS_ALLOW_HOOKS=1 was set at create time"
+  assert_output --partial "Drop the flag and recreate to restore it:  cleat rm && cleat"
+  # With the box's own egress file, the recreate goes through a launch.
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nallow = docs.example.test\n' > "$_EGRESS_BOXES_DIR/$CN"
+  plain_status
+  assert_output --partial "Drop the flag and recreate to restore it:  cleat, then accept the recreate"
+}
+
+@test "egress status: a box without the hooks escape prints no claim void row" {
+  status_caged
+  plain_status
+  refute_output --partial "claim is void"
+  refute_output --partial "Claim cannot be verified"
+}
+
+@test "egress status: status on a box created under an older gateway spec says the claim cannot be verified" {
+  status_caged
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HOOKS=1 caged_box
+  _GATEWAY_SPEC_VERSION=$(( _GATEWAY_SPEC_VERSION + 1 ))
+  plain_status
+  assert_output --partial "! Claim cannot be verified    this box was created by an older cleat"
+  refute_output --partial "claim is void"
+}
+
+@test "egress status: open mode status never uses the word allowlist and names the log, not a boundary" {
+  status_caged
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  mock_gw_admin policy-digest "ok policy-digest $(current_digest)"
+  plain_status
+  assert_output --partial "! Open egress: every TLS host is allowed and every destination is logged."
+  assert_output --partial "This is a log, not a boundary."
+  refute_output --partial "allowlist"
+}
+
+@test "egress status: status exits 0 on a refused engine, with the gateway down and with Docker down" {
+  status_caged
+  _egress_engine_kind() { printf engine-linux; }
+  plain_status
+  assert_success
+  assert_output --partial "x Egress control is not available on Docker Engine on Linux (rootful)"
+  assert_output --partial "cleat egress off"
+  refute_output --partial "Gateway healthy"
+  _egress_engine_kind() { printf desktop-macos; }
+  container_exists() { [ "$1" != "$GW" ]; }
+  plain_status
+  assert_success
+  assert_output --partial "x Gateway missing"
+  _daemon_up() { return 1; }
+  plain_status
+  assert_success
+  assert_output --partial "○ Docker is not running, so the gateway cannot be asked."
+}
+
+@test "egress status: a label with no policy, and a policy with no label, name their remedies" {
+  status_caged
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  plain_status
+  assert_output --partial "x Box main was created under an egress policy that no longer resolves."
+  assert_output --partial "Fix:  cleat egress off"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  plain_status
+  assert_output --partial "x This box was created without egress control"
+  assert_output --partial "cleat rm && cleat"
+  container_exists() { return 1; }
+  plain_status
+  assert_output --partial "○ No box yet. Its gateway is created with it on the next launch."
+}
+
+@test "egress status: a volume holding a third name is flagged, a silent gateway is not" {
+  status_caged
+  plain_status
+  refute_output --partial "holds something besides"
+  printf 'denials.log\nproxy.sock\npolicy.json\n' > "$DOCKER_MOCK_DIR/gwadmin/manifest"
+  plain_status
+  assert_output --partial "! The socket volume holds something besides the socket and the denial log."
+  : > "$DOCKER_MOCK_DIR/gwadmin/manifest"
+  plain_status
+  refute_output --partial "holds something besides"
+}
+
+@test "egress status: the cleat status egress row reads off with no policy and runs no probe" {
+  _EGRESS_ENFORCING=1
+  mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  _egress_info_probe() { echo probed >> "$TEST_TEMP/probed"; }
+  run _egress_status_summary_row "cleat-proj-00000000"
+  run _plain "$output"
+  assert_output "  Egress:    off  ·  full network egress"
+  [ ! -e "$TEST_TEMP/probed" ]
+  run grep -c "^docker" "$DOCKER_CALLS"
+  assert_output "0"
+  # cleat status itself carries the row.
+  run cmd_status "$PROJECT"
+  run _plain "$output"
+  assert_output --partial "Egress:    off  ·  full network egress"
+  [ ! -e "$TEST_TEMP/probed" ]
+}
+
+@test "egress status: the cleat status egress row says an open box is a log, not a boundary" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_status_summary_row "cleat-proj-00000000"
+  run _plain "$output"
+  assert_output --partial "open  ·  every TLS host allowed and logged, a log, not a boundary"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_status_summary_row "cleat-proj-00000000"
+  run _plain "$output"
+  assert_output "  Egress:    strict  ·  5 hosts, 1 pack"
+  # A policy that does not parse leaves the status screen standing.
+  printf '[egress]\nmode = strict\ndeny =\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_status_summary_row "cleat-proj-00000000"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "the policy does not parse"
+}
+
+@test "egress status: the cleat status egress row names a gateway that is not serving" {
+  status_caged
+  container_exists() { [ "$1" != "$GW" ]; }
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "! gateway missing. This is not a policy denial."
 }

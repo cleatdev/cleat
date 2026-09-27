@@ -10269,3 +10269,35 @@ mode = off"
     [ "$output" != "$c" ] || { echo "no words for reason code $c"; return 1; }
   done
 }
+
+@test "regression vNEXT: the hooks escape voided the claim everywhere except the screen that states it" {
+  # The launch summary tagged the box and the report named it, while the one
+  # screen whose job is to state what a box is protected by said nothing.
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")" "$TEST_TEMP/project"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  cd "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project" main)"
+  egress_box_names
+  use_gw_admin_stub
+  F_HOOKS=1 caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  run cmd_egress status
+  assert_output --partial "The claim is void for this box"
+}
+
+@test "regression vNEXT: cleat egress status printed its shared hosts twice" {
+  # ${list:-none} expands to the list when it is set, so the line printed
+  # every shared host, then every shared host again.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\npack = pypi\nallow = docs.example.test\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress status
+  run bash -c 'printf "%s\n" "$1" | grep "Shared:"' _ "$output"
+  [ "$(grep -o 'pypi.org (shared)' <<< "$output" | wc -l | tr -d ' ')" = 1 ]
+  run cmd_egress status
+  run bash -c 'printf "%s\n" "$1" | grep "Pinned:"' _ "$output"
+  [ "$(grep -o 'docs.example.test' <<< "$output" | wc -l | tr -d ' ')" = 1 ]
+}

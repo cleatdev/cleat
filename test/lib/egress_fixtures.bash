@@ -23,6 +23,11 @@ use_gw_admin_stub() {
 shift
 if [ "$1" = -u ]; then shift 2; fi
 shift
+# The volume listing status asks the gateway for, a python one-liner.
+if [ "${1:-}" = python3 ]; then
+  if [ -f "$DOCKER_MOCK_DIR/gwadmin/manifest" ]; then cat "$DOCKER_MOCK_DIR/gwadmin/manifest"; else printf 'denials.log\nproxy.sock\n'; fi
+  exit 0
+fi
 [ "${1:-}" = /usr/local/bin/gw-admin ] || exit 0
 f="$DOCKER_MOCK_DIR/gwadmin/$2"
 if [ ! -f "$f" ]; then

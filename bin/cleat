@@ -3350,8 +3350,10 @@ _egress_fragment_resolution() {          # <cname>
   local out
   [ "$_EGRESS_ENFORCING" = 1 ] || return 1
   [ -n "${1:-}" ] || return 1
+  # No case inside this substitution: bash 3.2 reads a pattern's ) as the
+  # end of the $( ).
   out="$( _egress_resolve "$1" >/dev/null 2>&1 || exit 1
-    case "$_EG_MODE" in strict|open) ;; *) exit 1 ;; esac
+    [ "$_EG_MODE" = strict ] || [ "$_EG_MODE" = open ] || exit 1
     printf '%s\n%s' "$_EG_MODE" "$_EG_HOSTS" )" || return 1
   if container_exists "$1"; then
     if ! _egress_label_read "$1" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then return 1; fi
@@ -11037,7 +11039,7 @@ _egress_denials_mark() {                 # <cname>
 # The saved mark as <gen>:<off>, or nothing.
 _egress_denials_mark_read() {            # <cname>
   local l
-  l="$(_read_unlinked_bounded "$CLEAT_RUN_DIR/$1/egress/denials-mark" 64 | head -n 1)"
+  l="$(_read_unlinked_bounded "$CLEAT_RUN_DIR/$1/egress/denials-mark" 64 | sed -n '1p')"
   case "$l" in [0-9]*:[0-9]*) ;; *) return 0 ;; esac
   case "${l%%:*}${l##*:}" in *[!0-9]*) return 0 ;; esac
   printf '%s' "$l"
@@ -12111,7 +12113,7 @@ _egress_notices_shown() {                # <cname> <token>
   _d="${_f%/*}"
   if [ -L "$_d" ] || [ -L "$_f" ] || [ -d "$_f" ]; then return 0; fi
   [ -f "$_f" ] || return 1
-  _read_unlinked_bounded "$_f" 256 | grep -qx -- "$2"
+  _read_unlinked_bounded "$_f" 256 | awk -v t="$2" '$0 == t { f = 1 } END { exit !f }'
 }
 
 # The project's origin, read host-side from its .git/config through the
@@ -12732,7 +12734,9 @@ _egress_cmd_review() {                   # <cname> <yes>
   echo -e "  ${BOLD}Held since the pin${RESET}  ${DIM}catalogue rev $(_sanitize_repo_str "$rev") → ${_EGRESS_CATALOGUE_REV}${RESET}"
   while IFS=$'\t' read -r d h o n; do
     case "$d" in added|weakened) ;; *) continue ;; esac
-    rec="$(_egress_catalogue_records | awk -F'\t' -v h="$h" '$2 == h { print; exit }')"
+    # Read to the end: an awk that exits early breaks the catalogue's pipe,
+    # and under pipefail that ends the verb.
+    rec="$(_egress_catalogue_records | awk -F'\t' -v h="$h" '$2 == h && !f { print; f = 1 }')"
     p="$(printf '%s' "$rec" | cut -f1)"
     cls="$(printf '%s' "$rec" | cut -f3)"
     flg="$(printf '%s' "$rec" | cut -f4)"

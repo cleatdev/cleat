@@ -10406,3 +10406,66 @@ pack = npm"
   assert_output --partial "! 1 destination was denied by egress policy this session"
   assert_output --partial "after.example"
 }
+
+@test "regression vNEXT: a case inside a command substitution broke the fragment on bash 3.2" {
+  # bash 3.2 reads a case pattern's ) as the end of the $( ) around it. The
+  # network fragment's resolution had one, so every macOS box kept the full
+  # network sentence while caged. Only a Mac runs 3.2, so a source guard, like
+  # every other bash 3.2 rule here: no case inside a $( ) that spans lines.
+  run awk -f "$BATS_TEST_DIRNAME/../fixtures/case_in_subst.awk" "$CLI"
+  assert_success
+  assert_output ""
+}
+
+@test "regression vNEXT: cleat egress review died on a broken pipe" {
+  # The held-host lookup piped the catalogue into an awk that exited at its
+  # first match. The catalogue's printf then wrote to a closed pipe and, under
+  # the binary's pipefail, the verb exited mid-list. It raced, so CI saw it
+  # and a local run did not. The consumer now reads to the end. The stub's
+  # rows are followed by a megabyte no pipe buffer holds, so its last write
+  # lands only if something is still reading. Some awks act on exit only once
+  # a read block fills, which is why the filler is large.
+  mock_egress_caged_launch
+  CN=cleat-proj-12345678
+  mkdir -p "$_EGRESS_PINS_DIR"
+  printf '[pin]\ncatalogue_rev = 0\npinned_at = 2026-09-01\ndigest = v1:0000000000000000\nhost = api.anthropic.com B\n' \
+    > "$_EGRESS_PINS_DIR/global"
+  eval "_real_records() $(declare -f _egress_catalogue_records | sed 1d)"
+  # Counted only for the review's own lookups: the resolver reads the
+  # catalogue too, and to the end.
+  _egress_catalogue_records() {
+    _real_records
+    [ "${FUNCNAME[1]}" = _egress_cmd_review ] || return 0
+    echo started >> "$TEST_TEMP/lookups"
+    awk 'BEGIN { for (i = 0; i < 20000; i++) printf "zz\tfiller%d.example\tB\t-\t-\t-\t-\n", i }' \
+      && echo finished >> "$TEST_TEMP/lookups"
+  }
+  _egress_apply_now() { :; }
+  run _egress_cmd_review "$CN" 1 </dev/null
+  assert_success
+  assert_output --partial "claude.ai"
+  run grep -c started "$TEST_TEMP/lookups"
+  refute_output "0"
+  local n="$output"
+  run grep -c finished "$TEST_TEMP/lookups"
+  assert_output "$n"
+}
+
+@test "regression vNEXT: port 80 was accepted" {
+  # Port 80 carries no ClientHello, so nothing on it can be checked. The
+  # gateway is told 443 and nothing else, the digest it recomputes covers it,
+  # and a typed :80 is refused before anything is written.
+  run _egress_policy_json strict example.com
+  assert_output --partial '"port": 443,'
+  refute_output --partial '"port": 80'
+  local want
+  want="v1:$(printf 'strict\n443\nexample.com\n' | _md5 | head -c 16)"
+  assert_output --partial "\"digest\": \"$want\""
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  cp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  run cmd_egress allow example.com:80 </dev/null
+  assert_failure
+  run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  assert_success
+}

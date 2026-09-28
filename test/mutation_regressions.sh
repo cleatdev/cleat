@@ -14730,7 +14730,7 @@ cat > "$SED_TMP" << 'SED'
   s@^    docker rm -f "[$](_egress_gateway_name "[$]cname")" >/dev/null 2>&1 || true@    docker volume rm "$(_egress_sock_volume "$cname")" >/dev/null 2>\&1 || true; docker rm -f "$(_egress_gateway_name "$cname")" >/dev/null 2>\&1 || true@
 }
 SED
-try "vnext_egress_teardown_order" "teardown removes the gateway before the box" "$CLI" "$EGRESS_GATEWAY_BATS"
+try "vnext_egress_teardown_order" "teardown removes the gateway before the box, then the socket volume" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 # Off machines gain no docker call on a removal.
 cat > "$SED_TMP" << 'SED'
@@ -15332,7 +15332,7 @@ cat > "$SED_TMP" << 'SED'
   s@^  \[ -z "[$]cname" \] && return 0@  :@
 }
 SED
-try "vnext_egress_off_global_no_recreate" "the global confirmation recreates nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
+try "vnext_egress_off_global_no_recreate" "egress: the global confirmation recreates nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_reload()/,/^}$/{
@@ -15381,7 +15381,7 @@ cat > "$SED_TMP" << 'SED'
   s@^  if ! _egress_engine_validated "[$]kind"; then _egress_engine_refusal "[$]kind"; return 1; fi$@  :@
 }
 SED
-try "vnext_egress_reload_refused_engine" "an unvalidated engine refuses" "$CLI" "$EGRESS_ENGINE_BATS"
+try "vnext_egress_reload_refused_engine" "egress reload: an unvalidated engine refuses" "$CLI" "$EGRESS_ENGINE_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_cmd_edit()/,/^}$/{
@@ -16141,6 +16141,41 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_help_verbs" "cleat egress --help prints the verbs" "$CLI" "$SMOKE_BATS"
+
+# ── CI fixes on the pre-flip tree ──
+
+# bash 3.2: no case inside a $( ) that spans lines.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_resolution()/,/^}$/{
+  s@^    \[ "\$_EG_MODE" = strict \] || \[ "\$_EG_MODE" = open \] || exit 1$@    case "$_EG_MODE" in strict|open) ;; *) exit 1 ;; esac@
+}
+SED
+try "vnext_egress_fragment_no_case_in_subst" "a case inside a command substitution broke the fragment on bash 3.2"
+
+# pipefail: the held-host lookup reads the catalogue to the end.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_review()/,/^}$/{
+  s@'\$2 == h \&\& !f { print; f = 1 }'@'$2 == h { print; exit }'@
+}
+SED
+try "vnext_egress_review_reads_whole_catalogue" "cleat egress review died on a broken pipe"
+
+# The gateway is told port 443 alone.
+cat > "$SED_TMP" << 'SED'
+/^_egress_policy_json()/,/^}$/{
+  s@"port": 443,@"port": 80,@
+}
+SED
+try "vnext_egress_port_80_refused" "port 80 was accepted"
+
+# The digest the gateway recomputes covers the port.
+cat > "$SED_TMP" << 'SED'
+/^_egress_policy_digest()/,/^}$/{
+  s@printf '%s\\n443\\n' "\$1"@printf '%s\\n80\\n' "$1"@
+}
+SED
+try "vnext_egress_port_in_digest" "port 80 was accepted"
+
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

@@ -14524,13 +14524,22 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_ring_open_not_saved" "landing on open in the global editor does not write mode open" "$CLI" "$EGRESS_UI_BATS"
 
-# The ring's off never commits on a default answer.
+# The ring's off never commits on a default answer. Under enforcement the
+# global off is the confirmation of 6.5.
+cat > "$SED_TMP" << 'SED'
+/^_egress_off_global()/,/^}$/{
+  s@case "\$ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 1 ;; esac@:@
+}
+SED
+try "vnext_egress_ring_off_confirms" "landing on off does not write a policy on a default answer" "$CLI" "$EGRESS_UI_BATS"
+
+# A box's own off, with no caged box to recreate, asks in the save screen.
 cat > "$SED_TMP" << 'SED'
 /^_egress_save_screen()/,/^}$/{
   s@^  if \[ "\$mode_out" = off \]; then@  if false; then@
 }
 SED
-try "vnext_egress_ring_off_confirms" "landing on off does not write a policy on a default answer" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_ring_off_confirms_box" "own off asks and writes nothing on a default answer" "$CLI" "$EGRESS_UI_BATS"
 
 # A stranger's page is judged by its body, not by whether it has a title.
 cat > "$SED_TMP" << 'SED'
@@ -15575,7 +15584,7 @@ try "vnext_egress_fragment_enforcing_only" "keep the shipped text byte for byte"
 # An off policy is no policy: only strict and open get the fragment.
 cat > "$SED_TMP" << 'SED'
 /^_egress_fragment_resolution()/,/^}$/{
-  s@strict|open) ;;@strict|open|off) ;;@
+  s@^    \[ "\$_EG_MODE" = strict \] || \[ "\$_EG_MODE" = open \] || exit 1$@    [ "$_EG_MODE" = strict ] || [ "$_EG_MODE" = open ] || [ "$_EG_MODE" = off ] || exit 1@
 }
 SED
 try "vnext_egress_fragment_off_is_shipped" "keep the shipped text byte for byte" "$CLI" "$EGRESS_FRAGMENT_BATS"

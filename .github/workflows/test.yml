@@ -126,6 +126,8 @@ jobs:
   # registered entry, so the shards partition the registry exactly. Each shard
   # is about a quarter of the old run. The step times out before the job so the
   # job survives to print how far it got, see the step after it.
+  # 2026-09-28: egress stage three took the registry to about 1920 entries and
+  # two of four shards reached the 40-minute step cap, so it runs as six.
   mutation-linux:
     name: mutation (ubuntu) shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -133,7 +135,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,10 +144,10 @@ jobs:
         run: bash --version
       - name: Install socat (the OAuth forward mutations drive the real one)
         run: sudo apt-get update && sudo apt-get install -y socat
-      - name: Mutation test the regression registry, shard ${{ matrix.shard }}/4
+      - name: Mutation test the regression registry, shard ${{ matrix.shard }}/6
         timeout-minutes: 40
         env:
-          MUTATION_SHARD_TOTAL: '4'
+          MUTATION_SHARD_TOTAL: '6'
           MUTATION_SHARD_INDEX: ${{ matrix.shard }}
           # A sed that matches nothing proves nothing. Fail the shard on one.
           MUTATION_MAX_SKIPPED: '0'

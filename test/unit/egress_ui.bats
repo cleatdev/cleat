@@ -410,6 +410,23 @@ allow = docs.rs"
   assert_output "mode = strict"
 }
 
+@test "egress ring: a box's own off asks and writes nothing on a default answer" {
+  # A box file turned off for a box that is not caged (none exists yet) has no
+  # recreate to run, so the save asks here, and Enter means no.
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load main
+  _EGE_MODE=off
+  run _egress_save_screen 1 <<< ""
+  assert_failure
+  assert_output --partial "Turn it off? [y/N]"
+  [ ! -e "$_EGE_FILE" ]
+  run _egress_save_screen 1 <<< "y"
+  assert_success
+  run _egress_section_canon "$_EGE_FILE"
+  assert_output --partial "mode = off"
+}
+
 @test "egress ring: landing on off does not write a policy on a default answer" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"

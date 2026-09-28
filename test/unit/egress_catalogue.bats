@@ -6,6 +6,7 @@
 # it through the same functions the editor will, and hold the published copy,
 # EGRESS-CATALOGUE.md, to it row for row.
 load "../setup"
+load "../lib/egress_fixtures"
 setup() {
   _common_setup
   # The stub, never the host's daemon: a session-marker read runs docker inspect.
@@ -501,4 +502,353 @@ host = zeta.example B"
   assert_output "B"
   run _egress_pin_class_key not-in-the-catalogue.example
   assert_output "unaudited"
+}
+
+# ── The pin, wired (7.5) ────────────────────────────────────────────────────
+# The launch writes the pin, the resolution reads it and never writes it, and
+# review is the only way a held addition gets in. Rev 1 holds nothing, so
+# these tests bump the rev in the sourced environment, the way a later
+# release would.
+
+# A caged box of this project under a strict policy, its gateway answering the
+# digest of whatever the resolution is when caged_box runs.
+pin_box() {
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  cd "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project" main)"
+  egress_box_names
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  GPIN="$CLEAT_CONFIG_DIR/egress-pins/global"
+}
+
+# The pin a user accepted earlier: the core pack and the github pack as the
+# catalogue has them, less any host named in $PIN_MISSING, at rev 1.
+old_pin() {
+  local lines="" h
+  for h in $(_egress_pack_hosts claude all) $(_egress_pack_hosts github); do
+    case " ${PIN_MISSING:-} " in *" $h "*) continue ;; esac
+    lines+="$h $(_egress_pin_class_key "$h")"$'\n'
+  done
+  lines+="${PIN_EXTRA:-}"
+  local args=() l
+  while IFS= read -r l; do [ -n "$l" ] && args+=("$l"); done <<< "$lines"
+  _egress_write_pin "$GPIN" 1 2026-09-01 "$(_egress_pin_digest "$lines")" "${args[@]}"
+}
+
+@test "egress pin: the first launch under a policy writes the pin at the shipped rev" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\nallow = typed.example\n' > "$CLEAT_GLOBAL_CONFIG"
+  caged_box
+  [ ! -e "$GPIN" ]
+  _egress_require "$CN" claude
+  assert_equal "$_EG_CAGED" 1
+  assert_equal "$_EG_PIN_NOTE" first
+  run _read_section_from_file "$GPIN" pin catalogue_rev
+  assert_output "$_EGRESS_CATALOGUE_REV"
+  run _read_section_from_file "$GPIN" pin pinned_at
+  assert_output "$(date +%Y-%m-%d)"
+  # The packs' hosts with their class keys, never the host the user typed.
+  local want
+  want="$(_egress_pin_lines "$(printf '%s\n' $(_egress_pack_hosts claude all) $(_egress_pack_hosts github) | LC_ALL=C sort -u)")"
+  run _read_section_all_from_file "$GPIN" pin host
+  assert_output "$want"
+  refute_output --partial "typed.example"
+  run _read_section_from_file "$GPIN" pin digest
+  assert_output "$(_egress_pin_digest "$want")"
+  run bash -c 'ls -l "$1" | cut -c1-10' _ "$GPIN"
+  assert_output "-rw-------"
+  # The next launch finds it and says nothing.
+  cp "$GPIN" "$TEST_TEMP/before"
+  _egress_require "$CN" claude
+  assert_equal "$_EG_PIN_NOTE" ""
+  run cmp "$GPIN" "$TEST_TEMP/before"
+  assert_success
+}
+
+@test "egress pin: a box with its own file pins on its own" {
+  pin_box
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nallow = own.example\n' > "$_EGRESS_BOXES_DIR/$CN"
+  run _egress_pin_file "$CN"
+  assert_output "$CLEAT_CONFIG_DIR/egress-pins/$CN"
+  run _egress_pin_file cleat-other-12345678
+  assert_output "$GPIN"
+  run _egress_pin_file ""
+  assert_output "$GPIN"
+  caged_box
+  _egress_require "$CN" claude
+  [ -f "$CLEAT_CONFIG_DIR/egress-pins/$CN" ]
+  [ ! -e "$GPIN" ]
+}
+
+@test "egress pin: at the shipped rev a pin changes nothing the resolution gives" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_resolve "$CN"
+  local bare="$_EG_HOSTS"
+  # A pin missing a host at the same rev: the difference is the user's own.
+  PIN_MISSING="uploads.github.com" old_pin
+  _egress_resolve "$CN"
+  assert_equal "$_EG_HOSTS" "$bare"
+  assert_equal "$_EG_HELD" ""
+  assert_equal "$_EG_PIN_DIFF" ""
+}
+
+@test "egress pin: a pack host added after the pin is held out of the resolution" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  _egress_resolve "$CN"
+  run printf '%s\n' "$_EG_HOSTS"
+  refute_line "uploads.github.com"
+  assert_line "github.com"
+  assert_equal "$_EG_HELD" "uploads.github.com"
+  run printf '%s' "$_EG_PIN_DIFF"
+  assert_output "added	uploads.github.com	-	B"
+  # What the gateway is asked to enforce is the pinned expansion.
+  _egress_render_policy "$CN" "$_EG_MODE" "$_EG_HOSTS"
+  run cat "$(_egress_policy_dir "$CN")/policy.json"
+  refute_output --partial "uploads.github.com"
+  assert_output --partial '"github.com"'
+}
+
+@test "egress pin: an addition the user allows by name is not held" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\nallow = uploads.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  _egress_resolve "$CN"
+  run printf '%s\n' "$_EG_HOSTS"
+  assert_line "uploads.github.com"
+  assert_equal "$_EG_HELD" ""
+  assert_equal "$_EG_PIN_DIFF" ""
+}
+
+@test "egress pin: a held launch runs on the pinned hosts and rewrites nothing" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  caged_box
+  cp "$GPIN" "$TEST_TEMP/before"
+  _egress_require "$CN" claude </dev/null
+  assert_equal "$_EG_CAGED" 1
+  run cmp "$GPIN" "$TEST_TEMP/before"
+  assert_success
+  run _egress_summary_pin_lines
+  assert_output --partial '1 new host in pack "github" held. Run cleat egress review.'
+}
+
+@test "egress pin: a moved rev with nothing held re-pins and counts the removals" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_EXTRA=$'gone.example B\n' old_pin
+  _EGRESS_CATALOGUE_REV=2
+  caged_box
+  _egress_require "$CN" claude
+  assert_equal "$_EG_CAGED" 1
+  run _read_section_from_file "$GPIN" pin catalogue_rev
+  assert_output "2"
+  run _read_section_all_from_file "$GPIN" pin host
+  refute_output --partial "gone.example"
+  run _egress_summary_pin_lines
+  assert_output --partial "1 host left the packs you use and no longer reaches the box."
+  refute_output --partial "held"
+}
+
+@test "egress pin: a user's own new pack at the shipped rev re-pins silently" {
+  pin_box
+  old_pin
+  printf '[egress]\nmode = strict\npack = github\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  caged_box
+  _egress_require "$CN" claude
+  assert_equal "$_EG_CAGED" 1
+  assert_equal "$_EG_PIN_NOTE" ""
+  run _read_section_all_from_file "$GPIN" pin host
+  assert_output --partial "registry.npmjs.org"
+  run _egress_summary_pin_lines
+  assert_output ""
+}
+
+@test "egress pin: a held Claude host refuses a strict launch and names review" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="code.claude.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  caged_box
+  run _egress_require "$CN" claude
+  assert_failure
+  assert_output --partial "this release adds a Claude host that its pin holds for review"
+  assert_output --partial "cleat egress review"
+  # Open reaches every host, so nothing a pin holds can starve it.
+  printf '[egress]\nmode = open\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  caged_box
+  _egress_require "$CN" claude
+  assert_equal "$_EG_CAGED" 1
+}
+
+@test "egress pin: a pin that cannot be written refuses the launch" {
+  pin_box
+  mkdir -p "$TEST_TEMP/victim" "$CLEAT_CONFIG_DIR/egress-pins"
+  ln -s "$TEST_TEMP/victim" "$GPIN"
+  caged_box
+  run _egress_require "$CN" claude
+  assert_failure
+  assert_output --partial "cleat could not write its egress pin"
+  run ls -A "$TEST_TEMP/victim"
+  assert_output ""
+}
+
+@test "egress pin: a comparison that cannot be made refuses rather than widening" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  caged_box
+  TMPDIR="$TEST_TEMP/no-such-dir" _egress_resolve "$CN"
+  assert_equal "$_EG_PIN_BROKEN" 1
+  TMPDIR="$TEST_TEMP/no-such-dir" run _egress_require "$CN" claude
+  assert_failure
+  assert_output --partial "could not compare its egress pin"
+}
+
+@test "egress pin: status names the held hosts" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" PIN_EXTRA="" old_pin
+  # A host the pin accepted at a stronger class than the catalogue gives now.
+  sed -i.bak 's/^host = github.com B$/host = github.com A/' "$GPIN"
+  _EGRESS_CATALOGUE_REV=2
+  caged_box
+  run _egress_status_render "$CN"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Held:      github.com (now contained), uploads.github.com (new)"
+  assert_output --partial "cleat egress review"
+  # Open holds nothing back from the box, so status claims nothing is held.
+  printf '[egress]\nmode = open\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_status_render "$CN"
+  run _plain "$output"
+  refute_output --partial "Held:"
+}
+
+@test "egress review: nothing held says so and writes nothing" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_cmd_review "$CN" 0 </dev/null
+  assert_success
+  assert_output --partial "Nothing is held. There is no pin yet"
+  [ ! -e "$GPIN" ]
+  old_pin
+  cp "$GPIN" "$TEST_TEMP/before"
+  run _egress_cmd_review "$CN" 0 </dev/null
+  assert_success
+  assert_output --partial "Nothing is held. Pinned at catalogue rev 1 on 2026-09-01."
+  run cmp "$GPIN" "$TEST_TEMP/before"
+  assert_success
+}
+
+@test "egress review: a pipe without --yes refuses" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  cp "$GPIN" "$TEST_TEMP/before"
+  run _egress_cmd_review "$CN" 0 </dev/null
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "+ uploads.github.com   pack github"
+  assert_output --partial "needs a terminal"
+  assert_output --partial "cleat egress review --yes"
+  run cmp "$GPIN" "$TEST_TEMP/before"
+  assert_success
+}
+
+@test "egress review: accepting re-pins rev, date, digest and hosts in one write" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  eval "_real_write_pin() $(declare -f _egress_write_pin | sed 1d)"
+  _egress_write_pin() { echo write >> "$TEST_TEMP/writes"; _real_write_pin "$@"; }
+  _egress_apply_now() { echo "apply [$1]" >> "$TEST_TEMP/applied"; }
+  run _egress_cmd_review "$CN" 1 </dev/null
+  assert_success
+  assert_output --partial "Re-pinned at catalogue rev 2."
+  run cat "$TEST_TEMP/writes"
+  assert_output "write"
+  run _read_section_from_file "$GPIN" pin catalogue_rev
+  assert_output "2"
+  run _read_section_from_file "$GPIN" pin pinned_at
+  assert_output "$(date +%Y-%m-%d)"
+  local want
+  want="$(_egress_pin_lines "$(printf '%s\n' $(_egress_pack_hosts claude all) $(_egress_pack_hosts github) | LC_ALL=C sort -u)")"
+  run _read_section_all_from_file "$GPIN" pin host
+  assert_output "$want"
+  run _read_section_from_file "$GPIN" pin digest
+  assert_output "$(_egress_pin_digest "$want")"
+  # The machine's pin reaches every running caged box.
+  run cat "$TEST_TEMP/applied"
+  assert_output "apply []"
+  # And the host is in the resolution now.
+  _egress_resolve "$CN"
+  assert_equal "$_EG_HELD" ""
+  run printf '%s\n' "$_EG_HOSTS"
+  assert_line "uploads.github.com"
+}
+
+@test "egress review: declining writes nothing" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  cp "$GPIN" "$TEST_TEMP/before"
+  _egress_on_terminal() { return 0; }
+  _egress_apply_now() { echo applied >> "$TEST_TEMP/applied"; }
+  run _egress_cmd_review "$CN" 0 <<< "n"
+  assert_success
+  assert_output --partial "Nothing changed. They stay held."
+  run cmp "$GPIN" "$TEST_TEMP/before"
+  assert_success
+  [ ! -f "$TEST_TEMP/applied" ]
+  # An empty answer is a no: accepting widens.
+  run _egress_cmd_review "$CN" 0 <<< ""
+  run cmp "$GPIN" "$TEST_TEMP/before"
+  assert_success
+  run _egress_cmd_review "$CN" 0 <<< "y"
+  assert_success
+  run _read_section_from_file "$GPIN" pin catalogue_rev
+  assert_output "2"
+}
+
+@test "egress review: a box's own pin applies to that box alone" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nallow = own.example\n' > "$_EGRESS_BOXES_DIR/$CN"
+  GPIN="$CLEAT_CONFIG_DIR/egress-pins/$CN" PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  _egress_apply_now() { echo "apply [$1]" >> "$TEST_TEMP/applied"; }
+  run _egress_cmd_review "$CN" 1 </dev/null
+  assert_success
+  run cat "$TEST_TEMP/applied"
+  assert_output "apply [$CN]"
+  [ ! -e "$CLEAT_CONFIG_DIR/egress-pins/global" ]
+}
+
+@test "egress review: a weakened host shows both classes and its residual" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github-raw\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_EXTRA=$'raw.githubusercontent.com B\n' old_pin
+  printf '[egress]\nmode = strict\npack = github\npack = github-raw\n' > "$CLEAT_GLOBAL_CONFIG"
+  _EGRESS_CATALOGUE_REV=2
+  run _egress_cmd_review "$CN" 0 </dev/null
+  run _plain "$output"
+  assert_output --partial "! raw.githubusercontent.com   contained -> open tenancy   measured h1+h2, 2026-09-21"
+  assert_output --partial "the operator serves content its users upload"
 }

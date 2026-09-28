@@ -379,7 +379,9 @@ _summary_line_of() { printf '%s\n' "$output" | grep -nF -- "$1" | head -n 1 | cu
   caps="$(_summary_line_of "Caps:")"
   egress="$(_summary_line_of "Egress:")"
   browser="$(_summary_line_of "Browser:")"
-  [ -n "$caps" ] && [ -n "$egress" ] && [ -n "$browser" ]
+  [ -n "$caps" ]
+  [ -n "$egress" ]
+  [ -n "$browser" ]
   [ "$caps" -lt "$egress" ]
   [ "$egress" -lt "$browser" ]
 }
@@ -415,6 +417,67 @@ _summary_line_of() { printf '%s\n' "$output" | grep -nF -- "$1" | head -n 1 | cu
   _plain_output
   assert_output --partial "Egress:     open  ·  every TLS host allowed, every host logged"
   refute_output --partial "saved, not enforced"
+}
+
+# A pin the user accepted at rev 1: the core and github packs, less one host.
+_summary_old_pin() {
+  local args=() h
+  for h in $(_egress_pack_hosts claude all) $(_egress_pack_hosts github); do
+    [ "$h" = uploads.github.com ] && continue
+    args+=("$h $(_egress_pin_class_key "$h")")
+  done
+  _egress_write_pin "$_EGRESS_PINS_DIR/global" 1 2026-09-01 v1:0000000000000000 "${args[@]}"
+}
+
+@test "summary: a held-additions line names cleat egress review" {
+  ACTIVE_CAPS=()
+  _EGRESS_ENFORCING=1
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  _summary_old_pin
+  _EGRESS_CATALOGUE_REV=2
+  # What the gate does before the summary prints.
+  _egress_resolve cleat-test-12345678
+  _egress_pin_launch cleat-test-12345678
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  _plain_output
+  # A sub-line of the row at its 14-space indent. _plain_output rewrites
+  # output and not lines, so the line is matched with its newline.
+  assert_output --partial $'\n''              1 new host in pack "github" held. Run cleat egress review.'
+  local egress held
+  egress="$(_summary_line_of "Egress:")"
+  held="$(_summary_line_of "held. Run cleat egress review.")"
+  [ "$held" -eq $((egress + 1)) ]
+  # Under open nothing is held back, so the row claims nothing is.
+  printf '[egress]\nmode = open\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_resolve cleat-test-12345678
+  _egress_pin_launch cleat-test-12345678
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  _plain_output
+  refute_output --partial "held"
+}
+
+@test "summary: the first launch under a pin says the packs were pinned" {
+  ACTIVE_CAPS=()
+  _EGRESS_ENFORCING=1
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_resolve cleat-test-12345678
+  _egress_pin_launch cleat-test-12345678
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  _plain_output
+  assert_output --partial $'\n'"              Packs pinned at catalogue rev ${_EGRESS_CATALOGUE_REV}. Later additions wait for review."
+  # The next launch finds the pin and says nothing about it.
+  _egress_resolve cleat-test-12345678
+  _egress_pin_launch cleat-test-12345678
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  _plain_output
+  refute_output --partial "Packs pinned"
+  # Before enforcement ships no launch pins anything, and no line says so.
+  _EGRESS_ENFORCING=0
+  _EG_PIN_NOTE=first
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  _plain_output
+  refute_output --partial "Packs pinned"
 }
 
 @test "summary block: omits Project line when project is empty" {

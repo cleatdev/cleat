@@ -15671,6 +15671,184 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_fragment_setup_prompt" "the setup prompt names the network the policy gives" "$CLI" "$EGRESS_FRAGMENT_BATS"
 
+# ── S21: the pin, wired (7.5) ──
+
+# The gate writes the pin.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  /_egress_pin_launch "\$_c" || return 1/d
+}
+SED
+try "vnext_egress_pin_gate_writes" "the first launch under a policy writes the pin at the shipped rev" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# A pin holds the packs' hosts, never the ones the user typed.
+cat > "$SED_TMP" << 'SED'
+/^_egress_resolve()/,/^}$/{
+  s|_EG_PIN_NAMES="\$(printf '%s\\n%s\\n' "\$_core" "\$_r_packhosts"|_EG_PIN_NAMES="$(printf '%s\\n%s\\n' "$_core" "$_r_hosts"|
+}
+SED
+try "vnext_egress_pin_packs_only" "the first launch under a policy writes the pin at the shipped rev" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The first pin says so on the summary.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s|_EG_PIN_NOTE=first|_EG_PIN_NOTE=|
+}
+SED
+try "vnext_egress_pin_first_note" "the first launch under a pin says the packs were pinned" "$CLI" "$TERMINAL_UX_BATS"
+
+# A box with its own file has its own pin.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_file()/,/^}$/{
+  s|printf '%s/%s' "\$_EGRESS_PINS_DIR" "\$1"|printf '%s/global' "$_EGRESS_PINS_DIR"|
+}
+SED
+try "vnext_egress_pin_per_box" "a box with its own file pins on its own" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# At the shipped rev every difference is the user's own.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_hold()/,/^}$/{
+  s@\[ "\$_rev" = "\$_EGRESS_CATALOGUE_REV" \] && return 0@:@
+}
+SED
+try "vnext_egress_pin_same_rev_holds_nothing" "at the shipped rev a pin changes nothing the resolution gives" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# A catalogue addition since the pin stays out of the resolution.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_hold()/,/^}$/{
+  s|if \[ -n "\$_EG_HELD" \]; then _EG_HOSTS=|if false; then _EG_HOSTS=|
+}
+SED
+try "vnext_egress_pin_addition_held" "a pack host added after the pin is held out of the resolution" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# An addition the user allows by name is theirs.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_hold()/,/^}$/{
+  /_egress_in_list "\$_h" "\$2" && continue/d
+}
+SED
+try "vnext_egress_pin_user_allow_not_held" "an addition the user allows by name is not held" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# No launch accepts a held change.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s@case "\$_EG_PIN_DIFF" in \*added\$'\\t'\*|\*weakened\$'\\t'\*) return 0 ;; esac@:@
+}
+SED
+try "vnext_egress_pin_launch_never_accepts" "a held launch runs on the pinned hosts and rewrites nothing" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# A moved rev with nothing held re-pins, so the removals apply.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s|^  _egress_pin_repin "\$_pf"$|  :|
+}
+SED
+try "vnext_egress_pin_moved_rev_repins" "a moved rev with nothing held re-pins and counts the removals" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The user's own pack change at the shipped rev re-pins.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s@\[ "\$_names" = "\$_EG_PIN_NAMES" \] && return 0@return 0@
+}
+SED
+try "vnext_egress_pin_user_change_repins" "own new pack at the shipped rev re-pins silently" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# A held Claude host refuses rather than starving the session.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s@\[ "\$_EG_HELD_CORE" = 1 \]@false@
+}
+SED
+try "vnext_egress_pin_core_held_refuses" "a held Claude host refuses a strict launch and names review" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# A pin that cannot be written refuses.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_repin()/,/^}$/{
+  s|_egress_pin_write "\$1" "\$_EGRESS_CATALOGUE_REV" && return 0|return 0|
+}
+SED
+try "vnext_egress_pin_unwritable_refuses" "a pin that cannot be written refuses the launch" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# A comparison that cannot be made refuses rather than widening.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_hold()/,/^}$/{
+  s|_EG_PIN_BROKEN=1$|:|
+}
+SED
+try "vnext_egress_pin_broken_refuses" "a comparison that cannot be made refuses rather than widening" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# Status names what is held.
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  /^    _egress_status_held_row$/d
+}
+SED
+try "vnext_egress_pin_status_held" "status names the held hosts" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# The summary names review for a held addition.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_pin_lines()/,/^}$/{
+  s|\*"cleat egress review."\*) echo -e|*"cleat egress review."*) : echo -e|
+}
+SED
+try "vnext_egress_pin_summary_held" "a held-additions line names cleat egress review" "$CLI" "$TERMINAL_UX_BATS"
+
+# Held lines are strict only: open holds nothing back.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_pin_lines()/,/^}$/{
+  /\[ "\$_EG_MODE" = strict \] || return 0/d
+}
+SED
+try "vnext_egress_pin_summary_open" "a held-additions line names cleat egress review" "$CLI" "$TERMINAL_UX_BATS"
+
+# review: accepting re-pins.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_review()/,/^}$/{
+  s|_egress_pin_write "\$pf" "\$_EGRESS_CATALOGUE_REV" \|\| return 1|:|
+}
+SED
+try "vnext_egress_review_accept_repins" "accepting re-pins rev, date, digest and hosts in one write" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# review: a pipe needs --yes.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_review()/,/^}$/{
+  s|if ! _egress_on_terminal; then|if false; then|
+}
+SED
+try "vnext_egress_review_pipe_refuses" "a pipe without --yes refuses" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# review: default deny.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_review()/,/^}$/{
+  s|\*) info "Nothing changed. They stay held."; return 0 ;;|*) ;;|
+}
+SED
+try "vnext_egress_review_default_deny" "declining writes nothing" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# review: the machine's pin reaches every running caged box.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_review()/,/^}$/{
+  s|\*/global) _egress_apply_now "" ;;|*/global) _egress_apply_now "$cname" ;;|
+}
+SED
+try "vnext_egress_review_global_applies_all" "accepting re-pins rev, date, digest and hosts in one write" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# review: nothing held writes nothing.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_review()/,/^}$/{
+  s|if \[ "\$held" != 1 \]; then|if false; then|
+}
+SED
+try "vnext_egress_review_nothing_held" "nothing held says so and writes nothing" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# review: the verb is dispatched.
+cat > "$SED_TMP" << 'SED'
+/^_egress_verb()/,/^}$/{
+  /review) _egress_cmd_review/d
+}
+SED
+try "vnext_egress_review_dispatched" "cleat egress review runs on the real binary" "$CLI" "$SMOKE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

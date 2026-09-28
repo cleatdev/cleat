@@ -3527,6 +3527,33 @@ SH
   refute_output --partial "unbound variable"
 }
 
+@test "smoke: cleat egress review runs on the real binary" {
+  run cleat_bin egress review < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "There is no pin to review."
+  mkdir -p "$XDG_CONFIG_HOME/cleat/egress-pins"
+  printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
+  run cleat_bin egress review < /dev/null
+  assert_success
+  assert_output --partial "There is no pin yet"
+  # A pin from an older catalogue that lacks hosts the shipped one carries.
+  printf '[pin]\ncatalogue_rev = 0\npinned_at = 2026-09-01\ndigest = v1:0000000000000000\nhost = api.anthropic.com B\n' \
+    > "$XDG_CONFIG_HOME/cleat/egress-pins/global"
+  run cleat_bin egress review < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "claude.ai"
+  assert_output --partial "needs a terminal"
+  run cleat_bin egress review --yes < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "Re-pinned at catalogue rev"
+  run cleat_bin egress review < /dev/null
+  assert_success
+  assert_output --partial "Nothing is held. Pinned at catalogue rev"
+}
+
 @test "smoke: cleat egress restart and restart --shim on a box with no policy exit 1 cleanly" {
   run cleat_bin egress restart < /dev/null
   assert_failure

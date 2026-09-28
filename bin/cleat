@@ -10102,6 +10102,7 @@ _egress_take_file() {                    # <file> <label>
     [ -n "$_v" ] || continue
     if _h="$(_egress_valid_host "$_v")"; then
       _r_hosts+="$_h"$'\n'
+      _r_allow+="$_h"$'\n'
     else
       # The reason is set in the current shell, not in the substitution above.
       _egress_valid_host "$_v" >/dev/null || true
@@ -10117,7 +10118,9 @@ EOF
       echo -e "  ${DIM}The packs are listed by ${BOLD}cleat egress packs${RESET}${DIM}.${RESET}"
       exit 1
     fi
-    _r_hosts+="$(_egress_pack_hosts "$_p")"$'\n'
+    _v="$(_egress_pack_hosts "$_p")"
+    _r_hosts+="$_v"$'\n'
+    _r_packhosts+="$_v"$'\n'
     _r_packs+="$_p"$'\n'
   done <<EOF
 $_p_vals
@@ -10166,7 +10169,7 @@ EOF
 # Called at statement position.
 _egress_resolve() {                      # <cname>
   local _cname="$1" _perbox _r_hosts="" _r_deny="" _r_packs="" _g_mode _entries
-  local _core
+  local _core _r_allow="" _r_packhosts=""
   _core="$(_egress_pack_hosts claude all)"
   _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress
   _g_mode="$_m_mode"
@@ -10180,6 +10183,10 @@ _egress_resolve() {                      # <cname>
   _egress_take_file "$CLEAT_GLOBAL_CONFIG" global
   _r_hosts="$(_egress_subtract "$_r_hosts" "$_r_deny")"
   _r_hosts="${_r_hosts:+$_r_hosts$'\n'}"
+  _r_allow="$(_egress_subtract "$_r_allow" "$_r_deny")"
+  _r_allow="${_r_allow:+$_r_allow$'\n'}"
+  _r_packhosts="$(_egress_subtract "$_r_packhosts" "$_r_deny")"
+  _r_packhosts="${_r_packhosts:+$_r_packhosts$'\n'}"
   _r_deny=""
   case "$_g_mode" in
     absent)
@@ -10194,6 +10201,8 @@ _egress_resolve() {                      # <cname>
     _egress_warn_unknown_keys "$_perbox"
     _egress_take_file "$_perbox" perbox
     _r_hosts="$(_egress_subtract "$_r_hosts" "$_r_deny")"
+    _r_allow="$(_egress_subtract "$_r_allow" "$_r_deny")"
+    _r_packhosts="$(_egress_subtract "$_r_packhosts" "$_r_deny")"
     if [ "$_m_mode" != absent ]; then _EG_MODE="$_m_mode"; _EG_WHY=perbox; fi
   fi
   if [ "$_EG_MODE" = strict ] && _egress_session_marker_valid "$_cname"; then
@@ -10202,6 +10211,144 @@ _egress_resolve() {                      # <cname>
   fi
   _EG_HOSTS="$(printf '%s\n%s\n' "$_core" "$_r_hosts" | { grep -v '^$' || true; } | LC_ALL=C sort -u)"
   _EG_PACKS="$(printf 'claude\n%s\n' "$_r_packs" | { grep -v '^$' || true; } | LC_ALL=C sort -u)"
+  # What a pin holds: the packs' hosts, never the ones the user typed.
+  _EG_PIN_NAMES="$(printf '%s\n%s\n' "$_core" "$_r_packhosts" | { grep -v '^$' || true; } | LC_ALL=C sort -u)"
+  _egress_pin_hold "$_cname" "$_r_allow"
+}
+
+# ── The pin, applied (7.5) ──
+# The resolution reads the pin and never writes it. While the pin's catalogue
+# rev is the shipped one, every difference from it is the user's own and
+# applies: the launch re-pins. Once the rev moved, the catalogue did, and its
+# additions are held out of _EG_HOSTS into _EG_HELD, so the gateway enforces
+# the pinned expansion. A weakened host stays allowed at the class the user
+# accepted, and is named. Removals and upgrades apply. _EG_PIN_DIFF is the
+# diff less any addition the user allows by name, one computation for the
+# gate, the summary, status and review. _EG_HELD_CORE is 1 when a held
+# addition is a Claude host, which makes the pinned expansion unusable.
+# _EG_PIN_BROKEN is 1 when the comparison could not be made.
+_EG_HELD=""
+_EG_HELD_CORE=0
+_EG_PIN_DIFF=""
+_EG_PIN_BROKEN=0
+_egress_pin_hold() {                     # <cname> <user allows>
+  local _pf _rev _tmp _diff _d _h _o _n
+  _EG_HELD=""; _EG_HELD_CORE=0; _EG_PIN_DIFF=""; _EG_PIN_BROKEN=0
+  case "$_EG_MODE" in strict|open) ;; *) return 0 ;; esac
+  _pf="$(_egress_pin_file "$1")"
+  [ -f "$_pf" ] || return 0
+  _rev="$(_read_section_from_file "$_pf" pin catalogue_rev)"
+  case "$_rev" in ""|*[!0-9]*) return 0 ;; esac
+  [ "$_rev" = "$_EGRESS_CATALOGUE_REV" ] && return 0
+  if ! _tmp="$(mktemp "${TMPDIR:-/tmp}/cleat-pin.XXXXXX" 2>/dev/null)"; then
+    _EG_PIN_BROKEN=1
+    return 0
+  fi
+  _egress_pin_lines "$_EG_PIN_NAMES" > "$_tmp"
+  _diff="$(_egress_pin_diff "$_pf" "$_tmp")"
+  rm -f "$_tmp"
+  while IFS=$'\t' read -r _d _h _o _n; do
+    [ -n "$_d" ] || continue
+    if [ "$_d" = added ]; then
+      # A host the user allows by name is theirs, not the vendor's.
+      _egress_in_list "$_h" "$2" && continue
+      _EG_HELD+="$_h"$'\n'
+      [ "$(_egress_host_pack "$_h")" = claude ] && _EG_HELD_CORE=1
+    fi
+    _EG_PIN_DIFF+="$_d"$'\t'"$_h"$'\t'"$_o"$'\t'"$_n"$'\n'
+  done <<EOF
+$_diff
+EOF
+  _EG_HELD="${_EG_HELD%$'\n'}"
+  _EG_PIN_DIFF="${_EG_PIN_DIFF%$'\n'}"
+  if [ -n "$_EG_HELD" ]; then _EG_HOSTS="$(_egress_subtract "$_EG_HOSTS" "$_EG_HELD")"; fi
+  return 0
+}
+
+# The pin that applies to a box: its own once it has its own file, else the
+# machine's.
+_egress_pin_file() {                     # <cname>
+  if [ -n "$1" ] && [ -z "${_EG_NO_PERBOX:-}" ] && { [ -e "$_EGRESS_BOXES_DIR/$1" ] || [ -L "$_EGRESS_BOXES_DIR/$1" ]; }; then
+    printf '%s/%s' "$_EGRESS_PINS_DIR" "$1"
+  else
+    printf '%s/global' "$_EGRESS_PINS_DIR"
+  fi
+}
+
+# `<host> <class key>` for each name, the form a pin and a shipped expansion
+# both hold.
+_egress_pin_lines() {                    # <host names>
+  local _h
+  while IFS= read -r _h; do
+    [ -n "$_h" ] || continue
+    printf '%s %s\n' "$_h" "$(_egress_pin_class_key "$_h")"
+  done <<EOF
+$1
+EOF
+}
+
+# Writes the pin for <file> at <rev> from the resolution's pin names.
+_egress_pin_write() {                    # <file> <rev>
+  local _lines _l _args=()
+  _lines="$(_egress_pin_lines "$_EG_PIN_NAMES")"
+  while IFS= read -r _l; do
+    [ -n "$_l" ] && _args=("${_args[@]+"${_args[@]}"}" "$_l")
+  done <<EOF
+$_lines
+EOF
+  _egress_write_pin "$1" "$2" "$(date +%Y-%m-%d)" "$(_egress_pin_digest "$_lines")" "${_args[@]+"${_args[@]}"}"
+}
+
+# The gate's pin step, under live enforcement, after the box proved caged and
+# before the live digest. No pin: this launch writes one at the shipped rev
+# and the summary says so. The same rev: a pin that differs from the packs in
+# use is the user's own change, re-pinned silently. A moved rev with nothing
+# held re-pins, so removals and upgrades apply. Anything held stays held: no
+# launch accepts, on a terminal or off one. A held Claude host refuses, since
+# the pinned expansion would leave Claude Code without it. The summary reads
+# _EG_PIN_NOTE and _EG_PIN_LAUNCH_DIFF, the diff this launch acted on.
+_EG_PIN_NOTE=""
+_EG_PIN_LAUNCH_DIFF=""
+_egress_pin_launch() {                   # <cname>
+  local _pf _rev _names
+  _EG_PIN_NOTE=""
+  _EG_PIN_LAUNCH_DIFF="$_EG_PIN_DIFF"
+  if [ "$_EG_PIN_BROKEN" = 1 ]; then
+    _egress_refuse policy "cleat could not compare its egress pin with this release's packs." \
+      "check that ${BOLD}${TMPDIR:-/tmp}${RESET} is writable, then re-run cleat"
+    return 1
+  fi
+  if [ "$_EG_MODE" = strict ] && [ "$_EG_HELD_CORE" = 1 ]; then
+    _egress_refuse policy "this release adds a Claude host that its pin holds for review. Claude Code may not work without it." \
+      "${BOLD}cleat egress review${RESET}"
+    return 1
+  fi
+  _pf="$(_egress_pin_file "$1")"
+  _rev=""
+  if [ -f "$_pf" ]; then _rev="$(_read_section_from_file "$_pf" pin catalogue_rev)"; fi
+  case "$_rev" in
+    ""|*[!0-9]*)
+      _egress_pin_repin "$_pf" || return 1
+      _EG_PIN_NOTE=first
+      return 0 ;;
+  esac
+  if [ "$_rev" = "$_EGRESS_CATALOGUE_REV" ]; then
+    _names="$(_read_section_all_from_file "$_pf" pin host | sed 's/ .*//' | LC_ALL=C sort -u)"
+    [ "$_names" = "$_EG_PIN_NAMES" ] && return 0
+    _egress_pin_repin "$_pf"
+    return $?
+  fi
+  case "$_EG_PIN_DIFF" in *added$'\t'*|*weakened$'\t'*) return 0 ;; esac
+  _egress_pin_repin "$_pf"
+}
+
+# A launch's pin write at the shipped rev. A pin that cannot be written is a
+# pin that holds nothing at the next catalogue move, so the launch refuses.
+_egress_pin_repin() {                    # <file>
+  _egress_pin_write "$1" "$_EGRESS_CATALOGUE_REV" && return 0
+  _egress_refuse policy "cleat could not write its egress pin." \
+    "check ${BOLD}${1/#${HOME}/~}${RESET} is a file you own, then re-run cleat"
+  return 1
 }
 
 # 1 when <file> carries an [egress] header, else 0. Read raw, so a bare header
@@ -11726,6 +11873,7 @@ _egress_require() {                      # <cname> <verb>
     return 1
   fi
   _egress_gateway_ok "$_c" || return 1
+  _egress_pin_launch "$_c" || return 1
   _egress_live_ok "$_c" "$_EG_MODE" "$_EG_HOSTS" || return 1
   _egress_shim_note "$_c"
   _EG_CAGED=1
@@ -11826,6 +11974,7 @@ _egress_summary_row() {                  # <cname>
     echo -e "              ${DIM}release. Nothing is filtered today)${RESET}"
   else
     echo -e "  ${DIM}Egress:${RESET}     ${BOLD}${_EG_MODE}${RESET}  ${DIM}·  ${_desc}${RESET}"
+    _egress_summary_pin_lines
   fi
   _egress_widening "$_c" "$_EG_MODE" "$_EG_HOSTS"
   _added="$(printf '%s' "$_EG_ADDED" | grep -c . || true)"
@@ -11836,6 +11985,29 @@ _egress_summary_row() {                  # <cname>
     echo -e "              ${AMBER}mode widened to open since the last launch.${RESET}  ${DIM}cleat egress status${RESET}"
   fi
   _egress_ledger_write "$_c" "$_EG_MODE" "$_EG_HOSTS"
+}
+
+# The pin's sub-lines of the Egress: row (7.5), from what this launch's gate
+# did: a first pin, then the held lines and the removal count. Both of those
+# are strict only: under open every host is reachable, so nothing is held
+# back and nothing that left a pack stops reaching the box.
+_egress_summary_pin_lines() {
+  local _l
+  if [ "$_EG_PIN_NOTE" = first ]; then
+    echo -e "              ${DIM}Packs pinned at catalogue rev ${_EGRESS_CATALOGUE_REV}. Later additions wait for review.${RESET}"
+  fi
+  [ "$_EG_MODE" = strict ] || return 0
+  [ -n "$_EG_PIN_LAUNCH_DIFF" ] || return 0
+  while IFS= read -r _l; do
+    [ -n "$_l" ] || continue
+    case "$_l" in
+      *"cleat egress review."*) echo -e "              ${AMBER}${_l}${RESET}" ;;
+      *) echo -e "              ${DIM}${_l}${RESET}" ;;
+    esac
+  done <<EOF
+$(_egress_pin_summary "$_EG_PIN_LAUNCH_DIFF")
+EOF
+  return 0
 }
 
 # ── cleat egress: the verbs of stage two ───────────────────────────────────
@@ -12236,6 +12408,7 @@ _egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <s
     log) _egress_cmd_log "$cname" "$5"; return $? ;;
     reload) _egress_cmd_reload "$cname"; return $? ;;
     restart) _egress_cmd_restart "$cname" "$6" "$7"; return $? ;;
+    review) _egress_cmd_review "$cname" "$4"; return $? ;;
     open) cmd_egress_open "$cname" "$4"; return $? ;;
     off) cmd_egress_off "$cname" "$4"; return $? ;;
   esac
@@ -12295,6 +12468,91 @@ _egress_apply_mode() {                   # <cname> <mode>
   if [ -z "$_got" ] || [ "$_got" != "$_want" ]; then return 1; fi
   # What the agent is told follows the policy it now runs under (9.4).
   _egress_fragment_refresh "$cname"
+  return 0
+}
+
+# The one line a residual takes in review, by the word a host is rated.
+_egress_review_residual() {              # <word>
+  case "$1" in
+    shared) printf 'allowing it allows other tenants of that edge' ;;
+    "open tenancy") printf 'the operator serves content its users upload' ;;
+    unaudited) printf 'nobody has measured who else it serves' ;;
+  esac
+}
+
+# cleat egress review [box] [--yes] (7.5): what the pin holds, one line per new
+# host or weakened class with its pack, its rating, its measurement and its
+# purpose. Accepting widens, so it asks [y/N] and a pipe needs --yes. A yes
+# re-pins the rev, the date, the digest and the hosts in one write, then every
+# running caged box the pin covers takes it now. Nothing held writes nothing.
+_egress_cmd_review() {                   # <cname> <yes>
+  local cname="$1" yes="$2" box pf rev at d h o n p rec cls flg legs purpose word res ans=""
+  local held=0
+  box="$(_sessions_safe_str "${_BOX:-main}")"
+  if ! ( _egress_resolve "$cname" ) >/dev/null 2>&1; then
+    _egress_resolve "$cname"
+    return 1
+  fi
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in
+    strict|open) ;;
+    *) info "Egress control is off for box ${BOLD}${box}${RESET}. There is no pin to review."; return 0 ;;
+  esac
+  pf="$(_egress_pin_file "$cname")"
+  if [ ! -f "$pf" ]; then
+    info "Nothing is held. There is no pin yet: the next caged launch writes one."
+    return 0
+  fi
+  rev="$(_read_section_from_file "$pf" pin catalogue_rev)"
+  at="$(_read_section_from_file "$pf" pin pinned_at)"
+  case "$_EG_PIN_DIFF" in *added$'\t'*|*weakened$'\t'*) held=1 ;; esac
+  if [ "$held" != 1 ]; then
+    info "Nothing is held. Pinned at catalogue rev $(_sanitize_repo_str "$rev") on $(_sanitize_repo_str "$at")."
+    return 0
+  fi
+  echo ""
+  echo -e "  ${BOLD}Held since the pin${RESET}  ${DIM}catalogue rev $(_sanitize_repo_str "$rev") → ${_EGRESS_CATALOGUE_REV}${RESET}"
+  while IFS=$'\t' read -r d h o n; do
+    case "$d" in added|weakened) ;; *) continue ;; esac
+    rec="$(_egress_catalogue_records | awk -F'\t' -v h="$h" '$2 == h { print; exit }')"
+    p="$(printf '%s' "$rec" | cut -f1)"
+    cls="$(printf '%s' "$rec" | cut -f3)"
+    flg="$(printf '%s' "$rec" | cut -f4)"
+    legs="$(printf '%s' "$rec" | cut -f5)"
+    purpose="$(printf '%s' "$rec" | cut -f7)"
+    word="$(_egress_class_word "$cls" "$flg")"
+    if [ "$d" = added ]; then
+      echo -e "    ${GREEN}+${RESET} ${BOLD}${h}${RESET}   pack ${p}   ${word}   ${DIM}measured ${legs}${RESET}"
+    else
+      echo -e "    ${AMBER}!${RESET} ${BOLD}${h}${RESET}   $(_egress_pin_key_word "$o") -> ${word}   ${DIM}measured ${legs}${RESET}"
+    fi
+    [ -n "$purpose" ] && echo -e "        ${DIM}${purpose}${RESET}"
+    res="$(_egress_review_residual "$word")"
+    [ -n "$res" ] && echo -e "        ${AMBER}${res}${RESET}"
+  done <<EOF
+$_EG_PIN_DIFF
+EOF
+  echo ""
+  if [ "$yes" != 1 ]; then
+    if ! _egress_on_terminal; then
+      error "cleat egress review widens what boxes may reach, so it needs a terminal."
+      echo -e "    ${DIM}On a pipe:${RESET} ${BOLD}cleat egress review --yes${RESET}"
+      return 1
+    fi
+    _ask_yn ans "Accept these and re-pin? [y/N] "
+    case "$ans" in
+      [yY]*) ;;
+      *) info "Nothing changed. They stay held."; return 0 ;;
+    esac
+  fi
+  _egress_pin_write "$pf" "$_EGRESS_CATALOGUE_REV" || return 1
+  success "Re-pinned at catalogue rev ${_EGRESS_CATALOGUE_REV}."
+  # A box's own pin reaches that box. The machine's reaches every caged box
+  # that runs.
+  case "$pf" in
+    */global) _egress_apply_now "" ;;
+    *) _egress_apply_now "$cname" ;;
+  esac
   return 0
 }
 
@@ -13639,6 +13897,7 @@ $_EG_HOSTS
 EOF
     if [ -n "$shared" ]; then shared="${shared%, }"; else shared=none; fi
     echo -e "  Shared:    ${shared}"
+    _egress_status_held_row
   else
     echo -e "  Allowed:   any name on port 443 ${DIM}(open)${RESET}"
   fi
@@ -13812,6 +14071,24 @@ _egress_status_channels() {
   echo -e "       project          the mounted working tree is the product"
   echo -e "       Anything you do allow can still carry data out."
   echo ""
+}
+
+# What the pin holds back from a strict box (7.5): the catalogue's new hosts,
+# and the hosts it now rates weaker than the user accepted, which still run.
+_egress_status_held_row() {
+  local _d _h _o _n _items=""
+  [ -n "$_EG_PIN_DIFF" ] || return 0
+  while IFS=$'\t' read -r _d _h _o _n; do
+    case "$_d" in
+      added) _items+="$_h (new), " ;;
+      weakened) _items+="$_h (now $(_egress_pin_key_word "$_n")), " ;;
+    esac
+  done <<EOF
+$_EG_PIN_DIFF
+EOF
+  [ -n "$_items" ] || return 0
+  echo -e "  ${AMBER}Held:${RESET}      ${_items%, }"
+  echo -e "             ${DIM}the packs changed since the pin. A new host stays out until${RESET} ${BOLD}cleat egress review${RESET}"
 }
 
 # The browser bridge's effective origin count, as cleat browser origins shows.

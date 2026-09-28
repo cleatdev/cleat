@@ -10476,3 +10476,34 @@ pack = npm"
   run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
   assert_success
 }
+
+@test "regression vNEXT: the egress integration teardown matched every container when its box name was empty" {
+  # A setup stopped before it named its box left CN empty, the name filter
+  # became name=^ and every container on the host was force-removed with its
+  # gateway and volume. The cleanup now touches Docker only for a name with
+  # container_name_for's shape, and only for that project's own boxes.
+  source "$BATS_TEST_DIRNAME/../lib/egress_int_teardown.bash"
+  use_docker_stub
+  local cn=cleat-int-project-e8db55e1 c
+  for c in "" garbage "cleat-" "cleat-x-1234567" "$cn;rm"; do
+    : > "$DOCKER_CALLS"
+    run eg_int_teardown_boxes "$c"
+    assert_success
+    run cat "$DOCKER_CALLS"
+    assert_output ""
+  done
+  # A well-formed name: its listing is anchored, and a foreign name docker
+  # might return is still never removed.
+  : > "$DOCKER_CALLS"
+  mock_docker_ps_filter "$cn
+${cn}-apt
+cleat-site-preview" "name=^${cn}(-[a-z0-9_.-]+)?$"
+  run eg_int_teardown_boxes "$cn"
+  assert_success
+  run grep -c "^docker rm -f cleat-site-preview" "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -c "^docker rm -f ${cn}-apt\$" "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -cF -- "--filter name=^${cn}(-[a-z0-9_.-]+)?\$" "$DOCKER_CALLS"
+  assert_output "1"
+}

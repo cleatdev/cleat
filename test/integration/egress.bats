@@ -29,6 +29,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 load "../setup"
+load "../lib/egress_int_teardown"
 
 _EG_KINDS=" desktop-macos desktop-windows desktop-linux engine-linux rootless vm-backend wsl-in-distro npipe-endpoint remote-endpoint windows-containers api-too-old unknown "
 
@@ -39,14 +40,24 @@ setup_file() {
   if ! docker info &>/dev/null; then
     skip "docker daemon not reachable"
   fi
-  local repo_root _build_log
+  local repo_root _build_log ver spec got
   repo_root="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
+  # Stamped the way the CLI's own build stamps it: a caged create refuses an
+  # image whose spec label predates the relay, and a bare build has none.
+  ver="$(cli_call eval 'printf "%s" "$VERSION"')"
+  spec="$(cli_call eval 'printf "%s" "$_IMAGE_SPEC_VERSION"')"
   # A failed build fails the file: a skip here would read as green.
-  _build_log="$(docker build -q -t cleat -f "$repo_root/docker/Dockerfile" "$repo_root/docker/" 2>&1)" || {
+  _build_log="$(docker build -q -t cleat --label "sh.cleat.version=$ver" --label "sh.cleat.image-spec=$spec" \
+    -f "$repo_root/docker/Dockerfile" "$repo_root/docker/" 2>&1)" || {
     echo "# docker build failed, nothing below was tested:" >&3
     echo "$_build_log" | sed 's/^/#   /' >&3
     return 1
   }
+  got="$(docker image inspect cleat --format '{{index .Config.Labels "sh.cleat.image-spec"}}' 2>/dev/null)"
+  if [ "$got" != "$spec" ]; then
+    echo "# the built image carries image-spec '$got', not '$spec'" >&3
+    return 1
+  fi
   EG_ENFORCING="$(cli_call eval 'printf "%s" "$_EGRESS_ENFORCING"')"
   EG_KIND="$(cli_call _egress_engine_kind)"
   case "$_EG_KINDS" in
@@ -66,6 +77,9 @@ setup_file() {
 }
 
 setup() {
+  # Cleared first, so a value exported by anything earlier can never reach
+  # the teardown's filters.
+  CN="" BH="" GW="" VOL=""
   _common_setup
   INT_PROJECT="$TEST_TEMP/int-project"
   mkdir -p "$INT_PROJECT"
@@ -81,18 +95,7 @@ setup() {
 }
 
 teardown() {
-  local n h c
-  # Every box of this project, then each box's gateway and socket volume by
-  # that box's own hash. The main box's hash always, since its gateway can
-  # outlive it.
-  for n in $(docker ps -a --filter "name=^${CN}" --format '{{.Names}}' 2>/dev/null) "$CN"; do
-    h="$(cli_call _egress_box_hash "$n")" || continue
-    docker rm -f "$n" >/dev/null 2>&1 || true
-    for c in $(docker ps -aq --filter "label=sh.cleat.gateway-for=${h}" 2>/dev/null); do
-      docker rm -f "$c" >/dev/null 2>&1 || true
-    done
-    docker volume rm "cleat-gw-$h-sock" >/dev/null 2>&1 || true
-  done
+  eg_int_teardown_boxes "${CN:-}"
   _common_teardown
 }
 
@@ -268,7 +271,8 @@ eg_other_branch_or_b() {
   b="$(docker inspect -f '{{.State.StartedAt}}' "$CN")"
   [ -n "$g" ]
   [ -n "$b" ]
-  [[ "$g" < "$b" ]]
+  # Never a bare [[ ]] here: before bash 4.1 a false one mid-test does not fail it.
+  [[ "$g" < "$b" ]] || { echo "# box started before its gateway: gw=$g box=$b" >&3; return 1; }
   run docker inspect -f '{{.State.Running}}' "$GW"
   assert_output "true"
 }

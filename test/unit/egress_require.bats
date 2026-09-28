@@ -326,6 +326,140 @@ teardown() { _common_teardown; }
   [ "$output" = "$plain" ]
 }
 
+# ── Row three's recreate offer (5.6) ────────────────────────────────────────
+# Called directly, never under run: the offer is never made in a subshell,
+# and run is one. Each call's output goes to a file.
+
+# A box that predates its policy, on a terminal, whose recreate lands a caged
+# box that passes every later check.
+offer_box() {
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+  F_HASH="" caged_box
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$TEST_TEMP/project"
+  _egress_on_terminal() { return 0; }
+  cmd_run() {
+    echo "run $1" >> "$TEST_TEMP/recreated"
+    rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+    caged_box
+  }
+  : > "$DOCKER_CALLS"
+}
+
+@test "egress require: a box that predates its policy offers a recreate on a terminal and recreates it caged on yes" {
+  offer_box
+  local rc=0
+  _egress_require "$CN" start <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 0
+  assert_equal "$_EG_CAGED" 1
+  run cat "$TEST_TEMP/out"
+  # The refusal first, the same words as off a terminal, then the offer.
+  assert_output --partial "it was created before its egress policy, so it has no cage."
+  assert_output --partial "under the policy now? It discards what was installed in it. [Y/n]"
+  run cat "$TEST_TEMP/recreated"
+  assert_output "run $TEST_TEMP/project"
+  run grep -c "^docker rm -f $CN\$" "$DOCKER_CALLS"
+  assert_output "1"
+  # An empty answer is the default, yes.
+  offer_box
+  rm -f "$TEST_TEMP/recreated"
+  rc=0
+  _egress_require "$CN" resume <<< "" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 0
+  run cat "$TEST_TEMP/recreated"
+  assert_output "run $TEST_TEMP/project"
+}
+
+@test "egress require: declining the recreate offer exits 1 and removes nothing" {
+  offer_box
+  local rc=0
+  _egress_require "$CN" start <<< "n" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 1
+  assert_equal "$_EG_CAGED" 0
+  [ ! -f "$TEST_TEMP/recreated" ]
+  run grep -c "^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress require: the recreate offer is made from start and resume alone" {
+  local verb rc
+  for verb in claude shell login setup run restart; do
+    offer_box
+    rc=0
+    _egress_require "$CN" "$verb" <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+    assert_equal "$verb:$rc" "$verb:1"
+    run cat "$TEST_TEMP/out"
+    refute_output --partial "[Y/n]"
+    [ ! -f "$TEST_TEMP/recreated" ]
+  done
+}
+
+@test "egress require: the recreate offer is never made in a subshell or off a terminal" {
+  offer_box
+  # The relaunch gate's shape.
+  local rc=0
+  ( _egress_require "$CN" start ) <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 1
+  [ ! -f "$TEST_TEMP/recreated" ]
+  # Off a terminal, with an answer waiting on stdin that must not be read.
+  _egress_on_terminal() { [ -t 0 ] && [ -t 1 ]; }
+  rc=0
+  _egress_require "$CN" start <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 1
+  run cat "$TEST_TEMP/out"
+  refute_output --partial "[Y/n]"
+  [ ! -f "$TEST_TEMP/recreated" ]
+}
+
+@test "egress require: a declined recreate prompt is not asked again by the gate" {
+  offer_box
+  _CONFIG_DRIFT_DECLINED=1
+  local rc=0
+  _egress_require "$CN" start <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 1
+  run cat "$TEST_TEMP/out"
+  refute_output --partial "[Y/n]"
+  [ ! -f "$TEST_TEMP/recreated" ]
+}
+
+@test "egress require: declining the config recreate prompt is remembered for the gate" {
+  container_exists() { return 0; }
+  _container_config_hash() { echo "v${_CONFIG_FP_VERSION}:old"; }
+  _is_tty() { return 0; }
+  _CONFIG_DRIFT_DECLINED=0
+  _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< "n" > "$TEST_TEMP/out" 2>&1
+  assert_equal "$_CONFIG_DRIFT_DECLINED" 1
+  # A yes is no decline.
+  _CONFIG_DRIFT_DECLINED=0
+  _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< "y" > "$TEST_TEMP/out" 2>&1
+  assert_equal "$_CONFIG_DRIFT_DECLINED" 0
+}
+
+@test "egress require: a fork is never offered the recreate" {
+  offer_box
+  _box_is_fork() { return 0; }
+  _fork_dir() { printf '%s\n' "$TEST_TEMP/project"; }
+  local rc=0
+  _egress_require "$CN" start <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 1
+  [ ! -f "$TEST_TEMP/recreated" ]
+}
+
+@test "egress require: a box with its own egress file is never told to cleat rm" {
+  F_HASH="" caged_box
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nallow = own.example\n' > "$_EGRESS_BOXES_DIR/$CN"
+  run _egress_require "$CN" start
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "cleat start on a terminal offers the recreate and keeps this box's own egress file"
+  refute_output --partial "cleat rm"
+  rm -f "$_EGRESS_BOXES_DIR/$CN"
+  run _egress_require "$CN" start
+  run _plain "$output"
+  assert_output --partial "cleat rm && cleat recreates it under the policy"
+}
+
 @test "egress require: a launch that drops the hooks escape a box was created with names the flag" {
   ACTIVE_CAPS=(hooks)
   F_HOOKS=1 CLEAT_EGRESS_ALLOW_HOOKS=1 caged_box
@@ -430,11 +564,9 @@ teardown() { _common_teardown; }
   [ "$(_egress_create_digest "$CN" none CAP_NET_RAW 0)" != "$a" ]
 }
 
-@test "egress require: the gateway spec version is in the create-time hash" {
-  local a
-  a="$(_egress_create_digest "$CN" none CAP_NET_RAW 0)"
+@test "egress require: the create-time facts are one fixed list and the hash is v1 hex" {
+  # Whether the spec version moves the hash is the fingerprint test above.
   _GATEWAY_SPEC_VERSION=2
-  [ "$(_egress_create_digest "$CN" none CAP_NET_RAW 0)" != "$a" ]
   run _egress_create_facts "$CN" none CAP_NET_RAW 0
   assert_output "egress:netmode=none
 egress:capdrop=CAP_NET_RAW

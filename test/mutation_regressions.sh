@@ -15970,6 +15970,85 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_summary_refused_engine" "a box turned off on a refused engine says why" "$CLI" "$TERMINAL_UX_BATS"
 
+# ── S23: row three's recreate offer (5.6) ──
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_create_drift()/,/^}$/{
+  s|_egress_recreate_offer "\$_cname" "\${2:-}"|false|
+}
+SED
+try "vnext_egress_offer_wired" "offers a recreate on a terminal and recreates it caged on yes" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  s@case "\$2" in start|resume) ;; \*) return 1 ;; esac@:@
+}
+SED
+try "vnext_egress_offer_verbs" "the recreate offer is made from start and resume alone" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  s@\[ "\$BASH_SUBSHELL" = 0 \] || return 1@:@
+}
+SED
+try "vnext_egress_offer_subshell" "the recreate offer is never made in a subshell or off a terminal" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  s@_egress_on_terminal || return 1@:@
+}
+SED
+try "vnext_egress_offer_terminal" "the recreate offer is never made in a subshell or off a terminal" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  /\[ "\$_CONFIG_DRIFT_DECLINED" = 1 \] && return 1/d
+}
+SED
+try "vnext_egress_offer_asked_once" "a declined recreate prompt is not asked again by the gate" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  /^    _CONFIG_DRIFT_DECLINED=1$/d
+}
+SED
+try "vnext_egress_offer_decline_recorded" "declining the config recreate prompt is remembered for the gate" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  s@^    \*) return 1 ;;$@    *) ;;@
+}
+SED
+try "vnext_egress_offer_decline" "declining the recreate offer exits 1 and removes nothing" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  /_box_is_fork "\$_cname" 2>\/dev\/null && return 1/d
+}
+SED
+try "vnext_egress_offer_no_fork" "a fork is never offered the recreate" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  s@_egress_teardown "\$_cname" keep || return 1@:@
+}
+SED
+try "vnext_egress_offer_removes_old" "offers a recreate on a terminal and recreates it caged on yes" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  s@cmd_run "\$_RESOLVED_PROJECT" || return 1@:@
+}
+SED
+try "vnext_egress_offer_creates_caged" "offers a recreate on a terminal and recreates it caged on yes" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_create_drift()/,/^}$/{
+  s@if \[ -e "\$_EGRESS_BOXES_DIR/\$_cname" \] || \[ -L "\$_EGRESS_BOXES_DIR/\$_cname" \]; then@if false; then@
+}
+SED
+try "vnext_egress_perbox_never_rm" "a box with its own egress file is never told to cleat rm" "$CLI" "$EGRESS_REQUIRE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

@@ -6743,6 +6743,9 @@ _notice_box() {
 # a guess: such containers are NOT nagged, and silently adopt the current format
 # the next time they're recreated for a real reason. This is what makes a CLI
 # upgrade that changes the fingerprint formula recreate-free.
+# 1 once a terminal declined this process's recreate prompt, so the egress
+# gate does not ask the same question again (5.6 row three).
+_CONFIG_DRIFT_DECLINED=0
 _resolve_config_drift() {
   local cname="$1"
   local project="${2:-}"
@@ -6786,6 +6789,7 @@ _resolve_config_drift() {
       return 0
     fi
     info "Skipped. Keeping existing container. Run ${BOLD}cleat rm && cleat${RESET} when ready."
+    _CONFIG_DRIFT_DECLINED=1
     return 0
   fi
 
@@ -11549,10 +11553,41 @@ _egress_refuse() {                       # <code> <reason> <fix>
   echo -e "    ${DIM}Fix:${RESET}  $3"
 }
 
+# The one answer to row three that continues (5.6): on a terminal, from start
+# or resume and never from a subshell, the refused box may be recreated under
+# its policy. A recreate site that keeps the box's own files, like every
+# recreate (8.7). rc 0 once the caged box exists, 1 on no or where no offer
+# is made. Never from the relaunch gate, shell, login, setup or claude: those
+# reach a running session, and a recreate discards the box's writable layer.
+# Never twice in one process: a declined recreate prompt stands.
+_egress_recreate_offer() {               # <cname> <verb>
+  local _cname="$1" yn=""
+  case "$2" in start|resume) ;; *) return 1 ;; esac
+  [ "$BASH_SUBSHELL" = 0 ] || return 1
+  _egress_on_terminal || return 1
+  [ "$_CONFIG_DRIFT_DECLINED" = 1 ] && return 1
+  _box_is_fork "$_cname" 2>/dev/null && return 1
+  [ -n "${_RESOLVED_PROJECT:-}" ] || return 1
+  echo ""
+  _ask_yn yn "Recreate ${BOLD}$(_sessions_safe_str "${_BOX:-main}")${RESET} under the policy now? It discards what was installed in it. [Y/n] "
+  case "$yn" in
+    ""|[yY]*) ;;
+    *) return 1 ;;
+  esac
+  info "Recreating container..."
+  if is_running "$_cname"; then docker stop "$_cname" >/dev/null 2>&1 || true; fi
+  _egress_teardown "$_cname" keep || return 1
+  _account_wipe_run_dir "$_cname"
+  success "Removed ${BOLD}${_cname}${RESET}."
+  cmd_run "$_RESOLVED_PROJECT" || return 1
+  _EG_REFUSED=""
+  return 0
+}
+
 # Check one of 5.6, the create-time hash. It refuses on every row but a match
 # and has no TTY branch and no environment bypass: a box whose create-time
 # facts drifted may have no cage at all.
-_egress_create_drift() {                 # <cname>
+_egress_create_drift() {                 # <cname> [verb]
   local _cname="$1" _cd _hooks _want _other
   if ! _egress_label_read "$_cname" sh.cleat.egress-hash; then
     _egress_refuse box "cleat could not read the box's labels, so it cannot prove the box matches the policy." \
@@ -11560,9 +11595,17 @@ _egress_create_drift() {                 # <cname>
     return 1
   fi
   if [ "$_EG_LABEL_SET" != 1 ]; then
-    _egress_refuse policy "it was created before its egress policy, so it has no cage." \
-      "${BOLD}cleat rm && cleat${RESET} recreates it under the policy"
-    return 1
+    # cleat rm forgets a box's own egress file, so it is never the remedy
+    # for a box that has one.
+    if [ -e "$_EGRESS_BOXES_DIR/$_cname" ] || [ -L "$_EGRESS_BOXES_DIR/$_cname" ]; then
+      _egress_refuse policy "it was created before its egress policy, so it has no cage." \
+        "${BOLD}cleat start${RESET} on a terminal offers the recreate and keeps this box's own egress file"
+    else
+      _egress_refuse policy "it was created before its egress policy, so it has no cage." \
+        "${BOLD}cleat rm && cleat${RESET} recreates it under the policy"
+    fi
+    _egress_recreate_offer "$_cname" "${2:-}"
+    return $?
   fi
   if [ "${_EG_LABEL%%:*}" != "v$_EGRESS_HASH_VERSION" ]; then
     _egress_refuse policy "it was created by a cleat that recorded its egress facts in another format, so they cannot be checked." \
@@ -11868,7 +11911,7 @@ _egress_require() {                      # <cname> <verb>
   if _box_is_fork "$_c" 2>/dev/null; then _ws="$(_fork_dir "$_c")"; fi
   _egress_precreate_check "$_c" "$_ws" "$_EG_MODE" || return 1
   _kind="$_EG_ENGINE_KIND"
-  _egress_create_drift "$_c" || return 1
+  _egress_create_drift "$_c" "$2" || return 1
   _egress_box_shape "$_c" || return 1
   if ! _egress_label_read "$_c" sh.cleat.egress-engine || [ "$_EG_LABEL" != "$_kind" ]; then
     _egress_refuse engine "it was created on another Docker engine than the one answering now." \

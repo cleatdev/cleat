@@ -1493,6 +1493,15 @@ restart_box() {
   run _plain "$output"
 }
 
+@test "egress restart: a running box is told the policy its new gateway enforces" {
+  restart_box
+  _egress_fragment_refresh() { echo "refresh $1" >> "$TEST_TEMP/refresh"; }
+  run cmd_egress restart
+  assert_success
+  run cat "$TEST_TEMP/refresh"
+  assert_output "refresh $CN"
+}
+
 @test "egress restart: removes the old gateway before running the new one" {
   restart_box
   run cmd_egress restart

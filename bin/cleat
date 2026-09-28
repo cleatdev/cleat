@@ -3304,7 +3304,10 @@ BOX_NOTES_EOF
 # after the box notes. Unlike _box_notes_claude_md, this fragment is
 # CLI-generated only: it is deliberately not baked into docker/CLAUDE.md,
 # which must stay byte-identical to _box_notes_claude_md per the guard test.
-_provisioning_notes_claude_md() {
+# Given a box under a live egress policy, its closing network sentence gives
+# way to the '# Network access' fragment (9.4).
+_provisioning_notes_claude_md() {        # [cname]
+  local _res _mode _hosts
   cat << 'PROVISIONING_NOTES_EOF'
 # Installing tools
 
@@ -3323,9 +3326,150 @@ sudo apt-get install -y <pkg>
 
 A line `script ./provision.sh` inlines that repo file's contents at that position.
 Never suggest forking Cleat, editing its Dockerfile, or `cleat rebuild` to add
-tools; `[setup]` is the supported path. There is no egress allowlist: the box has
-full network access.
 PROVISIONING_NOTES_EOF
+  # Under a policy the box is told what its network really is (9.4). Anywhere
+  # else, the shipped sentence, byte for byte.
+  if _res="$(_egress_fragment_resolution "${1:-}")"; then
+    _mode="${_res%%$'\n'*}"
+    _hosts=""
+    case "$_res" in *$'\n'*) _hosts="${_res#*$'\n'}" ;; esac
+    printf '%s\n' 'tools; `[setup]` is the supported path.' ''
+    _egress_fragment_claude_md "$_mode" "$_hosts"
+  else
+    printf '%s\n' 'tools; `[setup]` is the supported path. There is no egress allowlist: the box has' 'full network access.'
+  fi
+}
+
+# The policy a box's CLAUDE.md describes: its mode, then its hosts, one per
+# line. Nothing, and rc 1, unless enforcement is live, a strict or open policy
+# resolves and, for a box that exists, the box carries the egress label: a box
+# that predates its policy has the network it was made with, and must not be
+# told otherwise. Resolved in a silenced subshell, so a policy that does not
+# parse leaves the shipped text and the gate says why.
+_egress_fragment_resolution() {          # <cname>
+  local out
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 1
+  [ -n "${1:-}" ] || return 1
+  out="$( _egress_resolve "$1" >/dev/null 2>&1 || exit 1
+    case "$_EG_MODE" in strict|open) ;; *) exit 1 ;; esac
+    printf '%s\n%s' "$_EG_MODE" "$_EG_HOSTS" )" || return 1
+  if container_exists "$1"; then
+    if ! _egress_label_read "$1" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then return 1; fi
+  fi
+  printf '%s' "$out"
+}
+
+# The host list of the fragment: two-space indent, two spaces between names,
+# a new line before a name that would pass 78 columns.
+_egress_fragment_hosts() {               # <hosts>
+  local line="" h
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    if [ -z "$line" ]; then
+      line="  $h"
+    elif [ $(( ${#line} + 2 + ${#h} )) -gt 78 ]; then
+      printf '%s\n' "$line"
+      line="  $h"
+    else
+      line="$line  $h"
+    fi
+  done <<EOF
+$1
+EOF
+  [ -n "$line" ] && printf '%s\n' "$line"
+  return 0
+}
+
+# The '# Network access' block (9.4): what a caged box's network is, in terms
+# the agent can check, and what to do when a host is refused. Model-facing
+# payload. The host list is the resolution's own, never written by hand.
+_egress_fragment_claude_md() {           # <mode> <hosts>
+  cat << 'FRAGMENT_EOF'
+# Network access
+
+This box was created with --network none. It has a loopback interface and an
+empty routing table, so there is no route off this machine and no reachable
+DNS resolver. Check it yourself: `cat /proc/net/route` prints only its header
+line. Raw sockets are gone too (NET_RAW is dropped), so a raw send returns
+EPERM. That is not a broken image.
+
+FRAGMENT_EOF
+  if [ "$1" = open ]; then
+    cat << 'FRAGMENT_EOF'
+Every outbound connection instead goes through a proxy that runs outside the
+box, on a unix socket you cannot reconfigure, relayed to 127.0.0.1:3128.
+There is no host allowlist in this session. Every destination is still
+reached through the same proxy and every destination is recorded.
+
+A 403 whose body says "cleat egress" is a policy decision, not an
+authentication problem, so do not re-authenticate and do not switch accounts.
+
+When a request fails, read /run/cleat-egress/denials.log. It is written by the
+proxy and is read-only here, so it is the accurate record. It names the host
+and the reason.
+
+Port 80, literal IP addresses and DNS-over-anything are all refused. So is any
+host whose name resolves to a private, loopback or link-local address.
+denials.log shows that refusal as address. Every refused attempt is logged
+with the hostname you asked for.
+
+FRAGMENT_EOF
+  else
+    cat << 'FRAGMENT_EOF'
+Every outbound connection instead goes through a proxy that runs outside the
+box, on a unix socket you cannot reconfigure, relayed to 127.0.0.1:3128. Only
+these hosts are reachable, on port 443:
+
+FRAGMENT_EOF
+    _egress_fragment_hosts "$2"
+    cat << 'FRAGMENT_EOF'
+
+A connection to anything else fails. That is policy, not an outage, and not a
+bug in the code you are working on. A 403 whose body says "cleat egress" is a
+policy decision, not an authentication problem, so do not re-authenticate and
+do not switch accounts.
+
+When a request fails, read /run/cleat-egress/denials.log. It is written by the
+proxy and is read-only here, so it is the accurate record. It names the host
+and the reason.
+
+If you need a host that is not listed:
+  1. Stop. Do not retry. Do not look for a mirror or an alternate CDN. Do not
+     disable TLS verification. Do not try a different port.
+  2. Tell the user which host you need and why.
+  3. Give them this command: cleat egress allow <host>
+
+Port 80, literal IP addresses and DNS-over-anything are all refused. So is any
+host, listed above or not, whose name resolves to a private, loopback or
+link-local address. denials.log shows that refusal as address. Every refused
+attempt is logged with the hostname you asked for.
+
+FRAGMENT_EOF
+  fi
+  # The bridge is outside the proxy (9.7 item 5). Said per mode, because
+  # "a small fixed set" is false under always.
+  local _not="that does not go through this proxy"
+  [ "$1" = open ] || _not="that is not covered by the list above"
+  case "$(_browser_bridge_mode)" in
+    always)
+      printf '%s\n' "Your host's browser can be asked to open any URL this box writes" \
+        "(CLEAT_BROWSER_BRIDGE=always on the host), and ${_not}." ;;
+    off)
+      printf '%s\n' "Nothing this box writes opens in your host's browser." ;;
+    *)
+      printf '%s\n' "Your host's browser can still be asked to open a URL at a small fixed set of" \
+        "origins, and ${_not}. \`cleat browser origins\`" \
+        "on the host shows the set." ;;
+  esac
+}
+
+# Rewrites a running box's overlay so its next session reads the policy its
+# gateway now enforces (9.4). Fail-soft: the policy is already live.
+_egress_fragment_refresh() {             # <cname>
+  if container_exists "$1" && _container_has_kit_mounts "$1"; then
+    _generate_kit_overlay "$1" >/dev/null 2>&1 || true
+  fi
+  return 0
 }
 
 # One-paragraph description for the library listing and the confirm screen.
@@ -3776,7 +3920,7 @@ _generate_kit_overlay() {
     echo ""
     echo "# ── Cleat box provisioning ──"
     echo ""
-    _provisioning_notes_claude_md
+    _provisioning_notes_claude_md "$cname"
   } >> "$kit_dir/CLAUDE.md"
 
   # agents/: the user's own agents, as-is.
@@ -5138,7 +5282,14 @@ _setup_trust_prompt() {
   if [[ $is_reprompt -eq 1 ]]; then
     info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" setup)${RESET} setup changed since you approved it: it runs ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder${RESET}"
   else
-    info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" setup)${RESET} wants to run ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder (full network access)${RESET}"
+    local _net="full network access" _res
+    if _res="$(_egress_fragment_resolution "$(container_name_for "$project" "${_BOX:-main}")")"; then
+      case "${_res%%$'\n'*}" in
+        open) _net="any TLS host, through the egress proxy" ;;
+        *) _net="network limited to this box's egress policy" ;;
+      esac
+    fi
+    info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" setup)${RESET} wants to run ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder (${_net})${RESET}"
   fi
 
   # Preview: up to the first 15 payload lines, sanitized (repo-controlled
@@ -11495,6 +11646,9 @@ _egress_live_ok() {                      # <cname> <mode> <hosts>
     return 1
   fi
   _got="$(_egress_reload "$_gw")" || _got=""
+  if [ -n "$_got" ] && [ "$_got" = "$_want" ]; then
+    _egress_fragment_refresh "$_c"
+  fi
   [ -n "$_got" ] && [ "$_got" = "$_want" ] && return 0
   _egress_refuse gateway "its gateway is enforcing a different policy from the one saved, and a reload did not fix it." \
     "${BOLD}cleat egress reload${RESET}"
@@ -12140,7 +12294,7 @@ _egress_apply_mode() {                   # <cname> <mode>
   _want="$(_egress_policy_digest "$_EG_MODE" "$_EG_HOSTS")"
   if [ -z "$_got" ] || [ "$_got" != "$_want" ]; then return 1; fi
   # What the agent is told follows the policy it now runs under (9.4).
-  if _container_has_kit_mounts "$cname"; then _generate_kit_overlay "$cname"; fi
+  _egress_fragment_refresh "$cname"
   return 0
 }
 
@@ -12328,7 +12482,7 @@ _egress_cmd_restart() {                  # <cname> <shim> <pull>
   if is_running "$cname"; then
     # A heartbeat now, so the next gate reads a fresh relay and not -1.
     _run_bounded "$_EGRESS_PROBE_BOUND_S" docker exec -u "$ids" "$cname" /usr/local/bin/cleat-egress-shim --beat >/dev/null 2>&1 || true
-    if _container_has_kit_mounts "$cname"; then _generate_kit_overlay "$cname"; fi
+    _egress_fragment_refresh "$cname"
     success "Box ${BOLD}${sb}${RESET}'s gateway restarted and healthy."
   else
     docker stop "$gw" >/dev/null 2>&1 || true
@@ -20090,6 +20244,10 @@ cmd_claude() {
   # execs into the box and before the summary. Stage two asserts nothing
   # under a saved policy, see _egress_require.
   _egress_require "$cname" claude || exit 1
+  # This verb never regenerated the overlay, so a box whose policy changed
+  # since its last start would read the old network paragraph (9.4). The gate
+  # has just proved the box caged, so no second resolve decides it.
+  if [ "$_EG_CAGED" = 1 ]; then _egress_fragment_refresh "$cname"; fi
   _maybe_note_missing_kit_masks "$cname"
   _maybe_note_host_global_config
   _maybe_run_setup "$cname" "$project" "$box" || true

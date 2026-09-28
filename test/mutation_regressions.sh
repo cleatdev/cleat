@@ -15527,6 +15527,150 @@ s@flock -n 9 || exit 0@flock -n 9 || true@
 SED
 try "vnext_egress_shim_one_supervisor" "second supervisor exits" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
 
+# ── S20: what the agent is told (9.4) ──
+
+# The fragment must not reintroduce the false interface claim.
+cat > "$SED_TMP" << 'SED'
+s|created with --network none. It has a loopback interface and an|has no network interface of its own. It has|
+SED
+try "vnext_egress_fragment_interface_claim" "the network fragment never claims there is no interface" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# Under a policy the shipped "full network access" sentence is replaced.
+cat > "$SED_TMP" << 'SED'
+/^_provisioning_notes_claude_md()/,/^}$/{
+  s|if _res="\$(_egress_fragment_resolution "\${1:-}")"; then|if false; then|
+}
+SED
+try "vnext_egress_fragment_under_policy" "stops claiming full network access under a policy" "$CLI"
+
+# The overlay names its box, or no box's policy reaches its CLAUDE.md.
+cat > "$SED_TMP" << 'SED'
+/^_generate_kit_overlay()/,/^}$/{
+  s|_provisioning_notes_claude_md "\$cname"|_provisioning_notes_claude_md|
+}
+SED
+try "vnext_egress_fragment_overlay_names_box" "stops claiming full network access under a policy" "$CLI"
+
+# The host list is the resolution's, never a fixed one.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_claude_md()/,/^}$/{
+  s|_egress_fragment_hosts "\$2"|_egress_fragment_hosts "api.anthropic.com"|
+}
+SED
+try "vnext_egress_fragment_hosts_resolved" "the fragment host list is generated from the resolved policy" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# A box that predates its policy keeps the text true of the network it has.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_resolution()/,/^}$/{
+  s|if container_exists "\$1"; then|if false; then|
+}
+SED
+try "vnext_egress_fragment_label_required" "a box that predates its policy is not told it is caged" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# No fragment unless enforcement is live.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_resolution()/,/^}$/{
+  s@\[ "\$_EGRESS_ENFORCING" = 1 \] || return 1@:@
+}
+SED
+try "vnext_egress_fragment_enforcing_only" "keep the shipped text byte for byte" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# An off policy is no policy: only strict and open get the fragment.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_resolution()/,/^}$/{
+  s@strict|open) ;;@strict|open|off) ;;@
+}
+SED
+try "vnext_egress_fragment_off_is_shipped" "keep the shipped text byte for byte" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# Open mode is separate text, never the strict text with a list.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_claude_md()/,/^}$/{
+  s|^  if \[ "\$1" = open \]; then|  if false; then|
+}
+SED
+try "vnext_egress_fragment_open_text" "the open mode fragment still names the proxy and the log" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# The 403 sentence that stops a re-authentication loop.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_claude_md()/,/^}$/{
+  s|^bug in the code you are working on. A 403 whose body says "cleat egress" is a$|bug in the code you are working on.|
+}
+SED
+try "vnext_egress_fragment_403_strict" "a cleat egress 403 is not an auth failure" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# Every workaround forbidden by name.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_claude_md()/,/^}$/{
+  s|Do not look for a mirror or an alternate CDN. ||
+}
+SED
+try "vnext_egress_fragment_forbids_mirrors" "strict names every workaround it forbids" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# The browser paragraph is true under always.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_claude_md()/,/^}$/{
+  s|^    always)$|    always-never)|
+}
+SED
+try "vnext_egress_fragment_browser_always" "the browser paragraph says what the bridge really does" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# Open has no list for the bridge to be outside of.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_claude_md()/,/^}$/{
+  s@\[ "\$1" = open \] || _not=@false || _not=@
+}
+SED
+try "vnext_egress_fragment_browser_open" "the browser paragraph says what the bridge really does" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# The host list wraps.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_hosts()/,/^}$/{
+  s|-gt 78 \]|-gt 200 ]|
+}
+SED
+try "vnext_egress_fragment_wraps" "the host list wraps at 78 columns" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# A reload that lands rewrites the overlay.
+cat > "$SED_TMP" << 'SED'
+/^_egress_live_ok()/,/^}$/{
+  s|^    _egress_fragment_refresh "\$_c"$|    :|
+}
+SED
+try "vnext_egress_fragment_reload_refresh" "a reload that lands rewrites the overlay" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# The refresh never writes an overlay for a box that is not there.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fragment_refresh()/,/^}$/{
+  s|if container_exists "\$1" && _container_has_kit_mounts "\$1"; then|if _container_has_kit_mounts "$1"; then|
+}
+SED
+try "vnext_egress_fragment_refresh_exists" "the refresh skips a box with no overlay mounts" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# cleat claude never regenerated the overlay, so it must now.
+cat > "$SED_TMP" << 'SED'
+/^cmd_claude()/,/^}$/{
+  s|then _egress_fragment_refresh "\$cname"; fi|then :; fi|
+}
+SED
+try "vnext_egress_fragment_cmd_claude" "cleat claude rewrites the overlay after its gate" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+# A restarted gateway's box is told the policy it now runs under.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_restart()/,/^}$/{
+  s|^    _egress_fragment_refresh "\$cname"$|    :|
+}
+SED
+try "vnext_egress_fragment_restart_refresh" "told the policy its new gateway enforces" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# The setup prompt names the network the policy gives.
+cat > "$SED_TMP" << 'SED'
+/^_setup_trust_prompt()/,/^}$/{
+  s|\*) _net="network limited to this box's egress policy" ;;|*) : ;;|
+}
+SED
+try "vnext_egress_fragment_setup_prompt" "the setup prompt names the network the policy gives" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

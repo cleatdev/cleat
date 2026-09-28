@@ -10333,3 +10333,24 @@ mode = off"
   assert_output "mode = strict
 pack = npm"
 }
+
+@test "regression vNEXT: the claude md fragment stops claiming full network access under a policy" {
+  # The shipped provisioning notes told every box "There is no egress
+  # allowlist: the box has full network access." A caged box read that
+  # beside the cage it was in, then distrusted the rest of what it was told.
+  _caged_run_setup
+  cd "$TEST_TEMP/project"
+  _generate_kit_overlay "$CN"
+  run cat "$CLEAT_RUN_DIR/$CN/kit/CLAUDE.md"
+  assert_output --partial "# Network access"
+  assert_output --partial "relayed to 127.0.0.1:3128"
+  refute_output --partial "full network access"
+  refute_output --partial "There is no egress allowlist"
+  # The running caged box its gateway reloads is told the same.
+  container_exists() { return 0; }
+  caged_box
+  _generate_kit_overlay "$CN"
+  run cat "$CLEAT_RUN_DIR/$CN/kit/CLAUDE.md"
+  assert_output --partial "# Network access"
+  refute_output --partial "full network access"
+}

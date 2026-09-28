@@ -759,3 +759,39 @@ _default_launch() {
   done
   set +f
 }
+
+# ── cleat egress off writes (6.6) ───────────────────────────────────────────
+
+@test "egress off: the per-box file records mode = off" {
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nallow = docs.example.test\n' > "$_EGRESS_BOXES_DIR/cleat-app-1234abcd"
+  run _egress_write_box_mode cleat-app-1234abcd off
+  assert_success
+  run _egress_section_canon "$_EGRESS_BOXES_DIR/cleat-app-1234abcd"
+  assert_output "mode = off
+allow = docs.example.test"
+}
+
+@test "egress off: the global egress section is unchanged" {
+  printf '[caps]\ngh\n[egress]\nmode = strict\npack = npm\ndeny = x.example\n[resources]\nmemory = 8g\n[env]\nFOO\n' > "$CONF"
+  local before
+  before="$(cat "$CONF")"
+  run _egress_write_box_mode cleat-app-1234abcd off
+  assert_success
+  run cat "$CONF"
+  assert_output "$before"
+}
+
+@test "egress off: the global mode ring writes mode off and keeps the section" {
+  printf '[caps]\ngh\n[egress]\nmode = strict\npack = npm\n' > "$CONF"
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 1; }
+  _egress_engine_kind() { printf desktop-macos; }
+  run _egress_off_global 1
+  assert_success
+  run _egress_section_canon "$CONF"
+  assert_output "mode = off
+pack = npm"
+  run _read_caps_from_file "$CONF"
+  assert_output "gh"
+}

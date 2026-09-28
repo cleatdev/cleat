@@ -1605,3 +1605,227 @@ restart_box() {
   run _plain "$output"
   assert_output --partial "is not running, so it has no relay to restart."
 }
+
+# ── cleat egress open and off (6.5, 6.6) ────────────────────────────────────
+
+STARTED='2026-09-28T09:00:00.123456789Z'
+# A running caged box whose start time the marker template answers.
+open_box() {
+  reload_box
+  mock_docker_inspect_field "$CN" '{{if .State.Running}}{{.State.StartedAt}}{{end}}' "$STARTED"
+  _egress_on_terminal() { return 0; }
+}
+
+@test "egress open: a yes writes the session marker and reloads the gateway, a no writes nothing" {
+  open_box
+  run cmd_egress open <<< "n"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "! Open egress, this session only"
+  assert_output --partial "This is a log, not a"
+  assert_output --partial "Not changed."
+  [ ! -e "$_EGRESS_BOXES_DIR/$CN.session" ]
+  run grep -c "gw-admin reload" "$DOCKER_CALLS"
+  assert_output "0"
+  # The gateway answers the open policy's digest once it has taken it.
+  printf '[egress]\nmode = open\n' > "$TEST_TEMP/open.conf"
+  local keep="$CLEAT_GLOBAL_CONFIG"
+  CLEAT_GLOBAL_CONFIG="$TEST_TEMP/open.conf"
+  mock_gw_admin policy-digest "ok policy-digest $(current_digest)"
+  CLEAT_GLOBAL_CONFIG="$keep"
+  run cmd_egress open <<< "y"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Open for box main until it stops."
+  run cat "$_EGRESS_BOXES_DIR/$CN.session"
+  assert_output "$STARTED"
+  run grep -c "^docker exec $GW /usr/local/bin/gw-admin reload" "$DOCKER_CALLS"
+  assert_output "1"
+  # Nothing wrote mode = open anywhere.
+  run grep -rl "mode = open" "$CLEAT_CONFIG_DIR"
+  assert_failure
+}
+
+@test "egress open: a gateway that does not take it removes the marker" {
+  open_box
+  run cmd_egress open --yes
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "its gateway did not take open mode."
+  [ ! -e "$_EGRESS_BOXES_DIR/$CN.session" ]
+}
+
+@test "egress open: a valid session marker survives a second launch verb" {
+  open_box
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '%s\n' "$STARTED" > "$_EGRESS_BOXES_DIR/$CN.session"
+  mock_gw_admin policy-digest "ok policy-digest $(current_digest)"
+  _egress_resolve "$CN"
+  [ "$_EG_MODE" = open ]
+  run _egress_require "$CN" start
+  assert_success
+  run _egress_require "$CN" claude
+  assert_success
+  run grep -c "gw-admin reload" "$DOCKER_CALLS"
+  assert_output "0"
+  [ -f "$_EGRESS_BOXES_DIR/$CN.session" ]
+}
+
+@test "egress open: a stopped box refuses with a one-line reason" {
+  open_box
+  is_running() { return 1; }
+  run cmd_egress open --yes
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "Box main is not running. Start it first:  cleat start"
+  [ ! -e "$_EGRESS_BOXES_DIR/$CN.session" ]
+}
+
+@test "egress open: a box with egress off refuses and names cleat egress" {
+  open_box
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress open --yes
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "so there is no gateway to open. Turn it on:  cleat egress main"
+}
+
+@test "egress open: a pipe without --yes refuses" {
+  open_box
+  _egress_on_terminal() { return 1; }
+  run cmd_egress open
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "needs a terminal. On a pipe:  cleat egress open --yes"
+  run grep -c "gw-admin" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress open: --always writes mode open in the global section and keeps the entries" {
+  open_box
+  printf '[caps]\ngh\n[egress]\nmode = strict\npack = npm\nallow = docs.example.test\ndeny = x.example\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress open main --always --yes
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "--always pins open for every box. It takes no box."
+  run cmd_egress open --always --yes
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output --partial "mode = open"
+  assert_output --partial "pack = npm"
+  assert_output --partial "allow = docs.example.test"
+  assert_output --partial "deny = x.example"
+  run _read_caps_from_file "$CLEAT_GLOBAL_CONFIG"
+  assert_output "gh"
+}
+
+@test "egress off: the confirmed action removes the gateway, the box, the socket volume and the rendered policy, then recreates" {
+  open_box
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '%s\n' "$STARTED" > "$_EGRESS_BOXES_DIR/$CN.session"
+  cmd_run() { echo "cmd_run $1" >> "$DOCKER_CALLS"; }
+  run cmd_egress off <<< "y"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "recreated with a normal network"
+  local g b v r
+  g="$(grep -n "^docker rm -f $GW\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  b="$(grep -n "^docker rm -f $CN\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  v="$(grep -n "^docker volume rm $VOL\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  r="$(grep -n "^cmd_run " "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  [ -n "$g" ]
+  [ -n "$b" ]
+  [ -n "$v" ]
+  [ -n "$r" ]
+  [ "$g" -lt "$b" ]
+  [ "$b" -lt "$v" ]
+  [ "$v" -lt "$r" ]
+  [ ! -e "$(_egress_policy_dir "$CN")" ]
+  [ ! -e "$_EGRESS_BOXES_DIR/$CN.session" ]
+}
+
+@test "egress off: a declined confirmation changes nothing" {
+  open_box
+  cmd_run() { echo "cmd_run" >> "$DOCKER_CALLS"; }
+  run cmd_egress off <<< ""
+  assert_success
+  run _plain "$output"
+  assert_output --partial "! Turning egress control off for box main"
+  assert_output --partial "Every box shares ~/.claude, so this box will run any MCP server"
+  assert_output --partial "open mode reaches"
+  assert_output --partial "Not changed."
+  run grep -cE "^docker rm|^cmd_run" "$DOCKER_CALLS"
+  assert_output "0"
+  [ ! -e "$_EGRESS_BOXES_DIR/$CN" ]
+}
+
+@test "egress off: non-TTY refuses without --yes" {
+  open_box
+  _egress_on_terminal() { return 1; }
+  run cmd_egress off
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "needs a terminal. On a pipe:  cleat egress off --yes"
+  [ ! -e "$_EGRESS_BOXES_DIR/$CN" ]
+}
+
+@test "egress off: the confirmation does not offer open on a refused engine" {
+  open_box
+  _egress_engine_kind() { printf engine-linux; }
+  run cmd_egress off <<< "n"
+  run _plain "$output"
+  assert_output --partial "Turning egress control off for box main"
+  refute_output --partial "open mode reaches"
+}
+
+@test "egress off: an off box and a box not made yet each get their own answer" {
+  open_box
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress off --yes
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Egress control is already off for box main."
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  container_exists() { return 1; }
+  run cmd_egress off --yes
+  assert_success
+  run _plain "$output"
+  assert_output --partial "will be created with a normal network."
+  run cat "$_EGRESS_BOXES_DIR/$CN"
+  assert_output --partial "mode = off"
+}
+
+# Two caged boxes in other projects, as the global confirmation lists them.
+two_caged() {
+  open_box
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}'
+  mock_docker_ps_filter "$(printf 'cleat-a-11111111\ncleat-b-22222222')" "name=^cleat-" "label=sh.cleat.egress-hash"
+  mock_docker_inspect_field cleat-a-11111111 "$fmt" "|/work/a"
+  mock_docker_inspect_field cleat-b-22222222 "$fmt" "|/work/b"
+}
+
+@test "egress off: the global confirmation lists every box still under a policy and names the refusal" {
+  two_caged
+  run _egress_off_global 0 <<< "n"
+  run _plain "$output"
+  assert_output --partial "! Turning egress control off for every new box on this machine"
+  assert_output --partial "2 boxes were created under a policy."
+  assert_output --partial "each box refuses to start, attach or relaunch until"
+  assert_output --partial "cleat-a-11111111   strict   cleat egress off   /work/a"
+  assert_output --partial "cleat-b-22222222   strict   cleat egress off   /work/b"
+  assert_output --partial "Not changed."
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict"
+}
+
+@test "egress off: the global confirmation recreates nothing" {
+  two_caged
+  run _egress_off_global 0 <<< "y"
+  assert_success
+  run grep -cE "^docker (rm|run)" "$DOCKER_CALLS"
+  assert_output "0"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = off"
+}

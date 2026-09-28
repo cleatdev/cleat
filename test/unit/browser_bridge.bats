@@ -1880,3 +1880,12 @@ EOF
   run _maybe_report_blocked_opens "$log" 0
   refute_output --partial "callback port it needs was busy"
 }
+
+@test "browser: no egress policy widens the origin set" {
+  # An egress allow is what a box may dial through the gateway. It is never a
+  # page the host browser opens for it.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\nallow = webhook.site\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _bridge_origin_allowed webhook.site
+  assert_failure
+}

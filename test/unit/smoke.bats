@@ -3536,3 +3536,16 @@ SH
   assert_failure
   refute_output --partial "unbound variable"
 }
+
+@test "smoke: cleat egress open and off on a non-TTY exit without hanging" {
+  run cleat_bin_timeout 20 egress off < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "needs a terminal"
+  run cleat_bin_timeout 20 egress open < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+  run cleat_bin_timeout 20 egress open --always < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+}

@@ -12063,6 +12063,15 @@ _egress_help() {
 # step and answers as not built yet until then.
 _egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <shim> <pull> <always>
   local verb="$1" cname
+  # --always pins open for every box, so it takes none.
+  if [ "$verb" = open ] && [ "${8:-0}" = 1 ]; then
+    if [ -n "$2" ]; then
+      error "${BOLD}--always${RESET} pins open for every box. It takes no box."
+      return 1
+    fi
+    cmd_egress_open_always "$4"
+    return $?
+  fi
   _set_box "${2:-main}"
   cname="$(_egress_target_cname "$_BOX")"
   # The workspace the gate's containment check reads.
@@ -12073,6 +12082,8 @@ _egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <s
     log) _egress_cmd_log "$cname" "$5"; return $? ;;
     reload) _egress_cmd_reload "$cname"; return $? ;;
     restart) _egress_cmd_restart "$cname" "$6" "$7"; return $? ;;
+    open) cmd_egress_open "$cname" "$4"; return $? ;;
+    off) cmd_egress_off "$cname" "$4"; return $? ;;
   esac
   error "${BOLD}cleat egress $verb${RESET} is not built yet."
   return 1
@@ -12359,6 +12370,289 @@ _egress_restart_shim() {                 # <cname>
   error "The relay started, but the gateway heard no heartbeat. This is not a policy denial."
   echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart${RESET}"
   return 1
+}
+
+# ── open and off (6.5, 6.6) ──
+
+# Whether a person can answer a prompt here. A function, so a test can say so.
+_egress_on_terminal() { [ -t 0 ] && [ -t 1 ]; }
+
+# The session marker of cleat egress open: the box's start time, which the
+# resolution compares as an opaque string. A later start of the same box is a
+# new session, so the marker stops counting on its own. Never through a link.
+_egress_open_session() {                 # <cname>
+  local d="$_EGRESS_BOXES_DIR" m t tmp
+  m="$d/$1.session"
+  t="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect -f '{{if .State.Running}}{{.State.StartedAt}}{{end}}' "$1" 2>/dev/null)" || return 1
+  [ -n "$t" ] || return 1
+  [ -L "$d" ] && return 1
+  mkdir -p "$d" 2>/dev/null || return 1
+  if [ -L "$m" ] || [ -d "$m" ]; then return 1; fi
+  tmp="$d/.$1.session.$$"
+  if ! printf '%s\n' "$t" > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$m" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+_egress_open_screen() {                  # <every box: 1 or 0>
+  echo ""
+  if [ "${1:-0}" = 1 ]; then
+    echo -e "  ${AMBER}!${RESET} ${BOLD}Open egress for every box, until you change it${RESET}"
+  else
+    echo -e "  ${AMBER}!${RESET} ${BOLD}Open egress, this session only${RESET}"
+  fi
+  echo ""
+  echo -e "    The box may reach any TLS host. Every destination is recorded, and each"
+  echo -e "    one can become part of a policy afterwards. This is a log, not a"
+  echo -e "    boundary."
+  echo ""
+  echo -e "    Still refused in open mode:"
+  echo -e "      plaintext http          nothing on port 80 can be verified"
+  echo -e "      IP literals             a name is required, always"
+  echo -e "      private space           private, loopback and link-local addresses,"
+  echo -e "                              with no flag anywhere that grants one"
+  echo -e "      cloud metadata          169.254.169.254 and the rest of link-local"
+  echo -e "      raw sockets and DNS     the box still has no route off this machine"
+  echo ""
+  echo -e "    This is not the same as turning egress off. Off gives the box a real"
+  echo -e "    Docker network back, with DNS, the LAN, port 80 and no log. It"
+  echo -e "    recreates the box to do it."
+  echo ""
+}
+
+# cleat egress open [box]: every TLS host allowed and logged, for one box,
+# until it stops. Default-deny, and on a pipe only with --yes.
+cmd_egress_open() {                      # <cname> <yes>
+  local cname="$1" yes="${2:-0}" sb kind ans
+  sb="$(_sessions_safe_str "${_BOX:-main}")"
+  if [ "$yes" != 1 ] && ! _egress_on_terminal; then
+    error "cleat egress open changes what a box may reach, so it needs a terminal. On a pipe:  ${BOLD}cleat egress open --yes${RESET}"
+    return 1
+  fi
+  if ! _daemon_up; then error "Docker is not running."; return 1; fi
+  if ! is_running "$cname"; then
+    error "Box ${BOLD}${sb}${RESET} is not running. Start it first:  ${BOLD}cleat start${RESET}"
+    return 1
+  fi
+  _egress_resolve "$cname"
+  case "$_EG_MODE" in
+    open)
+      if [ "$_EG_WHY" = session ]; then
+        info "Box ${BOLD}${sb}${RESET} is already open until it stops."
+      else
+        info "Box ${BOLD}${sb}${RESET} is already open ($(_egress_why_text))."
+      fi
+      return 0 ;;
+    strict) ;;
+    *)
+      error "Egress control is off for box ${BOLD}${sb}${RESET}, so there is no gateway to open. Turn it on:  ${BOLD}cleat egress ${sb}${RESET}"
+      return 1 ;;
+  esac
+  if ! _egress_label_read "$cname" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then
+    error "Box ${BOLD}${sb}${RESET} was created without egress control, so it has no gateway to open."
+    echo -e "    It refuses to start until it is recreated:  $(_egress_recreate_words "$cname")"
+    return 1
+  fi
+  kind="$(_egress_engine_kind)"
+  if ! _egress_engine_validated "$kind"; then _egress_engine_refusal "$kind"; return 1; fi
+  if [ "$yes" != 1 ]; then
+    _egress_open_screen 0
+    printf '    Open egress for this box until it stops? [y/N] '
+    IFS= read -r ans || ans=""
+    case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 0 ;; esac
+  fi
+  if ! _egress_open_session "$cname"; then
+    _egress_refuse gateway "cleat could not record the open session." "check ${BOLD}${_EGRESS_BOXES_DIR/#${HOME}/~}${RESET} is a directory you own"
+    return 1
+  fi
+  if ! _egress_apply_mode "$cname" open; then
+    rm -f "$_EGRESS_BOXES_DIR/$cname.session" 2>/dev/null || true
+    _egress_refuse gateway "its gateway did not take open mode." "${BOLD}cleat egress restart${RESET}"
+    return 1
+  fi
+  success "Open for box ${BOLD}${sb}${RESET} until it stops. Every destination is logged:  ${BOLD}cleat egress log${RESET}"
+}
+
+# cleat egress open --always: the one path that writes mode = open, into the
+# global section, keeping every entry. Then every running caged box takes it.
+cmd_egress_open_always() {               # <yes>
+  local yes="${1:-0}" canon ans
+  if [ "$yes" != 1 ]; then
+    if ! _egress_on_terminal; then
+      error "cleat egress open --always opens every box, so it needs a terminal. On a pipe:  ${BOLD}cleat egress open --always --yes${RESET}"
+      return 1
+    fi
+    _egress_open_screen 1
+    printf '    Open egress for every box until you change it? [y/N] '
+    IFS= read -r ans || ans=""
+    case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 0 ;; esac
+  fi
+  _egress_file_state "$CLEAT_GLOBAL_CONFIG"
+  canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
+  _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" open "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
+  success "Every box is open until you change it. Every destination is logged."
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then _egress_apply_now ""; fi
+  return 0
+}
+
+# A box's own mode, written into its own file, keeping its entries. The
+# global section is never touched.
+_egress_write_box_mode() {               # <cname> <mode>
+  local f="$CLEAT_CONFIG_DIR/egress-boxes/$1" canon
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes" 2>/dev/null || return 1
+  _egress_file_state "$f"
+  canon="$(_egress_section_canon "$f")"
+  _write_egress_to_file "$CLEAT_CONFIG_DIR/egress-boxes/$1" "$2" "$_f_packs" "$_f_denies" "$_f_allows" "$canon"
+}
+
+# The boxes made under a policy, less any whose own file sets a mode, with
+# where each project is. One line each: <cname> <mode> <workspace>.
+_egress_caged_boxes() {
+  local n meta role src
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect --format \
+      '{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' "$n" 2>/dev/null)" || continue
+    role="${meta%%|*}"; src="${meta#*|}"
+    case "$role" in ROLE=|ROLE=box|"") ;; *) continue ;; esac
+    if [ -e "$_EGRESS_BOXES_DIR/$n" ]; then
+      ( _egress_read_file "$_EGRESS_BOXES_DIR/$n" egress >/dev/null 2>&1 && [ "$_m_mode" = absent ] ) || continue
+    fi
+    ( _egress_resolve "$n" ) >/dev/null 2>&1 || continue
+    _egress_resolve "$n"
+    printf '%s %s %s\n' "$n" "$_EG_MODE" "$src"
+  done < <(docker ps -a --filter "name=^cleat-" --filter label=sh.cleat.egress-hash --format '{{.Names}}' 2>/dev/null || true)
+}
+
+# The confirmation of 6.6, for one box or, with no box, for every new box.
+_egress_off_confirm() {                  # <cname or empty>
+  local sb rows="" n=0 c m src kind
+  echo ""
+  if [ -n "$1" ]; then
+    sb="$(_sessions_safe_str "${_BOX:-main}")"
+    echo -e "  ${AMBER}!${RESET} ${BOLD}Turning egress control off for box ${sb}${RESET}"
+    echo ""
+    echo -e "    This recreates the box. Your workspace is untouched. The container's"
+    echo -e "    own filesystem is not: anything installed inside it since it was"
+    echo -e "    created is lost, the same as cleat rm followed by cleat."
+    echo ""
+    echo -e "    A box created with no network of its own cannot be given one later."
+    echo -e "    Docker refuses it on a running container and on a stopped one alike."
+    echo -e "    There is no lighter way to do this."
+    echo ""
+    echo -e "    After the recreate the box gets a real Docker network back: its own"
+    echo -e "    DNS resolver, any host, any port, your LAN and this machine. Nothing"
+    echo -e "    is recorded."
+    echo ""
+    echo -e "    This box only. Your global policy is untouched and every other box"
+    echo -e "    on this machine keeps it."
+  else
+    while IFS=' ' read -r c m src; do
+      [ -n "$c" ] || continue
+      n=$((n + 1))
+      rows+="      $(_sessions_safe_str "$c")   ${m}   cleat egress off   ${DIM}$(_sessions_safe_str "${src/#${HOME}/~}")${RESET}"$'\n'
+    done < <(_egress_caged_boxes)
+    echo -e "  ${AMBER}!${RESET} ${BOLD}Turning egress control off for every new box on this machine${RESET}"
+    echo ""
+    echo -e "    This is your global policy, so no new box is created with a gateway."
+    echo -e "    Every box you start from now on gets a real Docker network: its own"
+    echo -e "    DNS resolver, any host, any port, your LAN and this machine. Nothing"
+    echo -e "    is recorded."
+    if [ "$n" -gt 0 ]; then
+      echo ""
+      if [ "$n" -eq 1 ]; then
+        echo -e "    1 box was created under a policy. A session already open in it"
+      else
+        echo -e "    ${n} boxes were created under a policy. A session already open in one"
+      fi
+      echo -e "    stays caged, but each box refuses to start, attach or relaunch until"
+      echo -e "    you recreate it with cleat egress off. A box created with no network"
+      echo -e "    of its own cannot be given one later, which Docker refuses on a"
+      echo -e "    running container and on a stopped one alike, so there is no lighter"
+      echo -e "    way to do this."
+      echo ""
+      printf '%b' "$rows"
+      echo ""
+      echo -e "    A recreate discards that container's writable layer, the same as"
+      echo -e "    cleat rm followed by cleat. Your workspace is untouched."
+    fi
+  fi
+  echo ""
+  echo -e "    Everything else about the cage is unchanged. No host credentials, no"
+  echo -e "    home directory, the same read-only mounts and the same resource"
+  echo -e "    limits."
+  echo ""
+  if [ -n "$1" ]; then
+    echo -e "    Every box shares ~/.claude, so this box will run any MCP server"
+    echo -e "    another box writes into ~/.claude/.config.json."
+  else
+    echo -e "    Every box shares ~/.claude, so a box with egress off runs any MCP"
+    echo -e "    server another box writes into ~/.claude/.config.json."
+  fi
+  kind="$(_egress_engine_kind)"
+  if _egress_engine_validated "$kind"; then
+    echo ""
+    echo -e "    If you only need broader access for one session, open mode reaches"
+    echo -e "    any TLS host and logs every one, with no recreate:  ${BOLD}cleat egress open${RESET}"
+  fi
+  echo ""
+}
+
+# cleat egress off [box]: give one box a normal network back. It recreates the
+# box, so it asks, default no, and on a pipe only with --yes. The global
+# policy is never touched. The seventeenth removal site. The teardown is
+# forced: this box is known to be caged, whatever its rendered policy says.
+cmd_egress_off() {                       # <cname> <yes>
+  local cname="$1" yes="${2:-0}" sb ans lbl=0 project
+  sb="$(_sessions_safe_str "${_BOX:-main}")"
+  if [ "$yes" != 1 ] && ! _egress_on_terminal; then
+    error "cleat egress off recreates box ${BOLD}${sb}${RESET}, so it needs a terminal. On a pipe:  ${BOLD}cleat egress off --yes${RESET}"
+    return 1
+  fi
+  _egress_resolve "$cname"
+  if _egress_label_read "$cname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then lbl=1; fi
+  if [ "$_EG_MODE" = off ] && [ "$lbl" = 0 ]; then
+    info "Egress control is already off for box ${BOLD}${sb}${RESET}."
+    return 0
+  fi
+  if ! _daemon_up; then error "Docker is not running."; return 1; fi
+  if ! container_exists "$cname"; then
+    _egress_write_box_mode "$cname" off || return 1
+    info "Box ${BOLD}${sb}${RESET} will be created with a normal network."
+    return 0
+  fi
+  if [ "$yes" != 1 ]; then
+    _egress_off_confirm "$cname"
+    printf '    Turn egress control off and recreate the box? [y/N] '
+    IFS= read -r ans || ans=""
+    case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 0 ;; esac
+  fi
+  project="$(resolve_project "$PWD")"
+  _egress_write_box_mode "$cname" off || return 1
+  _egress_teardown "$cname" keep force || { error "Could not remove box ${BOLD}${sb}${RESET}."; return 1; }
+  _account_wipe_run_dir "$cname"
+  cmd_run "$project"
+  success "Box ${BOLD}${sb}${RESET} recreated with a normal network. Egress control stays off for it:  ${BOLD}cleat egress ${sb}${RESET} turns it back on."
+}
+
+# The global off, from the global editor and the cleat config row: mode off
+# written into the global section, which keeps it. Nothing is recreated: a
+# caged box is recreated only by its own cleat egress off.
+_egress_off_global() {                   # <yes>
+  local yes="${1:-0}" canon ans
+  if [ "$yes" != 1 ]; then
+    _egress_off_confirm ""
+    printf '    Turn egress control off for every new box? [y/N] '
+    IFS= read -r ans || ans=""
+    case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 1 ;; esac
+  fi
+  _egress_file_state "$CLEAT_GLOBAL_CONFIG"
+  canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
+  _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" off "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
+  _egress_apply_mode "" off
+  success "Saved to ${CLEAT_GLOBAL_CONFIG/#${HOME}/~}: egress control is off for every new box."
+  return 0
 }
 
 # ── why, log and test (6.2, 9.3) ──
@@ -14044,6 +14338,34 @@ _egress_save_screen() {                  # <assume_yes>
   echo -e "    ${DIM}Written to ${_EGE_FILE/#${HOME}/~}, section [egress]${RESET}"
   echo -e "    ${DIM}The box cannot read or write that file.${RESET}"
   echo ""
+  # Under enforcement, the box ring's open writes this session's edits with
+  # the mode they came from and then opens the session, and off goes through
+  # the one recreate path. The global off has its own confirmation.
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    local ecname=""
+    [ -n "$_EGE_BOX" ] && ecname="$(_egress_target_cname "$_EGE_BOX")"
+    if [ "$_EGE_MODE" = open ] && [ -n "$ecname" ]; then
+      _write_egress_to_file "$_EGE_FILE" "$mode_out" "$_EGE_PACKS" "$_EGE_DENIES" "$_EGE_HOSTS" "$_EGE_CANON" || return 1
+      _EGE_SAVED=1
+      echo -e "    Open for this session only. See the next screen."
+      # Its own confirmation, whatever the save's: done in the typed editor
+      # answers Save, never Open.
+      cmd_egress_open "$ecname" 0
+      return $?
+    fi
+    if [ "$mode_out" = off ] && [ -z "$ecname" ]; then
+      _egress_off_global 0 || return 1
+      _EGE_SAVED=1
+      return 0
+    fi
+    if [ "$mode_out" = off ] && container_exists "$ecname" \
+       && _egress_label_read "$ecname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then
+      echo -e "    This recreates the box. See the next screen."
+      cmd_egress_off "$ecname" 0 || return 1
+      _EGE_SAVED=1
+      return 0
+    fi
+  fi
   # Off never commits on a default answer, typed or not (6.3, 6.6): an arrow
   # key and an Enter must not turn egress control off.
   if [ "$mode_out" = off ]; then

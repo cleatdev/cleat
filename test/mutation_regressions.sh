@@ -15426,6 +15426,70 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_restart_shim_as_coder" "starts the relay as coder and never replaces the gateway" "$CLI" "$EGRESS_GATEWAY_BATS"
 
+# open and off (6.5, 6.6).
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_off()/,/^}$/{
+  /_egress_teardown/d
+}
+SED
+try "vnext_egress_off_recreates" "the confirmed action removes the gateway, the box, the socket volume and the rendered policy, then recreates" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_off()/,/^}$/{
+  /_egress_write_box_mode/d
+}
+SED
+try "vnext_egress_off_writes_box_mode" "an off box and a box not made yet each get their own answer" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_write_box_mode()/,/^}$/{
+  s@"[$]CLEAT_CONFIG_DIR/egress-boxes/[$][A-Za-z_0-9]*"@"$CLEAT_GLOBAL_CONFIG"@
+}
+SED
+try "vnext_egress_off_leaves_global_alone" "cleat egress off removed the global egress section" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_bridge_origins_effective()/,/^}$/{
+  s@^  _bridge_origins_from_env ok@  _bridge_origins_from_env ok; echo webhook.site@
+}
+SED
+try "vnext_bridge_origins_never_from_egress" "no egress policy widens the origin set" "$CLI" "$BROWSER_BRIDGE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_open()/,/^}$/{
+  s@^    rm -f "[$]_EGRESS_BOXES_DIR/[$]cname.session" 2>/dev/null || true$@    :@
+}
+SED
+try "vnext_egress_open_failure_drops_marker" "a gateway that does not take it removes the marker" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_open()/,/^}$/{
+  s@^    case "[$]ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 0 ;; esac$@    :@
+}
+SED
+try "vnext_egress_open_default_deny" "a yes writes the session marker and reloads the gateway, a no writes nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_off()/,/^}$/{
+  s@^    case "[$]ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 0 ;; esac$@    :@
+}
+SED
+try "vnext_egress_off_default_deny" "a declined confirmation changes nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_screen()/,/^}$/{
+  s@^      cmd_egress_off "[$]ecname" 0 || return 1$@      cmd_egress_off "$ecname" "$yes" || return 1@
+}
+SED
+try "vnext_egress_ring_off_always_confirms" "done in the typed editor never answers the recreate" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_open_always()/,/^}$/{
+  s@_write_egress_to_file "[$]CLEAT_GLOBAL_CONFIG" open "[$]_f_packs" "[$]_f_denies" "[$]_f_allows"@_write_egress_to_file "$CLEAT_GLOBAL_CONFIG" open "" "" ""@
+}
+SED
+try "vnext_egress_open_always_keeps_entries" "always writes mode open in the global section and keeps the entries" "$CLI" "$EGRESS_GATEWAY_BATS"
+
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
 # socket sees the uid the host chose.
 cat > "$SED_TMP" << 'SED'

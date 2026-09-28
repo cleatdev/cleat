@@ -10322,3 +10322,14 @@ mode = off"
   run grep -c "^docker exec $GW /usr/local/bin/gw-admin reload" "$DOCKER_CALLS"
   assert_output "1"
 }
+
+@test "regression vNEXT: cleat egress off removed the global egress section" {
+  # Turning one box off must leave every other box's policy where it was.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_write_box_mode cleat-app-1234abcd off
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict
+pack = npm"
+}

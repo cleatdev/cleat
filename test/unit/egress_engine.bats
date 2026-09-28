@@ -278,3 +278,17 @@ desktop() {
   run grep -cE "^docker (run|rm)" "$DOCKER_CALLS"
   assert_output "0"
 }
+
+@test "open mode on a refused engine exits 1" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf engine-linux; }
+  is_running() { return 0; }
+  _egress_label_read() { _EG_LABEL_SET=1; _EG_LABEL=v1:0000000000000000; return 0; }
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress open --yes
+  assert_failure
+  assert_output --partial "not validated on this Docker engine"
+  [ ! -e "$_EGRESS_BOXES_DIR/$(container_name_for "$PWD" main).session" ]
+}

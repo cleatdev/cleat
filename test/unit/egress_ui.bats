@@ -1936,3 +1936,39 @@ plain() { run _plain "$output"; }
   run cmd_egress allow docs.example.test
   assert_success
 }
+
+@test "egress ring: open in the box editor writes the session marker and not the per-box file" {
+  status_caged
+  _egress_on_terminal() { return 0; }
+  mock_docker_inspect_field "$CN" '{{if .State.Running}}{{.State.StartedAt}}{{end}}' "2026-09-28T09:00:00Z"
+  # The reload itself is the apply-mode tests'. Here: what the ring writes.
+  _egress_apply_mode() { echo "apply $1 $2" >> "$TEST_TEMP/applied"; return 0; }
+  _egress_editor_load main
+  _EGE_RING_BACK=strict
+  _EGE_MODE=open
+  run _egress_save_screen 0 <<< $'y\ny'
+  run _plain "$output"
+  assert_output --partial "Open for this session only. See the next screen."
+  assert_output --partial "! Open egress, this session only"
+  [ -f "$_EGRESS_BOXES_DIR/$CN.session" ]
+  run cat "$TEST_TEMP/applied"
+  assert_output "apply $CN open"
+  run cat "$_EGRESS_BOXES_DIR/$CN"
+  refute_output --partial "mode = open"
+}
+
+@test "egress ring: done in the typed editor never answers the recreate or the open for you" {
+  status_caged
+  _egress_on_terminal() { return 0; }
+  cmd_run() { echo "cmd_run" >> "$DOCKER_CALLS"; }
+  _egress_editor_load main
+  _EGE_MODE=off
+  # The typed editor's done passes 1: that answers Save and nothing else.
+  run _egress_save_screen 1 <<< ""
+  run _plain "$output"
+  assert_output --partial "This recreates the box. See the next screen."
+  assert_output --partial "Turn egress control off and recreate the box? [y/N]"
+  assert_output --partial "Not changed."
+  run grep -cE "^docker rm|^cmd_run" "$DOCKER_CALLS"
+  assert_output "0"
+}

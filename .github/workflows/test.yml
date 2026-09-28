@@ -357,7 +357,9 @@ jobs:
   test-linux-arm64:
     name: test (ubuntu arm64, bash 5.x)
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 40
+    # Cancelled at 40 on 2026-09-27 with the egress tests in, as the other
+    # Linux legs were. 60 until the Linux legs shard.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:

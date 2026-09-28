@@ -3321,8 +3321,11 @@ allow = registry.npmjs.org"
   printf '[egress]\nmode = strict\npack = npm\ndeni = typo.example\n' > "$XDG_CONFIG_HOME/cleat/config"
   run cleat_bin egress status < /dev/null
   assert_success
-  assert_output --partial "Policy saved. Enforcement lands in a later release."
   assert_output --partial "Unknown key"
+  # The stub's engine is none cleat can identify, so status says a policy
+  # refuses here, and never that enforcement is still to come.
+  assert_output --partial "Egress control is not available on an engine cleat could not identify"
+  refute_output --partial "Enforcement lands"
   run cleat_bin egress --list < /dev/null
   assert_success
   assert_output --partial "registry.npmjs.org"
@@ -3427,7 +3430,7 @@ allow = registry.npmjs.org"
   assert_failure
 }
 
-@test "smoke: a saved egress policy launches a shell under strict mode" {
+@test "smoke: a saved egress policy refuses a shell on an unvalidated engine under strict mode" {
   mkdir -p "$TEST_TEMP/project" "$XDG_CONFIG_HOME/cleat"
   printf '[egress]\nmode = strict\npack = github\n' > "$XDG_CONFIG_HOME/cleat/config"
   local cname
@@ -3436,11 +3439,13 @@ allow = registry.npmjs.org"
   printf '%s\n' "$cname" > "$DOCKER_MOCK_DIR/ps_a_output"
   cd "$TEST_TEMP/project"
   run cleat_bin_timeout 10 shell < /dev/null
-  assert_success
+  assert_equal "$status" 1
   refute_output --partial "unbound variable"
-  refute_output --partial "Egress refused"
-  run grep -E '^docker exec -it' "$DOCKER_CALLS"
-  assert_success
+  assert_output --partial "Egress control is not available on this Docker engine"
+  assert_output --partial "cleat egress off"
+  # Nothing ran in the box.
+  run grep -E '^docker exec' "$DOCKER_CALLS"
+  assert_failure
 }
 
 @test "smoke: cleat egress audit classifies a host under strict mode" {
@@ -3533,6 +3538,21 @@ SH
   printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
   run cleat_bin egress reload < /dev/null
   refute_output --partial "unbound variable"
+}
+
+@test "smoke: cleat egress on a box with ssh exits nonzero with a named reason" {
+  # The writer refuses at the write, not only at the next launch (5.7
+  # assertion 16): a policy over a box that mounts the ssh agent is no cage.
+  mkdir -p "$TEST_TEMP/project" "$XDG_CONFIG_HOME/cleat"
+  printf '[caps]\nssh\n' > "$XDG_CONFIG_HOME/cleat/config"
+  cp "$XDG_CONFIG_HOME/cleat/config" "$TEST_TEMP/before"
+  cd "$TEST_TEMP/project"
+  run cleat_bin egress allow github < /dev/null
+  assert_failure
+  refute_output --partial "unbound variable"
+  assert_output --partial "the ssh capability mounts your agent"
+  run cmp "$XDG_CONFIG_HOME/cleat/config" "$TEST_TEMP/before"
+  assert_success
 }
 
 @test "smoke: cleat egress review runs on the real binary" {

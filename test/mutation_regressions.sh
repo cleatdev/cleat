@@ -13966,14 +13966,11 @@ try "vnext_egress_config_row_two_lines" "the config global block grows by exactl
 # egress_require.bats runs with _EGRESS_ENFORCING=1, so every assertion is live
 # here. Each sed is scoped to the one function that owns the property.
 
-# Stage two: a saved policy refuses no launch while enforcement has not
-# shipped. The stage-three commit that flips the constant retires this entry.
+# Enforcement ships on, and a source guard pins it.
 cat > "$SED_TMP" << 'SED'
-/^_egress_require()/,/^}$/{
-  s@      if \[ "\$_EGRESS_ENFORCING" != 1 \]; then return 0; fi ;;@      : ;;@
-}
+s@^_EGRESS_ENFORCING=1@_EGRESS_ENFORCING=0@
 SED
-try "vnext_egress_stage_two_inert" "a saved policy does not refuse a launch before enforcement ships" "$CLI" "$EGRESS_REQUIRE_BATS"
+try "vnext_egress_enforcing_shipped" "the egress gate shipped with enforcement off"
 
 # A down daemon is a daemon error, never an egress refusal.
 cat > "$SED_TMP" << 'SED'
@@ -16176,6 +16173,13 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_port_in_digest" "port 80 was accepted"
 
+# The writer refuses a policy over an interlocked box, on the real binary.
+cat > "$SED_TMP" << 'SED'
+/^_egress_writer_interlock()/,/^}$/{
+  s|^  _egress_interlocks "\$1"$|  :|
+}
+SED
+try "vnext_egress_writer_interlock_smoke" "cleat egress on a box with ssh exits nonzero with a named reason" "$CLI" "$SMOKE_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

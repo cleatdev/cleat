@@ -1,9 +1,9 @@
 #!/usr/bin/env bats
 # The egress gate (EGRESS-SPEC.md 5.5 to 5.7): _egress_require, the create-time
 # hash, the live-policy check, the box and gateway assertions and the
-# capability interlocks. Stage two ships the gate with _EGRESS_ENFORCING at 0,
-# so this file sets it to 1 after source_cli: every assertion runs live here,
-# before a gateway exists to hide behind. One test runs the stage-two value.
+# capability interlocks. Enforcement ships on. This file still sets
+# _EGRESS_ENFORCING=1 after source_cli, so every assertion runs live here
+# whatever the shipped value, which regressions.bats pins on its own.
 load "../setup"
 load "../lib/egress_fixtures"
 
@@ -29,16 +29,6 @@ teardown() { _common_teardown; }
 
 
 # ── Stage two, the daemon and the off path ──────────────────────────────────
-
-@test "egress require: a saved policy does not refuse a launch before enforcement ships" {
-  _EGRESS_ENFORCING=0
-  mkdir -p "$DOCKER_MOCK_DIR/inspect"
-  run _egress_require "$CN" start
-  assert_success
-  assert_output ""
-  run count_calls "docker inspect"
-  assert_output "0"
-}
 
 @test "egress require: no policy and no label passes silently" {
   rm -f "$CLEAT_GLOBAL_CONFIG"

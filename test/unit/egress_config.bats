@@ -723,26 +723,21 @@ _default_launch() {
   [ ! -e "$CLEAT_CONFIG_DIR/egress" ]
 }
 
-@test "egress default: a saved policy launches the same box and says it is not enforced" {
-  printf '[egress]\nmode = strict\n' > "$CONF"
-  _default_launch
-  assert_success
-  run sed $'s/\033\\[[0-9;]*m//g' <<< "$output"
-  assert_output --partial "saved, not enforced in this"
-  run grep -F "{{.HostConfig.NetworkMode}}" "$DOCKER_CALLS"
-  assert_failure
-  run docker_run_line_for "$CN"
-  [[ "$output" != *"--network"* ]]
-}
-
 @test "egress config: the resolved digest is recorded outside every mount source" {
-  printf '[egress]\nmode = strict\n' > "$CONF"
+  # A caged launch, the only kind a policy makes once enforcement is live.
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  mock_docker_images "cleat"
+  caged_box
   _default_launch
   assert_success
   local ledger src line a
   ledger="$(_egress_ledger_path "$CN")"
   [ -f "$ledger" ]
   run docker_run_line_for "$CN"
+  assert_output --partial "--network none"
   line="$output"
   set -f
   local prev=""

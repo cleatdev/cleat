@@ -416,10 +416,11 @@ allow = docs.rs"
   _egress_editor_load ""
   _egress_mode_step -1
   [ "$_EGE_MODE" = off ]
-  # Enter, even from the typed form's done, never turns it off.
+  # Enter, even from the typed form's done, never turns it off. Under live
+  # enforcement the question is the global off confirmation of 6.5.
   run _egress_save_screen 1 <<< ""
   assert_failure
-  assert_output --partial "Turn it off? [y/N]"
+  assert_output --partial "Turn egress control off for every new box? [y/N]"
   refute_output --partial "Allowed   9 hosts"
   refute_output --partial "port 443 only"
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"

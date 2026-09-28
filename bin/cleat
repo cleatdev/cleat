@@ -15,11 +15,12 @@ RELEASE_HIGHLIGHT_VERSION="1.5.4"
 # without training the eye to skip the startup block, where drift/update/security
 # notices also live. See concept/21-on-start-notices.md.
 RELEASE_HIGHLIGHT_MAX_SHOWS=3
-# Egress control (EGRESS-SPEC.md 12.4). 0 while the policy language ships
-# ahead of the gateway: a saved policy is read, shown and written, refuses no
-# launch, and the launch summary says so. The commit that wires the gateway
-# makes this 1, with a source guard pinning it.
-_EGRESS_ENFORCING=0
+# Egress control (EGRESS-SPEC.md 12.4). 1: a saved policy is enforced. A box
+# under one is created with no network of its own and a gateway, and the gate
+# refuses a launch it cannot prove caged. With no policy nothing changes. The
+# 0 branches stay as a fail-open lever the gate reads the same way, and a
+# source guard in regressions.bats pins the shipped value.
+_EGRESS_ENFORCING=1
 # The engines egress control is validated on, each licensed by a dated row in
 # docs/egress-validation.md (EGRESS-SPEC.md 10.5). No environment override:
 # an escape hatch on a security gate becomes the gate. macOS alone for the

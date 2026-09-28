@@ -10407,6 +10407,13 @@ pack = npm"
   assert_output --partial "after.example"
 }
 
+@test "regression vNEXT: the egress gate shipped with enforcement off" {
+  # The shipped value, read by a fresh bash with no test override: a policy
+  # the release claims to enforce must not ship behind a lever left at 0.
+  run bash -c 'source "$1" >/dev/null 2>&1; printf %s "$_EGRESS_ENFORCING"' _ "$CLI"
+  assert_output "1"
+}
+
 @test "regression vNEXT: a case inside a command substitution broke the fragment on bash 3.2" {
   # bash 3.2 reads a case pattern's ) as the end of the $( ) around it. The
   # network fragment's resolution had one, so every macOS box kept the full

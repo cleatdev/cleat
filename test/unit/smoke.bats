@@ -3386,6 +3386,14 @@ allow = registry.npmjs.org"
   run cleat_bin egress --help < /dev/null
   assert_success
   assert_output --partial "--inherit"
+  # Every verb this release dispatches has its line (7.10).
+  local v
+  for v in status packs allow deny audit why test log reload restart review open off; do
+    assert_output --partial "egress $v"
+  done
+  assert_output --partial "--shim"
+  assert_output --partial "--refused"
+  assert_output --partial "--always"
 }
 
 @test "smoke: cleat config --project prints no egress row" {

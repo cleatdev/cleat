@@ -16134,6 +16134,14 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_report_caged_only" "the session end report is silent with no policy" "$CLI" "$EGRESS_GATEWAY_BATS"
 
+# ── S26: every dispatched verb has its help line (7.10) ──
+cat > "$SED_TMP" << 'SED'
+/^_egress_help()/,/^}$/{
+  /egress review\${RESET}/d
+}
+SED
+try "vnext_egress_help_verbs" "cleat egress --help prints the verbs" "$CLI" "$SMOKE_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

@@ -836,7 +836,7 @@ rl_dead_pid() { local p; sleep 0.01 & p=$!; wait "$p" 2>/dev/null || true; echo 
   assert_output --partial "has no account mount"
   # A blank line separates that notice from the session output, so the reclaim
   # erases the blank and the notice stays in the scrollback.
-  [[ "$output" == *"$LF$LF"* ]]
+  assert_output --partial "$LF$LF"
   local tail_after_blank="${output##*"$LF$LF"}"
   case "$tail_after_blank" in
     *"Session ended"*) : ;;

@@ -468,7 +468,14 @@ _summary_old_pin() {
   run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
   _plain_output
   assert_output --partial $'\n'"              Packs pinned at catalogue rev ${_EGRESS_CATALOGUE_REV}. Later additions wait for review."
-  # The next launch finds the pin and says nothing about it.
+  # The same launch's second gate keeps the note for its summary.
+  _egress_resolve cleat-test-12345678
+  _egress_pin_launch cleat-test-12345678
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  _plain_output
+  assert_output --partial "Packs pinned at catalogue rev"
+  # The next launch, a new process, finds the pin and says nothing about it.
+  _EG_PIN_NOTE_CN=""
   _egress_resolve cleat-test-12345678
   _egress_pin_launch cleat-test-12345678
   run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"

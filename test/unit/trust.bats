@@ -213,7 +213,7 @@ _source_cli_silent() {
 
 @test "trust record: file is 0600" {
   _trust_record "/fake/proj" "h"
-  [[ -f "$CLEAT_TRUST_FILE" ]]
+  assert [ -f "$CLEAT_TRUST_FILE" ]
   local perms
   perms="$(stat -c '%a' "$CLEAT_TRUST_FILE" 2>/dev/null || stat -f '%Lp' "$CLEAT_TRUST_FILE" 2>/dev/null)"
   [[ "$perms" == "600" ]] || {

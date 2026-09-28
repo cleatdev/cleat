@@ -560,8 +560,9 @@ old_pin() {
   assert_output "$(_egress_pin_digest "$want")"
   run bash -c 'ls -l "$1" | cut -c1-10' _ "$GPIN"
   assert_output "-rw-------"
-  # The next launch finds it and says nothing.
+  # The next launch, a new process, finds it and says nothing.
   cp "$GPIN" "$TEST_TEMP/before"
+  _EG_PIN_NOTE_CN=""
   _egress_require "$CN" claude
   assert_equal "$_EG_PIN_NOTE" ""
   run cmp "$GPIN" "$TEST_TEMP/before"
@@ -851,4 +852,54 @@ old_pin() {
   run _plain "$output"
   assert_output --partial "! raw.githubusercontent.com   contained -> open tenancy   measured h1+h2, 2026-09-21"
   assert_output --partial "the operator serves content its users upload"
+}
+
+@test "egress pin: a box's own file never releases what the machine's pin holds" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_MISSING="uploads.github.com" old_pin
+  _EGRESS_CATALOGUE_REV=2
+  # A box file that only narrows.
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\ndeny = some.example\n' > "$_EGRESS_BOXES_DIR/$CN"
+  _egress_resolve "$CN"
+  assert_equal "$_EG_HELD" "uploads.github.com"
+  run printf '%s\n' "$_EG_HOSTS"
+  refute_line "uploads.github.com"
+  # Its first own pin is the machine's, at the old rev, holding the same.
+  caged_box
+  _egress_require "$CN" claude
+  assert_equal "$_EG_CAGED" 1
+  local bpin="$CLEAT_CONFIG_DIR/egress-pins/$CN"
+  run _read_section_from_file "$bpin" pin catalogue_rev
+  assert_output "1"
+  run _read_section_all_from_file "$bpin" pin host
+  refute_output --partial "uploads.github.com"
+  refute_output --partial "some.example"
+  assert_equal "$_EG_PIN_NOTE" ""
+  # Review reads the same pin.
+  run _egress_cmd_review "$CN" 0 </dev/null
+  run _plain "$output"
+  assert_output --partial "+ uploads.github.com"
+}
+
+@test "egress pin: what a launch's first gate saw survives its second gate" {
+  pin_box
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  PIN_EXTRA=$'gone.example B\n' old_pin
+  _EGRESS_CATALOGUE_REV=2
+  caged_box
+  # cmd_run's gate re-pins, then cmd_start's own gate finds the new pin.
+  _egress_require "$CN" run
+  _egress_resolve "$CN"
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/gwadmin"
+  use_gw_admin_stub
+  caged_box
+  _egress_require "$CN" start
+  run _egress_summary_pin_lines
+  assert_output --partial "1 host left the packs you use and no longer reaches the box."
+  # Another box starts over.
+  _egress_pin_launch cleat-other-12345678
+  run _egress_summary_pin_lines
+  refute_output --partial "left the packs"
 }

@@ -5269,6 +5269,16 @@ _trust_prompt() {
   esac
 }
 
+# Whether a box's [setup] will run caged (the wording of the prompt below). A box
+# that exists was made caged: the resolution checked its label. One not made
+# yet is caged only where a caged create can succeed. Probes silenced.
+_egress_setup_will_cage() {              # <cname> <mode>
+  container_exists "$1" && return 0
+  _daemon_up || return 1
+  _egress_engine_validated "$(_egress_engine_kind)" || return 1
+  ( _egress_interlocks "$2" ) >/dev/null 2>&1
+}
+
 # Show the [setup] consent prompt and read y/n. Returns 0 on approval.
 # A separate consent class from _trust_prompt (concept/16): approving caps
 # never approves this, and vice versa.
@@ -5285,8 +5295,13 @@ _setup_trust_prompt() {
   if [[ $is_reprompt -eq 1 ]]; then
     info "Project ${BOLD}$(_trust_subject "$project" "${_BOX:-main}" setup)${RESET} setup changed since you approved it: it runs ${BOLD}${entry_count} command(s)${RESET} ${DIM}in the box as coder${RESET}"
   else
-    local _net="full network access" _res
-    if _res="$(_egress_fragment_resolution "$(container_name_for "$project" "${_BOX:-main}")")"; then
+    local _net="full network access" _res _pcn
+    _pcn="$(container_name_for "$project" "${_BOX:-main}")"
+    # The policy's network only when the box will really be caged: made with
+    # its label, or not made yet on a validated engine that no capability
+    # interlock refuses. Anywhere else the create refuses, and after the
+    # user's cleat egress off the approved payload runs with full network.
+    if _res="$(_egress_fragment_resolution "$_pcn")" && _egress_setup_will_cage "$_pcn" "${_res%%$'\n'*}"; then
       case "${_res%%$'\n'*}" in
         open) _net="any TLS host, through the egress proxy" ;;
         *) _net="network limited to this box's egress policy" ;;
@@ -10258,7 +10273,7 @@ _egress_pin_hold() {                     # <cname> <user allows>
   local _pf _rev _tmp _diff _d _h _o _n
   _EG_HELD=""; _EG_HELD_CORE=0; _EG_PIN_DIFF=""; _EG_PIN_BROKEN=0
   case "$_EG_MODE" in strict|open) ;; *) return 0 ;; esac
-  _pf="$(_egress_pin_file "$1")"
+  _pf="$(_egress_pin_source "$1")"
   [ -f "$_pf" ] || return 0
   _rev="$(_read_section_from_file "$_pf" pin catalogue_rev)"
   case "$_rev" in ""|*[!0-9]*) return 0 ;; esac
@@ -10298,6 +10313,32 @@ _egress_pin_file() {                     # <cname>
   fi
 }
 
+# The pin a box's resolution is compared against: its own once it has one. A
+# box whose own file is newer than its own pin inherits the machine's pin,
+# because a per-box file (even one that only narrows) must never release what
+# the machine's pin holds for review.
+_egress_pin_source() {                   # <cname>
+  local _pf _g="$_EGRESS_PINS_DIR/global"
+  _pf="$(_egress_pin_file "$1")"
+  if [ "$_pf" != "$_g" ] && [ ! -e "$_pf" ] && [ ! -L "$_pf" ] && [ -f "$_g" ]; then
+    printf '%s' "$_g"
+  else
+    printf '%s' "$_pf"
+  fi
+}
+
+# A box's first own pin, copied from the machine's: its rev, its date and its
+# hosts, never the shipped expansion, so nothing held is released by the copy.
+_egress_pin_seed() {                     # <box pin> <machine pin>
+  local _l _args=()
+  while IFS= read -r _l; do
+    [ -n "$_l" ] && _args=("${_args[@]+"${_args[@]}"}" "$_l")
+  done < <(_read_section_all_from_file "$2" pin host)
+  _egress_write_pin "$1" "$(_read_section_from_file "$2" pin catalogue_rev)" \
+    "$(_read_section_from_file "$2" pin pinned_at)" "$(_read_section_from_file "$2" pin digest)" \
+    "${_args[@]+"${_args[@]}"}"
+}
+
 # `<host> <class key>` for each name, the form a pin and a shipped expansion
 # both hold.
 _egress_pin_lines() {                    # <host names>
@@ -10332,10 +10373,18 @@ EOF
 # _EG_PIN_NOTE and _EG_PIN_LAUNCH_DIFF, the diff this launch acted on.
 _EG_PIN_NOTE=""
 _EG_PIN_LAUNCH_DIFF=""
+_EG_PIN_NOTE_CN=""
 _egress_pin_launch() {                   # <cname>
-  local _pf _rev _names
-  _EG_PIN_NOTE=""
-  _EG_PIN_LAUNCH_DIFF="$_EG_PIN_DIFF"
+  local _pf _rev _names _src
+  # One launch runs the gate more than once (cmd_start runs cmd_run's, then
+  # its own), and the second finds what the first wrote. What the summary
+  # says is kept for the box across them, and starts over for another box.
+  if [ "$_EG_PIN_NOTE_CN" != "$1" ]; then
+    _EG_PIN_NOTE=""
+    _EG_PIN_LAUNCH_DIFF=""
+    _EG_PIN_NOTE_CN="$1"
+  fi
+  if [ -n "$_EG_PIN_DIFF" ]; then _EG_PIN_LAUNCH_DIFF="$_EG_PIN_DIFF"; fi
   if [ "$_EG_PIN_BROKEN" = 1 ]; then
     _egress_refuse policy "cleat could not compare its egress pin with this release's packs." \
       "check that ${BOLD}${TMPDIR:-/tmp}${RESET} is writable, then re-run cleat"
@@ -10347,6 +10396,14 @@ _egress_pin_launch() {                   # <cname>
     return 1
   fi
   _pf="$(_egress_pin_file "$1")"
+  _src="$(_egress_pin_source "$1")"
+  if [ "$_src" != "$_pf" ]; then
+    if ! _egress_pin_seed "$_pf" "$_src"; then
+      _egress_refuse policy "cleat could not write its egress pin." \
+        "check ${BOLD}${_pf/#${HOME}/~}${RESET} is a file you own, then re-run cleat"
+      return 1
+    fi
+  fi
   _rev=""
   if [ -f "$_pf" ]; then _rev="$(_read_section_from_file "$_pf" pin catalogue_rev)"; fi
   case "$_rev" in
@@ -12154,7 +12211,7 @@ _egress_origin_is_ssh() {                # <project>
     _line="${_line#"${_line%%[![:space:]]*}"}"
     case "$_line" in
       "["*)
-        _hdr="$(printf '%s' "$_line" | tr -d ' \t')"
+        _hdr="$(printf '%s' "$_line" | LC_ALL=C tr -d ' \t')"
         case "$_hdr" in
           '[remote"origin"]'*|'[remote.origin]'*) _in=1 ;;
           *) _in=0 ;;
@@ -12162,7 +12219,7 @@ _egress_origin_is_ssh() {                # <project>
         continue ;;
     esac
     [ "$_in" = 1 ] || continue
-    _k="$(printf '%s' "${_line%%=*}" | tr -d ' \t' | tr 'URL' 'url')"
+    _k="$(printf '%s' "${_line%%=*}" | LC_ALL=C tr -d ' \t' | LC_ALL=C tr 'URL' 'url')"
     [ "$_k" = url ] || continue
     case "$_line" in *=*) ;; *) continue ;; esac
     _u="${_line#*=}"
@@ -12170,7 +12227,7 @@ _egress_origin_is_ssh() {                # <project>
     _u="${_u%"${_u##*[![:space:]]}"}"
     _u="${_u#\"}"; _u="${_u%\"}"
     break
-  done < <(_read_unlinked_bounded "$1/.git/config" 65536)
+  done < <(_read_unlinked_bounded "$1/.git/config" 65536 | LC_ALL=C tr '\200-\377' '?')
   [ -n "$_u" ] || return 2
   case "$_u" in
     ssh://*|git+ssh://*|ssh+git://*) return 0 ;;
@@ -12729,7 +12786,7 @@ _egress_review_residual() {              # <word>
 # re-pins the rev, the date, the digest and the hosts in one write, then every
 # running caged box the pin covers takes it now. Nothing held writes nothing.
 _egress_cmd_review() {                   # <cname> <yes>
-  local cname="$1" yes="$2" box pf rev at d h o n p rec cls flg legs purpose word res ans=""
+  local cname="$1" yes="$2" box pf src rev at d h o n p rec cls flg legs purpose word res ans=""
   local held=0
   box="$(_sessions_safe_str "${_BOX:-main}")"
   if ! ( _egress_resolve "$cname" ) >/dev/null 2>&1; then
@@ -12742,12 +12799,13 @@ _egress_cmd_review() {                   # <cname> <yes>
     *) info "Egress control is off for box ${BOLD}${box}${RESET}. There is no pin to review."; return 0 ;;
   esac
   pf="$(_egress_pin_file "$cname")"
-  if [ ! -f "$pf" ]; then
+  src="$(_egress_pin_source "$cname")"
+  if [ ! -f "$src" ]; then
     info "Nothing is held. There is no pin yet: the next caged launch writes one."
     return 0
   fi
-  rev="$(_read_section_from_file "$pf" pin catalogue_rev)"
-  at="$(_read_section_from_file "$pf" pin pinned_at)"
+  rev="$(_read_section_from_file "$src" pin catalogue_rev)"
+  at="$(_read_section_from_file "$src" pin pinned_at)"
   case "$_EG_PIN_DIFF" in *added$'\t'*|*weakened$'\t'*) held=1 ;; esac
   if [ "$held" != 1 ]; then
     info "Nothing is held. Pinned at catalogue rev $(_sanitize_repo_str "$rev") on $(_sanitize_repo_str "$at")."
@@ -13148,11 +13206,19 @@ cmd_egress_open_always() {               # <yes>
     IFS= read -r ans || ans=""
     case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 0 ;; esac
   fi
+  _egress_writer_interlock open || return 1
   _egress_file_state "$CLEAT_GLOBAL_CONFIG"
   canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
   _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" open "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
-  success "Every box is open until you change it. Every destination is logged."
-  if [ "$_EGRESS_ENFORCING" = 1 ]; then _egress_apply_now ""; fi
+  success "The global policy is open until you change it. Every destination is logged."
+  echo -e "    ${DIM}A box with a mode of its own keeps it.${RESET}"
+  if [ "$_EGRESS_ENFORCING" = 1 ]; then
+    if _daemon_up && ! _egress_engine_validated "$(_egress_engine_kind)"; then
+      echo -e "    ${AMBER}Boxes on this machine will refuse to start until you switch engine or run cleat egress off.${RESET}"
+    fi
+    _egress_refusing_boxes_note
+    _egress_apply_now ""
+  fi
   return 0
 }
 
@@ -14069,6 +14135,21 @@ _egress_status_render() {                # <cname>
         echo -e "  ${RED}x${RESET} Box ${BOLD}${bx}${RESET} was created under an egress policy that no longer resolves."
         echo -e "    It refuses every launch until it is recreated with a normal network."
         echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress off${RESET}"
+      elif [ "$_EG_WHY" = perbox ]; then
+        # Its own file turned it off. The global section may cage every other
+        # box, and editing it cannot turn this one back on.
+        echo -e "  ${DIM}○${RESET} Egress control is off for this box, by its own file"
+        echo -e "    ${DIM}${_EGRESS_BOXES_DIR/#${HOME}/~}/${cname}${RESET}"
+        echo -e "    Full network egress for this box. Other boxes follow the global policy."
+        if _daemon_up; then
+          kind="$(_egress_engine_kind)"
+          if ! _egress_engine_validated "$kind"; then
+            echo -e "    ${DIM}This engine is not validated, so a policy box would refuse to start here: $(_egress_engine_words "$kind")${RESET}"
+          fi
+        fi
+        echo ""
+        echo -e "  Turn it on:   ${BOLD}cleat egress $bx${RESET}      this box's editor"
+        echo -e "                ${BOLD}cleat egress $bx --inherit${RESET}   follow the global policy again"
       else
         echo -e "  ${DIM}○${RESET} Egress control is off for this box"
         echo -e "    Full network egress, which is what every box on this machine has today."
@@ -14229,12 +14310,18 @@ _egress_status_summary_row() {           # <cname>
       echo -e "  ${BOLD}Egress:${RESET}    off  ${DIM}·  full network egress${RESET}"
       return 0 ;;
   esac
-  if [ "$_EGRESS_ENFORCING" = 1 ] && _daemon_up && container_exists "$1" \
-     && _egress_label_read "$1" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then
-    state="$(_egress_gateway_state "$1")"
-    if [ "$state" != healthy ]; then
-      echo -e "             ${AMBER}! gateway ${state}. This is not a policy denial.${RESET}  ${DIM}cleat egress status${RESET}"
-    fi
+  [ "$_EGRESS_ENFORCING" = 1 ] && _daemon_up && container_exists "$1" || return 0
+  _egress_label_read "$1" sh.cleat.egress-hash || return 0
+  if [ "$_EG_LABEL_SET" != 1 ]; then
+    # The policy says strict or open, and this box has no cage at all.
+    echo -e "             ${RED}x created without egress control, so it has no cage.${RESET} It refuses to start until recreated:  $(_egress_recreate_words "$1")"
+    return 0
+  fi
+  state="$(_egress_gateway_state "$1")"
+  # A gateway stopped with its stopped box is how a stopped box looks.
+  if [ "$state" = stopped ] && ! is_running "$1"; then return 0; fi
+  if [ "$state" != healthy ]; then
+    echo -e "             ${AMBER}! gateway ${state}. This is not a policy denial.${RESET}  ${DIM}cleat egress status${RESET}"
   fi
   return 0
 }
@@ -14248,7 +14335,7 @@ _egress_status_gateway_row() {           # <cname> <gateway> <state>
       meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect -f '{{.RestartCount}}|{{.State.OOMKilled}}|{{.Config.Image}}' "$gw" 2>/dev/null)" || meta=""
       rc_n="${meta%%|*}"; img="${meta##*|}"
       case "$rc_n" in ''|*[!0-9]*) rc_n="?" ;; esac
-      ups="$(docker ps -a --filter "name=^${gw}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
+      ups="$(docker ps -a --filter "name=^${gw}$" --format '{{.Status}}' 2>/dev/null | head -n 1)" || ups=""
       ups="${ups%% (*}"
       echo -e "  ${GREEN}●${RESET} Gateway healthy       ${gw}   $(printf '%s' "$ups" | tr 'U' 'u')   ${rc_n} restarts"
       if [ -n "$img" ]; then
@@ -15102,7 +15189,7 @@ _egress_editor_verdict() {
     down) printf 'Engine   checked at launch: Docker is not running' ;;
     *)
       if _egress_engine_validated "$_EGE_ENGINE"; then
-        printf 'Engine   validated, a save applies at the next launch: %s' "$(_egress_engine_words "$_EGE_ENGINE")"
+        printf 'Engine   validated: %s' "$(_egress_engine_words "$_EGE_ENGINE")"
       else
         printf 'Engine   not validated, a caged box will not start here: %s' "$(_egress_engine_words "$_EGE_ENGINE")"
       fi ;;
@@ -15114,7 +15201,8 @@ _egress_editor_verdict() {
 _egress_save_consequence() {             # <saved mode>
   local cname="" lbl=0
   _egress_editor_engine
-  if [ "$_EGE_ENGINE" != down ] && ! _egress_engine_validated "$_EGE_ENGINE"; then
+  # Saving off puts no box under a policy, so the engine refuses nothing.
+  if [ "$(_egress_effective_mode "$1")" != off ] && [ "$_EGE_ENGINE" != down ] && ! _egress_engine_validated "$_EGE_ENGINE"; then
     echo -e "    ${AMBER}Saved. Boxes on this machine will refuse to start until you switch engine or run${RESET}"
     echo -e "    ${AMBER}cleat egress off.${RESET} ${DIM}Validated: $(_egress_engine_words "${_EGRESS_VALIDATED_ENGINES%% *}").${RESET}"
     return 0
@@ -15410,6 +15498,8 @@ _egress_project_ignored_note() {         # <project .cleat>
 # entries already there are kept. Prints what it did.
 _egress_config_enable() {
   local canon
+  # The writer refuses what the next launch would, at the write (5.7, 16).
+  _egress_writer_interlock strict || return 1
   _egress_file_state "$CLEAT_GLOBAL_CONFIG"
   canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
   _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" strict "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
@@ -20983,7 +21073,9 @@ cmd_ps() {
       # label never reads as one. A gateway is not a box: its own row lives in
       # cleat egress status.
       _fmt_role='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}'
-      meta="$(docker inspect "$name" --format "${_fmt_role}|"'{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)"
+      # A row removed since the listing (a teardown in another terminal) is
+      # skipped: under set -e a failed inspect would end the whole list.
+      meta="$(docker inspect "$name" --format "${_fmt_role}|"'{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)" || continue
       _role="${meta%%|*}"
       meta="${meta#*|}"
       case "$_role" in ROLE=*) _role="${_role#ROLE=}" ;; *) _role="" ;; esac

@@ -22,8 +22,8 @@ _cname_for() { container_name_for "$1"; }
   # In production CLEAT_CONFIG_DIR is ~/.config/cleat (persistent); in the test
   # sandbox HOME itself is a mktemp dir under /tmp, so assert the structural
   # invariant rather than a literal /tmp prefix.
-  [[ "$CLEAT_RUN_DIR" == "$CLEAT_CONFIG_DIR/run" ]]
-  [[ "$CLEAT_RUN_DIR" == *"/cleat/run" ]]
+  assert_equal "$CLEAT_RUN_DIR" "$CLEAT_CONFIG_DIR/run"
+  [[ "$CLEAT_RUN_DIR" == *"/cleat/run" ]] || fail "the run dir is not under cleat/run: $CLEAT_RUN_DIR"
   # Never the old flat per-container /tmp scheme.
   [[ "$CLEAT_RUN_DIR" != *"/cleat-settings-"* ]]
 }

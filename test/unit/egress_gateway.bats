@@ -86,7 +86,7 @@ gw_started() {
 @test "egress: the gateway hash is twelve hex characters" {
   CN=cleat-demo-3f2a9104
   egress_box_names
-  [[ "$BH" =~ ^[0-9a-f]{12}$ ]]
+  assert_regex "$BH" '^[0-9a-f]{12}$'
   run _egress_gateway_name "$CN"
   assert_output "cleat-gw-$BH"
   run _egress_sock_volume "$CN"
@@ -801,7 +801,7 @@ SH
   assert_success
   run grep "^docker exec .*-w /workspace $CN runuser -u coder -- bash -e" "$DOCKER_CALLS"
   assert_success
-  [[ "$output" == *"-e HOME=/home/coder -e HTTPS_PROXY=http://127.0.0.1:3128 "* ]]
+  assert_output --partial "-e HOME=/home/coder -e HTTPS_PROXY=http://127.0.0.1:3128 "
   [[ "$output" == *"-e no_proxy=localhost,127.0.0.1,::1 -w /workspace "* ]]
 }
 

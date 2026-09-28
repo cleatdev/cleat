@@ -2306,7 +2306,7 @@ _utf8_locale() {
   # the reclaim erases the blank and the advisory stays in the scrollback.
   # Asserted on $output rather than on `lines`, because bats drops empty
   # elements from that array, which is exactly what hid this.
-  [[ "$output" == *"$LF$LF"* ]]
+  assert_output --partial "$LF$LF"
   local tail_after_blank="${output##*"$LF$LF"}"
   case "$tail_after_blank" in
     *"Session ended"*) : ;;
@@ -3277,7 +3277,7 @@ _host_hook_appends() {
   assert_success
   # The new file holds only the row just written.
   run bash -c 'wc -c < "$1" | tr -d " "' _ "$f"
-  [[ "$output" -lt 4096 ]]
+  assert [ "$output" -lt 4096 ]
   # And the session's read offset went back to the start, or the end-of-session
   # report would read past the end of the new file and say nothing.
   assert_equal "$_hook_drop_off" 0

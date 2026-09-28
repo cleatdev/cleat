@@ -1299,9 +1299,12 @@ SH
   second="$(grep -nE '^docker exec -it' "$DOCKER_CALLS" | sed -n 2p | cut -d: -f1)"
   gate="$(grep -nF "$T_NETMODE" "$DOCKER_CALLS" | awk -F: -v f="$first_exec" '$1 > f {print $1; exit}')"
   top="$(grep -nE '^docker top' "$DOCKER_CALLS" | awk -F: -v f="$first_exec" '$1 > f {print $1; exit}')"
-  [ -n "$first_exec" ] && [ -n "$second" ] && [ -n "$gate" ] && [ -n "$top" ]
-  [ "$gate" -lt "$top" ]
-  [ "$gate" -lt "$second" ]
+  assert [ -n "$first_exec" ]
+  assert [ -n "$second" ]
+  assert [ -n "$gate" ]
+  assert [ -n "$top" ]
+  assert [ "$gate" -lt "$top" ]
+  assert [ "$gate" -lt "$second" ]
 }
 
 @test "egress require: a refusal inside the relaunch loop breaks out and runs the session end once" {

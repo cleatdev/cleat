@@ -52,44 +52,44 @@ teardown() { _common_teardown; }
 
 @test "parse_global_flags: extracts --cap flag" {
   parse_global_flags --cap git start
-  [[ ${#_CLI_CAPS[@]} -eq 1 ]]
-  [[ "${_CLI_CAPS[0]}" == "git" ]]
-  [[ ${#_REMAINING_ARGS[@]} -eq 1 ]]
+  assert_equal "${#_CLI_CAPS[@]}" 1
+  assert_equal "${_CLI_CAPS[0]}" "git"
+  assert_equal "${#_REMAINING_ARGS[@]}" 1
   [[ "${_REMAINING_ARGS[0]}" == "start" ]]
 }
 
 @test "parse_global_flags: extracts multiple --cap flags" {
   parse_global_flags --cap git --cap env start
-  [[ ${#_CLI_CAPS[@]} -eq 2 ]]
-  [[ "${_CLI_CAPS[0]}" == "git" ]]
+  assert_equal "${#_CLI_CAPS[@]}" 2
+  assert_equal "${_CLI_CAPS[0]}" "git"
   [[ "${_CLI_CAPS[1]}" == "env" ]]
 }
 
 @test "parse_global_flags: extracts --env KEY=VALUE" {
   parse_global_flags --env FOO=bar start
-  [[ ${#_CLI_ENVS[@]} -eq 1 ]]
+  assert_equal "${#_CLI_ENVS[@]}" 1
   [[ "${_CLI_ENVS[0]}" == "FOO=bar" ]]
 }
 
 @test "parse_global_flags: extracts --env bare KEY" {
   parse_global_flags --env MY_VAR start
-  [[ ${#_CLI_ENVS[@]} -eq 1 ]]
+  assert_equal "${#_CLI_ENVS[@]}" 1
   [[ "${_CLI_ENVS[0]}" == "MY_VAR" ]]
 }
 
 @test "parse_global_flags: extracts --env-file path" {
   parse_global_flags --env-file /tmp/test.env start
-  [[ ${#_CLI_ENV_FILES[@]} -eq 1 ]]
+  assert_equal "${#_CLI_ENV_FILES[@]}" 1
   [[ "${_CLI_ENV_FILES[0]}" == "/tmp/test.env" ]]
 }
 
 @test "parse_global_flags: mixed flags and commands" {
   parse_global_flags --cap git --env TOKEN=abc --env-file /tmp/e.env resume /some/path
-  [[ ${#_CLI_CAPS[@]} -eq 1 ]]
-  [[ ${#_CLI_ENVS[@]} -eq 1 ]]
-  [[ ${#_CLI_ENV_FILES[@]} -eq 1 ]]
-  [[ ${#_REMAINING_ARGS[@]} -eq 2 ]]
-  [[ "${_REMAINING_ARGS[0]}" == "resume" ]]
+  assert_equal "${#_CLI_CAPS[@]}" 1
+  assert_equal "${#_CLI_ENVS[@]}" 1
+  assert_equal "${#_CLI_ENV_FILES[@]}" 1
+  assert_equal "${#_REMAINING_ARGS[@]}" 2
+  assert_equal "${_REMAINING_ARGS[0]}" "resume"
   [[ "${_REMAINING_ARGS[1]}" == "/some/path" ]]
 }
 
@@ -119,9 +119,9 @@ teardown() { _common_teardown; }
 
 @test "parse_global_flags: no flags passes everything through" {
   parse_global_flags start /my/project
-  [[ ${#_CLI_CAPS[@]} -eq 0 ]]
-  [[ ${#_CLI_ENVS[@]} -eq 0 ]]
-  [[ ${#_CLI_ENV_FILES[@]} -eq 0 ]]
+  assert_equal "${#_CLI_CAPS[@]}" 0
+  assert_equal "${#_CLI_ENVS[@]}" 0
+  assert_equal "${#_CLI_ENV_FILES[@]}" 0
   [[ ${#_REMAINING_ARGS[@]} -eq 2 ]]
 }
 

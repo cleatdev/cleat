@@ -1294,16 +1294,22 @@ good.example.test
 @test "egress ui: the sni subcode list is closed at six and handshake flood is not one of them" {
   run bash -c 'set -f; set -- $1; echo $#' _ "$_EGRESS_SNI_SUBCODES"
   assert_output "6"
-  [[ " $_EGRESS_SNI_SUBCODES " != *" handshake-flood "* ]]
-  [[ " $_EGRESS_REASON_CODES " == *" handshake-flood "* ]]
+  [[ " $_EGRESS_SNI_SUBCODES " != *" handshake-flood "* ]] || fail "handshake-flood is listed as an sni subcode"
+  [[ " $_EGRESS_REASON_CODES " == *" handshake-flood "* ]] || fail "handshake-flood is not a reason code"
   # Exactly the three security codes, and no other code is one.
   local c
+  # One run per code: a command negated with ! never stops a test, so a loop
+  # of them would check only the last code.
+  local c n=0
   for c in $_EGRESS_REASON_CODES; do
+    run _egress_log_is_security_code "$c"
     case "$c" in
-      sni|handshake-flood|address) _egress_log_is_security_code "$c" ;;
-      *) ! _egress_log_is_security_code "$c" ;;
+      sni|handshake-flood|address) assert_success ;;
+      *) assert_failure ;;
     esac
+    n=$((n + 1))
   done
+  assert_equal "$n" 7
 }
 
 @test "egress ui: a reason code a newer gateway sends prints as itself" {
@@ -1366,11 +1372,11 @@ good.example.test
   run _plain "$output"
   assert_output --partial "Saved. Boxes on this machine will refuse to start until you switch engine or run"
   assert_output --partial "cleat egress off"
-  # A validated engine says a save applies at the next launch.
+  # A validated engine names itself. A save on it applies to running boxes at once.
   _EGE_ENGINE=""
   _egress_engine_kind() { printf desktop-macos; }
   run _egress_draw 0
-  assert_output --partial "Engine   validated, a save applies at the next launch: Docker Desktop"
+  assert_output --partial "Engine   validated: Docker Desktop"
 }
 
 # ── cleat egress status (9.3) ───────────────────────────────────────────────
@@ -2137,4 +2143,111 @@ deny_row() { printf '2026-09-28T14:31:0%sZ code=%s sub=%s origin=box host=%s por
   [ -n "$v" ]
   [ -n "$d" ]
   [ "$v" -lt "$d" ]
+}
+
+# ── Review fixes: what status, open and the editor say ─────────────────────
+
+@test "egress status: cleat status stays quiet for a caged box stopped normally and names an uncaged one" {
+  status_caged
+  is_running() { return 1; }
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "Egress:    strict"
+  refute_output --partial "gateway"
+  refute_output --partial "!"
+  # A box with no label under a policy has no cage, and says so.
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "x created without egress control, so it has no cage."
+  assert_output --partial "cleat rm && cleat"
+}
+
+@test "egress status: a box its own file turned off names that file and never the global remedies" {
+  status_caged
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/$CN"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  run _egress_status_render "$CN"
+  run _plain "$output"
+  assert_output --partial "Egress control is off for this box, by its own file"
+  assert_output --partial "Other boxes follow the global policy."
+  assert_output --partial "cleat egress main --inherit"
+  refute_output --partial "every box on this machine has today"
+  refute_output --partial "the Egress row, which opens the same editor"
+  _egress_engine_kind() { printf engine-linux; }
+  run _egress_status_render "$CN"
+  run _plain "$output"
+  assert_output --partial "This engine is not validated"
+}
+
+@test "egress open: --always and the config row refuse a box with the docker capability, and write nothing" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  cp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  run cmd_egress_open_always 1
+  assert_failure
+  assert_output --partial "the docker capability hands the box the Docker daemon"
+  run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  assert_success
+  run _egress_config_enable
+  assert_failure
+  assert_output --partial "the docker capability hands the box the Docker daemon"
+  run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  assert_success
+}
+
+@test "egress open: --always says the global policy is open and what a refused engine means" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  _egress_apply_now() { :; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  run cmd_egress_open_always 1
+  assert_success
+  run _plain "$output"
+  assert_output --partial "The global policy is open until you change it."
+  assert_output --partial "A box with a mode of its own keeps it."
+  refute_output --partial "Every box is open"
+  refute_output --partial "refuse to start until you switch engine"
+  _egress_engine_kind() { printf engine-linux; }
+  run cmd_egress_open_always 1
+  run _plain "$output"
+  assert_output --partial "Boxes on this machine will refuse to start until you switch engine or run cleat egress off."
+}
+
+@test "egress save: an off save on an unvalidated engine warns of no refusal" {
+  _EGRESS_ENFORCING=1
+  _egress_editor_engine() { _EGE_ENGINE=engine-linux; }
+  _daemon_up() { return 0; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _EGE_BOX=main
+  run _egress_save_consequence off
+  refute_output --partial "refuse to start"
+  run _egress_save_consequence strict
+  assert_output --partial "refuse to start"
+}
+
+@test "egress notices: the origin reader survives a byte a UTF-8 tr would refuse" {
+  # A tr that refuses a high byte outside the C locale, as BSD tr does in a
+  # UTF-8 one. A Latin-1 branch name in .git/config is enough to meet it.
+  mkdir -p "$TEST_TEMP/bsdtr" "$PROJECT/.git"
+  cat > "$TEST_TEMP/bsdtr/tr" <<'SH'
+#!/usr/bin/env bash
+if [ "${LC_ALL:-}" != C ]; then
+  if LC_ALL=C grep -q $'[\x80-\xff]'; then echo "tr: Illegal byte sequence" >&2; exit 1; fi
+fi
+exec /usr/bin/tr "$@"
+SH
+  chmod +x "$TEST_TEMP/bsdtr/tr"
+  printf '[branch "caf\xe9"]\n\tremote = origin\n[remote "origin"]\n\turl = git@github.com:o/r.git\n' > "$PROJECT/.git/config"
+  PATH="$TEST_TEMP/bsdtr:$PATH" LANG=en_US.UTF-8 run _egress_origin_is_ssh "$PROJECT"
+  assert_equal "$status" 0
+  refute_output --partial "Illegal byte"
 }

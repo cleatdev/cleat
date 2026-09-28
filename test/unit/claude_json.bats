@@ -183,7 +183,7 @@ teardown() { _common_teardown; }
 
   _build_project_claude_json "$OUT"
 
-  [[ -f "$OUT" ]]
+  assert [ -f "$OUT" ]
   run jq -e . "$OUT"
   assert_success
   # Even with no host/persisted state, the box is born onboarded + trusted.
@@ -232,7 +232,7 @@ teardown() { _common_teardown; }
   assert_output --partial "backed up to"
 
   # Backup created, original left exactly as-is (not reset to {}).
-  [[ -f "${HOST_JSON}.bak" ]]
+  assert [ -f "${HOST_JSON}.bak" ]
   run cat "$HOST_JSON"
   assert_output '{"oauthAccount": {'
 
@@ -269,7 +269,7 @@ teardown() { _common_teardown; }
   assert_success
   assert_output --partial "backed up to"
 
-  [[ -f "${HOST_JSON}.bak" ]]
+  assert [ -f "${HOST_JSON}.bak" ]
   # Output is a valid object that kept the persisted project state.
   run jq -e 'type=="object"' "$OUT"
   assert_success
@@ -286,7 +286,7 @@ teardown() { _common_teardown; }
 
   _build_project_claude_json "$OUT"
 
-  [[ -f "$OUT" ]]
+  assert [ -f "$OUT" ]
   run jq -r '.userID' "$OUT"
   assert_output "u1"
 }
@@ -305,7 +305,7 @@ teardown() { _common_teardown; }
 
   PATH="$nojq" run _build_project_claude_json "$OUT"
   assert_success
-  [[ -f "$OUT" ]]
+  assert [ -f "$OUT" ]
   run cat "$OUT"
   assert_output --partial '"userID"'
 }
@@ -337,7 +337,7 @@ teardown() { _common_teardown; }
   PATH="$nojq" run _build_project_claude_json "$OUT"
   assert_success
   assert_output --partial "backed up to"
-  [[ -f "${HOST_JSON}.bak" ]]
+  assert [ -f "${HOST_JSON}.bak" ]
   # The corrupt content must NOT have been copied into the mounted file.
   run cat "$OUT"
   refute_output --partial 'oauthAccount'

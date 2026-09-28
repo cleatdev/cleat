@@ -356,7 +356,7 @@ _pin_geom() { _term_rows() { echo "${1:-24}"; }; _term_cols() { echo "${2:-100}"
   assert_success
   local l
   for l in "${lines[@]}"; do
-    [[ "$l" == *"$(printf '\033')[K" ]]
+    [[ "$l" == *"$(printf '\033')[K" ]] || fail "a line does not end in an erase to end of line: $l"
   done
 }
 
@@ -1482,7 +1482,7 @@ _pass_gates() {
   # so asserting only "it did not crash" proves nothing: check the content.
   run _sessions_frame -3 -7 5 100 5
   assert_success
-  [[ "${lines[0]}" == *"row 0"* ]]
+  [[ "${lines[0]}" == *"row 0"* ]] || fail "the first line is not row 0: ${lines[0]}"
   run _sessions_frame "" "" "" "" ""
   assert_success
 }

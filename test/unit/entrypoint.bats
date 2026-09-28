@@ -275,16 +275,28 @@ SH
   chmod +x "$SHIM_DIR/bin/"*
 }
 
+# The supervisor leads a process group of its own (job control in the
+# subshell), so a stop ends its relay, its heartbeat loop and their sleeps with
+# it. Killing the supervisor alone left the loop beating after the test, and
+# once teardown deleted the stubs it ran the host's real socat.
 _shim_start() {
-  PATH="$SHIM_DIR/bin:$PATH" bash "$SHIM" </dev/null >/dev/null 2>&1 3>&- &
-  echo $! > "$SHIM_DIR/sup.pid"
+  ( set -m
+    PATH="$SHIM_DIR/bin:$PATH" bash "$SHIM" </dev/null >/dev/null 2>&1 3>&- &
+    echo $! > "$SHIM_DIR/sup.pid" )
 }
 
+# Ends the whole group and waits up to 3 s for it to be gone. A group still
+# alive then fails the test rather than leak into the next one.
 _shim_stop() {
-  local pid
+  local pid i=0
   pid="$(cat "$SHIM_DIR/sup.pid" 2>/dev/null)" || return 0
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  case "$pid" in ""|*[!0-9]*) return 0 ;; esac
+  kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  while kill -0 -- "-$pid" 2>/dev/null; do
+    [ "$i" -lt 30 ] || { echo "the shim's process group $pid outlived its stop"; return 1; }
+    sleep 0.1; i=$((i + 1))
+  done
+  return 0
 }
 
 # Runs the shim to its end in at most 3 s, rc in SHIM_RC. One still running
@@ -346,8 +358,8 @@ _shim_await() {
   _shim_start
   _shim_await "$SOCAT_LOG" '^beat'
   _shim_stop
-  # One beat or more, each the same bytes: compare the first.
-  run head -c 81 "$BEAT_LOG"
+  # One beat or more, each the same 79 bytes: compare the first.
+  run head -c 79 "$BEAT_LOG"
   assert_output "$(printf 'CONNECT cleat-gateway.invalid:443 HTTP/1.1\r\nHost: cleat-gateway.invalid:443\r\n\r\n')"
   run grep -ci 'selftest' "$BEAT_LOG"
   assert_output "0"

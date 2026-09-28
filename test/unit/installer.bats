@@ -76,7 +76,7 @@ teardown() { _common_teardown; }
   assert_output --partial "Linked"
 
   # Verify symlink exists and points to the right place
-  [[ -L "$FAKE_BIN/cleat" ]]
+  assert [ -L "$FAKE_BIN/cleat" ]
   local target
   target="$(readlink "$FAKE_BIN/cleat")"
   [[ "$target" == "$FAKE_REPO/bin/cleat" ]]

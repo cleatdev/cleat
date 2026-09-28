@@ -1107,7 +1107,7 @@ CURL
   assert_success
   local plain
   plain="$(printf '%s\n' "$output" | sed $'s/\033\\[[0-9;]*m//g')"
-  [[ "$plain" == *"session [box]"* ]]
+  [[ "$plain" == *"session [box]"* ]] || fail "the usage line has no session [box]"
   [[ "$plain" != *"sessions [box]"* ]]
 }
 
@@ -3553,6 +3553,19 @@ SH
   assert_output --partial "the ssh capability mounts your agent"
   run cmp "$XDG_CONFIG_HOME/cleat/config" "$TEST_TEMP/before"
   assert_success
+}
+
+@test "smoke: cleat ps survives a row removed between the listing and its inspect" {
+  # A teardown in another terminal removes a gateway between docker ps and
+  # the per-row inspect. Under set -e that inspect ended the whole list.
+  printf 'cleat-gw-0123456789ab\tUp 2 minutes\ncleat-demo-3f2a9104\tUp 2 minutes\n' > "$DOCKER_MOCK_DIR/ps_a_output"
+  # The combined inspect cmd_ps makes (the fixtures' T_PSMETA).
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}|{{.State.Running}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}'
+  mock_docker_inspect_field cleat-demo-3f2a9104 "$fmt" "ROLE=box|main|true|/Users/x/demo"
+  run cleat_bin ps < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "cleat-demo-3f2a9104"
 }
 
 @test "smoke: cleat egress review runs on the real binary" {

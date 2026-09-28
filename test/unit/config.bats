@@ -201,7 +201,7 @@ EOF
 git
 EOF
   resolve_caps "$TEST_TEMP/project"
-  [[ ${#ACTIVE_CAPS[@]} -eq 1 ]]
+  assert_equal "${#ACTIVE_CAPS[@]}" 1
   [[ "${ACTIVE_CAPS[0]}" == "git" ]]
 }
 
@@ -216,7 +216,7 @@ EOF
 env
 EOF
   resolve_caps "$TEST_TEMP/project"
-  [[ ${#ACTIVE_CAPS[@]} -eq 2 ]]
+  assert_equal "${#ACTIVE_CAPS[@]}" 2
   # Both git and env should be present
   local has_git=false has_env=false
   for cap in "${ACTIVE_CAPS[@]}"; do
@@ -245,7 +245,7 @@ EOF
 @test "resolve_caps: includes CLI --cap flags" {
   _CLI_CAPS=(git)
   resolve_caps "$TEST_TEMP/project"
-  [[ ${#ACTIVE_CAPS[@]} -eq 1 ]]
+  assert_equal "${#ACTIVE_CAPS[@]}" 1
   [[ "${ACTIVE_CAPS[0]}" == "git" ]]
 }
 
@@ -316,10 +316,10 @@ EOF
   assert_output --partial "unsafe-rm is accepted only from your global config or --cap"
   assert_output --partial "cleat config --enable unsafe-rm"
   refute_output --partial "unsafe-rm enabled"
-  [[ ! -e "$d/.cleat" ]]
+  assert [ ! -e "$d/.cleat" ]
   run cmd_config az --enable unsafe-rm
   assert_failure
-  [[ ! -e "$d/.cleat" ]]
+  assert [ ! -e "$d/.cleat" ]
   # The global config still takes it, and a project can still disable it.
   run cmd_config --enable unsafe-rm
   assert_success
@@ -384,7 +384,7 @@ EOF
   cd "$TEST_TEMP"
   run cmd_config --enable env
   assert_success
-  [[ -f "$TEST_TEMP/.cleat.env" ]]
+  assert [ -f "$TEST_TEMP/.cleat.env" ]
   run cat "$TEST_TEMP/.cleat.env"
   assert_output --partial "project environment variables"
   assert_output --partial "KEY=VALUE"
@@ -1478,9 +1478,11 @@ EOF
   [ "$(CLEAT_EGRESS_ALLOW_HOOKS=1 compute_config_fingerprint "$TEST_TEMP")" = "$a" ]
 }
 
-# v1.5.4's _resolve_config_drift, copied literally. For a box with egress off,
-# the shipped function prints exactly what this printed and makes exactly its
-# docker calls, on every exit.
+# v1.5.4's _resolve_config_drift, copied literally, over v1.5.4's fingerprint
+# (the fixture): for a box with egress off, the shipped function prints exactly
+# what this printed and makes exactly its docker calls, on every exit. With
+# today's fingerprint on both sides a change that moved every box would cancel.
+source "$BATS_TEST_DIRNAME/../fixtures/fingerprint_v154.bash"
 _drift_v154() {
   local cname="$1"
   local project="${2:-}"
@@ -1490,7 +1492,7 @@ _drift_v154() {
   local stored_hash current_hash
   stored_hash="$(_container_config_hash "$cname")"
   [[ "$stored_hash" == "v${_CONFIG_FP_VERSION}:"* ]] || return 0
-  current_hash="v${_CONFIG_FP_VERSION}:$(compute_config_fingerprint "$project")"
+  current_hash="v${_CONFIG_FP_VERSION}:$(_fp_v154 "$project")"
   [[ "$stored_hash" == "$current_hash" ]] && return 0
 
   if _is_tty; then
@@ -1518,7 +1520,7 @@ _drift_v154() {
 # terminal answered yes and no, a drift off a terminal. Fails naming the case.
 _drift_matches_v154() {                  # <cname>
   local fp stored tty ans new old cnew cold
-  fp="v2:$(compute_config_fingerprint "$TEST_TEMP")"
+  fp="v2:$(_fp_v154 "$TEST_TEMP")"
   for stored in "$fp" "v2:old"; do
     for tty in 0 1; do
       for ans in y n; do

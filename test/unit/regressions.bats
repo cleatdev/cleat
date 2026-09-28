@@ -9965,6 +9965,17 @@ _c19_star_project() {
   assert_failure
   run grep -n -- "--upstream-map" "$CLI"
   assert_failure
+  # And the run line the CLI actually sends carries neither.
+  mkdir -p "$TEST_TEMP/proj" "$CLEAT_CONFIG_DIR"
+  local box
+  box="$(container_name_for "$TEST_TEMP/proj")"
+  _egress_render_policy "$box" strict claude.ai
+  run _egress_gateway_run "$box" 501 20
+  assert_success
+  run grep "^docker run .*--label sh.cleat.role=gateway" "$DOCKER_CALLS"
+  assert_success
+  refute_output --partial "--resolver-fixture"
+  refute_output --partial "--upstream-map"
 }
 
 # A UTF-8 aware awk, the kind macOS ships: outside the C locale an octal escape
@@ -9973,6 +9984,9 @@ _c19_star_project() {
 # escape to the bytes of those characters and runs the real awk, which is what
 # that awk does. Under LC_ALL=C it runs the real awk untouched.
 _utf8_awk_on_path() {
+  # An LC_ALL inherited from the caller would make the stand-in pass straight
+  # through, and its self-check would then see no BOM survive.
+  unset LC_ALL
   REAL_AWK="$(command -v awk)"
   export REAL_AWK
   mkdir -p "$TEST_TEMP/utf8awk"
@@ -10040,14 +10054,14 @@ SH
   mkdir -p "$TEST_TEMP/gw" "$CLEAT_CONFIG_DIR"
   local box gw
   box="$(container_name_for "$TEST_TEMP/gw")"
-  [[ "$box" =~ ^cleat-gw-[0-9a-f]{8}$ ]]
+  assert_regex "$box" '^cleat-gw-[0-9a-f]{8}$'
   gw="$(_egress_gateway_name "$box")"
   [ "$gw" != "$box" ]
   _egress_render_policy "$box" strict claude.ai
   run _egress_gateway_run "$box" 501 20
   assert_success
   run bash -c 'grep "^docker run " "$1" | grep -o -- "--name [^ ]*"' _ "$DOCKER_CALLS"
-  [[ "$output" =~ ^--name\ cleat-gw-[0-9a-f]{12}$ ]]
+  assert_regex "$output" '^--name cleat-gw-[0-9a-f]{12}$'
   [ "$output" != "--name $box" ]
 }
 
@@ -10105,6 +10119,9 @@ _caged_run_setup() {
   # A box turned off on its own under a machine-wide policy has no policy. Its
   # fingerprint is the one it was created with, so no recreate prompt, and the
   # drift check reads nothing of egress from Docker.
+  # This file's setup stubs the drift check out for every other test, so the
+  # real one is sourced back here. Against the stub this test proved nothing.
+  source_cli
   ACTIVE_CAPS=(git)
   container_exists() { return 0; }
   is_running() { return 1; }
@@ -10114,7 +10131,10 @@ _caged_run_setup() {
   mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")" "$_EGRESS_BOXES_DIR"
   printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
   printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/$cn"
-  stored="v2:$(compute_config_fingerprint "$TEST_TEMP" "$cn")"
+  # The hash v1.5.4 stored, from a literal copy of its function: built from
+  # today's, a change that moved every box would cancel out.
+  source "$BATS_TEST_DIRNAME/../fixtures/fingerprint_v154.bash"
+  stored="v2:$(_fp_v154 "$TEST_TEMP")"
   eval "_container_config_hash() { echo '$stored'; }"
   run _resolve_config_drift "$cn" "$TEST_TEMP" <<< "y"
   assert_success
@@ -10440,6 +10460,41 @@ pack = npm"
   assert_success
 }
 
+@test "regression vNEXT: a bare [[ ]] check mid-test passed on bash 3.2 whatever it found" {
+  # Before bash 4.1 a failing [[ ]] or (( )) does not stop a test under
+  # errexit, no bash stops on a command negated with ! and none stops on the
+  # first check of an AND list. Forty-nine such checks sat mid-test, the macOS
+  # leg's only proof of the 12-hex gateway hash among them, and each passed
+  # there whatever it found.
+  local awkf="$BATS_TEST_DIRNAME/../fixtures/bare_check_midtest.awk"
+  run awk -f "$awkf" "$BATS_TEST_DIRNAME"/*.bats "$BATS_TEST_DIRNAME"/../integration/*.bats
+  assert_success
+  assert_output ""
+  # It flags a check followed by another statement, a negated command, a
+  # check inside a loop (only the last pass would count) and an AND list of
+  # checks, whose first check's failure no bash sees.
+  local f
+  printf '@test "a" {\n  [[ x == y ]]\n  echo more\n}\n' > "$TEST_TEMP/b1.bats"
+  printf '@test "a" {\n  ! grep -q x f\n  echo more\n}\n' > "$TEST_TEMP/b2.bats"
+  printf '@test "a" {\n  for c in 1 2; do\n    [[ $c == 1 ]]\n  done\n}\n' > "$TEST_TEMP/b3.bats"
+  printf '@test "a" {\n  (( 1 > 2 ))\n  echo more\n}\n' > "$TEST_TEMP/b4.bats"
+  printf '@test "a" {\n  [ x = y ] && [ a = a ]\n  echo more\n}\n' > "$TEST_TEMP/b5.bats"
+  for f in b1 b2 b3 b4 b5; do
+    run awk -f "$awkf" "$TEST_TEMP/$f.bats"
+    assert_failure
+    assert_output --partial "$TEST_TEMP/$f.bats:"
+  done
+  # And stays quiet on a check that decides: the test's last statement, one
+  # joined to a fail, a mock's return value and a conditional command.
+  printf '@test "a" {\n  echo x\n  [[ x == x ]]\n}\n' > "$TEST_TEMP/q1.bats"
+  printf '@test "a" {\n  [[ x == x ]] || fail "no"\n  echo more\n}\n' > "$TEST_TEMP/q2.bats"
+  printf '@test "a" {\n  f() {\n    [[ -n x ]]\n  }\n  run f\n}\n' > "$TEST_TEMP/q3.bats"
+  printf '@test "a" {\n  [ -f x ] && rm x\n  echo more\n}\n' > "$TEST_TEMP/q4.bats"
+  run awk -f "$awkf" "$TEST_TEMP/q1.bats" "$TEST_TEMP/q2.bats" "$TEST_TEMP/q3.bats" "$TEST_TEMP/q4.bats"
+  assert_success
+  assert_output ""
+}
+
 @test "regression vNEXT: cleat egress review died on a broken pipe" {
   # The held-host lookup piped the catalogue into an awk that exited at its
   # first match. The catalogue's printf then wrote to a closed pipe and, under
@@ -10522,4 +10577,24 @@ cleat-site-preview" "name=^${cn}(-[a-z0-9_.-]+)?$"
   assert_output "1"
   run grep -cF -- "--filter name=^${cn}(-[a-z0-9_.-]+)?\$" "$DOCKER_CALLS"
   assert_output "1"
+}
+
+@test "regression vNEXT: cleat egress status died when the gateway uptime read failed" {
+  # The daemon can drop between the health read and the uptime read. Under
+  # the binary's strict mode that unguarded read ended status at its first
+  # row, with a blank screen. Sourced with strict mode on, as the binary runs.
+  run bash -c '
+    source "$1" || exit 9
+    _run_bounded() { shift; "$@"; }
+    docker() {
+      case "$*" in
+        ps*"{{.Status}}"*) echo "Cannot connect to the Docker daemon" >&2; return 1 ;;
+        inspect*RestartCount*) printf "0|false|img\n" ;;
+      esac
+    }
+    _egress_status_gateway_row cleat-demo-3f2a9104 cleat-gw-0123456789ab healthy
+    echo SURVIVED' _ "$CLI"
+  assert_success
+  assert_output --partial "Gateway healthy"
+  assert_output --partial "SURVIVED"
 }

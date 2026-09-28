@@ -665,6 +665,49 @@ _default_launch() {
   run cmd_start "$TEST_TEMP/project"
 }
 
+# Creates the box in this shell, so the caps and env keys cmd_run resolved are
+# still set, and prints the hash v1.5.4 would have stored for them.
+_create_and_v154_hash() {
+  _host_clip_cmd() { echo ""; }
+  check_for_update() { true; }
+  check_drift() { true; }
+  _resolve_config_drift() { true; }
+  cmd_start "$TEST_TEMP/project" >/dev/null 2>&1 || return 1
+  printf 'v2:%s caps=%s\n' "$(_fp_v154 "$TEST_TEMP/project")" "${ACTIVE_CAPS[*]:-}"
+}
+
+@test "egress default: a box with no policy is created with the config hash v1.5.4 gave it" {
+  # Against a literal copy of v1.5.4's function, never today's: an oracle that
+  # calls today's function cancels out a change that moves every box, which is
+  # the change that puts a recreate prompt in front of every box after an
+  # upgrade.
+  source "$BATS_TEST_DIRNAME/../fixtures/fingerprint_v154.bash"
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  local conf want n=0
+  for conf in "" $'[egress]\nmode = off\n' "enforcing-off"; do
+    : > "$DOCKER_CALLS"
+    _EGRESS_ENFORCING=1
+    case "$conf" in
+      "") printf '[caps]\ngit\n' > "$CONF" ;;
+      enforcing-off)
+        printf '[caps]\ngit\n[egress]\nmode = strict\nallow = a.example\n' > "$CONF"
+        _EGRESS_ENFORCING=0 ;;
+      *) printf '[caps]\ngit\n%s' "$conf" > "$CONF" ;;
+    esac
+    run _create_and_v154_hash
+    assert_success
+    # The caps were read, so the hash covers more than an empty config.
+    assert_output --partial " caps=git"
+    want="${output%% *}"
+    run docker_run_line_for "$CN"
+    assert_success
+    assert_output --partial "--label sh.cleat.config-hash=$want "
+    n=$((n + 1))
+  done
+  assert_equal "$n" 3
+}
+
 @test "egress default: no egress section means the box is created with a normal network" {
   rm -f "$CONF"
   [ ! -e "$_EGRESS_BOXES_DIR/$CN" ]
@@ -682,9 +725,9 @@ _default_launch() {
   assert_output --partial "Egress:     off  ·  full network egress"
   refute_output --partial "saved, not enforced"
   # Then the negatives.
-  [[ "$runline" != *"--network"* ]]
-  [[ "$runline" != *"--volumes-from"* ]]
-  [[ "$runline" != *"cleat-gw-"* ]]
+  [[ "$runline" != *"--network"* ]] || fail "the uncaged run line has --network"
+  [[ "$runline" != *"--volumes-from"* ]] || fail "the uncaged run line has --volumes-from"
+  [[ "$runline" != *"cleat-gw-"* ]] || fail "the uncaged run line names a gateway"
   run grep -E '^docker (run|create) .*cleat-gw-' "$DOCKER_CALLS"
   assert_failure
   run grep -E '^docker volume create' "$DOCKER_CALLS"
@@ -699,7 +742,7 @@ _default_launch() {
   # mount, no gateway exec or copy, no rendered policy on the host.
   local no
   for no in --cap-drop sh.cleat.egress-hash sh.cleat.egress-engine sh.cleat.role /run/cleat-egress; do
-    [[ "$runline" != *"$no"* ]]
+    [[ "$runline" != *"$no"* ]] || fail "the uncaged run line has $no"
   done
   run grep -E '^docker exec .*cleat-gw-' "$DOCKER_CALLS"
   assert_failure

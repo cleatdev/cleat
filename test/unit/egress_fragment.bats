@@ -304,3 +304,20 @@ refresh $CN"
   run _setup_trust_prompt "$TEST_TEMP/project" "echo hi" 1 <<< "n"
   assert_output --partial "in the box as coder (full network access)"
 }
+
+@test "egress fragment: the setup prompt promises the policy's network only where the box will be caged" {
+  policy 'mode = strict\n'
+  # A validated engine and nothing that refuses: the policy's network.
+  run _setup_trust_prompt "$TEST_TEMP/project" "echo hi" 1 <<< "n"
+  assert_output --partial "(network limited to this box's egress policy)"
+  # An engine that refuses every caged create: the create would refuse, so
+  # after cleat egress off the approved payload runs with full network.
+  _egress_engine_kind() { printf engine-linux; }
+  run _setup_trust_prompt "$TEST_TEMP/project" "echo hi" 1 <<< "n"
+  assert_output --partial "(full network access)"
+  # A capability the interlock refuses: the same.
+  _egress_engine_kind() { printf desktop-macos; }
+  _egress_interlocks() { return 1; }
+  run _setup_trust_prompt "$TEST_TEMP/project" "echo hi" 1 <<< "n"
+  assert_output --partial "(full network access)"
+}

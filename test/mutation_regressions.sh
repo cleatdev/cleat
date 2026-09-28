@@ -95,6 +95,7 @@ CLIP_SHIM="$REPO_ROOT/docker/clip"
 EGRESS_SHIM="$REPO_ROOT/docker/cleat-egress-shim"
 TEST_SH="$REPO_ROOT/test.sh"
 MOCK_DOCKER="$REPO_ROOT/test/fixtures/mock_bin/docker"
+EGRESS_INT_TEARDOWN="$REPO_ROOT/test/lib/egress_int_teardown.bash"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
 INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
 ENTRYPOINT_BACKUP="/tmp/cleat-regression-mutation-entrypoint-backup-$$"
@@ -106,6 +107,7 @@ TEST_SH_BACKUP="/tmp/cleat-regression-mutation-testsh-backup-$$"
 INT_LIFECYCLE_BACKUP="/tmp/cleat-regression-mutation-intlifecycle-backup-$$"
 SETUP_BASH_BACKUP="/tmp/cleat-regression-mutation-setupbash-backup-$$"
 MOCK_DOCKER_BACKUP="/tmp/cleat-regression-mutation-mockdocker-backup-$$"
+EGRESS_INT_TEARDOWN_BACKUP="/tmp/cleat-regression-mutation-egressintteardown-backup-$$"
 
 BOLD=$'\033[1m'
 RED=$'\033[0;31m'
@@ -115,7 +117,7 @@ DIM=$'\033[2m'
 RESET=$'\033[0m'
 
 # Mutual exclusion, taken BEFORE the backups and BEFORE the cleanup trap. Both
-# of those WRITE the eleven tracked files this lock exists to protect, so a run
+# of those WRITE the twelve tracked files this lock exists to protect, so a run
 # that is correctly refused must not have reached them.
 _CLEAT_TEST_LOCK_ROOT="$REPO_ROOT"
 # Optional sharding for CI, the same shape test.sh uses: MUTATION_SHARD_TOTAL=N
@@ -156,6 +158,7 @@ _restore_targets() {
   [[ -f "$INT_LIFECYCLE_BACKUP" ]] && cp "$INT_LIFECYCLE_BACKUP" "$INT_LIFECYCLE_BATS"
   [[ -f "$SETUP_BASH_BACKUP" ]] && cp "$SETUP_BASH_BACKUP" "$SETUP_BASH"
   [[ -f "$MOCK_DOCKER_BACKUP" ]] && cp "$MOCK_DOCKER_BACKUP" "$MOCK_DOCKER"
+  [[ -f "$EGRESS_INT_TEARDOWN_BACKUP" ]] && cp "$EGRESS_INT_TEARDOWN_BACKUP" "$EGRESS_INT_TEARDOWN"
   return 0
 }
 
@@ -163,7 +166,7 @@ cleanup() {
   _restore_targets
   rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP" \
         "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$EGRESS_SHIM_BACKUP" "$TEST_SH_BACKUP" \
-        "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP" "$MOCK_DOCKER_BACKUP"
+        "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP" "$MOCK_DOCKER_BACKUP" "$EGRESS_INT_TEARDOWN_BACKUP"
 }
 # A signal only exits, and the EXIT trap does the restoring, exactly once. A
 # trap that ran cleanup on INT or TERM without exiting sent bash back into the
@@ -184,11 +187,12 @@ cp "$TEST_SH" "$TEST_SH_BACKUP"
 cp "$INT_LIFECYCLE_BATS" "$INT_LIFECYCLE_BACKUP"
 cp "$SETUP_BASH" "$SETUP_BASH_BACKUP"
 cp "$MOCK_DOCKER" "$MOCK_DOCKER_BACKUP"
+cp "$EGRESS_INT_TEARDOWN" "$EGRESS_INT_TEARDOWN_BACKUP"
 filter="${1:-}"
 
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
-# Target file defaults to $CLI; pass another of the eleven tracked targets
+# Target file defaults to $CLI; pass another of the twelve tracked targets
 # ($INSTALLER, $SETUP_BASH, $MOCK_DOCKER, ...) to mutate a companion file. A
 # path with no backup is refused rather than mutated, because nothing could
 # restore it. Returns 0 if mutation caught, 1 if missed, 2 if skipped.
@@ -214,6 +218,8 @@ run_mutation() {
     backup="$SETUP_BASH_BACKUP"
   elif [[ "$target" == "$MOCK_DOCKER" ]]; then
     backup="$MOCK_DOCKER_BACKUP"
+  elif [[ "$target" == "$EGRESS_INT_TEARDOWN" ]]; then
+    backup="$EGRESS_INT_TEARDOWN_BACKUP"
   elif [[ "$target" == "$CLI" ]]; then
     backup="$BACKUP"
   else
@@ -14691,8 +14697,12 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_gateway_hash_width" "the gateway hash is twelve hex characters" "$CLI" "$EGRESS_GATEWAY_BATS"
 
+# The fix is the width: at 8 hex a gateway name has a box name's shape. A
+# prefix swap would also end the collision, so it cannot stand for the revert.
 cat > "$SED_TMP" << 'SED'
-s|cleat-gw-%s|cleat-egress-%s|
+/^_egress_box_hash()/,/^}$/{
+  s@[$]{_h:0:12}@${_h:0:8}@
+}
 SED
 try "vnext_egress_gateway_name_namespace" "the gateway name collided with a box" "$CLI"
 
@@ -15033,7 +15043,7 @@ try "vnext_egress_start_never_recreates" "a missing gateway refuses cleat start 
 # Gateways are never boxes (8.8, 8.9).
 cat > "$SED_TMP" << 'SED'
 /^cmd_ps()/,/^}$/{
-  /sh.cleat.role/d
+  s/in ""|box) ;; \*) continue ;; esac/in ""|box) ;; *) ;; esac/
 }
 SED
 try "vnext_ps_excludes_gateway" "cleat ps showed a gateway as a box" "$CLI"
@@ -15142,6 +15152,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_security_codes_closed" "the sni subcode list is closed at six" "$CLI" "$EGRESS_UI_BATS"
 
+# A code that is not a security code must say so: the loop once negated each
+# check with !, which never fails a test, so widening the list went unseen.
+cat > "$SED_TMP" << 'SED'
+/^_egress_log_is_security_code()/,/^}$/{
+  s@^  case "[$]1" in sni|handshake-flood|address) return 0 ;; esac@  case "$1" in sni|handshake-flood|address|policy) return 0 ;; esac@
+}
+SED
+try "vnext_egress_security_codes_not_widened" "the sni subcode list is closed at six" "$CLI" "$EGRESS_UI_BATS"
+
 cat > "$SED_TMP" << 'SED'
 /^cmd_egress()/,/^}$/{
   s@^      --refused) \[\[ "[$]sub" == log \]\] || @      --refused) true || @
@@ -15180,14 +15199,14 @@ try "vnext_egress_denials_offset_past_end" "an offset past the end of the file r
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_denials_rows()/,/^}$/{
-  s@^      if (\$0 !~ /^\[0-9\]\[0-9\]\[0-9\]\[0-9\]-\[0-9\]\[0-9\]-\[0-9\]\[0-9\]T\[0-9\]\[0-9\]:\[0-9\]\[0-9\]:\[0-9\]\[0-9\]Z /) next$@      :@
+  s@^      if (\$0 !~ /^\[0-9\]\[0-9\]\[0-9\]\[0-9\]-\[0-9\]\[0-9\]-\[0-9\]\[0-9\]T\[0-9\]\[0-9\]:\[0-9\]\[0-9\]:\[0-9\]\[0-9\]Z /) next$@      x = 0@
 }
 SED
 try "vnext_egress_denials_stamp_first" "a line with no leading timestamp is skipped" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_denials_rows()/,/^}$/{
-  s@^      if (gsub(/\[^a-z0-9.:_?-\]/, "?", h)) t = 1$@      :@
+  s@^      if (gsub(/\[^a-z0-9.:_?-\]/, "?", h)) t = 1$@      x = 0@
 }
 SED
 try "vnext_egress_denials_host_sanitised" "a row with a replaced byte renders as truncated" "$CLI" "$EGRESS_GATEWAY_BATS"
@@ -15213,6 +15232,58 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_claim_void_row" "the hooks escape prints a claim void row in status" "$CLI" "$EGRESS_UI_BATS"
+
+# The same removal, against the regression that records the gap.
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  /_egress_claim_void_line/d
+}
+SED
+try "vnext_egress_claim_void_regression" "the hooks escape voided the claim everywhere except the screen" "$CLI"
+
+# The gateway's two harness seams on a shipped run line.
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_run()/,/^}$/{
+  s@^    "[$]_GATEWAY_IMAGE" >/dev/null 2>@    "$_GATEWAY_IMAGE" --resolver-fixture /x >/dev/null 2>@
+}
+SED
+try "vnext_egress_gateway_no_resolver_seam" "the gateway resolver test seam never reaches a shipped run line" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_gateway_run()/,/^}$/{
+  s@^    "[$]_GATEWAY_IMAGE" >/dev/null 2>@    "$_GATEWAY_IMAGE" --upstream-map /x >/dev/null 2>@
+}
+SED
+try "vnext_egress_gateway_no_upstream_seam" "the gateway resolver test seam never reaches a shipped run line" "$CLI"
+
+# The integration teardown touches Docker only for a name with a box's shape,
+# and removes only that project's own boxes from what the listing returns.
+cat > "$SED_TMP" << 'SED'
+/^eg_int_teardown_boxes()/,/^}$/{
+  s@^    [*]) return 0 ;;$@    *) ;;@
+}
+SED
+try "vnext_egress_int_teardown_shape_guard" "the egress integration teardown matched every container" "$EGRESS_INT_TEARDOWN"
+
+cat > "$SED_TMP" << 'SED'
+/^eg_int_teardown_boxes()/,/^}$/{
+  /case "[$]n" in "[$]cn"|"[$]cn"-[*]) ;; [*]) continue ;; esac/d
+}
+SED
+try "vnext_egress_int_teardown_own_boxes" "the egress integration teardown matched every container" "$EGRESS_INT_TEARDOWN"
+
+# A fingerprint line outside the live-enforcement gate moves every box's hash,
+# so every existing box meets a recreate prompt after the upgrade. Each oracle
+# holds today's function to a literal copy of v1.5.4's, never to itself.
+cat > "$SED_TMP" << 'SED'
+/^compute_config_fingerprint()/,/^}$/{
+  /^  if \[\[ "[$]{_EGRESS_FP_CAGED:-0}" == 1 \]\]; then$/i\
+  fingerprint_input+="egress:none"$'\\n'
+}
+SED
+try "vnext_egress_fp_v154_regression" "adding egress changed config drift for boxes with no policy" "$CLI"
+try "vnext_egress_fp_v154_drift" "with egress off the drift advisory is byte-identical" "$CLI" "$CONFIG_BATS"
+try "vnext_egress_fp_v154_create" "a box with no policy is created with the config hash" "$CLI" "$EGRESS_CONFIG_BATS"
 
 cat > "$SED_TMP" << 'SED'
 s@_ACCOUNT_BOX_DIR="/home/coder/.cleat-auth"@_ACCOUNT_BOX_DIR="/home/coder/.cleat-elsewhere"@
@@ -16114,7 +16185,7 @@ try "vnext_egress_report_truncated" "a truncated host is never looked up" "$CLI"
 
 cat > "$SED_TMP" << 'SED'
 /^_maybe_report_egress_denials()/,/^}$/{
-  s|        on++|        :|
+  s|        on++|        x = 0|
 }
 SED
 try "vnext_egress_report_ports" "port refusals are counted on their own line" "$CLI" "$EGRESS_UI_BATS"
@@ -16270,6 +16341,130 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_config_drift_downgrade_no_dir" "left to the gate even with no rendered policy here" "$CLI" "$CONFIG_BATS"
+
+# ── Review fixes: the pin ──
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_source()/,/^}$/{
+  s@^    printf '%s' "\$_g"$@    printf '%s' "$_pf"@
+}
+SED
+try "vnext_egress_pin_source_inherits" "own file never releases what the machine" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s@^  if \[ "\$_src" != "\$_pf" \]; then@  if false; then@
+}
+SED
+try "vnext_egress_pin_seed_copies" "own file never releases what the machine" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s@^  if \[ "\$_EG_PIN_NOTE_CN" != "\$1" \]; then@  if true; then@
+}
+SED
+try "vnext_egress_pin_note_kept" "first gate saw survives its second gate" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_pin_launch()/,/^}$/{
+  s@^  if \[ -n "\$_EG_PIN_DIFF" \]; then _EG_PIN_LAUNCH_DIFF="\$_EG_PIN_DIFF"; fi@  _EG_PIN_LAUNCH_DIFF="$_EG_PIN_DIFF"@
+}
+SED
+try "vnext_egress_pin_diff_kept" "first gate saw survives its second gate" "$CLI" "$EGRESS_CATALOGUE_BATS"
+
+# ── Review fixes: what status, open, the editor and the prompts say ──
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_summary_row()/,/^}$/{
+  /if \[ "\$state" = stopped \] && ! is_running "\$1"; then return 0; fi/d
+}
+SED
+try "vnext_egress_status_row_stopped_quiet" "stays quiet for a caged box stopped normally" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_summary_row()/,/^}$/{
+  s@^  if \[ "\$_EG_LABEL_SET" != 1 \]; then@  if false; then@
+}
+SED
+try "vnext_egress_status_row_uncaged" "stays quiet for a caged box stopped normally" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  s@^      elif \[ "\$_EG_WHY" = perbox \]; then@      elif false; then@
+}
+SED
+try "vnext_egress_status_perbox_off" "its own file turned off names that file" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_open_always()/,/^}$/{
+  /_egress_writer_interlock open || return 1/d
+}
+SED
+try "vnext_egress_open_always_interlock" "always and the config row refuse a box with the docker capability" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_config_enable()/,/^}$/{
+  /_egress_writer_interlock strict || return 1/d
+}
+SED
+try "vnext_egress_config_enable_interlock" "always and the config row refuse a box with the docker capability" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_open_always()/,/^}$/{
+  s@The global policy is open until you change it.@Every box is open until you change it.@
+}
+SED
+try "vnext_egress_open_always_wording" "always says the global policy is open" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_egress_open_always()/,/^}$/{
+  s@if _daemon_up && ! _egress_engine_validated "\$(_egress_engine_kind)"; then@if false; then@
+}
+SED
+try "vnext_egress_open_always_engine" "always says the global policy is open" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_consequence()/,/^}$/{
+  s@if \[ "\$(_egress_effective_mode "\$1")" != off \] && @if @
+}
+SED
+try "vnext_egress_save_off_no_refusal" "an off save on an unvalidated engine warns of no refusal" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_verdict()/,/^}$/{
+  s@'Engine   validated: %s'@'Engine   validated, a save applies at the next launch: %s'@
+}
+SED
+try "vnext_egress_editor_verdict_now" "the editor still opens on a refused engine" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_origin_is_ssh()/,/^}$/{
+  s@ | LC_ALL=C tr '\\200-\\377' '?')@)@
+  s@_hdr="\$(printf '%s' "\$_line" | LC_ALL=C tr -d@_hdr="$(printf '%s' "$_line" | tr -d@
+}
+SED
+try "vnext_egress_origin_c_locale" "the origin reader survives a byte a UTF-8 tr would refuse" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_setup_trust_prompt()/,/^}$/{
+  s@ && _egress_setup_will_cage "\$_pcn" "\${_res%%\$'\\n'\*}"@@
+}
+SED
+try "vnext_egress_setup_prompt_will_cage" "network only where the box will be caged" "$CLI" "$EGRESS_FRAGMENT_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_ps()/,/^}$/{
+  s@{{end}}{{end}}' 2>/dev/null)" || continue@{{end}}{{end}}' 2>/dev/null)"@
+}
+SED
+try "vnext_ps_vanished_row" "cleat ps survives a row removed between the listing and its inspect" "$CLI" "$SMOKE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_gateway_row()/,/^}$/{
+  s@ 2>/dev/null | head -n 1)" || ups=""@ 2>/dev/null | head -n 1)"@
+}
+SED
+try "vnext_egress_status_uptime_guard" "cleat egress status died when the gateway uptime read failed"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

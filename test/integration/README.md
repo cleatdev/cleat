@@ -32,9 +32,25 @@ Every test starts with a `skip_if_no_docker` check. On machines without Docker
 ```
 test/integration/
   run.sh           is the runner script (invokes bats on *.bats files)
+  accounts.bats    covers named Claude logins against a real box
+  egress.bats      covers egress control: the refusal on an engine that is not validated,
+                   and the ten cases of EGRESS-SPEC.md 11.7 on one that is
+  handoff.bats     covers the live account handoff
+  image.bats       covers the built image itself
   lifecycle.bats   covers the full container lifecycle: build → start → shell → stop → rm
-  env.bats         covers env passthrough: .cleat.env vars visible in cleat shell
+  provision.bats   covers [setup] provisioning
 ```
+
+`egress.bats` reads the engine kind and the shipped `_EGRESS_ENFORCING` from
+`bin/cleat` and never patches it. Every CI leg reads an engine that is not
+validated, so there it asserts the refusal. Its full cases run on Docker
+Desktop for macOS, from the Mac itself. A CI step pins the kind it expects with
+`CLEAT_INT_EXPECT_ENGINE`, and the file fails when the kind it reads differs.
+
+Run from inside a Cleat box against the host's Docker, set `TMPDIR` to the
+checkout's gitignored `.egress-scratch/` first, so every path the CLI binds
+exists on the Docker host too. These files build the `cleat` image, which
+replaces the host's own.
 
 ## Running locally
 

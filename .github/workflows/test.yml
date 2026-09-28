@@ -334,6 +334,10 @@ jobs:
       - name: Verify docker available
         run: docker version
       - name: Run integration suite
+        # egress.bats fails when the engine kind it reads differs, so a runner
+        # that drifts fails here instead of quietly taking another branch.
+        env:
+          CLEAT_INT_EXPECT_ENGINE: engine-linux
         run: ./test/integration/run.sh
 
 
@@ -377,6 +381,8 @@ jobs:
       - name: Verify docker available
         run: docker version
       - name: Run integration suite (builds and runs the arm64 cleat image)
+        env:
+          CLEAT_INT_EXPECT_ENGINE: engine-linux
         run: ./test/integration/run.sh
 
   # ── Windows + WSL2 (Ubuntu) ─────────────────────────────────────────────────
@@ -553,6 +559,7 @@ jobs:
           # Colima's forwarded socket explicitly so cleat's engine-aware docker
           # cap resolves + binds it regardless of the test's HOME.
           export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+          export CLEAT_INT_EXPECT_ENGINE=vm-backend
           rc=0; ./test/integration/run.sh > "$RUNNER_TEMP/integration.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/integration.log"; : > "$RUNNER_TEMP/integration.printed"; exit "$rc"
         timeout-minutes: 45
@@ -669,6 +676,8 @@ jobs:
       # Cleat's own entry point. run.sh self-skips if the daemon is unreachable,
       # so a bring-up that half-failed degrades to a skip rather than a false red.
       - name: Run integration suite against the rootless daemon
+        env:
+          CLEAT_INT_EXPECT_ENGINE: rootless
         run: |
           rc=0; ./test/integration/run.sh > "$RUNNER_TEMP/integration-rootless.log" 2>&1 < /dev/null || rc=$?
           cat "$RUNNER_TEMP/integration-rootless.log"; exit "$rc"

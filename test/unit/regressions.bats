@@ -10369,3 +10369,40 @@ pack = npm"
   refute_output --partial "host.docker.internal"
   refute_output --partial "git over ssh"
 }
+
+@test "regression vNEXT: the session end report re-reported denials from an earlier session" {
+  # The log outlives a session. A report that read it from the top named two
+  # denials the user had already seen, and counted them again.
+  mock_egress_caged_launch
+  CN=cleat-proj-12345678
+  egress_box_names
+  caged_box
+  local old new
+  old='2026-09-28T09:00:00Z code=policy sub=- origin=box host=old1.example port=443 trunc=0\n2026-09-28T09:00:01Z code=policy sub=- origin=box host=old2.example port=443 trunc=0\n'
+  new='2026-09-28T10:00:00Z code=policy sub=- origin=box host=new.example port=443 trunc=0\n'
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW"
+  printf '%b' "$old$new" > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+  mock_gw_admin log-state "ok log-state 1 0"
+  run _maybe_report_egress_denials "$CN" 1 "$(printf '%b' "$old" | wc -c | tr -d ' ')"
+  run _plain "$output"
+  assert_output --partial "! 1 destination was denied by egress policy this session"
+  assert_output --partial "new.example"
+  refute_output --partial "old1.example"
+}
+
+@test "regression vNEXT: the session end report went silent after the denial log wrapped" {
+  # The gateway caps the log and truncates it in place, moving its
+  # generation. The mark's offset then points past or into rows written since,
+  # so the report reads the whole new generation, never nothing.
+  mock_egress_caged_launch
+  CN=cleat-proj-12345678
+  egress_box_names
+  caged_box
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW"
+  printf '2026-09-28T10:00:00Z code=policy sub=- origin=box host=after.example port=443 trunc=0\n' > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+  mock_gw_admin log-state "ok log-state 2 90"
+  run _maybe_report_egress_denials "$CN" 1 40
+  run _plain "$output"
+  assert_output --partial "! 1 destination was denied by egress policy this session"
+  assert_output --partial "after.example"
+}

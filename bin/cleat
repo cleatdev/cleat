@@ -17311,6 +17311,15 @@ exec_claude() {
   # relaunch (EGRESS-SPEC.md 5.7).
   _egress_require "$cname" claude || exit 1
   _egress_proxy_env_add
+  # The session-end egress report reads the denials appended from here on
+  # (9.5), the way the browser report reads from $_proxy_log_off.
+  local _ec_eg_on=0 _ec_eg_gen="" _ec_eg_off=0
+  if [ "$_EG_CAGED" = 1 ]; then
+    _ec_eg_on=1
+    _egress_denials_mark "$cname"
+    _ec_eg_gen="$_EG_MARK_GEN"
+    _ec_eg_off="$_EG_MARK_OFF"
+  fi
 
   _CLIP_DIR="$CLEAT_RUN_DIR/${cname}/clip"
   _CLIP_WATCHER_PID=""
@@ -17818,6 +17827,14 @@ exec_claude() {
     boxstopped) _handoff_say T-boxstopped ;;
   esac
 
+  # The egress report first among the session-end reports (9.5): a denied
+  # destination outranks everything below it. A switch or a cancel ran no
+  # session, so there is nothing to report.
+  case "$_ec_note" in
+    switching|cancelled) ;;
+    *) if [ "$_ec_eg_on" = 1 ]; then _maybe_report_egress_denials "$cname" "$_ec_eg_gen" "$_ec_eg_off"; fi ;;
+  esac
+
   # The harvest that could not take the account lock. After the reclaim above,
   # for the same reason as the fork advisory below: printed before it, its last
   # line sat directly above the cursor and the reclaim erased it.
@@ -18094,6 +18111,118 @@ _maybe_report_capped_images() {
     warn "Did not paste ${BOLD}${n}${RESET} images into the box ${DIM}(rate cap: ${_CLIPIMG_RATE_PER_MIN} a minute)${RESET}"
   fi
   echo -e "    ${DIM}Each paste reads your host clipboard, so the box cannot ask faster than that. Paste again after a minute.${RESET}"
+  return 0
+}
+
+# ── The session-end egress report (9.5) ──
+# Printed first among the session-end reports, only for a launch that passed
+# the gate caged under live enforcement. It reads through the one reader of
+# the denial log: a copy out of the gateway, the byte window from the mark
+# the session took before it started, the validated rows. Every number is a
+# count taken here, every value is sanitised again before it reaches the
+# terminal, and a refused handshake is a security event, never a host to
+# allow. The claim-void line prints even when nothing was denied. Silent
+# otherwise when there is nothing to say, and when the mark is missing,
+# because a window without its start would re-report earlier sessions.
+_EGRESS_REPORT_MAX=3
+_maybe_report_egress_denials() {         # <cname> <mark_gen> <mark_off>
+  local cname="$1" mark_gen="$2" mark_off="$3" gw copy off rows sum k a b
+  local sec_n=0 sec_sni=1 pol_n=0 port_n=0 srows="" prows="" pairs="" h t p w line shown
+  gw="$(_egress_gateway_name "$cname")"
+  copy="$CLEAT_RUN_DIR/$cname/egress/denials.log"
+  if [ "$(_egress_claim_void "$cname")" = void ]; then
+    echo ""
+    _egress_claim_void_line "$cname"
+  fi
+  [ -n "$mark_gen" ] || return 0
+  _egress_denials_copy "$cname" || return 0
+  off="$(_egress_denials_window "$gw" "$mark_gen:$mark_off" "$copy")"
+  rows="$(_egress_denials_rows "$copy" "$off")"
+  [ -n "$rows" ] || return 0
+  sum="$(printf '%s\n' "$rows" | LC_ALL=C awk -v max="$_EGRESS_REPORT_MAX" '
+    {
+      c = substr($2, 6); h = substr($5, 6); tr = substr($7, 7)
+      if (c == "sni" || c == "handshake-flood" || c == "address") {
+        sn++
+        if (c != "sni") mixed = 1
+        if (sn <= max) print "S", h, substr($1, 12, 8)
+      } else if (c == "policy") {
+        if (!(h in seen)) { seen[h] = 1; pn++; if (pn <= max) print "P", h, tr }
+      } else if (c == "port") {
+        on++
+      }
+    }
+    END { printf "SN %d %d\nPN %d\nON %d\n", sn, mixed ? 0 : 1, pn, on }')"
+  while IFS=' ' read -r k a b; do
+    case "$k" in
+      S) srows+="$a $b"$'\n' ;;
+      P) prows+="$a $b"$'\n' ;;
+      SN) sec_n="$a"; sec_sni="$b" ;;
+      PN) pol_n="$a" ;;
+      ON) port_n="$a" ;;
+    esac
+  done <<EOF
+$sum
+EOF
+  case "$sec_n$pol_n$port_n" in *[!0-9]*) return 0 ;; esac
+  if [ "$sec_n" -gt 0 ]; then
+    echo ""
+    if [ "$sec_sni" = 1 ]; then w="because the handshake did not match the tunnel"; else w="by the gateway's own checks, not your policy"; fi
+    if [ "$sec_n" -eq 1 ]; then error "1 connection was refused ${w}"; else error "${sec_n} connections were refused ${w}"; fi
+    shown=0
+    while IFS=' ' read -r h t; do
+      [ -n "$h" ] || continue
+      printf '      %-44s %s\n' "$(_sanitize_repo_str "$h")" "$(_sanitize_repo_str "$t")"
+      shown=$((shown + 1))
+    done <<EOF
+$srows
+EOF
+    if [ "$sec_n" -gt "$shown" ]; then echo "      and $((sec_n - shown)) more"; fi
+    echo -e "      ${DIM}Your policy did not cause this.${RESET}       ${BOLD}cleat egress log --refused${RESET}"
+  fi
+  if [ "$pol_n" -gt 0 ] || [ "$port_n" -gt 0 ]; then
+    echo ""
+    if [ "$pol_n" -eq 1 ]; then
+      warn "1 destination was denied by egress policy this session"
+    elif [ "$pol_n" -gt 1 ]; then
+      warn "${pol_n} destinations were denied by egress policy this session"
+    elif [ "$port_n" -eq 1 ]; then
+      warn "1 connection on a port other than 443 was refused this session"
+    else
+      warn "${port_n} connections on a port other than 443 were refused this session"
+    fi
+    # The shown hosts, grouped by the pack that carries each: the one lookup
+    # per shown host, never per row.
+    while IFS=' ' read -r h t; do
+      [ -n "$h" ] || continue
+      h="$(_sanitize_repo_str "$h")"
+      if [ "$t" = 1 ]; then
+        pairs+="~$h"$'\t'"$h (truncated)"$'\n'
+      else
+        p="$(_egress_host_pack "$h")"
+        pairs+="${p:-~$h}"$'\t'"$h"$'\n'
+      fi
+    done <<EOF
+$prows
+EOF
+    while IFS=$'\t' read -r p line; do
+      [ -n "$p" ] || continue
+      case "$p" in
+        "~"*) printf '      %-44s %s\n' "$line" "no pack      unaudited" ;;
+        *) printf '      %-44s %s\n' "$line" "pack $p   $(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")" ;;
+      esac
+    done <<EOF
+$(printf '%s' "$pairs" | LC_ALL=C awk -F'\t' '$1 != "" { if ($1 in v) v[$1] = v[$1] ", " $2; else { v[$1] = $2; k[++n] = $1 } } END { for (i = 1; i <= n; i++) print k[i] "\t" v[k[i]] }')
+EOF
+    if [ "$pol_n" -gt "$_EGRESS_REPORT_MAX" ]; then echo "      and $((pol_n - _EGRESS_REPORT_MAX)) more"; fi
+    if [ "$pol_n" -gt 0 ] && [ "$port_n" -eq 1 ]; then
+      echo "      1 connection on a port other than 443 was refused."
+    elif [ "$pol_n" -gt 0 ] && [ "$port_n" -gt 1 ]; then
+      echo "      ${port_n} connections on a port other than 443 were refused."
+    fi
+    echo ""
+    echo -e "    ${BOLD}cleat egress log${RESET}     ${DIM}every denial with timestamps${RESET}"
+  fi
   return 0
 }
 

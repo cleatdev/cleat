@@ -16049,6 +16049,91 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_perbox_never_rm" "a box with its own egress file is never told to cleat rm" "$CLI" "$EGRESS_REQUIRE_BATS"
 
+# ── S24: the session-end egress report (9.5) ──
+
+# stage three: the session end report must use the byte window
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  s|"[$]mark_gen:[$]mark_off"|"$mark_gen:0"|
+}
+SED
+try "vnext_egress_report_byte_window" "the session end report re-reported denials from an earlier session"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_denials_window()/,/^}$/{
+  s@^  \[ "[$]_gen" = "[$]_mark_gen" \] || { printf 0; return 0; }@  :@
+}
+SED
+try "vnext_egress_report_wrapped" "the session end report went silent after the denial log wrapped"
+
+cat > "$SED_TMP" << 'SED'
+s|^_EGRESS_REPORT_MAX=3$|_EGRESS_REPORT_MAX=5|
+SED
+try "vnext_egress_report_max" "shows at most three denied hosts and counts the rest" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  s|if (!(h in seen)) { seen\[h\] = 1; pn++;|{ pn++;|
+}
+SED
+try "vnext_egress_report_counts_hosts" "shows at most three denied hosts and counts the rest" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  s@if (c == "sni" || c == "handshake-flood" || c == "address") {@if (0) {@
+}
+SED
+try "vnext_egress_report_security_apart" "a refused handshake is reported separately" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  s|if \[ "\$(_egress_claim_void "\$cname")" = void \]; then|if false; then|
+}
+SED
+try "vnext_egress_report_claim_void" "the hooks escape prints the claim void line with nothing else to report" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  s@\[ -n "\$mark_gen" \] || return 0@:@
+}
+SED
+try "vnext_egress_report_no_mark" "silent with nothing to say or no mark" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  s|if \[ "\$t" = 1 \]; then|if false; then|
+}
+SED
+try "vnext_egress_report_truncated" "a truncated host is never looked up" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  s|        on++|        :|
+}
+SED
+try "vnext_egress_report_ports" "port refusals are counted on their own line" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s|then _maybe_report_egress_denials "\$cname"|then : _maybe_report_egress_denials "$cname"|
+}
+SED
+try "vnext_egress_report_called" "the egress report prints before the browser reports" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s|^    _egress_denials_mark "\$cname"$|    :|
+}
+SED
+try "vnext_egress_report_marked" "the egress report prints before the browser reports" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s|  if \[ "\$_EG_CAGED" = 1 \]; then|  if true; then|
+}
+SED
+try "vnext_egress_report_caged_only" "the session end report is silent with no policy" "$CLI" "$EGRESS_GATEWAY_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

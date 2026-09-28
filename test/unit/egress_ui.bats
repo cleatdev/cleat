@@ -1995,3 +1995,127 @@ plain() { run _plain "$output"; }
   refute_output --partial "claim void"
   refute_output --partial "! hooks"
 }
+
+# ── The session-end egress report (9.5) ─────────────────────────────────────
+
+# A caged box whose gateway's denial log holds <rows>, and the log-state the
+# gateway answers now.
+report_box() {                           # <rows> [state]
+  status_caged
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW"
+  printf '%b' "${1:-}" > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+  mock_gw_admin log-state "ok log-state ${2:-1 0}"
+}
+deny_row() { printf '2026-09-28T14:31:0%sZ code=%s sub=%s origin=box host=%s port=%s trunc=0\\n' "$1" "$2" "${4:--}" "$3" "${5:-443}"; }
+
+@test "egress report: the session end report reads only the bytes appended during the session" {
+  local before
+  before="$(deny_row 1 policy old1.example)$(deny_row 2 policy old2.example)"
+  report_box "$before$(deny_row 3 policy sentry.io)"
+  local off
+  off="$(printf '%b' "$before" | wc -c | tr -d ' ')"
+  run _maybe_report_egress_denials "$CN" 1 "$off"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "! 1 destination was denied by egress policy this session"
+  assert_output --partial "sentry.io"
+  refute_output --partial "old1.example"
+  refute_output --partial "old2.example"
+}
+
+@test "egress report: the session end report shows at most three denied hosts and counts the rest" {
+  report_box "$(deny_row 1 policy registry.npmjs.org)$(deny_row 2 policy registry.yarnpkg.com)$(deny_row 3 policy sentry.io)$(deny_row 4 policy four.example)$(deny_row 5 policy five.example)$(deny_row 6 policy sentry.io)"
+  run _maybe_report_egress_denials "$CN" 1 0
+  assert_success
+  run _plain "$output"
+  # Five distinct hosts, counted here, never read from the log.
+  assert_output --partial "! 5 destinations were denied by egress policy this session"
+  assert_output --regexp "registry\.npmjs\.org, registry\.yarnpkg\.com +pack npm   contained"
+  assert_output --regexp "sentry\.io +no pack      unaudited"
+  refute_output --partial "four.example"
+  assert_output --partial "      and 2 more"
+  assert_output --partial "cleat egress log     every denial with timestamps"
+  # fix is a later release: no remedy names a verb that does not exist.
+  refute_output --partial "cleat egress fix"
+}
+
+@test "egress report: a refused handshake is reported separately and is never offered as a fix" {
+  report_box "$(deny_row 7 sni raw.pastebin.example sni-mismatch)$(deny_row 8 policy sentry.io)"
+  run _maybe_report_egress_denials "$CN" 1 0
+  assert_success
+  run _plain "$output"
+  assert_output --partial "✖ 1 connection was refused because the handshake did not match the tunnel"
+  assert_output --regexp "raw\.pastebin\.example +14:31:07"
+  assert_output --partial "Your policy did not cause this.       cleat egress log --refused"
+  assert_output --partial "! 1 destination was denied by egress policy this session"
+  # The refused host is never in the policy list and never beside allow.
+  run bash -c 'printf "%s\n" "$1" | sed -n "/destination/,\$p"' _ "$(_plain "$output")"
+  refute_output --partial "raw.pastebin.example"
+  run _maybe_report_egress_denials "$CN" 1 0
+  refute_output --partial "allow"
+  # Anything but sni is the gateway's own checks.
+  report_box "$(deny_row 1 address internal.example)$(deny_row 2 sni a.example sni-mismatch)"
+  run _maybe_report_egress_denials "$CN" 1 0
+  run _plain "$output"
+  assert_output --partial "✖ 2 connections were refused by the gateway's own checks, not your policy"
+  refute_output --partial "destination"
+}
+
+@test "egress report: port refusals are counted on their own line" {
+  report_box "$(deny_row 1 port a.example - 80)$(deny_row 2 port b.example - 22)"
+  run _maybe_report_egress_denials "$CN" 1 0
+  run _plain "$output"
+  assert_output --partial "! 2 connections on a port other than 443 were refused this session"
+  report_box "$(deny_row 1 policy sentry.io)$(deny_row 2 port a.example - 80)"
+  run _maybe_report_egress_denials "$CN" 1 0
+  run _plain "$output"
+  assert_output --partial "! 1 destination was denied by egress policy this session"
+  assert_output --partial "      1 connection on a port other than 443 was refused."
+}
+
+@test "egress report: a truncated host is never looked up and says so" {
+  report_box '2026-09-28T14:31:01Z code=policy sub=- origin=box host=registry.npmjs.org port=443 trunc=1\n'
+  _egress_host_pack() { echo "looked up" >> "$TEST_TEMP/lookups"; }
+  run _maybe_report_egress_denials "$CN" 1 0
+  run _plain "$output"
+  assert_output --regexp "registry\.npmjs\.org \(truncated\) +no pack"
+  [ ! -f "$TEST_TEMP/lookups" ]
+}
+
+@test "egress report: the session end report is silent with nothing to say or no mark" {
+  report_box ""
+  : > "$DOCKER_CALLS"
+  run _maybe_report_egress_denials "$CN" 1 0
+  assert_success
+  assert_output ""
+  # No mark: a window without its start would re-report earlier sessions.
+  report_box "$(deny_row 1 policy sentry.io)"
+  : > "$DOCKER_CALLS"
+  run _maybe_report_egress_denials "$CN" "" 0
+  assert_output ""
+  run grep -c "^docker cp" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress report: the hooks escape prints the claim void line with nothing else to report" {
+  report_box ""
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HOOKS=1 caged_box
+  run _maybe_report_egress_denials "$CN" 1 0
+  assert_success
+  run _plain "$output"
+  assert_output --partial "! The claim is void for this box"
+  refute_output --partial "destination"
+  # And first, above anything denied.
+  report_box "$(deny_row 1 policy sentry.io)"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HOOKS=1 caged_box
+  run _maybe_report_egress_denials "$CN" 1 0
+  run _plain "$output"
+  local v d
+  v="$(printf '%s\n' "$output" | grep -n "claim is void" | cut -d: -f1)"
+  d="$(printf '%s\n' "$output" | grep -n "destination was denied" | cut -d: -f1)"
+  [ -n "$v" ]
+  [ -n "$d" ]
+  [ "$v" -lt "$d" ]
+}

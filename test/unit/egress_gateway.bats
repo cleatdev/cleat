@@ -711,6 +711,59 @@ proxy_env_on() {                         # <cname>
   proxy_env_on "$CN"
 }
 
+# The session appends to both logs while it runs: a denial in the gateway's
+# log and a blocked browser open in the bridge's.
+session_appends() {
+  local proxy="$CLEAT_RUN_DIR/$CN/bridge/proxy-log"
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW" "${proxy%/*}"
+  : > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+  mock_gw_admin log-state "ok log-state 1 0"
+  cat > "$TEST_TEMP/sessexec.sh" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" claude "*)
+    printf '2026-09-28T14:31:07Z code=policy sub=- origin=box host=sentry.io port=443 trunc=0\n' >> "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+    printf '[browser-watcher 10:00:00] %s origin=x.example url=https://x.example/\n' "$_BROWSER_BLOCKED_MARK" >> "$proxy" ;;
+esac
+exec "$TEST_TEMP/gwexec.sh" "\$@"
+SH
+  chmod +x "$TEST_TEMP/sessexec.sh"
+  export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/sessexec.sh"
+}
+
+@test "egress report: the egress report prints before the browser reports" {
+  caged_running
+  session_appends
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run _plain "$output"
+  local ended egress blocked
+  ended="$(printf '%s\n' "$output" | grep -n "Session ended" | head -1 | cut -d: -f1)"
+  egress="$(printf '%s\n' "$output" | grep -n "destination was denied by egress policy" | head -1 | cut -d: -f1)"
+  blocked="$(printf '%s\n' "$output" | grep -n "Blocked" | head -1 | cut -d: -f1)"
+  [ -n "$ended" ]
+  [ -n "$egress" ]
+  [ -n "$blocked" ]
+  [ "$ended" -lt "$egress" ]
+  [ "$egress" -lt "$blocked" ]
+}
+
+@test "egress report: the session end report is silent with no policy" {
+  caged_running
+  session_appends
+  # No policy, and a box created without one.
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  : > "$DOCKER_CALLS"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  refute_output --partial "denied by egress policy"
+  run grep -c "^docker cp" "$DOCKER_CALLS"
+  assert_output "0"
+  run grep -c "gw-admin log-state" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
 @test "egress gateway: cleat shell and cleat login into a caged box carry the proxy environment" {
   caged_running
   run cmd_shell "$TEST_TEMP/project"

@@ -10422,6 +10422,22 @@ pack = npm"
   run awk -f "$BATS_TEST_DIRNAME/../fixtures/case_in_subst.awk" "$CLI"
   assert_success
   assert_output ""
+  # The guard finds the substitution the way bash 3.2 does, so it catches the
+  # forms a line-based check misses: one line, a nested $( ) before the case,
+  # and an inner substitution closed first. Each fails on a real bash 3.2.
+  local f
+  printf 'x="$(case "$1" in a) echo A ;; esac)"\n' > "$TEST_TEMP/c1"
+  printf 'out="$(g "$(h)"\n  case "$m" in a) exit 1 ;; esac\n  printf x)"\n' > "$TEST_TEMP/c2"
+  printf 'out="$(\n  y="$(h)"\n  case "$m" in\n    a) exit 1 ;;\n  esac\n  printf x)"\n' > "$TEST_TEMP/c3"
+  for f in c1 c2 c3; do
+    run awk -f "$BATS_TEST_DIRNAME/../fixtures/case_in_subst.awk" "$TEST_TEMP/$f"
+    assert_failure
+  done
+  # And stays quiet on what 3.2 parses: a case outside any substitution, the
+  # word inside quotes, and a heredoc body.
+  printf 'case "$m" in a) x="$(h)" ;; esac\ny="$(echo "no case here")"\ncat <<EOF\n$(case)\nEOF\n' > "$TEST_TEMP/c4"
+  run awk -f "$BATS_TEST_DIRNAME/../fixtures/case_in_subst.awk" "$TEST_TEMP/c4"
+  assert_success
 }
 
 @test "regression vNEXT: cleat egress review died on a broken pipe" {

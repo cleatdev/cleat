@@ -1508,7 +1508,7 @@ plain_status() { run cmd_egress status; run _plain "$output"; }
   mkdir -p "$_EGRESS_BOXES_DIR"
   printf '[egress]\nallow = docs.example.test\n' > "$_EGRESS_BOXES_DIR/$CN"
   plain_status
-  assert_output --partial "Drop the flag and recreate to restore it:  cleat, then accept the recreate"
+  assert_output --partial "Drop the flag and recreate to restore it:  cleat start on a terminal, then accept the recreate"
 }
 
 @test "egress status: a box without the hooks escape prints no claim void row" {
@@ -1919,18 +1919,19 @@ plain() { run _plain "$output"; }
   _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf 'cleat-a-11111111\ncleat-b-22222222\ncleat-c-33333333\ncleat-gw-0123456789ab\n' > "$DOCKER_MOCK_DIR/ps_a_output"
-  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}'
-  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a"
-  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b"
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}'
+  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a|main"
+  # A named box's row names that box, whatever box this verb is for.
+  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b|api"
   # A box already caged, and a gateway, are not in the list.
-  mock_docker_inspect_field cleat-c-33333333 "$fmt" "|HASH|/work/c"
-  mock_docker_inspect_field cleat-gw-0123456789ab "$fmt" "ROLE=gateway||"
+  mock_docker_inspect_field cleat-c-33333333 "$fmt" "|HASH|/work/c|main"
+  mock_docker_inspect_field cleat-gw-0123456789ab "$fmt" "ROLE=gateway|||"
   _egress_editor_load ""
   run _egress_save_screen 1
   run _plain "$output"
   assert_output --partial "2 boxes were created without egress control. Each refuses to start"
   assert_output --partial "cleat-a-11111111   cleat rm && cleat   /work/a"
-  assert_output --partial "cleat-b-22222222   cleat rm && cleat   /work/b"
+  assert_output --partial "cleat-b-22222222   cleat rm api && cleat start api   /work/b"
   refute_output --partial "cleat-c-33333333"
   refute_output --partial "cleat-gw-0123456789ab"
   refute_output --partial "Applies"

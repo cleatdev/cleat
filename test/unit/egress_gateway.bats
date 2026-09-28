@@ -1000,7 +1000,93 @@ stopped_caged() {
   assert_output ""
 }
 
+@test "egress: cleat resume refuses a box made before its policy while it is still stopped" {
+  stopped_caged
+  F_HASH="" caged_box
+  run cmd_resume "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "created before its egress policy"
+  run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress: an unvalidated engine refuses a stopped caged box before it starts" {
+  stopped_caged
+  caged_box
+  _egress_engine_kind() { printf 'engine-linux'; }
+  local v
+  for v in cmd_start cmd_resume; do
+    : > "$DOCKER_CALLS"
+    run "$v" "$TEST_TEMP/project"
+    assert_failure
+    assert_output --partial "not validated on this Docker engine"
+    run grep -cE "^docker start " "$DOCKER_CALLS"
+    assert_output "0"
+  done
+}
+
+@test "egress: a stopped box whose shape is wrong is refused before it starts" {
+  stopped_caged
+  F_NETMODE=bridge F_NETS="bridge " caged_box
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "Egress refused box"
+  run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress: a gateway that kept running takes the saved policy before its box starts" {
+  stopped_caged
+  local want
+  want="$(current_digest)"
+  F_DIGEST_SEQ="v1:0000000000000000 $want" caged_box
+  is_running() { [ "$1" = "$GW" ]; }
+  run cmd_start "$TEST_TEMP/project"
+  local reload start
+  reload="$(grep -n "gw-admin reload" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  start="$(grep -n "^docker start $CN\$" "$DOCKER_CALLS" | head -1 | cut -d: -f1)"
+  [ -n "$reload" ]
+  [ -n "$start" ]
+  [ "$reload" -lt "$start" ]
+  # A gateway that does not take it refuses the start, and the box stays down.
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/gwadmin"
+  use_gw_admin_stub
+  F_DIGEST_SEQ="v1:0000000000000000" caged_box
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "enforcing a different policy"
+  run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress: a box this start brought up and the gate refuses is stopped again" {
+  stopped_caged
+  caged_box
+  _egress_require() { return 1; }
+  local v
+  for v in cmd_start cmd_resume; do
+    : > "$DOCKER_CALLS"
+    run "$v" "$TEST_TEMP/project"
+    assert_failure
+    run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
+    assert_output "1"
+    run grep -c "^docker stop $CN\$" "$DOCKER_CALLS"
+    assert_output "1"
+
+  done
+  # A box that was already running is never stopped by a refusal.
+  is_running() { return 0; }
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  run grep -c "^docker stop $CN\$" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
 @test "egress: cleat start leaves a box that never had a gateway to check one" {
+  # Refused while still stopped: started first, it would run on the network
+  # it was made with until something stopped it.
   stopped_caged
   F_HASH="" caged_box
   container_exists() { [ "$1" != "$GW" ]; }
@@ -1009,7 +1095,7 @@ stopped_caged() {
   assert_output --partial "created before its egress policy"
   refute_output --partial "cleat egress restart"
   run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
-  assert_output "1"
+  assert_output "0"
   run grep -c "^docker start cleat-gw-" "$DOCKER_CALLS"
   assert_output "0"
 }
@@ -1449,7 +1535,7 @@ reload_box() {
   run cmd_egress reload
   assert_success
   run _plain "$output"
-  assert_output --partial "Box main is stopped. Its gateway reads the policy when it starts."
+  assert_output --partial "Box main is stopped. Its gateway takes the saved policy before the box next starts."
   run grep -c "gw-admin reload" "$DOCKER_CALLS"
   assert_output "0"
 }

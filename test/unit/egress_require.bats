@@ -442,12 +442,83 @@ offer_box() {
   run _egress_require "$CN" start
   assert_failure
   run _plain "$output"
-  assert_output --partial "cleat start on a terminal offers the recreate and keeps this box's own egress file"
+  assert_output --partial "cleat start on a terminal, then accept the recreate"
   refute_output --partial "cleat rm"
   rm -f "$_EGRESS_BOXES_DIR/$CN"
   run _egress_require "$CN" start
   run _plain "$output"
   assert_output --partial "cleat rm && cleat recreates it under the policy"
+}
+
+@test "egress require: every recreate remedy names this box and never cleat rm for one with its own file" {
+  local row
+  # A named box: a bare cleat rm would remove main.
+  _BOX=api
+  for row in hash netmode; do
+    rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+    case "$row" in
+      hash) F_HASH="LABEL=v1:0000000000000000" caged_box ;;
+      netmode) F_NETMODE=bridge F_NETS="bridge " caged_box ;;
+    esac
+    run _egress_require "$CN" shell
+    assert_failure
+    run _plain "$output"
+    assert_output --partial "cleat rm api && cleat start api"
+    refute_output --partial "cleat rm && cleat"
+  done
+  # A box with its own egress file: cleat rm would delete it.
+  _BOX=main
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nmode = strict\n' > "$_EGRESS_BOXES_DIR/$CN"
+  for row in hash netmode hooks; do
+    rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+    case "$row" in
+      hash) F_HASH="LABEL=v1:0000000000000000" caged_box ;;
+      netmode) F_NETMODE=bridge F_NETS="bridge " caged_box ;;
+      hooks) F_HOOKS=1 caged_box ;;
+    esac
+    run _egress_require "$CN" shell
+    assert_failure
+    run _plain "$output"
+    assert_output --partial "cleat start on a terminal, then accept the recreate"
+    refute_output --partial "cleat rm"
+  done
+}
+
+@test "egress require: a box whose shape is wrong is offered the recreate from start on a terminal" {
+  offer_box
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+  F_NETMODE=bridge F_NETS="bridge " caged_box
+  local rc=0
+  _egress_require "$CN" start <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 0
+  run cat "$TEST_TEMP/out"
+  assert_output --partial "its network mode is not none."
+  assert_output --partial "[Y/n]"
+  run cat "$TEST_TEMP/recreated"
+  assert_output "run $TEST_TEMP/project"
+}
+
+@test "egress require: the cage-on drift prompt names the policy and its decline keeps the box's own file" {
+  container_exists() { return 0; }
+  _container_config_hash() { echo "v${_CONFIG_FP_VERSION}:old"; }
+  _is_tty() { return 0; }
+  F_HASH="" caged_box
+  run _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< "n"
+  assert_output --partial "it has no egress cage, and your egress policy needs one"
+  run _plain "$output"
+  assert_output --partial "Run cleat rm && cleat when ready."
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\ndeny = example.com\n' > "$_EGRESS_BOXES_DIR/$CN"
+  run _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< "n"
+  run _plain "$output"
+  assert_output --partial "Recreate when ready: cleat start on a terminal, then accept the recreate"
+  refute_output --partial "cleat rm"
+  # Off a terminal, the same remedy.
+  _is_tty() { return 1; }
+  run _resolve_config_drift "$CN" "$TEST_TEMP/project"
+  run _plain "$output"
+  assert_output --partial "Recreate to apply: cleat start on a terminal, then accept the recreate"
 }
 
 @test "egress require: a launch that drops the hooks escape a box was created with names the flag" {

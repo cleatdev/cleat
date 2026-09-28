@@ -6768,16 +6768,23 @@ _resolve_config_drift() {
   [[ "$stored_hash" == "$current_hash" ]] && return 0
   # A caged box whose policy no longer resolves drifts too, and the default-yes
   # recreate below would bring it back with a normal network, unasked. Leave it
-  # to the gate, which refuses it and names cleat egress off (5.6). Only a box
-  # with a rendered policy on this host is read, so an off machine gains no
-  # docker call here.
-  if [ "$_EGRESS_FP_CAGED" = 0 ] && [ -d "$(_egress_policy_dir "$cname")" ] \
+  # to the gate, which refuses it and names cleat egress off (5.6). The label
+  # is read on a terminal, where that recreate is offered, or where a rendered
+  # policy says the box was caged here, so an off machine off a terminal gains
+  # no docker call.
+  if [ "$_EGRESS_FP_CAGED" = 0 ] && { _is_tty || [ -d "$(_egress_policy_dir "$cname")" ]; } \
      && _egress_label_read "$cname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then
     return 0
   fi
+  # A box made before its policy meets this prompt once, and its recreate is
+  # the one that cages it (ruling 1). It says so rather than blaming the caps.
+  local _why="its capabilities, environment, or resource limits differ from your current setup"
+  if [ "$_EGRESS_FP_CAGED" = 1 ] && _egress_label_read "$cname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" != 1 ]; then
+    _why="it has no egress cage, and your egress policy needs one"
+  fi
 
   if _is_tty; then
-    info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created: its capabilities, environment, or resource limits differ from your current setup"
+    info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created: ${_why}"
     local yn=""
     _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
     if [[ -z "$yn" || "$yn" == [yY]* ]]; then
@@ -6791,12 +6798,18 @@ _resolve_config_drift() {
       success "Removed ${BOLD}${cname}${RESET}."
       return 0
     fi
-    info "Skipped. Keeping existing container. Run ${BOLD}cleat rm && cleat${RESET} when ready."
+    # The remedy names this box, and never cleat rm for one with its own
+    # egress file, which cleat rm would delete.
+    if [ -e "$_EGRESS_BOXES_DIR/$cname" ] || [ -L "$_EGRESS_BOXES_DIR/$cname" ]; then
+      info "Skipped. Keeping existing container. Recreate when ready: $(_egress_recreate_words "$cname")"
+    else
+      info "Skipped. Keeping existing container. Run $(_egress_recreate_words "$cname") when ready."
+    fi
     _CONFIG_DRIFT_DECLINED=1
     return 0
   fi
 
-  info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created. Recreate to apply: ${BOLD}cleat rm && cleat${RESET}"
+  info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created. Recreate to apply: $(_egress_recreate_words "$cname")"
 }
 
 # Image-content drift: the local image's baked content spec is OLDER than the
@@ -10592,12 +10605,10 @@ _egress_pin_key_word() {                 # <class key>
 }
 
 # ── The gate (5.7): _egress_require and the facts it reads ─────────────────
-# Stage two ships the whole gate with _EGRESS_ENFORCING at 0, so a saved policy
-# refuses no launch: right after the daemon probe it returns 0 whenever a
-# policy resolves. egress_require.bats sets the constant to 1, so every
-# assertion below is tested and mutation-checked before a gateway exists to
-# hide behind. Every docker read here is bounded: a wedged daemon must not
-# hang a launch inside the gate.
+# Enforcement ships on (_EGRESS_ENFORCING=1). With it at 0 a saved policy
+# refuses no launch: right after the daemon probe the gate returns 0 whenever
+# a policy resolves, which is the fail-open lever. Every docker read here is
+# bounded: a wedged daemon must not hang a launch inside the gate.
 
 # The gateway, its socket volume and its rendered policy derive from the BOX's
 # container name, never the project path, so a fork or a second box never
@@ -11098,13 +11109,25 @@ EOF
 # otherwise make as a root-owned directory. A box with no egress label is not
 # this function's to judge: the gate refuses it once it is up. Prints its own
 # refusal. Called guarded, so every step is checked by hand.
-_egress_start_gateway() {                # <cname>
-  local cname="$1" gw
+_egress_start_gateway() {                # <cname> [verb]
+  local cname="$1" verb="${2:-start}" gw _ws
   [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  _EG_VERB="$verb"
   _egress_resolve "$cname"
   case "$_EG_MODE" in strict|open) ;; *) return 0 ;; esac
-  _egress_label_read "$cname" sh.cleat.egress-hash || return 0
-  [ "$_EG_LABEL_SET" = 1 ] || return 0
+  # Every refusal a stopped box can answer comes before its docker start. A
+  # box started first and refused after would be left running on whatever
+  # network it was made with. The gate asks them again once it is up. Row
+  # three's recreate offer is made here too, from start and resume.
+  _ws="${_RESOLVED_PROJECT:-}"
+  if _box_is_fork "$cname" 2>/dev/null; then _ws="$(_fork_dir "$cname")"; fi
+  _egress_precreate_check "$cname" "$_ws" "$_EG_MODE" || return 1
+  _egress_create_drift "$cname" "$verb" || return 1
+  _egress_box_shape "$cname" || return 1
+  if ! _egress_label_read "$cname" sh.cleat.egress-engine || [ "$_EG_LABEL" != "$_EG_ENGINE_KIND" ]; then
+    _egress_recreate_refuse engine "$cname" "it was created on another Docker engine than the one answering now." \
+      "switch back to that engine, or " " to recreate it here" || return 1
+  fi
   gw="$(_egress_gateway_name "$cname")"
   if ! container_exists "$gw"; then
     _egress_refuse gateway "its gateway is missing, so it has no egress at all." "${BOLD}cleat egress restart${RESET}"
@@ -11126,7 +11149,18 @@ _egress_start_gateway() {                # <cname>
     _egress_refuse gateway "its gateway did not become healthy." "${BOLD}cleat egress restart${RESET}"
     return 1
   fi
+  # A gateway that kept running while its box was stopped still holds the
+  # policy it loaded then. It takes the saved one before the box starts.
+  _egress_live_ok "$cname" "$_EG_MODE" "$_EG_HOSTS" || return 1
   return 0
+}
+
+# A gate refusal after this invocation started a stopped box: it is stopped
+# again, with its gateway, so a refused box is never left running.
+_egress_unstart() {                      # <cname>
+  docker stop "$1" >/dev/null 2>&1 || true
+  _egress_stop "$1"
+  echo -e "    ${DIM}Stopped it again. It stays stopped until the refusal above is fixed.${RESET}"
 }
 
 # One label of a container through the marker template, so an unreadable
@@ -11597,23 +11631,14 @@ _egress_create_drift() {                 # <cname> [verb]
       "check that Docker is healthy, then re-run cleat"
     return 1
   fi
+  if [ -n "${2:-}" ]; then _EG_VERB="$2"; fi
   if [ "$_EG_LABEL_SET" != 1 ]; then
-    # cleat rm forgets a box's own egress file, so it is never the remedy
-    # for a box that has one.
-    if [ -e "$_EGRESS_BOXES_DIR/$_cname" ] || [ -L "$_EGRESS_BOXES_DIR/$_cname" ]; then
-      _egress_refuse policy "it was created before its egress policy, so it has no cage." \
-        "${BOLD}cleat start${RESET} on a terminal offers the recreate and keeps this box's own egress file"
-    else
-      _egress_refuse policy "it was created before its egress policy, so it has no cage." \
-        "${BOLD}cleat rm && cleat${RESET} recreates it under the policy"
-    fi
-    _egress_recreate_offer "$_cname" "${2:-}"
+    _egress_recreate_refuse policy "$_cname" "it was created before its egress policy, so it has no cage." "" " recreates it under the policy"
     return $?
   fi
   if [ "${_EG_LABEL%%:*}" != "v$_EGRESS_HASH_VERSION" ]; then
-    _egress_refuse policy "it was created by a cleat that recorded its egress facts in another format, so they cannot be checked." \
-      "${BOLD}cleat rm && cleat${RESET} recreates it under the policy"
-    return 1
+    _egress_recreate_refuse policy "$_cname" "it was created by a cleat that recorded its egress facts in another format, so they cannot be checked." "" " recreates it under the policy"
+    return $?
   fi
   _cd="$(_egress_capdrop_canon "$_EGRESS_BOX_CAPDROP")"
   _hooks="$(_egress_hooks_fact)"
@@ -11622,17 +11647,16 @@ _egress_create_drift() {                 # <cname> [verb]
   if [ "$_hooks" = 1 ]; then _other=0; else _other=1; fi
   if [ "$_EG_LABEL" = "$(_egress_create_digest "$_cname" none "$_cd" "$_other")" ]; then
     if [ "$_hooks" = 1 ]; then
-      _egress_refuse policy "it was created without CLEAT_EGRESS_ALLOW_HOOKS=1 and this launch sets it." \
-        "unset ${BOLD}CLEAT_EGRESS_ALLOW_HOOKS${RESET}, or ${BOLD}cleat rm && cleat${RESET} with it set to recreate the box"
+      _egress_recreate_refuse policy "$_cname" "it was created without CLEAT_EGRESS_ALLOW_HOOKS=1 and this launch sets it." \
+        "unset ${BOLD}CLEAT_EGRESS_ALLOW_HOOKS${RESET}, or " " with it set to recreate the box"
     else
-      _egress_refuse policy "it was created with CLEAT_EGRESS_ALLOW_HOOKS=1 and the hooks capability, and this launch does not have both." \
-        "set ${BOLD}CLEAT_EGRESS_ALLOW_HOOKS=1${RESET} with the hooks capability, or ${BOLD}cleat rm && cleat${RESET} to recreate the box without it"
+      _egress_recreate_refuse policy "$_cname" "it was created with CLEAT_EGRESS_ALLOW_HOOKS=1 and the hooks capability, and this launch does not have both." \
+        "set ${BOLD}CLEAT_EGRESS_ALLOW_HOOKS=1${RESET} with the hooks capability, or " " to recreate the box without it"
     fi
-    return 1
+    return $?
   fi
-  _egress_refuse policy "a create-time fact changed since it was created (network, dropped capabilities, socket volume or gateway version)." \
-    "${BOLD}cleat rm && cleat${RESET} recreates it under the policy"
-  return 1
+  _egress_recreate_refuse policy "$_cname" "a create-time fact changed since it was created (network, dropped capabilities, socket volume or gateway version)." \
+    "" " recreates it under the policy"
 }
 
 # One bounded inspect read of the box.
@@ -11646,60 +11670,60 @@ _egress_box_shape() {                    # <cname>
   local _c="$1" _v _bh _d
   _v="$(_egress_box_field "$_c" '{{.HostConfig.NetworkMode}}')" || _v="?"
   if [ "$_v" != none ]; then
-    _egress_refuse box "its network mode is not none." "${BOLD}cleat rm && cleat${RESET}"; return 1
+    _egress_recreate_refuse box "$_c" "its network mode is not none."; return $?
   fi
   _v="$(_egress_box_field "$_c" '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}')" || _v="?"
   if [ "$_v" != "none " ]; then
-    _egress_refuse box "it is attached to a network other than none." "${BOLD}cleat rm && cleat${RESET}"; return 1
+    _egress_recreate_refuse box "$_c" "it is attached to a network other than none."; return $?
   fi
   _v="$(_egress_box_field "$_c" '{{json .HostConfig.CapAdd}}')" || _v="?"
   case "$_v" in null|"[]") ;; *)
-    _egress_refuse box "it was created with added capabilities." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+    _egress_recreate_refuse box "$_c" "it was created with added capabilities."; return $? ;;
   esac
   _v="$(_egress_box_field "$_c" '{{json .HostConfig.CapDrop}}')" || _v="?"
   case "$_v" in *'"CAP_NET_RAW"'*|*'"ALL"'*) ;; *)
-    _egress_refuse box "it does not drop NET_RAW." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+    _egress_recreate_refuse box "$_c" "it does not drop NET_RAW."; return $? ;;
   esac
   _v="$(_egress_box_field "$_c" '{{json .HostConfig.ExtraHosts}}')" || _v="?"
   case "$_v" in null|"[]") ;; *)
-    _egress_refuse box "it carries extra host entries." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+    _egress_recreate_refuse box "$_c" "it carries extra host entries."; return $? ;;
   esac
   _v="$(_egress_box_field "$_c" '{{.HostConfig.PidMode}}|{{.HostConfig.UsernsMode}}|{{.HostConfig.IpcMode}}')" || _v="?"
   case "$_v" in "||private"|"||shareable"|"||") ;; *)
-    _egress_refuse box "it shares a host namespace (pid, user or ipc)." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+    _egress_recreate_refuse box "$_c" "it shares a host namespace (pid, user or ipc)."; return $? ;;
   esac
   _v="$(_egress_box_field "$_c" '{{json .HostConfig.Devices}}')" || _v="?"
   case "$_v" in null|"[]") ;; *)
-    _egress_refuse box "it has host devices mapped in." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+    _egress_recreate_refuse box "$_c" "it has host devices mapped in."; return $? ;;
   esac
   _v="$(_egress_box_field "$_c" '{{json .HostConfig.SecurityOpt}}')" || _v="?"
   case "$_v" in
     "?"|*'=unconfined"'*|*':unconfined"'*)
-      _egress_refuse box "a security profile is unconfined." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+      _egress_recreate_refuse box "$_c" "a security profile is unconfined."; return $? ;;
   esac
   _v="$(_egress_box_field "$_c" '{{.HostConfig.Privileged}}')" || _v="?"
   if [ "$_v" != false ]; then
-    _egress_refuse box "it is privileged." "${BOLD}cleat rm && cleat${RESET}"; return 1
+    _egress_recreate_refuse box "$_c" "it is privileged."; return $?
   fi
   # 10: the socket volume, by name and read-only, and the volume's own labels,
   # because a reaped volume is auto-created empty under the same name.
   _bh="$(_egress_box_hash "$_c")"
   _v="$(_egress_box_field "$_c" '{{range .Mounts}}{{if eq .Destination "/run/cleat-egress"}}{{.Type}} {{.Name}} {{.RW}}{{end}}{{end}}')" || _v="?"
   if [ "$_v" != "volume $(_egress_sock_volume "$_c") false" ]; then
-    _egress_refuse box "its egress socket is not the read-only volume cleat made for it." "${BOLD}cleat rm && cleat${RESET}"; return 1
+    _egress_recreate_refuse box "$_c" "its egress socket is not the read-only volume cleat made for it."; return $?
   fi
   _v="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker volume inspect --format \
     '{{index .Labels "sh.cleat.role"}} {{index .Labels "sh.cleat.gateway-for"}}' "$(_egress_sock_volume "$_c")" 2>/dev/null)" || _v="?"
   if [ "$_v" != "egress-sock $_bh" ]; then
     # Not egress restart, which never creates a volume: only a recreate
     # makes the labelled one.
-    _egress_refuse gateway "its egress socket volume is not the one cleat labelled for it, so the socket may be empty." \
-      "${BOLD}cleat rm && cleat${RESET} recreates it with its socket volume"; return 1
+    _egress_recreate_refuse gateway "$_c" "its egress socket volume is not the one cleat labelled for it, so the socket may be empty." \
+      "" " recreates it with its socket volume"; return $?
   fi
   # 11: no docker socket, in any position of .Mounts.
   _v="$(_egress_box_field "$_c" '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}FOUND{{end}}{{end}}')" || _v="?"
   if [ -n "$_v" ]; then
-    _egress_refuse box "the Docker socket is mounted into it." "${BOLD}cleat rm && cleat${RESET}"; return 1
+    _egress_recreate_refuse box "$_c" "the Docker socket is mounted into it."; return $?
   fi
   # 17: no mount lands on the rendered policy, by destination and by name.
   _v="$(_egress_box_field "$_c" '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}')" || {
@@ -11707,14 +11731,14 @@ _egress_box_shape() {                    # <cname>
   while IFS= read -r _d; do
     case "$_d" in
       /etc/cleat-egress|/etc/cleat-egress/*)
-        _egress_refuse box "a mount reaches the gateway's policy." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+        _egress_recreate_refuse box "$_c" "a mount reaches the gateway's policy."; return $? ;;
       # The ssh capability's two mounts are create-time, so a box keeps them
       # after a launch drops the capability. Read off the box, never the caps.
       /home/coder/.ssh|/home/coder/.ssh/*|/tmp/ssh-agent.sock)
-        _egress_refuse box "it still has your ssh keys or agent mounted." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+        _egress_recreate_refuse box "$_c" "it still has your ssh keys or agent mounted."; return $? ;;
       # /var/run is a link to /run in the image, so either path is the socket.
       /var/run/docker.sock|/run/docker.sock)
-        _egress_refuse box "the Docker socket is mounted into it." "${BOLD}cleat rm && cleat${RESET}"; return 1 ;;
+        _egress_recreate_refuse box "$_c" "the Docker socket is mounted into it."; return $? ;;
     esac
   done <<EOF
 $_v
@@ -11723,7 +11747,7 @@ EOF
     _egress_refuse box "cleat could not read its mounts." "check that Docker is healthy, then re-run cleat"; return 1; }
   while IFS= read -r _d; do
     if [ -n "$_d" ] && [ "$_d" = "$(_egress_policy_volume "$_c")" ]; then
-      _egress_refuse box "a mount reaches the gateway's policy." "${BOLD}cleat rm && cleat${RESET}"; return 1
+      _egress_recreate_refuse box "$_c" "a mount reaches the gateway's policy."; return $?
     fi
   done <<EOF
 $_v
@@ -11891,6 +11915,7 @@ _egress_require() {                      # <cname> <verb>
   local _c="$1" _kind _ws
   _EG_REFUSED=""
   _EG_CAGED=0
+  _EG_VERB="${2:-}"
   # A down daemon is a daemon error, never an egress refusal: the verb fails
   # on its own message and the autopilot gets its chance. Unbounded, as it
   # ships, because _run_bounded cannot run a shell function.
@@ -11917,9 +11942,8 @@ _egress_require() {                      # <cname> <verb>
   _egress_create_drift "$_c" "$2" || return 1
   _egress_box_shape "$_c" || return 1
   if ! _egress_label_read "$_c" sh.cleat.egress-engine || [ "$_EG_LABEL" != "$_kind" ]; then
-    _egress_refuse engine "it was created on another Docker engine than the one answering now." \
-      "switch back to that engine, or ${BOLD}cleat rm && cleat${RESET} to recreate it here"
-    return 1
+    _egress_recreate_refuse engine "$_c" "it was created on another Docker engine than the one answering now." \
+      "switch back to that engine, or " " to recreate it here" || return 1
   fi
   _egress_gateway_ok "$_c" || return 1
   _egress_pin_launch "$_c" || return 1
@@ -12222,11 +12246,9 @@ EOF
   return 0
 }
 
-# ── cleat egress: the verbs of stage two ───────────────────────────────────
-# EGRESS-SPEC.md 6.2. Stage two writes and reads a policy. Nothing enforces it
-# yet, and every surface says so: the verbs that need a running gateway (why,
-# fix, test, log, reload, restart, review, open, tighten, off) are reserved
-# barewords that say when they land.
+# ── cleat egress: the verbs ────────────────────────────────────────────────
+# EGRESS-SPEC.md 6.2. fix and tighten stay reserved barewords that say they
+# land in a later release. Every other verb is dispatched below.
 
 # The sentences a saved policy prints. The first only while enforcement has
 # not shipped. The second stays until the core pack is measured against a real
@@ -12802,7 +12824,7 @@ _egress_cmd_reload() {                   # <cname>
     return 1
   fi
   if ! is_running "$cname"; then
-    info "Box ${BOLD}$(_sessions_safe_str "$box")${RESET} is stopped. Its gateway reads the policy when it starts."
+    info "Box ${BOLD}$(_sessions_safe_str "$box")${RESET} is stopped. Its gateway takes the saved policy before the box next starts."
     return 0
   fi
   # A policy inside the cage is never pushed (5.2).
@@ -12860,7 +12882,7 @@ EOF
 # than one at a time at each launch. Each with where its project is, since
 # the recreate runs from there.
 _egress_refusing_boxes_note() {
-  local kind n meta role lbl src rows="" count=0
+  local kind n meta role lbl src bx rows="" count=0
   [ "$_EGRESS_ENFORCING" = 1 ] || return 0
   _daemon_up || return 0
   kind="$(_egress_engine_kind)"
@@ -12868,9 +12890,12 @@ _egress_refusing_boxes_note() {
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect --format \
-      '{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' "$n" 2>/dev/null)" || continue
+      '{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}' "$n" 2>/dev/null)" || continue
     role="${meta%%|*}"; meta="${meta#*|}"
-    lbl="${meta%%|*}"; src="${meta#*|}"
+    lbl="${meta%%|*}"; meta="${meta#*|}"
+    # The box name last: each row's remedy names its own box, which may not
+    # be the one this verb is for.
+    src="${meta%|*}"; bx="${meta##*|}"
     case "$role" in ROLE=|ROLE=box|"") ;; *) continue ;; esac
     [ "$lbl" = HASH ] && continue
     # A box its own file turns off is not asked to change.
@@ -12878,7 +12903,7 @@ _egress_refusing_boxes_note() {
     _egress_resolve "$n"
     case "$_EG_MODE" in strict|open) ;; *) continue ;; esac
     count=$((count + 1))
-    rows+="      $(_sessions_safe_str "$n")   $(_egress_recreate_words "$n")   ${DIM}$(_sessions_safe_str "${src/#${HOME}/~}")${RESET}"$'\n'
+    rows+="      $(_sessions_safe_str "$n")   $(_egress_recreate_words "$n" "${bx:-main}")   ${DIM}$(_sessions_safe_str "${src/#${HOME}/~}")${RESET}"$'\n'
   done < <(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null || true)
   [ "$count" -gt 0 ] || return 0
   if [ "$count" -eq 1 ]; then
@@ -13964,12 +13989,29 @@ _egress_cmd_packs() {
 # The recreate words for a box whose create-time facts are wrong (9.3): a box
 # with its own egress file keeps it across a recreate, and cleat rm would
 # forget it, so such a box is told to recreate through a launch.
-_egress_recreate_words() {               # <cname>
+_egress_recreate_words() {               # <cname> [box]
+  local _b="${2:-${_BOX:-main}}" _s=""
+  if [ "$_b" != main ]; then _s=" $(_sessions_safe_str "$_b")"; fi
+  # cleat rm forgets a box's own egress file, which may be the only thing
+  # caging it, so a box with one is recreated by the offer start and resume
+  # make on a terminal, which keeps it.
   if [ -e "$_EGRESS_BOXES_DIR/$1" ] || [ -L "$_EGRESS_BOXES_DIR/$1" ]; then
-    printf '%s' "${BOLD}cleat${RESET}, then accept the recreate"
+    printf '%s' "${BOLD}cleat start${_s}${RESET} on a terminal, then accept the recreate"
+  elif [ -n "$_s" ]; then
+    # A bare cleat rm acts on main.
+    printf '%s' "${BOLD}cleat rm${_s} && cleat start${_s}${RESET}"
   else
     printf '%s' "${BOLD}cleat rm && cleat${RESET}"
   fi
+}
+
+# A refusal whose only way out is a recreate: the one remedy for this box,
+# then, from start or resume on a terminal, the offer to make it (5.6). rc 0
+# once a caged box stands in its place.
+_EG_VERB=""
+_egress_recreate_refuse() {              # <code> <cname> <reason> [before] [after]
+  _egress_refuse "$1" "$3" "${4:-}$(_egress_recreate_words "$2")${5:-}"
+  _egress_recreate_offer "$2" "$_EG_VERB"
 }
 
 # The one generator of the claim-void and claim-unverifiable sentences, which
@@ -20230,7 +20272,7 @@ _refresh_settings_overlays() {
 }
 
 cmd_start() {
-  local project box
+  local project box _eg_started=0
   project="$(resolve_project "${1:-}")"
   box="${_BOX:-main}"
   _RESOLVED_PROJECT="$project"
@@ -20299,11 +20341,12 @@ cmd_start() {
         _refresh_project_claude_json "$project" "$box"
         # A caged box's gateway first, so its relay's first heartbeat meets a
         # serving gateway (8.7). Before the spinner: it may refuse.
-        _egress_start_gateway "$cname" || exit 1
+        _egress_start_gateway "$cname" start || exit 1
         spin "Starting container..."
         local _docker_err="/tmp/cleat-err.$$"
         local start_rc=0
         docker start "$cname" > /dev/null 2>"$_docker_err" || start_rc=$?
+        [[ $start_rc -eq 0 ]] && _eg_started=1
         spin_stop "$start_rc" "Container started" "Container failed to start"
         if [[ $start_rc -ne 0 ]]; then
           [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
@@ -20335,9 +20378,12 @@ cmd_start() {
   fi
 
   # The egress gate (EGRESS-SPEC.md 5.7): after resolve_caps, before anything
-  # execs into the box and before the summary. Stage two asserts nothing
-  # under a saved policy, see _egress_require.
-  _egress_require "$cname" start || exit 1
+  # execs into the box and before the summary. A box this start brought up
+  # and the gate refuses is stopped again.
+  if ! _egress_require "$cname" start; then
+    if [ "$_eg_started" = 1 ]; then _egress_unstart "$cname"; fi
+    exit 1
+  fi
 
   # After the recreate decision above, never before it. A box created before
   # the host-only history store is recreated on this start, and the new
@@ -20369,7 +20415,7 @@ cmd_start() {
 }
 
 cmd_resume() {
-  local project box
+  local project box _eg_started=0
   project="$(resolve_project "${1:-}")"
   box="${_BOX:-main}"
   _RESOLVED_PROJECT="$project"
@@ -20430,10 +20476,11 @@ cmd_resume() {
         # Same stopped-container refresh as cmd_start: fold in host changes and
         # logins from other boxes before the bind source is re-resolved.
         _refresh_project_claude_json "$project" "$box"
-        _egress_start_gateway "$cname" || exit 1
+        _egress_start_gateway "$cname" resume || exit 1
         local _docker_err="/tmp/cleat-err.$$"
         local resume_rc=0
         docker start "$cname" > /dev/null 2>"$_docker_err" || resume_rc=$?
+        [[ $resume_rc -eq 0 ]] && _eg_started=1
         if [[ $resume_rc -ne 0 ]]; then
           error "Container failed to start."
           [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
@@ -20454,9 +20501,12 @@ cmd_resume() {
   fi
 
   # The egress gate (EGRESS-SPEC.md 5.7): after resolve_caps, before anything
-  # execs into the box and before the summary. Stage two asserts nothing
-  # under a saved policy, see _egress_require.
-  _egress_require "$cname" resume || exit 1
+  # execs into the box and before the summary. A box this resume brought up
+  # and the gate refuses is stopped again.
+  if ! _egress_require "$cname" resume; then
+    if [ "$_eg_started" = 1 ]; then _egress_unstart "$cname"; fi
+    exit 1
+  fi
 
   # After the recreate decision above, never before it. A box created before
   # the host-only history store is recreated on this start, and the new
@@ -20870,8 +20920,7 @@ cmd_claude() {
     cmd_run "$project"
   fi
   # The egress gate (EGRESS-SPEC.md 5.7): after resolve_caps, before anything
-  # execs into the box and before the summary. Stage two asserts nothing
-  # under a saved policy, see _egress_require.
+  # execs into the box and before the summary.
   _egress_require "$cname" claude || exit 1
   # This verb never regenerated the overlay, so a box whose policy changed
   # since its last start would read the old network paragraph (9.4). The gate

@@ -1526,7 +1526,14 @@ _drift_matches_v154() {                  # <cname>
         if [ "$tty" = 1 ]; then _is_tty() { return 0; }; else _is_tty() { return 1; }; fi
         : > "$DOCKER_CALLS"
         new="$(_resolve_config_drift "$1" "$TEST_TEMP" <<< "$ans" 2>&1)"
-        cnew="$(cat "$DOCKER_CALLS")"
+        # On a terminal the drift check reads the egress label before it offers
+        # a recreate (the downgrade guard). A read, the one call it may add,
+        # and only there: off a terminal the calls are v1.5.4's exactly.
+        if [ "$tty" = 1 ]; then
+          cnew="$(grep -v 'sh.cleat.egress-hash' "$DOCKER_CALLS" || true)"
+        else
+          cnew="$(cat "$DOCKER_CALLS")"
+        fi
         : > "$DOCKER_CALLS"
         old="$(_drift_v154 "$1" "$TEST_TEMP" <<< "$ans" 2>&1)"
         cold="$(cat "$DOCKER_CALLS")"
@@ -1583,6 +1590,28 @@ _drift_matches_v154() {                  # <cname>
   _GATEWAY_SPEC_VERSION=99
   run _resolve_config_drift "$cn" "$TEST_TEMP"
   assert_output --partial "Config changed"
+}
+
+@test "config: a caged box whose policy is gone is left to the gate even with no rendered policy here" {
+  # Another config dir (XDG_CONFIG_HOME set in one shell only) has no rendered
+  # policy for the box, and a default Enter would recreate it with a normal
+  # network. On a terminal the label is read first.
+  ACTIVE_CAPS=(git)
+  container_exists() { return 0; }
+  is_running() { return 1; }
+  _is_tty() { return 0; }
+  _EGRESS_ENFORCING=1
+  local cn=cleat-foo-1a2b3c4d caged
+  caged="v2:$(_EGRESS_FP_CAGED=1 compute_config_fingerprint "$TEST_TEMP" "$cn")"
+  eval "_container_config_hash() { echo '$caged'; }"
+  [ ! -d "$(_egress_policy_dir "$cn")" ]
+  mock_docker_inspect_field "$cn" "$T_HASH" "LABEL=v1:0123456789abcdef"
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  run _resolve_config_drift "$cn" "$TEST_TEMP" <<< ""
+  assert_success
+  assert_output ""
+  run grep -c "^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
 }
 
 @test "config: a caged box whose policy is gone is left to the gate, never recreated uncaged" {

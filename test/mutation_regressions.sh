@@ -14757,7 +14757,7 @@ try "vnext_egress_box_sock_ids_numeric" "the box's socket owner is read off its 
 # The unlabelled-volume remedy is a recreate: egress restart never makes one.
 cat > "$SED_TMP" << 'SED'
 /^_egress_box_shape()/,/^}$/{
-  s@"[$]{BOLD}cleat rm && cleat[$]{RESET} recreates it with its socket volume"@"${BOLD}cleat egress restart${RESET}"@
+  s@^    _egress_recreate_refuse gateway "[$]_c" "its egress socket volume@    _EG_VERB=; _egress_refuse gateway "its egress socket volume is not the one cleat labelled for it, so the socket may be empty." "${BOLD}cleat egress restart${RESET}"; return 1; _egress_recreate_refuse gateway "$_c" "its egress socket volume@
 }
 SED
 try "vnext_egress_volume_remedy_recreates" "an unlabelled auto-created socket volume refuses" "$CLI" "$EGRESS_REQUIRE_BATS"
@@ -14860,14 +14860,14 @@ try "vnext_config_fp_block" "the egress facts enter the fingerprint only under l
 
 cat > "$SED_TMP" << 'SED'
 /^_resolve_config_drift()/,/^}$/{
-  s@^  if \[ "[$]_EGRESS_FP_CAGED" = 0 \] && \[ -d@  if false \&\& [ -d@
+  s@^  if \[ "[$]_EGRESS_FP_CAGED" = 0 \] && {@  if false \&\& {@
 }
 SED
 try "vnext_config_drift_no_downgrade" "a caged box whose policy is gone is left to the gate" "$CLI" "$CONFIG_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_resolve_config_drift()/,/^}$/{
-  s@ && \[ -d "[$](_egress_policy_dir "[$]cname")" \] \\$@ \\@
+  s@ && { _is_tty || \[ -d "[$](_egress_policy_dir "[$]cname")" \]; } \\$@ \\@
 }
 SED
 try "vnext_config_drift_off_no_read" "with egress off the drift advisory is byte-identical to v1.5.0" "$CLI" "$CONFIG_BATS"
@@ -15018,7 +15018,7 @@ try "vnext_egress_stop_presence_gate" "rm and stop add no docker call for a box 
 # is refused, never made anew.
 cat > "$SED_TMP" << 'SED'
 /^cmd_start()/,/^}$/{
-  /^        _egress_start_gateway "[$]cname" || exit 1$/d
+  /^        _egress_start_gateway "[$]cname" start || exit 1$/d
 }
 SED
 try "vnext_egress_start_gateway_first" "cleat start on a stopped caged box starts the gateway before the box" "$CLI" "$EGRESS_GATEWAY_BATS"
@@ -15979,8 +15979,8 @@ try "vnext_egress_summary_refused_engine" "a box turned off on a refused engine 
 # ── S23: row three's recreate offer (5.6) ──
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_create_drift()/,/^}$/{
-  s|_egress_recreate_offer "\$_cname" "\${2:-}"|false|
+/^_egress_recreate_refuse()/,/^}$/{
+  s|_egress_recreate_offer "\$2" "\$_EG_VERB"|false|
 }
 SED
 try "vnext_egress_offer_wired" "offers a recreate on a terminal and recreates it caged on yes" "$CLI" "$EGRESS_REQUIRE_BATS"
@@ -16049,8 +16049,8 @@ SED
 try "vnext_egress_offer_creates_caged" "offers a recreate on a terminal and recreates it caged on yes" "$CLI" "$EGRESS_REQUIRE_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_create_drift()/,/^}$/{
-  s@if \[ -e "\$_EGRESS_BOXES_DIR/\$_cname" \] || \[ -L "\$_EGRESS_BOXES_DIR/\$_cname" \]; then@if false; then@
+/^_egress_recreate_words()/,/^}$/{
+  s@if \[ -e "\$_EGRESS_BOXES_DIR/\$1" \] || \[ -L "\$_EGRESS_BOXES_DIR/\$1" \]; then@if false; then@
 }
 SED
 try "vnext_egress_perbox_never_rm" "a box with its own egress file is never told to cleat rm" "$CLI" "$EGRESS_REQUIRE_BATS"
@@ -16189,6 +16189,87 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_writer_interlock_smoke" "cleat egress on a box with ssh exits nonzero with a named reason" "$CLI" "$SMOKE_BATS"
+
+# ── Review fixes: a stopped box is refused before its docker start ──
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_start_gateway()/,/^}$/{
+  /^  _egress_create_drift "\$cname" "\$verb" || return 1$/d
+}
+SED
+try "vnext_egress_start_drift_first" "refuses a box made before its policy while it is still stopped" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_start_gateway()/,/^}$/{
+  /^  _egress_precreate_check "\$cname" "\$_ws" "\$_EG_MODE" || return 1$/d
+}
+SED
+try "vnext_egress_start_engine_first" "an unvalidated engine refuses a stopped caged box before it starts" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_start_gateway()/,/^}$/{
+  /^  _egress_box_shape "\$cname" || return 1$/d
+}
+SED
+try "vnext_egress_start_shape_first" "a stopped box whose shape is wrong is refused before it starts" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_start_gateway()/,/^}$/{
+  /^  _egress_live_ok "\$cname" "\$_EG_MODE" "\$_EG_HOSTS" || return 1$/d
+}
+SED
+try "vnext_egress_start_reloads_running_gateway" "a gateway that kept running takes the saved policy before its box starts" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  s@    if \[ "\$_eg_started" = 1 \]; then _egress_unstart "\$cname"; fi@    :@
+}
+SED
+try "vnext_egress_unstart_start" "a box this start brought up and the gate refuses is stopped again" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  s@    if \[ "\$_eg_started" = 1 \]; then _egress_unstart "\$cname"; fi@    :@
+}
+SED
+try "vnext_egress_unstart_resume" "a box this start brought up and the gate refuses is stopped again" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# ── Review fixes: every recreate remedy names its box and keeps its file ──
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_words()/,/^}$/{
+  s@^  elif \[ -n "\$_s" \]; then@  elif false; then@
+}
+SED
+try "vnext_egress_remedy_names_box" "every recreate remedy names this box and never cleat rm" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@_why="it has no egress cage, and your egress policy needs one"@:@
+}
+SED
+try "vnext_egress_drift_names_cage" "the cage-on drift prompt names the policy and its decline keeps" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@Recreate to apply: \$(_egress_recreate_words "\$cname")@Recreate to apply: ${BOLD}cleat rm \&\& cleat${RESET}@
+}
+SED
+try "vnext_egress_drift_advisory_keeps_file" "the cage-on drift prompt names the policy and its decline keeps" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  s@\$(_egress_recreate_words "\$n" "\${bx:-main}")@$(_egress_recreate_words "$n")@
+}
+SED
+try "vnext_egress_note_names_each_box" "a first global policy names every box that will refuse" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@{ _is_tty || \[ -d@{ false || [ -d@
+}
+SED
+try "vnext_config_drift_downgrade_no_dir" "left to the gate even with no rendered policy here" "$CLI" "$CONFIG_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

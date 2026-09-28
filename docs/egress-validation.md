@@ -1,10 +1,12 @@
 # Egress control: validation per Docker engine
 
-Cleat enforces an egress policy only on a Docker engine a person has validated
-by hand. Every other engine refuses a box with a policy rather than claim a
-cage nobody has tested. This file is where that validation is recorded. A leg
-enters `_EGRESS_VALIDATED_ENGINES` in `bin/cleat` only when all fifteen steps
-below pass and its dated row is in the results table.
+Cleat enforces an egress policy only on a Docker engine in its validated set.
+Every other engine refuses a box with a policy rather than claim a cage nobody
+has tested. This file is where the hand validation of each engine is recorded.
+A leg enters `_EGRESS_VALIDATED_ENGINES` in `bin/cleat` only when all fifteen
+steps below pass and its dated row is in the results table. The one exception
+is the first: Docker Desktop for macOS ships in the set ahead of its row, and
+the row must land before the release.
 
 No automated leg can run the whole list. Steps 11, 14 and 15 need a host sleep
 or a daemon restart. An agent working inside a Cleat box would restart the
@@ -13,8 +15,8 @@ validated (`test/integration/egress.bats`).
 
 ## What to record for each run
 
-The date, the engine kind (`cleat egress status` names it), the Docker API
-version, the host uid, the box uid, the exact CLI version, the image spec
+The date, the engine kind (`cleat egress status` names it on a leg not yet
+validated, the editor's Engine line on one that is), the Docker API version, the host uid, the box uid, the exact CLI version, the image spec
 version and the three normalization strings of step 4.
 
 ## The fifteen steps
@@ -107,10 +109,12 @@ suspend threshold. The keep-awake utility being off is the point: a daily setup
 that keeps the machine awake hides this failure.
 
 It exists because the worst failure in this design is silent. One failed
-`fork()` kills the relay, every later request from that box fails and the
-gateway stays healthy throughout. Overnight that is a total loss of egress that
-nothing on the host reports on its own. `cleat egress status` shows the relay's
-last heartbeat. `cleat egress restart --shim` brings it back.
+`fork()` kills socat. Its supervisor starts it again about a second later and
+logs `relay exited` in `/tmp/cleat-egress-shim.log` inside the box, so count
+those lines. If the supervisor itself dies, every later request from that box
+fails and the gateway stays healthy throughout. Overnight that is a total loss
+of egress that nothing on the host reports on its own. `cleat egress status`
+shows the relay's last heartbeat. `cleat egress restart --shim` brings it back.
 
 ## Results
 

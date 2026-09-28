@@ -399,6 +399,8 @@ _summary_line_of() { printf '%s\n' "$output" | grep -nF -- "$1" | head -n 1 | cu
 
 @test "summary: a saved policy reads saved and not enforced while enforcement has not shipped" {
   ACTIVE_CAPS=()
+  # Its own setting, never the default: the flip moves the default.
+  _EGRESS_ENFORCING=0
   printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
   run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
   assert_success
@@ -1036,4 +1038,245 @@ EOF
   run cmd_rm "$TEST_TEMP/p1"
   assert_success
   [ ! -e "$CLEAT_CONFIG_DIR/egress-notices/$cn" ]
+}
+
+# ── The enforcing states of the Egress: row and the once-per-box notices ────
+# (6.7, 3.8). All render only under live enforcement, strict or open.
+
+# A project whose origin is <url>, written the way git writes it.
+_summary_origin() {
+  mkdir -p "$TEST_TEMP/project/.git"
+  printf '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = %s\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n' "$1" > "$TEST_TEMP/project/.git/config"
+}
+
+_summary_enforcing() {
+  ACTIVE_CAPS=()
+  _EGRESS_ENFORCING=1
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  NMARK="$CLEAT_CONFIG_DIR/egress-notices/cleat-test-12345678"
+}
+
+@test "egress notices: the first launch under a policy names the ssh remote once" {
+  _summary_enforcing
+  _summary_origin "git@github.com:o/r.git"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  _plain_output
+  assert_output --partial "Egress:     strict  ·  5 hosts, 1 pack
+              host.docker.internal is not reachable from a box with a policy.
+              An MCP server running on your host stops working here
+              git over ssh cannot leave this box. Re-point the repo to https:
+              git remote set-url origin https://github.com/<owner>/<repo>"
+  run cat "$NMARK"
+  assert_output "hostdocker
+sshremote"
+}
+
+@test "egress notices: the second launch under the same policy prints neither notice" {
+  _summary_enforcing
+  _summary_origin "ssh://git@github.com/o/r.git"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_output --partial "host.docker.internal"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "host.docker.internal"
+  refute_output --partial "git over ssh"
+}
+
+@test "egress notices: an https origin gets the host.docker.internal notice and no ssh line" {
+  _summary_enforcing
+  _summary_origin "https://github.com/o/r.git"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_output --partial "host.docker.internal is not reachable"
+  refute_output --partial "git over ssh"
+  run cat "$NMARK"
+  assert_output "hostdocker"
+  # A later move to ssh still gets its one notice.
+  _summary_origin "git@github.com:o/r.git"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "host.docker.internal"
+  assert_output --partial "git over ssh cannot leave this box"
+  run cat "$NMARK"
+  assert_output "hostdocker
+sshremote"
+}
+
+@test "egress notices: an origin that cannot be told prints nothing and uses no token" {
+  _summary_enforcing
+  mkdir -p "$TEST_TEMP/project"
+  # No repository at all.
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "git over ssh"
+  run cat "$NMARK"
+  assert_output "hostdocker"
+  # A .git file (a worktree), then a config that is a link, then a FIFO, then
+  # a repository with no origin: none can be read, none uses the token.
+  printf 'gitdir: /elsewhere\n' > "$TEST_TEMP/project/.git"
+  run _egress_origin_is_ssh "$TEST_TEMP/project"
+  assert_equal "$status" 2
+  rm -f "$TEST_TEMP/project/.git"
+  mkdir -p "$TEST_TEMP/project/.git"
+  printf '[remote "origin"]\n\turl = git@github.com:o/r.git\n' > "$TEST_TEMP/elsewhere"
+  ln -s "$TEST_TEMP/elsewhere" "$TEST_TEMP/project/.git/config"
+  run _egress_origin_is_ssh "$TEST_TEMP/project"
+  assert_equal "$status" 2
+  rm -f "$TEST_TEMP/project/.git/config"
+  mkfifo "$TEST_TEMP/project/.git/config"
+  run _egress_origin_is_ssh "$TEST_TEMP/project"
+  assert_equal "$status" 2
+  rm -f "$TEST_TEMP/project/.git/config"
+  printf '[remote "upstream"]\n\turl = git@github.com:u/r.git\n' > "$TEST_TEMP/project/.git/config"
+  run _egress_origin_is_ssh "$TEST_TEMP/project"
+  assert_equal "$status" 2
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "git over ssh"
+  run cat "$NMARK"
+  assert_output "hostdocker"
+}
+
+@test "egress notices: the origin reader knows the ssh forms and nothing else" {
+  local u
+  for u in "git@github.com:o/r.git" "github.com:o/r" "ssh://git@host/o/r" "git+ssh://host/o/r" "ssh+git://host/o/r" '"git@github.com:o/r.git"'; do
+    _summary_origin "$u"
+    run _egress_origin_is_ssh "$TEST_TEMP/project"
+    assert_equal "$u:$status" "$u:0"
+  done
+  for u in "https://github.com/o/r.git" "http://host/o/r" "file:///srv/r.git" "/srv/git/r.git" "../r" "git://host/o/r"; do
+    _summary_origin "$u"
+    run _egress_origin_is_ssh "$TEST_TEMP/project"
+    assert_equal "$u:$status" "$u:1"
+  done
+  # Only origin counts, in either header form, with any case of its key.
+  mkdir -p "$TEST_TEMP/project/.git"
+  printf '[remote "upstream"]\n\turl = git@github.com:u/r.git\n[remote "origin"]\n\turl = https://github.com/o/r.git\n' > "$TEST_TEMP/project/.git/config"
+  run _egress_origin_is_ssh "$TEST_TEMP/project"
+  assert_equal "$status" 1
+  printf '[remote.origin]\r\n\tURL = git@github.com:o/r.git\r\n' > "$TEST_TEMP/project/.git/config"
+  run _egress_origin_is_ssh "$TEST_TEMP/project"
+  assert_equal "$status" 0
+}
+
+@test "egress notices: a marker that is a link or a directory reads as shown" {
+  _summary_enforcing
+  _summary_origin "git@github.com:o/r.git"
+  mkdir -p "$CLEAT_CONFIG_DIR/egress-notices" "$TEST_TEMP/victim"
+  ln -s "$TEST_TEMP/victim" "$NMARK"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "host.docker.internal"
+  run ls -A "$TEST_TEMP/victim"
+  assert_output ""
+  # The writer refuses the link on its own, whatever its caller decided.
+  run _egress_notices_record cleat-test-12345678 hostdocker
+  assert_success
+  run ls -A "$TEST_TEMP/victim"
+  assert_output ""
+  rm -f "$NMARK"
+  mkdir -p "$NMARK"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "host.docker.internal"
+  run ls -A "$NMARK"
+  assert_output ""
+}
+
+@test "egress notices: no notice and no marker before enforcement ships or under off" {
+  _summary_enforcing
+  _summary_origin "git@github.com:o/r.git"
+  _EGRESS_ENFORCING=0
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "host.docker.internal"
+  [ ! -e "$NMARK" ]
+  _EGRESS_ENFORCING=1
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "host.docker.internal"
+  [ ! -e "$NMARK" ]
+}
+
+@test "summary: with enforcement off the egress row is the stage-two row" {
+  ACTIVE_CAPS=(gh)
+  _EGRESS_ENFORCING=0
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _summary_origin "git@github.com:o/r.git"
+  run _egress_summary_row cleat-test-12345678 "$TEST_TEMP/project"
+  _plain_output
+  assert_output "  Egress:     strict  ·  5 hosts, 1 pack   (saved, not enforced in this
+              release. Nothing is filtered today)"
+}
+
+@test "summary: the gh cap prints the host command line under the egress row" {
+  _summary_enforcing
+  ACTIVE_CAPS=(gh)
+  CLEAT_BROWSER_BRIDGE=always run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_success
+  _plain_output
+  assert_output --partial $'\n''              ! gh lets the box set commands your host'"'"'s gh runs'
+  local egress gh browser
+  egress="$(_summary_line_of "Egress:")"
+  gh="$(_summary_line_of "! gh lets the box")"
+  browser="$(_summary_line_of "Browser:")"
+  [ "$gh" -eq $((egress + 1)) ]
+  [ "$gh" -lt "$browser" ]
+  # An off row claims nothing, so it warns about nothing.
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  refute_output --partial "! gh"
+}
+
+@test "summary: the enforcing row runs no docker exec and open reads amber" {
+  _summary_enforcing
+  : > "$DOCKER_CALLS"
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  run grep -c "^docker exec" "$DOCKER_CALLS"
+  assert_output "0"
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row cleat-test-12345678
+  assert_output --partial "$(printf '\033[38;5;214m·  every TLS host allowed, every host logged')"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row cleat-test-12345678
+  refute_output --partial "$(printf '\033[38;5;214m·')"
+}
+
+@test "summary: a box turned off on a refused engine says why and names egress status" {
+  ACTIVE_CAPS=()
+  _EGRESS_ENFORCING=1
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/cleat-test-12345678"
+  _egress_engine_kind() { echo probe >> "$TEST_TEMP/probes"; printf 'vm-backend'; }
+  run _egress_summary_row cleat-test-12345678
+  _plain_output
+  assert_output "  Egress:     off  ·  full network egress   (not supported on a VM engine like Colima)
+              cleat egress status"
+  _egress_engine_kind() { echo probe >> "$TEST_TEMP/probes"; printf 'engine-linux'; }
+  run _egress_summary_row cleat-test-12345678
+  _plain_output
+  assert_output --partial "(not validated on Docker Engine on Linux)"
+  # On the validated engine the box is off by choice, and says only off.
+  _egress_engine_kind() { echo probe >> "$TEST_TEMP/probes"; printf 'desktop-macos'; }
+  run _egress_summary_row cleat-test-12345678
+  _plain_output
+  assert_output "  Egress:     off  ·  full network egress"
+  # With no machine policy, nothing asks the engine anything.
+  rm -f "$TEST_TEMP/probes" "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row cleat-test-12345678
+  _plain_output
+  assert_output "  Egress:     off  ·  full network egress"
+  [ ! -f "$TEST_TEMP/probes" ]
+  # Nor on a box with no file of its own.
+  rm -f "$_EGRESS_BOXES_DIR/cleat-test-12345678"
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_summary_row cleat-test-12345678
+  [ ! -f "$TEST_TEMP/probes" ]
+}
+
+@test "egress notices: a fork's origin is its copy's, not the project's" {
+  _summary_enforcing
+  _summary_origin "https://github.com/o/r.git"
+  mkdir -p "$TEST_TEMP/forkcopy/.git"
+  printf '[remote "origin"]\n\turl = git@github.com:o/r.git\n' > "$TEST_TEMP/forkcopy/.git/config"
+  _box_is_fork() { return 0; }
+  _fork_dir() { printf '%s\n' "$TEST_TEMP/forkcopy"; }
+  run _print_summary_block "cleat-test-12345678" "$TEST_TEMP/project"
+  assert_output --partial "git over ssh cannot leave this box"
 }

@@ -7074,7 +7074,10 @@ _print_summary_block() {
   _print_caps "  " "Caps:" "       "
   # Between Caps and Browser, never after Browser: that row is silent in auto,
   # so a later position would move with an environment variable (6.7).
-  _egress_summary_row "$cname"
+  # A fork's workspace is its copy, and the copy's origin is what it pushes to.
+  local _eg_proj="$project"
+  if _box_is_fork "$cname"; then _eg_proj="$(_fork_dir "$cname")"; fi
+  _egress_summary_row "$cname" "$_eg_proj"
   # The browser bridge mode and whether the destination gate is on (EGRESS-SPEC
   # B7). Silent in auto, which is every launch that never set the variable, so
   # the default summary stays as quiet as concept/21 asks. The two other modes
@@ -11949,14 +11952,22 @@ _egress_plural() {                       # <n> <word>
 
 # The Egress: row of the launch summary, between Caps: and Browser:. Prints
 # on every launch. Runs after _egress_require in the same process, so the
-# resolution it takes cannot refuse here.
-_egress_summary_row() {                  # <cname>
-  local _c="$1" _n _np _desc _added
+# resolution it takes cannot refuse here. Under live enforcement, strict or
+# open, its sub-lines stack in one order (6.7): the ! channel lines, the held
+# lines, the widening lines, then the once-per-box notices, recorded only
+# after they print. It never execs into the box. The claim-void tag is one
+# bounded inspect, and the engine probe runs only in the refused-engine row.
+_egress_summary_row() {                  # <cname> [project]
+  local _c="$1" _proj="${2:-}" _n _np _desc _added _word _tone
   _egress_resolve "$_c"
   case "$_EG_MODE" in
     strict|open) ;;
     *)
-      echo -e "  ${DIM}Egress:${RESET}     off  ${DIM}·  full network egress${RESET}"
+      if [ "$_EGRESS_ENFORCING" = 1 ] && [ "$_EG_WHY" = perbox ] && _egress_summary_refused_engine "$_c"; then
+        :
+      else
+        echo -e "  ${DIM}Egress:${RESET}     off  ${DIM}·  full network egress${RESET}"
+      fi
       # Nothing is wider than off, so the launch after it widened from
       # nothing. The record goes, and that launch compares to none.
       rm -f "$(_egress_ledger_path "$_c")" 2>/dev/null || true
@@ -11973,7 +11984,19 @@ _egress_summary_row() {                  # <cname>
     echo -e "  ${DIM}Egress:${RESET}     ${BOLD}${_EG_MODE}${RESET}  ${DIM}·  ${_desc}   (saved, not enforced in this${RESET}"
     echo -e "              ${DIM}release. Nothing is filtered today)${RESET}"
   else
-    echo -e "  ${DIM}Egress:${RESET}     ${BOLD}${_EG_MODE}${RESET}  ${DIM}·  ${_desc}${RESET}"
+    _word="$_EG_MODE"
+    if [ "$(_egress_claim_void "$_c")" = void ]; then _word="$_word, claim void"; fi
+    # Open is a log, not a boundary (6.5): the whole row reads amber.
+    _tone="$DIM"
+    [ "$_EG_MODE" = open ] && _tone="$AMBER"
+    echo -e "  ${DIM}Egress:${RESET}     ${BOLD}${_word}${RESET}  ${_tone}·  ${_desc}${RESET}"
+    # A warning outranks everything below it.
+    if cap_is_active gh; then
+      echo -e "              ${AMBER}! gh lets the box set commands your host's gh runs${RESET}"
+    fi
+    if cap_is_active hooks; then
+      echo -e "              ${AMBER}! hooks runs your host commands with box-supplied stdin${RESET}"
+    fi
     _egress_summary_pin_lines
   fi
   _egress_widening "$_c" "$_EG_MODE" "$_EG_HOSTS"
@@ -11985,6 +12008,149 @@ _egress_summary_row() {                  # <cname>
     echo -e "              ${AMBER}mode widened to open since the last launch.${RESET}  ${DIM}cleat egress status${RESET}"
   fi
   _egress_ledger_write "$_c" "$_EG_MODE" "$_EG_HOSTS"
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  _egress_notices_print "$_c" "$_proj"
+  _egress_notices_record "$_c" $_EG_NOTICE_TOKENS
+}
+
+# The off row of a box whose own file turned it off because the engine
+# refuses a policy (6.7): the machine's [egress] alone resolves strict or
+# open and this engine is not validated. rc 1, printing nothing, otherwise.
+# The one summary state that probes the engine.
+_egress_summary_refused_engine() {       # <cname>
+  local _gm _kind
+  _gm="$( _EG_NO_PERBOX=1; _egress_resolve "$1" >/dev/null 2>&1 || exit 1; printf '%s' "$_EG_MODE" )" || return 1
+  case "$_gm" in strict|open) ;; *) return 1 ;; esac
+  _kind="$(_egress_engine_kind)"
+  _egress_engine_validated "$_kind" && return 1
+  echo -e "  ${DIM}Egress:${RESET}     off  ${DIM}·  full network egress   ($(_egress_engine_short "$_kind"))${RESET}"
+  echo -e "              ${DIM}cleat egress status${RESET}"
+  return 0
+}
+
+# An engine in the few words a summary row has room for. A supported design
+# is "not validated", anything else "not supported", the two shapes of
+# _egress_engine_refusal.
+_egress_engine_short() {                 # <kind>
+  case "$1" in
+    desktop-macos) printf 'not validated on Docker Desktop on macOS' ;;
+    desktop-windows) printf 'not validated on Docker Desktop on Windows' ;;
+    engine-linux) printf 'not validated on Docker Engine on Linux' ;;
+    desktop-linux) printf 'not supported on Docker Desktop on Linux' ;;
+    rootless) printf 'not supported on rootless Docker' ;;
+    vm-backend) printf 'not supported on a VM engine like Colima' ;;
+    wsl-in-distro) printf 'not supported on Docker inside WSL' ;;
+    npipe-endpoint) printf 'not supported on docker.exe over a pipe' ;;
+    remote-endpoint) printf 'not supported on a remote engine' ;;
+    windows-containers) printf 'not supported on Windows containers' ;;
+    api-too-old) printf 'not supported on an engine older than 20.10' ;;
+    *) printf 'not supported on this engine' ;;
+  esac
+}
+
+# ── The once-per-box notices (3.8) ──
+# Two incompatibilities a policy brings, each announced once for the life of
+# the box: host.docker.internal stops resolving, and git over ssh cannot
+# leave. The marker is egress-notices/<cname>, one token per line, written
+# after the lines print, so a launch that dies before its summary uses up
+# nothing. A recreate keeps it and a forget teardown removes it. Both are
+# advisories: a condition that cannot be determined prints nothing and uses
+# no token.
+
+_egress_notices_path() { printf '%s/egress-notices/%s' "$CLEAT_CONFIG_DIR" "$1"; }
+
+# rc 0 when <token> was shown, or when the marker cannot be read as a plain
+# file: a marker that is a link or a directory reads as everything shown, so
+# a broken one never nags every launch.
+_egress_notices_shown() {                # <cname> <token>
+  local _f _d
+  _f="$(_egress_notices_path "$1")"
+  _d="${_f%/*}"
+  if [ -L "$_d" ] || [ -L "$_f" ] || [ -d "$_f" ]; then return 0; fi
+  [ -f "$_f" ] || return 1
+  _read_unlinked_bounded "$_f" 256 | grep -qx -- "$2"
+}
+
+# The project's origin, read host-side from its .git/config through the
+# bounded, link-refusing reader. Git itself never runs on a file the box can
+# write: a FIFO planted at .git/config would hang it, and its config is the
+# box's to author. rc 0 for an ssh remote, 1 for another, 2 when it cannot be
+# told (no .git directory, no origin, unreadable).
+_egress_origin_is_ssh() {                # <project>
+  local _line _in=0 _u="" _hdr _k
+  [ -n "$1" ] && [ -d "$1/.git" ] && [ ! -L "$1/.git" ] || return 2
+  while IFS= read -r _line; do
+    _line="${_line%$'\r'}"
+    _line="${_line#"${_line%%[![:space:]]*}"}"
+    case "$_line" in
+      "["*)
+        _hdr="$(printf '%s' "$_line" | tr -d ' \t')"
+        case "$_hdr" in
+          '[remote"origin"]'*|'[remote.origin]'*) _in=1 ;;
+          *) _in=0 ;;
+        esac
+        continue ;;
+    esac
+    [ "$_in" = 1 ] || continue
+    _k="$(printf '%s' "${_line%%=*}" | tr -d ' \t' | tr 'URL' 'url')"
+    [ "$_k" = url ] || continue
+    case "$_line" in *=*) ;; *) continue ;; esac
+    _u="${_line#*=}"
+    _u="${_u#"${_u%%[![:space:]]*}"}"
+    _u="${_u%"${_u##*[![:space:]]}"}"
+    _u="${_u#\"}"; _u="${_u%\"}"
+    break
+  done < <(_read_unlinked_bounded "$1/.git/config" 65536)
+  [ -n "$_u" ] || return 2
+  case "$_u" in
+    ssh://*|git+ssh://*|ssh+git://*) return 0 ;;
+    *://*) return 1 ;;
+  esac
+  # The scp form, host:path, has a colon with no slash before it.
+  case "${_u%%:*}" in
+    "$_u") return 1 ;;
+    */*|"") return 1 ;;
+  esac
+  return 0
+}
+
+# Prints the notices this launch owes and leaves their tokens in
+# _EG_NOTICE_TOKENS for the record.
+_EG_NOTICE_TOKENS=""
+_egress_notices_print() {                # <cname> <project>
+  _EG_NOTICE_TOKENS=""
+  if ! _egress_notices_shown "$1" hostdocker; then
+    echo -e "              ${DIM}host.docker.internal is not reachable from a box with a policy.${RESET}"
+    echo -e "              ${DIM}An MCP server running on your host stops working here${RESET}"
+    _EG_NOTICE_TOKENS="hostdocker"
+  fi
+  if ! _egress_notices_shown "$1" sshremote && _egress_origin_is_ssh "$2"; then
+    echo -e "              ${DIM}git over ssh cannot leave this box. Re-point the repo to https:${RESET}"
+    echo -e "              ${DIM}git remote set-url origin https://github.com/<owner>/<repo>${RESET}"
+    _EG_NOTICE_TOKENS="${_EG_NOTICE_TOKENS:+$_EG_NOTICE_TOKENS }sshremote"
+  fi
+  return 0
+}
+
+# Adds tokens to a box's marker: the union with what it holds, through a temp
+# file and one mv in the same directory. Never through a link, fail-soft.
+_egress_notices_record() {               # <cname> [token...]
+  local _f _d _tmp _old="" _t
+  [ "$#" -gt 1 ] || return 0
+  _f="$(_egress_notices_path "$1")"
+  _d="${_f%/*}"
+  shift
+  [ -L "$_d" ] && return 0
+  mkdir -p "$_d" 2>/dev/null || return 0
+  if [ -L "$_d" ] || [ -L "$_f" ] || [ -d "$_f" ]; then return 0; fi
+  if [ -f "$_f" ]; then _old="$(_read_unlinked_bounded "$_f" 256)"; fi
+  _tmp="$_d/.${_f##*/}.$$"
+  {
+    printf '%s\n' "$_old"
+    for _t in "$@"; do printf '%s\n' "$_t"; done
+  } | { grep -x -e hostdocker -e sshremote || true; } | LC_ALL=C sort -u > "$_tmp" 2>/dev/null \
+    && mv -f "$_tmp" "$_f" 2>/dev/null || rm -f "$_tmp" 2>/dev/null || true
+  return 0
 }
 
 # The pin's sub-lines of the Egress: row (7.5), from what this launch's gate

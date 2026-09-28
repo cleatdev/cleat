@@ -10354,3 +10354,18 @@ pack = npm"
   assert_output --partial "# Network access"
   refute_output --partial "full network access"
 }
+
+@test "regression vNEXT: the egress once-per-box notice printed on every launch" {
+  # "Once" needs a record that outlives the launch. Without it the two
+  # notices print on every start and read as a new problem each time.
+  mock_egress_caged_launch
+  mkdir -p "$TEST_TEMP/project/.git"
+  printf '[remote "origin"]\n\turl = git@github.com:o/r.git\n' > "$TEST_TEMP/project/.git/config"
+  ACTIVE_CAPS=()
+  run _egress_summary_row cleat-proj-12345678 "$TEST_TEMP/project"
+  assert_output --partial "host.docker.internal is not reachable"
+  assert_output --partial "git over ssh cannot leave this box"
+  run _egress_summary_row cleat-proj-12345678 "$TEST_TEMP/project"
+  refute_output --partial "host.docker.internal"
+  refute_output --partial "git over ssh"
+}

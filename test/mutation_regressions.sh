@@ -15849,6 +15849,127 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_review_dispatched" "cleat egress review runs on the real binary" "$CLI" "$SMOKE_BATS"
 
+# ── S22: the enforcing summary states and the once-per-box notices ──
+
+# The notices print once: the marker is written after they render.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_row()/,/^}$/{
+  /_egress_notices_record/d
+}
+SED
+try "vnext_egress_notice_once" "the second launch under the same policy prints neither notice" "$CLI" "$TERMINAL_UX_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_row()/,/^}$/{
+  /_egress_notices_record/d
+}
+SED
+try "vnext_egress_notice_once_regression" "the egress once-per-box notice printed on every launch" "$CLI"
+
+# A shown notice is read back.
+cat > "$SED_TMP" << 'SED'
+/^_egress_notices_print()/,/^}$/{
+  s|if ! _egress_notices_shown "\$1" hostdocker; then|if true; then|
+}
+SED
+try "vnext_egress_notice_reader" "the second launch under the same policy prints neither notice" "$CLI" "$TERMINAL_UX_BATS"
+
+# The notices are enforcement's alone.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_row()/,/^}$/{
+  /^  \[ "\$_EGRESS_ENFORCING" = 1 \] || return 0$/d
+}
+SED
+try "vnext_egress_notice_enforcing_only" "no notice and no marker before enforcement ships" "$CLI" "$TERMINAL_UX_BATS"
+
+# The ssh url forms.
+cat > "$SED_TMP" << 'SED'
+/^_egress_origin_is_ssh()/,/^}$/{
+  s|ssh://\*\|git+ssh://\*\|ssh+git://\*) return 0 ;;|ssh://*\|git+ssh://*\|ssh+git://*) return 1 ;;|
+}
+SED
+try "vnext_egress_origin_ssh_urls" "the origin reader knows the ssh forms and nothing else" "$CLI" "$TERMINAL_UX_BATS"
+
+# The scp form.
+cat > "$SED_TMP" << 'SED'
+/^_egress_origin_is_ssh()/,/^}$/{
+  s|^  return 0$|  return 1|
+}
+SED
+try "vnext_egress_origin_scp_form" "the origin reader knows the ssh forms and nothing else" "$CLI" "$TERMINAL_UX_BATS"
+
+# Only origin's url counts.
+cat > "$SED_TMP" << 'SED'
+/^_egress_origin_is_ssh()/,/^}$/{
+  s|'\[remote"origin"\]'\*\|'\[remote.origin\]'\*) _in=1 ;;|'['*) _in=1 ;;|
+}
+SED
+try "vnext_egress_origin_only" "the origin reader knows the ssh forms and nothing else" "$CLI" "$TERMINAL_UX_BATS"
+
+# An origin that cannot be told uses no token.
+cat > "$SED_TMP" << 'SED'
+/^_egress_origin_is_ssh()/,/^}$/{
+  s|\[ -n "\$_u" \] \|\| return 2|[ -n "$_u" ] \|\| return 0|
+}
+SED
+try "vnext_egress_origin_unknown_silent" "an origin that cannot be told prints nothing and uses no token" "$CLI" "$TERMINAL_UX_BATS"
+
+# A marker that is a link or a directory reads as shown.
+cat > "$SED_TMP" << 'SED'
+/^_egress_notices_shown()/,/^}$/{
+  /if \[ -L "\$_d" \] || \[ -L "\$_f" \] || \[ -d "\$_f" \]; then return 0; fi/d
+}
+SED
+try "vnext_egress_notice_marker_link_shown" "a marker that is a link or a directory reads as shown" "$CLI" "$TERMINAL_UX_BATS"
+
+# The writer never writes through a link.
+cat > "$SED_TMP" << 'SED'
+/^_egress_notices_record()/,/^}$/{
+  /if \[ -L "\$_d" \] || \[ -L "\$_f" \] || \[ -d "\$_f" \]; then return 0; fi/d
+}
+SED
+try "vnext_egress_notice_record_link" "a marker that is a link or a directory reads as shown" "$CLI" "$TERMINAL_UX_BATS"
+
+# A fork reads its copy's origin.
+cat > "$SED_TMP" << 'SED'
+/^_print_summary_block()/,/^}$/{
+  s|if _box_is_fork "\$cname"; then _eg_proj="\$(_fork_dir "\$cname")"; fi|:|
+}
+SED
+try "vnext_egress_notice_fork_origin" "a fork's origin is its copy's" "$CLI" "$TERMINAL_UX_BATS"
+
+# The gh line under a policy.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_row()/,/^}$/{
+  s|! gh lets the box set commands your host's gh runs|gh|
+}
+SED
+try "vnext_egress_summary_gh_line" "the gh cap prints the host command line under the egress row" "$CLI" "$TERMINAL_UX_BATS"
+
+# The claim-void tag.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_row()/,/^}$/{
+  s|_word="\$_word, claim void"|:|
+}
+SED
+try "vnext_egress_summary_claim_void" "the hooks escape prints claim void in the launch summary row" "$CLI" "$EGRESS_UI_BATS"
+
+# Open reads amber.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_row()/,/^}$/{
+  /\[ "\$_EG_MODE" = open \] && _tone="\$AMBER"/d
+}
+SED
+try "vnext_egress_summary_open_amber" "the enforcing row runs no docker exec and open reads amber" "$CLI" "$TERMINAL_UX_BATS"
+
+# The refused-engine row names only a refused engine.
+cat > "$SED_TMP" << 'SED'
+/^_egress_summary_refused_engine()/,/^}$/{
+  /_egress_engine_validated "\$_kind" && return 1/d
+}
+SED
+try "vnext_egress_summary_refused_engine" "a box turned off on a refused engine says why" "$CLI" "$TERMINAL_UX_BATS"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

@@ -1972,3 +1972,26 @@ plain() { run _plain "$output"; }
   run grep -cE "^docker rm|^cmd_run" "$DOCKER_CALLS"
   assert_output "0"
 }
+
+@test "egress ui: the hooks escape prints claim void in the launch summary row" {
+  # 9.3: a box created under the hooks escape carries hooks=1 in its create
+  # hash, and every surface that names the claim says it is void.
+  mock_egress_caged_launch
+  CN=cleat-proj-12345678
+  egress_box_names
+  F_HOOKS=1 caged_box
+  ACTIVE_CAPS=(hooks)
+  run _egress_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "Egress:     strict, claim void  ·  5 hosts, 1 pack"
+  assert_output --partial "              ! hooks runs your host commands with box-supplied stdin"
+  # The same box made without the escape: the claim stands.
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  caged_box
+  ACTIVE_CAPS=()
+  run _egress_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "Egress:     strict  ·  5 hosts, 1 pack"
+  refute_output --partial "claim void"
+  refute_output --partial "! hooks"
+}

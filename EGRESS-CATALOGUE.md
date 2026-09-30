@@ -26,9 +26,8 @@ Egress control is not enforced yet. A saved policy is configuration only. See
   measurement and the next.
 - **flags** name how the editor treats the row: `core` and `locked` rows are always on,
   `default` packs sit on the `[setup]` provisioning path, a `sub-tick` host is added on its own
-  from the pack's hosts, a `parameterised` host needs a value you type (the part in braces), `no-security` means an
-  apt source without a security suite and `requires-cap` means the pack needs a capability that
-  egress control refuses.
+  from the pack's hosts, a `parameterised` host needs a value you type (the part in braces) and
+  `no-security` means an apt source without a security suite.
 - Nothing marked shared, open tenancy, unaudited or parameterised is ever ticked for you, with two
   named exceptions, `apt-debian` and `apt-image-extras`, which sit on the `[setup]` path. Debian
   publishes no single-origin security archive, and the image configures the Docker and GitHub CLI
@@ -99,12 +98,13 @@ Egress control is not enforced yet. A saved policy is configuration only. See
 | `maven` | `repo1.maven.org` | contained |  | h1+h2, 2026-09-21 |
 | `maven` | `plugins.gradle.org` | contained |  | h1 only, no h2 offered, 2026-09-21 |
 | `maven` | `services.gradle.org` | contained |  | h1 only, no h2 offered, 2026-09-21 |
-| `containers` | `registry-1.docker.io` | contained | `requires-cap` | h1+h2, 2026-09-21 |
-| `containers` | `auth.docker.io` | contained | `requires-cap` | h1+h2, 2026-09-21 |
-| `containers` | `production.cloudflare.docker.com` | contained | `requires-cap` | h1+h2, 2026-09-21 |
-| `containers` | `index.docker.io` | contained | `requires-cap` | h1+h2, 2026-09-21 |
-| `containers` | `ghcr.io` | contained | `requires-cap` | h1+h2, 2026-09-21 |
-| `containers` | `pkg-containers.githubusercontent.com` | open tenancy | `open-tenancy` `requires-cap` | h1+h2, 2026-09-21 |
+| `containers` | `registry-1.docker.io` | contained |  | h1+h2, 2026-09-21 |
+| `containers` | `auth.docker.io` | contained |  | h1+h2, 2026-09-21 |
+| `containers` | `production.cloudflare.docker.com` | contained |  | h1+h2, 2026-09-21 |
+| `containers` | `production.cloudfront.docker.com` | contained |  | h1+h2, 2026-09-30 |
+| `containers` | `index.docker.io` | contained |  | h1+h2, 2026-09-21 |
+| `containers` | `ghcr.io` | contained |  | h1+h2, 2026-09-21 |
+| `containers` | `pkg-containers.githubusercontent.com` | open tenancy | `open-tenancy` | h1+h2, 2026-09-21 |
 | `homebrew` | `formulae.brew.sh` | open tenancy | `open-tenancy` | h1+h2, 2026-09-21 |
 | `homebrew` | `ghcr.io` | contained |  | h1+h2, 2026-09-21 |
 | `homebrew` | `pkg-containers.githubusercontent.com` | open tenancy | `open-tenancy` | h1+h2, 2026-09-21 |

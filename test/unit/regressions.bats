@@ -10033,6 +10033,28 @@ pack = go
 pack = npm"
 }
 
+@test "regression vNEXT: Esc did not leave the egress editor's add-a-host prompt" {
+  # The prompt read a whole line, so Esc went into the name and the prompt
+  # stayed open for whatever was typed next. Only an empty line went back.
+  # Here Esc is pressed and a name is typed seconds later: the prompt must
+  # be gone by then and leave the name unread. fd 7, since bats owns fd 3.
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  _term_rows() { echo 30; }
+  _term_cols() { echo 100; }
+  _egress_editor_load ""
+  _egress_measure
+  local rc=0 rest=""
+  exec 7< <(printf 'registry.example.com\033'; sleep 3; printf 'docs.rs\n')
+  _egress_add_prompt <&7 > "$TEST_TEMP/out" || rc=$?
+  IFS= read -r rest <&7 || true
+  exec 7<&-
+  assert_equal "$rc" 1
+  assert_equal "$rest" "docs.rs"
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output ""
+}
+
 @test "regression vNEXT: a box following every box into off was saved on a default Enter" {
   # A box with a mode of its own stepped back to inherit while every box was
   # off: the save plan read the ring's literal value, so Save? [Y/n] took a

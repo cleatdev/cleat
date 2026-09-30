@@ -118,14 +118,14 @@ _review_page_max() {
 # The engine the editor probes, validated, so no warning line takes a row.
 _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 
-@test "egress measure: 26 packs on a 24 row terminal give a page of 7, not 26" {
+@test "egress measure: 26 packs on a 24 row terminal give a page of 6, not 26" {
   _rows_of 24
   _egress_term_now
   _EG_E=0
   _EGE_NHOST=0
   _egress_measure 26
   run echo "$_EG_PAGE"
-  assert_output "7"
+  assert_output "6"
 }
 
 @test "egress measure: 2 packs in a 50 row window give a page of 2, not 33" {
@@ -138,19 +138,30 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
   assert_output "2"
 }
 
-@test "egress measure: a 19 row terminal refuses the TUI and the text picker runs" {
+@test "egress measure: a 21 row terminal refuses the TUI and the text picker runs" {
   _EG_E=0
   _EGE_NHOST=0
-  _rows_of 19
+  _rows_of 21
   _egress_term_now
   run _egress_measure 26
   assert_failure
-  _rows_of 20
+  _rows_of 22
   _egress_term_now
   run _egress_measure 26
   assert_success
+  # And it still holds the editor once the first host is added, so adding
+  # one never drops to the typed picker.
+  _EGE_NHOST=1
+  run _egress_measure 26
+  assert_success
+  # With a host row, 21 rows are too few as well.
+  _rows_of 21
+  _egress_term_now
+  run _egress_measure 26
+  assert_failure
+  _EGE_NHOST=0
   mkdir -p "$CLEAT_CONFIG_DIR"
-  _rows_of 19
+  _rows_of 21
   _keys QUIT
   run _egress_editor "" <<< "q"
   assert_success
@@ -181,7 +192,7 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 @test "egress measure: host rows give way to pack rows in a short window" {
   _EG_E=0
   _EGE_NHOST=5
-  _rows_of 21
+  _rows_of 22
   _egress_term_now
   _egress_measure 26
   run echo "$_EG_HV $_EG_PAGE"
@@ -213,6 +224,14 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
   _egress_measure
   run bash -c 'wc -l' < <(_egress_draw 0)
   assert_output --regexp '^ *23$'
+  # A pack's hosts, scrolled in a short window, keep the same height.
+  _validated
+  _rows_of 18
+  _egress_editor_load ""
+  _egress_ix_of docs
+  _egress_hosts_open "$_EGX"
+  run bash -c 'wc -l' < <(_egress_draw)
+  assert_output --regexp '^ *17$'
 }
 
 @test "egress draw: the frame is the same height whichever row the cursor is on" {
@@ -260,10 +279,8 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
     assert_equal "${_EGC_CNT[i]}" "$(_egress_pack_hosts "$p" | grep -c . || true)"
     assert_equal "${_EGC_FLAGS[i]}" "$(_egress_pack_flags "$p")"
     assert_equal "${_EGC_WORD[i]}" "$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
-    # The editor's risk is the class word in plain words, and a refused
-    # capability is its own.
+    # The editor's risk is the class word in plain words.
     _egress_risk_of "${_EGC_WORD[i]}"
-    case ",${_EGC_FLAGS[i]}," in *,requires-cap,*) _EGK=4 ;; esac
     assert_equal "${_EGC_RISK[i]}" "$_EGK"
     # Every pack says what it is for.
     _egress_pack_purpose "$p"
@@ -377,7 +394,6 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
     ix="${_EGO[i]}"
     p="${_EGC_P[ix]}"
     line="$(printf '%s\n' "$_EGF" | _plainw | grep -E "^ {2,4}(> )?\[.\] $p +" || true)"
-    _egress_pack_refused "$ix" && { i=$((i + 1)); continue; }
     case "${_EGC_WORD[ix]}" in
       shared) assert_equal "${line##* ! }" "reaches other sites" ;;
       "open tenancy") assert_equal "${line##* ! }" "anyone can upload" ;;
@@ -608,25 +624,35 @@ pack = github"
 pack = github"
 }
 
-@test "egress picker: a refused capability pack cannot be ticked from the list, its hosts or the typed picker" {
+@test "egress picker: the containers pack ticks like any pack, for pulls without a Docker daemon" {
+  # It once needed the docker cap, which egress control refuses, so it could
+  # never be ticked. A registry pull needs no daemon (skopeo, crane, oras).
+  # With the cap the host daemon pulls, outside the box's egress anyway.
   mkdir -p "$CLEAT_CONFIG_DIR"
-  _rows_of 40
+  _rows_of 60
   _egress_editor_load ""
+  _egress_measure
+  run _plain "$(_egress_draw 0)"
+  assert_output --regexp "\[·\] containers +skopeo, crane and oras +! anyone can upload"
+  refute_output --partial "docker cap"
   _egress_toggle pack:containers
   run _egress_is_ticked containers
-  assert_failure
-  # Its hosts: space on a host that comes with it does nothing either.
+  assert_success
+  # From its hosts too: space on a host that comes with it ticks the pack.
+  _egress_toggle pack:containers
   _egress_ix_of containers
   _egress_hosts_open "$_EGX"
   _KEY=SPACE
   _egress_tui_key
   run _egress_is_ticked containers
-  assert_failure
+  assert_success
   _EG_SCREEN=list
-  run _egress_picker_text "" <<< $'containers\ndone'
-  assert_output --partial "containers needs the docker cap, which egress control refuses."
+  # And from the typed picker, which saves it.
+  _egress_editor_load ""
+  run _egress_picker_text "" <<< $'containers\ndone\ny'
+  refute_output --partial "docker cap"
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
-  refute_output --partial "containers"
+  assert_output --partial "pack = containers"
 }
 
 @test "egress picker: a pack with no default host cannot be ticked as a pack" {
@@ -760,9 +786,284 @@ allow = registry.yarnpkg.com"
   assert_output $'\033[H'
   run _plain "$(cat "$TEST_TEMP/out")"
   assert_output --partial "  Add a host > "
-  # The cursor waits on the frame's last line, after the label.
-  run grep -c $'\033\\[29;16H' "$TEST_TEMP/out"
-  assert_output "2"
+  # The line is drawn again on the frame's last line after every key. Only
+  # there, with the cursor left after what is typed.
+  run sort -u < <(grep -ao $'\033''\[[0-9]*;1H' "$TEST_TEMP/out")
+  assert_output $'\033[29;1H'
+}
+
+@test "egress picker: Esc goes back from every prompt and changes nothing" {
+  # Each prompt gets Esc, then more typing two seconds later, well after Esc
+  # has had its second. The prompt must be gone by then and leave that typing
+  # unread, so end of input cannot stand in for Esc. fd 7: bats owns fd 3.
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  local rest rc
+  # Add a host: what was typed is dropped.
+  rc=0
+  exec 7< <(printf 'docs.rs\033'; sleep 2; printf 'later.example.com\n')
+  _egress_add_prompt <&7 > "$TEST_TEMP/out.add" || rc=$?
+  IFS= read -r rest <&7 || true
+  exec 7<&-
+  assert_equal "$rc" 1
+  assert_equal "$rest" "later.example.com"
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output ""
+  run printf '%s' "$_EG_PROMPT"
+  assert_output ""
+  # Find a pack: the filter stays as it was.
+  _EGE_FILTER=git
+  _egress_rows_build
+  exec 7< <(printf 'npm\033'; sleep 2; printf 'later\n')
+  _egress_filter_prompt <&7 > "$TEST_TEMP/out.find"
+  IFS= read -r rest <&7 || true
+  exec 7<&-
+  assert_equal "$rest" "later"
+  run printf '%s' "$_EGE_FILTER"
+  assert_output "git"
+  _EGE_FILTER=""
+  _egress_rows_build
+  # The part in braces: no host, still on the pack's hosts.
+  _egress_ix_of atlassian
+  _egress_hosts_open "$_EGX"
+  _EG_HCUR=$(( ${#_EGH[@]} - 1 ))
+  rc=0
+  exec 7< <(printf 'acme\033'; sleep 2; printf 'later\n')
+  _egress_fill_prompt <&7 > "$TEST_TEMP/out.fill" || rc=$?
+  IFS= read -r rest <&7 || true
+  exec 7<&-
+  assert_equal "$rc" 1
+  assert_equal "$rest" "later"
+  run printf '%s|%s' "$_EGE_HOSTS" "$_EG_SCREEN"
+  assert_output "|hosts"
+  # Each prompt says so.
+  local f
+  for f in add find fill; do
+    run _plain "$(cat "$TEST_TEMP/out.$f")"
+    assert_output --partial "Esc goes back."
+  done
+}
+
+@test "egress picker: Esc in the add prompt goes back to the list and the editor carries on" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  local add
+  add="$(_row_index "$_EGRESS_ROW_ADD")"
+  # The keys after the prompt come from the list: the prompt reads its own
+  # line from stdin, which goes on after Esc has had its second.
+  _keys $(_downs "$add") SPACE UP QUIT
+  run _egress_picker_tui "" < <(printf 'docs.rs\033'; sleep 2; printf 'x\n')
+  assert_success
+  run _plain "$output"
+  refute_output --partial "Added"
+  assert_output --partial "Nothing saved."
+}
+
+@test "egress picker: Esc with a key right after it is still Esc and an Alt chord is dropped" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  local rest rc=0
+  # Esc, then an arrow inside Esc's second: still Esc. The arrow is read
+  # whole, so none of it lands anywhere.
+  exec 7< <(printf 'docs.rs\033\033[B'; sleep 2; printf 'x\n')
+  _egress_add_prompt <&7 > "$TEST_TEMP/out" || rc=$?
+  IFS= read -r rest <&7 || true
+  exec 7<&-
+  assert_equal "$rc" 1
+  assert_equal "$rest" "x"
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output ""
+  # Option+Left in Terminal.app sends ESC b. It moves nothing here and must
+  # not close the prompt, though no second byte follows within the second:
+  # bash 3.2 threw away the b and read it as Esc.
+  exec 7< <(printf 'docs.r\033b'; sleep 2; printf 's\n')
+  _egress_add_prompt <&7 > "$TEST_TEMP/out"
+  exec 7<&-
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output "docs.rs"
+}
+
+@test "egress picker: the key reader tells Esc from arrows, chords and longer sequences" {
+  local s want
+  for s in $'\e[A:UP' $'\eOA:UP' $'\eOB:DOWN' $'\e[C:RIGHT' $'\eOD:LEFT' $'\e:ESC' $'\eb:OTHER' $'\e[3~:OTHER' $'\e[1;5C:OTHER' $'\e\e[B:ESC' $'\e\e:ESC'; do
+    want="${s##*:}"
+    _egress_key <<< "${s%:*}"
+    assert_equal "$_KEY" "$want"
+  done
+  # A longer sequence is read to its end: the key after it is the next key.
+  _egress_key < <(printf '\033[3~q')
+  assert_equal "$_KEY" OTHER
+  { _egress_key; _egress_key; } < <(printf '\033[3~q')
+  assert_equal "$_KEY" QUIT
+}
+
+@test "egress picker: a key that is not plain ASCII shows as ? and is never dropped from the line" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30 60
+  _egress_editor_load ""
+  _egress_measure
+  # A paste of bücher.de must not become bcher.de.
+  _egress_add_prompt < <(printf 'b\303\274cher.de\n') > "$TEST_TEMP/out" || true
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output ""
+  run _plain "$(cat "$TEST_TEMP/out")"
+  assert_output --partial "Only plain ASCII can be typed here."
+  assert_output --regexp "Add a host > b\?+cher\.de"
+  # Wide characters never widen the line past the window.
+  local o
+  _egress_add_prompt < <(printf '%s\033' "$(printf '例%.0s' $(seq 1 40))") > "$TEST_TEMP/out" || true
+  # A refusal draws the frame again from the top left, so split there too.
+  o="$(cat "$TEST_TEMP/out")"
+  o="${o//$'\033[29;1H'/$'\n'}"
+  run _widest < <(_plainw <<< "${o//$'\033[H'/$'\n'}")
+  assert [ "$output" -lt 60 ]
+}
+
+@test "egress picker: a prompt holds 253 characters, shows the cursor while typing and hides it after" {
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  _egress_prompt_line "Add a host >" < <(printf '%s\n' "$(printf 'a%.0s' $(seq 1 300))") > "$TEST_TEMP/out"
+  assert_equal "${#_EG_IN}" 253
+  run grep -c $'\033\\[?25h' "$TEST_TEMP/out"
+  assert_output "1"
+  run tail -c 6 "$TEST_TEMP/out"
+  assert_output $'\033[?25l'
+}
+
+@test "egress picker: a resize while typing ends the prompt when the window is too small and redraws it when not" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  # The resize arrives after the second key, while the prompt waits for the
+  # third: the check after that key must see it.
+  eval "$(declare -f _egress_prompt_echo | sed '1s/_egress_prompt_echo/_eg_echo_real/')"
+  _EG_NECHO=0
+  _EG_TO=15
+  _egress_prompt_echo() {
+    _EG_NECHO=$((_EG_NECHO + 1))
+    if [ "$_EG_NECHO" = 3 ]; then
+      _EG_WINCH=1
+      eval "_egress_term_now() { _EG_ROWS=$_EG_TO; _EG_RAWCOLS=110; }"
+    fi
+    _eg_echo_real
+  }
+  local rc=0
+  _egress_add_prompt < <(printf 'docs.rs\n') > "$TEST_TEMP/out" || rc=$?
+  assert_equal "$rc" 1
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output ""
+  # Grown to 40 rows: the frame is drawn again and the line moves to its
+  # last row. The name goes in.
+  _egress_term_now() { _EG_ROWS=30; _EG_RAWCOLS=110; }
+  _egress_term_now
+  _egress_measure
+  _EG_NECHO=0
+  _EG_TO=40
+  _egress_add_prompt < <(printf 'docs.rs\n') > "$TEST_TEMP/out"
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output "docs.rs"
+  run grep -c $'\033\\[39;1H' "$TEST_TEMP/out"
+  refute_output "0"
+}
+
+@test "egress picker: a prompt edits its line a key at a time" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  local in
+  # Backspace (both bytes), Ctrl-U, arrows and longer key sequences, a tab.
+  for in in 'docs.rx\177s' 'docs.rt\bs' 'junk\025docs.rs' 'do\033[Dcs\033[3~.rs\033[1;5C' 'do\tcs.\033OArs' 'docs.r\033bs'; do
+    _egress_editor_load ""
+    _egress_measure
+    _egress_add_prompt < <(printf "$in\n") > "$TEST_TEMP/out"
+    run printf '%s' "$_EGE_HOSTS"
+    assert_output "docs.rs"
+  done
+  # Ctrl-D on an empty line goes back, on a typed one it is ignored.
+  _egress_editor_load ""
+  _egress_measure
+  _egress_add_prompt < <(printf '\004docs.rs\n') > "$TEST_TEMP/out" || true
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output ""
+  _egress_add_prompt < <(printf 'docs\004.rs\n') > "$TEST_TEMP/out"
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output "docs.rs"
+}
+
+@test "egress picker: a long typed line keeps its end in view and never wraps" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  local c long o
+  long="$(printf 'a%.0s' $(seq 1 150)).example.com"
+  for c in 60 80; do
+    _rows_of 30 "$c"
+    _egress_editor_load ""
+    _egress_measure
+    _egress_add_prompt < <(printf '%s\033' "$long") > "$TEST_TEMP/out" || true
+    # Each redraw of the line, one per row.
+    o="$(cat "$TEST_TEMP/out")"
+    run _plainw <<< "${o##*$'\033[29;1H'}"
+    assert_output --regexp "Add a host > ~a+\.example\.com$"
+    run _widest < <(_plainw <<< "${o//$'\033[29;1H'/$'\n'}")
+    assert [ "$output" -lt "$c" ]
+  done
+}
+
+@test "egress picker: typing in a prompt forks nothing" {
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  local words log="$TEST_TEMP/forks"
+  words=" $(compgen -b | tr '\n' ' ') $(compgen -k | tr '\n' ' ') (( [[ "
+  : > "$log"
+  _fd_trap() {
+    case "${BASH_COMMAND//'$(('/}" in *'$('*|*'`'*|*'<('*|*'>('*|*' | '*) printf 'subst: %s\n' "$BASH_COMMAND" >> "$log" ;; esac
+    local w="${BASH_COMMAND%% *}"
+    case "$w" in *=*) return 0 ;; esac
+    declare -F "$w" >/dev/null 2>&1 && return 0
+    case "$words" in *" $w "*) return 0 ;; esac
+    printf 'external: %s\n' "$BASH_COMMAND" >> "$log"
+  }
+  printf 'docs.rx\177s\033[Dz\025docs.rs\n' > "$TEST_TEMP/in"
+  set -T
+  trap '_fd_trap' DEBUG
+  _egress_prompt_line "Add a host >" < "$TEST_TEMP/in" > "$TEST_TEMP/out"
+  trap - DEBUG
+  set +T
+  run cat "$log"
+  assert_output ""
+  run printf '%s' "$_EG_IN"
+  assert_output "docs.rs"
+}
+
+@test "egress draw: one blank line always sits over the footer, however full the pane" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 40
+  local box i out ix
+  for box in "" main; do
+    _egress_editor_load "$box"
+    _egress_measure
+    i=0
+    while [ "$i" -lt "${#_EGR[@]}" ]; do
+      out+="$(_egress_draw "$i")"$'\n'
+      i=$((i + 1))
+    done
+    for ix in "${_EGO[@]}"; do
+      _egress_hosts_open "$ix"
+      out+="$(_egress_draw)"$'\n'
+      _EG_SCREEN=list
+    done
+  done
+  # The line over every "On save:" is blank, even under a full pane (the mode
+  # row's is).
+  run awk '/On save:/ { n++; if (prev !~ /^[[:space:]]*$/) bad++ } { prev = $0 } END { print n + 0, bad + 0 }' < <(_plainw <<< "$out")
+  assert_output --regexp "^[1-9][0-9]* 0$"
 }
 
 @test "egress picker: the review has a screen of its own and a no brings the list back" {
@@ -1069,19 +1370,19 @@ allow = extra.example.com"
   assert_output --partial "host:registry.npmjs.org"
 }
 
-@test "egress box: a refused pack already in the file shows ticked and can be unticked" {
+@test "egress box: a pack with no default host already in the file shows ticked and can be unticked" {
   mkdir -p "$CLEAT_CONFIG_DIR"
-  printf '[egress]\nmode = strict\npack = containers\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nmode = strict\npack = github-objects\n' > "$CLEAT_GLOBAL_CONFIG"
   _rows_of 40
   _egress_editor_load ""
   _egress_measure
   run _plain "$(_egress_draw 0)"
-  assert_output --regexp "\[✔\] containers"
-  _egress_toggle pack:containers
+  assert_output --regexp "\[✔\] github-objects"
+  _egress_toggle pack:github-objects
   run printf '%s' "$_EGE_PACKS"
   assert_output ""
   # And, off again, it never ticks back.
-  _egress_toggle pack:containers
+  _egress_toggle pack:github-objects
   run printf '%s' "$_EGE_PACKS"
   assert_output ""
 }
@@ -1331,7 +1632,7 @@ allow = extra.example.com"
     case "$words" in *" $w "*) return 0 ;; esac
     printf 'external: %s\n' "$BASH_COMMAND" >> "$log"
   }
-  for s in x q $'\e[B'; do
+  for s in x q $'\e[B' $'\eOA' $'\eb' $'\e\e[B' $'\e[1;5C'; do
     set -T
     trap '_fd_trap' DEBUG
     _egress_key <<< "$s"

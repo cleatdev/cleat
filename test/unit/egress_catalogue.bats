@@ -52,7 +52,7 @@ _field() { _egress_catalogue_records | awk -F'\t' -v h="$1" -v f="$2" '$2 == h &
   run printf '%s' "$bad"
   assert_output ""
   run bash -c 'wc -l' < <(_egress_catalogue_records)
-  assert_output --regexp '^ *82$'
+  assert_output --regexp '^ *83$'
 }
 
 @test "egress catalogue: an unclassified host renders as unaudited" {
@@ -257,12 +257,16 @@ uploads.github.com"
 
 @test "egress catalogue: the published catalogue file matches the shipped table row for row" {
   local want got
+  # The flags too: the published column is each token in backticks.
   want="$(_egress_catalogue_records | while IFS=$'\t' read -r p h c f l cert why; do
-    printf '%s|%s|%s|%s\n' "$p" "$h" "$(_egress_class_word "$c" "$f")" "$l"
+    fl=""
+    [ "$f" = - ] || fl="\`${f//,/\` \`}\`"
+    printf '%s|%s|%s|%s|%s\n' "$p" "$h" "$(_egress_class_word "$c" "$f")" "$fl" "$l"
   done)"
   got="$(grep '^| `' "$PUBLISHED" | awk -F' [|] ' '{
     p=$1; sub(/^[|] /, "", p); gsub(/`/, "", p); h=$2; gsub(/`/, "", h);
-    l=$5; sub(/ [|]$/, "", l); print p "|" h "|" $3 "|" l }')"
+    f=$4; sub(/^ +/, "", f); sub(/ +$/, "", f);
+    l=$5; sub(/ [|]$/, "", l); print p "|" h "|" $3 "|" f "|" l }')"
   run diff <(printf '%s\n' "$want") <(printf '%s\n' "$got")
   assert_success
   assert_output ""
@@ -343,7 +347,9 @@ s3.amazonaws.com"
 
 @test "egress catalogue: a pack's flags are the union in the closed-set order" {
   run _egress_pack_flags containers
-  assert_output "open-tenancy,requires-cap"
+  assert_output "open-tenancy"
+  run _egress_pack_flags github-objects
+  assert_output "sub-tick,open-tenancy"
   run _egress_pack_flags claude
   assert_output "core,locked"
   run _egress_pack_flags github

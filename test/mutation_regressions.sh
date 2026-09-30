@@ -13928,7 +13928,7 @@ cat > "$SED_TMP" << 'SED'
   s@^  if \[ "[$]total" -lt "[$]avail" \]; then _EG_PAGE="[$]total"; else _EG_PAGE="[$]avail"; fi@  _EG_PAGE="$total"@
 }
 SED
-try "vnext_egress_measure_min" "26 packs on a 24 row terminal give a page of 7, not 26" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_measure_min" "26 packs on a 24 row terminal give a page of 6, not 26" "$CLI" "$EGRESS_UI_BATS"
 
 # A window that cannot hold _EGRESS_MIN_PAGE pack rows runs the typed picker.
 cat > "$SED_TMP" << 'SED'
@@ -13936,11 +13936,11 @@ cat > "$SED_TMP" << 'SED'
   s@^  \[ "[$]avail" -lt "[$]_EGRESS_MIN_PAGE" \] && return 1@  [ "$avail" -lt 1 ] \&\& avail=1@
 }
 SED
-try "vnext_egress_measure_min_window" "a 19 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_measure_min_window" "a 21 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
 
 # The chrome budget carries the shell prompt's row, which is never drawn.
 cat > "$SED_TMP" << 'SED'
-s|^_EGRESS_CHROME_LINES=13|_EGRESS_CHROME_LINES=12|
+s|^_EGRESS_CHROME_LINES=14|_EGRESS_CHROME_LINES=13|
 SED
 try "vnext_egress_chrome_reserves_the_prompt_row" "a saturated page draws one line fewer than the terminal has rows" "$CLI" "$EGRESS_UI_BATS"
 
@@ -16600,17 +16600,10 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_enter_saves_anywhere" "enter reviews and saves from any row" "$CLI" "$EGRESS_UI_BATS"
 
-# M4 and S5: a refused pack and a pack with no host of its own never tick.
+# S5: a pack with no host of its own never ticks as a pack.
 cat > "$SED_TMP" << 'SED'
 /^_egress_toggle()/,/^}$/{
-  /^        _egress_pack_refused "\$ix" && return 0$/d
-}
-SED
-try "vnext_egress_refused_cap_toggle" "a refused capability pack cannot be ticked from the list" "$CLI" "$EGRESS_UI_BATS"
-
-cat > "$SED_TMP" << 'SED'
-/^_egress_toggle()/,/^}$/{
-  /^        \[ "\${_EGC_CNT\[ix\]}" = 0 \] && return 0$/d
+  s@^        \[ "\${_EGC_CNT\[ix\]}" = 0 \] && return 0$@        :@
 }
 SED
 try "vnext_egress_no_default_host" "a pack with no default host cannot be ticked as a pack" "$CLI" "$EGRESS_UI_BATS"
@@ -16662,8 +16655,8 @@ try "vnext_egress_frame_clears" "every frame starts at the top left and clears w
 
 # Prompts and the review draw inside the full screen, never under a list.
 cat > "$SED_TMP" << 'SED'
-/^_egress_prompt_line()/,/^}$/{
-  s@^  printf '\\033\[%d;%dH' "\$_EG_FL" "\$(( \${#1} + 4 ))"$@  echo ""@
+/^_egress_prompt_echo()/,/^}$/{
+  s@^  printf '\\033\[%d;1H\\033\[K  %s%s%s %s' "\$_EG_FL" @  printf '\\n  %s%s%s %s' @
 }
 SED
 try "vnext_egress_prompt_in_frame" "a prompt draws inside the frame, never under it" "$CLI" "$EGRESS_UI_BATS"
@@ -16686,7 +16679,7 @@ try "vnext_egress_editor_refuses_first" "the editor never opens when a save woul
 # The key reader decodes as _read_keypress does.
 cat > "$SED_TMP" << 'SED'
 /^_egress_key()/,/^}$/{
-  s@^        "\[C") _KEY=RIGHT ;;$@        "[C") _KEY=ESC ;;@
+  s@^        "\[C"|OC) _KEY=RIGHT ;;$@        "[C"|OC) _KEY=ESC ;;@
 }
 SED
 try "vnext_egress_key_right_not_esc" "the editor key reader decodes every sequence" "$CLI" "$EGRESS_UI_BATS"
@@ -16718,7 +16711,7 @@ cat > "$SED_TMP" << 'SED'
   s@^      if ! _egress_pack_on "\$p"; then$@      if true; then@
 }
 SED
-try "vnext_egress_refused_on_untick" "a refused pack already in the file shows ticked and can be unticked" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_refused_on_untick" "a pack with no default host already in the file shows ticked and can be unticked" "$CLI" "$EGRESS_UI_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_editor_load()/,/^}$/{
@@ -16942,7 +16935,7 @@ cat > "$SED_TMP" << 'SED'
   s@^    echo -e "  Mode \${_EGE_MODE} \${DIM}(\${_EGT})\${RESET}"$@    echo -e "  Mode ${_EGE_MODE}"@
 }
 SED
-try "vnext_egress_typed_meaning" "a 19 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_typed_meaning" "a 21 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_tui_review()/,/^}$/{
@@ -16978,6 +16971,165 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_offbox_redeny_regr" "a pack shown off for a box stayed allowed in its file"
+
+# ── The editor's prompts, footer and containers pack (2026-09-30) ──
+# Esc goes back from a prompt at once, leaving what is typed next unread.
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  s@^        \[ -z "[$]_EGQ" \] && { rc=1; break; } ;;$@        : ;;@
+}
+SED
+try "vnext_egress_prompt_esc_regr" "Esc did not leave the egress editor's add-a-host prompt"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  s@^      [$]'\\177'|[$]'\\b') _EG_IN="[$]{_EG_IN%?}" ;;$@      $'\\177'|$'\\b') ;;@
+}
+SED
+try "vnext_egress_prompt_backspace" "a prompt edits its line a key at a time" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  s@^      [$]'\\025') _EG_IN="" ;;$@      $'\\025') ;;@
+}
+SED
+try "vnext_egress_prompt_ctrl_u" "a prompt edits its line a key at a time" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_esc_rest()/,/^}$/{
+  s@^  while \[ "[$]n" -lt 8 \]; do$@  while [ "$n" -lt 0 ]; do@
+}
+SED
+try "vnext_egress_prompt_seq_rest" "a prompt edits its line a key at a time" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  /^      \[\[:cntrl:\]\]) ;;$/d
+}
+SED
+try "vnext_egress_prompt_cntrl" "a prompt edits its line a key at a time" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_echo()/,/^}$/{
+  /^  if \[ "[$]{#t}" -gt "[$]room" \]; then/d
+}
+SED
+try "vnext_egress_prompt_scroll" "a long typed line keeps its end in view and never wraps" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_echo()/,/^}$/{
+  s@ "[$]_EG_FL" "[$]_EGX_B"@ "$((_EG_FL + 1))" "$_EGX_B"@
+}
+SED
+try "vnext_egress_prompt_echo_row" "a prompt draws inside the frame, never under it" "$CLI" "$EGRESS_UI_BATS"
+
+# One blank line over the footer on the list and on a pack's hosts.
+cat > "$SED_TMP" << 'SED'
+/^_egress_frame_list()/,/^}$/{
+  /^  # One blank line over the footer, however full the pane is\.$/{
+    n
+    d
+  }
+}
+SED
+try "vnext_egress_footer_blank_list" "one blank line always sits over the footer" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_frame_hosts()/,/^}$/{
+  /^  _egress_pane_lines$/{
+    n
+    d
+  }
+}
+SED
+try "vnext_egress_footer_blank_hosts" "one blank line always sits over the footer" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_frame_hosts()/,/^}$/{
+  s@^  page=[$](( _EG_ROWS - 13 - _EG_E ))$@  page=$(( _EG_ROWS - 12 - _EG_E ))@
+}
+SED
+try "vnext_egress_hosts_page_lines" "a saturated page draws one line fewer than the terminal has rows" "$CLI" "$EGRESS_UI_BATS"
+
+# Esc read one byte at a time: a second Esc is Esc, a chord is not.
+cat > "$SED_TMP" << 'SED'
+/^_egress_esc_rest()/,/^}$/{
+  s@^    [$]'\\e') _egress_esc_rest; _EGQ=""; return 0 ;;$@    $'\\e') _EGQ=x; return 0 ;;@
+}
+SED
+try "vnext_egress_esc_twice" "Esc with a key right after it is still Esc" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_esc_rest()/,/^}$/{
+  s@^    \*) _EGQ="[$]b"; return 0 ;;$@    *) _EGQ=""; return 0 ;;@
+}
+SED
+try "vnext_egress_esc_chord" "Esc with a key right after it is still Esc" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_esc_rest()/,/^}$/{
+  s@^    case "[$]b" in \[0123456789\\;\]) ;; \*) return 0 ;; esac$@    return 0@
+}
+SED
+try "vnext_egress_esc_seq_final" "the key reader tells Esc from arrows, chords and longer sequences" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_key()/,/^}$/{
+  s@^        "\[A"|OA) _KEY=UP ;;$@        "[A") _KEY=UP ;;@
+}
+SED
+try "vnext_egress_key_ss3" "the key reader tells Esc from arrows, chords and longer sequences" "$CLI" "$EGRESS_UI_BATS"
+
+# A key outside plain ASCII shows as ?, so a paste never loses a character.
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  /^            \[ "[$]{#_EG_IN}" -lt 253 \] && _EG_IN="[$]_EG_IN?"$/d
+}
+SED
+try "vnext_egress_prompt_placeholder" "a key that is not plain ASCII shows as" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  s@-lt 253 \] && _EG_IN="[$]_EG_IN[$]c"@-lt 99999 ] \&\& _EG_IN="$_EG_IN$c"@
+}
+SED
+try "vnext_egress_prompt_cap" "a prompt holds 253 characters" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  /^  printf '\\033\[?25h'$/d
+}
+SED
+try "vnext_egress_prompt_cursor_on" "a prompt holds 253 characters" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  /^  printf '\\033\[?25l'$/d
+}
+SED
+try "vnext_egress_prompt_cursor_off" "a prompt holds 253 characters" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  /^      _egress_measure || { rc=1; break; }$/d
+}
+SED
+try "vnext_egress_prompt_resize_measure" "a resize while typing ends the prompt" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  /^      _egress_draw "[$]_EG_CUR"$/d
+}
+SED
+try "vnext_egress_prompt_resize_redraw" "a resize while typing ends the prompt" "$CLI" "$EGRESS_UI_BATS"
+
+# A window that opens the editor keeps it when the first host is added.
+cat > "$SED_TMP" << 'SED'
+/^_egress_measure()/,/^}$/{
+  s@^    \[ [$]((avail - 1)) -lt "[$]_EGRESS_MIN_PAGE" \] && return 1$@    :@
+}
+SED
+try "vnext_egress_measure_host_room" "a 21 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

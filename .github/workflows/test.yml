@@ -411,8 +411,9 @@ jobs:
     # The whole suite took 44 minutes, then its step alone 49.7, and one run was
     # killed at the old 45 with nothing printed. Four shards like the macOS leg,
     # each about a quarter of that. The step times out before the job so the job
-    # survives to print how far it got.
-    timeout-minutes: 50
+    # survives to print how far it got. Shard 3 took 37 of the step's 40 minutes
+    # on 2026-09-30, so both went up by ten.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -483,7 +484,7 @@ jobs:
           rc=0; bash ./test.sh > /tmp/suite.log 2>&1 < /dev/null || rc=$?
           cat /tmp/suite.log; : > /tmp/suite.printed; exit "$rc"
         # 25 cancelled a shard mid regressions.bats on 2026-09-26.
-        timeout-minutes: 40
+        timeout-minutes: 50
       # Same reason as the mutation job: the suite writes to a file, so a killed
       # step prints nothing. This runs only when the step above failed, and
       # prints only when it never reached its own cat.

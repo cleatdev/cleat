@@ -9841,12 +9841,13 @@ ruby	index.rubygems.org	C	-	h1+h2, 2026-09-21	DD:93:EA:BE:2C:61:21:83:AB:C9:F5:8
 maven	repo1.maven.org	B	-	h1+h2, 2026-09-21	3B:62:E2:3C:46:BC:42:7B:25:74:90:0C:4D:EF:A8:01:9A:58:2C:AD:73:7E:34:12:AC:16:28:A3:83:27:CA:40	Maven Central
 maven	plugins.gradle.org	B	-	h1 only, no h2 offered, 2026-09-21	B1:D5:B9:07:D2:53:70:C3:AF:F8:C9:78:95:86:9D:6B:2A:8F:FD:BC:EA:B4:CF:05:AF:EB:DB:DC:DA:EE:5A:69	The Gradle plugin portal
 maven	services.gradle.org	B	-	h1 only, no h2 offered, 2026-09-21	B1:D5:B9:07:D2:53:70:C3:AF:F8:C9:78:95:86:9D:6B:2A:8F:FD:BC:EA:B4:CF:05:AF:EB:DB:DC:DA:EE:5A:69	Gradle distributions
-containers	registry-1.docker.io	B	requires-cap	h1+h2, 2026-09-21	AA:AB:BB:8B:DF:D5:6B:6E:E1:92:AE:FD:D9:89:DD:35:D1:1C:9A:33:7C:78:22:AE:00:DD:3F:D0:68:FA:DF:48	Docker Hub, which needs the docker capability egress control refuses
-containers	auth.docker.io	B	requires-cap	h1+h2, 2026-09-21	D1:80:3D:16:1E:A6:B4:99:57:A6:B4:0B:05:BF:18:59:24:20:E8:92:D8:63:A1:B6:A3:B6:8D:D1:B0:AF:A9:18	Docker Hub, which needs the docker capability egress control refuses
-containers	production.cloudflare.docker.com	B	requires-cap	h1+h2, 2026-09-21	B7:E5:00:E4:5F:B3:79:E0:5E:FF:98:C2:CA:2F:AB:CB:93:D0:92:EB:95:C0:F6:D5:26:02:69:D7:32:99:95:67	Docker Hub, which needs the docker capability egress control refuses
-containers	index.docker.io	B	requires-cap	h1+h2, 2026-09-21	AA:AB:BB:8B:DF:D5:6B:6E:E1:92:AE:FD:D9:89:DD:35:D1:1C:9A:33:7C:78:22:AE:00:DD:3F:D0:68:FA:DF:48	Docker Hub, which needs the docker capability egress control refuses
-containers	ghcr.io	B	requires-cap	h1+h2, 2026-09-21	A8:34:58:AF:8B:8F:AC:89:2E:2E:50:21:4E:75:37:0F:F1:EC:B2:ED:4B:C3:B8:C0:89:6E:2D:48:6A:85:FE:6E	GitHub Container Registry, which needs the docker capability
-containers	pkg-containers.githubusercontent.com	C	open-tenancy,requires-cap	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	GHCR blobs, same edge as raw.githubusercontent.com
+containers	registry-1.docker.io	B	-	h1+h2, 2026-09-21	AA:AB:BB:8B:DF:D5:6B:6E:E1:92:AE:FD:D9:89:DD:35:D1:1C:9A:33:7C:78:22:AE:00:DD:3F:D0:68:FA:DF:48	Docker Hub, for image pulls without a Docker daemon
+containers	auth.docker.io	B	-	h1+h2, 2026-09-21	D1:80:3D:16:1E:A6:B4:99:57:A6:B4:0B:05:BF:18:59:24:20:E8:92:D8:63:A1:B6:A3:B6:8D:D1:B0:AF:A9:18	Docker Hub, for image pulls without a Docker daemon
+containers	production.cloudflare.docker.com	B	-	h1+h2, 2026-09-21	B7:E5:00:E4:5F:B3:79:E0:5E:FF:98:C2:CA:2F:AB:CB:93:D0:92:EB:95:C0:F6:D5:26:02:69:D7:32:99:95:67	Docker Hub layers, on its earlier CDN
+containers	production.cloudfront.docker.com	B	-	h1+h2, 2026-09-30	0B:55:2F:3E:98:7C:1B:C6:03:DB:C2:A8:AA:55:12:CD:69:79:4F:34:D7:4E:5E:5E:45:14:66:37:F8:B3:1C:2A	Docker Hub layers, where pulls are sent today
+containers	index.docker.io	B	-	h1+h2, 2026-09-21	AA:AB:BB:8B:DF:D5:6B:6E:E1:92:AE:FD:D9:89:DD:35:D1:1C:9A:33:7C:78:22:AE:00:DD:3F:D0:68:FA:DF:48	Docker Hub, for image pulls without a Docker daemon
+containers	ghcr.io	B	-	h1+h2, 2026-09-21	A8:34:58:AF:8B:8F:AC:89:2E:2E:50:21:4E:75:37:0F:F1:EC:B2:ED:4B:C3:B8:C0:89:6E:2D:48:6A:85:FE:6E	GitHub Container Registry, for image pulls without a Docker daemon
+containers	pkg-containers.githubusercontent.com	C	open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	GHCR blobs, same edge as raw.githubusercontent.com
 homebrew	formulae.brew.sh	C	open-tenancy	h1+h2, 2026-09-21	C0:CA:FD:C2:FB:47:64:BB:2C:1A:9F:0A:B5:6F:C3:F6:91:AB:FA:C4:46:BF:90:AD:2F:D9:7B:A7:EC:2B:47:8B	Homebrew formulae, on the GitHub Pages edge
 homebrew	ghcr.io	B	-	h1+h2, 2026-09-21	A8:34:58:AF:8B:8F:AC:89:2E:2E:50:21:4E:75:37:0F:F1:EC:B2:ED:4B:C3:B8:C0:89:6E:2D:48:6A:85:FE:6E	Homebrew bottles from GHCR
 homebrew	pkg-containers.githubusercontent.com	C	open-tenancy	h1+h2, 2026-09-21	71:F1:07:7D:B3:77:FD:7B:8D:68:38:0D:A6:6F:A6:82:38:A3:03:B2:91:1B:CB:77:0B:3B:2A:42:66:93:CF:84	GHCR blobs, same edge as raw.githubusercontent.com
@@ -9867,7 +9868,7 @@ CATALOGUE
 
 # The flag vocabulary, closed and ordered (7.1). A record's flags follow this
 # order and carry nothing else.
-_EGRESS_FLAG_TOKENS="core locked default sub-tick open-tenancy parameterised no-security requires-cap deprecated"
+_EGRESS_FLAG_TOKENS="core locked default sub-tick open-tenancy parameterised no-security deprecated"
 
 # Every record, after the one check a reader must make: an unknown flag token
 # refuses the whole catalogue rather than being dropped, because a mistyped
@@ -14560,14 +14561,18 @@ _egress_cmd_inherit() {                  # <box> <assume_yes>
 # lines, never more than the window's rows minus one, so drawing it can never
 # scroll the screen it is drawn on. Change the frame and change these in the
 # same commit: they are counted, never guessed.
-_EGRESS_CHROME_LINES=13   # twelve fixed lines: title, subtitle, blank, mode
+_EGRESS_CHROME_LINES=14   # thirteen fixed lines: title, subtitle, blank, mode
                           # row, blank, packs header, find row, hosts header,
-                          # add row, blank, status, legend. Plus one row kept
-                          # free.
+                          # add row, blank, blank over the footer, status,
+                          # legend. Plus one row kept free.
 _EGRESS_PANE_LINES=4      # the detail pane under the lists, padded
 _EGRESS_HOST_VIEW=3       # most host rows shown at once, scrolling
 _EGRESS_MIN_PAGE=3        # fewest pack rows that still get the full screen
 _EGRESS_MIN_COLS=60       # narrowest window that gets the full screen
+# What a prompt takes from the keyboard: printable ASCII, listed rather than a
+# range, which can collate in a UTF-8 locale. A host name, a pack name and a
+# name's part are all ASCII. A wide character would wrap the line.
+_EGRESS_TYPABLE=$' !"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~'
 _EGRESS_ROW_ADD="+add"
 _EGRESS_ROW_FILTER="+filter"
 _EG_E=0
@@ -14630,6 +14635,11 @@ _egress_measure() {                      # [<packs to show>]
     _EG_HV=$((_EG_HV - 1))
     avail=$((avail + 1))
   done
+  # With no host yet, keep room for one: a window that opens the editor must
+  # still hold it once a host is added, or the first one drops to typing.
+  if [ "$_EG_HV" = 0 ]; then
+    [ $((avail - 1)) -lt "$_EGRESS_MIN_PAGE" ] && return 1
+  fi
   [ "$avail" -lt "$_EGRESS_MIN_PAGE" ] && return 1
   [ "$total" -lt 1 ] && total=1
   if [ "$total" -lt "$avail" ]; then _EG_PAGE="$total"; else _EG_PAGE="$avail"; fi
@@ -14807,7 +14817,7 @@ _egress_pack_purpose() {                 # <pack>
     rust) _EGT='cargo and Rust toolchains' ;;
     ruby) _EGT='gem and bundler' ;;
     maven) _EGT='Maven Central and Gradle' ;;
-    containers) _EGT='docker pull' ;;
+    containers) _EGT='skopeo, crane and oras' ;;
     homebrew) _EGT='brew install' ;;
     huggingface) _EGT='models and datasets' ;;
     playwright) _EGT='Playwright browsers' ;;
@@ -14820,8 +14830,7 @@ _egress_pack_purpose() {                 # <pack>
 # The editor's plain words for a catalogue class word, the only risk words it
 # shows. The class words stay in cleat egress packs, --list and the published
 # catalogue. Into _EGK: 0 reaches that service alone, 1 reaches other sites,
-# 2 anyone can upload, 3 not checked. A pack that needs a refused capability
-# is 4, set by the cache, never by a class.
+# 2 anyone can upload, 3 not checked.
 _egress_risk_of() {                      # <class word>
   case "$1" in
     "single origin"|contained) _EGK=0 ;;
@@ -14837,7 +14846,6 @@ _egress_risk_tag() {                     # <risk>
     1) _EGT="! reaches other sites" ;;
     2) _EGT="! anyone can upload" ;;
     3) _EGT="! not checked" ;;
-    4) _EGT="needs the docker cap" ;;
     *) _EGT="" ;;
   esac
   return 0
@@ -14848,7 +14856,6 @@ _egress_risk_line() {                    # <risk>
     1) _EGT="! This also reaches other sites on the same server." ;;
     2) _EGT="! Anyone can upload here. Data can leave through it." ;;
     3) _EGT="! Cleat has not checked what else answers here." ;;
-    4) _EGT="✘ Needs the docker cap, which egress control refuses." ;;
     *) _EGT="Reaches this service and nothing else." ;;
   esac
   return 0
@@ -15178,7 +15185,6 @@ EOF
            C) _EGC_WORD[i]=shared ;; *) _EGC_WORD[i]=unaudited ;; esac ;;
     esac
     _egress_risk_of "${_EGC_WORD[i]}"
-    case ",$out," in *,requires-cap,*) _EGK=4 ;; esac
     _EGC_RISK[i]="$_EGK"
     _egress_pack_purpose "${_EGC_P[i]}"
     _EGC_PURP[i]="$_EGT"
@@ -15259,11 +15265,6 @@ _egress_host_ix() {                      # <host>
 _egress_host_risk() {                    # <host>
   if _egress_host_ix "$1"; then _EGK="${_EGK_R[_EGX]}"; else _EGK=3; fi
   return 0
-}
-
-_egress_pack_refused() {                 # <cache index>
-  case ",${_EGC_FLAGS[$1]}," in *,requires-cap,*) return 0 ;; esac
-  return 1
 }
 
 # Whether a pack is on for what the editor shows: the file's own, or for a
@@ -15379,22 +15380,20 @@ _egress_offbox_denies() {
 }
 
 # The order packs are listed in, fixed for the session: on when the editor
-# opened, then found in this project or suggested, then the catalogue order,
-# and a pack that needs a refused capability last unless it is on. The core
-# is never a row.
+# opened, then found in this project or suggested, then the catalogue order.
+# The core is never a row.
 _egress_editor_order() {
   local i pass p
   _EGO=()
-  for pass in 1 2 3 4; do
+  for pass in 1 2 3; do
     i=0
     while [ "$i" -lt "${#_EGC_P[@]}" ]; do
       p="${_EGC_P[i]}"
       if [ "$p" != claude ]; then
         case "$pass" in
           1) if _egress_pack_on "$p"; then _EGO+=("$i"); fi ;;
-          2) if ! _egress_pack_on "$p" && ! _egress_pack_refused "$i" && [ -n "${_EGC_DET[i]}" ]; then _EGO+=("$i"); fi ;;
-          3) if ! _egress_pack_on "$p" && ! _egress_pack_refused "$i" && [ -z "${_EGC_DET[i]}" ]; then _EGO+=("$i"); fi ;;
-          4) if _egress_pack_refused "$i" && ! _egress_pack_on "$p"; then _EGO+=("$i"); fi ;;
+          2) if ! _egress_pack_on "$p" && [ -n "${_EGC_DET[i]}" ]; then _EGO+=("$i"); fi ;;
+          3) if ! _egress_pack_on "$p" && [ -z "${_EGC_DET[i]}" ]; then _EGO+=("$i"); fi ;;
         esac
       fi
       i=$((i + 1))
@@ -15515,9 +15514,8 @@ _egress_editor_changed() {
 
 # ── Changes, in the shell itself ──
 
-# Space on a pack or a host row. A pack that needs a refused capability, and
-# a pack with no default host, never tick from any door (one already on can
-# still go off). The global editor ticks and unticks its own packs. A box
+# Space on a pack or a host row. A pack with no default host never ticks as
+# a pack from any door (one already on can still go off). The global editor ticks and unticks its own packs. A box
 # turns a pack every box has off for itself (M20): the hosts only that pack
 # provides are denied in its own file, worked out again after every change
 # (_egress_offbox_denies). A pack's tick never touches the user's own blocks:
@@ -15532,7 +15530,6 @@ _egress_toggle() {                       # <row>
       _egress_ix_of "$p" || return 0
       ix="$_EGX"
       if ! _egress_pack_on "$p"; then
-        _egress_pack_refused "$ix" && return 0
         [ "${_EGC_CNT[ix]}" = 0 ] && return 0
       fi
       if [ -z "$_EGE_BOX" ]; then
@@ -15607,20 +15604,48 @@ _egress_mode_step() {                    # <-1|1>
 
 # ── Keys ──
 
+# After an escape byte, the rest of the key into _EGQ: empty for Esc alone.
+# One byte at a time, each within a second, because bash 3.2 drops what a
+# longer read got when it times out, which turned Option+Left (ESC b) into
+# Esc. ESC [ is read to its last byte (ESC [ A, ESC [ 3 ~, ESC [ 1 ; 5 C),
+# ESC O takes one byte more, any other byte is an Alt or Option chord. A
+# second ESC is an Esc of its own: the sequence it starts is read and
+# dropped, so an arrow pressed just after Esc leaves nothing behind.
+_egress_esc_rest() {
+  local b="" n=0
+  _EGQ=""
+  IFS= read -rsn1 -t 1 b 2>/dev/null || return 0
+  case "$b" in
+    "") return 0 ;;
+    $'\e') _egress_esc_rest; _EGQ=""; return 0 ;;
+    "["|O) _EGQ="$b" ;;
+    *) _EGQ="$b"; return 0 ;;
+  esac
+  while [ "$n" -lt 8 ]; do
+    b=""
+    IFS= read -rsn1 -t 1 b 2>/dev/null || return 0
+    _EGQ="$_EGQ$b"
+    case "$_EGQ" in O?) return 0 ;; esac
+    case "$b" in [0123456789\;]) ;; *) return 0 ;; esac
+    n=$((n + 1))
+  done
+  return 0
+}
+
 # The editor's key reader, in this shell: _KEY gets exactly the words
 # _read_keypress prints, with no subshell. End of input is QUIT, never ENTER:
 # enter saves here.
 _egress_key() {
-  local k="" s=""
+  local k=""
   if ! IFS= read -rsn1 k 2>/dev/null; then _KEY=QUIT; return 0; fi
   case "$k" in
     $'\e')
-      IFS= read -rsn2 -t 1 s 2>/dev/null || true
-      case "$s" in
-        "[A") _KEY=UP ;;
-        "[B") _KEY=DOWN ;;
-        "[C") _KEY=RIGHT ;;
-        "[D") _KEY=LEFT ;;
+      _egress_esc_rest
+      case "$_EGQ" in
+        "[A"|OA) _KEY=UP ;;
+        "[B"|OB) _KEY=DOWN ;;
+        "[C"|OC) _KEY=RIGHT ;;
+        "[D"|OD) _KEY=LEFT ;;
         "") _KEY=ESC ;;
         *) _KEY=OTHER ;;
       esac ;;
@@ -15657,7 +15682,7 @@ _egress_tui_key() {
         "$_EGRESS_ROW_ADD") _EG_ACT=add ;;
         pack:*)
           # A pack with nothing to tick as a whole is picked host by host.
-          if [ "${_EGC_CNT[${_EGRI[$_EG_CUR]}]}" = 0 ] && ! _egress_pack_refused "${_EGRI[$_EG_CUR]}"; then
+          if [ "${_EGC_CNT[${_EGRI[$_EG_CUR]}]}" = 0 ]; then
             _egress_hosts_open "${_EGRI[$_EG_CUR]}"
           else
             _egress_toggle "$row"
@@ -15706,7 +15731,6 @@ _egress_hosts_key() {
     DOWN) [ "$_EG_HCUR" -lt "$last" ] && _EG_HCUR=$((_EG_HCUR + 1)) ;;
     LEFT|QUIT|ESC) _EG_SCREEN=list ;;
     SPACE)
-      _egress_pack_refused "$_EG_HPIX" && return 0
       case "$row" in
         def:*) _egress_toggle "pack:${_EGC_P[$_EG_HPIX]}" ;;
         opt:*) _egress_host_toggle "${row#opt:}"; _egress_editor_changed ;;
@@ -15839,14 +15863,16 @@ _egress_frame_list() {                   # <cursor index>
   _egress_fl ""
   if [ -n "$_EG_PROMPT" ]; then _EGP=("${_EG_PP[@]}"); else _egress_pane_set "${_EGR[$cur]}" "${_EGRI[$cur]}"; fi
   _egress_pane_lines
+  # One blank line over the footer, however full the pane is.
+  _egress_fl ""
   _egress_status_line
   _egress_legend_line "${_EGR[$cur]}" "${_EGRI[$cur]}"
   return 0
 }
 
 # One pack row: the cursor, the tick, the name, what it is for (at 78
-# columns and more) and one tag, first match wins: the refused capability,
-# the risk, for a box its state, for the global editor what was found.
+# columns and more) and one tag, first match wins: the risk, for a box its
+# state, for the global editor what was found.
 _egress_pack_line() {                    # <cache index> <1 on the cursor row>
   local ix="$1" on="$2" p mark tick name purp="" col w tagc lead=""
   p="${_EGC_P[ix]}"
@@ -15858,12 +15884,6 @@ _egress_pack_line() {                    # <cache index> <1 on the cursor row>
   if [ "$_EG_COLS" -ge 78 ]; then printf -v purp '%-30s' "${_EGC_PURP[ix]}"; fi
   _egress_fit "$_EGT" $(( w - col ))
   if [ "$on" = 1 ]; then mark="  ${_EGX_C}▸${_EGX_R} "; else mark="    "; fi
-  if _egress_pack_refused "$ix"; then
-    # A refused pack is dim from end to end, its tick true to the file.
-    case "$_EGS" in own|both|every) tick="✔" ;; *) tick="·" ;; esac
-    _egress_fl "${mark}${_EGX_D}[${tick}] ${name}${purp}${_EGT}${_EGX_R}"
-    return 0
-  fi
   case "$_EGS" in own|both|every) tick="[${_EGX_G}✔${_EGX_R}] " ;; *) tick="[${_EGX_D}·${_EGX_R}] " ;; esac
   case "$_EGT" in "!"*) tagc="$_EGX_A" ;; *) tagc="$_EGX_D" ;; esac
   if [ "$on" = 1 ]; then
@@ -15936,7 +15956,9 @@ _egress_host_line() {                    # <host> <1 on the cursor row>
 _egress_frame_hosts() {
   local ix="$_EG_HPIX" w page first n i row h tick tag tagc mark nw col t
   w=$(( _EG_COLS - 1 ))
-  page=$(( _EG_ROWS - 12 - _EG_E ))
+  # Twelve fixed lines: title, subtitle, blank, the pack's name, blank, the
+  # pane's four, blank, status and legend. Plus one row kept free.
+  page=$(( _EG_ROWS - 13 - _EG_E ))
   [ "$page" -lt 1 ] && page=1
   _egress_fit "(${_EGC_PURP[ix]})" $(( w - 3 - ${#_EGC_P[ix]} ))
   _egress_fl "  ${_EGX_B}${_EGC_P[ix]}${_EGX_R} ${_EGX_D}${_EGT}${_EGX_R}"
@@ -15971,26 +15993,22 @@ _egress_frame_hosts() {
         _egress_risk_tag "$_EGK"
         tag="$_EGT" ;;
     esac
-    _egress_pack_refused "$ix" && tick="[·] "
     _egress_fit "$h" "$nw"
     printf -v h '%-*s ' "$nw" "$_EGT"
     _egress_fit "$tag" $(( w - col ))
     case "$_EGT" in "!"*) tagc="$_EGX_A" ;; *) tagc="$_EGX_D" ;; esac
     if [ "$i" -eq "$_EG_HCUR" ]; then mark="  ${_EGX_C}▸${_EGX_R} "; h="${_EGX_B}${h}${_EGX_R}"; else mark="    "; fi
-    if _egress_pack_refused "$ix"; then
-      _egress_fl "${mark}${_EGX_D}${tick}${h}${_EGT}${_EGX_R}"
-    else
-      _egress_fl "${mark}${tick}${h}${tagc}${_EGT}${_EGX_R}"
-    fi
+    _egress_fl "${mark}${tick}${h}${tagc}${_EGT}${_EGX_R}"
     n=$((n + 1))
   done
   _egress_fl ""
   if [ -n "$_EG_PROMPT" ]; then _EGP=("${_EG_PP[@]}"); else _egress_hosts_pane "${_EGH[$_EG_HCUR]:-}"; fi
   _egress_pane_lines
+  _egress_fl ""
   _egress_status_line
   case "${_EGH[$_EG_HCUR]:-}" in
     tpl:*) t="↑/↓ move  space type the name  ← back  ⏎ save" ;;
-    *) if _egress_pack_refused "$ix"; then t="↑/↓ move  ← back  ⏎ save"; else t="↑/↓ move  space tick  ← back  ⏎ save"; fi ;;
+    *) t="↑/↓ move  space tick  ← back  ⏎ save" ;;
   esac
   _egress_legend_put "$t"
 }
@@ -16087,7 +16105,7 @@ _egress_legend_line() {                  # <row> <cache index>
     "$_EGRESS_ROW_FILTER") t="↑/↓ move  space find a pack  ⏎ save  q cancel" ;;
     "$_EGRESS_ROW_ADD") t="↑/↓ move  space add a host  ⏎ save  q cancel" ;;
     pack:*)
-      if _egress_pack_refused "$2" || [ "${_EGC_CNT[$2]}" = 0 ]; then
+      if [ "${_EGC_CNT[$2]}" = 0 ]; then
         t="↑/↓ move  → its hosts  ⏎ save  q cancel"
       else
         t="↑/↓ move  space tick  → its hosts  ⏎ save  q cancel"
@@ -16264,9 +16282,6 @@ _egress_pack_pane() {                    # <cache index>
   _EGP[1]="$_EGT"
   # Lines 3 and 4: notes, first match first.
   _EGN_NOTES=()
-  if _egress_pack_refused "$ix"; then
-    _EGN_NOTES+=("It gives the box your Docker daemon and its networks.")
-  fi
   case "${_EGC_DET[ix]}:$p" in
     ticked:apt-debian) _EGN_NOTES+=("Ticked for [setup], Debian's one security source.") ;;
     ticked:apt-image-extras) _EGN_NOTES+=("Ticked for [setup]. cli.github.com stays off.") ;;
@@ -16292,7 +16307,7 @@ _egress_pack_pane() {                    # <cache index>
     atlassian) _EGN_NOTES+=("Right arrow adds your Jira or Confluence site.") ;;
     aws) _EGN_NOTES+=("Right arrow adds a regional STS or S3 host.") ;;
   esac
-  if ! _egress_pack_refused "$ix" && [ -n "${_EGC_OPT[ix]}" ] && [ "$total" != 0 ]; then
+  if [ -n "${_EGC_OPT[ix]}" ] && [ "$total" != 0 ]; then
     _egress_nl_count "${_EGC_OPT[ix]}"
     if [ "$_EGN" -gt 1 ]; then
       _EGN_NOTES+=("Right arrow shows $_EGN more $p hosts to add one by one.")
@@ -16300,7 +16315,7 @@ _egress_pack_pane() {                    # <cache index>
       _EGN_NOTES+=("Right arrow adds ${_EGC_OPT[ix]} on its own.")
     fi
   fi
-  if [ "${_EGC_SIB[ix]}" -gt 0 ] && ! _egress_pack_refused "$ix"; then
+  if [ "${_EGC_SIB[ix]}" -gt 0 ]; then
     if [ "${_EGC_SIBG[ix]}" = 1 ]; then
       _EGN_NOTES+=("One tick here reaches ${_EGC_SIB[ix]} other GitHub hosts as well.")
     else
@@ -16310,7 +16325,7 @@ _egress_pack_pane() {                    # <cache index>
   case "$p" in
     apt-debian|apt-image-extras) [ -n "${_EGC_DATE[ix]}" ] && _EGN_NOTES+=("Checked ${_EGC_DATE[ix]}.") ;;
     *)
-      if [ "${_EGC_RISK[ix]}" -ge 1 ] && [ "${_EGC_RISK[ix]}" -le 3 ]; then _EGN_NOTES+=("Cleat never ticks this for you."); fi ;;
+      if [ "${_EGC_RISK[ix]}" -ge 1 ]; then _EGN_NOTES+=("Cleat never ticks this for you."); fi ;;
   esac
   _EGP[2]="${_EGN_NOTES[0]:-}"
   if [ -z "$_EGE_BOX" ]; then
@@ -16319,9 +16334,7 @@ _egress_pack_pane() {                    # <cache index>
   fi
   # Line 4 for a box: what space does here.
   _egress_pack_state "$p"
-  if _egress_pack_refused "$ix"; then
-    _EGP[3]="Space does nothing here."
-  elif [ "${_EGC_CNT[ix]}" = 0 ]; then
+  if [ "${_EGC_CNT[ix]}" = 0 ]; then
     _EGP[3]="Space or right arrow picks its hosts."
   else
     case "$_EGS" in
@@ -16385,15 +16398,6 @@ _egress_hosts_pane() {                   # <hosts row>
   if _egress_host_ix "$h"; then why="${_EGK_W[_EGX]}"; else why="$h"; fi
   _egress_host_risk "$h"
   _egress_risk_line "$_EGK"
-  if _egress_pack_refused "$ix"; then
-    _egress_fit "$why" "$w"
-    _EGP[0]="$_EGT"
-    _egress_risk_line 4
-    _EGP[1]="$_EGT"
-    _EGP[2]="It gives the box your Docker daemon and its networks."
-    _EGP[3]="Space does nothing here."
-    return 0
-  fi
   # What the host is for, over two lines when it needs them.
   if [ "${#why}" -gt "$w" ]; then
     _egress_wrap "$why" "$w" 2
@@ -16534,12 +16538,16 @@ _egress_cursor_to() {                    # <row>
 }
 
 # A prompt inside the frame: the pane shows _EG_PP and the last line the
-# label, the cursor after it and echo on for one line, into _EG_IN, trimmed.
-# rc 1 at end of input. The next frame is drawn from the top again, so an
-# answer long enough to wrap leaves nothing behind.
+# label with what is typed after it, into _EG_IN, trimmed. Read a key at a
+# time with echo off, so Esc can go back: Enter ends the line, Backspace takes
+# one character back, Ctrl-U clears the line, an arrow or any other key
+# sequence is ignored. rc 1 on Esc, at end of input, or when a resize leaves a
+# window too small for the editor, so the loop can fall back. A key runs no
+# subshell.
 _egress_prompt_line() {                  # <label>
-  # A resize while a prompt was open: measure, and end the prompt when the
-  # window no longer holds the editor, so the loop can fall back.
+  local c rc=0
+  _EG_IN=""
+  # A resize while the prompt was closed: measure first.
   if [ "$_EG_WINCH" = 1 ]; then
     _EG_WINCH=0
     _egress_term_now
@@ -16547,19 +16555,59 @@ _egress_prompt_line() {                  # <label>
   fi
   _EG_PROMPT="$1"
   _egress_draw "$_EG_CUR"
-  printf '\033[%d;%dH' "$_EG_FL" "$(( ${#1} + 4 ))"
-  _egress_tui_typing on
-  _EG_IN=""
-  if ! IFS= read -r _EG_IN; then
-    _egress_tui_typing off
-    _EG_PROMPT=""
+  printf '\033[?25h'
+  while :; do
+    _egress_prompt_echo
+    if ! IFS= read -rsn1 c 2>/dev/null; then rc=1; break; fi
+    case "$c" in
+      "") break ;;
+      $'\e')
+        # Esc alone goes back. An arrow, another key sequence or an Alt
+        # chord is read whole and dropped, so none of it lands in the line.
+        _egress_esc_rest
+        [ -z "$_EGQ" ] && { rc=1; break; } ;;
+      $'\177'|$'\b') _EG_IN="${_EG_IN%?}" ;;
+      $'\025') _EG_IN="" ;;
+      $'\004') [ -z "$_EG_IN" ] && { rc=1; break; } ;;
+      [[:cntrl:]]) ;;
+      *)
+        case "$_EGRESS_TYPABLE" in
+          *"$c"*) [ "${#_EG_IN}" -lt 253 ] && _EG_IN="$_EG_IN$c" ;;
+          *)
+            # Anything else shows as ?, which no host holds, so what is on
+            # the line is what is taken: a paste of bücher.de never quietly
+            # becomes bcher.de.
+            [ "${#_EG_IN}" -lt 253 ] && _EG_IN="$_EG_IN?"
+            _egress_prompt_refusal "Only plain ASCII can be typed here."
+            _egress_draw "$_EG_CUR" ;;
+        esac ;;
+    esac
+    if [ "$_EG_WINCH" = 1 ]; then
+      _EG_WINCH=0
+      _egress_term_now
+      _egress_measure || { rc=1; break; }
+      _egress_draw "$_EG_CUR"
+    fi
+  done
+  printf '\033[?25l'
+  _EG_PROMPT=""
+  if [ "$rc" = 1 ]; then
+    _EG_IN=""
     return 1
   fi
-  _egress_tui_typing off
-  _EG_PROMPT=""
   _EG_IN="${_EG_IN#"${_EG_IN%%[![:space:]]*}"}"
   _EG_IN="${_EG_IN%"${_EG_IN##*[![:space:]]}"}"
   return 0
+}
+
+# The prompt's line, drawn again after a key: the label, then what is typed,
+# its end kept when it is wider than the window. The cursor stays after it.
+_egress_prompt_echo() {
+  local room t="$_EG_IN"
+  room=$(( _EG_COLS - 1 - 2 - ${#_EG_PROMPT} - 2 ))
+  [ "$room" -lt 2 ] && room=2
+  if [ "${#t}" -gt "$room" ]; then t="…${t:$(( ${#t} - room + 1 ))}"; fi
+  printf '\033[%d;1H\033[K  %s%s%s %s' "$_EG_FL" "$_EGX_B" "$_EG_PROMPT" "$_EGX_R" "$t"
 }
 
 # A refusal into the prompt's pane, lines 3 and 4, in red. Its own two lines
@@ -16581,7 +16629,7 @@ _egress_prompt_refusal() {               # <text>
 
 _egress_filter_prompt() {
   local in
-  _EG_PP=("Shows only the packs whose name contains some text." "Ticked packs outside the match stay ticked." "An empty line shows every pack." "")
+  _EG_PP=("Shows only the packs whose name contains some text." "Ticked packs outside the match stay ticked." "An empty line shows every pack. Esc goes back." "")
   _egress_prompt_line "Find a pack >" || return 0
   in="$(printf '%s' "$_EG_IN" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' | LC_ALL=C tr -cd 'abcdefghijklmnopqrstuvwxyz0123456789-')"
   _EGE_FILTER="${in:0:16}"
@@ -16622,11 +16670,11 @@ _egress_add_refusal() {                  # <input>
   esac
 }
 
-# Adding a host by name, in the pane. A refused name says why and asks again,
-# with nothing typed lost. rc 0 when a host was added.
+# Adding a host by name, in the pane. A refused name says why and asks again.
+# Esc or an empty line goes back. rc 0 when a host was added.
 _egress_add_prompt() {
   local h
-  _EG_PP=("Its exact name, like registry.example.com." "HTTPS only, no wildcards. An empty line goes back." "" "")
+  _EG_PP=("Its exact name, like registry.example.com." "HTTPS only, no wildcards. Esc goes back." "" "")
   while :; do
     _egress_prompt_line "Add a host >" || return 1
     [ -n "$_EG_IN" ] || return 1
@@ -16651,7 +16699,7 @@ _egress_fill_prompt() {
   part="${tpl#*"{"}"
   part="${part%%"}"*}"
   case "$part" in site) ex=acme ;; region) ex=eu-west-1 ;; *) ex=name ;; esac
-  _EG_PP=("Type only the {$part} part, like $ex." "Letters, digits and dashes. An empty line goes back." "" "")
+  _EG_PP=("Type only the {$part} part, like $ex." "Letters, digits and dashes. Esc goes back." "" "")
   while :; do
     _egress_prompt_line "{$part} >" || return 1
     [ -n "$_EG_IN" ] || return 1
@@ -17307,10 +17355,6 @@ _egress_picker_text() {                  # <box or empty>
         if _egress_ix_of "$in"; then
           ix="$_EGX"
           if [ "$in" = claude ]; then info "The core pack is always on."; continue; fi
-          if _egress_pack_refused "$ix"; then
-            warn "${in} needs the docker cap, which egress control refuses."
-            continue
-          fi
           if [ "${_EGC_CNT[ix]}" = 0 ]; then
             info "${in} has no host that comes with it. Type each host you want by name."
             continue

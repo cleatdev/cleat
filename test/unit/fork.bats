@@ -631,6 +631,13 @@ SHIM
 
 @test "fork: a fresh copy reads as just now, never as nothing" {
   mkdir -p "$TEST_TEMP/freshcopy"
+  # The clock reads the copy's own mtime, so the copy is exactly this
+  # second's. On the real clock a slow runner could cross a second between
+  # the mkdir and the read, and then an empty age for a zero delta went
+  # unseen (the harness reported fork_age_floor MISSED on CI).
+  local mt
+  mt="$(_path_mtime "$TEST_TEMP/freshcopy")"
+  eval "date() { if [ \"\${1:-}\" = +%s ]; then echo $mt; else command date \"\$@\"; fi; }"
   run _fork_age_human "$TEST_TEMP/freshcopy"
   assert_output "just now"
 }

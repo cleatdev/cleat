@@ -51,8 +51,10 @@ jobs:
     runs-on: ubuntu-latest
     # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30. The
     # egress tests added about 350 by 2026-09-26 and a run was cancelled at 40,
-    # so 60 until the Linux legs shard the way macOS and WSL2 do.
-    timeout-minutes: 60
+    # so 60. The ubuntu-latest leg took 52 of those on 2026-09-28 and the egress
+    # editor rewrite added about two local minutes, so 75 until the Linux legs
+    # shard the way macOS and WSL2 do.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,8 +92,10 @@ jobs:
     runs-on: ubuntu-22.04
     # 23-24 minutes on a slow day (2026-09-22), so 40 rather than 30. The
     # egress tests added about 350 by 2026-09-26 and a run was cancelled at 40,
-    # so 60 until the Linux legs shard the way macOS and WSL2 do.
-    timeout-minutes: 60
+    # so 60. The ubuntu-latest leg took 52 of those on 2026-09-28 and the egress
+    # editor rewrite added about two local minutes, so 75 until the Linux legs
+    # shard the way macOS and WSL2 do.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:

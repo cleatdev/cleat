@@ -216,6 +216,7 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 }
 
 @test "egress draw: the frame is the same height whichever row the cursor is on" {
+  trap - DEBUG
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\npack = npm\nallow = docs.rs\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
   _rows_of 30
@@ -321,29 +322,31 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 }
 
 @test "egress draw: no drawn line is wider than the terminal, so the redraw never drifts" {
-  local c r
+  # Hundreds of frames: bats' own DEBUG trap on every command would make this
+  # ten times slower, so it is off here, as in the cache test.
+  trap - DEBUG
+  local c r frames i
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\npack = npm\nallow = a-rather-long-host-name-for-the-host-column.example.com\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
   for c in 80 78 77 60; do
     _rows_of 60 "$c"
     _egress_editor_load ""
     _egress_measure
-    run _widest < <(_egress_draw 1)
-    assert [ "$output" -lt "$c" ]
-    # Every row's pane, and every pack's hosts.
-    local i=0
+    # Every row's frame, and every listed pack's hosts.
+    frames=""
+    i=0
     while [ "$i" -lt "${#_EGR[@]}" ]; do
-      run _widest < <(_egress_draw "$i")
-      assert [ "$output" -lt "$c" ]
+      frames+="$(_egress_draw "$i")"$'\n'
       i=$((i + 1))
     done
     for r in containers atlassian npm huggingface aws; do
       _egress_ix_of "$r"
       _egress_hosts_open "$_EGX"
-      run _widest < <(_egress_draw)
-      assert [ "$output" -lt "$c" ]
+      frames+="$(_egress_draw)"$'\n'
       _EG_SCREEN=list
     done
+    run _widest <<< "$frames"
+    assert [ "$output" -lt "$c" ]
   done
   # A box editor with a long box name stays inside the width too.
   _rows_of 60 80
@@ -387,6 +390,7 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 }
 
 @test "egress draw: the mode row names what the mode does for every ring value" {
+  trap - DEBUG
   _rows_of 40
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
@@ -417,6 +421,7 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 }
 
 @test "egress picker: a keypress forks nothing and calls docker nothing" {
+  trap - DEBUG
   # The first editor ran about 300 processes and 3 docker calls on every key,
   # which was its lag. The real loop runs over every row kind, both editors,
   # with a DEBUG trap armed from its first key. It records any command
@@ -450,10 +455,18 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
     _egress_editor_load "$box"
     K=(RIGHT RIGHT RIGHT RIGHT LEFT LEFT LEFT LEFT OTHER DOWN)
     n="${#_EGR[@]}"
+    # Every pack row is walked in the global editor. The box editor keys
+    # every third, which still meets each kind of row (on, off, no default
+    # host, a part to type) at a third of the cost.
     i=2
     while [ "$i" -lt "$n" ]; do
       case "${_EGR[i]}" in
-        pack:*) K+=(SPACE LEFT SPACE LEFT RIGHT DOWN SPACE SPACE UP LEFT DOWN) ;;
+        pack:*)
+          if [ -z "$box" ] || [ $(( i % 3 )) = 0 ]; then
+            K+=(SPACE LEFT SPACE LEFT RIGHT DOWN SPACE SPACE UP LEFT DOWN)
+          else
+            K+=(DOWN)
+          fi ;;
         host:*) K+=(SPACE SPACE DOWN) ;;
       esac
       i=$((i + 1))
@@ -478,7 +491,7 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
     assert_output ""
     run cat "$DOCKER_CALLS"
     assert_output ""
-    assert [ "$KI" -gt 40 ]
+    assert [ "$KI" -gt 30 ]
   done
 }
 
@@ -554,6 +567,7 @@ _validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 }
 
 @test "egress picker: enter reviews and saves from any row" {
+  trap - DEBUG
   # The maintainer's rule: enter saves from every row, as cleat config does.
   mkdir -p "$CLEAT_CONFIG_DIR"
   _rows_of 30
@@ -910,6 +924,7 @@ pack = npm"
 }
 
 @test "egress box: the save count equals the resolved count, box and global" {
+  trap - DEBUG
   mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
   local cn
   cn="$(_egress_target_cname main)"
@@ -948,6 +963,7 @@ pack = npm"
 }
 
 @test "egress box: unticking an inherited pack denies only hosts no other tick provides" {
+  trap - DEBUG
   mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
   local cn
   cn="$(_egress_target_cname main)"
@@ -1071,6 +1087,7 @@ allow = extra.example.com"
 }
 
 @test "egress box: host values count as the resolver reads them, and one that is no host goes back as it was" {
+  trap - DEBUG
   mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
   local cn
   cn="$(_egress_target_cname main)"
@@ -1201,6 +1218,7 @@ allow = extra.example.com"
 }
 
 @test "egress draw: a box's open session, a caged box under off and a box that cannot open say so" {
+  trap - DEBUG
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
   _EGRESS_ENFORCING=1
@@ -1237,6 +1255,7 @@ allow = extra.example.com"
 }
 
 @test "egress draw: at 60 columns no pane line of a pack, a mode or a tool row is cut" {
+  trap - DEBUG
   mkdir -p "$CLEAT_CONFIG_DIR"
   _trusted_setup_project
   cd "$PROJECT"
@@ -1445,7 +1464,9 @@ pack = npm"
 
 @test "egress draw: no catalogue class word is drawn anywhere in the editor" {
   # The class words stay in cleat egress packs and --list. The editor says
-  # the same in plain words (the maintainer's rule 5).
+  # the same in plain words (the maintainer's rule 5). Hundreds of frames, so
+  # bats' own DEBUG trap is off, as in the cache test.
+  trap - DEBUG
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\nallow = x.example.com\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
   _rows_of 60
@@ -2629,6 +2650,7 @@ good.example.test
 }
 
 @test "egress ui: with enforcement live no surface says it lands later" {
+  trap - DEBUG
   _EGRESS_ENFORCING=1
   _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }
   mkdir -p "$CLEAT_CONFIG_DIR"

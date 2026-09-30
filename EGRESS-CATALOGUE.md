@@ -18,11 +18,15 @@ Egress control is not enforced yet. A saved policy is configuration only. See
   **shared**: the edge serves a different site when asked, so allowing the host allows more than
   its name. **open tenancy**: whatever the edge does, anyone can place content there, so the host is
   an upload or download channel for strangers. **unaudited**: no measurement exists.
+- The editor (`cleat egress`) says a class in plain words on the pack's row and in its pane:
+  nothing for single origin and contained, `! reaches other sites` for shared, `! anyone can
+  upload` for open tenancy and `! not checked` for unaudited. A pack takes the word of its weakest
+  default host. The class words above stay in `cleat egress packs`, `--list` and this file.
 - A class is a dated measurement, not a guarantee. An edge can move with no signal between one
   measurement and the next.
 - **flags** name how the editor treats the row: `core` and `locked` rows are always on,
-  `default` packs sit on the `[setup]` provisioning path, a `sub-tick` host is offered in its own
-  pane, a `parameterised` host needs a value you type (the part in braces), `no-security` means an
+  `default` packs sit on the `[setup]` provisioning path, a `sub-tick` host is added on its own
+  from the pack's hosts, a `parameterised` host needs a value you type (the part in braces), `no-security` means an
   apt source without a security suite and `requires-cap` means the pack needs a capability that
   egress control refuses.
 - Nothing marked shared, open tenancy, unaudited or parameterised is ever ticked for you, with two

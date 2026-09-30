@@ -76,9 +76,10 @@ _trusted_setup_project() {
 
 # ── The editor (6.1, 6.4) ────────────────────────────────────────────────────
 
-# A scripted key stream. The reader runs in a command substitution, so its
-# position lives in a file. When the stream runs out it answers QUIT, so a
-# test can never spin.
+# A scripted key stream. The config editor reads keys through _read_keypress
+# in a command substitution, so the position lives in a file. The egress
+# editor reads through _egress_key in its own shell, from the same stream.
+# When the stream runs out it answers QUIT, so a test can never spin.
 _keys() {
   printf '%s\n' "$@" > "$TEST_TEMP/keys"
   echo 0 > "$TEST_TEMP/kp"
@@ -88,48 +89,158 @@ _keys() {
     echo $(( n + 1 )) > "$TEST_TEMP/kp"
     sed -n "$(( n + 1 ))p" "$TEST_TEMP/keys" | grep . || echo QUIT
   }
+  _egress_key() { _KEY="$(_read_keypress)"; }
 }
-# A terminal of <n> rows. eval, because inside a nested definition $1 is the
-# inner function's own argument, which is empty.
-_rows_of() { eval "_term_rows() { echo $1; }"; _term_cols() { echo 110; }; }
+# A window of <rows> rows and 110 columns, or <cols>. eval, because inside a
+# nested definition $1 is the inner function's own argument, which is empty.
+_rows_of() { eval "_term_rows() { echo $1; }; _term_cols() { echo ${2:-110}; }"; }
 _row_index() { _egress_editor_rows | grep -nxF -- "$1" | cut -d: -f1 | awk '{ print $1 - 1 }'; }
 _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
+_ups() { local i; for ((i = 0; i < $1; i++)); do printf 'UP '; done; }
+# A frame as plain text: every escape out and each glyph one ASCII character,
+# because some awks count bytes.
+_plainw() {
+  sed $'s/\033\\[[0-9;?]*[A-Za-z]//g' | sed 's/▸/>/g; s/✔/v/g; s/·/./g; s/‹/</g; s/›/>/g; s/…/~/g; s/✘/x/g; s/↑/^/g; s/↓/v/g; s/←/</g; s/→/>/g; s/⏎/E/g'
+}
+_widest() { _plainw | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }'; }
+# The most lines any page of a paged review printed.
+_review_page_max() {
+  local rest="$1" page m=0 n
+  while :; do
+    page="${rest%%$'\033[H\033[2J'*}"
+    n="$(printf '%s' "$page" | grep -c '')"
+    if [ "$n" -gt "$m" ]; then m="$n"; fi
+    [ "$page" = "$rest" ] && break
+    rest="${rest#*$'\033[H\033[2J'}"
+  done
+  echo "$m"
+}
+# The engine the editor probes, validated, so no warning line takes a row.
+_validated() { _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }; }
 
-@test "egress measure: 26 packs on a 24 row terminal give a page of 2, not 26" {
+@test "egress measure: 26 packs on a 24 row terminal give a page of 7, not 26" {
   _rows_of 24
+  _egress_term_now
+  _EG_E=0
+  _EGE_NHOST=0
   _egress_measure 26
   run echo "$_EG_PAGE"
-  assert_output "2"
+  assert_output "7"
 }
 
-@test "egress measure: 2 packs in a 50 row window give a page of 2, not 28" {
+@test "egress measure: 2 packs in a 50 row window give a page of 2, not 33" {
   _rows_of 50
+  _egress_term_now
+  _EG_E=0
+  _EGE_NHOST=0
   _egress_measure 2
   run echo "$_EG_PAGE"
   assert_output "2"
 }
 
-@test "egress measure: a 22 row terminal refuses the TUI and the text picker runs" {
-  _rows_of 22
+@test "egress measure: a 19 row terminal refuses the TUI and the text picker runs" {
+  _EG_E=0
+  _EGE_NHOST=0
+  _rows_of 19
+  _egress_term_now
   run _egress_measure 26
   assert_failure
+  _rows_of 20
+  _egress_term_now
+  run _egress_measure 26
+  assert_success
   mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 19
   _keys QUIT
   run _egress_editor "" <<< "q"
   assert_success
-  assert_output --partial "(typed)"
+  assert_output --partial "(typed, what every box may reach)"
+  refute_output --partial $'\033[?1049h'
+  run _plain "$output"
+  assert_output --partial "Mode strict (only the hosts ticked below)"
+}
+
+@test "egress measure: a window narrower than 60 columns runs the typed picker" {
+  _EG_E=0
+  _EGE_NHOST=0
+  _rows_of 40 59
+  _egress_term_now
+  run _egress_measure 26
+  assert_failure
+  _rows_of 40 60
+  _egress_term_now
+  run _egress_measure 26
+  assert_success
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 40 59
+  _keys QUIT
+  run _egress_editor "" <<< "q"
+  assert_output --partial "(typed, what every box may reach)"
+}
+
+@test "egress measure: host rows give way to pack rows in a short window" {
+  _EG_E=0
+  _EGE_NHOST=5
+  _rows_of 21
+  _egress_term_now
+  _egress_measure 26
+  run echo "$_EG_HV $_EG_PAGE"
+  assert_output "1 3"
+  _rows_of 40
+  _egress_term_now
+  _egress_measure 26
+  run echo "$_EG_HV"
+  assert_output "3"
 }
 
 @test "egress draw: a saturated page draws one line fewer than the terminal has rows" {
   _rows_of 24
   _egress_editor_load ""
-  _egress_measure 26
+  _egress_measure
   run bash -c 'wc -l' < <(_egress_draw 0)
   assert_output --regexp '^ *23$'
   _rows_of 40
-  _egress_measure 26
+  _egress_term_now
+  _egress_measure
   run bash -c 'wc -l' < <(_egress_draw 5)
   assert_output --regexp '^ *39$'
+  # With host rows and the engine line, the page gives way and the frame keeps
+  # its height.
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\nallow = a.example.com\nallow = b.example.com\nallow = c.example.com\nallow = d.example.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 24
+  _egress_editor_load ""
+  _egress_measure
+  run bash -c 'wc -l' < <(_egress_draw 0)
+  assert_output --regexp '^ *23$'
+}
+
+@test "egress draw: the frame is the same height whichever row the cursor is on" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\nallow = docs.rs\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  local i n want=""
+  i=0
+  while [ "$i" -lt "${#_EGR[@]}" ]; do
+    n="$(_egress_draw "$i" | wc -l | tr -d ' ')"
+    [ -n "$want" ] || want="$n"
+    assert_equal "$n" "$want"
+    i=$((i + 1))
+  done
+  assert_equal "$want" 29
+}
+
+@test "egress draw: every frame starts at the top left and clears what is below it" {
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  _egress_frame_build 0
+  run printf '%s' "${_EGF:0:3}"
+  assert_output $'\033[H'
+  run printf '%s' "${_EGF: -3}"
+  assert_output $'\033[J'
 }
 
 @test "egress ui: the editor cache agrees with the catalogue helpers for every pack" {
@@ -139,56 +250,260 @@ _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
   # DEBUG trap makes ten times slower, so the trap is off for this test.
   trap - DEBUG
   _egress_editor_cache
-  local p i n=0
+  local p i n=0 k
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     i="$(_egress_cache_ix "$p")"
     assert_equal "${_EGC_HOSTS[i]}" "$(_egress_pack_hosts "$p")"
+    assert_equal "${_EGC_ALL[i]}" "$(_egress_pack_hosts "$p" all)"
     assert_equal "${_EGC_CNT[i]}" "$(_egress_pack_hosts "$p" | grep -c . || true)"
     assert_equal "${_EGC_FLAGS[i]}" "$(_egress_pack_flags "$p")"
     assert_equal "${_EGC_WORD[i]}" "$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
+    # The editor's risk is the class word in plain words, and a refused
+    # capability is its own.
+    _egress_risk_of "${_EGC_WORD[i]}"
+    case ",${_EGC_FLAGS[i]}," in *,requires-cap,*) _EGK=4 ;; esac
+    assert_equal "${_EGC_RISK[i]}" "$_EGK"
+    # Every pack says what it is for.
+    _egress_pack_purpose "$p"
+    assert_not_equal "$_EGT" ""
+    assert_equal "${_EGC_PURP[i]}" "$_EGT"
     n=$((n + 1))
   done < <(_egress_pack_ids)
   assert_equal "$n" "${#_EGC_P[@]}"
   assert_equal "$_EGC_IDS" "$(_egress_pack_ids)"
+  # And every host's own risk is its catalogue word.
+  k=0
+  while [ "$k" -lt "${#_EGK_H[@]}" ]; do
+    _egress_risk_of "$(_egress_host_word "${_EGK_H[k]}")"
+    assert_equal "${_EGK_R[k]}" "$_EGK"
+    k=$((k + 1))
+  done
 }
 
 @test "egress draw: the detail pane is always _EGRESS_PANE_LINES lines" {
   _egress_editor_load ""
   local r
-  for r in mode core pack:apt-debian pack:github host:docs.rs "$_EGRESS_ROW_ADD" "$_EGRESS_ROW_SAVE"; do
-    run bash -c 'wc -l' < <(_egress_pane "$r")
+  for r in mode "$_EGRESS_ROW_FILTER" pack:apt-debian pack:github pack:containers pack:github-objects host:docs.rs "$_EGRESS_ROW_ADD"; do
+    run bash -c 'wc -l' < <(_egress_pane_text "$r")
     assert_output --regexp "^ *${_EGRESS_PANE_LINES}\$"
   done
 }
 
-@test "egress draw: a pane text longer than the pane is cut, never drawn past it" {
-  _egress_pane_text() { local i; for i in 1 2 3 4 5 6 7 8 9; do echo "pane line $i"; done; }
-  run bash -c 'wc -l' < <(_egress_pane mode)
-  assert_output --regexp "^ *${_EGRESS_PANE_LINES}\$"
-  run _egress_pane mode
-  assert_output --partial "pane line ${_EGRESS_PANE_LINES}"
-  refute_output --partial "pane line $((_EGRESS_PANE_LINES + 1))"
+@test "egress draw: a pane line longer than the width is cut with an ellipsis and the pane stays 4 lines" {
+  _rows_of 30 80
+  _egress_editor_load ""
+  _egress_measure
+  local long
+  long="$(printf 'x%.0s' $(seq 1 200))"
+  _egress_pane_set() { _EGP=("$long" "! $long" "✘ $long" ""); }
+  run _widest < <(_egress_draw 0)
+  assert [ "$output" -lt 80 ]
+  run bash -c 'wc -l' < <(_egress_draw 0)
+  assert_output --regexp '^ *29$'
+  run _plain "$(_egress_draw 0)"
+  assert_output --partial "x…"
 }
 
 @test "egress ui: a label carrying a newline draws one physical row" {
+  # The box name is cleaned when the editor loads it, and a filter only ever
+  # arrives through the find prompt, which reads one line.
+  mkdir -p "$CLEAT_CONFIG_DIR"
   _rows_of 24
-  _egress_editor_load ""
-  _egress_measure 26
-  _EGE_FILTER=$'a\nb'
-  _EGE_BOX=$'x\ny'
+  _egress_editor_load $'x\ny'
+  _egress_measure
+  _egress_filter_prompt <<< $'a\nb' >/dev/null
+  run printf '%s' "$_EGE_FILTER"
+  assert_output "a"
   local lines
   lines="$(_egress_draw 0 | wc -l | tr -d ' ')"
-  assert_equal "$lines" "$(( 10 + _EG_PAGE + 5 + 6 ))"
+  assert_equal "$lines" "$(( _EGRESS_CHROME_LINES - 1 + _EGRESS_PANE_LINES + _EG_PAGE + _EG_HV + _EG_E ))"
+}
+
+@test "egress draw: no drawn line is wider than the terminal, so the redraw never drifts" {
+  local c r
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\nallow = a-rather-long-host-name-for-the-host-column.example.com\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  for c in 80 78 77 60; do
+    _rows_of 60 "$c"
+    _egress_editor_load ""
+    _egress_measure
+    run _widest < <(_egress_draw 1)
+    assert [ "$output" -lt "$c" ]
+    # Every row's pane, and every pack's hosts.
+    local i=0
+    while [ "$i" -lt "${#_EGR[@]}" ]; do
+      run _widest < <(_egress_draw "$i")
+      assert [ "$output" -lt "$c" ]
+      i=$((i + 1))
+    done
+    for r in containers atlassian npm huggingface aws; do
+      _egress_ix_of "$r"
+      _egress_hosts_open "$_EGX"
+      run _widest < <(_egress_draw)
+      assert [ "$output" -lt "$c" ]
+      _EG_SCREEN=list
+    done
+  done
+  # A box editor with a long box name stays inside the width too.
+  _rows_of 60 80
+  _egress_editor_load "a-box-with-a-rather-long-name-for-this-screen"
+  _egress_measure
+  run _widest < <(_egress_draw 1)
+  assert [ "$output" -lt 80 ]
+}
+
+@test "egress draw: a risk word keeps its colour after the cut" {
+  _rows_of 60 120
+  _egress_editor_load ""
+  _egress_measure
+  run bash -c 'cat' < <(_egress_draw 1)
+  assert_output --partial "$(printf '%b' "$AMBER")! reaches other sites"
+  assert_output --partial "$(printf '%b' "$AMBER")! anyone can upload"
+  refute_output --partial '\033'
+}
+
+@test "egress draw: every risky pack row carries its risk word and no safe row does" {
+  _rows_of 60 120
+  _egress_editor_load ""
+  _egress_measure
+  local i ix p line
+  _egress_frame_build 0
+  i=0
+  while [ "$i" -lt "${#_EGO[@]}" ]; do
+    ix="${_EGO[i]}"
+    p="${_EGC_P[ix]}"
+    line="$(printf '%s\n' "$_EGF" | _plainw | grep -E "^ {2,4}(> )?\[.\] $p +" || true)"
+    _egress_pack_refused "$ix" && { i=$((i + 1)); continue; }
+    case "${_EGC_WORD[ix]}" in
+      shared) assert_equal "${line##* ! }" "reaches other sites" ;;
+      "open tenancy") assert_equal "${line##* ! }" "anyone can upload" ;;
+      unaudited) assert_equal "${line##* ! }" "not checked" ;;
+      *)
+        case "$line" in *" ! "*) fail "a safe pack carries a risk word: $line" ;; esac ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+@test "egress draw: the mode row names what the mode does for every ring value" {
+  _rows_of 40
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  local m
+  _egress_editor_load ""
+  _egress_measure
+  for m in strict open off; do
+    _EGE_MODE="$m"
+    run _plain "$(_egress_draw 5)"
+    case "$m" in
+      strict) assert_output --partial "Mode    strict     (only the hosts ticked below)" ;;
+      open) assert_output --partial "Mode    open       (per box only, not saved here)" ;;
+      off) assert_output --partial "Mode    off        (no control for new boxes)" ;;
+    esac
+  done
+  _egress_editor_load main
+  _egress_measure
+  for m in inherit strict open off; do
+    _EGE_MODE="$m"
+    run _plain "$(_egress_draw 0)"
+    case "$m" in
+      inherit) assert_output --partial "Mode  ‹ inherit ›  (same as every box: strict)" ;;
+      strict) assert_output --partial "Mode  ‹ strict ›   (only the hosts ticked below)" ;;
+      open) assert_output --partial "Mode  ‹ open ›     (any host until it stops, logged)" ;;
+      off) assert_output --partial "Mode  ‹ off ›      (no control: any host, any port)" ;;
+    esac
+  done
+}
+
+@test "egress picker: a keypress forks nothing and calls docker nothing" {
+  # The first editor ran about 300 processes and 3 docker calls on every key,
+  # which was its lag. The real loop runs over every row kind, both editors,
+  # with a DEBUG trap armed from its first key. It records any command
+  # substitution, any command run in a child process (a subshell, a pipeline,
+  # a process substitution) and any command that is not a builtin, a keyword
+  # or a function. BASHPID marks a child on bash 4 and later, BASH_SUBSHELL
+  # the rest on 3.2. The stub's call log records docker.
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = github\npack = npm\nallow = docs.rs\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  local words box log="$TEST_TEMP/forks" me i n
+  words=" $(compgen -b | tr '\n' ' ') $(compgen -k | tr '\n' ' ') (( [[ "
+  me="${BASHPID:-}"
+  : > "$log"
+  _fd_trap() {
+    if [ "$BASH_SUBSHELL" -gt 0 ] || { [ -n "$me" ] && [ "${BASHPID:-$me}" != "$me" ]; }; then
+      printf 'child: %s\n' "$BASH_COMMAND" >> "$log"
+      return 0
+    fi
+    case "${BASH_COMMAND//'$(('/}" in *'$('*|*'`'*|*'<('*|*'>('*|*' | '*) printf 'subst: %s\n' "$BASH_COMMAND" >> "$log" ;; esac
+    local w="${BASH_COMMAND%% *}"
+    case "$w" in *=*) return 0 ;; esac
+    declare -F "$w" >/dev/null 2>&1 && return 0
+    case "$words" in *" $w "*) return 0 ;; esac
+    printf 'external: %s\n' "$BASH_COMMAND" >> "$log"
+  }
+  _rows_of 30
+  for box in "" main; do
+    # The keys: the ring both ways, then every row. A pack is ticked and
+    # unticked and its hosts opened, keyed and left, a host row is ticked
+    # twice. Find and Add are passed by, since a prompt may fork.
+    _egress_editor_load "$box"
+    K=(RIGHT RIGHT RIGHT RIGHT LEFT LEFT LEFT LEFT OTHER DOWN)
+    n="${#_EGR[@]}"
+    i=2
+    while [ "$i" -lt "$n" ]; do
+      case "${_EGR[i]}" in
+        pack:*) K+=(SPACE LEFT SPACE LEFT RIGHT DOWN SPACE SPACE UP LEFT DOWN) ;;
+        host:*) K+=(SPACE SPACE DOWN) ;;
+      esac
+      i=$((i + 1))
+    done
+    for i in $(seq 1 $(( n + 2 ))); do K+=(UP); done
+    K+=(QUIT)
+    KI=0
+    _egress_key() {
+      if [ "$KI" = 0 ]; then
+        : > "$DOCKER_CALLS"
+        set -T
+        trap '_fd_trap' DEBUG
+      fi
+      _KEY="${K[$KI]:-QUIT}"
+      KI=$((KI + 1))
+    }
+    # A prompt the walk lands on answers end of input.
+    _egress_picker_tui "$box" > "$TEST_TEMP/frames" < /dev/null
+    trap - DEBUG
+    set +T
+    run cat "$log"
+    assert_output ""
+    run cat "$DOCKER_CALLS"
+    assert_output ""
+    assert [ "$KI" -gt 40 ]
+  done
+}
+
+@test "egress picker: the engine is probed once per editor, never per draw" {
+  _rows_of 30
+  local once
+  : > "$DOCKER_CALLS"
+  _egress_editor_load ""
+  once="$(wc -l < "$DOCKER_CALLS" | tr -d ' ')"
+  assert [ "$once" -gt 0 ]
+  : > "$DOCKER_CALLS"
+  _keys DOWN DOWN SPACE DOWN RIGHT LEFT UP LEFT RIGHT DOWN DOWN SPACE QUIT
+  run _egress_picker_tui ""
+  assert_success
+  run bash -c 'wc -l < "$1" | tr -d " "' _ "$DOCKER_CALLS"
+  assert_output "$once"
 }
 
 @test "egress picker: the add row is reachable by arrow keys alone" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   _rows_of 30
   _egress_editor_load ""
-  local add save
+  local add
   add="$(_row_index "$_EGRESS_ROW_ADD")"
-  _keys $(_downs "$add") ENTER $(_downs 5) ENTER
+  _keys $(_downs "$add") SPACE ENTER
   run _egress_picker_tui "" <<< $'docs.rs\ny'
   assert_success
   run _read_section_all_from_file "$CLEAT_GLOBAL_CONFIG" egress allow
@@ -200,10 +515,12 @@ _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
   _egress_editor_load ""
   local f
   f="$(_row_index "$_EGRESS_ROW_FILTER")"
-  _keys $(_downs "$f") ENTER QUIT
-  run _egress_picker_tui "" <<< "apt"
-  assert_output --partial "[/] filter               apt"
-  assert_output --partial "showing 1-3 of 3"
+  _keys $(_downs "$f") SPACE QUIT
+  run _egress_picker_tui "" <<< "APT"
+  run _plain "$output"
+  assert_output --partial "[/] Find a pack           apt"
+  assert_output --partial "Packs matching \"apt\" (space ticks)"
+  assert_output --partial "3 of 26"
 }
 
 @test "egress picker: an unknown key is ignored, not a cancel" {
@@ -217,23 +534,59 @@ _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
   assert_output "4"
 }
 
-@test "egress picker: the save row is the only path that writes" {
+@test "egress picker: q and escape write nothing, whatever was ticked" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   _rows_of 30
-  _keys DOWN DOWN SPACE RIGHT QUIT
+  _keys DOWN DOWN SPACE RIGHT DOWN SPACE LEFT QUIT
   run _egress_picker_tui ""
   assert_success
-  [ ! -e "$CLEAT_GLOBAL_CONFIG" ] || { cat "$CLEAT_GLOBAL_CONFIG"; return 1; }
+  assert_output --partial "Nothing saved."
+  run test -e "$CLEAT_GLOBAL_CONFIG"
+  assert_failure
+  # Esc ends the editor itself, before the stream could run out.
+  _keys ESC DOWN DOWN
+  run _egress_picker_tui ""
+  assert_output --partial "Nothing saved."
+  run cat "$TEST_TEMP/kp"
+  assert_output "1"
+  run test -e "$CLEAT_GLOBAL_CONFIG"
+  assert_failure
+}
+
+@test "egress picker: enter reviews and saves from any row" {
+  # The maintainer's rule: enter saves from every row, as cleat config does.
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  local gh r n
+  gh="$(_row_index pack:github)"
+  for r in mode "$_EGRESS_ROW_FILTER" pack:npm "$_EGRESS_ROW_ADD"; do
+    rm -f "$CLEAT_GLOBAL_CONFIG"
+    _egress_editor_load ""
+    n="$(_row_index "$r")"
+    _keys $(_downs "$gh") SPACE $(_ups 60) $(_downs "$n") ENTER
+    run _egress_picker_tui "" <<< "y"
+    assert_success
+    run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+    assert_output "mode = strict
+pack = github"
+  done
+  # And from a pack's hosts.
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  _keys $(_downs "$gh") SPACE RIGHT ENTER
+  run _egress_picker_tui "" <<< "y"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict
+pack = github"
 }
 
 @test "egress picker: space ticks a pack and the save writes it" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   _rows_of 30
   _egress_editor_load ""
-  local gh save
+  local gh
   gh="$(_row_index pack:github)"
-  save="$(_row_index "$_EGRESS_ROW_SAVE")"
-  _keys $(_downs "$gh") SPACE $(_downs $(( save - gh ))) ENTER
+  _keys $(_downs "$gh") SPACE ENTER
   run _egress_picker_tui "" <<< "y"
   assert_success
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
@@ -241,11 +594,42 @@ _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
 pack = github"
 }
 
-@test "egress picker: a refused capability pack cannot be ticked" {
+@test "egress picker: a refused capability pack cannot be ticked from the list, its hosts or the typed picker" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 40
   _egress_editor_load ""
   _egress_toggle pack:containers
   run _egress_is_ticked containers
   assert_failure
+  # Its hosts: space on a host that comes with it does nothing either.
+  _egress_ix_of containers
+  _egress_hosts_open "$_EGX"
+  _KEY=SPACE
+  _egress_tui_key
+  run _egress_is_ticked containers
+  assert_failure
+  _EG_SCREEN=list
+  run _egress_picker_text "" <<< $'containers\ndone'
+  assert_output --partial "containers needs the docker cap, which egress control refuses."
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  refute_output --partial "containers"
+}
+
+@test "egress picker: a pack with no default host cannot be ticked as a pack" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 40
+  _egress_editor_load ""
+  _egress_toggle pack:github-objects
+  run _egress_is_ticked github-objects
+  assert_failure
+  # Space on its row opens its hosts, to pick one by one.
+  _egress_cursor_to pack:github-objects
+  _KEY=SPACE
+  _egress_tui_key
+  run echo "$_EG_SCREEN"
+  assert_output "hosts"
+  run _egress_picker_text "" <<< $'github-objects\nq'
+  assert_output --partial "github-objects has no host that comes with it."
 }
 
 @test "egress picker: left and right turn the mode ring, a box's ring starts at inherit" {
@@ -260,32 +644,888 @@ pack = github"
   _egress_mode_step -1
   run echo "$_EGE_MODE"
   assert_output "off"
-  _EGE_BOX=main
-  _EGE_MODE=inherit
+  _egress_editor_load main
+  run echo "$_EGE_MODE"
+  assert_output "inherit"
   _egress_mode_step 1
   run echo "$_EGE_MODE"
   assert_output "strict"
 }
 
-@test "egress picker: enter on a pack opens its action screen and tick ticks it" {
+@test "egress picker: left and right do nothing off the mode row" {
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_cursor_to pack:github
+  _KEY=LEFT
+  _egress_tui_key
+  run echo "$_EGE_MODE $_EG_SCREEN"
+  assert_output "strict list"
+  _egress_cursor_to "$_EGRESS_ROW_ADD"
+  _KEY=RIGHT
+  _egress_tui_key
+  run echo "$_EGE_MODE $_EG_SCREEN"
+  assert_output "strict list"
+  _EG_CUR=0
+  _KEY=LEFT
+  _egress_tui_key
+  run echo "$_EGE_MODE"
+  assert_output "off"
+}
+
+@test "egress picker: right on a pack opens its hosts and space there ticks the pack" {
   _rows_of 30
   _egress_editor_load ""
   local go
   go="$(_row_index pack:go)"
-  _keys $(_downs "$go") ENTER ENTER QUIT
+  _keys $(_downs "$go") RIGHT SPACE QUIT
   run _egress_picker_tui ""
-  assert_output --partial "  > tick"
+  run _plain "$output"
+  assert_output --partial "go (go get and go mod)"
+  assert_output --partial "comes with the pack"
+  assert_output --partial "[✔] proxy.golang.org"
+  # q on the hosts goes back to the list, and a second q leaves.
+  _keys $(_downs "$go") RIGHT QUIT QUIT
+  run _egress_picker_tui ""
+  run grep -c "Nothing saved" <<< "$output"
+  assert_output "1"
+}
+
+@test "egress picker: a host added on its own from a pack's hosts is saved as a host of yours" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  local npm
+  npm="$(_row_index pack:npm)"
+  _keys $(_downs "$npm") RIGHT DOWN SPACE ENTER
+  run _egress_picker_tui "" <<< "y"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict
+allow = registry.yarnpkg.com"
+}
+
+@test "egress picker: a named site is saved as an exact allow and a dot is refused" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_ix_of atlassian
+  _egress_hosts_open "$_EGX"
+  _EG_HCUR=$(( ${#_EGH[@]} - 1 ))
+  run printf '%s' "${_EGH[$_EG_HCUR]}"
+  assert_output "tpl:{site}.atlassian.net"
+  _egress_fill_prompt <<< $'acme.evil.com\n-acme\nAcme' > "$TEST_TEMP/out"
+  run _plain "$(cat "$TEST_TEMP/out")"
+  assert_output --partial "Only letters, digits and dashes, like acme."
+  assert_output --partial "A name cannot start or end with a dash."
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output "acme.atlassian.net"
+  run printf '%s' "$_EG_SCREEN ${_EGR[$_EG_CUR]}"
+  assert_output "list host:acme.atlassian.net"
 }
 
 @test "egress picker: a host typed in the wrong shape is refused with the reason and no lost typing" {
+  _rows_of 30
   _egress_editor_load ""
-  run _egress_add_prompt <<< $'*.acme.internal\nhttps://Docs.RS/\nhttp://deb.debian.org:80\nuser@git.acme.internal/repo\ndocs.rs'
-  assert_success
+  _egress_add_prompt <<< $'*.acme.internal\nhttps://Docs.RS/\nhttp://deb.debian.org:80\nuser@git.acme.internal/repo\ndocs.rs' > "$TEST_TEMP/out"
+  run _plain "$(cat "$TEST_TEMP/out")"
   assert_output --partial "No wildcards"
   assert_output --partial "Did you mean:  docs.rs"
   assert_output --partial "Port 80 carries no ClientHello"
   assert_output --partial "No userinfo and no path"
-  assert_output --partial "added just now"
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output "docs.rs"
+}
+
+@test "egress picker: a prompt draws inside the frame, never under it" {
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  _egress_add_prompt <<< $'*.bad\ndocs.rs' > "$TEST_TEMP/out"
+  # Everything written is a frame: it starts at the top left, and nothing is
+  # printed after the last one.
+  run head -c 3 "$TEST_TEMP/out"
+  assert_output $'\033[H'
+  run _plain "$(cat "$TEST_TEMP/out")"
+  assert_output --partial "  Add a host > "
+  # The cursor waits on the frame's last line, after the label.
+  run grep -c $'\033\\[29;16H' "$TEST_TEMP/out"
+  assert_output "2"
+}
+
+@test "egress picker: the review has a screen of its own and a no brings the list back" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  local gh
+  gh="$(_row_index pack:github)"
+  _keys $(_downs "$gh") SPACE ENTER QUIT
+  run _egress_picker_tui "" <<< "n"
+  local drawn="$output"
+  run _plain "$drawn"
+  assert_output --partial "Save what every box may reach?"
+  assert_output --partial "Not saved. Your changes are still here."
+  assert_output --partial "Nothing saved."
+  # The review is drawn on a cleared screen, not under the list: once when the
+  # editor took the screen and once for the review.
+  run grep -c $'\033\\[H\033\\[2J' <<< "$drawn"
+  assert_output "2"
+  run test -e "$CLEAT_GLOBAL_CONFIG"
+  assert_failure
+}
+
+@test "egress picker: a refused save stays on screen until a key, then the list comes back" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _EGRESS_ENFORCING=1
+  _validated
+  _daemon_up() { return 0; }
+  _egress_label_read() { _EG_LABEL_SET=1; return 0; }
+  is_running() { return 1; }
+  _set_box main
+  _rows_of 30
+  # The q after the refusal is the wait's key, not a cancel: the editor
+  # goes back to the list and reads once more before the stream runs out.
+  _keys RIGHT RIGHT ENTER QUIT
+  run _egress_picker_tui main
+  run _plain "$output"
+  assert_output --partial "is not running"
+  assert_output --partial "Press any key to go back."
+  run cat "$TEST_TEMP/kp"
+  assert_output "5"
+}
+
+@test "egress picker: the editor takes the alternate screen and gives it back" {
+  _rows_of 30
+  _keys DOWN QUIT
+  run _egress_picker_tui ""
+  assert_output --partial $'\033[?1049h'
+  assert_output --partial $'\033[?1049l'
+  # The last thing written is outside it.
+  run _plain "${output##*$'\033[?1049l'}"
+  assert_output --partial "Nothing saved."
+}
+
+@test "egress picker: an interrupt restores the cursor, echo and the screen" {
+  _rows_of 30
+  _tui_echo_restore() { echo "ECHO RESTORED"; }
+  _egress_key() { sh -c 'kill -INT $PPID'; sleep 1; _KEY=QUIT; }
+  run _egress_picker_tui ""
+  assert_equal "$status" 130
+  assert_output --partial "ECHO RESTORED"
+  run _plain "${output##*$'\033[?25h'}"
+  refute_output --partial "Cleat egress"
+  run grep -c $'\033\\[?1049l' <<< "$output"
+  assert_output "1"
+}
+
+@test "egress picker: the editor key reader decodes every sequence as _read_keypress does" {
+  local s want
+  for s in $'\e[A' $'\e[B' $'\e[C' $'\e[D' $'\e[5~' $'\e' ' ' 'q' 'Q' 'x'; do
+    want="$(printf '%s' "$s" | _read_keypress)"
+    _KEY=""
+    _egress_key < <(printf '%s' "$s")
+    assert_equal "$_KEY" "$want"
+  done
+  _egress_key < <(printf '\n')
+  assert_equal "$_KEY" "ENTER"
+  # End of input is a cancel here, never enter: enter saves.
+  _egress_key < /dev/null
+  assert_equal "$_KEY" "QUIT"
+}
+
+@test "egress picker: the editor never opens when a save would be refused" {
+  # The maintainer's rule: no editor for a save the writer would refuse. One
+  # message names the capability, where it is on and the command.
+  _EGRESS_ENFORCING=1
+  mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT"
+  cd "$PROJECT"
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  _keys QUIT
+  run _egress_editor ""
+  assert_failure
+  refute_output --partial $'\033[?1049h'
+  run _plain "$output"
+  assert_output --partial "Egress control cannot be saved while the docker capability is on."
+  assert_output --partial "hands the box your Docker daemon"
+  assert_output --partial "It is on in your global config. Turn it off:  cleat config --disable docker"
+  # A trusted project's own caps, and a box's own section.
+  printf '[caps]\ngit\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[caps]\nssh\n[box.api.caps]\nhooks\n' > "$PROJECT/.cleat"
+  _CLI_TRUST_PROJECT=1
+  run _egress_editor ""
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "It is on in this project's .cleat. Turn it off:  cleat config --project --disable ssh"
+  _set_box api
+  run _egress_editor api
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "It is on for box api in this project's .cleat. Turn it off:  cleat config api --disable hooks"
+  # main's own section replaces [caps] for main, so it is the one named.
+  printf '[caps]\ngit\n[box.main.caps]\ndocker\n' > "$PROJECT/.cleat"
+  _set_box main
+  run _egress_editor ""
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "It is on for box main in this project's .cleat. Turn it off:  cleat config main --disable docker"
+  # With no such capability it opens.
+  printf '[caps]\ngit\n' > "$PROJECT/.cleat"
+  _set_box main
+  run _egress_editor ""
+  assert_success
+  assert_output --partial $'\033[?1049h'
+}
+
+@test "egress picker: the config row's off opens the editor even under a refused capability" {
+  # Off is never refused, and the row that turns egress off must not be the
+  # one door a capability closes.
+  _EGRESS_ENFORCING=1
+  _validated
+  mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT"
+  cd "$PROJECT"
+  printf '[caps]\ndocker\n[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_caged_boxes() { :; }
+  _rows_of 30
+  _keys ENTER
+  run _egress_picker_tui "" off <<< "y"
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = off
+pack = npm"
+}
+
+# ── What a box shows and gets (M20) ──────────────────────────────────────────
+
+@test "egress box: the box editor shows the global packs ticked for every box" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = github\npack = npm\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 30
+  _egress_editor_load main
+  _egress_measure
+  run _plain "$(_egress_draw 0)"
+  assert_output --regexp "\[✔\] github +git, gh and tarballs +every box"
+  assert_output --regexp "\[✔\] npm +npm, pnpm and yarn +every box"
+  assert_output --partial "[✔] docs.rs"
+  assert_output --partial "(same as every box: strict)"
+  assert_output --partial "On save: 11 hosts allowed"
+}
+
+@test "egress box: the save count equals the resolved count, box and global" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  _counted() {
+    _egress_resolve "$1"
+    printf '%s\n' "$_EG_HOSTS" | grep -c .
+  }
+  printf '[egress]\nmode = strict\npack = github\npack = npm\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load main
+  assert_equal "$_EGE_COUNT" 11
+  assert_equal "$_EGE_COUNT" "$(_counted "$cn")"
+  printf '[egress]\nmode = strict\npack = github\npack = npm\nallow = docs.rs\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load main
+  assert_equal "$_EGE_COUNT" 10
+  # Unticking npm in the box: 9, and the resolver agrees after the save.
+  _egress_toggle pack:npm
+  assert_equal "$_EGE_COUNT" 9
+  _egress_save_screen 1 >/dev/null
+  assert_equal "$(_counted "$cn")" 9
+  # A global pack that shares a host with the box's own: the shared host
+  # stays, the other goes.
+  rm -f "${_EGRESS_BOXES_DIR:?}/${cn:?}"
+  printf '[egress]\nmode = strict\npack = dotnet\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\npack = azure-cli\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  assert_equal "$_EGE_COUNT" 7
+  _egress_toggle pack:dotnet
+  assert_equal "$_EGE_COUNT" 6
+  _egress_save_screen 1 >/dev/null
+  assert_equal "$(_counted "$cn")" 6
+  # The global editor counts its own blocks.
+  printf '[egress]\nmode = strict\npack = github\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  assert_equal "$_EGE_COUNT" 8
+  assert_equal "$_EGE_COUNT" "$(_counted "")"
+}
+
+@test "egress box: unticking an inherited pack denies only hosts no other tick provides" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = strict\npack = dotnet\npack = azure-cli\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load main
+  _sorted() { printf '%s\n' "$1" | LC_ALL=C sort; }
+  _egress_toggle pack:dotnet
+  run _sorted "$_EGE_DENIES"
+  assert_output "dot.net"
+  run _egress_is_ticked azure-cli
+  assert_success
+  # Then azure-cli: now nothing else brings packages.microsoft.com.
+  _egress_toggle pack:azure-cli
+  run _sorted "$_EGE_DENIES"
+  assert_output "dot.net
+packages.microsoft.com"
+  # dotnet back on brings packages.microsoft.com with it. azure-cli stays
+  # off for this box, as the user left it, with nothing of its own to block.
+  _egress_toggle pack:dotnet
+  run printf '%s' "$_EGE_DENIES"
+  assert_output ""
+  run _egress_is_ticked azure-cli
+  assert_failure
+  assert_equal "$_EGE_COUNT" 7
+  # A box whose file already blocks a pack's own hosts shows it off, and a
+  # save it did not touch writes the blocks back as they were.
+  printf '[egress]\ndeny = dot.net\ndeny = packages.microsoft.com\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  run _egress_is_ticked dotnet
+  assert_failure
+  run _egress_is_ticked azure-cli
+  assert_failure
+  _egress_host_add extra.example.com
+  _egress_save_screen 1 >/dev/null
+  run _egress_section_canon "$_EGRESS_BOXES_DIR/$cn"
+  assert_output "deny = dot.net
+deny = packages.microsoft.com
+allow = extra.example.com"
+  # Unticking the host an off pack was relying on blocks it again (the
+  # review said the pack was off, so the file says so too).
+  rm -f "${_EGRESS_BOXES_DIR:?}/${cn:?}"
+  printf '[egress]\nmode = strict\npack = homebrew\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nallow = ghcr.io\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  _egress_toggle pack:homebrew
+  _egress_toggle host:ghcr.io
+  _egress_save_screen 1 >/dev/null
+  _egress_resolve "$cn"
+  run _egress_in_list ghcr.io "$_EG_HOSTS"
+  assert_failure
+}
+
+@test "egress box: no row or key changes the core" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\ndeny = claude.ai\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  assert_equal "$_EGE_COUNT" 5
+  run _egress_editor_rows
+  refute_output --partial "pack:claude"
+  refute_output --partial "host:api.anthropic.com"
+  _egress_toggle pack:claude
+  assert_equal "$_EGE_COUNT" 5
+  assert_equal "$_EGE_PACKS" ""
+  _egress_resolve ""
+  run printf '%s\n' "$_EG_HOSTS"
+  assert_output --partial "claude.ai"
+}
+
+@test "egress box: a block of the user's own on a ticked pack's host shows as its own row" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = strict\npack = dotnet\npack = azure-cli\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\npack = azure-cli\ndeny = dot.net\ndeny = packages.microsoft.com\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  # dotnet reads as off for this box through dot.net. packages.microsoft.com
+  # is azure-cli's only host: that block is the user's, and it shows.
+  run _egress_is_ticked dotnet
+  assert_failure
+  run _egress_editor_rows
+  assert_output --partial "host:packages.microsoft.com"
+  run _egress_pack_note azure-cli
+  assert_output "One of its hosts is blocked, in the hosts below."
+  _egress_resolve "$cn"
+  run bash -c 'printf "%s\n" "$1" | grep -c .' _ "$_EG_HOSTS"
+  assert_output "$_EGE_COUNT"
+}
+
+@test "egress box: a host every box blocks that the box's own pack brings back is no blocked row" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = strict\ndeny = registry.npmjs.org\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\npack = npm\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  run _egress_editor_rows
+  refute_output --partial "host:registry.npmjs.org"
+  assert_equal "$_EGE_COUNT" 6
+  # Without the box's own npm, every box's block shows, and holds.
+  rm -f "${_EGRESS_BOXES_DIR:?}/${cn:?}"
+  _egress_editor_load main
+  run _egress_editor_rows
+  assert_output --partial "host:registry.npmjs.org"
+}
+
+@test "egress box: a refused pack already in the file shows ticked and can be unticked" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = containers\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 40
+  _egress_editor_load ""
+  _egress_measure
+  run _plain "$(_egress_draw 0)"
+  assert_output --regexp "\[✔\] containers"
+  _egress_toggle pack:containers
+  run printf '%s' "$_EGE_PACKS"
+  assert_output ""
+  # And, off again, it never ticks back.
+  _egress_toggle pack:containers
+  run printf '%s' "$_EGE_PACKS"
+  assert_output ""
+}
+
+@test "egress box: host values count as the resolver reads them, and one that is no host goes back as it was" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\ndeny = Registry.npmjs.org\nallow = Docs.RS.\nallow = not_a_host\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  _egress_resolve "$cn" >/dev/null 2>&1
+  run bash -c 'printf "%s\n" "$1" | grep -c .' _ "$_EG_HOSTS"
+  assert_output "$_EGE_COUNT"
+  # The block, read as the resolver reads it, turns npm off for this box.
+  run _egress_is_ticked npm
+  assert_failure
+  run _egress_editor_rows
+  assert_output --partial "host:docs.rs"
+  refute_output --partial "not_a_host"
+  _egress_host_add extra.example.com
+  _egress_save_screen 1 >/dev/null
+  run _read_section_all_from_file "$_EGRESS_BOXES_DIR/$cn" egress allow
+  assert_output --partial "not_a_host"
+  assert_output --partial "docs.rs"
+  # A value carrying a control sequence is no host: it is never drawn.
+  printf '[egress]\nmode = strict\nallow = a\033[2Jb.example.com\nallow = ok.example.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  _egress_frame_build 0
+  run printf '%s' "$_EGF"
+  refute_output --partial $'\033[2J'
+  assert_equal "$_EGE_COUNT" 6
+}
+
+@test "egress save: a pack unticked for a box is named once" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\npack = npm\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  _egress_toggle pack:npm
+  run _egress_save_screen 1
+  run _plain "$output"
+  assert_output --partial "Removed   npm, off for this box only"
+  refute_output --partial "npm and npm"
+}
+
+@test "egress save: a box that follows every box into off asks, default no" {
+  # Stepping a box with a mode of its own back to inherit, while every box
+  # is off, turns it off: the off confirmation asks, never Save? [Y/n].
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = off\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nmode = strict\n' > "$_EGRESS_BOXES_DIR/$cn"
+  cp "$_EGRESS_BOXES_DIR/$cn" "$TEST_TEMP/before"
+  # A box that exists and was made with no cage: off needs no recreate, and
+  # the line after the save must not say it refuses to start.
+  container_exists() { return 0; }
+  _egress_label_read() { _EG_LABEL_SET=0; return 0; }
+  _egress_editor_load main
+  _egress_mode_step -1
+  run echo "$_EGE_MODE"
+  assert_output "inherit"
+  run _egress_save_screen 0 <<< ""
+  assert_failure
+  assert_output --partial "Turn it off? [y/N]"
+  refute_output --partial "Save? [Y/n]"
+  run cmp "$_EGRESS_BOXES_DIR/$cn" "$TEST_TEMP/before"
+  assert_success
+  run _egress_save_screen 0 <<< "y"
+  assert_success
+  refute_output --partial "refuses to start"
+  run cat "$_EGRESS_BOXES_DIR/$cn"
+  assert_output "[egress]"
+}
+
+@test "egress save: a box that follows every box into open asks, default no" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = open\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nmode = strict\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  _egress_mode_step -1
+  run _egress_save_screen 0 <<< ""
+  assert_failure
+  assert_output --partial "will reach any host, as every box does"
+  assert_output --partial "Save? [y/N]"
+  run cat "$_EGRESS_BOXES_DIR/$cn"
+  assert_output --partial "mode = strict"
+}
+
+@test "egress review: a review longer than the window is shown a page at a time" {
+  _rows_of 12
+  _egress_editor_load ""
+  _EG_TUI=1
+  _EG_ROWS=12
+  local text i
+  text=""
+  for i in $(seq 1 20); do text+="line $i"$'\n'; done
+  _keys OTHER OTHER
+  run _egress_review_show "$text"
+  assert_success
+  assert_output --partial "More below: any key goes on, q goes back."
+  assert_output --partial "line 1"
+  assert_output --partial "line 20"
+  # No page is taller than the window less the question's rows.
+  run _review_page_max "$output"
+  assert [ "$output" -le 10 ]
+  # q on a page is a no.
+  _keys QUIT
+  run _egress_review_show "$text"
+  assert_failure
+  refute_output --partial "line 20"
+  _EG_TUI=0
+}
+
+@test "egress draw: the global editor on a policy saved as open says every box is open" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = open\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  run _plain "$(_egress_draw 0)"
+  assert_output --partial "(any host for every box, logged)"
+  assert_output --partial "On save: keeps open, any host for every box"
+  assert_output --partial "cleat egress open --always set this."
+  refute_output --partial "per box only"
+}
+
+@test "egress draw: a box's open session, a caged box under off and a box that cannot open say so" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  _EGRESS_ENFORCING=1
+  _validated
+  _daemon_up() { return 0; }
+  _egress_label_read() { _EG_LABEL_SET=1; return 0; }
+  is_running() { return 1; }
+  _egress_session_marker_valid() { return 0; }
+  _rows_of 30
+  _egress_editor_load main
+  _egress_measure
+  run _plain "$(_egress_draw 0)"
+  assert_output --partial "(open until it stops, then same as every box: strict)"
+  assert_output --partial "This box is open for this session: cleat egress open."
+  _EGE_MODE=open
+  run _plain "$(_egress_draw 3)"
+  assert_output --partial "On save: already open until it stops"
+  _egress_save_plan
+  run echo "$_EGS_PLAN"
+  assert_output "write"
+  # No session, and the box stopped: the reason is on the status line.
+  _egress_session_marker_valid() { return 1; }
+  _egress_editor_load main
+  _egress_measure
+  _EGE_MODE=open
+  run _plain "$(_egress_draw 3)"
+  assert_output --partial "On save: cannot open: box main is not running"
+  # Every box off, and this box made with a cage.
+  printf '[egress]\nmode = off\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load main
+  _egress_measure
+  run _plain "$(_egress_draw 0)"
+  assert_output --partial "It was made with a cage, so it refuses to start"
+}
+
+@test "egress draw: at 60 columns no pane line of a pack, a mode or a tool row is cut" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _trusted_setup_project
+  cd "$PROJECT"
+  _rows_of 60 60
+  local box r i
+  for box in "" main; do
+    _egress_editor_load "$box"
+    _egress_measure
+    i=0
+    while [ "$i" -lt "${#_EGR[@]}" ]; do
+      r="${_EGR[i]}"
+      case "$r" in host:*) i=$((i + 1)); continue ;; esac
+      _egress_pane_set "$r" "${_EGRI[i]}"
+      _EGF=""
+      _egress_pane_lines
+      run _plain "$_EGF"
+      refute_output --partial "…"
+      i=$((i + 1))
+    done
+    for r in inherit strict open off; do
+      if [ -z "$box" ] && [ "$r" = inherit ]; then continue; fi
+      _EGE_MODE="$r"
+      _egress_pane_set mode
+      _EGF=""
+      _egress_pane_lines
+      run _plain "$_EGF"
+      refute_output --partial "…"
+    done
+  done
+}
+
+@test "egress picker: a refused host names the rule in words, never a reason code" {
+  local h
+  for h in foo_bar.com a..b.com "exa mple.com" "$(printf 'x%.0s' $(seq 1 260)).com"; do
+    run _egress_add_refusal "$h"
+    refute_output --regexp "[A-Z_]{6,}"
+  done
+  run _egress_add_refusal "exa mple.com"
+  assert_output --partial "No spaces"
+  run _egress_add_refusal foo_bar.com
+  assert_output --partial "Each part between dots is letters, digits and dashes."
+}
+
+@test "egress picker: a resize during a prompt ends it when the window no longer holds the editor" {
+  _rows_of 30
+  _egress_editor_load ""
+  _egress_measure
+  _EG_WINCH=1
+  _egress_term_now() { _EG_ROWS=15; _EG_RAWCOLS=80; }
+  run _egress_add_prompt <<< "docs.rs"
+  assert_failure
+  refute_output --partial "Add a host >"
+}
+
+@test "egress picker: at the top level Ctrl-C only exits and the exit gives the terminal back" {
+  # On bash 4 and later an INT trap runs inside the key reader, which puts
+  # back its echo-off state after the trap: a restore in the trap was undone.
+  # So the interrupt only exits and the EXIT trap restores, after the reader.
+  run bash -c 'source "$1"; _egress_tui_enter >/dev/null; trap -p INT; trap -p EXIT' _ "$CLI"
+  assert_output --partial "trap -- 'exit 130' SIGINT"
+  assert_output --partial "_egress_tui_exit"
+}
+
+@test "egress picker: the key reader itself runs no subprocess" {
+  local words log="$TEST_TEMP/forks" s
+  words=" $(compgen -b | tr '\n' ' ') $(compgen -k | tr '\n' ' ') (( [[ "
+  : > "$log"
+  _fd_trap() {
+    case "${BASH_COMMAND//'$(('/}" in *'$('*|*'`'*|*'<('*|*'>('*|*' | '*) printf 'subst: %s\n' "$BASH_COMMAND" >> "$log" ;; esac
+    local w="${BASH_COMMAND%% *}"
+    case "$w" in *=*) return 0 ;; esac
+    declare -F "$w" >/dev/null 2>&1 && return 0
+    case "$words" in *" $w "*) return 0 ;; esac
+    printf 'external: %s\n' "$BASH_COMMAND" >> "$log"
+  }
+  for s in x q $'\e[B'; do
+    set -T
+    trap '_fd_trap' DEBUG
+    _egress_key <<< "$s"
+    trap - DEBUG
+    set +T
+  done
+  run cat "$log"
+  assert_output ""
+}
+
+@test "egress picker: a save leaves the full screen first, so what it did stays on the screen" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _egress_editor_load ""
+  local gh
+  gh="$(_row_index pack:github)"
+  _keys $(_downs "$gh") SPACE ENTER
+  run _egress_picker_tui "" <<< "y"
+  assert_success
+  assert_output --partial $'\033[?1049l'
+  run _plain "${output##*$'\033[?1049l'}"
+  assert_output --partial "Saved to"
+  # Nothing changed: the note is outside the full screen too.
+  _keys ENTER
+  run _egress_picker_tui ""
+  assert_output --partial $'\033[?1049l'
+  run _plain "${output##*$'\033[?1049l'}"
+  assert_output --partial "Nothing to save."
+}
+
+@test "egress picker: a resize to a window too small runs the typed picker on the normal screen" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _keys DOWN DOWN SPACE OTHER DOWN
+  _egress_key() {
+    _KEY="$(_read_keypress)"
+    if [ "$_KEY" = OTHER ]; then _rows_of 15; _EG_WINCH=1; fi
+  }
+  run _egress_picker_tui "" <<< "q"
+  local drawn="$output"
+  run _plain "${drawn##*$'\033[?1049l'}"
+  assert_output --partial "(typed, what every box may reach)"
+  # The tick made on the full screen carried over.
+  assert_output --regexp "\[✔\] github"
+  run grep -c $'\033\\[?1049l' <<< "$drawn"
+  assert_output "1"
+}
+
+@test "egress picker: a resize signal is measured at the next key" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _rows_of 30
+  _keys DOWN WINCH DOWN QUIT
+  _egress_key() {
+    _KEY="$(_read_keypress)"
+    if [ "$_KEY" = WINCH ]; then _rows_of 40; sh -c 'kill -WINCH $PPID'; _KEY=OTHER; fi
+  }
+  _egress_picker_tui "" > "$TEST_TEMP/frames"
+  assert_equal "$_EG_ROWS" 40
+}
+
+@test "egress picker: an exit from inside the editor gives the terminal back, and the caller's exit trap" {
+  # Strict mode can end the editor anywhere. The EXIT trap it sets restores
+  # the screen, the cursor and echo, then runs the trap the caller had.
+  run bash -c 'source "$1"; trap "echo CALLER-EXIT" EXIT; _egress_tui_enter >/dev/null; false' _ "$CLI"
+  assert_failure
+  assert_output --partial $'\033[?1049l'
+  assert_output --partial "CALLER-EXIT"
+  # A clean leave puts the caller's trap back as it was.
+  run bash -c 'source "$1"; trap "echo CALLER-EXIT" EXIT; _egress_tui_enter >/dev/null; _egress_tui_leave >/dev/null; trap -p EXIT; trap - EXIT' _ "$CLI"
+  assert_output --partial "echo CALLER-EXIT"
+  refute_output --partial "_egress_tui_exit"
+}
+
+@test "egress picker: the config row's off door opens the editor under a refused capability, and a strict save from it is refused" {
+  _EGRESS_ENFORCING=1
+  _validated
+  mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT"
+  cd "$PROJECT"
+  printf '[caps]\ndocker\n[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  cp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  _egress_caged_boxes() { :; }
+  _egress_have_tty() { return 0; }
+  _rows_of 30
+  # The ring back to strict and a pack ticked: the save is the writer's to
+  # refuse, and nothing is written.
+  _keys RIGHT DOWN DOWN SPACE ENTER OTHER QUIT
+  run _egress_config_handoff off
+  run _plain "$output"
+  assert_output --partial "Egress control cannot be saved while the docker capability is on."
+  assert_output --partial "Press any key to go back."
+  run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  assert_success
+  # Off itself goes through.
+  _keys ENTER
+  run _egress_config_handoff off <<< "y"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = off
+pack = npm"
+}
+
+@test "egress ring: a caged box's off save keeps the ticks the review showed" {
+  status_caged
+  _egress_on_terminal() { return 0; }
+  cmd_run() { echo "cmd_run" >> "$DOCKER_CALLS"; }
+  _egress_teardown() { return 0; }
+  _account_wipe_run_dir() { :; }
+  _egress_editor_load main
+  _egress_toggle pack:npm
+  _EGE_MODE=off
+  run _egress_save_screen 1 <<< "y"
+  assert_success
+  run _egress_section_canon "$_EGRESS_BOXES_DIR/$CN"
+  assert_output "mode = off
+pack = npm"
+}
+
+@test "egress ring: done in the typed editor never answers the open for you" {
+  status_caged
+  _egress_on_terminal() { return 0; }
+  mock_docker_inspect_field "$CN" '{{if .State.Running}}{{.State.StartedAt}}{{end}}' "2026-09-28T09:00:00Z"
+  _egress_apply_mode() { return 0; }
+  _egress_editor_load main
+  _EGE_MODE=open
+  run _egress_save_screen 1 <<< ""
+  assert_failure
+  assert_output --partial "Open egress for this box until it stops? [y/N]"
+  run test -e "$_EGRESS_BOXES_DIR/$CN.session"
+  assert_failure
+}
+
+@test "egress draw: no catalogue class word is drawn anywhere in the editor" {
+  # The class words stay in cleat egress packs and --list. The editor says
+  # the same in plain words (the maintainer's rule 5).
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\nallow = x.example.com\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  _rows_of 60
+  local box i out="" ix
+  for box in "" main; do
+    _egress_editor_load "$box"
+    _egress_measure
+    i=0
+    while [ "$i" -lt "${#_EGR[@]}" ]; do
+      out+="$(_egress_draw "$i")"
+      i=$((i + 1))
+    done
+    for ix in "${_EGO[@]}"; do
+      _egress_hosts_open "$ix"
+      _EG_HCUR=0
+      while [ "$_EG_HCUR" -lt "${#_EGH[@]}" ]; do
+        out+="$(_egress_draw)"
+        _EG_HCUR=$((_EG_HCUR + 1))
+      done
+      _EG_SCREEN=list
+    done
+  done
+  # A review that adds one pack of every risk.
+  _egress_editor_load ""
+  _egress_toggle pack:pypi
+  _egress_toggle pack:github-raw
+  _egress_host_add unchecked.example.com
+  out+="$(_egress_save_review 0 <<< "n" 2>&1 || true)"
+  run _plain "$out"
+  refute_output --regexp "contained|open tenancy|single origin|unaudited|[^a-z]shared"
+}
+
+@test "egress picker: the editor opens under a refused capability when what it loads is off" {
+  # The refusal before the editor opens is for a save that would be refused.
+  # A box whose own mode is off, or every box off, saves its lists freely:
+  # only turning it on is refused, at the review.
+  _EGRESS_ENFORCING=1
+  _validated
+  mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT" "$_EGRESS_BOXES_DIR"
+  cd "$PROJECT"
+  printf '[caps]\ndocker\n[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/$(_egress_target_cname main)"
+  _set_box main
+  _rows_of 30
+  _keys QUIT
+  run _egress_editor main
+  assert_success
+  assert_output --partial $'\033[?1049h'
+  printf '[caps]\ndocker\n[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  _keys QUIT
+  run _egress_editor ""
+  assert_success
+  assert_output --partial $'\033[?1049h'
+  # With no policy anywhere the editor is for turning it on: refused.
+  printf '[caps]\ndocker\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_editor ""
+  assert_failure
+}
+
+@test "egress save: leaving open for strict says what the box had" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = open\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  _egress_mode_step -1
+  run _egress_save_screen 0 <<< "n"
+  run _plain "$output"
+  assert_output --partial "Was any host, each one logged."
+  refute_output --partial "Was no control"
+}
+
+@test "egress ui: a save with nothing to change after the config row turned egress on is no cancel" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  _egress_have_tty() { return 0; }
+  _rows_of 30
+  _keys ENTER
+  run _egress_config_handoff on
+  run _plain "$output"
+  assert_output --partial "Nothing to save."
+  assert_output --partial "Egress control is on with the Claude Code hosts only."
+  refute_output --partial "Cancelled."
 }
 
 # ── Pre-ticks in the editor (6.4) ────────────────────────────────────────────
@@ -297,7 +1537,7 @@ pack = github"
   run _egress_is_ticked apt-debian
   assert_success
   run _egress_pack_note apt-debian
-  assert_output "exception, audited 2026-09-21"
+  assert_output "Ticked for [setup], Debian's one security source."
 }
 
 @test "egress pretick: an untrusted setup section suggests apt-debian and does not tick it" {
@@ -307,7 +1547,7 @@ pack = github"
   run _egress_is_ticked apt-debian
   assert_failure
   run _egress_pack_note apt-debian
-  assert_output "suggested, not ticked"
+  assert_output "Suggested: this project has a [setup] section."
 }
 
 @test "egress pretick: a git remote does not tick the githubusercontent object hosts" {
@@ -319,6 +1559,8 @@ pack = github"
   assert_success
   run _egress_is_ticked github-objects
   assert_failure
+  run _egress_pack_note github
+  assert_output "Ticked for you: this project has a GitHub remote."
 }
 
 @test "egress pretick: a policy that already carries a pack is never re-detected" {
@@ -345,13 +1587,16 @@ pack = github"
 @test "egress save: the diff names both setup exceptions with their audit date" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   _trusted_setup_project
+  : > "$PROJECT/package.json"
   cd "$PROJECT"
   _egress_editor_load ""
   run _egress_save_screen 1
-  assert_output --partial "apt-debian is on a shared edge"
-  assert_output --partial "apt-image-extras covers the two apt sources"
-  assert_output --partial "measured $(_egress_catalogue_records | awk -F'\t' '$1 == "apt-debian" { sub(/^.*, /, "", $5); print $5 }')"
-  assert_output --partial "Detected from files in this project, which the agent can edit."
+  run _plain "$output"
+  assert_output --partial "apt-debian and apt-image-extras were ticked for your trusted [setup]"
+  assert_output --partial "section, a file the agent can edit."
+  assert_output --partial "checked $(_egress_catalogue_records | awk -F'\t' '$1 == "apt-debian" { sub(/^.*, /, "", $5); print $5 }')."
+  assert_output --partial "npm was ticked from files in this project too."
+  assert_output --partial "! apt-debian also reaches other sites on the same server."
 }
 
 @test "egress save: answering no writes nothing" {
@@ -359,7 +1604,26 @@ pack = github"
   _egress_editor_load ""
   run _egress_save_screen 0 <<< "n"
   assert_failure
-  [ ! -e "$CLEAT_GLOBAL_CONFIG" ] || { echo "a declined save wrote"; return 1; }
+  run test -e "$CLEAT_GLOBAL_CONFIG"
+  assert_failure
+}
+
+@test "egress save: nothing changed saves nothing and says so" {
+  mkdir -p "$CLEAT_CONFIG_DIR" "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  cp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  _egress_editor_load ""
+  run _egress_save_screen 1
+  assert_failure
+  assert_output --partial "Nothing to save."
+  run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
+  assert_success
+  # A box with no file of its own gets none for nothing.
+  _egress_editor_load main
+  run _egress_save_screen 1
+  assert_output --partial "Nothing to save."
+  run test -e "$_EGE_FILE"
+  assert_failure
 }
 
 @test "egress save: a box editor writes the box's own file with no mode of its own" {
@@ -368,7 +1632,7 @@ pack = github"
   cd "$PROJECT"
   _set_box main
   _egress_editor_load main
-  _EGE_HOSTS="extra.example"
+  _egress_host_add extra.example
   run _egress_save_screen 1
   assert_success
   run cat "$_EGE_FILE"
@@ -377,6 +1641,48 @@ allow = extra.example"
   run cat "$CLEAT_GLOBAL_CONFIG"
   assert_output "[egress]
 mode = strict"
+}
+
+@test "egress save: a deny the editor loaded survives its save" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = github\ndeny = api.github.com\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  _egress_toggle pack:npm
+  run _egress_save_screen 1
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict
+pack = github
+pack = npm
+deny = api.github.com"
+}
+
+@test "egress save: a successful save moves the baseline" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  _egress_toggle pack:npm
+  _egress_save_screen 1 >/dev/null
+  # A second save from the same editor is not taken for another terminal's.
+  _egress_toggle pack:go
+  run _egress_save_screen 1
+  assert_success
+  refute_output --partial "changed in another terminal"
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict
+pack = go
+pack = npm"
+}
+
+@test "egress save: the writer refuses inherit for the global config, and so does the typed picker" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  run _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" inherit "npm" "" ""
+  assert_failure
+  assert_output --partial "Refusing to write an egress policy without a mode"
+  run test -e "$CLEAT_GLOBAL_CONFIG"
+  assert_failure
+  run _egress_picker_text "" <<< $'mode inherit\nq'
+  assert_output --partial "Only a box can inherit."
 }
 
 # ── The typed picker ────────────────────────────────────────────────────────
@@ -391,23 +1697,37 @@ pack = npm
 allow = docs.rs"
 }
 
+@test "egress typed picker: -name drops a pack or a host" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\npack = go\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_picker_text "" <<< $'-npm\n-docs.rs\ndone'
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = strict
+pack = go"
+}
+
 @test "egress ring: landing on open in the global editor does not write mode open" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   run _egress_picker_text "" <<< $'mode open\ndone'
   assert_output --partial "Open is per box and per session"
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
   assert_output "mode = strict"
-  # The drawn ring: open shows its two lines and a save keeps the mode before it.
+  # The drawn ring: open says it is set per box, and a save keeps the mode
+  # the editor loaded.
   _egress_editor_load ""
+  _egress_toggle pack:npm
   _egress_mode_step 1
-  [ "$_EGE_MODE" = open ]
+  run echo "$_EGE_MODE"
+  assert_output "open"
   run _egress_pane_text mode
   assert_output --partial "cleat egress open <box>"
-  assert_output --partial "keeps mode strict"
+  assert_output --partial "Saving here keeps mode strict."
   run _egress_save_screen 1
   assert_success
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
-  assert_output "mode = strict"
+  assert_output "mode = strict
+pack = npm"
 }
 
 @test "egress ring: a box's own off asks and writes nothing on a default answer" {
@@ -420,7 +1740,8 @@ allow = docs.rs"
   run _egress_save_screen 1 <<< ""
   assert_failure
   assert_output --partial "Turn it off? [y/N]"
-  [ ! -e "$_EGE_FILE" ]
+  run test -e "$_EGE_FILE"
+  assert_failure
   run _egress_save_screen 1 <<< "y"
   assert_success
   run _egress_section_canon "$_EGE_FILE"
@@ -432,20 +1753,20 @@ allow = docs.rs"
   printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
   _egress_editor_load ""
   _egress_mode_step -1
-  [ "$_EGE_MODE" = off ]
+  run echo "$_EGE_MODE"
+  assert_output "off"
   # Enter, even from the typed form's done, never turns it off. Under live
-  # enforcement the question is the global off confirmation of 6.5.
+  # enforcement the question is the global off confirmation of 6.6.
   run _egress_save_screen 1 <<< ""
   assert_failure
   assert_output --partial "Turn egress control off for every new box? [y/N]"
-  refute_output --partial "Allowed   9 hosts"
-  refute_output --partial "port 443 only"
+  refute_output --partial "Allowed"
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
   assert_output "mode = strict
 pack = npm"
   # And nothing claims Saved before the answer.
   run _egress_save_screen 1 <<< "n"
-  refute_output --partial "Saved."
+  refute_output --partial "Saved"
   run _egress_save_screen 1 <<< "y"
   assert_success
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
@@ -453,15 +1774,33 @@ pack = npm"
 pack = npm"
 }
 
+@test "egress ring: an off save keeps the ticks the review showed" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load ""
+  _egress_toggle pack:go
+  _egress_host_add docs.rs
+  _EGE_MODE=off
+  run _egress_save_screen 1 <<< "y"
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = off
+pack = go
+pack = npm
+allow = docs.rs"
+}
+
 @test "egress typed picker: q and end of input save nothing" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   run _egress_picker_text "" <<< $'npm\nq'
   assert_success
-  [ ! -e "$CLEAT_GLOBAL_CONFIG" ] || return 1
+  run test -e "$CLEAT_GLOBAL_CONFIG"
+  assert_failure
   _EGE_FILE=""
   run _egress_picker_text "" <<< $'npm'
   assert_success
-  [ ! -e "$CLEAT_GLOBAL_CONFIG" ] || return 1
+  run test -e "$CLEAT_GLOBAL_CONFIG"
+  assert_failure
 }
 
 @test "egress typed picker: a bad host is refused with its reason" {
@@ -1147,41 +2486,6 @@ good.example.test
   refute_output --partial "The catalogue lists it"
 }
 
-@test "egress draw: no drawn line is wider than the terminal, so the redraw never drifts" {
-  local c longest
-  _EGE_BOX=""
-  for c in 80 60; do
-    _rows_of 60
-    eval "_term_cols() { echo $c; }"
-    _egress_editor_load ""
-    _egress_measure 26
-    longest="$(_egress_draw 1 | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
-    [ "$longest" -lt "$c" ]
-    # Every pack's detail pane too, the containers pane among them.
-    local r
-    for r in pack:containers pack:docs pack:huggingface pack:atlassian core mode; do
-      longest="$(_egress_pane "$r" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
-      [ "$longest" -lt "$c" ]
-    done
-  done
-  # A box editor with a long box name stays inside the width too.
-  eval "_term_cols() { echo 80; }"
-  _egress_editor_load "a-box-with-a-rather-long-name-for-this-screen"
-  _egress_measure 26
-  longest="$(_egress_draw 1 | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
-  [ "$longest" -lt 80 ]
-}
-
-@test "egress draw: a class word keeps its colour after the cut" {
-  _rows_of 60
-  eval "_term_cols() { echo 120; }"
-  _egress_editor_load ""
-  _egress_measure 26
-  run bash -c 'cat' < <(_egress_draw 1)
-  assert_output --partial "$(printf '%b' "$AMBER")shared"
-  refute_output --partial '\033'
-}
-
 @test "egress audit: a stranger's page with no title still needs a person" {
   _audit_stub
   FOREIGN_ANSWER="200|1.1|93.184.215.14|AmazonS3|412|eeeeeeeeeeee|"
@@ -1336,10 +2640,13 @@ good.example.test
   out+="$(cmd_help 2>&1)"
   _rows_of 40
   _egress_editor_load ""
-  _egress_measure 26
+  _egress_measure
+  _egress_toggle pack:npm
   out+="$(_egress_save_screen 1 2>&1)"
   out+="$(_egress_draw 0 2>&1)"
-  _EGE_RING_BACK=strict
+  _EGE_MODE=open
+  out+="$(_egress_pane_text mode 2>&1)"
+  _egress_editor_load main
   _EGE_MODE=open
   out+="$(_egress_pane_text mode 2>&1)"
   out+="$(_egress_config_enable 2>&1)"
@@ -1363,20 +2670,24 @@ good.example.test
   mkdir -p "$CLEAT_CONFIG_DIR"
   _rows_of 40
   _egress_editor_load ""
-  _egress_measure 26
+  _egress_measure
   run _egress_draw 0
   assert_success
-  assert_output --partial "Engine   not validated, a caged box will not start here: Docker Engine"
+  run _plain "$output"
+  assert_output --partial "! A caged box will not start on this engine: Docker Engine"
   run _egress_save_screen 1
   assert_success
   run _plain "$output"
   assert_output --partial "Saved. Boxes on this machine will refuse to start until you switch engine or run"
   assert_output --partial "cleat egress off"
-  # A validated engine names itself. A save on it applies to running boxes at once.
-  _EGE_ENGINE=""
+  # A validated engine needs no line, and the list gets the row back.
   _egress_engine_kind() { printf desktop-macos; }
-  run _egress_draw 0
-  assert_output --partial "Engine   validated: Docker Desktop"
+  _egress_editor_load ""
+  _egress_measure
+  run _plain "$(_egress_draw 0)"
+  refute_output --partial "A caged box will not start"
+  refute_output --partial "Docker is not running"
+  assert_equal "$_EG_E" 0
 }
 
 # ── cleat egress status (9.3) ───────────────────────────────────────────────
@@ -1904,6 +3215,8 @@ plain() { run _plain "$output"; }
   # A running caged box: the global save reaches it now.
   mock_docker_ps_filter "$CN" "label=sh.cleat.egress-hash"
   _egress_editor_load ""
+  # A change to the file that leaves the resolved policy as the gateway has it.
+  _egress_host_add pypi.org
   run _egress_save_screen 1
   run _plain "$output"
   assert_output --partial "Applied to $CN: its gateway reloaded."
@@ -1911,6 +3224,7 @@ plain() { run _plain "$output"; }
   # No box running: the next box takes it.
   mock_docker_ps_filter "" "label=sh.cleat.egress-hash"
   _egress_editor_load ""
+  _egress_host_add files.pythonhosted.org
   run _egress_save_screen 1
   run _plain "$output"
   assert_output --partial "Applies to the next box you start."
@@ -1951,8 +3265,9 @@ plain() { run _plain "$output"; }
   run cmd_egress allow docs.example.test
   assert_failure
   run _plain "$output"
-  assert_output --partial "the ssh capability mounts your agent"
-  assert_output --partial "cleat egress off"
+  assert_output --partial "Egress control cannot be saved while the ssh capability is on."
+  assert_output --partial "ssh mounts your SSH agent"
+  assert_output --partial "It is on in your global config. Turn it off:  cleat config --disable ssh"
   # Nothing was written.
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
   assert_output ""
@@ -1969,17 +3284,26 @@ plain() { run _plain "$output"; }
   # The reload itself is the apply-mode tests'. Here: what the ring writes.
   _egress_apply_mode() { echo "apply $1 $2" >> "$TEST_TEMP/applied"; return 0; }
   _egress_editor_load main
-  _EGE_RING_BACK=strict
   _EGE_MODE=open
   run _egress_save_screen 0 <<< $'y\ny'
   run _plain "$output"
-  assert_output --partial "Open for this session only. See the next screen."
+  assert_output --partial "Open for this session only. See below."
   assert_output --partial "! Open egress, this session only"
   [ -f "$_EGRESS_BOXES_DIR/$CN.session" ]
   run cat "$TEST_TEMP/applied"
   assert_output "apply $CN open"
+  # With no edits there is no file of its own to write, and none is made.
+  run test -e "$_EGRESS_BOXES_DIR/$CN"
+  assert_failure
+  # With an edit, the file keeps the mode it had and never says open.
+  rm -f "${_EGRESS_BOXES_DIR:?}/${CN:?}.session" "${TEST_TEMP:?}/applied"
+  _egress_editor_load main
+  _egress_host_add extra.example.com
+  _EGE_MODE=open
+  run _egress_save_screen 0 <<< $'y\ny'
   run cat "$_EGRESS_BOXES_DIR/$CN"
-  refute_output --partial "mode = open"
+  assert_output "[egress]
+allow = extra.example.com"
 }
 
 @test "egress ring: done in the typed editor never answers the recreate or the open for you" {
@@ -1991,7 +3315,7 @@ plain() { run _plain "$output"; }
   # The typed editor's done passes 1: that answers Save and nothing else.
   run _egress_save_screen 1 <<< ""
   run _plain "$output"
-  assert_output --partial "This recreates the box. See the next screen."
+  assert_output --partial "This recreates the box. See below."
   assert_output --partial "Turn egress control off and recreate the box? [y/N]"
   assert_output --partial "Not changed."
   run grep -cE "^docker rm|^cmd_run" "$DOCKER_CALLS"
@@ -2192,12 +3516,14 @@ deny_row() { printf '2026-09-28T14:31:0%sZ code=%s sub=%s origin=box host=%s por
   cp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
   run cmd_egress_open_always 1
   assert_failure
-  assert_output --partial "the docker capability hands the box the Docker daemon"
+  run _plain "$output"
+  assert_output --partial "docker hands the box your Docker daemon"
   run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
   assert_success
   run _egress_config_enable
   assert_failure
-  assert_output --partial "the docker capability hands the box the Docker daemon"
+  run _plain "$output"
+  assert_output --partial "docker hands the box your Docker daemon"
   run cmp "$CLEAT_GLOBAL_CONFIG" "$TEST_TEMP/before"
   assert_success
 }

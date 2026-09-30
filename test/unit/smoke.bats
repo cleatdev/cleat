@@ -3296,6 +3296,88 @@ SH
   assert_output --partial "needs a terminal"
 }
 
+@test "smoke: the egress editor walks every row under strict mode" {
+  # The editor's keys and frames run no subshell, so strict mode reaches all of
+  # them: an empty array under set -u on bash 3.2, a failed test at the end of
+  # a function under set -e. Source the real binary under set -euo pipefail
+  # and, in both editors, key every row by its index, every host of every
+  # pack, every ring value into a review and every prompt at end of input,
+  # then the full loop and the typed picker.
+  mkdir -p "$XDG_CONFIG_HOME/cleat" "$TEST_TEMP/project"
+  printf '[egress]\nmode = strict\npack = npm\nallow = docs.rs\ndeny = api.github.com\n' > "$XDG_CONFIG_HOME/cleat/config"
+  cd "$TEST_TEMP/project"
+  run env HOME="$HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" CLI="$CLI" PATH="$MOCK_BIN:$PATH" \
+    DOCKER_CALLS="$DOCKER_CALLS" DOCKER_MOCK_DIR="$DOCKER_MOCK_DIR" \
+    bash -euo pipefail -c '
+      source "$CLI"
+      _term_rows() { echo 30; }
+      _term_cols() { echo 100; }
+      walked=0
+      for box in "" main; do
+        _egress_editor_load "$box"
+        _egress_measure
+        n="${#_EGR[@]}"
+        i=0
+        while [ "$i" -lt "$n" ]; do
+          for k in SPACE SPACE RIGHT LEFT OTHER DOWN UP; do
+            _EG_SCREEN=list
+            [ "$i" -lt "${#_EGR[@]}" ] && _EG_CUR="$i"
+            _KEY="$k"
+            _egress_tui_key
+            _egress_measure || true
+            _egress_frame_build
+          done
+          walked=$((walked + 1))
+          i=$((i + 1))
+        done
+        for ix in "${_EGO[@]}"; do
+          _egress_hosts_open "$ix"
+          j=0
+          while [ "$j" -lt "${#_EGH[@]}" ]; do
+            for k in SPACE SPACE DOWN UP OTHER; do
+              _EG_SCREEN=hosts
+              _EG_HCUR="$j"
+              _KEY="$k"
+              _egress_hosts_key
+              _egress_frame_build
+            done
+            case "${_EGH[$j]}" in tpl:*) _egress_fill_prompt < /dev/null || true ;; esac
+            j=$((j + 1))
+          done
+        done
+        _EG_SCREEN=list
+        _egress_add_prompt < /dev/null || true
+        _egress_filter_prompt < /dev/null || true
+        for m in inherit strict open off; do
+          if [ -z "$box" ] && [ "$m" = inherit ]; then continue; fi
+          _EGE_MODE="$m"
+          _egress_recount
+          _egress_frame_build 0
+          _egress_save_review 0 < /dev/null > /dev/null || true
+        done
+        [ "$walked" -ge "$n" ]
+      done
+      K=(RIGHT RIGHT RIGHT LEFT DOWN DOWN SPACE RIGHT DOWN SPACE LEFT ENTER QUIT)
+      KI=0
+      _egress_key() { _KEY="${K[$KI]:-QUIT}"; KI=$((KI + 1)); }
+      _egress_picker_tui "" < /dev/null
+      KI=0
+      _egress_picker_tui main < /dev/null
+      _EGE_FILE=""
+      _egress_picker_text "" <<< "$(printf "npm\n-npm\ngo\nmode off\nmode strict\n-docs.rs\nx.example.com\ndone\n")"
+      echo "WALKED $walked"
+    '
+  assert_success
+  refute_output --partial "unbound variable"
+  assert_output --partial "WALKED"
+  run cat "$XDG_CONFIG_HOME/cleat/config"
+  assert_output "[egress]
+mode = strict
+pack = go
+deny = api.github.com
+allow = x.example.com"
+}
+
 @test "smoke: cleat egress status on a machine with no policy says off" {
   run cleat_bin egress status < /dev/null
   assert_success
@@ -3550,7 +3632,8 @@ SH
   run cleat_bin egress allow github < /dev/null
   assert_failure
   refute_output --partial "unbound variable"
-  assert_output --partial "the ssh capability mounts your agent"
+  assert_output --partial "the ssh capability is on"
+  assert_output --partial "cleat config --disable ssh"
   run cmp "$XDG_CONFIG_HOME/cleat/config" "$TEST_TEMP/before"
   assert_success
 }

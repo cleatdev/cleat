@@ -13928,28 +13928,28 @@ cat > "$SED_TMP" << 'SED'
   s@^  if \[ "[$]total" -lt "[$]avail" \]; then _EG_PAGE="[$]total"; else _EG_PAGE="[$]avail"; fi@  _EG_PAGE="$total"@
 }
 SED
-try "vnext_egress_measure_min" "26 packs on a 24 row terminal give a page of 2, not 26" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_measure_min" "26 packs on a 24 row terminal give a page of 7, not 26" "$CLI" "$EGRESS_UI_BATS"
 
-# A window that cannot hold one pack row runs the typed picker.
+# A window that cannot hold _EGRESS_MIN_PAGE pack rows runs the typed picker.
 cat > "$SED_TMP" << 'SED'
 /^_egress_measure()/,/^}$/{
-  s@^  \[ "[$]avail" -lt 1 \] && return 1@  [ "$avail" -lt 1 ] \&\& avail=1@
+  s@^  \[ "[$]avail" -lt "[$]_EGRESS_MIN_PAGE" \] && return 1@  [ "$avail" -lt 1 ] \&\& avail=1@
 }
 SED
-try "vnext_egress_measure_min_window" "a 22 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_measure_min_window" "a 19 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
 
 # The chrome budget carries the shell prompt's row, which is never drawn.
 cat > "$SED_TMP" << 'SED'
-s|^_EGRESS_CHROME_LINES=11|_EGRESS_CHROME_LINES=10|
+s|^_EGRESS_CHROME_LINES=13|_EGRESS_CHROME_LINES=12|
 SED
 try "vnext_egress_chrome_reserves_the_prompt_row" "a saturated page draws one line fewer than the terminal has rows" "$CLI" "$EGRESS_UI_BATS"
 
 # The add row is a member of the list the cursor walks. Taking it out of the
 # rows leaves no arrow path to it. The spec anchored on an _eg_list array;
-# this implementation builds the rows in _egress_editor_rows.
+# this implementation builds the rows in _egress_rows_build.
 cat > "$SED_TMP" << 'SED'
-/^_egress_editor_rows()/,/^}$/{
-  s@^  printf '%s\\n%s\\n%s\\n' "[$]_EGRESS_ROW_ADD" "[$]_EGRESS_ROW_FILTER" "[$]_EGRESS_ROW_SAVE"@  printf '%s\\n%s\\n' "$_EGRESS_ROW_FILTER" "$_EGRESS_ROW_SAVE"@
+/^_egress_rows_build()/,/^}$/{
+  /^  _EGR+=("[$]_EGRESS_ROW_ADD")$/d
 }
 SED
 try "vnext_egress_add_row_present" "the add row is reachable by arrow keys alone" "$CLI" "$EGRESS_UI_BATS"
@@ -14471,7 +14471,7 @@ try "vnext_egress_policy_file_gate" "a global config linked into the workspace r
 
 # The editor's save compares against what it loaded.
 cat > "$SED_TMP" << 'SED'
-/^_egress_save_screen()/,/^}$/{
+/^_egress_save_commit()/,/^}$/{
   s@ "\$_EGE_CANON" || return 1@ || return 1@
 }
 SED
@@ -14509,22 +14509,22 @@ try "vnext_egress_seccomp_colon" "a colon separated unconfined profile refuses" 
 # ── Hostile review 2 fixes, 2026-09-26 ──
 # Every drawn line is cut to the terminal, so a wrap never desyncs the redraw.
 cat > "$SED_TMP" << 'SED'
-/^_egress_line()/,/^}$/{
-  /^  t="\${t:0:\$w}"$/d
+/^_egress_fit()/,/^}$/{
+  s@^  if \[ "\${#1}" -le "\$w" \]; then _EGT="\$1"; else _EGT="\${1:0:\$((w - 1))}…"; fi$@  _EGT="$1"@
 }
 SED
 try "vnext_egress_editor_fit" "no drawn line is wider than the terminal" "$CLI" "$EGRESS_UI_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_draw()/,/^}$/{
-  /^      line="\${line:0:\$w}"$/d
+/^_egress_host_line()/,/^}$/{
+  s@^  _egress_fit "\$h" "\$nw"$@  _egress_fit "$h" 200@
 }
 SED
-try "vnext_egress_pack_row_fit" "no drawn line is wider than the terminal" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_host_row_fit" "no drawn line is wider than the terminal" "$CLI" "$EGRESS_UI_BATS"
 
 # The ring's open is never written.
 cat > "$SED_TMP" << 'SED'
-/^_egress_save_screen()/,/^}$/{
+/^_egress_save_plan()/,/^}$/{
   s@^  if \[ "\$mode_out" = open \]; then@  if false; then@
 }
 SED
@@ -14533,7 +14533,7 @@ try "vnext_egress_ring_open_not_saved" "landing on open in the global editor doe
 # The ring's off never commits on a default answer. Under enforcement the
 # global off is the confirmation of 6.5.
 cat > "$SED_TMP" << 'SED'
-/^_egress_off_global()/,/^}$/{
+/^_egress_ask_no()/,/^}$/{
   s@case "\$ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 1 ;; esac@:@
 }
 SED
@@ -14541,8 +14541,8 @@ try "vnext_egress_ring_off_confirms" "landing on off does not write a policy on 
 
 # A box's own off, with no caged box to recreate, asks in the save screen.
 cat > "$SED_TMP" << 'SED'
-/^_egress_save_screen()/,/^}$/{
-  s@^  if \[ "\$mode_out" = off \]; then@  if false; then@
+/^_egress_save_plan()/,/^}$/{
+  s@^  if \[ "\$mode_out" = off \] || \[ "\$after:\$_EGS_PLAN" = off:write \]; then@  if false; then@
 }
 SED
 try "vnext_egress_ring_off_confirms_box" "own off asks and writes nothing on a default answer" "$CLI" "$EGRESS_UI_BATS"
@@ -15176,8 +15176,8 @@ SED
 try "vnext_egress_copy_truthful_when_live" "with enforcement live no surface says it lands later" "$CLI" "$EGRESS_UI_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_editor_verdict()/,/^}$/{
-  s@not validated, a caged box will not start here: @validated, a save applies at the next launch: @
+/^_egress_editor_warning()/,/^}$/{
+  s@_EGE_WARN="! A caged box will not start on this engine: @_EGE_WARN="! Saving applies at the next launch: @
 }
 SED
 try "vnext_egress_editor_names_engine" "the editor still opens on a refused engine" "$CLI" "$EGRESS_UI_BATS"
@@ -15540,22 +15540,22 @@ SED
 try "vnext_egress_open_failure_drops_marker" "a gateway that does not take it removes the marker" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^cmd_egress_open()/,/^}$/{
-  s@^    case "[$]ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 0 ;; esac$@    :@
+/^_egress_ask_no()/,/^}$/{
+  s@^  case "[$]ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 1 ;; esac$@  :@
 }
 SED
 try "vnext_egress_open_default_deny" "a yes writes the session marker and reloads the gateway, a no writes nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^cmd_egress_off()/,/^}$/{
-  s@^    case "[$]ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 0 ;; esac$@    :@
+/^_egress_ask_no()/,/^}$/{
+  s@^  case "[$]ans" in y|Y|yes|YES) ;; \*) info "Not changed."; return 1 ;; esac$@  :@
 }
 SED
 try "vnext_egress_off_default_deny" "a declined confirmation changes nothing" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_save_screen()/,/^}$/{
-  s@^      cmd_egress_off "[$]ecname" 0 || return 1$@      cmd_egress_off "$ecname" "$yes" || return 1@
+/^_egress_save_review()/,/^}$/{
+  s@^  if _egress_ask_no "\$q"; then return 0; fi$@  if [ "$yes" = 1 ] || _egress_ask_no "$q"; then return 0; fi@
 }
 SED
 try "vnext_egress_ring_off_always_confirms" "done in the typed editor never answers the recreate" "$CLI" "$EGRESS_UI_BATS"
@@ -16256,7 +16256,7 @@ try "vnext_egress_port_in_digest" "port 80 was accepted"
 # The writer refuses a policy over an interlocked box, on the real binary.
 cat > "$SED_TMP" << 'SED'
 /^_egress_writer_interlock()/,/^}$/{
-  s|^  _egress_interlocks "\$1"$|  :|
+  s|^  \[ -n "\$caps" \] \|\| return 0$|  return 0|
 }
 SED
 try "vnext_egress_writer_interlock_smoke" "cleat egress on a box with ssh exits nonzero with a named reason" "$CLI" "$SMOKE_BATS"
@@ -16430,9 +16430,10 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_save_off_no_refusal" "an off save on an unvalidated engine warns of no refusal" "$CLI" "$EGRESS_UI_BATS"
 
+# A validated engine takes no warning line: the list gets the row back.
 cat > "$SED_TMP" << 'SED'
-/^_egress_editor_verdict()/,/^}$/{
-  s@'Engine   validated: %s'@'Engine   validated, a save applies at the next launch: %s'@
+/^_egress_editor_warning()/,/^}$/{
+  s@^  elif ! _egress_engine_validated "\$_EGE_ENGINE"; then$@  elif true; then@
 }
 SED
 try "vnext_egress_editor_verdict_now" "the editor still opens on a refused engine" "$CLI" "$EGRESS_UI_BATS"
@@ -16465,6 +16466,518 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_status_uptime_guard" "cleat egress status died when the gateway uptime read failed"
+
+# ── The egress editor v2 (6.1, 6.4, the maintainer's six requirements) ──────
+# No subshell on a key: the list edits are parameter expansions.
+cat > "$SED_TMP" << 'SED'
+/^_egress_toggle()/,/^}$/{
+  s@then _egress_nl_drop _EGE_PACKS "\$p"; else@then _EGE_PACKS="$(_egress_list_without "$_EGE_PACKS" "$p")"; else@
+}
+SED
+try "vnext_egress_key_forks" "a keypress forks nothing and calls docker nothing" "$CLI" "$EGRESS_UI_BATS"
+
+# The engine is probed once, when the editor opens.
+cat > "$SED_TMP" << 'SED'
+/^_egress_frame_build()/,/^}$/{
+  s@^  _EGF=\$'\\033\[H'$@  _EGE_ENGINE=""; _egress_editor_engine; _EGF=$'\\033[H'@
+}
+SED
+try "vnext_egress_engine_once" "the egress editor probed the engine with docker on every key"
+try "vnext_egress_engine_once_ui" "the engine is probed once per editor, never per draw" "$CLI" "$EGRESS_UI_BATS"
+
+# M20: a box counts what every box gets, less the global blocks.
+cat > "$SED_TMP" << 'SED'
+/^_egress_recount()/,/^}$/{
+  /^  \[ -n "\$_EGE_BOX" \] && set="\$_EGE_G_HOSTS"$/d
+}
+SED
+try "vnext_egress_recount_global" "the box egress editor drew the global packs unticked and counted 5"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_recount()/,/^}$/{
+  /^  _egress_nl_minus set "\$_EGE_DENIES"$/d
+}
+SED
+try "vnext_egress_recount_denies" "the save count equals the resolved count, box and global" "$CLI" "$EGRESS_UI_BATS"
+
+# The core is added after the blocks, as the resolver adds it.
+cat > "$SED_TMP" << 'SED'
+/^_egress_recount()/,/^}$/{
+  s@^  _egress_nl_minus set "\$_EGE_DENIES"$@  _egress_nl_union set "$_EGE_CORE"; _egress_nl_minus set "$_EGE_DENIES"@
+  /^  _egress_nl_union set "\$_EGE_CORE"$/d
+}
+SED
+try "vnext_egress_core_after_denies" "no row or key changes the core" "$CLI" "$EGRESS_UI_BATS"
+
+# Unticking a pack every box has blocks only the hosts nothing else brings.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_sole_hosts()/,/^}$/{
+  s@^    if \[ -n "\$h" \] && ! _egress_nl_has "\$h" "\$others"; then@    if [ -n "$h" ]; then@
+}
+SED
+try "vnext_egress_sole_hosts" "unticking an inherited pack denies only hosts no other tick provides" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_changed()/,/^}$/{
+  /^  \[ -n "\$_EGE_BOX" \] && _egress_offbox_denies$/d
+}
+SED
+try "vnext_egress_offbox_settle" "unticking an inherited pack denies only hosts no other tick provides" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_absorb()/,/^}$/{
+  /_egress_nl_add _EGE_OFFBOX "\$p"; moved=1/d
+}
+SED
+try "vnext_egress_offbox_absorb" "unticking an inherited pack denies only hosts no other tick provides" "$CLI" "$EGRESS_UI_BATS"
+
+# M9d: a box's open is checked before anything is asked or written.
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_review()/,/^}$/{
+  s@&& ! _egress_open_check "\$_EGE_CNAME" @\&\& false \&\& ! _egress_open_check "$_EGE_CNAME" @
+}
+SED
+try "vnext_egress_open_checked_first" "a declined or refused open in the box egress editor wrote the box file"
+
+# An off save writes the editor's lists, never the file's.
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_commit()/,/^}$/{
+  s@^      _egress_off_global 1 "\$_EGE_PACKS" "\$denies" "\$allows" "\$_EGE_CANON" || return 1$@      _egress_off_global 1 || return 1@
+}
+SED
+try "vnext_egress_off_keeps_ticks" "an off save from the egress editor dropped the ticks its review showed"
+
+# A save moves the baseline, and writes back every deny it loaded.
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_commit()/,/^}$/{
+  /^  _EGE_CANON="\$(_egress_section_canon "\$_EGE_FILE")"$/d
+}
+SED
+try "vnext_egress_baseline_moves" "a successful save moves the baseline" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_commit()/,/^}$/{
+  s@^  _write_egress_to_file "\$_EGE_FILE" "\$_EGS_MODE" "\$_EGE_PACKS" "\$denies" @  _write_egress_to_file "$_EGE_FILE" "$_EGS_MODE" "$_EGE_PACKS" "" @
+}
+SED
+try "vnext_egress_deny_survives" "a deny the editor loaded survives its save" "$CLI" "$EGRESS_UI_BATS"
+
+# inherit exists for a box's own file only.
+cat > "$SED_TMP" << 'SED'
+/^_write_egress_to_file()/,/^}$/{
+  s@^      case "\$file" in "\$_EGRESS_BOXES_DIR"/\*) ;; \*) error "Refusing to write an egress policy without a mode"; return 1 ;; esac ;;$@      ;;@
+}
+SED
+try "vnext_egress_writer_inherit" "the writer refuses inherit for the global config" "$CLI" "$EGRESS_UI_BATS"
+
+# The rows say risk in plain words, and the mode row what the mode does.
+cat > "$SED_TMP" << 'SED'
+/^_egress_risk_of()/,/^}$/{
+  s@^    shared) _EGK=1 ;;$@    shared) _EGK=0 ;;@
+}
+SED
+try "vnext_egress_risk_words" "every risky pack row carries its risk word and no safe row does" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_mode_meaning()/,/^}$/{
+  s@^    strict) _EGT="only the hosts ticked below" ;;$@    strict) _EGT="" ;;@
+}
+SED
+try "vnext_egress_mode_meaning" "the mode row names what the mode does for every ring value" "$CLI" "$EGRESS_UI_BATS"
+
+# Keys: left and right turn the ring on its row alone, enter saves from any.
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_key()/,/^}$/{
+  s@^    LEFT) \[ "\$row" = mode \] && _egress_mode_step -1 ;;$@    LEFT) _egress_mode_step -1 ;;@
+}
+SED
+try "vnext_egress_ring_row_guard" "left and right do nothing off the mode row" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_key()/,/^}$/{
+  s@^    ENTER) _EG_ACT=save ;;$@    ENTER) [ "$row" = mode ] \&\& _EG_ACT=save ;;@
+}
+SED
+try "vnext_egress_enter_saves_anywhere" "enter reviews and saves from any row" "$CLI" "$EGRESS_UI_BATS"
+
+# M4 and S5: a refused pack and a pack with no host of its own never tick.
+cat > "$SED_TMP" << 'SED'
+/^_egress_toggle()/,/^}$/{
+  /^        _egress_pack_refused "\$ix" && return 0$/d
+}
+SED
+try "vnext_egress_refused_cap_toggle" "a refused capability pack cannot be ticked from the list" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_toggle()/,/^}$/{
+  /^        \[ "\${_EGC_CNT\[ix\]}" = 0 \] && return 0$/d
+}
+SED
+try "vnext_egress_no_default_host" "a pack with no default host cannot be ticked as a pack" "$CLI" "$EGRESS_UI_BATS"
+
+# A typed part of a name is one label: no dot.
+cat > "$SED_TMP" << 'SED'
+/^_egress_fill_prompt()/,/^}$/{
+  s@^      \*\[!abcdefghijklmnopqrstuvwxyz0123456789-\]\*)$@      *[!abcdefghijklmnopqrstuvwxyz0123456789.-]*)@
+}
+SED
+try "vnext_egress_fill_label" "a named site is saved as an exact allow and a dot is refused" "$CLI" "$EGRESS_UI_BATS"
+
+# The window: too narrow runs the typed picker, a short one gives up host rows.
+cat > "$SED_TMP" << 'SED'
+/^_egress_measure()/,/^}$/{
+  /^  \[ "\$_EG_RAWCOLS" -lt "\$_EGRESS_MIN_COLS" \] && return 1$/d
+}
+SED
+try "vnext_egress_narrow_typed" "a window narrower than 60 columns runs the typed picker" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_measure()/,/^}$/{
+  s@^  while \[ "\$avail" -lt "\$_EGRESS_MIN_PAGE" \] && \[ "\$_EG_HV" -gt 1 \]; do$@  while false; do@
+}
+SED
+try "vnext_egress_hosts_give_way" "host rows give way to pack rows in a short window" "$CLI" "$EGRESS_UI_BATS"
+
+# The full screen: taken and given back, on every exit, Ctrl-C included.
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_enter()/,/^}$/{
+  s@^  printf '\\033\[?1049h\\033\[?25l\\033\[H\\033\[2J'$@  printf '\\033[?25l\\033[H\\033[2J'@
+}
+SED
+try "vnext_egress_alt_screen" "the editor takes the alternate screen and gives it back" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_enter()/,/^}$/{
+  s@^    trap '_egress_tui_restore; echo ""; exit 130' INT TERM HUP$@    trap 'echo ""; exit 130' INT TERM HUP@
+}
+SED
+try "vnext_egress_interrupt_restores" "an interrupt restores the cursor, echo and the screen" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_frame_build()/,/^}$/{
+  /^  _EGF+=\$'\\033\[J'$/d
+}
+SED
+try "vnext_egress_frame_clears" "every frame starts at the top left and clears what is below it" "$CLI" "$EGRESS_UI_BATS"
+
+# Prompts and the review draw inside the full screen, never under a list.
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  s@^  printf '\\033\[%d;%dH' "\$_EG_FL" "\$(( \${#1} + 4 ))"$@  echo ""@
+}
+SED
+try "vnext_egress_prompt_in_frame" "a prompt draws inside the frame, never under it" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_review()/,/^}$/{
+  /^  printf '\\033\[H\\033\[2J'$/d
+}
+SED
+try "vnext_egress_review_own_screen" "the review has a screen of its own and a no brings the list back" "$CLI" "$EGRESS_UI_BATS"
+
+# The editor never opens when a save would be refused.
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor()/,/^}$/{
+  /^  _egress_writer_interlock "\$(_egress_entry_mode "\$box")" || return 1$/d
+}
+SED
+try "vnext_egress_editor_refuses_first" "the editor never opens when a save would be refused" "$CLI" "$EGRESS_UI_BATS"
+
+# The key reader decodes as _read_keypress does.
+cat > "$SED_TMP" << 'SED'
+/^_egress_key()/,/^}$/{
+  s@^        "\[C") _KEY=RIGHT ;;$@        "[C") _KEY=ESC ;;@
+}
+SED
+try "vnext_egress_key_right_not_esc" "the editor key reader decodes every sequence" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_key()/,/^}$/{
+  s@^        \*) _KEY=OTHER ;;$@        *) _KEY=ESC ;;@
+}
+SED
+try "vnext_egress_key_unknown_not_esc" "the editor key reader decodes every sequence" "$CLI" "$EGRESS_UI_BATS"
+
+# ── The editor v2 review fixes (2026-09-29) ──
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_absorb()/,/^}$/{
+  s@^  _egress_nl_minus _EGE_DUSER "\$_EGE_DOFF"$@  _egress_packs_hosts "$_EGE_OFFBOX"; _egress_nl_minus _EGE_DUSER "$_EGN_OUT"@
+}
+SED
+try "vnext_egress_user_deny_row" "a block of the user's own on a ticked pack's host shows as its own row" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_host_state()/,/^}$/{
+  /^    _egress_nl_has "\$1" "\$_EGN_OUT" && _EGS=none$/d
+}
+SED
+try "vnext_egress_gblock_reached" "a host every box blocks that the box's own pack brings back" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_toggle()/,/^}$/{
+  s@^      if ! _egress_pack_on "\$p"; then$@      if true; then@
+}
+SED
+try "vnext_egress_refused_on_untick" "a refused pack already in the file shows ticked and can be unticked" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_load()/,/^}$/{
+  s@^  _egress_nl_hosts _EGE_DENIES "\$_f_denies"$@  _egress_nl_set _EGE_DENIES "$_f_denies"; _EGN_OUT=""@
+}
+SED
+try "vnext_egress_normalise_hosts" "host values count as the resolver reads them" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_commit()/,/^}$/{
+  /^  _egress_nl_union allows "\$_EGE_BAD_ALLOWS"$/d
+}
+SED
+try "vnext_egress_bad_values_kept" "host values count as the resolver reads them" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_diff()/,/^}$/{
+  /^  _egress_nl_minus remp "\$offp"$/d
+}
+SED
+try "vnext_egress_removed_once" "a pack unticked for a box is named once" "$CLI" "$EGRESS_UI_BATS"
+
+# A box that follows every box into off asks, default no.
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_plan()/,/^}$/{
+  s@ || \[ "\$after:\$_EGS_PLAN" = off:write \]@@
+}
+SED
+try "vnext_egress_inherit_off_asks" "a box that follows every box into off asks, default no" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_inherit_off_asks_regr" "a box following every box into off was saved on a default Enter"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_plan()/,/^}$/{
+  /_EGS_WIDEN=1; fi$/d
+}
+SED
+try "vnext_egress_widen_asks" "a box that follows every box into open asks, default no" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_commit()/,/^}$/{
+  s@_egress_save_consequence "\$(_egress_effective_mode "\$_EGS_MODE")"@_egress_save_consequence "$_EGS_MODE"@
+}
+SED
+try "vnext_egress_consequence_effective" "a box that follows every box into off asks, default no" "$CLI" "$EGRESS_UI_BATS"
+
+# The review is paged on the full screen.
+cat > "$SED_TMP" << 'SED'
+/^_egress_review_show()/,/^}$/{
+  s@^  room=\$(( _EG_ROWS - 3 ))$@  room=999@
+}
+SED
+try "vnext_egress_review_pages" "a review longer than the window is shown a page at a time" "$CLI" "$EGRESS_UI_BATS"
+
+# The words: a policy saved as open, a session, a caged box under off, why
+# a box cannot open, a refused host.
+cat > "$SED_TMP" << 'SED'
+/^_egress_mode_meaning()/,/^}$/{
+  s@^        _EGT="any host for every box, logged"$@        _EGT="per box only, not saved here"@
+}
+SED
+try "vnext_egress_global_open_meaning" "the global editor on a policy saved as open says every box is open" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_editor_load()/,/^}$/{
+  /_egress_session_marker_valid "\$_EGE_CNAME"; then _EGE_SESSION=1; fi$/d
+}
+SED
+try "vnext_egress_session_shown" "a caged box under off and a box that cannot open say so" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_mode_pane()/,/^}$/{
+  s@^          if \[ "\$_EGE_CAGED" = 1 \]; then$@          if false; then@
+}
+SED
+try "vnext_egress_caged_off_pane" "a caged box under off and a box that cannot open say so" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_words()/,/^}$/{
+  s@^            stopped) _EGT="cannot open: box \$_EGE_BOXS is not running" ;;$@            stopped) _EGT="cannot open, see above" ;;@
+}
+SED
+try "vnext_egress_open_reason_status" "a caged box under off and a box that cannot open say so" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_add_refusal()/,/^}$/{
+  /^    BAD_LABEL) printf /d
+}
+SED
+try "vnext_egress_plain_reasons" "a refused host names the rule in words" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cap_refusal()/,/^}$/{
+  s@^      if _cleat_section_present "\$project/.cleat" "box.\${box}.caps"; then$@      if [ "$box" != main ] \&\& _cleat_section_present "$project/.cleat" "box.${box}.caps"; then@
+}
+SED
+try "vnext_egress_box_main_section" "the editor never opens when a save would be refused" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_box_main_section_regr" "the capability refusal named a command that left box main's own section on"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_entry_mode()/,/^}$/{
+  s@^  case "\$m" in absent) printf strict ;; \*) printf '%s' "\$m" ;; esac$@  printf strict@
+}
+SED
+try "vnext_egress_entry_mode_off" "the editor opens under a refused capability when what it loads is off" "$CLI" "$EGRESS_UI_BATS"
+
+# The full screen: leaving it before a save's result, on a fallback, on any
+# exit, and Ctrl-C that only exits at the top level.
+cat > "$SED_TMP" << 'SED'
+/^_egress_picker_tui()/,/^}$/{
+  /^        if _egress_tui_review; then$/{n;d;}
+}
+SED
+try "vnext_egress_save_leaves_first" "a save leaves the full screen first" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_picker_tui()/,/^}$/{
+  /^        if \[ "\$_EGS_OUT" = none \]; then$/{n;d;}
+}
+SED
+try "vnext_egress_none_leaves" "a save leaves the full screen first" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_picker_tui()/,/^}$/{
+  /^    if ! _egress_measure; then$/{n;d;}
+}
+SED
+try "vnext_egress_typed_fallback_leaves" "a resize to a window too small runs the typed picker on the normal screen" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_enter()/,/^}$/{
+  /^  trap '_EG_WINCH=1' WINCH$/d
+}
+SED
+try "vnext_egress_winch_trap" "a resize signal is measured at the next key" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
+  /^    _egress_measure || return 1$/d
+}
+SED
+try "vnext_egress_prompt_resize" "a resize during a prompt ends it" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_enter()/,/^}$/{
+  s@^    trap "_egress_tui_exit; \${_EG_OLD_EXIT:-:}" EXIT$@    :@
+}
+SED
+try "vnext_egress_exit_trap" "an exit from inside the editor gives the terminal back" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_leave()/,/^}$/{
+  s@^    if \[ -n "\$_EG_OLD_EXIT" \]; then trap -- "\$_EG_OLD_EXIT" EXIT; else trap - EXIT; fi$@    trap - EXIT@
+}
+SED
+try "vnext_egress_exit_trap_restored" "an exit from inside the editor gives the terminal back" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_enter()/,/^}$/{
+  s@^    trap 'exit 130' INT TERM HUP$@    trap '_egress_tui_restore; echo ""; exit 130' INT TERM HUP@
+}
+SED
+try "vnext_egress_ctrl_c_exit_only" "at the top level Ctrl-C only exits" "$CLI" "$EGRESS_UI_BATS"
+
+# No fork in the loop around a key, nor in the key reader.
+cat > "$SED_TMP" << 'SED'
+/^_egress_picker_tui()/,/^}$/{
+  s@^    if \[ "\$_EG_WINCH" = 1 \]; then$@    if true; then@
+}
+SED
+try "vnext_egress_loop_no_fork" "a keypress forks nothing and calls docker nothing" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_key()/,/^}$/{
+  s@^  if ! IFS= read -rsn1 k 2>/dev/null; then _KEY=QUIT; return 0; fi$@  if ! k="$(IFS= read -rsn1 k 2>/dev/null \&\& printf '%s' "$k")"; then _KEY=QUIT; return 0; fi@
+}
+SED
+try "vnext_egress_key_reader_fork" "the key reader itself runs no subprocess" "$CLI" "$EGRESS_UI_BATS"
+
+# The doors: the config row's off always opens, a strict save from it is
+# still refused, a caged box's off keeps the lists, done never opens.
+cat > "$SED_TMP" << 'SED'
+/^_egress_config_handoff()/,/^}$/{
+  s@^      _egress_picker_tui "" off || true$@      _egress_writer_interlock strict || return 0; _egress_picker_tui "" off || true@
+}
+SED
+try "vnext_egress_config_off_door" "the config row's off door opens the editor under a refused capability" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_review()/,/^}$/{
+  s@^      if ! refusal="\$(_egress_writer_interlock @      if false \&\& ! refusal="$(_egress_writer_interlock @
+}
+SED
+try "vnext_egress_review_interlock" "the config row's off door opens the editor under a refused capability" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_commit()/,/^}$/{
+  s@^      cmd_egress_off "\$_EGE_CNAME" 1 "\$_EGE_PACKS" "\$denies" "\$allows" "\$_EGE_CANON" "\$_EGS_MODE" || return 1$@      cmd_egress_off "$_EGE_CNAME" 1 || return 1@
+}
+SED
+try "vnext_egress_offbox_lists" "a caged box's off save keeps the ticks the review showed" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_review()/,/^}$/{
+  s@^  if _egress_ask_no "\$q"; then return 0; fi$@  if [ "$yes" = 1 ] || _egress_ask_no "$q"; then return 0; fi@
+}
+SED
+try "vnext_egress_open_ask_on_done" "done in the typed editor never answers the open for you" "$CLI" "$EGRESS_UI_BATS"
+
+# The words and keys the tests pin: no class word anywhere, the typed mode's
+# meaning, a refusal read before the list returns, Esc as cancel, what the
+# box had and a save with nothing to change.
+cat > "$SED_TMP" << 'SED'
+/^_egress_pack_pane()/,/^}$/{
+  s@^  _EGP\[1\]="\$_EGT"$@  _EGP[1]="$_EGT (${_EGC_WORD[ix]})"@
+}
+SED
+try "vnext_egress_no_jargon" "no catalogue class word is drawn anywhere in the editor" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_picker_text()/,/^}$/{
+  s@^    echo -e "  Mode \${_EGE_MODE} \${DIM}(\${_EGT})\${RESET}"$@    echo -e "  Mode ${_EGE_MODE}"@
+}
+SED
+try "vnext_egress_typed_meaning" "a 19 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_review()/,/^}$/{
+  /^    _egress_key$/d
+}
+SED
+try "vnext_egress_refusal_waits" "a refused save stays on screen until a key" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_tui_key()/,/^}$/{
+  s@^    QUIT|ESC) _EG_ACT=cancel ;;$@    QUIT) _EG_ACT=cancel ;;@
+}
+SED
+try "vnext_egress_esc_cancels" "q and escape write nothing" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_save_diff()/,/^}$/{
+  /Was any host, each one logged/d
+}
+SED
+try "vnext_egress_was_open" "leaving open for strict says what the box had" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_config_handoff()/,/^}$/{
+  s@^        if \[ "\${_EGS_OUT:-}" = none \]; then$@        if false; then@
+}
+SED
+try "vnext_egress_handoff_none" "a save with nothing to change after the config row turned egress on" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_offbox_denies()/,/^}$/{
+  /^    _egress_nl_union _EGE_DOFF "\$_EGD"$/d
+}
+SED
+try "vnext_egress_offbox_redeny_regr" "a pack shown off for a box stayed allowed in its file"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

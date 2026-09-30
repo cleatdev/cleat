@@ -9425,11 +9425,8 @@ _EG_WARNED_KEY_FILES=""
 _EG_NO_PERBOX=""
 _EGE_FILE=""
 _EGE_BOX=""
-_EGE_FIRST=0
-_EGE_HFIRST=0
 _EGE_SAVED=0
 _EGE_CANON=""
-_EGE_RING_BACK=""
 _EG_MODE=""
 _EG_HOSTS=""
 _EG_PACKS=""
@@ -12716,19 +12713,6 @@ _egress_verb() {                         # <verb> <box> <arg> <yes> <refused> <s
   return 1
 }
 
-# The interlocks at the writer (3, 5.7 assertion 16): a write that would put
-# the directory's box under a policy while it has the docker, ssh or hooks
-# capability is refused here, not only at its next launch. Live enforcement
-# only, and only when the write leaves the box strict or open.
-_egress_writer_interlock() {             # <effective mode>
-  local project
-  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
-  case "$1" in strict|open) ;; *) return 0 ;; esac
-  project="$(resolve_project "$PWD" 2>/dev/null)" || return 0
-  resolve_caps "$project" readonly >/dev/null 2>&1 || return 0
-  _egress_interlocks "$1"
-}
-
 # The mode a box would run under once <file mode> is written: a box file that
 # sets none takes the global one. In a subshell: a reader that refuses exits.
 _egress_effective_mode() {               # <file mode>
@@ -13121,7 +13105,7 @@ _egress_open_screen() {                  # <every box: 1 or 0>
     echo -e "  ${AMBER}!${RESET} ${BOLD}Open egress, this session only${RESET}"
   fi
   echo ""
-  echo -e "    The box may reach any TLS host. Every destination is recorded, and each"
+  echo -e "    The box may reach any TLS host. Every destination is recorded. Each"
   echo -e "    one can become part of a policy afterwards. This is a log, not a"
   echo -e "    boundary."
   echo ""
@@ -13139,20 +13123,64 @@ _egress_open_screen() {                  # <every box: 1 or 0>
   echo ""
 }
 
+# Why box <cname> cannot open for this session, into _EG_OPEN_WHY, empty
+# when it can: down, stopped, off, uncaged or engine. No prompt, no write, no
+# output. <mode> is the mode the box will run under, resolved when not given.
+# cleat egress open and the box editor's ring both ask this, and both print
+# its answer through _egress_open_refusal.
+_EG_OPEN_WHY=""
+_EG_OPEN_KIND=""
+_egress_open_check() {                   # <cname> [<mode>] [<1: daemon and box already checked>]
+  local cname="$1" mode="${2:-}"
+  _EG_OPEN_WHY=""
+  if [ "${3:-0}" != 1 ]; then
+    if ! _daemon_up; then _EG_OPEN_WHY=down; return 1; fi
+    if ! is_running "$cname"; then _EG_OPEN_WHY=stopped; return 1; fi
+  fi
+  if [ -z "$mode" ]; then _egress_resolve "$cname"; mode="$_EG_MODE"; fi
+  case "$mode" in strict|open) ;; *) _EG_OPEN_WHY=off; return 1 ;; esac
+  if ! _egress_label_read "$cname" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then
+    _EG_OPEN_WHY=uncaged
+    return 1
+  fi
+  _EG_OPEN_KIND="${_EGE_ENGINE:-}"
+  case "$_EG_OPEN_KIND" in ""|down) _EG_OPEN_KIND="$(_egress_engine_kind)" ;; esac
+  if ! _egress_engine_validated "$_EG_OPEN_KIND"; then _EG_OPEN_WHY=engine; return 1; fi
+  return 0
+}
+
+_egress_open_refusal() {                 # <cname>
+  local sb
+  sb="$(_sessions_safe_str "${_BOX:-main}")"
+  case "$_EG_OPEN_WHY" in
+    down) error "Docker is not running." ;;
+    stopped) error "Box ${BOLD}${sb}${RESET} is not running. Start it first:  ${BOLD}cleat start${RESET}" ;;
+    off) error "Egress control is off for box ${BOLD}${sb}${RESET}, so there is no gateway to open. Turn it on:  ${BOLD}cleat egress ${sb}${RESET}" ;;
+    uncaged)
+      error "Box ${BOLD}${sb}${RESET} was created without egress control, so it has no gateway to open."
+      echo -e "    It refuses to start until it is recreated:  $(_egress_recreate_words "$1")" ;;
+    engine) _egress_engine_refusal "$_EG_OPEN_KIND" ;;
+  esac
+  return 0
+}
+
+# The confirmation of 6.5 for one box, default no. rc 0 on a yes.
+_egress_open_ask() {
+  _egress_open_screen 0
+  _egress_ask_no '    Open egress for this box until it stops? [y/N] '
+}
+
 # cleat egress open [box]: every TLS host allowed and logged, for one box,
 # until it stops. Default-deny, and on a pipe only with --yes.
 cmd_egress_open() {                      # <cname> <yes>
-  local cname="$1" yes="${2:-0}" sb kind ans
+  local cname="$1" yes="${2:-0}" sb
   sb="$(_sessions_safe_str "${_BOX:-main}")"
   if [ "$yes" != 1 ] && ! _egress_on_terminal; then
     error "cleat egress open changes what a box may reach, so it needs a terminal. On a pipe:  ${BOLD}cleat egress open --yes${RESET}"
     return 1
   fi
-  if ! _daemon_up; then error "Docker is not running."; return 1; fi
-  if ! is_running "$cname"; then
-    error "Box ${BOLD}${sb}${RESET} is not running. Start it first:  ${BOLD}cleat start${RESET}"
-    return 1
-  fi
+  if ! _daemon_up; then _EG_OPEN_WHY=down; _egress_open_refusal "$cname"; return 1; fi
+  if ! is_running "$cname"; then _EG_OPEN_WHY=stopped; _egress_open_refusal "$cname"; return 1; fi
   _egress_resolve "$cname"
   case "$_EG_MODE" in
     open)
@@ -13162,23 +13190,10 @@ cmd_egress_open() {                      # <cname> <yes>
         info "Box ${BOLD}${sb}${RESET} is already open ($(_egress_why_text))."
       fi
       return 0 ;;
-    strict) ;;
-    *)
-      error "Egress control is off for box ${BOLD}${sb}${RESET}, so there is no gateway to open. Turn it on:  ${BOLD}cleat egress ${sb}${RESET}"
-      return 1 ;;
   esac
-  if ! _egress_label_read "$cname" sh.cleat.egress-hash || [ "$_EG_LABEL_SET" != 1 ]; then
-    error "Box ${BOLD}${sb}${RESET} was created without egress control, so it has no gateway to open."
-    echo -e "    It refuses to start until it is recreated:  $(_egress_recreate_words "$cname")"
-    return 1
-  fi
-  kind="$(_egress_engine_kind)"
-  if ! _egress_engine_validated "$kind"; then _egress_engine_refusal "$kind"; return 1; fi
+  if ! _egress_open_check "$cname" "$_EG_MODE" 1; then _egress_open_refusal "$cname"; return 1; fi
   if [ "$yes" != 1 ]; then
-    _egress_open_screen 0
-    printf '    Open egress for this box until it stops? [y/N] '
-    IFS= read -r ans || ans=""
-    case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 0 ;; esac
+    _egress_open_ask || return 0
   fi
   if ! _egress_open_session "$cname"; then
     _egress_refuse gateway "cleat could not record the open session." "check ${BOLD}${_EGRESS_BOXES_DIR/#${HOME}/~}${RESET} is a directory you own"
@@ -13222,11 +13237,16 @@ cmd_egress_open_always() {               # <yes>
   return 0
 }
 
-# A box's own mode, written into its own file, keeping its entries. The
-# global section is never touched.
-_egress_write_box_mode() {               # <cname> <mode>
+# A box's own mode, written into its own file, keeping its entries, or the
+# lists given (the editor's, with the section as it loaded it). The global
+# section is never touched.
+_egress_write_box_mode() {               # <cname> <mode> [<packs> <denies> <allows> <canon>]
   local f="$CLEAT_CONFIG_DIR/egress-boxes/$1" canon
   mkdir -p "$CLEAT_CONFIG_DIR/egress-boxes" 2>/dev/null || return 1
+  if [ "$#" -ge 6 ]; then
+    _write_egress_to_file "$CLEAT_CONFIG_DIR/egress-boxes/$1" "$2" "$3" "$4" "$5" "$6"
+    return $?
+  fi
   _egress_file_state "$f"
   canon="$(_egress_section_canon "$f")"
   _write_egress_to_file "$CLEAT_CONFIG_DIR/egress-boxes/$1" "$2" "$_f_packs" "$_f_denies" "$_f_allows" "$canon"
@@ -13325,12 +13345,20 @@ _egress_off_confirm() {                  # <cname or empty>
   echo ""
 }
 
+# The confirmation of 6.6 for one caged box, default no. rc 0 on a yes.
+_egress_off_box_ask() {                  # <cname>
+  _egress_off_confirm "$1"
+  _egress_ask_no '    Turn egress control off and recreate the box? [y/N] '
+}
+
 # cleat egress off [box]: give one box a normal network back. It recreates the
 # box, so it asks, default no, and on a pipe only with --yes. The global
 # policy is never touched. The seventeenth removal site. The teardown is
 # forced: this box is known to be caged, whatever its rendered policy says.
-cmd_egress_off() {                       # <cname> <yes>
-  local cname="$1" yes="${2:-0}" sb ans lbl=0 project
+# The box editor passes its own lists, which the write keeps, and the mode
+# it writes: off, or inherit when the box follows every box into off.
+cmd_egress_off() {                       # <cname> <yes> [<packs> <denies> <allows> <canon> [<mode>]]
+  local cname="$1" yes="${2:-0}" sb lbl=0 project wmode="${7:-off}"
   sb="$(_sessions_safe_str "${_BOX:-main}")"
   if [ "$yes" != 1 ] && ! _egress_on_terminal; then
     error "cleat egress off recreates box ${BOLD}${sb}${RESET}, so it needs a terminal. On a pipe:  ${BOLD}cleat egress off --yes${RESET}"
@@ -13344,38 +13372,43 @@ cmd_egress_off() {                       # <cname> <yes>
   fi
   if ! _daemon_up; then error "Docker is not running."; return 1; fi
   if ! container_exists "$cname"; then
-    _egress_write_box_mode "$cname" off || return 1
+    _egress_write_box_mode "$cname" "$wmode" "${@:3:4}" || return 1
     info "Box ${BOLD}${sb}${RESET} will be created with a normal network."
     return 0
   fi
   if [ "$yes" != 1 ]; then
-    _egress_off_confirm "$cname"
-    printf '    Turn egress control off and recreate the box? [y/N] '
-    IFS= read -r ans || ans=""
-    case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 0 ;; esac
+    _egress_off_box_ask "$cname" || return 0
   fi
   project="$(resolve_project "$PWD")"
-  _egress_write_box_mode "$cname" off || return 1
+  _egress_write_box_mode "$cname" "$wmode" "${@:3:4}" || return 1
   _egress_teardown "$cname" keep force || { error "Could not remove box ${BOLD}${sb}${RESET}."; return 1; }
   _account_wipe_run_dir "$cname"
   cmd_run "$project"
   success "Box ${BOLD}${sb}${RESET} recreated with a normal network. Egress control stays off for it:  ${BOLD}cleat egress ${sb}${RESET} turns it back on."
 }
 
+# The confirmation of 6.6 for every new box, default no. rc 0 on a yes.
+_egress_off_global_ask() {
+  _egress_off_confirm ""
+  _egress_ask_no '    Turn egress control off for every new box? [y/N] '
+}
+
 # The global off, from the global editor and the cleat config row: mode off
 # written into the global section, which keeps it. Nothing is recreated: a
-# caged box is recreated only by its own cleat egress off.
-_egress_off_global() {                   # <yes>
-  local yes="${1:-0}" canon ans
+# caged box is recreated only by its own cleat egress off. The editor passes
+# its own lists, so an off save keeps the ticks its review showed.
+_egress_off_global() {                   # <yes> [<packs> <denies> <allows> <canon>]
+  local yes="${1:-0}" canon
   if [ "$yes" != 1 ]; then
-    _egress_off_confirm ""
-    printf '    Turn egress control off for every new box? [y/N] '
-    IFS= read -r ans || ans=""
-    case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 1 ;; esac
+    _egress_off_global_ask || return 1
   fi
-  _egress_file_state "$CLEAT_GLOBAL_CONFIG"
-  canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
-  _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" off "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
+  if [ "$#" -ge 5 ]; then
+    _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" off "$2" "$3" "$4" "$5" || return 1
+  else
+    _egress_file_state "$CLEAT_GLOBAL_CONFIG"
+    canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
+    _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" off "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
+  fi
   _egress_apply_mode "" off
   success "Saved to ${CLEAT_GLOBAL_CONFIG/#${HOME}/~}: egress control is off for every new box."
   return 0
@@ -14512,48 +14545,350 @@ _egress_cmd_inherit() {                  # <box> <assume_yes>
 }
 
 # ── The editor (6.1, 6.4) ──────────────────────────────────────────────────
-# Five zones: mode, the locked core, packs, pinned hosts and a fixed-height
-# detail pane, then the save row and the effective line. Keys are only what
-# _read_keypress emits: up and down move, space ticks, left and right turn the
-# mode ring, enter opens the row under the cursor and q cancels. Adding a
-# host, filtering and saving are rows the cursor walks, never letter keys.
+# A full-screen editor on the terminal's alternate screen. Nothing it draws is
+# left in the scrollback, and a prompt, a refusal or the save review takes the
+# place of the list instead of stacking a copy of it underneath. Keys are only
+# what _read_keypress emits (6.1, no letter hotkeys): up and down move, space
+# ticks the row or opens its prompt, left and right turn the mode on the mode
+# row and right opens a pack's hosts, enter reviews and saves from any row, q
+# cancels. Everything a frame shows is worked out when the editor opens, into
+# plain variables and arrays, so a key runs no subshell and no docker call.
+# The first editor ran about 300 processes and 3 docker calls on every key.
 
-# Every line of the Screen 1 draw is a physical line and these count them,
-# plus one row left for the shell prompt, budgeted and never drawn. Change the
-# draw and change these in the same commit: they are counted, never guessed.
-_EGRESS_CHROME_LINES=11   # ten drawn lines: title, scope, notice, mode row,
-                          # core row, packs header, hosts header, save row,
-                          # effective row, footer keys. Plus the prompt row.
-_EGRESS_HOST_LINES=5      # a 3-row pinned-host viewport, the add row, the
-                          # filter row
-_EGRESS_PANE_LINES=6      # the detail pane, fixed, padded with cleared blanks
-_EGRESS_ACTION_LINES=5    # the action screen
-_EGRESS_HOST_VIEW=3
+# Every drawn line is a physical line and these count them. A frame is
+# _EGRESS_CHROME_LINES - 1 + _EG_E + _EG_PAGE + _EG_HV + _EGRESS_PANE_LINES
+# lines, never more than the window's rows minus one, so drawing it can never
+# scroll the screen it is drawn on. Change the frame and change these in the
+# same commit: they are counted, never guessed.
+_EGRESS_CHROME_LINES=13   # twelve fixed lines: title, subtitle, blank, mode
+                          # row, blank, packs header, find row, hosts header,
+                          # add row, blank, status, legend. Plus one row kept
+                          # free.
+_EGRESS_PANE_LINES=4      # the detail pane under the lists, padded
+_EGRESS_HOST_VIEW=3       # most host rows shown at once, scrolling
+_EGRESS_MIN_PAGE=3        # fewest pack rows that still get the full screen
+_EGRESS_MIN_COLS=60       # narrowest window that gets the full screen
 _EGRESS_ROW_ADD="+add"
 _EGRESS_ROW_FILTER="+filter"
-_EGRESS_ROW_SAVE="+save"
+_EG_E=0
+_EG_HV=0
+_EG_PAGE=1
+_EG_ROWS=24
+_EG_COLS=80
+_EG_RAWCOLS=80
+_EG_WINCH=0
+_EG_TUI=0
+_EG_CUR=0
+_EG_FIRST=0
+_EG_HFIRST=0
+_EG_SCREEN=list
+_EG_PROMPT=""
+_EG_ACT=""
+_EGE_NPACK=0
+_EGE_NPACK_ALL=0
+_EGE_NHOST=0
+_EGE_MSG=""
+_EGE_MSGC=""
+_EGE_ENGINE=""
+_EGE_WARN=""
+_EGE_OPEN_WHY=""
+_EGE_CAGED=0
+_EGS_PLAN=""
+_EGS_OUT=""
+_EGS_MODE=""
+_KEY=""
+_EGR=()
+_EGRI=()
+_EGO=()
+_EGH=()
+_EGP=("" "" "" "")
+_EG_PP=("" "" "" "")
 
-# _EG_PAGE is the pack viewport: the smaller of what fits and what there is to
-# show. Returns 1 when the window cannot hold one pack row, and the caller runs
-# the typed picker instead.
-_egress_measure() {
-  local total="${1:-0}" avail
+# The window, measured when the editor opens and again after the terminal says
+# it was resized (SIGWINCH), never on a key. A function, so a test can set it.
+_egress_term_now() {
   _EG_ROWS="$(_term_rows)"
-  _EG_COLS="$(_term_cols)"
+  _EG_RAWCOLS="$(_term_cols)"
+}
+
+# _EG_PAGE is the pack viewport and _EG_HV the host viewport: the smaller of
+# what fits and what there is to show, and a short window gives up host rows
+# down to one before pack rows. Returns 1 when the window cannot hold the
+# editor, and the caller runs the typed picker instead: under
+# _EGRESS_MIN_COLS columns, or too short for _EGRESS_MIN_PAGE pack rows. No
+# subshell: it runs before every frame.
+_egress_measure() {                      # [<packs to show>]
+  local total="${1:-$_EGE_NPACK_ALL}" avail
   case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  _EG_COLS="$_EG_RAWCOLS"
+  [ "$_EG_COLS" -gt 200 ] && _EG_COLS=200
+  [ "$_EG_RAWCOLS" -lt "$_EGRESS_MIN_COLS" ] && return 1
+  _EG_HV="$_EGE_NHOST"
+  [ "$_EG_HV" -gt "$_EGRESS_HOST_VIEW" ] && _EG_HV="$_EGRESS_HOST_VIEW"
+  avail=$(( _EG_ROWS - _EGRESS_CHROME_LINES - _EGRESS_PANE_LINES - _EG_E - _EG_HV ))
+  while [ "$avail" -lt "$_EGRESS_MIN_PAGE" ] && [ "$_EG_HV" -gt 1 ]; do
+    _EG_HV=$((_EG_HV - 1))
+    avail=$((avail + 1))
+  done
+  [ "$avail" -lt "$_EGRESS_MIN_PAGE" ] && return 1
   [ "$total" -lt 1 ] && total=1
-  avail=$(( _EG_ROWS - _EGRESS_CHROME_LINES - _EGRESS_HOST_LINES - _EGRESS_PANE_LINES ))
-  [ "$avail" -lt 1 ] && return 1
   if [ "$total" -lt "$avail" ]; then _EG_PAGE="$total"; else _EG_PAGE="$avail"; fi
   return 0
 }
 
-# The editor's state, loaded from the file it will write. _EGE_* globals so
-# the draw, the keys and the save read one copy.
+# ── Newline lists, in the shell itself ──
+# The editor's state is newline lists with no trailing newline. A key may not
+# fork, so none of these runs a command. The locals are spelled so no caller's
+# variable name can collide with them through the indirection.
+_egress_nl_has() {                       # <item> <list>
+  case $'\n'"$2"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
+  return 1
+}
+_egress_nl_add() {                       # <variable> <item>
+  local _nla_cur="${!1}"
+  [ -n "$2" ] || return 0
+  _egress_nl_has "$2" "$_nla_cur" && return 0
+  if [ -n "$_nla_cur" ]; then printf -v "$1" '%s\n%s' "$_nla_cur" "$2"; else printf -v "$1" '%s' "$2"; fi
+}
+_egress_nl_drop() {                      # <variable> <item>
+  local _nld_rest="${!1}" _nld_out="" _nld_l
+  _egress_nl_has "$2" "$_nld_rest" || return 0
+  while [ -n "$_nld_rest" ]; do
+    _nld_l="${_nld_rest%%$'\n'*}"
+    if [ "$_nld_l" = "$_nld_rest" ]; then _nld_rest=""; else _nld_rest="${_nld_rest#*$'\n'}"; fi
+    if [ -n "$_nld_l" ] && [ "$_nld_l" != "$2" ]; then _nld_out="${_nld_out:+$_nld_out$'\n'}$_nld_l"; fi
+  done
+  printf -v "$1" '%s' "$_nld_out"
+}
+# <variable> gains every item of <list> it lacks.
+_egress_nl_union() {                     # <variable> <list>
+  local _nlu_rest="$2" _nlu_l
+  while [ -n "$_nlu_rest" ]; do
+    _nlu_l="${_nlu_rest%%$'\n'*}"
+    if [ "$_nlu_l" = "$_nlu_rest" ]; then _nlu_rest=""; else _nlu_rest="${_nlu_rest#*$'\n'}"; fi
+    [ -n "$_nlu_l" ] && _egress_nl_add "$1" "$_nlu_l"
+  done
+  return 0
+}
+# <variable> loses every item of <list>.
+_egress_nl_minus() {                     # <variable> <list>
+  local _nlm_rest="$2" _nlm_l
+  while [ -n "$_nlm_rest" ]; do
+    _nlm_l="${_nlm_rest%%$'\n'*}"
+    if [ "$_nlm_l" = "$_nlm_rest" ]; then _nlm_rest=""; else _nlm_rest="${_nlm_rest#*$'\n'}"; fi
+    [ -n "$_nlm_l" ] && _egress_nl_drop "$1" "$_nlm_l"
+  done
+  return 0
+}
+# The items of <a> that <b> lacks, into _EGN_OUT.
+_egress_nl_diff() {                      # <a> <b>
+  local _nlf_rest="$1" _nlf_l
+  _EGN_OUT=""
+  while [ -n "$_nlf_rest" ]; do
+    _nlf_l="${_nlf_rest%%$'\n'*}"
+    if [ "$_nlf_l" = "$_nlf_rest" ]; then _nlf_rest=""; else _nlf_rest="${_nlf_rest#*$'\n'}"; fi
+    if [ -n "$_nlf_l" ] && ! _egress_nl_has "$_nlf_l" "$2"; then _EGN_OUT="${_EGN_OUT:+$_EGN_OUT$'\n'}$_nlf_l"; fi
+  done
+  return 0
+}
+_egress_nl_count() {                     # <list>  (sets _EGN)
+  local _nlc_rest="$1" _nlc_l
+  _EGN=0
+  while [ -n "$_nlc_rest" ]; do
+    _nlc_l="${_nlc_rest%%$'\n'*}"
+    if [ "$_nlc_l" = "$_nlc_rest" ]; then _nlc_rest=""; else _nlc_rest="${_nlc_rest#*$'\n'}"; fi
+    [ -n "$_nlc_l" ] && _EGN=$((_EGN + 1))
+  done
+  return 0
+}
+# Host values from a policy file into <variable>, each as _egress_valid_host
+# gives it, and the values that are no host name into _EGN_OUT. At load only:
+# it runs the validator in a subshell per value.
+_egress_nl_hosts() {                     # <variable> <list>
+  local _nlh_rest="$2" _nlh_l _nlh_h _nlh_bad=""
+  printf -v "$1" '%s' ""
+  while [ -n "$_nlh_rest" ]; do
+    _nlh_l="${_nlh_rest%%$'\n'*}"
+    if [ "$_nlh_l" = "$_nlh_rest" ]; then _nlh_rest=""; else _nlh_rest="${_nlh_rest#*$'\n'}"; fi
+    [ -n "$_nlh_l" ] || continue
+    if _nlh_h="$(_egress_valid_host "$_nlh_l")"; then
+      _egress_nl_add "$1" "$_nlh_h"
+    else
+      _egress_nl_add _nlh_bad "$_nlh_l"
+    fi
+  done
+  _EGN_OUT="$_nlh_bad"
+  return 0
+}
+
+# A list read from a policy file, blank lines dropped, into <variable>.
+_egress_nl_set() {                       # <variable> <list>
+  printf -v "$1" '%s' ""
+  _egress_nl_union "$1" "$2"
+}
+# The items of <list> as prose, "a, b and c", into _EGT. No serial comma.
+_egress_nl_prose() {                     # <list>
+  local _nlp_rest="$1" _nlp_l _nlp_n=0 _nlp_last=""
+  _EGT=""
+  while [ -n "$_nlp_rest" ]; do
+    _nlp_l="${_nlp_rest%%$'\n'*}"
+    if [ "$_nlp_l" = "$_nlp_rest" ]; then _nlp_rest=""; else _nlp_rest="${_nlp_rest#*$'\n'}"; fi
+    [ -n "$_nlp_l" ] || continue
+    if [ -n "$_nlp_last" ]; then _EGT="${_EGT:+$_EGT, }$_nlp_last"; fi
+    _nlp_last="$_nlp_l"
+    _nlp_n=$((_nlp_n + 1))
+  done
+  if [ "$_nlp_n" -gt 1 ]; then _EGT="$_EGT and $_nlp_last"; else _EGT="$_nlp_last"; fi
+  return 0
+}
+
+# One line of text cut to <width> columns, into _EGT, with … where it was cut.
+# Every text the editor cuts is ASCII: the glyphs sit in fixed prefixes of
+# known width, so a character count is a column count in any locale.
+_egress_fit() {                          # <text> <width>
+  local w="$2"
+  [ "$w" -lt 1 ] && w=1
+  if [ "${#1}" -le "$w" ]; then _EGT="$1"; else _EGT="${1:0:$((w - 1))}…"; fi
+  return 0
+}
+
+# <text> wrapped at <width> into _EGW, at most <max> lines, the last cut.
+_egress_wrap() {                         # <text> <width> <max>
+  local rest="$1" w="$2" max="$3" line="" word
+  _EGW=()
+  [ "$w" -lt 10 ] && w=10
+  while [ -n "$rest" ] && [ "${#_EGW[@]}" -lt "$max" ]; do
+    word="${rest%% *}"
+    if [ "$word" = "$rest" ]; then rest=""; else rest="${rest#* }"; fi
+    [ -n "$word" ] || continue
+    if [ -z "$line" ]; then
+      line="$word"
+    elif [ $(( ${#line} + 1 + ${#word} )) -le "$w" ]; then
+      line="$line $word"
+    else
+      _EGW+=("$line")
+      line="$word"
+    fi
+  done
+  # What did not fit joins the last line, which is then cut.
+  if [ -n "$rest" ]; then line="$line $rest"; fi
+  if [ -n "$line" ] && [ "${#_EGW[@]}" -lt "$max" ]; then _EGW+=("$line"); fi
+  if [ "${#_EGW[@]}" -gt 0 ]; then
+    _egress_fit "${_EGW[${#_EGW[@]}-1]}" "$w"
+    _EGW[${#_EGW[@]}-1]="$_EGT"
+  fi
+  return 0
+}
+
+# ── Words (6.4) ──
+# The catalogue names hosts. This names what a person ticks a pack to do,
+# into _EGT.
+_egress_pack_purpose() {                 # <pack>
+  _EGT=""
+  case "$1" in
+    github) _EGT='git, gh and tarballs' ;;
+    github-objects) _EGT='LFS and release downloads' ;;
+    github-raw) _EGT='raw files from any repo' ;;
+    gitlab) _EGT='git and the GitLab API' ;;
+    atlassian) _EGT='Bitbucket and Atlassian' ;;
+    azure-devops) _EGT='Azure DevOps and Artifacts' ;;
+    aws) _EGT='AWS sign-in and S3' ;;
+    gcp) _EGT='Google sign-in and APIs' ;;
+    npm) _EGT='npm, pnpm and yarn' ;;
+    pypi) _EGT='pip, uv and poetry' ;;
+    apt-debian) _EGT='apt-get on Debian' ;;
+    apt-image-extras) _EGT="Docker's apt repository" ;;
+    apt-ubuntu) _EGT='apt-get on Ubuntu' ;;
+    debian-mirror) _EGT='Debian archive, no security' ;;
+    dotnet) _EGT='.NET and Microsoft packages' ;;
+    astral) _EGT='the uv installer' ;;
+    azure-cli) _EGT='the azure-cli apt repository' ;;
+    go) _EGT='go get and go mod' ;;
+    rust) _EGT='cargo and Rust toolchains' ;;
+    ruby) _EGT='gem and bundler' ;;
+    maven) _EGT='Maven Central and Gradle' ;;
+    containers) _EGT='docker pull' ;;
+    homebrew) _EGT='brew install' ;;
+    huggingface) _EGT='models and datasets' ;;
+    playwright) _EGT='Playwright browsers' ;;
+    docs) _EGT='MDN, Stack Overflow, docs' ;;
+    claude) _EGT='Claude Code itself' ;;
+  esac
+  return 0
+}
+
+# The editor's plain words for a catalogue class word, the only risk words it
+# shows. The class words stay in cleat egress packs, --list and the published
+# catalogue. Into _EGK: 0 reaches that service alone, 1 reaches other sites,
+# 2 anyone can upload, 3 not checked. A pack that needs a refused capability
+# is 4, set by the cache, never by a class.
+_egress_risk_of() {                      # <class word>
+  case "$1" in
+    "single origin"|contained) _EGK=0 ;;
+    shared) _EGK=1 ;;
+    "open tenancy") _EGK=2 ;;
+    *) _EGK=3 ;;
+  esac
+  return 0
+}
+# A risk's tag on a row, into _EGT. Empty for none.
+_egress_risk_tag() {                     # <risk>
+  case "$1" in
+    1) _EGT="! reaches other sites" ;;
+    2) _EGT="! anyone can upload" ;;
+    3) _EGT="! not checked" ;;
+    4) _EGT="needs the docker cap" ;;
+    *) _EGT="" ;;
+  esac
+  return 0
+}
+# A risk as a sentence, for a pane, into _EGT.
+_egress_risk_line() {                    # <risk>
+  case "$1" in
+    1) _EGT="! This also reaches other sites on the same server." ;;
+    2) _EGT="! Anyone can upload here. Data can leave through it." ;;
+    3) _EGT="! Cleat has not checked what else answers here." ;;
+    4) _EGT="✘ Needs the docker cap, which egress control refuses." ;;
+    *) _EGT="Reaches this service and nothing else." ;;
+  esac
+  return 0
+}
+
+# What each mode does, beside it on the mode row (6.3), into _EGT. It changes
+# as the ring turns, whichever row the cursor is on.
+_egress_mode_meaning() {                 # <mode>
+  case "$1" in
+    inherit) _EGT="same as every box: ${_EGE_G_EFF:-off}" ;;
+    strict) _EGT="only the hosts ticked below" ;;
+    open)
+      if [ -n "$_EGE_BOX" ]; then
+        _EGT="any host until it stops, logged"
+      elif [ "${_EGE_LOAD_MODE:-}" = open ]; then
+        _EGT="any host for every box, logged"
+      else
+        _EGT="per box only, not saved here"
+      fi ;;
+    off)
+      if [ -n "$_EGE_BOX" ]; then _EGT="no control: any host, any port"; else _EGT="no control for new boxes"; fi ;;
+    *) _EGT="" ;;
+  esac
+  return 0
+}
+
+# ── The editor's state (6.4) ──
+# Loaded from the file it will write and, for a box, from the global section
+# the box inherits, so the box editor shows what the box really gets (M20).
+# _EGE_* globals, so the frame, the keys and the save read one copy. The
+# lists: _EGE_PACKS, _EGE_HOSTS and _EGE_DENIES are what a save writes, the
+# _ORIG_ ones what the file held. _EGE_UNTICKED keeps a host unticked this
+# session on screen. _EGE_OFFBOX is the global packs a box turned off for
+# itself, which it does with deny lines.
 _egress_editor_load() {                  # <box or empty>
-  local box="$1" p _det
+  local box="$1" p _det project v h
   _EGE_BOX="$box"
+  _EGE_BOXS=""
   if [ -n "$box" ]; then
+    _EGE_BOXS="$(_sessions_safe_str "$box")"
     _EGE_CNAME="$(_egress_target_cname "$box")"
     _EGE_FILE="$_EGRESS_BOXES_DIR/$_EGE_CNAME"
   else
@@ -14562,67 +14897,206 @@ _egress_editor_load() {                  # <box or empty>
   fi
   _egress_file_state "$_EGE_FILE"
   _EGE_CANON="$(_egress_section_canon "$_EGE_FILE")"
-  _EGE_MODE="$_f_mode"
-  if [ -z "$box" ]; then
-    case "$_EGE_MODE" in absent) _EGE_MODE=strict ;; esac
-  else
-    case "$_EGE_MODE" in absent) _EGE_MODE=inherit ;; esac
-  fi
-  _EGE_PACKS="$(printf '%s\n' "$_f_packs" | grep -v '^$' || true)"
-  _EGE_HOSTS="$(printf '%s\n' "$_f_allows" | grep -v '^$' || true)"
-  _EGE_UNTICKED=""
-  _EGE_DENIES="$_f_denies"
   _EGE_ORIG_MODE="$_f_mode"
+  _EGE_MODE="$_f_mode"
+  if [ "$_EGE_MODE" = absent ]; then
+    if [ -n "$box" ]; then _EGE_MODE=inherit; else _EGE_MODE=strict; fi
+  fi
+  _EGE_LOAD_MODE="$_EGE_MODE"
+  _egress_nl_set _EGE_PACKS "$_f_packs"
+  # Host values as the resolver reads them: lower case, one trailing dot
+  # dropped. A value that is no host name is kept aside and written back
+  # untouched: the resolver ignores such an allow and refuses such a deny.
+  _egress_nl_hosts _EGE_HOSTS "$_f_allows"
+  _EGE_BAD_ALLOWS="$_EGN_OUT"
+  _egress_nl_hosts _EGE_DENIES "$_f_denies"
+  _EGE_BAD_DENIES="$_EGN_OUT"
   _EGE_ORIG_PACKS="$_EGE_PACKS"
   _EGE_ORIG_HOSTS="$_EGE_HOSTS"
+  _EGE_ORIG_DENIES="$_EGE_DENIES"
+  _EGE_UNTICKED=""
   _EGE_FILTER=""
   _EGE_SUGGEST=""
   _EGE_DETECTED=""
+  _EGE_MSG=""
+  _EGE_MSGC=""
+  # The global section, for a box: its packs show ticked for every box. One
+  # that does not parse shows nothing inherited. The launch names the fault.
+  _EGE_G_MODE=absent; _EGE_G_PACKS=""; _EGE_G_ALLOWS=""; _EGE_G_DENIES=""
+  if [ -n "$box" ] && ( _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress ) >/dev/null 2>&1; then
+    _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress
+    _EGE_G_MODE="$_m_mode"
+    _egress_nl_set _EGE_G_PACKS "$_p_vals"
+    _egress_nl_hosts _EGE_G_ALLOWS "$_e_vals"
+    _egress_nl_hosts _EGE_G_DENIES "$_d_vals"
+  fi
+  case "$_EGE_G_MODE" in absent) _EGE_G_EFF=off ;; *) _EGE_G_EFF="$_EGE_G_MODE" ;; esac
+  _egress_colours
+  _egress_editor_cache
+  _EGE_CORE="${_EGC_HOSTS[0]:-}"
+  _egress_ix_of claude && _EGE_CORE="${_EGC_ALL[_EGX]}"
+  _egress_nl_count "$_EGE_CORE"
+  _EGE_NCORE="$_EGN"
+  # What every box gets, less the core, for a box's count (_egress_resolve's
+  # order: the global packs and hosts, less the global blocks).
+  _EGE_G_HOSTS=""
+  if [ -n "$box" ]; then
+    local _r="$_EGE_G_PACKS"
+    while [ -n "$_r" ]; do
+      p="${_r%%$'\n'*}"
+      if [ "$p" = "$_r" ]; then _r=""; else _r="${_r#*$'\n'}"; fi
+      [ -n "$p" ] && _egress_ix_of "$p" && _egress_nl_union _EGE_G_HOSTS "${_EGC_HOSTS[_EGX]}"
+    done
+    _egress_nl_union _EGE_G_HOSTS "$_EGE_G_ALLOWS"
+    _egress_nl_minus _EGE_G_HOSTS "$_EGE_G_DENIES"
+  fi
+  _egress_editor_absorb
+  # What the file allows before anything is ticked for the user.
+  _egress_recount
+  _EGE_WAS="$_EGE_COUNT"
+  _EGE_WAS_EFF="$_EGE_EFF"
+  case "$_EGE_ORIG_MODE:$box" in absent:) _EGE_WAS_EFF=off ;; esac
   # First run means no pack and no allow entry, never no section: the config
   # row turns the feature on by writing mode alone, and the editor it hands
   # to must still arrive with the evidence ticked.
   if [ -z "$box" ] && [ -z "$_EGE_PACKS$_EGE_HOSTS" ]; then
+    project="$(resolve_project "$PWD")"
     while read -r p _det; do
       [ -n "$p" ] || continue
+      _egress_ix_of "$p" || continue
+      _egress_evidence "$p" "$project"
+      _EGC_EV[_EGX]="$_EGT"
       if [ "$_det" = ticked ]; then
-        _EGE_PACKS="$(printf '%s\n%s\n' "$_EGE_PACKS" "$p" | grep -v '^$' || true)"
+        _egress_nl_add _EGE_PACKS "$p"
         _EGE_DETECTED+="$p "
+        _EGC_DET[_EGX]=ticked
       else
         _EGE_SUGGEST+="$p "
+        _EGC_DET[_EGX]=suggested
       fi
-    done < <(_egress_detect_packs "$(resolve_project "$PWD")")
+    done < <(_egress_detect_packs "$project")
   fi
-  _EGE_RING_BACK="$_EGE_MODE"
-  _egress_editor_cache
+  # Probed once, here, in this shell. A probe in each frame was three docker
+  # calls on every key, the lag the first editor had.
+  _EGE_ENGINE=""
+  _egress_editor_engine
+  _EGE_CAGED=0
+  _EGE_OPEN_WHY=""
+  _EGE_SESSION=0
+  if [ -n "$box" ] && [ "$_EGRESS_ENFORCING" = 1 ] && [ "$_EGE_ENGINE" != down ]; then
+    if _egress_label_read "$_EGE_CNAME" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then _EGE_CAGED=1; fi
+    # A box opened for this session (cleat egress open) reaches any host
+    # until it stops, whatever its file says.
+    if _egress_session_marker_valid "$_EGE_CNAME"; then _EGE_SESSION=1; fi
+  fi
+  _egress_editor_order
+  _egress_rows_build
+  _egress_recount
+  if [ -n "$box" ] && [ "$_EGRESS_ENFORCING" = 1 ]; then
+    _egress_open_check "$_EGE_CNAME" "$_EGE_EFF" || true
+    _EGE_OPEN_WHY="$_EG_OPEN_WHY"
+  fi
+  _egress_editor_warning
+  _EG_CUR=0; _EG_FIRST=0; _EG_HFIRST=0; _EG_SCREEN=list; _EG_PROMPT=""
+  _egress_term_now
+  _egress_measure || true
+  return 0
+}
+
+# The colours as bytes, once: the frame is written with %s, which would print
+# a \033 spelling as it is.
+_egress_colours() {
+  printf -v _EGX_B '%b' "$BOLD"
+  printf -v _EGX_D '%b' "$DIM"
+  printf -v _EGX_R '%b' "$RESET"
+  printf -v _EGX_G '%b' "$GREEN"
+  printf -v _EGX_A '%b' "$AMBER"
+  printf -v _EGX_E '%b' "$RED"
+  printf -v _EGX_C '%b' "$CYAN"
+  _EGX_K=$'\033[K'
+}
+
+# Why a pack was found in this project, as the tag and the pane say it, into
+# _EGT. The same files _egress_detect_packs reads, and only their names.
+_egress_evidence() {                     # <pack> <project>
+  local f
+  _EGT=""
+  case "$1" in
+    github) _EGT="a GitHub remote" ;;
+    npm) for f in package.json pnpm-lock.yaml yarn.lock; do if [ -f "$2/$f" ]; then _EGT="$f"; break; fi; done ;;
+    go) _EGT="go.mod" ;;
+    pypi) for f in pyproject.toml requirements.txt; do if [ -f "$2/$f" ]; then _EGT="$f"; break; fi; done ;;
+    rust) _EGT="Cargo.toml" ;;
+    apt-debian|apt-image-extras) _EGT="a [setup] section" ;;
+  esac
+  return 0
+}
+
+# The one amber line under the title, highest priority first, and _EG_E, the
+# line it costs. None on a validated engine.
+_egress_editor_warning() {
+  _EGE_WARN=""
+  if [ "$_EGRESS_ENFORCING" != 1 ]; then
+    _EGE_WARN="! Saving writes the policy. Enforcement lands in a later release."
+  elif [ "$_EGE_ENGINE" = down ]; then
+    _EGE_WARN="! Docker is not running. The engine is checked at launch."
+  elif ! _egress_engine_validated "$_EGE_ENGINE"; then
+    _EGE_WARN="! A caged box will not start on this engine: $(_egress_engine_words "$_EGE_ENGINE")"
+  fi
+  if [ -n "$_EGE_WARN" ]; then _EG_E=1; else _EG_E=0; fi
+  return 0
 }
 
 _egress_is_ticked() {                    # <pack>
-  _egress_in_list "$1" "$_EGE_PACKS"
+  _egress_pack_on "$1"
 }
 
-# The rows the cursor walks, one per line: mode, core, pack:<id> for every pack
-# the filter admits, host:<name> for every pinned host, then the three rows.
-# What the editor draws for each pack is fixed for the session: its hosts, its
-# class word, its flags. Built once at load into indexed arrays, so a
-# keypress re-reads nothing from the catalogue. Measured before: about 1.3 s
-# per keypress with every pack on screen, each row parsing the catalogue
-# four times.
+# What the editor draws for each pack is fixed for the session: its hosts,
+# its risk, its purpose, its dates. Built once when the editor opens, into
+# indexed arrays, in one pass over the catalogue, so a key re-reads nothing.
+# Per pack (catalogue order, claude first): _EGC_P id, _EGC_HOSTS default
+# hosts, _EGC_ALL every host, _EGC_OPT hosts added on their own, _EGC_TPL
+# hosts with a part to type, _EGC_CNT, _EGC_FLAGS, _EGC_WORD the class word,
+# _EGC_RISK, _EGC_PURP, _EGC_DATE, _EGC_SIB the hosts outside the pack that
+# share a default host's certificate. Per catalogue record: _EGK_H host,
+# _EGK_P its pack's index, _EGK_R risk, _EGK_W purpose, _EGK_D date, _EGK_C
+# certificate, _EGK_DEF 1 for a default host.
 _EGC_P=()
 _EGC_CNT=()
 _EGC_WORD=()
 _EGC_FLAGS=()
 _EGC_PARAM=()
 _EGC_HOSTS=()
+_EGC_ALL=()
+_EGC_OPT=()
+_EGC_TPL=()
+_EGC_RISK=()
+_EGC_PURP=()
+_EGC_DATE=()
+_EGC_SIB=()
+_EGC_SIBG=()
+_EGC_DET=()
+_EGC_EV=()
+_EGK_H=()
+_EGK_P=()
+_EGK_R=()
+_EGK_W=()
+_EGK_D=()
+_EGK_C=()
+_EGK_DEF=()
 _EGC_IDS=""
 _egress_editor_cache() {
-  local recs p h c f ix i last="" last_ix="" rank t out n
+  local recs p h c f m cert why ix i last="" last_ix="" rank t out n k=0 r j sib g
   local defr=() anyr=() deff=() anyf=() ndef=()
   _EGC_P=(); _EGC_CNT=(); _EGC_WORD=(); _EGC_FLAGS=(); _EGC_PARAM=(); _EGC_HOSTS=()
+  _EGC_ALL=(); _EGC_OPT=(); _EGC_TPL=(); _EGC_RISK=(); _EGC_PURP=(); _EGC_DATE=()
+  _EGC_SIB=(); _EGC_SIBG=(); _EGC_DET=(); _EGC_EV=()
+  _EGK_H=(); _EGK_P=(); _EGK_R=(); _EGK_W=(); _EGK_D=(); _EGK_C=(); _EGK_DEF=()
   _EGC_IDS=""
   # One pass over the catalogue. Records of a pack sit together, so the last
   # pack's index is reused and the search runs once per pack.
   recs="$(_egress_catalogue_records)" || recs=""
-  while IFS=$'\t' read -r p h c f _; do
+  while IFS=$'\t' read -r p h c f m cert why; do
     [ -n "$p" ] || continue
     if [ "$p" = "$last" ]; then
       ix="$last_ix"
@@ -14636,6 +15110,8 @@ _egress_editor_cache() {
       if [ -z "$ix" ]; then
         ix="${#_EGC_P[@]}"
         _EGC_P[ix]="$p"; _EGC_IDS+="$p"$'\n'; _EGC_HOSTS[ix]=""; _EGC_PARAM[ix]=0
+        _EGC_ALL[ix]=""; _EGC_OPT[ix]=""; _EGC_TPL[ix]=""; _EGC_DATE[ix]=""
+        _EGC_DET[ix]=""; _EGC_EV[ix]=""
         defr[ix]=0; anyr[ix]=0; deff[ix]=""; anyf[ix]=""; ndef[ix]=0
       fi
       last="$p"; last_ix="$ix"
@@ -14644,9 +15120,34 @@ _egress_editor_cache() {
     case "$c" in A) rank=1 ;; B) rank=2 ;; C) rank=3 ;; *) rank=4 ;; esac
     [ "$rank" -gt "${anyr[ix]}" ] && anyr[ix]="$rank"
     anyf[ix]+=",$f,"
+    # This host's own word as _egress_class_word gives it, in plain words:
+    # open tenancy beats the class letter.
+    case ",$f," in
+      *,open-tenancy,*) r=2 ;;
+      *) case "$c" in A|B) r=0 ;; C) r=1 ;; *) r=3 ;; esac ;;
+    esac
+    _EGK_H[k]="$h"; _EGK_P[k]="$ix"; _EGK_R[k]="$r"; _EGK_W[k]="$why"; _EGK_C[k]="$cert"
+    case "$m" in
+      *", 20"[0123456789][0123456789]-*) _EGK_D[k]="${m##*, }" ;;
+      *) _EGK_D[k]="" ;;
+    esac
+    if [ -z "${_EGC_DATE[ix]}" ]; then _EGC_DATE[ix]="${_EGK_D[k]}"; fi
+    _EGC_ALL[ix]+="$h"$'\n'
     case ",$f," in *,parameterised,*) _EGC_PARAM[ix]=1 ;; esac
-    # A sub-tick and a parameterised host are never in the default set.
-    case ",$f," in *,sub-tick,*|*,parameterised,*) continue ;; esac
+    # A sub-tick and a parameterised host are never in the default set. One
+    # with a {part} is typed, one without is added on its own.
+    case ",$f," in
+      *,sub-tick,*|*,parameterised,*)
+        _EGK_DEF[k]=0
+        case "$h" in
+          *"{"*) _EGC_TPL[ix]+="$h"$'\n' ;;
+          *) _EGC_OPT[ix]+="$h"$'\n' ;;
+        esac
+        k=$((k + 1))
+        continue ;;
+    esac
+    _EGK_DEF[k]=1
+    k=$((k + 1))
     _EGC_HOSTS[ix]+="$h"$'\n'
     ndef[ix]=$((ndef[ix] + 1))
     [ "$rank" -gt "${defr[ix]}" ] && defr[ix]="$rank"
@@ -14660,6 +15161,9 @@ EOF
     n="${ndef[i]}"
     _EGC_CNT[i]="$n"
     _EGC_HOSTS[i]="${_EGC_HOSTS[i]%$'\n'}"
+    _EGC_ALL[i]="${_EGC_ALL[i]%$'\n'}"
+    _EGC_OPT[i]="${_EGC_OPT[i]%$'\n'}"
+    _EGC_TPL[i]="${_EGC_TPL[i]%$'\n'}"
     # The summary is taken over the default hosts, or every host when the
     # whole pack is a second decision (_egress_pack_summary_rows).
     if [ "$n" -gt 0 ]; then rank="${defr[i]}"; f="${deff[i]}"; else rank="${anyr[i]}"; f="${anyf[i]}"; fi
@@ -14669,342 +15173,1423 @@ EOF
       case "$f" in *",$t,"*) out="${out:+$out,}$t" ;; esac
     done
     _EGC_FLAGS[i]="$out"
-    _EGC_WORD[i]="$(_egress_class_word "$c" "$out")"
+    case ",$out," in *,open-tenancy,*) _EGC_WORD[i]="open tenancy" ;;
+      *) case "$c" in A) _EGC_WORD[i]="single origin" ;; B) _EGC_WORD[i]=contained ;;
+           C) _EGC_WORD[i]=shared ;; *) _EGC_WORD[i]=unaudited ;; esac ;;
+    esac
+    _egress_risk_of "${_EGC_WORD[i]}"
+    case ",$out," in *,requires-cap,*) _EGK=4 ;; esac
+    _EGC_RISK[i]="$_EGK"
+    _egress_pack_purpose "${_EGC_P[i]}"
+    _EGC_PURP[i]="$_EGT"
+    _EGC_SIB[i]=0
+    _EGC_SIBG[i]=0
+    i=$((i + 1))
+  done
+  # The hosts outside a risky pack that share a certificate with one of its
+  # default hosts (7.1): the gateway sees one name, so a tick reaches them all.
+  j=0
+  while [ "$j" -lt "$k" ]; do
+    ix="${_EGK_P[j]}"
+    if [ "${_EGK_DEF[j]}" = 1 ] && [ "${_EGC_RISK[ix]}" -ge 1 ] && [ "${_EGK_C[j]}" != - ] && [ -n "${_EGK_C[j]}" ]; then
+      sib="${_EGC_SIBL[ix]:-}"
+      i=0
+      while [ "$i" -lt "$k" ]; do
+        if [ "${_EGK_C[i]}" = "${_EGK_C[j]}" ] && ! _egress_nl_has "${_EGK_H[i]}" "${_EGC_HOSTS[ix]}"; then
+          _egress_nl_add sib "${_EGK_H[i]}"
+        fi
+        i=$((i + 1))
+      done
+      _EGC_SIBL[ix]="$sib"
+    fi
+    j=$((j + 1))
+  done
+  i=0
+  while [ "$i" -lt "${#_EGC_P[@]}" ]; do
+    if [ -n "${_EGC_SIBL[i]:-}" ]; then
+      _egress_nl_count "${_EGC_SIBL[i]}"
+      _EGC_SIB[i]="$_EGN"
+      g=1
+      t="${_EGC_SIBL[i]}"
+      while [ -n "$t" ]; do
+        h="${t%%$'\n'*}"
+        if [ "$h" = "$t" ]; then t=""; else t="${t#*$'\n'}"; fi
+        case "$h" in *github.com|*githubusercontent.com) ;; *) g=0 ;; esac
+      done
+      _EGC_SIBG[i]="$g"
+    fi
+    i=$((i + 1))
+  done
+  _EGC_SIBL=()
+  return 0
+}
+_EGC_SIBL=()
+
+# The cache index of a pack into _EGX, rc 1 when the cache does not hold it.
+# In this shell, never in a command substitution: a key may not fork.
+_egress_ix_of() {                        # <pack>
+  local i=0
+  while [ "$i" -lt "${#_EGC_P[@]}" ]; do
+    if [ "${_EGC_P[i]}" = "$1" ]; then _EGX="$i"; return 0; fi
+    i=$((i + 1))
+  done
+  _EGX=""
+  return 1
+}
+
+# The cache index of a pack, or nothing, for the tests that read the cache.
+_egress_cache_ix() {                     # <pack>
+  _egress_ix_of "$1" || return 1
+  printf '%s' "$_EGX"
+}
+
+# A host's catalogue record into _EGX, rc 1 for a host the catalogue does
+# not name. The first record wins: every record of one host carries one class.
+_egress_host_ix() {                      # <host>
+  local i=0
+  while [ "$i" -lt "${#_EGK_H[@]}" ]; do
+    if [ "${_EGK_H[i]}" = "$1" ]; then _EGX="$i"; return 0; fi
+    i=$((i + 1))
+  done
+  _EGX=""
+  return 1
+}
+# A host's risk into _EGK: its catalogue word, or not checked when the
+# catalogue does not name it.
+_egress_host_risk() {                    # <host>
+  if _egress_host_ix "$1"; then _EGK="${_EGK_R[_EGX]}"; else _EGK=3; fi
+  return 0
+}
+
+_egress_pack_refused() {                 # <cache index>
+  case ",${_EGC_FLAGS[$1]}," in *,requires-cap,*) return 0 ;; esac
+  return 1
+}
+
+# Whether a pack is on for what the editor shows: the file's own, or for a
+# box one it inherits and has not turned off for itself.
+_egress_pack_on() {                      # <pack>
+  _egress_nl_has "$1" "$_EGE_PACKS" && return 0
+  if [ -n "$_EGE_BOX" ] && _egress_nl_has "$1" "$_EGE_G_PACKS" && ! _egress_nl_has "$1" "$_EGE_OFFBOX"; then return 0; fi
+  return 1
+}
+
+# A pack's state into _EGS: own, both (own and every box), every (inherited),
+# offbox (inherited and turned off for this box) or off.
+_egress_pack_state() {                   # <pack>
+  if _egress_nl_has "$1" "$_EGE_PACKS"; then
+    if [ -n "$_EGE_BOX" ] && _egress_nl_has "$1" "$_EGE_G_PACKS"; then _EGS=both; else _EGS=own; fi
+  elif [ -n "$_EGE_BOX" ] && _egress_nl_has "$1" "$_EGE_G_PACKS"; then
+    if _egress_nl_has "$1" "$_EGE_OFFBOX"; then _EGS=offbox; else _EGS=every; fi
+  else
+    _EGS=off
+  fi
+  return 0
+}
+
+# The default hosts of <pack> that nothing else still on provides, into _EGD:
+# what a box must deny to turn the pack off for itself (M20). Another pack,
+# a host by name and the core all keep a host, so unticking dotnet leaves
+# packages.microsoft.com to azure-cli. A host every box already blocks needs
+# no block of its own.
+_egress_pack_sole_hosts() {              # <pack>
+  local p="$1" q rest h others="" mine
+  _EGD=""
+  _egress_ix_of "$p" || return 0
+  mine="${_EGC_HOSTS[_EGX]}"
+  rest="$_EGE_G_PACKS"$'\n'"$_EGE_PACKS"
+  while [ -n "$rest" ]; do
+    q="${rest%%$'\n'*}"
+    if [ "$q" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$q" ] && [ "$q" != "$p" ] || continue
+    _egress_pack_on "$q" || continue
+    _egress_ix_of "$q" && _egress_nl_union others "${_EGC_HOSTS[_EGX]}"
+  done
+  _egress_nl_union others "$_EGE_HOSTS"
+  _egress_nl_union others "$_EGE_G_ALLOWS"
+  _egress_nl_union others "$_EGE_CORE"
+  _egress_nl_union others "$_EGE_G_DENIES"
+  rest="$mine"
+  while [ -n "$rest" ]; do
+    h="${rest%%$'\n'*}"
+    if [ "$h" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    if [ -n "$h" ] && ! _egress_nl_has "$h" "$others"; then _egress_nl_add _EGD "$h"; fi
+  done
+  return 0
+}
+
+# At load, for a box: a global pack each of whose own hosts the box already
+# denies shows as off for this box, and its deny lines are shown on the pack
+# row instead of as rows of their own. They are written back exactly as they
+# were loaded: recomputing them would widen the file unasked. Repeated until
+# nothing moves, because two packs can share the host they were blocked by.
+_egress_editor_absorb() {
+  local rest p h r2 all hit moved=1
+  _EGE_OFFBOX=""
+  if [ -n "$_EGE_BOX" ]; then
+    while [ "$moved" = 1 ]; do
+      moved=0
+      rest="$_EGE_G_PACKS"
+      while [ -n "$rest" ]; do
+        p="${rest%%$'\n'*}"
+        if [ "$p" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+        [ -n "$p" ] || continue
+        _egress_nl_has "$p" "$_EGE_PACKS" && continue
+        _egress_nl_has "$p" "$_EGE_OFFBOX" && continue
+        _egress_pack_sole_hosts "$p"
+        [ -n "$_EGD" ] || continue
+        all=1; hit=0
+        r2="$_EGD"
+        while [ -n "$r2" ]; do
+          h="${r2%%$'\n'*}"
+          if [ "$h" = "$r2" ]; then r2=""; else r2="${r2#*$'\n'}"; fi
+          if _egress_nl_has "$h" "$_EGE_DENIES"; then hit=1; else all=0; fi
+        done
+        if [ "$all" = 1 ] && [ "$hit" = 1 ]; then _egress_nl_add _EGE_OFFBOX "$p"; moved=1; fi
+      done
+    done
+  fi
+  _EGE_OFFBOX_ORIG="$_EGE_OFFBOX"
+  # The denies split in two: the ones that turn those packs off for this
+  # box, worked out again after every change, and the user's own, which only
+  # a host row changes. Together they are exactly the lines loaded.
+  _egress_offbox_denies
+  _EGE_DUSER="$_EGE_DENIES"
+  _egress_nl_minus _EGE_DUSER "$_EGE_DOFF"
+  _EGE_ORIG_DUSER="$_EGE_DUSER"
+  return 0
+}
+
+# The denies a box needs for the global packs it turned off: each one's own
+# hosts that nothing still on provides, worked out afresh after every change,
+# into _EGE_DOFF. Unticking a pack or a host that was covering one of them
+# blocks it again, so a pack shown off is off in the file too.
+_egress_offbox_denies() {
+  local rest p
+  _EGE_DOFF=""
+  rest="$_EGE_OFFBOX"
+  while [ -n "$rest" ]; do
+    p="${rest%%$'\n'*}"
+    if [ "$p" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$p" ] || continue
+    _egress_pack_sole_hosts "$p"
+    _egress_nl_union _EGE_DOFF "$_EGD"
+  done
+  return 0
+}
+
+# The order packs are listed in, fixed for the session: on when the editor
+# opened, then found in this project or suggested, then the catalogue order,
+# and a pack that needs a refused capability last unless it is on. The core
+# is never a row.
+_egress_editor_order() {
+  local i pass p
+  _EGO=()
+  for pass in 1 2 3 4; do
+    i=0
+    while [ "$i" -lt "${#_EGC_P[@]}" ]; do
+      p="${_EGC_P[i]}"
+      if [ "$p" != claude ]; then
+        case "$pass" in
+          1) if _egress_pack_on "$p"; then _EGO+=("$i"); fi ;;
+          2) if ! _egress_pack_on "$p" && ! _egress_pack_refused "$i" && [ -n "${_EGC_DET[i]}" ]; then _EGO+=("$i"); fi ;;
+          3) if ! _egress_pack_on "$p" && ! _egress_pack_refused "$i" && [ -z "${_EGC_DET[i]}" ]; then _EGO+=("$i"); fi ;;
+          4) if _egress_pack_refused "$i" && ! _egress_pack_on "$p"; then _EGO+=("$i"); fi ;;
+        esac
+      fi
+      i=$((i + 1))
+    done
+  done
+  _EGE_NPACK_ALL="${#_EGO[@]}"
+  return 0
+}
+
+# A host row's state into _EGS, first match wins: blocked (a deny the save
+# writes), lifted (a loaded deny the save drops), own (an allow of this
+# file), unticked (one unticked this session), gblock (a box's view of a
+# global deny, shown and never changed here), every (a box's view of a global
+# allow) or none.
+_egress_host_state() {                   # <host>
+  if _egress_nl_has "$1" "$_EGE_DUSER"; then _EGS=blocked
+  elif _egress_nl_has "$1" "$_EGE_ORIG_DUSER"; then _EGS=lifted
+  elif _egress_nl_has "$1" "$_EGE_HOSTS"; then _EGS=own
+  elif _egress_nl_has "$1" "$_EGE_UNTICKED"; then _EGS=unticked
+  elif [ -n "$_EGE_BOX" ] && _egress_nl_has "$1" "$_EGE_G_DENIES"; then
+    # The resolver applies every box's blocks before this box's own packs,
+    # so a pack of the box's own reaches the host all the same: no row.
+    _EGS=gblock
+    _egress_packs_hosts "$_EGE_PACKS"
+    _egress_nl_has "$1" "$_EGN_OUT" && _EGS=none
+  elif [ -n "$_EGE_BOX" ] && _egress_nl_has "$1" "$_EGE_G_ALLOWS"; then _EGS=every
+  else _EGS=none
+  fi
+  return 0
+}
+
+# The rows the cursor walks, into _EGR, with _EGRI the cache index of each
+# pack row: mode, find, the packs the filter admits, the host rows, add. The
+# host rows: this file's hosts, ticked or unticked this session, a box's
+# inherited hosts, the user's blocks and, for a box, every box's blocks.
+_egress_rows_build() {
+  local j ix p rest h
+  _EGR=(mode "$_EGRESS_ROW_FILTER")
+  _EGRI=(-1 -1)
+  _EGE_NPACK=0
+  j=0
+  while [ "$j" -lt "${#_EGO[@]}" ]; do
+    ix="${_EGO[j]}"
+    p="${_EGC_P[ix]}"
+    case "$p" in *"$_EGE_FILTER"*) _EGR+=("pack:$p"); _EGRI+=("$ix"); _EGE_NPACK=$((_EGE_NPACK + 1)) ;; esac
+    j=$((j + 1))
+  done
+  _EGE_HROWS=""
+  _egress_nl_union _EGE_HROWS "$_EGE_ORIG_HOSTS"
+  _egress_nl_union _EGE_HROWS "$_EGE_HOSTS"
+  _egress_nl_union _EGE_HROWS "$_EGE_UNTICKED"
+  [ -n "$_EGE_BOX" ] && _egress_nl_union _EGE_HROWS "$_EGE_G_ALLOWS"
+  # The user's own blocks. A block that turns a pack off shows on its row.
+  _egress_nl_union _EGE_HROWS "$_EGE_ORIG_DUSER"
+  _egress_nl_union _EGE_HROWS "$_EGE_DUSER"
+  [ -n "$_EGE_BOX" ] && _egress_nl_union _EGE_HROWS "$_EGE_G_DENIES"
+  _EGE_NHOST=0
+  rest="$_EGE_HROWS"
+  while [ -n "$rest" ]; do
+    h="${rest%%$'\n'*}"
+    if [ "$h" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$h" ] || continue
+    # An allow a save drops, and never shown this session, is not a row.
+    _egress_host_state "$h"
+    [ "$_EGS" = none ] && continue
+    _EGR+=("host:$h")
+    _EGRI+=(-1)
+    _EGE_NHOST=$((_EGE_NHOST + 1))
+  done
+  _EGR+=("$_EGRESS_ROW_ADD")
+  _EGRI+=(-1)
+  [ "$_EG_CUR" -gt $(( ${#_EGR[@]} - 1 )) ] && _EG_CUR=$(( ${#_EGR[@]} - 1 ))
+  # The host viewport follows the host count. Whether the window still holds
+  # the editor is the loop's question, asked before the next frame.
+  _egress_measure || true
+  return 0
+}
+
+# The rows as a stream, for the tests.
+_egress_editor_rows() {
+  local r
+  for r in "${_EGR[@]+"${_EGR[@]}"}"; do printf '%s\n' "$r"; done
+}
+
+# How many hosts a save would allow, into _EGE_COUNT, and _EGE_EFF, the mode
+# the box would run under. In the resolver's order (_egress_resolve): for a
+# box, what every box gets less the global blocks, then this file's packs and
+# hosts, less this file's blocks, then the core, which nothing can block.
+_egress_recount() {
+  local set="" rest p
+  [ -n "$_EGE_BOX" ] && set="$_EGE_G_HOSTS"
+  rest="$_EGE_PACKS"
+  while [ -n "$rest" ]; do
+    p="${rest%%$'\n'*}"
+    if [ "$p" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$p" ] && _egress_ix_of "$p" && _egress_nl_union set "${_EGC_HOSTS[_EGX]}"
+  done
+  _egress_nl_union set "$_EGE_HOSTS"
+  _egress_nl_minus set "$_EGE_DENIES"
+  _egress_nl_union set "$_EGE_CORE"
+  _egress_nl_count "$set"
+  _EGE_COUNT="$_EGN"
+  _EGE_EFF="$_EGE_MODE"
+  if [ "$_EGE_EFF" = inherit ]; then _EGE_EFF="$_EGE_G_EFF"; fi
+  return 0
+}
+
+# After any change to the lists: the rows and the count, again. No subshell.
+_egress_editor_changed() {
+  _EGE_DOFF=""
+  [ -n "$_EGE_BOX" ] && _egress_offbox_denies
+  _EGE_DENIES="$_EGE_DUSER"
+  _egress_nl_union _EGE_DENIES "$_EGE_DOFF"
+  _egress_rows_build
+  _egress_recount
+  return 0
+}
+
+# ── Changes, in the shell itself ──
+
+# Space on a pack or a host row. A pack that needs a refused capability, and
+# a pack with no default host, never tick from any door (one already on can
+# still go off). The global editor ticks and unticks its own packs. A box
+# turns a pack every box has off for itself (M20): the hosts only that pack
+# provides are denied in its own file, worked out again after every change
+# (_egress_offbox_denies). A pack's tick never touches the user's own blocks:
+# a blocked host of a ticked pack shows as its own row.
+_egress_toggle() {                       # <row>
+  local row="$1" p ix
+  case "$row" in
+    pack:*)
+      p="${row#pack:}"
+      # The core is never a row and never a tick: it is always on.
+      [ "$p" = claude ] && return 0
+      _egress_ix_of "$p" || return 0
+      ix="$_EGX"
+      if ! _egress_pack_on "$p"; then
+        _egress_pack_refused "$ix" && return 0
+        [ "${_EGC_CNT[ix]}" = 0 ] && return 0
+      fi
+      if [ -z "$_EGE_BOX" ]; then
+        if _egress_nl_has "$p" "$_EGE_PACKS"; then _egress_nl_drop _EGE_PACKS "$p"; else _egress_nl_add _EGE_PACKS "$p"; fi
+      elif _egress_pack_on "$p"; then
+        _egress_nl_drop _EGE_PACKS "$p"
+        if _egress_nl_has "$p" "$_EGE_G_PACKS"; then
+          _egress_pack_sole_hosts "$p"
+          if [ -n "$_EGD" ]; then
+            _egress_nl_add _EGE_OFFBOX "$p"
+          else
+            _EGE_MSG="Other ticks reach every $p host, so it stays on."
+            _EGE_MSGC="$_EGX_D"
+          fi
+        fi
+      elif _egress_nl_has "$p" "$_EGE_OFFBOX"; then
+        _egress_nl_drop _EGE_OFFBOX "$p"
+      else
+        _egress_nl_add _EGE_PACKS "$p"
+      fi ;;
+    host:*) _egress_host_toggle "${row#host:}" ;;
+    *) return 0 ;;
+  esac
+  _egress_editor_changed
+}
+
+# Space on a host: by its state (_egress_host_state). A block goes, a lifted
+# block comes back, an allow of this file unticks and ticks, a box blocks an
+# inherited host for itself, and a host nothing names is added. A global block
+# is never changed from a box.
+_egress_host_toggle() {                  # <host>
+  _egress_host_state "$1"
+  case "$_EGS" in
+    blocked) _egress_nl_drop _EGE_DUSER "$1" ;;
+    lifted) _egress_nl_add _EGE_DUSER "$1" ;;
+    own) _egress_nl_drop _EGE_HOSTS "$1"; _egress_nl_add _EGE_UNTICKED "$1" ;;
+    unticked) _egress_nl_add _EGE_HOSTS "$1"; _egress_nl_drop _EGE_UNTICKED "$1" ;;
+    every) _egress_nl_add _EGE_DUSER "$1" ;;
+    none) _egress_nl_add _EGE_HOSTS "$1" ;;
+  esac
+  return 0
+}
+
+# A host typed by name. It is this file's own allow, and a block of the same
+# name in this file goes with it, the way cleat egress allow takes a name off
+# the deny list: the resolver applies a block after an allow.
+_egress_host_add() {                     # <host>
+  _egress_nl_add _EGE_HOSTS "$1"
+  _egress_nl_drop _EGE_UNTICKED "$1"
+  _egress_nl_drop _EGE_DUSER "$1"
+  _egress_editor_changed
+}
+
+# The mode ring. A box's ring starts at inherit. The ring shows open, and a
+# save never writes it (6.3): open is for one session of one box, through
+# cleat egress open, and a save keeps the mode the editor loaded.
+_egress_mode_step() {                    # <-1|1>
+  local ring="strict open off" m i=0 n=3 cur=0
+  if [ -n "$_EGE_BOX" ]; then ring="inherit strict open off"; n=4; fi
+  for m in $ring; do
+    [ "$m" = "$_EGE_MODE" ] && cur=$i
+    i=$((i + 1))
+  done
+  cur=$(( (cur + $1 + n) % n ))
+  i=0
+  for m in $ring; do
+    [ "$i" -eq "$cur" ] && _EGE_MODE="$m"
+    i=$((i + 1))
+  done
+  _egress_recount
+}
+
+# ── Keys ──
+
+# The editor's key reader, in this shell: _KEY gets exactly the words
+# _read_keypress prints, with no subshell. End of input is QUIT, never ENTER:
+# enter saves here.
+_egress_key() {
+  local k="" s=""
+  if ! IFS= read -rsn1 k 2>/dev/null; then _KEY=QUIT; return 0; fi
+  case "$k" in
+    $'\e')
+      IFS= read -rsn2 -t 1 s 2>/dev/null || true
+      case "$s" in
+        "[A") _KEY=UP ;;
+        "[B") _KEY=DOWN ;;
+        "[C") _KEY=RIGHT ;;
+        "[D") _KEY=LEFT ;;
+        "") _KEY=ESC ;;
+        *) _KEY=OTHER ;;
+      esac ;;
+    " ") _KEY=SPACE ;;
+    "") _KEY=ENTER ;;
+    q|Q) _KEY=QUIT ;;
+    *) _KEY=OTHER ;;
+  esac
+  return 0
+}
+
+# One key on the list or on a pack's hosts. No subshell, no docker call, no
+# catalogue read. Moves _EG_CUR and sets _EG_ACT when the key asks for more
+# than a redraw: save, cancel, find, add or fill.
+_egress_tui_key() {
+  local row last
+  _EG_ACT=""
+  if [ "$_EG_SCREEN" = hosts ]; then _egress_hosts_key; return 0; fi
+  row="${_EGR[$_EG_CUR]}"
+  last=$(( ${#_EGR[@]} - 1 ))
+  case "$_KEY" in
+    UP) [ "$_EG_CUR" -gt 0 ] && _EG_CUR=$((_EG_CUR - 1)) ;;
+    DOWN) [ "$_EG_CUR" -lt "$last" ] && _EG_CUR=$((_EG_CUR + 1)) ;;
+    LEFT) [ "$row" = mode ] && _egress_mode_step -1 ;;
+    RIGHT)
+      case "$row" in
+        mode) _egress_mode_step 1 ;;
+        pack:*) _egress_hosts_open "${_EGRI[$_EG_CUR]}" ;;
+      esac ;;
+    SPACE)
+      case "$row" in
+        mode) _egress_mode_step 1 ;;
+        "$_EGRESS_ROW_FILTER") _EG_ACT=find ;;
+        "$_EGRESS_ROW_ADD") _EG_ACT=add ;;
+        pack:*)
+          # A pack with nothing to tick as a whole is picked host by host.
+          if [ "${_EGC_CNT[${_EGRI[$_EG_CUR]}]}" = 0 ] && ! _egress_pack_refused "${_EGRI[$_EG_CUR]}"; then
+            _egress_hosts_open "${_EGRI[$_EG_CUR]}"
+          else
+            _egress_toggle "$row"
+          fi ;;
+        host:*) _egress_toggle "$row" ;;
+      esac ;;
+    ENTER) _EG_ACT=save ;;
+    QUIT|ESC) _EG_ACT=cancel ;;
+  esac
+  return 0
+}
+
+# A pack's hosts, drawn in place of the list: its default hosts, the ones
+# added on their own and the ones with a part to type. _EGH holds the rows.
+_egress_hosts_open() {                   # <cache index>
+  local ix="$1" rest h
+  _EG_HPIX="$ix"
+  _EGH=()
+  rest="${_EGC_HOSTS[ix]}"
+  while [ -n "$rest" ]; do
+    h="${rest%%$'\n'*}"; if [ "$h" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$h" ] && _EGH+=("def:$h")
+  done
+  rest="${_EGC_OPT[ix]}"
+  while [ -n "$rest" ]; do
+    h="${rest%%$'\n'*}"; if [ "$h" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$h" ] && _EGH+=("opt:$h")
+  done
+  rest="${_EGC_TPL[ix]}"
+  while [ -n "$rest" ]; do
+    h="${rest%%$'\n'*}"; if [ "$h" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$h" ] && _EGH+=("tpl:$h")
+  done
+  _EG_HCUR=0
+  _EG_HSFIRST=0
+  _EG_SCREEN=hosts
+  return 0
+}
+
+_egress_hosts_key() {
+  local last row
+  last=$(( ${#_EGH[@]} - 1 ))
+  row="${_EGH[$_EG_HCUR]:-}"
+  case "$_KEY" in
+    UP) [ "$_EG_HCUR" -gt 0 ] && _EG_HCUR=$((_EG_HCUR - 1)) ;;
+    DOWN) [ "$_EG_HCUR" -lt "$last" ] && _EG_HCUR=$((_EG_HCUR + 1)) ;;
+    LEFT|QUIT|ESC) _EG_SCREEN=list ;;
+    SPACE)
+      _egress_pack_refused "$_EG_HPIX" && return 0
+      case "$row" in
+        def:*) _egress_toggle "pack:${_EGC_P[$_EG_HPIX]}" ;;
+        opt:*) _egress_host_toggle "${row#opt:}"; _egress_editor_changed ;;
+        tpl:*) _EG_ACT=fill ;;
+      esac ;;
+    ENTER) _EG_ACT=save ;;
+  esac
+  return 0
+}
+
+# ── The frame ──
+
+# One frame line: cleared to the end, then a newline. _EG_FL counts them.
+_egress_fl() {
+  _EGF+="$1${_EGX_K}"$'\n'
+  _EG_FL=$((_EG_FL + 1))
+}
+
+# The whole frame into _EGF, from the top-left corner down, every line cut to
+# one column short of the window so none can wrap, then the rest of the screen
+# cleared. At most _EG_ROWS - 1 lines (_egress_measure).
+_egress_frame_build() {                  # <cursor index>
+  local cur="${1:-$_EG_CUR}" w t
+  _EGF=$'\033[H'
+  _EG_FL=0
+  w=$(( _EG_COLS - 1 ))
+  if [ -n "$_EGE_BOX" ]; then t="(what box $_EGE_BOXS may reach)"; else t="(what every box may reach)"; fi
+  _egress_fit "$t" $(( w - 15 ))
+  _egress_fl "  ${_EGX_B}Cleat egress${_EGX_R} ${_EGX_D}${_EGT}${_EGX_R}"
+  _egress_fit "Claude Code's own $_EGE_NCORE hosts are always allowed." $(( w - 2 ))
+  _egress_fl "  ${_EGX_D}${_EGT}${_EGX_R}"
+  if [ -n "$_EGE_WARN" ]; then
+    _egress_fit "$_EGE_WARN" $(( w - 2 ))
+    _egress_fl "  ${_EGX_A}${_EGT}${_EGX_R}"
+  fi
+  _egress_fl ""
+  if [ "$_EG_SCREEN" = hosts ]; then _egress_frame_hosts; else _egress_frame_list "$cur"; fi
+  _EGF+=$'\033[J'
+  return 0
+}
+
+_egress_frame_list() {                   # <cursor index>
+  local cur="$1" w i n first hfirst npk nhs ix row h left right pad v t
+  w=$(( _EG_COLS - 1 ))
+  npk="$_EGE_NPACK"
+  nhs="$_EGE_NHOST"
+  # The mode row, with what the mode does beside it (M19).
+  # The meaning starts at column 23 whether or not the ‹ › are drawn.
+  _egress_mode_meaning "$_EGE_MODE"
+  if [ "$_EGE_SESSION" = 1 ] && [ "$_EGE_MODE" = "$_EGE_LOAD_MODE" ]; then _EGT="open until it stops, then $_EGT"; fi
+  _egress_fit "$_EGT" $(( w - 25 ))
+  if [ "$cur" -eq 0 ]; then
+    printf -v v '%*s' $(( 9 - ${#_EGE_MODE} )) ""
+    _egress_fl "  ${_EGX_C}▸${_EGX_R} ${_EGX_B}Mode${_EGX_R}  ‹ ${_EGX_B}${_EGE_MODE}${_EGX_R} ›${v}${_EGX_D}(${_EGT})${_EGX_R}"
+  else
+    printf -v v '%*s' $(( 11 - ${#_EGE_MODE} )) ""
+    _egress_fl "    Mode    ${_EGE_MODE}${v}${_EGX_D}(${_EGT})${_EGX_R}"
+  fi
+  _egress_fl ""
+  # The pack window follows the cursor and stays put while the cursor is in it.
+  first="$_EG_FIRST"
+  if [ "$cur" -ge 2 ] && [ "$cur" -lt $(( 2 + npk )) ]; then
+    i=$(( cur - 2 ))
+    [ "$i" -lt "$first" ] && first="$i"
+    [ "$i" -ge $(( first + _EG_PAGE )) ] && first=$(( i - _EG_PAGE + 1 ))
+  fi
+  [ "$first" -gt $(( npk > _EG_PAGE ? npk - _EG_PAGE : 0 )) ] && first=$(( npk > _EG_PAGE ? npk - _EG_PAGE : 0 ))
+  _EG_FIRST="$first"
+  if [ -n "$_EGE_FILTER" ]; then left="Packs matching \"$_EGE_FILTER\" (space ticks)"; else left="Packs (space ticks)"; fi
+  right=""
+  if [ "$npk" -gt "$_EG_PAGE" ]; then
+    right="$(( first + 1 ))-$(( first + _EG_PAGE )) of $npk"
+  elif [ -n "$_EGE_FILTER" ]; then
+    right="$npk of $_EGE_NPACK_ALL"
+  fi
+  pad=$(( w - 2 - ${#left} - ${#right} ))
+  if [ -n "$right" ] && [ "$pad" -ge 2 ]; then
+    printf -v t '%*s' "$pad" ""
+    _egress_fl "  ${_EGX_D}${left}${t}${right}${_EGX_R}"
+  else
+    _egress_fit "$left" $(( w - 2 ))
+    _egress_fl "  ${_EGX_D}${_EGT}${_EGX_R}"
+  fi
+  # The find row, with the filter as a dim value.
+  if [ "$cur" -eq 1 ]; then t="  ${_EGX_C}▸${_EGX_R} [/] ${_EGX_B}Find a pack${_EGX_R}"; else t="    [/] Find a pack"; fi
+  if [ -n "$_EGE_FILTER" ]; then t="$t           ${_EGX_D}${_EGE_FILTER}${_EGX_R}"; fi
+  _egress_fl "$t"
+  n=0
+  while [ "$n" -lt "$_EG_PAGE" ]; do
+    i=$(( first + n ))
+    if [ "$i" -lt "$npk" ]; then
+      ix="${_EGRI[$(( 2 + i ))]}"
+      if [ "$cur" -eq $(( 2 + i )) ]; then _egress_pack_line "$ix" 1; else _egress_pack_line "$ix" 0; fi
+    else
+      # A filter keeps the page's height, so the pane does not jump.
+      _egress_fl ""
+    fi
+    n=$((n + 1))
+  done
+  # The host rows, their own window.
+  hfirst="$_EG_HFIRST"
+  i=$(( cur - 2 - npk ))
+  if [ "$i" -ge 0 ] && [ "$i" -lt "$nhs" ]; then
+    [ "$i" -lt "$hfirst" ] && hfirst="$i"
+    [ "$i" -ge $(( hfirst + _EG_HV )) ] && hfirst=$(( i - _EG_HV + 1 ))
+  fi
+  [ "$hfirst" -gt $(( nhs > _EG_HV ? nhs - _EG_HV : 0 )) ] && hfirst=$(( nhs > _EG_HV ? nhs - _EG_HV : 0 ))
+  _EG_HFIRST="$hfirst"
+  left="Hosts (space ticks)"
+  if [ "$nhs" -gt "$_EG_HV" ]; then
+    right="$(( hfirst + 1 ))-$(( hfirst + _EG_HV )) of $nhs"
+    pad=$(( w - 2 - ${#left} - ${#right} ))
+    printf -v t '%*s' "$pad" ""
+    _egress_fl "  ${_EGX_D}${left}${t}${right}${_EGX_R}"
+  else
+    _egress_fl "  ${_EGX_D}${left}${_EGX_R}"
+  fi
+  n=0
+  while [ "$n" -lt "$_EG_HV" ]; do
+    i=$(( hfirst + n ))
+    row="${_EGR[$(( 2 + npk + i ))]}"
+    if [ "$cur" -eq $(( 2 + npk + i )) ]; then _egress_host_line "${row#host:}" 1; else _egress_host_line "${row#host:}" 0; fi
+    n=$((n + 1))
+  done
+  if [ "$cur" -eq $(( 2 + npk + nhs )) ]; then
+    _egress_fl "  ${_EGX_C}▸${_EGX_R} [+] ${_EGX_B}Add a host${_EGX_R}"
+  else
+    _egress_fl "    [+] Add a host"
+  fi
+  _egress_fl ""
+  if [ -n "$_EG_PROMPT" ]; then _EGP=("${_EG_PP[@]}"); else _egress_pane_set "${_EGR[$cur]}" "${_EGRI[$cur]}"; fi
+  _egress_pane_lines
+  _egress_status_line
+  _egress_legend_line "${_EGR[$cur]}" "${_EGRI[$cur]}"
+  return 0
+}
+
+# One pack row: the cursor, the tick, the name, what it is for (at 78
+# columns and more) and one tag, first match wins: the refused capability,
+# the risk, for a box its state, for the global editor what was found.
+_egress_pack_line() {                    # <cache index> <1 on the cursor row>
+  local ix="$1" on="$2" p mark tick name purp="" col w tagc lead=""
+  p="${_EGC_P[ix]}"
+  w=$(( _EG_COLS - 1 ))
+  _egress_pack_state "$p"
+  _egress_pack_tag "$ix"
+  if [ "$_EG_COLS" -ge 78 ]; then col=56; else col=26; fi
+  printf -v name '%-18s' "$p"
+  if [ "$_EG_COLS" -ge 78 ]; then printf -v purp '%-30s' "${_EGC_PURP[ix]}"; fi
+  _egress_fit "$_EGT" $(( w - col ))
+  if [ "$on" = 1 ]; then mark="  ${_EGX_C}▸${_EGX_R} "; else mark="    "; fi
+  if _egress_pack_refused "$ix"; then
+    # A refused pack is dim from end to end, its tick true to the file.
+    case "$_EGS" in own|both|every) tick="✔" ;; *) tick="·" ;; esac
+    _egress_fl "${mark}${_EGX_D}[${tick}] ${name}${purp}${_EGT}${_EGX_R}"
+    return 0
+  fi
+  case "$_EGS" in own|both|every) tick="[${_EGX_G}✔${_EGX_R}] " ;; *) tick="[${_EGX_D}·${_EGX_R}] " ;; esac
+  case "$_EGT" in "!"*) tagc="$_EGX_A" ;; *) tagc="$_EGX_D" ;; esac
+  if [ "$on" = 1 ]; then
+    name="${_EGX_B}${name}${_EGX_R}"
+  else
+    purp="${_EGX_D}${purp}${_EGX_R}"
+  fi
+  _egress_fl "${mark}${tick}${name}${purp}${tagc}${_EGT}${_EGX_R}"
+}
+
+# A pack row's one tag into _EGT (see _egress_pack_line). Needs _EGS.
+_egress_pack_tag() {                     # <cache index>
+  local ix="$1"
+  _egress_risk_tag "${_EGC_RISK[ix]}"
+  [ -n "$_EGT" ] && return 0
+  if [ -n "$_EGE_BOX" ]; then
+    case "$_EGS" in
+      every|both) _EGT="every box" ;;
+      offbox) _EGT="off for this box" ;;
+    esac
+    return 0
+  fi
+  case "${_EGC_DET[ix]}" in
+    ticked)
+      case "${_EGC_P[ix]}" in
+        apt-debian|apt-image-extras) _EGT="ticked for [setup]" ;;
+        *) _EGT="found ${_EGC_EV[ix]}" ;;
+      esac ;;
+    suggested) _EGT="suggested" ;;
+  esac
+  return 0
+}
+
+# One host row: the name across the name and purpose columns, cut with …, and
+# one tag: blocked, the risk, or every box.
+_egress_host_line() {                    # <host> <1 on the cursor row>
+  local h="$1" on="$2" mark tick tag="" tagc col nw w
+  w=$(( _EG_COLS - 1 ))
+  if [ "$_EG_COLS" -ge 78 ]; then col=56; else col=26; fi
+  nw=$(( col - 9 ))
+  _egress_host_state "$h"
+  _egress_host_risk "$h"
+  case "$_EGS" in
+    blocked|gblock) tick="[${_EGX_E}✘${_EGX_R}] " ;;
+    own|every) tick="[${_EGX_G}✔${_EGX_R}] " ;;
+    *) tick="[${_EGX_D}·${_EGX_R}] " ;;
+  esac
+  case "$_EGS" in
+    blocked) tag="blocked" ;;
+    gblock) tag="blocked for every box" ;;
+    *)
+      _egress_risk_tag "$_EGK"
+      tag="$_EGT"
+      [ -z "$tag" ] && [ "$_EGS" = every ] && tag="every box" ;;
+  esac
+  _egress_fit "$h" "$nw"
+  printf -v h '%-*s ' "$nw" "$_EGT"
+  _egress_fit "$tag" $(( w - col ))
+  case "$_EGT" in "!"*) tagc="$_EGX_A" ;; *) tagc="$_EGX_D" ;; esac
+  if [ "$on" = 1 ]; then
+    mark="  ${_EGX_C}▸${_EGX_R} "
+    h="${_EGX_B}${h}${_EGX_R}"
+  else
+    mark="    "
+  fi
+  _egress_fl "${mark}${tick}${h}${tagc}${_EGT}${_EGX_R}"
+}
+
+# A pack's hosts, in place of the list.
+_egress_frame_hosts() {
+  local ix="$_EG_HPIX" w page first n i row h tick tag tagc mark nw col t
+  w=$(( _EG_COLS - 1 ))
+  page=$(( _EG_ROWS - 12 - _EG_E ))
+  [ "$page" -lt 1 ] && page=1
+  _egress_fit "(${_EGC_PURP[ix]})" $(( w - 3 - ${#_EGC_P[ix]} ))
+  _egress_fl "  ${_EGX_B}${_EGC_P[ix]}${_EGX_R} ${_EGX_D}${_EGT}${_EGX_R}"
+  first="$_EG_HSFIRST"
+  [ "$_EG_HCUR" -lt "$first" ] && first="$_EG_HCUR"
+  [ "$_EG_HCUR" -ge $(( first + page )) ] && first=$(( _EG_HCUR - page + 1 ))
+  _EG_HSFIRST="$first"
+  if [ "$_EG_COLS" -ge 78 ]; then col=48; else col=34; fi
+  nw=$(( col - 9 ))
+  n=0
+  while [ "$n" -lt "$page" ] && [ $(( first + n )) -lt "${#_EGH[@]}" ]; do
+    i=$(( first + n ))
+    row="${_EGH[i]}"
+    h="${row#*:}"
+    _egress_host_risk "$h"
+    case "$row" in
+      def:*)
+        if _egress_pack_on "${_EGC_P[ix]}"; then tick="[${_EGX_G}✔${_EGX_R}] "; else tick="[${_EGX_D}·${_EGX_R}] "; fi
+        tag="comes with the pack" ;;
+      opt:*)
+        _egress_host_state "$h"
+        case "$_EGS" in
+          blocked|gblock) tick="[${_EGX_E}✘${_EGX_R}] " ;;
+          own|every) tick="[${_EGX_G}✔${_EGX_R}] " ;;
+          *) tick="[${_EGX_D}·${_EGX_R}] " ;;
+        esac
+        _egress_risk_tag "$_EGK"
+        tag="$_EGT"
+        if [ -z "$tag" ] && _egress_host_ix "$h"; then tag="${_EGK_W[_EGX]}"; fi ;;
+      tpl:*)
+        tick="[+] "
+        _egress_risk_tag "$_EGK"
+        tag="$_EGT" ;;
+    esac
+    _egress_pack_refused "$ix" && tick="[·] "
+    _egress_fit "$h" "$nw"
+    printf -v h '%-*s ' "$nw" "$_EGT"
+    _egress_fit "$tag" $(( w - col ))
+    case "$_EGT" in "!"*) tagc="$_EGX_A" ;; *) tagc="$_EGX_D" ;; esac
+    if [ "$i" -eq "$_EG_HCUR" ]; then mark="  ${_EGX_C}▸${_EGX_R} "; h="${_EGX_B}${h}${_EGX_R}"; else mark="    "; fi
+    if _egress_pack_refused "$ix"; then
+      _egress_fl "${mark}${_EGX_D}${tick}${h}${_EGT}${_EGX_R}"
+    else
+      _egress_fl "${mark}${tick}${h}${tagc}${_EGT}${_EGX_R}"
+    fi
+    n=$((n + 1))
+  done
+  _egress_fl ""
+  if [ -n "$_EG_PROMPT" ]; then _EGP=("${_EG_PP[@]}"); else _egress_hosts_pane "${_EGH[$_EG_HCUR]:-}"; fi
+  _egress_pane_lines
+  _egress_status_line
+  case "${_EGH[$_EG_HCUR]:-}" in
+    tpl:*) t="↑/↓ move  space type the name  ← back  ⏎ save" ;;
+    *) if _egress_pack_refused "$ix"; then t="↑/↓ move  ← back  ⏎ save"; else t="↑/↓ move  space tick  ← back  ⏎ save"; fi ;;
+  esac
+  _egress_legend_put "$t"
+}
+
+# The pane's four lines, from _EGP: indented, dim, amber for a line that
+# starts with !, red for one that starts with ✘, each cut to the window.
+_egress_pane_lines() {
+  local i=0 t c w prev=""
+  w=$(( _EG_COLS - 1 - 6 ))
+  while [ "$i" -lt "$_EGRESS_PANE_LINES" ]; do
+    t="${_EGP[i]:-}"
+    case "$t" in
+      "!"*) c="$_EGX_A" ;;
+      "✘"*) c="$_EGX_E" ;;
+      # A refusal's second line is indented under its first, and red too.
+      "  "*) if [ "$prev" = "$_EGX_E" ]; then c="$_EGX_E"; else c="$_EGX_D"; fi ;;
+      *) c="$_EGX_D" ;;
+    esac
+    prev="$c"
+    case "$t" in
+      "✘"*) _egress_fit "${t#✘}" $(( w - 1 )); t="✘${_EGT}" ;;
+      *) _egress_fit "$t" "$w"; t="$_EGT" ;;
+    esac
+    if [ -n "$t" ]; then _egress_fl "      ${c}${t}${_EGX_R}"; else _egress_fl ""; fi
     i=$((i + 1))
   done
 }
 
-# The cache index of a pack, or nothing.
-_egress_cache_ix() {                     # <pack>
+# The line above the legend: what a save would do, or a note for one frame.
+_egress_status_line() {
+  local w
+  w=$(( _EG_COLS - 1 ))
+  if [ -n "$_EGE_MSG" ]; then
+    _egress_fit "$_EGE_MSG" $(( w - 2 ))
+    _egress_fl "  ${_EGE_MSGC:-$_EGX_D}${_EGT}${_EGX_R}"
+    _EGE_MSG=""
+    _EGE_MSGC=""
+    return 0
+  fi
+  _egress_save_words
+  _egress_fit "$_EGT" $(( w - 11 ))
+  _egress_fl "  ${_EGX_D}On save:${_EGX_R} ${_EGT}"
+}
+
+# What saving now would do, in a few words, into _EGT.
+_egress_save_words() {
+  local was=""
+  case "$_EGE_WAS_EFF" in
+    off) was="no control" ;;
+    open) was="any host" ;;
+    *) was="$_EGE_WAS" ;;
+  esac
+  case "$_EGE_MODE" in
+    open)
+      if [ -n "$_EGE_BOX" ]; then
+        if [ "$_EGE_SESSION" = 1 ]; then
+          _EGT="already open until it stops"
+        else
+          case "$_EGE_OPEN_WHY" in
+            "") _EGT="opens this box until it stops" ;;
+            down) _EGT="cannot open: Docker is not running" ;;
+            stopped) _EGT="cannot open: box $_EGE_BOXS is not running" ;;
+            off) _EGT="cannot open: egress control is off" ;;
+            uncaged) _EGT="cannot open: box $_EGE_BOXS has no cage yet" ;;
+            *) _EGT="cannot open: this engine cannot run a cage" ;;
+          esac
+        fi
+      else
+        case "$_EGE_LOAD_MODE" in
+          open) _EGT="keeps open, any host for every box" ;;
+          off) _EGT="keeps off, no control for new boxes" ;;
+          *) _EGT="keeps $_EGE_LOAD_MODE, $_EGE_COUNT hosts allowed" ;;
+        esac
+      fi ;;
+    off)
+      if [ -n "$_EGE_BOX" ]; then _EGT="no control, any host"; else _EGT="no control for new boxes"; fi ;;
+    *)
+      case "$_EGE_EFF" in
+        off) _EGT="no control, every box is off" ;;
+        open) _EGT="any host, every box is open" ;;
+        *)
+          _EGT="$_EGE_COUNT hosts allowed"
+          [ "$was" != "$_EGE_COUNT" ] && _EGT="$_EGT, was $was" ;;
+      esac ;;
+  esac
+  return 0
+}
+
+# The last line: the keys for the row, or the prompt waiting for a line.
+_egress_legend_line() {                  # <row> <cache index>
+  local t
+  case "$1" in
+    mode) t="↑/↓ move  ←/→ change mode  ⏎ save  q cancel" ;;
+    "$_EGRESS_ROW_FILTER") t="↑/↓ move  space find a pack  ⏎ save  q cancel" ;;
+    "$_EGRESS_ROW_ADD") t="↑/↓ move  space add a host  ⏎ save  q cancel" ;;
+    pack:*)
+      if _egress_pack_refused "$2" || [ "${_EGC_CNT[$2]}" = 0 ]; then
+        t="↑/↓ move  → its hosts  ⏎ save  q cancel"
+      else
+        t="↑/↓ move  space tick  → its hosts  ⏎ save  q cancel"
+      fi ;;
+    *) t="↑/↓ move  space tick  ⏎ save  q cancel" ;;
+  esac
+  _egress_legend_put "$t"
+}
+_egress_legend_put() {                   # <legend>
+  if [ -n "$_EG_PROMPT" ]; then
+    _egress_fl "  ${_EGX_B}${_EG_PROMPT}${_EGX_R} "
+  else
+    _egress_fl "  ${_EGX_D}${1}${_EGX_R}"
+  fi
+}
+
+# Draws a frame: built in this shell, written in one printf.
+_egress_draw() {                         # <cursor index>
+  _egress_frame_build "${1:-$_EG_CUR}"
+  printf '%s' "$_EGF"
+}
+
+# ── The pane: four lines on the row under the cursor ──
+# Plain text into _EGP[0..3]. A line that starts with ! is drawn amber, one
+# that starts with ✘ red. No subshell: everything it reads is in the cache.
+_egress_pane_set() {                     # <row> [<cache index>]
+  local row="$1" ix="${2:--1}"
+  _EGP=("" "" "" "")
+  case "$row" in
+    mode) _egress_mode_pane ;;
+    "$_EGRESS_ROW_FILTER")
+      _EGP[0]="Shows only the packs whose name contains some text."
+      _EGP[1]="Ticked packs outside the match stay ticked."
+      if [ -n "$_EGE_FILTER" ]; then
+        _EGP[2]="Showing packs with \"$_EGE_FILTER\" in the name."
+        _EGP[3]="Space changes it. An empty answer shows every pack."
+      else
+        _EGP[2]="Space asks for the text."
+      fi ;;
+    "$_EGRESS_ROW_ADD")
+      _EGP[0]="Add one host by its exact name."
+      _EGP[1]="Like registry.example.com. HTTPS only, no wildcards."
+      _EGP[2]="A name on a private address is always blocked."
+      _EGP[3]="Space asks for the name." ;;
+    pack:*)
+      if [ "$ix" -lt 0 ]; then _egress_ix_of "${row#pack:}" || return 0; ix="$_EGX"; fi
+      _egress_pack_pane "$ix" ;;
+    host:*) _egress_host_pane "${row#host:}" ;;
+  esac
+  return 0
+}
+
+# What the mode does, as the ring stands (table J of the build spec).
+_egress_mode_pane() {
+  if [ "$_EGE_SESSION" = 1 ] && [ "$_EGE_MODE" != off ]; then
+    _EGP[0]="This box is open for this session: cleat egress open."
+    _EGP[1]="It may reach any host until it stops. Each is logged."
+    _EGP[2]="Then it runs as below. Saving keeps the session."
+    _EGP[3]="Left or right changes the mode it goes back to."
+    return 0
+  fi
+  case "$_EGE_MODE" in
+    inherit)
+      _EGP[0]="This box follows the setting for every box: $_EGE_G_EFF."
+      case "$_EGE_G_EFF" in
+        strict)
+          _EGP[1]="It reaches only the hosts ticked below, over HTTPS."
+          _EGP[2]="A tick here changes this box and no other." ;;
+        open)
+          _EGP[1]="It may reach any host. Each one is logged."
+          _EGP[2]="Ticks here count once every box is strict again." ;;
+        *)
+          if [ "$_EGE_CAGED" = 1 ]; then
+            # A box made with a cage cannot be given a network in place.
+            _EGP[1]="It was made with a cage, so it refuses to start"
+            _EGP[2]="until cleat egress off recreates it."
+          else
+            _EGP[1]="So it has a normal network and nothing is logged."
+            _EGP[2]="Ticks here count once egress control is on."
+          fi ;;
+      esac
+      _EGP[3]="Right arrow gives this box a mode of its own." ;;
+    strict)
+      if [ -n "$_EGE_BOX" ]; then
+        _EGP[0]="This box reaches only the hosts ticked below."
+        _EGP[1]="Everything else is blocked and logged."
+        _EGP[2]="It stays strict whatever every other box is set to."
+        _EGP[3]="Left arrow goes back to the setting for every box."
+      else
+        _EGP[0]="Boxes reach only the hosts ticked below, over HTTPS."
+        _EGP[1]="Everything else is blocked and logged."
+        _EGP[2]="The agent cannot change this list from inside a box."
+        _EGP[3]="A project's .cleat file cannot change it either."
+      fi ;;
+    open)
+      if [ -n "$_EGE_BOX" ]; then
+        _EGP[0]="This box may reach any host until it stops."
+        _EGP[1]="Each host it reaches is logged."
+        _EGP[2]="Your network, IP addresses and port 80 stay blocked."
+        if [ "$_EGRESS_ENFORCING" != 1 ]; then
+          _EGP[3]="Open lands in a later release. Saving keeps $_EGE_LOAD_MODE."
+        else
+          case "$_EGE_OPEN_WHY" in
+            "") _EGP[3]="Saving asks you to confirm. Your ticks are kept." ;;
+            down) _EGP[3]="! Docker is not running, so this box cannot open." ;;
+            stopped) _EGP[3]="! This box is not running, so it cannot open now." ;;
+            off) _EGP[3]="! Egress control is off, so there is nothing to open." ;;
+            uncaged) _EGP[3]="! This box has no cage yet, so it cannot open." ;;
+            *) _EGP[3]="! A caged box cannot run on this engine." ;;
+          esac
+        fi
+      else
+        if [ "$_EGE_LOAD_MODE" = open ]; then
+          _EGP[0]="Every box may reach any host. Each one is logged."
+          _EGP[1]="cleat egress open --always set this."
+          _EGP[2]="Saving keeps it. A box with its own mode keeps that."
+          _EGP[3]="Left arrow goes back to strict."
+        else
+          _EGP[0]="Open lets a box reach any host. Each one is logged."
+          _EGP[1]="It is set per box: cleat egress open <box>."
+          _EGP[2]="For every box, type cleat egress open --always."
+          _EGP[3]="Saving here keeps mode $_EGE_LOAD_MODE."
+        fi
+      fi ;;
+    off)
+      if [ -n "$_EGE_BOX" ]; then
+        _EGP[0]="This box gets a normal network: any host, any port."
+        _EGP[1]="Nothing is blocked or logged."
+        if [ "$_EGE_CAGED" = 1 ]; then
+          _EGP[2]="Saving recreates the box and asks you first."
+          _EGP[3]="Your files stay. Tools installed in the box are lost."
+        else
+          _EGP[2]="Saving asks you to confirm."
+        fi
+      else
+        _EGP[0]="New boxes get a normal network: any host, any port."
+        _EGP[1]="Nothing is blocked or logged. A box made with a cage"
+        _EGP[2]="refuses to start until cleat egress off recreates it."
+        _EGP[3]="Saving asks you to confirm."
+      fi ;;
+  esac
+  return 0
+}
+
+# A pack: its hosts, its risk, then notes. The global editor gets two notes,
+# a box one note and the pack's state on this box.
+_egress_pack_pane() {                    # <cache index>
+  local ix="$1" p rest h n=0 shown="" cand fin final="" total w
+  p="${_EGC_P[ix]}"
+  w=$(( _EG_COLS - 1 - 6 ))
+  total="${_EGC_CNT[ix]}"
+  # Line 1: the default hosts, as many as fit, then "and N more".
+  if [ "$total" = 0 ]; then
+    _EGP[0]="No host is on until you pick one: right arrow."
+  else
+    rest="${_EGC_HOSTS[ix]}"
+    while [ -n "$rest" ]; do
+      h="${rest%%$'\n'*}"; if [ "$h" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+      [ -n "$h" ] || continue
+      if [ -z "$shown" ]; then cand="$h"
+      elif [ "$n" -eq $(( total - 1 )) ]; then cand="$shown and $h"
+      else cand="$shown, $h"
+      fi
+      if [ $(( total - n - 1 )) -gt 0 ]; then fin="$cand and $(( total - n - 1 )) more"; else fin="$cand"; fi
+      if [ "${#fin}" -gt "$w" ] && [ "$n" -gt 0 ]; then break; fi
+      shown="$cand"
+      final="$fin"
+      n=$((n + 1))
+    done
+    _EGP[0]="$final"
+  fi
+  # Line 2: the risk, in plain words.
+  _egress_risk_line "${_EGC_RISK[ix]}"
+  _EGP[1]="$_EGT"
+  # Lines 3 and 4: notes, first match first.
+  _EGN_NOTES=()
+  if _egress_pack_refused "$ix"; then
+    _EGN_NOTES+=("It gives the box your Docker daemon and its networks.")
+  fi
+  case "${_EGC_DET[ix]}:$p" in
+    ticked:apt-debian) _EGN_NOTES+=("Ticked for [setup], Debian's one security source.") ;;
+    ticked:apt-image-extras) _EGN_NOTES+=("Ticked for [setup]. cli.github.com stays off.") ;;
+    suggested:apt-debian|suggested:apt-image-extras) _EGN_NOTES+=("Suggested: this project has a [setup] section.") ;;
+    ticked:*) _EGN_NOTES+=("Ticked for you: this project has ${_EGC_EV[ix]}.") ;;
+    suggested:*) _EGN_NOTES+=("Suggested: this project has ${_EGC_EV[ix]}.") ;;
+  esac
+  # A block of the user's own on one of its hosts, shown as a host row.
+  _egress_nl_diff "${_EGC_HOSTS[ix]}" "$_EGE_DUSER"
+  if [ "$total" != 0 ] && [ "$_EGN_OUT" != "${_EGC_HOSTS[ix]}" ]; then
+    _egress_nl_diff "${_EGC_HOSTS[ix]}" "$_EGN_OUT"
+    _egress_nl_count "$_EGN_OUT"
+    if [ "$_EGN" = 1 ]; then _EGN_NOTES+=("One of its hosts is blocked, in the hosts below."); else _EGN_NOTES+=("$_EGN of its hosts are blocked, in the hosts below."); fi
+  fi
+  # A pack off for this box whose hosts other ticks still bring.
+  if [ -n "$_EGE_BOX" ] && _egress_nl_has "$p" "$_EGE_OFFBOX"; then
+    _egress_pack_sole_hosts "$p"
+    [ -z "$_EGD" ] && _EGN_NOTES+=("Other ticks still reach all of its hosts.")
+  fi
+  case "$p" in
+    github) _EGN_NOTES+=("A token in the box can still push your code out.") ;;
+    debian-mirror) _EGN_NOTES+=("No security suite here, so no security fixes.") ;;
+    atlassian) _EGN_NOTES+=("Right arrow adds your Jira or Confluence site.") ;;
+    aws) _EGN_NOTES+=("Right arrow adds a regional STS or S3 host.") ;;
+  esac
+  if ! _egress_pack_refused "$ix" && [ -n "${_EGC_OPT[ix]}" ] && [ "$total" != 0 ]; then
+    _egress_nl_count "${_EGC_OPT[ix]}"
+    if [ "$_EGN" -gt 1 ]; then
+      _EGN_NOTES+=("Right arrow shows $_EGN more $p hosts to add one by one.")
+    else
+      _EGN_NOTES+=("Right arrow adds ${_EGC_OPT[ix]} on its own.")
+    fi
+  fi
+  if [ "${_EGC_SIB[ix]}" -gt 0 ] && ! _egress_pack_refused "$ix"; then
+    if [ "${_EGC_SIBG[ix]}" = 1 ]; then
+      _EGN_NOTES+=("One tick here reaches ${_EGC_SIB[ix]} other GitHub hosts as well.")
+    else
+      _EGN_NOTES+=("One tick here reaches ${_EGC_SIB[ix]} other hosts as well.")
+    fi
+  fi
+  case "$p" in
+    apt-debian|apt-image-extras) [ -n "${_EGC_DATE[ix]}" ] && _EGN_NOTES+=("Checked ${_EGC_DATE[ix]}.") ;;
+    *)
+      if [ "${_EGC_RISK[ix]}" -ge 1 ] && [ "${_EGC_RISK[ix]}" -le 3 ]; then _EGN_NOTES+=("Cleat never ticks this for you."); fi ;;
+  esac
+  _EGP[2]="${_EGN_NOTES[0]:-}"
+  if [ -z "$_EGE_BOX" ]; then
+    _EGP[3]="${_EGN_NOTES[1]:-}"
+    return 0
+  fi
+  # Line 4 for a box: what space does here.
+  _egress_pack_state "$p"
+  if _egress_pack_refused "$ix"; then
+    _EGP[3]="Space does nothing here."
+  elif [ "${_EGC_CNT[ix]}" = 0 ]; then
+    _EGP[3]="Space or right arrow picks its hosts."
+  else
+    case "$_EGS" in
+      own) _EGP[3]="On for this box only. Space turns it off." ;;
+      both|every) _EGP[3]="On for every box. Space turns it off for this box." ;;
+      offbox) _EGP[3]="Off for this box only. Space turns it back on." ;;
+      *) _EGP[3]="Space turns it on for this box only." ;;
+    esac
+  fi
+  return 0
+}
+_EGN_NOTES=()
+
+# A host row of the list: the name, the risk or the block, what space does.
+_egress_host_pane() {                    # <host>
+  local h="$1" rest q
+  _EGP[0]="$h"
+  _egress_host_state "$h"
+  _egress_host_risk "$h"
+  _egress_risk_line "$_EGK"
+  _EGP[1]="$_EGT"
+  _EGP[3]="A name on a private address is always blocked."
+  case "$_EGS" in
+    blocked)
+      if [ -n "$_EGE_BOX" ] && _egress_nl_has "$h" "$_EGE_G_ALLOWS"; then
+        _EGP[1]="Blocked for this box, whatever every box allows."
+        _EGP[2]="Blocked for this box only. Space allows it again."
+      else
+        _EGP[1]="Blocked by you, whatever any pack allows."
+        _EGP[2]="Space lifts the block when you save."
+      fi ;;
+    lifted) _EGP[2]="The block goes when you save. Space keeps it." ;;
+    own) _EGP[2]="Added by you. Space unticks it, saving drops it." ;;
+    unticked) _EGP[2]="Unticked. Saving drops it. Space ticks it again." ;;
+    gblock)
+      _EGP[1]="Blocked for every box."
+      _EGP[2]="Only the editor for every box lifts it: cleat egress" ;;
+    every)
+      _EGP[2]="Added for every box. Space blocks it for this box."
+      # A host an on pack also brings stays on through the pack.
+      rest="$_EGE_G_PACKS"$'\n'"$_EGE_PACKS"
+      while [ -n "$rest" ]; do
+        q="${rest%%$'\n'*}"; if [ "$q" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+        [ -n "$q" ] || continue
+        if _egress_pack_on "$q" && _egress_ix_of "$q" && _egress_nl_has "$h" "${_EGC_HOSTS[_EGX]}"; then
+          _EGP[3]="Also comes with $q, which is on."
+          break
+        fi
+      done ;;
+  esac
+  return 0
+}
+
+# A row of a pack's hosts: what it is, its risk, how it is added, its date.
+_egress_hosts_pane() {                   # <hosts row>
+  local row="$1" h ix="$_EG_HPIX" why="" w
+  _EGP=("" "" "" "")
+  [ -n "$row" ] || return 0
+  h="${row#*:}"
+  w=$(( _EG_COLS - 1 - 6 ))
+  if _egress_host_ix "$h"; then why="${_EGK_W[_EGX]}"; else why="$h"; fi
+  _egress_host_risk "$h"
+  _egress_risk_line "$_EGK"
+  if _egress_pack_refused "$ix"; then
+    _egress_fit "$why" "$w"
+    _EGP[0]="$_EGT"
+    _egress_risk_line 4
+    _EGP[1]="$_EGT"
+    _EGP[2]="It gives the box your Docker daemon and its networks."
+    _EGP[3]="Space does nothing here."
+    return 0
+  fi
+  # What the host is for, over two lines when it needs them.
+  if [ "${#why}" -gt "$w" ]; then
+    _egress_wrap "$why" "$w" 2
+    _EGP[0]="${_EGW[0]:-}"
+    _EGP[1]="${_EGW[1]:-}"
+    _egress_risk_line "$_EGK"
+    _EGP[2]="$_EGT"
+    case "$row" in
+      def:*) _EGP[3]="It comes with the pack." ;;
+      opt:*) _EGP[3]="Added on its own, as a host of yours." ;;
+      tpl:*) _EGP[3]="Space asks for the part in braces." ;;
+    esac
+    return 0
+  fi
+  _EGP[0]="$why"
+  _EGP[1]="$_EGT"
+  case "$row" in
+    def:*)
+      if [ "${_EGC_CNT[ix]}" = 1 ]; then
+        _EGP[2]="It is the one host that comes with the pack."
+      else
+        _EGP[2]="It comes with the pack: one tick for all ${_EGC_CNT[ix]}."
+      fi
+      if _egress_host_ix "$h" && [ -n "${_EGK_D[_EGX]}" ]; then _EGP[3]="Checked ${_EGK_D[_EGX]}."; fi ;;
+    opt:*)
+      _EGP[2]="Added on its own and saved as a host of yours."
+      if _egress_host_ix "$h" && [ -n "${_EGK_D[_EGX]}" ]; then _EGP[3]="Checked ${_EGK_D[_EGX]}."; fi ;;
+    tpl:*)
+      _EGP[2]="Space asks for the part in braces."
+      _EGP[3]="It is saved as a host of your own." ;;
+  esac
+  return 0
+}
+
+# A pack's first note (the pane's third line), printed, for the tests.
+_egress_pack_note() {                    # <pack>
+  _egress_ix_of "$1" || return 0
+  _EGP=("" "" "" "")
+  _egress_pack_pane "$_EGX"
+  printf '%s' "${_EGP[2]}"
+}
+
+# The pane of a row, printed: four lines, for the tests.
+_egress_pane_text() {                    # <row>
   local i=0
-  while [ "$i" -lt "${#_EGC_P[@]}" ]; do
-    if [ "${_EGC_P[i]}" = "$1" ]; then printf '%s' "$i"; return 0; fi
+  _egress_pane_set "$1"
+  while [ "$i" -lt "$_EGRESS_PANE_LINES" ]; do
+    printf '%s\n' "${_EGP[i]}"
+    i=$((i + 1))
+  done
+}
+
+# ── The full screen ──
+
+_EG_OLD_EXIT=""
+_EG_EXIT_SET=0
+_egress_trap_arg() { _EG_OLD_EXIT="${2:-}"; }
+
+# Takes the terminal: the alternate screen, the cursor hidden, echo off, and
+# traps that give all of it back on Ctrl-C or on any exit, however abrupt. A
+# resize only sets a flag and the next key measures again: the key reader is
+# not interrupted by it (bash 3.2.57 and 5.2), and a key is the next moment
+# anything would be drawn anyway.
+_egress_tui_enter() {
+  local t=""
+  _EG_TUI=1
+  _EG_WINCH=0
+  trap '_EG_WINCH=1' WINCH
+  # A strict-mode exit inside the editor must not leave the terminal on the
+  # alternate screen with no cursor and no echo, so the EXIT trap gives it
+  # back. Ctrl-C only exits: on bash 4 and later the trap runs inside the key
+  # reader, which puts back its own echo-off state as it unwinds, after any
+  # restore the trap made. The EXIT trap runs after that. Only at the top
+  # level: in a subshell the EXIT trap belongs to whoever made the subshell,
+  # so there the interrupt restores itself.
+  _EG_OLD_EXIT=""
+  _EG_EXIT_SET=0
+  if [ "$BASH_SUBSHELL" = 0 ]; then
+    t="$(trap -p EXIT)"
+    if [ -n "$t" ]; then eval "_egress_trap_arg ${t#trap }"; fi
+    trap "_egress_tui_exit; ${_EG_OLD_EXIT:-:}" EXIT
+    trap 'exit 130' INT TERM HUP
+    _EG_EXIT_SET=1
+  else
+    trap '_egress_tui_restore; echo ""; exit 130' INT TERM HUP
+  fi
+  _tui_echo_off
+  printf '\033[?1049h\033[?25l\033[H\033[2J'
+}
+
+# The EXIT trap's half: the terminal back, and a fresh line under it.
+_egress_tui_exit() {
+  [ "$_EG_TUI" = 1 ] || return 0
+  _egress_tui_restore
+  echo ""
+}
+
+# Gives the terminal back, once: the normal screen, the cursor and echo.
+_egress_tui_restore() {
+  [ "$_EG_TUI" = 1 ] || return 0
+  _EG_TUI=0
+  printf '\033[?25h\033[?1049l'
+  _tui_echo_restore
+  return 0
+}
+
+# Leaves the full screen for good: the terminal back, every trap it set undone.
+_egress_tui_leave() {
+  _egress_tui_restore
+  trap - INT TERM HUP WINCH
+  if [ "$_EG_EXIT_SET" = 1 ]; then
+    if [ -n "$_EG_OLD_EXIT" ]; then trap -- "$_EG_OLD_EXIT" EXIT; else trap - EXIT; fi
+    _EG_EXIT_SET=0
+  fi
+  return 0
+}
+
+# The cursor and echo for a line of typing, and back.
+_egress_tui_typing() {                   # <on|off>
+  if [ "$1" = on ]; then
+    printf '\033[?25h'
+    _tui_echo_restore
+  else
+    _tui_echo_off
+    printf '\033[?25l'
+  fi
+  return 0
+}
+
+# The cursor onto a row by its name, or where it was.
+_egress_cursor_to() {                    # <row>
+  local i=0
+  while [ "$i" -lt "${#_EGR[@]}" ]; do
+    if [ "${_EGR[i]}" = "$1" ]; then _EG_CUR="$i"; return 0; fi
     i=$((i + 1))
   done
   return 1
 }
 
-# A pack's default hosts, from the cache when it holds the pack.
-_egress_ege_pack_hosts() {               # <pack>
-  local i
-  if i="$(_egress_cache_ix "$1")"; then printf '%s\n' "${_EGC_HOSTS[i]}"; else _egress_pack_hosts "$1"; fi
+# A prompt inside the frame: the pane shows _EG_PP and the last line the
+# label, the cursor after it and echo on for one line, into _EG_IN, trimmed.
+# rc 1 at end of input. The next frame is drawn from the top again, so an
+# answer long enough to wrap leaves nothing behind.
+_egress_prompt_line() {                  # <label>
+  # A resize while a prompt was open: measure, and end the prompt when the
+  # window no longer holds the editor, so the loop can fall back.
+  if [ "$_EG_WINCH" = 1 ]; then
+    _EG_WINCH=0
+    _egress_term_now
+    _egress_measure || return 1
+  fi
+  _EG_PROMPT="$1"
+  _egress_draw "$_EG_CUR"
+  printf '\033[%d;%dH' "$_EG_FL" "$(( ${#1} + 4 ))"
+  _egress_tui_typing on
+  _EG_IN=""
+  if ! IFS= read -r _EG_IN; then
+    _egress_tui_typing off
+    _EG_PROMPT=""
+    return 1
+  fi
+  _egress_tui_typing off
+  _EG_PROMPT=""
+  _EG_IN="${_EG_IN#"${_EG_IN%%[![:space:]]*}"}"
+  _EG_IN="${_EG_IN%"${_EG_IN##*[![:space:]]}"}"
+  return 0
 }
 
-_egress_editor_rows() {
-  local p h
-  printf 'mode\ncore\n'
-  while IFS= read -r p; do
-    [ -n "$p" ] && [ "$p" != claude ] || continue
-    case "$p" in *"$_EGE_FILTER"*) printf 'pack:%s\n' "$p" ;; esac
-  done <<EOF
-${_EGC_IDS:-$(_egress_pack_ids)}
-EOF
-  while IFS= read -r h; do
-    [ -n "$h" ] && printf 'host:%s\n' "$h"
-  done <<EOF
-$(printf '%s\n%s\n' "$_EGE_HOSTS" "$_EGE_UNTICKED" | grep -v '^$' || true)
-EOF
-  printf '%s\n%s\n%s\n' "$_EGRESS_ROW_ADD" "$_EGRESS_ROW_FILTER" "$_EGRESS_ROW_SAVE"
-}
-
-# The note beside a pack row.
-_egress_pack_note() {                    # <pack>
-  local p="$1" i
-  if i="$(_egress_cache_ix "$p")"; then
-    case ",${_EGC_FLAGS[i]}," in
-      *,requires-cap,*) printf 'needs the docker cap, refused'; return 0 ;;
-    esac
-    case " $_EGE_DETECTED " in *" $p "*)
-      case "$p" in
-        apt-debian|apt-image-extras) printf 'exception, audited 2026-09-21' ;;
-        *) printf 'detected from this project' ;;
-      esac
-      return 0 ;;
-    esac
-    case " $_EGE_SUGGEST " in *" $p "*) printf 'suggested, not ticked'; return 0 ;; esac
-    [ "${_EGC_PARAM[i]}" = 1 ] && printf 'part of it needs a name you type'
+# A refusal into the prompt's pane, lines 3 and 4, in red. Its own two lines
+# when they fit, so a "Did you mean" stays whole, else wrapped to the width.
+_egress_prompt_refusal() {               # <text>
+  local w l1 l2=""
+  w=$(( _EG_COLS - 1 - 6 - 2 ))
+  l1="${1%%$'\n'*}"
+  case "$1" in *$'\n'*) l2="${1#*$'\n'}"; l2="${l2%%$'\n'*}" ;; esac
+  if [ "${#l1}" -le "$w" ] && [ "${#l2}" -le "$w" ]; then
+    _EG_PP[2]="✘ $l1"
+    _EG_PP[3]="  $l2"
     return 0
   fi
-  case ",$(_egress_pack_flags "$p")," in
-    *,requires-cap,*) printf 'needs the docker cap, refused'; return 0 ;;
-  esac
-  case " $_EGE_DETECTED " in *" $p "*)
-    case "$p" in
-      apt-debian|apt-image-extras) printf 'exception, audited 2026-09-21' ;;
-      *) printf 'detected from this project' ;;
-    esac
-    return 0 ;;
-  esac
-  case " $_EGE_SUGGEST " in *" $p "*) printf 'suggested, not ticked'; return 0 ;; esac
-  case ",$(_egress_catalogue_records | awk -F'\t' -v p="$p" '$1 == p { print $4 }' | tr '\n' ',')," in
-    *,parameterised,*) printf 'part of it needs a name you type' ;;
-  esac
+  _egress_wrap "${1//$'\n'/ }" "$w" 2
+  _EG_PP[2]="✘ ${_EGW[0]:-}"
+  _EG_PP[3]="  ${_EGW[1]:-}"
 }
 
-# The fixed-height detail pane for the row under the cursor, exactly
-# _EGRESS_PANE_LINES lines, padded with cleared blanks and cut at a line.
-_egress_pane_text() {                    # <row>
-  local row="$1" p h word
-  case "$row" in
-    mode)
-      case "$_EGE_MODE" in
-        strict) printf 'mode strict. Only the ticked hosts, on port 443. A project .cleat\ncannot change this policy.\n' ;;
-        open)
-          if [ -n "$_EGE_BOX" ]; then
-            printf 'Open is per box and per session: cleat egress open %s.\n' "$_EGE_BOX"
-          else
-            printf 'Open is per box and per session: cleat egress open <box>.\n'
-          fi
-          if [ "$_EGRESS_ENFORCING" = 1 ]; then
-            printf 'To pin it for every box, type cleat egress open --always.\nA save here keeps mode %s.\n' "$_EGE_RING_BACK"
-          else
-            printf 'To pin it for every box, type cleat egress open --always.\nBoth land with enforcement. A save here keeps mode %s.\n' "$_EGE_RING_BACK"
-          fi ;;
-        off) printf 'mode off. Full network egress, as with no policy at all.\n' ;;
-        inherit) printf 'inherit. This box keeps the global mode and adds or removes\nhosts through its own file.\n' ;;
-      esac
-      printf 'Left and right turn the mode.\n' ;;
-    core)
-      printf 'Claude Code needs these and they cannot be unticked:\n'
-      _egress_pack_hosts claude all | paste -sd, - | sed 's/,/, /g' ;;
-    pack:*)
-      p="${row#pack:}"
-      word="$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
-      printf '%s   %s, measured 2026-09-21\n' "$p" "$word"
-      _egress_pack_hosts "$p" | paste -sd, - | sed 's/,/, /g'
-      case "$p" in
-        apt-debian) printf 'Debian publishes no single-origin security archive, so this stays\nticked on the [setup] path. Archive only, no security suite: debian-mirror\n' ;;
-        apt-image-extras) printf 'The two apt sources the image configures. cli.github.com is its own\ntick, because it shares an edge with raw.githubusercontent.com.\n' ;;
-      esac
-      case "$word" in
-        shared) printf 'A shared edge: allowing it allows other sites on that edge.\n' ;;
-        "open tenancy") printf 'Open tenancy: anyone can place content there.\n' ;;
-      esac
-      printf '... cleat egress packs\n' ;;
-    host:*)
-      h="${row#host:}"
-      printf '%s   %s\n' "$h" "$(_egress_host_word "$h")"
-      printf 'Pinned by you. Space unticks it, enter removes it.\n'
-      printf 'A name that resolves to a private address is refused in every mode.\n' ;;
-    "$_EGRESS_ROW_ADD") printf 'Enter to add one host by name: port 443, exact match, no wildcard.\n' ;;
-    "$_EGRESS_ROW_FILTER") printf 'Enter to show only the packs whose name contains some text.\n' ;;
-    "$_EGRESS_ROW_SAVE") printf 'Enter to review the change and save it. q leaves without saving.\n' ;;
-  esac
-}
-
-_egress_pane() {                         # <row>
-  local n=0 line
-  while IFS= read -r line && [ "$n" -lt "$_EGRESS_PANE_LINES" ]; do
-    _egress_line "  $(_sessions_safe_str "$line")"
-    n=$((n + 1))
-  done < <(_egress_pane_text "$1")
-  while [ "$n" -lt "$_EGRESS_PANE_LINES" ]; do
-    printf '\033[K\n'
-    n=$((n + 1))
-  done
-}
-
-# One drawn line: cleared, cut to one character short of the terminal width
-# so it can never wrap, then coloured. A wrapped line is two physical lines
-# under a cursor-up that counted one, and the block drifts on every key.
-_egress_line() {                         # <plain text> [<colour>]
-  local w="${_EG_COLS:-80}" t="$1"
-  case "$w" in ''|*[!0-9]*) w=80 ;; esac
-  [ "$w" -gt 1 ] && w=$((w - 1))
-  t="${t:0:$w}"
-  if [ -n "${2:-}" ]; then printf '\033[K%b%s%b\n' "$2" "$t" "$RESET"; else printf '\033[K%s\n' "$t"; fi
-}
-
-# One full draw of the block, always 10 + _EG_PAGE + 5 + 6 physical lines:
-# every zone draws exactly its counted height, padding with cleared blanks,
-# and every label passes through _sessions_safe_str, which drops newline and
-# every other C0 byte, so no label can add a line and desync the redraw.
-_egress_draw() {                         # <cursor index>
-  local cur="$1" i n row p h cnt word note mark tick ix line w wp amb rst
-  local rows=() packs=() hosts=() pidx=() hidx=()
-  local nrows=0 npk=0 nhs=0 first hfirst
-  while IFS= read -r row; do
-    rows[nrows]="$row"
-    case "$row" in
-      pack:*) packs[npk]="${row#pack:}"; pidx[npk]="$nrows"; npk=$((npk + 1)) ;;
-      host:*) hosts[nhs]="${row#host:}"; hidx[nhs]="$nrows"; nhs=$((nhs + 1)) ;;
-    esac
-    nrows=$((nrows + 1))
-  done < <(_egress_editor_rows)
-  # The pack window follows the cursor and stays put while the cursor is in it.
-  first="${_EGE_FIRST:-0}"
-  i=0
-  while [ "$i" -lt "$npk" ]; do
-    if [ "${pidx[i]}" -eq "$cur" ]; then
-      [ "$i" -lt "$first" ] && first="$i"
-      [ "$i" -ge $(( first + _EG_PAGE )) ] && first=$(( i - _EG_PAGE + 1 ))
-    fi
-    i=$((i + 1))
-  done
-  [ "$first" -gt $(( npk > _EG_PAGE ? npk - _EG_PAGE : 0 )) ] && first=$(( npk > _EG_PAGE ? npk - _EG_PAGE : 0 ))
-  _EGE_FIRST="$first"
-  hfirst="${_EGE_HFIRST:-0}"
-  i=0
-  while [ "$i" -lt "$nhs" ]; do
-    if [ "${hidx[i]}" -eq "$cur" ]; then
-      [ "$i" -lt "$hfirst" ] && hfirst="$i"
-      [ "$i" -ge $(( hfirst + _EGRESS_HOST_VIEW )) ] && hfirst=$(( i - _EGRESS_HOST_VIEW + 1 ))
-    fi
-    i=$((i + 1))
-  done
-  [ "$hfirst" -gt $(( nhs > _EGRESS_HOST_VIEW ? nhs - _EGRESS_HOST_VIEW : 0 )) ] && hfirst=$(( nhs > _EGRESS_HOST_VIEW ? nhs - _EGRESS_HOST_VIEW : 0 ))
-  _EGE_HFIRST="$hfirst"
-  # The colour codes as bytes, once per draw: they are spliced into a line
-  # printed with %s, which would print a \033 spelling literally.
-  amb="$(printf '%b' "$AMBER")"
-  rst="$(printf '%b' "$RESET")"
-
-  if [ -n "$_EGE_BOX" ]; then
-    _egress_line "  Cleat egress   hosts box $(_sessions_safe_str "$_EGE_BOX") may reach, starting from the global policy" "$BOLD"
-    _egress_line "  Scope    box $(_sessions_safe_str "$_EGE_BOX")   $(_sessions_safe_str "${_EGE_FILE/#${HOME}/~}")"
-  else
-    _egress_line "  Cleat egress   hosts every box may reach" "$BOLD"
-    _egress_line "  Scope    global   $(_sessions_safe_str "${_EGE_FILE/#${HOME}/~}") [egress]"
-  fi
-  if [ "$_EGRESS_ENFORCING" = 1 ]; then
-    _egress_line "  $(_egress_editor_verdict)" "$AMBER"
-  else
-    _egress_line "  Saving writes the policy. Enforcement lands in a later release." "$AMBER"
-  fi
-  mark=" "; [ "$cur" -eq 0 ] && mark=">"
-  _egress_line "$mark Mode     $_EGE_MODE"
-  mark=" "; [ "$cur" -eq 1 ] && mark=">"
-  _egress_line "$mark [v] Claude Code           5 hosts   core, cannot be unticked"
-  if [ "$npk" -eq 0 ]; then
-    _egress_line "  Packs    none match the filter"
-  else
-    _egress_line "  Packs    space ticks    showing $(( first + 1 ))-$(( first + _EG_PAGE < npk ? first + _EG_PAGE : npk )) of $npk"
-  fi
-  n=0
-  while [ "$n" -lt "$_EG_PAGE" ]; do
-    i=$(( first + n ))
-    if [ "$i" -lt "$npk" ]; then
-      p="${packs[i]}"
-      mark=" "; [ "${pidx[i]}" -eq "$cur" ] && mark=">"
-      if ix="$(_egress_cache_ix "$p")"; then
-        cnt="${_EGC_CNT[ix]}"; word="${_EGC_WORD[ix]}"
-      else
-        cnt="$(_egress_pack_hosts "$p" | grep -c . || true)"
-        word="$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"
-      fi
-      note="$(_egress_pack_note "$p")"
-      tick="."; _egress_is_ticked "$p" && tick="v"
-      line="$(printf '%s [%s] %-20s %2s %-5s  %-12s  %s' "$mark" "$tick" "$(_sessions_safe_str "$p")" "$cnt" "$([ "$cnt" = 1 ] && echo host || echo hosts)" "$word" "$note")"
-      w="${_EG_COLS:-80}"; case "$w" in ''|*[!0-9]*) w=80 ;; esac; [ "$w" -gt 1 ] && w=$((w - 1))
-      line="${line:0:$w}"
-      # The class word is coloured after the cut, so the colour codes never
-      # count toward the width and a cut never splits one.
-      case "$word" in
-        shared|"open tenancy")
-          wp="$(printf '%-12s' "$word")"
-          case "$line" in *"  $wp"*) line="${line%%"  $wp"*}  ${amb}${wp}${rst}${line#*"  $wp"}" ;; esac ;;
-      esac
-      printf '\033[K%s\n' "$line"
-    else
-      printf '\033[K\n'
-    fi
-    n=$((n + 1))
-  done
-  if [ "$nhs" -eq 0 ]; then
-    _egress_line "  Hosts    none pinned"
-  else
-    _egress_line "  Hosts    showing $(( hfirst + 1 ))-$(( hfirst + _EGRESS_HOST_VIEW < nhs ? hfirst + _EGRESS_HOST_VIEW : nhs )) of $nhs"
-  fi
-  n=0
-  while [ "$n" -lt "$_EGRESS_HOST_VIEW" ]; do
-    i=$(( hfirst + n ))
-    if [ "$i" -lt "$nhs" ]; then
-      h="${hosts[i]}"
-      mark=" "; [ "${hidx[i]}" -eq "$cur" ] && mark=">"
-      tick="."; _egress_in_list "$h" "$_EGE_HOSTS" && tick="v"
-      _egress_line "$(printf '%s [%s] %-36s %s' "$mark" "$tick" "$(_sessions_safe_str "$h")" "$(_egress_host_word "$h")")"
-    else
-      printf '\033[K\n'
-    fi
-    n=$((n + 1))
-  done
-  mark=" "; [ "${rows[nrows-3]}" = "$_EGRESS_ROW_ADD" ] && [ "$cur" -eq $((nrows - 3)) ] && mark=">"
-  _egress_line "$mark [+] add a host"
-  mark=" "; [ "$cur" -eq $((nrows - 2)) ] && mark=">"
-  _egress_line "$mark [/] filter               $(_sessions_safe_str "${_EGE_FILTER:-none}")"
-  _egress_pane "${rows[cur]}"
-  mark=" "; [ "$cur" -eq $((nrows - 1)) ] && mark=">"
-  if [ "$_EGRESS_ENFORCING" = 1 ]; then
-    _egress_line "$mark [>] save                 writes the section"
-  else
-    _egress_line "$mark [>] save                 writes the section, nothing is filtered yet"
-  fi
-  _egress_editor_effective
-  _egress_line "  ^/v move   space tick   </> mode   enter open   q cancel"
-}
-
-# The effective line: what saving would allow, as arithmetic over the ticks.
-# How many hosts the editor's state allows: the core, the ticked packs and
-# the pinned hosts, counted once each.
-_egress_editor_host_count() {
-  { _egress_pack_hosts claude all
-    printf '%s\n' "$_EGE_PACKS" | while IFS= read -r p; do [ -n "$p" ] && _egress_ege_pack_hosts "$p"; done
-    printf '%s\n' "$_EGE_HOSTS"; } | grep -v '^$' | LC_ALL=C sort -u | grep -c . || true
-}
-
-_egress_editor_effective() {
-  local n npk nhs
-  npk="$(printf '%s\n' "$_EGE_PACKS" | grep -c . || true)"
-  nhs="$(printf '%s\n' "$_EGE_HOSTS" | grep -c . || true)"
-  n="$(_egress_editor_host_count)"
-  _egress_line "  Effective   $n hosts   $npk packs and core   $nhs pinned"
-}
-
-_egress_row_at() {                       # <index>
-  _egress_editor_rows | sed -n "$(( $1 + 1 ))p"
-}
-
-_egress_row_count() {
-  _egress_editor_rows | grep -c .
-}
-
-# Ticks or unticks the row under the cursor. The core cannot be unticked and a
-# pack that needs a refused capability cannot be ticked.
-_egress_toggle() {                       # <row>
-  local row="$1" p h
-  case "$row" in
-    pack:*)
-      p="${row#pack:}"
-      case ",$(_egress_pack_flags "$p")," in *,requires-cap,*) return 0 ;; esac
-      if _egress_is_ticked "$p"; then
-        _EGE_PACKS="$(_egress_list_without "$_EGE_PACKS" "$p")"
-      else
-        _EGE_PACKS="$(printf '%s\n%s\n' "$_EGE_PACKS" "$p" | grep -v '^$' || true)"
-      fi ;;
-    host:*)
-      h="${row#host:}"
-      if _egress_in_list "$h" "$_EGE_HOSTS"; then
-        _EGE_HOSTS="$(_egress_list_without "$_EGE_HOSTS" "$h")"
-        _EGE_UNTICKED="$(printf '%s\n%s\n' "$_EGE_UNTICKED" "$h" | grep -v '^$' || true)"
-      else
-        _EGE_UNTICKED="$(_egress_list_without "$_EGE_UNTICKED" "$h")"
-        _EGE_HOSTS="$(printf '%s\n%s\n' "$_EGE_HOSTS" "$h" | grep -v '^$' || true)"
-      fi ;;
-  esac
-}
-
-# The mode ring. A box's ring starts at inherit.
-# The ring shows open, and a save never writes it (6.3): open is for one
-# session, through cleat egress open, which lands with enforcement. The mode
-# the ring left for open is what a save writes.
-_egress_mode_step() {                    # <-1|1>
-  local ring="strict open off" m i=0 n=3 cur=0
-  [ -n "$_EGE_BOX" ] && { ring="inherit strict open off"; n=4; }
-  for m in $ring; do [ "$m" = "$_EGE_MODE" ] && cur=$i; i=$((i + 1)); done
-  [ "$_EGE_MODE" != open ] && _EGE_RING_BACK="$_EGE_MODE"
-  cur=$(( (cur + $1 + n) % n ))
-  i=0
-  for m in $ring; do [ "$i" -eq "$cur" ] && _EGE_MODE="$m"; i=$((i + 1)); done
+_egress_filter_prompt() {
+  local in
+  _EG_PP=("Shows only the packs whose name contains some text." "Ticked packs outside the match stay ticked." "An empty line shows every pack." "")
+  _egress_prompt_line "Find a pack >" || return 0
+  in="$(printf '%s' "$_EG_IN" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' | LC_ALL=C tr -cd 'abcdefghijklmnopqrstuvwxyz0123456789-')"
+  _EGE_FILTER="${in:0:16}"
+  _EG_FIRST=0
+  _egress_rows_build
+  # The cursor onto the first match, or back on the find row.
+  if [ "$_EGE_NPACK" -gt 0 ]; then _EG_CUR=2; else _EG_CUR=1; fi
+  return 0
 }
 
 # Why a typed host was refused, in the words of Screen 4.
@@ -15028,172 +16613,550 @@ _egress_add_refusal() {                  # <input>
   case "$_EG_HOST_REASON" in
     IP_LITERAL) printf 'An IP address is never allowed. Name the host.\n' ;;
     NOT_FQDN) printf 'A host needs at least one dot, like registry.example.com.\n' ;;
-    *) printf 'Not a host name Cleat can hold (%s).\n' "$_EG_HOST_REASON" ;;
+    NON_ASCII) printf 'Letters, digits, dots and dashes only. No spaces.\n' ;;
+    TOO_LONG) printf 'Too long for a host name.\n' ;;
+    MULTI_TRAILING_DOT) printf 'One dot at the end at most.\n' ;;
+    BAD_LABEL) printf 'Each part between dots is letters, digits and dashes.\nIt cannot be empty or start or end with a dash.\n' ;;
+    BAD_CHARS) printf 'Hostname only: no path, query, percent sign or brackets.\n' ;;
+    *) printf 'Not a host name Cleat can hold.\n' ;;
   esac
 }
 
-# The add screen leaves the fixed block: the prompt goes below it on a fresh
-# line and a new block is drawn underneath, so no cursor arithmetic crosses
-# the read. Returns 0 when a host was added.
+# Adding a host by name, in the pane. A refused name says why and asks again,
+# with nothing typed lost. rc 0 when a host was added.
 _egress_add_prompt() {
-  local in h
-  _cursor_show
-  echo ""
-  echo -e "    Add a host    ${DIM}hostname only, port 443, exact match${RESET}"
+  local h
+  _EG_PP=("Its exact name, like registry.example.com." "HTTPS only, no wildcards. An empty line goes back." "" "")
   while :; do
-    printf '    > '
-    IFS= read -r in || return 1
-    in="${in#"${in%%[![:space:]]*}"}"
-    in="${in%"${in##*[![:space:]]}"}"
-    [ -n "$in" ] || return 1
-    if h="$(_egress_valid_host "$in")"; then
-      if ! _egress_in_list "$h" "$_EGE_HOSTS"; then
-        _EGE_HOSTS="$(printf '%s\n%s\n' "$_EGE_HOSTS" "$h" | grep -v '^$' || true)"
-      fi
-      _EGE_UNTICKED="$(_egress_list_without "$_EGE_UNTICKED" "$h")"
-      echo -e "    ${GREEN}[v]${RESET} $(_sessions_safe_str "$h")   $(_egress_host_word "$h")   added just now"
-      echo -e "        ${DIM}A name that resolves to a private address is refused in every mode.${RESET}"
-      echo ""
+    _egress_prompt_line "Add a host >" || return 1
+    [ -n "$_EG_IN" ] || return 1
+    if h="$(_egress_valid_host "$_EG_IN")"; then
+      _egress_host_add "$h"
+      _egress_cursor_to "host:$h" || true
+      _EGE_MSG="Added $h. A name on a private address is always blocked."
+      _EGE_MSGC="$_EGX_D"
       return 0
     fi
-    _egress_add_refusal "$in" | while IFS= read -r line; do echo -e "    ${RED}x${RESET} ${line}"; done
+    _egress_prompt_refusal "$(_egress_add_refusal "$_EG_IN")"
   done
 }
 
-_egress_filter_prompt() {
-  local in
-  _cursor_show
+# The part in braces of a pack's host, typed (atlassian's {site}, aws's
+# {region}). One DNS label: 1 to 63 of an explicit set, never a range, which
+# can collate in a UTF-8 locale. No dot, so it never names another domain.
+# Saved as an exact allow of this file.
+_egress_fill_prompt() {
+  local tpl part ex lab h
+  tpl="${_EGH[$_EG_HCUR]#tpl:}"
+  part="${tpl#*"{"}"
+  part="${part%%"}"*}"
+  case "$part" in site) ex=acme ;; region) ex=eu-west-1 ;; *) ex=name ;; esac
+  _EG_PP=("Type only the {$part} part, like $ex." "Letters, digits and dashes. An empty line goes back." "" "")
+  while :; do
+    _egress_prompt_line "{$part} >" || return 1
+    [ -n "$_EG_IN" ] || return 1
+    lab="$(printf '%s' "$_EG_IN" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+    case "$lab" in
+      *[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
+        _egress_prompt_refusal "Only letters, digits and dashes, like $ex. No dot: the rest of the name is fixed."
+        continue ;;
+      -*|*-)
+        _egress_prompt_refusal "A name cannot start or end with a dash."
+        continue ;;
+    esac
+    if [ "${#lab}" -gt 63 ]; then
+      _egress_prompt_refusal "At most 63 characters."
+      continue
+    fi
+    if h="$(_egress_valid_host "${tpl%%"{"*}${lab}${tpl#*"}"}")"; then
+      _egress_host_add "$h"
+      _EG_SCREEN=list
+      _egress_cursor_to "host:$h" || true
+      _EGE_MSG="Added $h as a host of your own."
+      _EGE_MSGC="$_EGX_D"
+      return 0
+    fi
+    _egress_prompt_refusal "$(_egress_add_refusal "${tpl%%"{"*}${lab}${tpl#*"}"}")"
+  done
+}
+
+# The save review in place of the list. rc 0 on a yes, and the caller leaves
+# the full screen and writes. On a no the list comes back as it was, and after
+# a refusal once a key is pressed, so the reason can be read first.
+_egress_tui_review() {
+  local rc=0
+  printf '\033[H\033[2J'
+  _egress_tui_typing on
+  _egress_save_review 0 || rc=1
+  if [ "$rc" = 1 ] && [ "$_EGS_OUT" = refused ]; then
+    printf '\n    Press any key to go back.'
+    _egress_key
+  fi
+  _egress_tui_typing off
+  if [ "$_EGS_OUT" = no ] && [ -z "$_EGE_MSG" ]; then
+    _EGE_MSG="Not saved. Your changes are still here."
+    _EGE_MSGC="$_EGX_D"
+  fi
+  return "$rc"
+}
+
+# The TUI. Returns 0 after a save or a cancel, and the save's own rc when the
+# write fails.
+_egress_picker_tui() {                   # <box or empty> [<starting mode>]
+  local box="$1" rc=0
+  _egress_editor_load "$box"
+  _EGE_SAVED=0
+  # The config row's off lands here with the ring on off.
+  if [ -n "${2:-}" ]; then
+    _EGE_MODE="$2"
+    _egress_recount
+  fi
+  if ! _egress_measure; then
+    _egress_picker_text "$box"
+    return $?
+  fi
+  _egress_tui_enter
+  while :; do
+    if [ "$_EG_WINCH" = 1 ]; then
+      _EG_WINCH=0
+      _egress_term_now
+    fi
+    if ! _egress_measure; then
+      _egress_tui_leave
+      _egress_picker_text "$box"
+      return $?
+    fi
+    _egress_draw "$_EG_CUR"
+    _egress_key
+    _egress_tui_key
+    case "$_EG_ACT" in
+      cancel)
+        _EGS_OUT=""
+        _egress_tui_leave
+        info "Nothing saved."
+        return 0 ;;
+      find) _egress_filter_prompt || true ;;
+      add) _egress_add_prompt || true ;;
+      fill) _egress_fill_prompt || true ;;
+      save)
+        if _egress_tui_review; then
+          _egress_tui_leave
+          _egress_save_commit || rc=$?
+          return "$rc"
+        fi
+        if [ "$_EGS_OUT" = none ]; then
+          _egress_tui_leave
+          info "Nothing to save."
+          return 0
+        fi ;;
+    esac
+  done
+}
+
+# ── Saving (6.4 Screen 5) ──
+
+# What a save does, from the ring and the file, into _EGS_MODE, the mode it
+# writes, and _EGS_PLAN: write, open (a box's session, 6.5), off-global
+# (6.6), off-box (a caged box's recreate, 6.6) or off-file (a box with no
+# cage to recreate). _EGS_WIDEN is 1 when the save leaves a box open to any
+# host where it was not: that write asks default no. Forks: it runs once, on
+# enter.
+_egress_save_plan() {
+  local mode_out="$_EGE_MODE" before after
+  _EGS_PLAN=write
+  _EGS_WIDEN=0
+  # Open is never written from the editor (6.3). The ring's open keeps the
+  # mode the editor loaded, and for a box it is the session of cleat egress
+  # open, confirmed on its own. A box already open this session has nothing
+  # to open.
+  if [ "$mode_out" = open ]; then
+    mode_out="$_EGE_LOAD_MODE"
+    if [ -n "$_EGE_BOX" ] && [ "$_EGRESS_ENFORCING" = 1 ] && [ "$_EGE_LOAD_MODE" != open ] && [ "$_EGE_SESSION" != 1 ]; then _EGS_PLAN=open; fi
+  fi
+  _EGS_MODE="$mode_out"
+  # What the box runs under, before and after. inherit follows every box,
+  # so a box can be turned off, or open, by the mode it inherits.
+  before="$_EGE_ORIG_MODE"
+  case "$before" in absent) if [ -n "$_EGE_BOX" ]; then before=inherit; else before=off; fi ;; esac
+  before="$(_egress_effective_mode "$before")"
+  after="$(_egress_effective_mode "$mode_out")"
+  # Turning off never commits on a default answer (6.3, 6.6). A file that is
+  # off already only keeps its lists up to date.
+  if [ "$mode_out" = off ] || [ "$after:$_EGS_PLAN" = off:write ]; then
+    if [ "$before" = off ]; then
+      _EGS_PLAN=write
+    elif [ "$_EGRESS_ENFORCING" = 1 ] && [ -z "$_EGE_BOX" ]; then
+      _EGS_PLAN=off-global
+    elif [ "$_EGRESS_ENFORCING" = 1 ] && container_exists "$_EGE_CNAME" \
+       && _egress_label_read "$_EGE_CNAME" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then
+      _EGS_PLAN=off-box
+    else
+      _EGS_PLAN=off-file
+    fi
+  fi
+  if [ "$_EGS_PLAN" = write ] && [ "$after" = open ] && [ "$before" != open ]; then _EGS_WIDEN=1; fi
+  return 0
+}
+
+# Whether the lists differ from the file. Order never counts.
+_egress_lists_changed() {
+  _egress_nl_diff "$_EGE_PACKS" "$_EGE_ORIG_PACKS"; [ -n "$_EGN_OUT" ] && return 0
+  _egress_nl_diff "$_EGE_ORIG_PACKS" "$_EGE_PACKS"; [ -n "$_EGN_OUT" ] && return 0
+  _egress_nl_diff "$_EGE_HOSTS" "$_EGE_ORIG_HOSTS"; [ -n "$_EGN_OUT" ] && return 0
+  _egress_nl_diff "$_EGE_ORIG_HOSTS" "$_EGE_HOSTS"; [ -n "$_EGN_OUT" ] && return 0
+  _egress_nl_diff "$_EGE_DENIES" "$_EGE_ORIG_DENIES"; [ -n "$_EGN_OUT" ] && return 0
+  _egress_nl_diff "$_EGE_ORIG_DENIES" "$_EGE_DENIES"; [ -n "$_EGN_OUT" ] && return 0
+  return 1
+}
+
+# Whether writing _EGS_MODE and the lists would change the file.
+_egress_save_changed() {
+  local orig="$_EGE_ORIG_MODE"
+  if [ "$orig" = absent ] && [ -n "$_EGE_BOX" ]; then orig=inherit; fi
+  [ "$_EGS_MODE" != "$orig" ] && return 0
+  _egress_lists_changed
+}
+
+# The hosts of the packs in <list>, into _EGN_OUT.
+_egress_packs_hosts() {                  # <packs>
+  local rest="$1" p out=""
+  while [ -n "$rest" ]; do
+    p="${rest%%$'\n'*}"; if [ "$p" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$p" ] && _egress_ix_of "$p" && _egress_nl_union out "${_EGC_HOSTS[_EGX]}"
+  done
+  _EGN_OUT="$out"
+  return 0
+}
+
+# The review's lines: the mode, what was added, removed, blocked and
+# unblocked, and what the save allows.
+_egress_save_diff() {
+  local addp remp offp backp addh remh newd liftd t p added="" removed="" mw
+  _egress_nl_diff "$_EGE_PACKS" "$_EGE_ORIG_PACKS"; addp="$_EGN_OUT"
+  _egress_nl_diff "$_EGE_ORIG_PACKS" "$_EGE_PACKS"; remp="$_EGN_OUT"
+  _egress_nl_diff "$_EGE_OFFBOX" "$_EGE_OFFBOX_ORIG"; offp="$_EGN_OUT"
+  _egress_nl_diff "$_EGE_OFFBOX_ORIG" "$_EGE_OFFBOX"; backp="$_EGN_OUT"
+  _egress_nl_diff "$_EGE_HOSTS" "$_EGE_ORIG_HOSTS"; addh="$_EGN_OUT"
+  _egress_nl_diff "$_EGE_ORIG_HOSTS" "$_EGE_HOSTS"; remh="$_EGN_OUT"
+  # A pack a box turned off is named once, as off for this box.
+  _egress_nl_minus remp "$offp"
+  _egress_nl_diff "$_EGE_DUSER" "$_EGE_ORIG_DUSER"; newd="$_EGN_OUT"
+  _egress_nl_diff "$_EGE_ORIG_DUSER" "$_EGE_DUSER"; liftd="$_EGN_OUT"
+  _EGS_NEWP="$addp"
+  _EGS_NEWH="$addh"
+  # The mode, and what it does.
+  case "$_EGS_PLAN:$_EGE_MODE:$_EGS_MODE" in
+    open:*) mw="open until box $_EGE_BOXS stops. The file keeps $_EGS_MODE." ;;
+    *:open:open) mw="open, any host for every box, each one logged" ;;
+    *:open:*) mw="$_EGS_MODE. Open is set per box: cleat egress open <box>." ;;
+    *:*:strict) mw="strict, only the hosts ticked" ;;
+    *)
+      _egress_mode_meaning "$_EGS_MODE"
+      mw="$_EGS_MODE, $_EGT" ;;
+  esac
+  echo -e "    Mode      ${mw}"
+  _egress_nl_union added "$addp"
+  _egress_nl_union added "$addh"
+  t="$backp"
+  while [ -n "$t" ]; do
+    p="${t%%$'\n'*}"; if [ "$p" = "$t" ]; then t=""; else t="${t#*$'\n'}"; fi
+    [ -n "$p" ] && _egress_nl_add added "$p, back on for this box"
+  done
+  _egress_nl_union removed "$remp"
+  _egress_nl_union removed "$remh"
+  t="$offp"
+  while [ -n "$t" ]; do
+    p="${t%%$'\n'*}"; if [ "$p" = "$t" ]; then t=""; else t="${t#*$'\n'}"; fi
+    [ -n "$p" ] && _egress_nl_add removed "$p, off for this box only"
+  done
+  if [ -n "$added" ]; then _egress_nl_prose "$added"; echo -e "    Added     $(_sessions_safe_str "$_EGT")"; fi
+  if [ -n "$removed" ]; then _egress_nl_prose "$removed"; echo -e "    Removed   $(_sessions_safe_str "$_EGT")"; fi
+  if [ -n "$newd" ]; then _egress_nl_prose "$newd"; echo -e "    Blocked   $(_sessions_safe_str "$_EGT")"; fi
+  if [ -n "$liftd" ]; then _egress_nl_prose "$liftd"; echo -e "    Unblocked $(_sessions_safe_str "$_EGT")"; fi
+  _egress_recount
+  if [ "$(_egress_effective_mode "$_EGS_MODE")" = strict ] && [ "$_EGS_PLAN" != open ]; then
+    case "$_EGE_WAS_EFF" in
+      strict)
+        if [ "$_EGE_WAS" != "$_EGE_COUNT" ]; then
+          echo -e "    Allowed   ${_EGE_COUNT} hosts, HTTPS only. Was ${_EGE_WAS}."
+        else
+          echo -e "    Allowed   ${_EGE_COUNT} hosts, HTTPS only."
+        fi ;;
+      open) echo -e "    Allowed   ${_EGE_COUNT} hosts, HTTPS only. Was any host, each one logged." ;;
+      *) echo -e "    Allowed   ${_EGE_COUNT} hosts, HTTPS only. Was no control." ;;
+    esac
+  fi
+  return 0
+}
+
+# One line per risk the save adds, each naming the packs and hosts that
+# carry it, then the [setup] exceptions in words.
+_egress_save_risks() {
+  local r1="" r2="" r3="" rest p ex="" others="" date="" t
+  rest="$_EGS_NEWP"
+  while [ -n "$rest" ]; do
+    p="${rest%%$'\n'*}"; if [ "$p" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$p" ] && _egress_ix_of "$p" || continue
+    case "${_EGC_RISK[_EGX]}" in 1) _egress_nl_add r1 "$p" ;; 2) _egress_nl_add r2 "$p" ;; 3) _egress_nl_add r3 "$p" ;; esac
+    case "${_EGC_DET[_EGX]}:$p" in
+      ticked:apt-debian|ticked:apt-image-extras) _egress_nl_add ex "$p"; date="${_EGC_DATE[_EGX]}" ;;
+      ticked:*) _egress_nl_add others "$p" ;;
+    esac
+  done
+  rest="$_EGS_NEWH"
+  while [ -n "$rest" ]; do
+    p="${rest%%$'\n'*}"; if [ "$p" = "$rest" ]; then rest=""; else rest="${rest#*$'\n'}"; fi
+    [ -n "$p" ] || continue
+    _egress_host_risk "$p"
+    case "$_EGK" in 1) _egress_nl_add r1 "$p" ;; 2) _egress_nl_add r2 "$p" ;; 3) _egress_nl_add r3 "$p" ;; esac
+  done
+  [ -n "$r1$r2$r3$ex$others" ] && echo ""
+  if [ -n "$r1" ]; then
+    _egress_nl_prose "$r1"
+    _egress_nl_count "$r1"
+    if [ "$_EGN" -gt 1 ]; then
+      echo -e "  ${AMBER}!${RESET} $(_sessions_safe_str "$_EGT") also reach other sites on the same server."
+    else
+      echo -e "  ${AMBER}!${RESET} $(_sessions_safe_str "$_EGT") also reaches other sites on the same server."
+    fi
+  fi
+  if [ -n "$r2" ]; then _egress_nl_prose "$r2"; echo -e "  ${AMBER}!${RESET} Anyone can upload to $(_sessions_safe_str "$_EGT")."; fi
+  if [ -n "$r3" ]; then _egress_nl_prose "$r3"; echo -e "  ${AMBER}!${RESET} Cleat has not checked $(_sessions_safe_str "$_EGT")."; fi
+  case "$ex" in
+    apt-debian$'\n'apt-image-extras|apt-image-extras$'\n'apt-debian)
+      echo -e "    apt-debian and apt-image-extras were ticked for your trusted [setup]"
+      echo -e "    section, a file the agent can edit. Debian has no safer source of"
+      echo -e "    security fixes. cli.github.com stays off, so apt-get install gh fails"
+      echo -e "    until you tick it. Both checked ${date}." ;;
+    apt-debian)
+      echo -e "    apt-debian was ticked for your trusted [setup] section, a file the"
+      echo -e "    agent can edit. Debian has no safer source of security fixes."
+      echo -e "    Checked ${date}." ;;
+    apt-image-extras)
+      echo -e "    apt-image-extras was ticked for your trusted [setup] section, a file"
+      echo -e "    the agent can edit. cli.github.com stays off, so apt-get install gh"
+      echo -e "    fails until you tick it. Checked ${date}." ;;
+  esac
+  if [ -n "$others" ]; then
+    _egress_nl_prose "$others"
+    _egress_nl_count "$others"
+    t="were"
+    [ "$_EGN" -eq 1 ] && t="was"
+    if [ -n "$ex" ]; then
+      echo -e "    $(_sessions_safe_str "$_EGT") ${t} ticked from files in this project too."
+    else
+      echo -e "    $(_sessions_safe_str "$_EGT") ${t} ticked from files in this project, which the agent can edit."
+    fi
+  fi
+  return 0
+}
+
+# The review (6.4 Screen 5): what the save changes and each risk it adds,
+# then one question, one acknowledgement and never one per tick. Off and open
+# keep their own default-no confirmations (6.5, 6.6), asked here whatever
+# <assume_yes> says: done in the typed editor answers Save and nothing else.
+# On the full screen the text is shown a page at a time when it is longer
+# than the window, so nothing scrolls away before the question.
+# rc 0 to go ahead. rc 1 with _EGS_OUT none (nothing to save), no or refused,
+# and nothing written in any of them.
+_egress_save_review() {                  # <assume_yes>
+  local yes="${1:-0}" text refusal q="" ans
+  _EGS_OUT=""
+  _egress_save_plan
+  if [ "$_EGS_PLAN" = write ] && ! _egress_save_changed; then
+    _EGS_OUT=none
+    return 1
+  fi
+  # The head ends in a blank line, which the substitution drops: put it back.
+  text="$(_egress_save_head)"$'\n'
+  # Checked before anything is asked or written (M9d): a stopped, off or
+  # uncaged box, or an engine that cannot run one, cannot open.
+  if [ "$_EGS_PLAN" = open ] && ! _egress_open_check "$_EGE_CNAME" "$(_egress_effective_mode "$_EGS_MODE")"; then
+    text+=$'\n'"$(_egress_open_refusal "$_EGE_CNAME" 2>&1)"
+    text+=$'\n'"    Nothing was saved. The mode is back on ${_EGE_LOAD_MODE}."
+    _egress_review_show "$text" || true
+    _EGE_MODE="$_EGE_LOAD_MODE"
+    _egress_recount
+    _EGS_OUT=refused
+    return 1
+  fi
+  case "$_EGS_PLAN" in
+    write|open)
+      if ! refusal="$(_egress_writer_interlock "$(_egress_effective_mode "$_EGS_MODE")" 2>&1)"; then
+        _egress_review_show "$text"$'\n'"$refusal" || true
+        _EGS_OUT=refused
+        return 1
+      fi ;;
+  esac
+  case "$_EGS_PLAN" in
+    open)
+      text+=$'\n'"    Open for this session only. See below."$'\n'
+      text+="$(_egress_open_screen 0)"
+      q="    Open egress for this box until it stops? [y/N] " ;;
+    off-global)
+      text+="$(_egress_off_confirm "")"
+      q="    Turn egress control off for every new box? [y/N] " ;;
+    off-box)
+      text+=$'\n'"    This recreates the box. See below."$'\n'
+      text+="$(_egress_off_confirm "$_EGE_CNAME")"
+      q="    Turn egress control off and recreate the box? [y/N] " ;;
+    off-file)
+      if [ -n "$_EGE_BOX" ]; then
+        text+=$'\n'"$(echo -e "  ${AMBER}!${RESET} Off gives box ${_EGE_BOXS} a normal network: any host, any port, nothing logged.")"
+      else
+        text+=$'\n'"$(echo -e "  ${AMBER}!${RESET} Off gives every new box a normal network: any host, any port, nothing logged.")"
+      fi
+      q="    Turn it off? [y/N] " ;;
+    *)
+      if [ "$_EGS_WIDEN" = 1 ]; then
+        text+=$'\n'"$(echo -e "  ${AMBER}!${RESET} Box ${_EGE_BOXS} will reach any host, as every box does. Each one is logged.")"
+        q="    Save? [y/N] "
+      fi
+      text+=$'\n'"$(echo -e "    ${DIM}No box can read or change this file.${RESET}")" ;;
+  esac
+  if ! _egress_review_show "$text"; then
+    _EGS_OUT=no
+    return 1
+  fi
+  if [ -z "$q" ]; then
+    # The one question a typed done answers.
+    [ "$yes" -eq 1 ] && return 0
+    printf '    Save? [Y/n] '
+    IFS= read -r ans || ans="n"
+    case "$ans" in ""|y|Y|yes|YES) return 0 ;; esac
+    info "Not saved."
+    _EGS_OUT=no
+    return 1
+  fi
+  if _egress_ask_no "$q"; then return 0; fi
+  if [ "$_EGS_PLAN" = open ]; then
+    echo -e "    Nothing was saved. The mode is back on ${_EGE_LOAD_MODE}."
+    _EGE_MODE="$_EGE_LOAD_MODE"
+    _egress_recount
+    _EGE_MSG="Not opened. The mode is back on ${_EGE_LOAD_MODE}. Your ticks are still here."
+    _EGE_MSGC="$_EGX_D"
+  fi
+  _EGS_OUT=no
+  return 1
+}
+
+# The review's head: the question it answers, the diff and the risks.
+_egress_save_head() {
   echo ""
-  printf '    Filter packs by name (empty clears): '
-  IFS= read -r in || in=""
-  in="$(printf '%s' "$in" | tr -cd 'abcdefghijklmnopqrstuvwxyz0123456789-')"
-  _EGE_FILTER="$in"
+  if [ -n "$_EGE_BOX" ]; then
+    echo -e "  ${BOLD}Save what box ${_EGE_BOXS} may reach?${RESET}"
+  else
+    echo -e "  ${BOLD}Save what every box may reach?${RESET}"
+  fi
+  echo ""
+  _egress_save_diff
+  _egress_save_risks
   echo ""
 }
 
-# The save diff (Screen 5): one acknowledgment, never one per tick. Writes
-# through the single writer and returns 0 when saved.
-_egress_save_screen() {                  # <assume_yes>
-  local yes="${1:-0}" ans added removed n p ex="" mode_out
-  _cursor_show
-  # Open is never written from the editor. The ring's open saves the mode it
-  # came from.
-  mode_out="$_EGE_MODE"
-  if [ "$mode_out" = open ]; then
-    mode_out="${_EGE_RING_BACK:-strict}"
-    [ "$mode_out" = open ] && mode_out=strict
+# A question whose default is no: rc 0 on a yes. cleat egress open and off
+# ask theirs through it, and so does the editor's review.
+_egress_ask_no() {                       # <question>
+  local ans
+  printf '%s' "$1"
+  IFS= read -r ans || ans=""
+  case "$ans" in y|Y|yes|YES) ;; *) info "Not changed."; return 1 ;; esac
+  return 0
+}
+
+# How many rows <line> takes at the window's width, into _EGN, colour codes
+# not counted.
+_egress_phys_lines() {                   # <line>
+  local t="$1" pre
+  while :; do
+    case "$t" in
+      *$'\033['*) pre="${t%%$'\033['*}"; t="${t#*$'\033['}"; t="$pre${t#*m}" ;;
+      *) break ;;
+    esac
+  done
+  _EGN=$(( (${#t} + _EG_COLS - 1) / _EG_COLS ))
+  [ "$_EGN" -lt 1 ] && _EGN=1
+  return 0
+}
+
+# Review text. Off the full screen it prints as it is. On it, a text longer
+# than the window is shown a page at a time with a key between pages, since
+# the alternate screen keeps no scrollback. rc 1 when q or Esc ends a page.
+_egress_review_show() {                  # <text>
+  local rest="$1"$'\n' line room used=0
+  if [ "${_EG_TUI:-0}" != 1 ]; then
+    printf '%s\n' "$1"
+    return 0
   fi
-  echo ""
-  echo -e "  ${BOLD}Save this policy?${RESET}"
-  echo ""
-  if [ "$_EGE_MODE" = open ]; then
-    echo -e "    Mode      ${mode_out}  ${DIM}(open is per session and is not saved here)${RESET}"
-  else
-    echo -e "    Mode      ${mode_out}"
-  fi
-  printf '    Packs     %s\n' "$(printf 'claude\n%s\n' "$_EGE_PACKS" | grep -v '^$' | paste -sd, - | sed 's/,/, /g')"
-  added="$(printf '%s\n' "$_EGE_PACKS" | while IFS= read -r p; do [ -n "$p" ] && ! _egress_in_list "$p" "$_EGE_ORIG_PACKS" && printf '%s\n' "$p"; done | paste -sd, - | sed 's/,/, /g')"
-  removed="$(printf '%s\n' "$_EGE_ORIG_PACKS" | while IFS= read -r p; do [ -n "$p" ] && ! _egress_in_list "$p" "$_EGE_PACKS" && printf '%s\n' "$p"; done | paste -sd, - | sed 's/,/, /g')"
-  [ -n "$added" ] && echo -e "              ${GREEN}+ ${added}${RESET}"
-  [ -n "$removed" ] && echo -e "              ${DIM}- ${removed}${RESET}"
-  printf '    Pinned    %s\n' "$(printf '%s\n' "$_EGE_HOSTS" | grep -v '^$' | paste -sd, - | sed 's/,/, /g')"
-  n="$(_egress_editor_host_count)"
-  case "$mode_out" in
-    off) echo -e "    Allowed   every host  ${DIM}(egress control off: the list is kept for later)${RESET}" ;;
-    inherit) echo -e "    Allowed   the global mode, with ${n} hosts from this file and the core" ;;
-    *) echo -e "    Allowed   ${n} hosts, port 443 only" ;;
+  # The question and one spare row stay free below the last page.
+  room=$(( _EG_ROWS - 3 ))
+  while [ -n "$rest" ]; do
+    line="${rest%%$'\n'*}"
+    rest="${rest#*$'\n'}"
+    _egress_phys_lines "$line"
+    if [ $(( used + _EGN )) -gt "$room" ] && [ "$used" -gt 0 ]; then
+      printf '%s\n' "  ${_EGX_D}More below: any key goes on, q goes back.${_EGX_R}"
+      _egress_key
+      case "$_KEY" in QUIT|ESC) return 1 ;; esac
+      printf '\033[H\033[2J'
+      used=0
+    fi
+    printf '%s\n' "$line"
+    used=$(( used + _EGN ))
+  done
+  return 0
+}
+
+# Does what the review agreed to and says what happened. Every write goes
+# through the one writer with the section as the editor loaded it, so a
+# change made in another terminal meanwhile refuses rather than vanishing.
+# A value that is no host name goes back as it was.
+_egress_save_commit() {
+  local allows="$_EGE_HOSTS" denies="$_EGE_DENIES"
+  _egress_nl_union allows "$_EGE_BAD_ALLOWS"
+  _egress_nl_union denies "$_EGE_BAD_DENIES"
+  case "$_EGS_PLAN" in
+    open)
+      # The edits first, with the mode the file had, then the session.
+      if _egress_save_changed; then
+        _write_egress_to_file "$_EGE_FILE" "$_EGS_MODE" "$_EGE_PACKS" "$denies" "$allows" "$_EGE_CANON" || return 1
+        _EGE_CANON="$(_egress_section_canon "$_EGE_FILE")"
+        success "Saved to ${_EGE_FILE/#${HOME}/~}"
+      fi
+      _EGE_SAVED=1
+      cmd_egress_open "$_EGE_CNAME" 1
+      return $? ;;
+    off-global)
+      _egress_off_global 1 "$_EGE_PACKS" "$denies" "$allows" "$_EGE_CANON" || return 1
+      _EGE_SAVED=1
+      return 0 ;;
+    off-box)
+      cmd_egress_off "$_EGE_CNAME" 1 "$_EGE_PACKS" "$denies" "$allows" "$_EGE_CANON" "$_EGS_MODE" || return 1
+      _EGE_SAVED=1
+      return 0 ;;
   esac
-  for p in apt-debian apt-image-extras; do _egress_is_ticked "$p" && ex+="$p "; done
-  if [ -n "$ex" ]; then
-    echo ""
-    echo -e "  ${AMBER}!${RESET} $(echo $ex | wc -w | tr -d ' ') pack(s) on the [setup] path, measured $(_egress_catalogue_records | awk -F'\t' '$1 == "apt-debian" && !d { d = 1; sub(/^.*, /, "", $5); print $5 }'):"
-    case " $ex " in *" apt-debian "*)
-      echo -e "    apt-debian is on a shared edge. Debian publishes no single-origin source for"
-      echo -e "    security updates, so an allowed name there can be answered by another tenant." ;;
-    esac
-    case " $ex " in *" apt-image-extras "*)
-      echo -e "    apt-image-extras covers the two apt sources the image configures itself."
-      echo -e "    download.docker.com is ticked. cli.github.com is off, so apt-get install gh fails." ;;
-    esac
-    [ -n "$_EGE_DETECTED" ] && echo -e "    ${DIM}Detected from files in this project, which the agent can edit.${RESET}"
-  fi
-  echo ""
-  echo -e "    ${DIM}Written to ${_EGE_FILE/#${HOME}/~}, section [egress]${RESET}"
-  echo -e "    ${DIM}The box cannot read or write that file.${RESET}"
-  echo ""
-  # Under enforcement, the box ring's open writes this session's edits with
-  # the mode they came from and then opens the session, and off goes through
-  # the one recreate path. The global off has its own confirmation.
-  if [ "$_EGRESS_ENFORCING" = 1 ]; then
-    local ecname=""
-    [ -n "$_EGE_BOX" ] && ecname="$(_egress_target_cname "$_EGE_BOX")"
-    if [ "$_EGE_MODE" = open ] && [ -n "$ecname" ]; then
-      _write_egress_to_file "$_EGE_FILE" "$mode_out" "$_EGE_PACKS" "$_EGE_DENIES" "$_EGE_HOSTS" "$_EGE_CANON" || return 1
-      _EGE_SAVED=1
-      echo -e "    Open for this session only. See the next screen."
-      # Its own confirmation, whatever the save's: done in the typed editor
-      # answers Save, never Open.
-      cmd_egress_open "$ecname" 0
-      return $?
-    fi
-    if [ "$mode_out" = off ] && [ -z "$ecname" ]; then
-      _egress_off_global 0 || return 1
-      _EGE_SAVED=1
-      return 0
-    fi
-    if [ "$mode_out" = off ] && container_exists "$ecname" \
-       && _egress_label_read "$ecname" sh.cleat.egress-hash && [ "$_EG_LABEL_SET" = 1 ]; then
-      echo -e "    This recreates the box. See the next screen."
-      cmd_egress_off "$ecname" 0 || return 1
-      _EGE_SAVED=1
-      return 0
-    fi
-  fi
-  # Off never commits on a default answer, typed or not (6.3, 6.6): an arrow
-  # key and an Enter must not turn egress control off.
-  if [ "$mode_out" = off ]; then
-    echo -e "  ${AMBER}!${RESET} Mode off turns egress control off for $([ -n "$_EGE_BOX" ] && echo "box $(_sessions_safe_str "$_EGE_BOX")" || echo "every box"). Boxes reach the whole network."
-    printf '    Turn it off? [y/N] '
-    IFS= read -r ans || ans="n"
-    case "$ans" in y|Y|yes|YES) ;; *) info "Not saved."; return 1 ;; esac
-  elif [ "$yes" -ne 1 ]; then
-    printf '    Save? [Y/n] '
-    IFS= read -r ans || ans="n"
-    case "$ans" in ""|y|Y|yes|YES) ;; *) info "Not saved."; return 1 ;; esac
-  fi
-  _egress_writer_interlock "$(_egress_effective_mode "$mode_out")" || return 1
-  _write_egress_to_file "$_EGE_FILE" "$mode_out" "$_EGE_PACKS" "$_EGE_DENIES" "$_EGE_HOSTS" "$_EGE_CANON" || return 1
+  _write_egress_to_file "$_EGE_FILE" "$_EGS_MODE" "$_EGE_PACKS" "$denies" "$allows" "$_EGE_CANON" || return 1
+  # The baseline moves to what was written, so a second save compares with it.
+  _EGE_CANON="$(_egress_section_canon "$_EGE_FILE")"
   _EGE_SAVED=1
   success "Saved to ${_EGE_FILE/#${HOME}/~}"
   if [ "$_EGRESS_ENFORCING" = 1 ]; then
-    _egress_save_consequence "$mode_out"
+    # The mode the box runs under: a box that inherits off is off.
+    _egress_save_consequence "$(_egress_effective_mode "$_EGS_MODE")"
   else
     echo -e "    Saved. Enforcement lands in a later release. Nothing is filtered today."
   fi
   return 0
 }
 
-# The editor's engine line (10.6): the verdict on this engine, in every state,
-# measured once per editor. The editor opens, edits and saves on any engine:
-# policy is portable, and only a launch refuses.
-_EGE_ENGINE=""
-_egress_editor_engine() {
-  if [ -z "$_EGE_ENGINE" ]; then
-    if _daemon_up; then _EGE_ENGINE="$(_egress_engine_kind)"; else _EGE_ENGINE=down; fi
+# The review and the write, as one: the typed picker and the tests.
+_egress_save_screen() {                  # <assume_yes>
+  _cursor_show
+  if ! _egress_save_review "${1:-0}"; then
+    [ "$_EGS_OUT" = none ] && info "Nothing to save."
+    return 1
   fi
-}
-_egress_editor_verdict() {
-  _egress_editor_engine
-  # The verdict first: a narrow terminal cuts the engine's name, never it.
-  case "$_EGE_ENGINE" in
-    down) printf 'Engine   checked at launch: Docker is not running' ;;
-    *)
-      if _egress_engine_validated "$_EGE_ENGINE"; then
-        printf 'Engine   validated: %s' "$(_egress_engine_words "$_EGE_ENGINE")"
-      else
-        printf 'Engine   not validated, a caged box will not start here: %s' "$(_egress_engine_words "$_EGE_ENGINE")"
-      fi ;;
-  esac
+  _egress_save_commit
 }
 
 # What a save means, once enforcement is live (6.4 Screen 5): one line, the
@@ -15240,137 +17203,68 @@ _egress_save_consequence() {             # <saved mode>
   fi
 }
 
-# The action screen for a pack or host row: arrows and enter, back last.
-_egress_action_screen() {                # <row>
-  local row="$1" items="" sel=0 n i key it
-  case "$row" in
-    pack:*)
-      if _egress_is_ticked "${row#pack:}"; then items="untick"; else items="tick"; fi
-      items+=$'\n'"show every host"$'\n'"back" ;;
-    host:*) items="remove"$'\n'"back" ;;
-    *) return 0 ;;
-  esac
-  n="$(printf '%s\n' "$items" | grep -c .)"
-  echo ""
-  while :; do
-    i=0
-    while IFS= read -r it; do
-      if [ "$i" -eq "$sel" ]; then printf '\033[K  > %s\n' "$it"; else printf '\033[K    %s\n' "$it"; fi
-      i=$((i + 1))
-    done <<EOF
-$items
-EOF
-    key="$(_read_keypress)"
-    case "$key" in
-      UP) [ "$sel" -gt 0 ] && sel=$((sel - 1)) ;;
-      DOWN) [ "$sel" -lt $((n - 1)) ] && sel=$((sel + 1)) ;;
-      ENTER)
-        it="$(printf '%s\n' "$items" | sed -n "$((sel + 1))p")"
-        case "$it" in
-          tick|untick) _egress_toggle "$row" ;;
-          remove)
-            _EGE_HOSTS="$(_egress_list_without "$_EGE_HOSTS" "${row#host:}")"
-            _EGE_UNTICKED="$(_egress_list_without "$_EGE_UNTICKED" "${row#host:}")" ;;
-          "show every host")
-            echo ""
-            _egress_catalogue_records | awk -F'\t' -v p="${row#pack:}" '$1 == p { print $2 }' | while IFS= read -r it; do
-              printf '    %-40s %s\n' "$it" "$(_egress_host_word "$it")"
-            done
-            echo "" ;;
-        esac
-        return 0 ;;
-      QUIT|ESC) return 0 ;;
-    esac
-    printf '\033[%dA' "$n"
-  done
-}
-
-# The TUI. Returns 0 after a save or a cancel.
-_egress_picker_tui() {                   # <box or empty> [<starting mode>]
-  local box="$1" cur=0 key row nrows draw_lines
-  _egress_editor_load "$box"
-  _EGE_FIRST=0
-  _EGE_HFIRST=0
-  _EGE_SAVED=0
-  # The config row's off lands here with the ring on off and the cursor on the
-  # save row, so the next enter reaches the confirmation.
-  if [ -n "${2:-}" ]; then
-    _EGE_MODE="$2"
-    cur=$(( $(_egress_row_count) - 1 ))
+# The editor's engine, measured once per editor, in this shell. The editor
+# opens, edits and saves on any engine: policy is portable, and only a launch
+# refuses.
+_egress_editor_engine() {
+  if [ -z "$_EGE_ENGINE" ]; then
+    if _daemon_up; then _EGE_ENGINE="$(_egress_engine_kind)"; else _EGE_ENGINE=down; fi
   fi
-  echo ""
-  while :; do
-    nrows="$(_egress_row_count)"
-    [ "$cur" -ge "$nrows" ] && cur=$((nrows - 1))
-    if ! _egress_measure "$(_egress_editor_rows | grep -c '^pack:' || true)"; then
-      _egress_tui_release
-      _egress_picker_text "$box"
-      return $?
-    fi
-    draw_lines=$(( _EGRESS_CHROME_LINES - 1 + _EG_PAGE + _EGRESS_HOST_LINES + _EGRESS_PANE_LINES ))
-    # Keys typed ahead during a draw must not echo into the block, and a
-    # Ctrl-C must hand the terminal back with its cursor and its echo.
-    _tui_echo_off
-    trap '_egress_tui_release; echo ""; exit 130' INT TERM HUP
-    _cursor_hide
-    _egress_draw "$cur"
-    key="$(_read_keypress)"
-    row="$(_egress_row_at "$cur")"
-    case "$key" in
-      UP) [ "$cur" -gt 0 ] && cur=$((cur - 1)) ;;
-      DOWN) [ "$cur" -lt $((nrows - 1)) ] && cur=$((cur + 1)) ;;
-      LEFT) _egress_mode_step -1 ;;
-      RIGHT) _egress_mode_step 1 ;;
-      SPACE) _egress_toggle "$row" ;;
-      QUIT|ESC) _egress_tui_release; echo ""; info "Nothing saved."; return 0 ;;
-      ENTER)
-        case "$row" in
-          "$_EGRESS_ROW_ADD") _egress_tui_release; _egress_add_prompt || true; continue ;;
-          "$_EGRESS_ROW_FILTER") _egress_tui_release; _egress_filter_prompt; cur=0; continue ;;
-          "$_EGRESS_ROW_SAVE")
-            _egress_tui_release
-            if _egress_save_screen 0; then return 0; fi
-            continue ;;
-          pack:*|host:*) _egress_action_screen "$row"; continue ;;
-        esac ;;
-    esac
-    printf '\033[%dA' "$draw_lines"
-  done
 }
 
-# Hands the terminal back: cursor shown, echo restored, the draw's trap gone.
-# Before every line prompt and at every way out of the editor.
-_egress_tui_release() {
-  _cursor_show
-  _tui_echo_restore
-  trap - INT TERM HUP
-}
-
-# The typed picker: for a window too short to draw the block and for anyone
-# who prefers typing. A pack name ticks or unticks, a host adds, -host
-# removes, "mode <m>" sets the mode, "done" saves after the same diff, "q"
-# leaves.
+# The typed picker: for a window too small for the full screen, and for anyone
+# who prefers typing. A pack name ticks it, a host name adds it, -name drops
+# either, "mode <m>" sets the mode, "done" saves after the same review, "q"
+# leaves. The same state and the same writer as the full screen.
 _egress_picker_text() {                  # <box or empty>
-  local box="$1" in p h
+  local box="$1" in p h i ix
   [ -n "${_EGE_FILE:-}" ] || _egress_editor_load "$box"
   echo ""
-  echo -e "  ${BOLD}Cleat egress${RESET} ${DIM}(typed)${RESET}   ${DIM}${_EGE_FILE/#${HOME}/~} [egress]${RESET}"
-  if [ "$_EGRESS_ENFORCING" = 1 ]; then
-    echo -e "  ${AMBER}$(_egress_editor_verdict)${RESET}"
+  if [ -n "$_EGE_BOX" ]; then
+    echo -e "  ${BOLD}Cleat egress${RESET} ${DIM}(typed, what box ${_EGE_BOXS} may reach)${RESET}"
   else
-    echo -e "  ${AMBER}Saving writes the policy. Enforcement lands in a later release.${RESET}"
+    echo -e "  ${BOLD}Cleat egress${RESET} ${DIM}(typed, what every box may reach)${RESET}"
   fi
+  echo -e "  ${DIM}Claude Code's own ${_EGE_NCORE} hosts are always allowed.${RESET}"
+  if [ -n "$_EGE_WARN" ]; then echo -e "  ${AMBER}${_EGE_WARN}${RESET}"; fi
   while :; do
     echo ""
-    echo -e "  Mode: ${_EGE_MODE}"
-    while IFS= read -r p; do
-      [ -n "$p" ] && [ "$p" != claude ] || continue
-      if _egress_is_ticked "$p"; then printf '    [v] %-20s %s\n' "$p" "$(_egress_class_word "$(_egress_pack_class "$p")" "$(_egress_pack_flags "$p")")"; fi
-    done < <(_egress_pack_ids)
-    while IFS= read -r h; do [ -n "$h" ] && printf '    [v] %-20s %s\n' "$(_sessions_safe_str "$h")" "$(_egress_host_word "$h")"; done <<EOF
-$_EGE_HOSTS
-EOF
-    echo -e "  ${DIM}A pack name ticks it, a host adds it, -name removes, \"mode strict\", \"done\" saves, \"q\" leaves.${RESET}"
+    _egress_mode_meaning "$_EGE_MODE"
+    echo -e "  Mode ${_EGE_MODE} ${DIM}(${_EGT})${RESET}"
+    i=0
+    while [ "$i" -lt "${#_EGO[@]}" ]; do
+      ix="${_EGO[i]}"
+      p="${_EGC_P[ix]}"
+      if _egress_pack_on "$p"; then
+        _egress_pack_state "$p"
+        _egress_pack_tag "$ix"
+        [ -n "$_EGT" ] || _EGT="${_EGC_PURP[ix]}"
+        printf '    [✔] %-16s %s\n' "$p" "$_EGT"
+      fi
+      i=$((i + 1))
+    done
+    i=0
+    while [ "$i" -lt "${#_EGR[@]}" ]; do
+      case "${_EGR[i]}" in
+        host:*)
+          h="${_EGR[i]#host:}"
+          _egress_host_state "$h"
+          _egress_host_risk "$h"
+          _egress_risk_tag "$_EGK"
+          case "$_EGS" in
+            own|every) printf '    [✔] %s  %s\n' "$h" "$_EGT" ;;
+            blocked|gblock) printf '    [✘] %s  blocked\n' "$h" ;;
+          esac ;;
+      esac
+      i=$((i + 1))
+    done
+    echo -e "  ${DIM}A pack name ticks it. A host name adds it.${RESET}"
+    if [ -n "$_EGE_BOX" ]; then
+      echo -e "  ${DIM}-name drops either. mode strict, off or inherit sets it.${RESET}"
+    else
+      echo -e "  ${DIM}-name drops either. mode strict or mode off sets the mode.${RESET}"
+    fi
+    echo -e "  ${DIM}done saves. q leaves.${RESET}"
     printf '  > '
     IFS= read -r in || { echo ""; info "Nothing saved."; return 0; }
     in="${in#"${in%%[![:space:]]*}"}"
@@ -15378,11 +17272,14 @@ EOF
     case "$in" in
       "") continue ;;
       q|quit) info "Nothing saved."; return 0 ;;
-      done|save) _egress_save_screen 1; return $? ;;
+      done|save)
+        if _egress_save_screen 1; then return 0; fi
+        [ "$_EGS_OUT" = none ] && return 0
+        return 1 ;;
       mode\ *)
         p="${in#mode }"
         case "$p" in
-          strict|off) _EGE_MODE="$p" ;;
+          strict|off) _EGE_MODE="$p"; _egress_recount ;;
           # Never saved from the editor, typed or drawn (6.3).
           open)
             if [ "$_EGRESS_ENFORCING" = 1 ]; then
@@ -15390,34 +17287,130 @@ EOF
             else
               warn "Open is per box and per session: cleat egress open. It lands with enforcement."
             fi ;;
-          inherit) if [ -n "$_EGE_BOX" ]; then _EGE_MODE=inherit; else warn "Only a box can inherit."; fi ;;
+          inherit)
+            if [ -n "$_EGE_BOX" ]; then _EGE_MODE=inherit; _egress_recount; else warn "Only a box can inherit."; fi ;;
           *) warn "The modes are strict, open and off." ;;
         esac ;;
       -*)
         p="${in#-}"
-        if _egress_is_pack "$p"; then
-          _EGE_PACKS="$(_egress_list_without "$_EGE_PACKS" "$p")"
+        if _egress_ix_of "$p"; then
+          if _egress_pack_on "$p"; then _egress_toggle "pack:$p"; fi
         else
-          _EGE_HOSTS="$(_egress_list_without "$_EGE_HOSTS" "$(_egress_valid_host "$p" 2>/dev/null || printf '%s' "$p")")"
+          h="$(_egress_valid_host "$p" 2>/dev/null || printf '%s' "$p")"
+          _egress_host_state "$h"
+          case "$_EGS" in
+            own|unticked) _egress_nl_drop _EGE_HOSTS "$h"; _egress_nl_drop _EGE_UNTICKED "$h"; _egress_editor_changed ;;
+            every) _egress_host_toggle "$h"; _egress_editor_changed ;;
+          esac
         fi ;;
       *)
-        if _egress_is_pack "$in"; then
-          [ "$in" = claude ] && { info "The core pack is always on."; continue; }
-          _egress_toggle "pack:$in"
+        if _egress_ix_of "$in"; then
+          ix="$_EGX"
+          if [ "$in" = claude ]; then info "The core pack is always on."; continue; fi
+          if _egress_pack_refused "$ix"; then
+            warn "${in} needs the docker cap, which egress control refuses."
+            continue
+          fi
+          if [ "${_EGC_CNT[ix]}" = 0 ]; then
+            info "${in} has no host that comes with it. Type each host you want by name."
+            continue
+          fi
+          _egress_pack_on "$in" || _egress_toggle "pack:$in"
         elif h="$(_egress_valid_host "$in")"; then
-          _egress_in_list "$h" "$_EGE_HOSTS" || _EGE_HOSTS="$(printf '%s\n%s\n' "$_EGE_HOSTS" "$h" | grep -v '^$' || true)"
+          _egress_host_add "$h"
         else
-          _egress_add_refusal "$in" | while IFS= read -r p; do echo -e "    ${RED}x${RESET} $p"; done
+          _egress_add_refusal "$in" | while IFS= read -r p; do echo -e "    ${RED}✘${RESET} $p"; done
         fi ;;
     esac
   done
 }
 
-# The editor entry: the TUI when the window can hold it, the typed picker
-# otherwise.
+# The capabilities that void a policy (3, 5.7 assertion 16), refused where a
+# policy is written rather than only at the next launch: every writer and,
+# before it opens, the editor, so no save is offered that would be refused.
+# Live enforcement only, and only when the write leaves the box strict or
+# open. One message names each such capability, where it is on and the one
+# command that turns it off there.
+_egress_writer_interlock() {             # <effective mode>
+  local project caps=""
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  case "$1" in strict|open) ;; *) return 0 ;; esac
+  project="$(resolve_project "$PWD" 2>/dev/null)" || return 0
+  resolve_caps "$project" readonly >/dev/null 2>&1 || return 0
+  if _egress_docker_conflict "$1"; then caps+="docker "; fi
+  if _egress_ssh_conflict "$1"; then caps+="ssh "; fi
+  if _egress_hooks_conflict "$1"; then caps+="hooks "; fi
+  [ -n "$caps" ] || return 0
+  _egress_cap_refusal "$project" $caps
+  return 1
+}
+
+# The refusal itself. resolve_caps has just run, so _PCAPS is the project's
+# view and _PENV_APPROVED says whether it applied.
+_egress_cap_refusal() {                  # <project> <cap>...
+  local project="$1" c names="" box="${_BOX:-main}" global cmd
+  shift
+  for c in "$@"; do names="${names:+$names$'\n'}$c"; done
+  _egress_nl_prose "$names"
+  if [ "$#" -gt 1 ]; then
+    error "Egress control cannot be saved while the ${_EGT} capabilities are on."
+  else
+    error "Egress control cannot be saved while the ${_EGT} capability is on."
+  fi
+  global="$(_read_caps_from_file "$CLEAT_GLOBAL_CONFIG" 2>/dev/null || true)"
+  for c in "$@"; do
+    case "$c" in
+      docker) echo -e "    ${BOLD}docker${RESET} hands the box your Docker daemon, which reaches every network." ;;
+      ssh) echo -e "    ${BOLD}ssh${RESET} mounts your SSH agent, which signs for anything. SSH cannot leave a cage anyway." ;;
+      hooks) echo -e "    ${BOLD}hooks${RESET} runs host commands at times the box picks, which no policy governs." ;;
+    esac
+    if _egress_nl_has "$c" "$global"; then
+      echo -e "      It is on in your global config. Turn it off:  ${BOLD}cleat config --disable ${c}${RESET}"
+    fi
+    if [ "${_PENV_APPROVED:-0}" = 1 ] && _egress_nl_has "$c" "${_PCAPS%$'\n'}"; then
+      # A box's own section, main's included, replaces [caps] for that box,
+      # so it is the section the command must edit.
+      if _cleat_section_present "$project/.cleat" "box.${box}.caps"; then
+        cmd="cleat config ${box} --disable ${c}"
+        echo -e "      It is on for box $(_sessions_safe_str "$box") in this project's .cleat. Turn it off:  ${BOLD}${cmd}${RESET}"
+      else
+        echo -e "      It is on in this project's .cleat. Turn it off:  ${BOLD}cleat config --project --disable ${c}${RESET}"
+      fi
+    fi
+    case " ${_CLI_CAPS[*]+${_CLI_CAPS[*]}} " in
+      *" $c "*) echo -e "      It is on through ${BOLD}--cap ${c}${RESET} on this command. Run it without that flag." ;;
+    esac
+  done
+  return 0
+}
+
+# The mode a save of what the editor loads would leave, for the check before
+# it opens: strict, open or off. No policy anywhere reads as strict, since
+# turning egress on is what the editor is for. Only a mode off, the box's own
+# or the one it inherits, reads as off. In subshells: a file that does not
+# parse exits.
+_egress_entry_mode() {                   # <box or empty>
+  local m="" g
+  if [ -n "$1" ]; then
+    m="$( ( _egress_read_file "$_EGRESS_BOXES_DIR/$(_egress_target_cname "$1")" egress >/dev/null 2>&1 && printf '%s' "$_m_mode" ) || true )"
+  fi
+  case "${m:-absent}" in
+    absent|inherit)
+      g="$( ( _egress_read_file "$CLEAT_GLOBAL_CONFIG" egress >/dev/null 2>&1 && printf '%s' "$_m_mode" ) || true )"
+      m="${g:-absent}" ;;
+  esac
+  case "$m" in absent) printf strict ;; *) printf '%s' "$m" ;; esac
+}
+
+# The editor entry. It never opens when a save would be refused: the same
+# check the writer makes, for the mode a save of what it loads would leave.
+# A box or a policy that is off opens, and a save that turns it on is still
+# refused at the review. Then the full screen when the window can hold it,
+# the typed picker otherwise.
 _egress_editor() {                       # <box or empty>
   local box="$1" rc=0
   _EGE_FILE=""
+  _egress_writer_interlock "$(_egress_entry_mode "$box")" || return 1
   _egress_picker_tui "$box" || rc=$?
   _cursor_show
   return "$rc"
@@ -15528,10 +17521,16 @@ _egress_config_handoff() {               # <on|off|empty>
       _egress_config_enable || return 1
       _egress_have_tty || return 0
       _EGE_SAVED=0
+      _EGS_OUT=""
       _egress_picker_tui "" "" || true
       _cursor_show
       if [ "${_EGE_SAVED:-0}" != 1 ]; then
-        echo -e "  Cancelled. Egress control is on with the Claude Code hosts only."
+        # A save with nothing to change is not a cancel.
+        if [ "${_EGS_OUT:-}" = none ]; then
+          echo -e "  Egress control is on with the Claude Code hosts only."
+        else
+          echo -e "  Cancelled. Egress control is on with the Claude Code hosts only."
+        fi
         echo -e "  ${DIM}Add what your boxes need with ${BOLD}cleat egress${RESET}${DIM}, or turn it off from this row.${RESET}"
       fi ;;
     off)

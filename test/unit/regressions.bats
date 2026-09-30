@@ -9940,6 +9940,8 @@ _c19_star_project() {
   mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
   printf '[egress]\nmode = strict\npack = github\n' > "$CLEAT_GLOBAL_CONFIG"
   _egress_editor_load ""
+  # An edit in the editor, so its save has something to write.
+  _egress_toggle pack:npm
   run _egress_cmd_edit deny "" docs.example.test
   assert_success
   run _egress_save_screen 1
@@ -9947,6 +9949,142 @@ _c19_star_project() {
   assert_output --partial "changed in another terminal"
   run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
   assert_output --partial "deny = docs.example.test"
+}
+
+@test "regression vNEXT: the egress editor probed the engine with docker on every key" {
+  # The engine verdict ran in a command substitution in each draw, so the
+  # cache it set was gone the moment the draw ended: three docker round trips
+  # on every key, the lag the editor had on a Mac.
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  _term_rows() { echo 30; }
+  _term_cols() { echo 100; }
+  _egress_editor_load ""
+  _egress_measure
+  : > "$DOCKER_CALLS"
+  local k
+  for k in DOWN DOWN SPACE DOWN RIGHT LEFT UP UP LEFT RIGHT; do
+    _KEY="$k"
+    _egress_tui_key
+    _egress_frame_build "$_EG_CUR"
+  done
+  run cat "$DOCKER_CALLS"
+  assert_output ""
+}
+
+@test "regression vNEXT: the box egress editor drew the global packs unticked and counted 5" {
+  # The box editor read the box's own file alone: with a global policy of
+  # strict, github, npm and docs.rs it showed both packs unticked and "5
+  # hosts", while the box resolved to 11.
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  printf '[egress]\nmode = strict\npack = github\npack = npm\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_editor_load main
+  run _egress_is_ticked npm
+  assert_success
+  assert_equal "$_EGE_COUNT" 11
+  _egress_resolve "$(_egress_target_cname main)"
+  run bash -c 'printf "%s\n" "$1" | grep -c .' _ "$_EG_HOSTS"
+  assert_output "$_EGE_COUNT"
+}
+
+@test "regression vNEXT: a declined or refused open in the box egress editor wrote the box file" {
+  # The box ring on open wrote the box file first and asked about open after,
+  # so a no, or a stopped box, still left a file behind with a mode nobody
+  # chose.
+  mkdir -p "$TEST_TEMP/proj" "$_EGRESS_BOXES_DIR"
+  cd "$TEST_TEMP/proj"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _set_box main
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  _egress_label_read() { _EG_LABEL_SET=1; return 0; }
+  is_running() { return 1; }
+  _egress_editor_load main
+  _egress_host_add extra.example.com
+  _EGE_MODE=open
+  run _egress_save_screen 0 <<< "y"
+  assert_failure
+  assert_output --partial "is not running"
+  run test -e "$_EGE_FILE"
+  assert_failure
+  is_running() { return 0; }
+  run _egress_save_screen 0 <<< "n"
+  assert_failure
+  run test -e "$_EGE_FILE"
+  assert_failure
+}
+
+@test "regression vNEXT: an off save from the egress editor dropped the ticks its review showed" {
+  # The global off wrote the file's own lists, not the editor's, so what was
+  # ticked on the way to off vanished from the file.
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  printf '[egress]\nmode = strict\npack = npm\n' > "$CLEAT_GLOBAL_CONFIG"
+  _egress_caged_boxes() { :; }
+  _egress_editor_load ""
+  _egress_toggle pack:go
+  _EGE_MODE=off
+  run _egress_save_screen 1 <<< "y"
+  assert_success
+  run _egress_section_canon "$CLEAT_GLOBAL_CONFIG"
+  assert_output "mode = off
+pack = go
+pack = npm"
+}
+
+@test "regression vNEXT: a box following every box into off was saved on a default Enter" {
+  # A box with a mode of its own stepped back to inherit while every box was
+  # off: the save plan read the ring's literal value, so Save? [Y/n] took a
+  # plain Enter and the box's cage was gone without the off confirmation.
+  mkdir -p "$TEST_TEMP/proj" "$_EGRESS_BOXES_DIR"
+  cd "$TEST_TEMP/proj"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nmode = strict\n' > "$_EGRESS_BOXES_DIR/$cn"
+  cp "$_EGRESS_BOXES_DIR/$cn" "$TEST_TEMP/before"
+  _egress_editor_load main
+  _egress_mode_step -1
+  run _egress_save_screen 0 <<< ""
+  assert_failure
+  run cmp "$_EGRESS_BOXES_DIR/$cn" "$TEST_TEMP/before"
+  assert_success
+}
+
+@test "regression vNEXT: a pack shown off for a box stayed allowed in its file" {
+  # The hosts a box denied to turn a pack off were worked out once, at the
+  # key. Unticking the host that was covering one of them left it reachable
+  # through the pack while the review said the pack was off.
+  mkdir -p "$TEST_TEMP/proj" "$_EGRESS_BOXES_DIR"
+  cd "$TEST_TEMP/proj"
+  local cn
+  cn="$(_egress_target_cname main)"
+  printf '[egress]\nmode = strict\npack = homebrew\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nallow = ghcr.io\n' > "$_EGRESS_BOXES_DIR/$cn"
+  _egress_editor_load main
+  _egress_toggle pack:homebrew
+  _egress_toggle host:ghcr.io
+  _egress_save_screen 1 >/dev/null
+  _egress_resolve "$cn"
+  run _egress_in_list ghcr.io "$_EG_HOSTS"
+  assert_failure
+}
+
+@test "regression vNEXT: the capability refusal named a command that left box main's own section on" {
+  # [box.main.caps] replaces [caps] for main, and the refusal named
+  # cleat config --project, which edits [caps] and leaves main as it was.
+  _EGRESS_ENFORCING=1
+  mkdir -p "$TEST_TEMP/proj"
+  cd "$TEST_TEMP/proj"
+  printf '[caps]\ngit\n[box.main.caps]\ndocker\n' > .cleat
+  _CLI_TRUST_PROJECT=1
+  _set_box main
+  run _egress_writer_interlock strict
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "cleat config main --disable docker"
+  refute_output --partial "cleat config --project --disable docker"
 }
 
 @test "regression vNEXT: the validated engine set shipped wider than its checklist rows" {

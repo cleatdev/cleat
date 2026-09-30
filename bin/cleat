@@ -16578,8 +16578,12 @@ _egress_prompt_line() {                  # <label>
             # the line is what is taken: a paste of bücher.de never quietly
             # becomes bcher.de.
             [ "${#_EG_IN}" -lt 253 ] && _EG_IN="$_EG_IN?"
-            _egress_prompt_refusal "Only plain ASCII can be typed here."
-            _egress_draw "$_EG_CUR" ;;
+            # The frame is drawn again only when the refusal first shows, so
+            # a long paste is not a redraw a byte.
+            if [ "${_EG_PP[2]:-}" != "✘ Only plain ASCII can be typed here." ]; then
+              _egress_prompt_refusal "Only plain ASCII can be typed here."
+              _egress_draw "$_EG_CUR"
+            fi ;;
         esac ;;
     esac
     if [ "$_EG_WINCH" = 1 ]; then

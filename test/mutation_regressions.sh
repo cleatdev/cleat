@@ -17090,6 +17090,13 @@ try "vnext_egress_prompt_placeholder" "a key that is not plain ASCII shows as" "
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_prompt_line()/,/^}$/{
+  s@^            if \[ "[$]{_EG_PP\[2\]:-}" != "✘ Only plain ASCII can be typed here\." \]; then$@            if true; then@
+}
+SED
+try "vnext_egress_prompt_refusal_once" "a key that is not plain ASCII shows as" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_prompt_line()/,/^}$/{
   s@-lt 253 \] && _EG_IN="[$]_EG_IN[$]c"@-lt 99999 ] \&\& _EG_IN="$_EG_IN$c"@
 }
 SED

@@ -917,6 +917,11 @@ allow = registry.yarnpkg.com"
   # Wide characters never widen the line past the window.
   local o
   _egress_add_prompt < <(printf '%s\033' "$(printf '例%.0s' $(seq 1 40))") > "$TEST_TEMP/out" || true
+  # The frame is drawn twice, when the prompt opens and when the refusal
+  # first shows, not once a byte: a long paste stays cheap, which bash 3.2
+  # needs.
+  run grep -o $'\033\\[H' "$TEST_TEMP/out"
+  assert_equal "${#lines[@]}" 2
   # A refusal draws the frame again from the top left, so split there too.
   o="$(cat "$TEST_TEMP/out")"
   o="${o//$'\033[29;1H'/$'\n'}"

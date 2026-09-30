@@ -193,7 +193,9 @@ jobs:
   test-macos-bash32:
     name: test (macos, bash 3.2) shard ${{ matrix.shard }}
     runs-on: macos-15
-    timeout-minutes: 45
+    # Shard 3 carries egress_ui.bats and regressions.bats and took 34 minutes
+    # on 2026-09-30, after a test that redrew once a byte ran it past 45.
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:

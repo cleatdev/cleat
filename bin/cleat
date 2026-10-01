@@ -613,23 +613,56 @@ _restore_terminal() {
 }
 
 # ── Keypress reader for TUI ────────────────────────────────────────────────
+# After an escape byte, the rest of the key into _ESC_REST: empty for Esc
+# alone. One byte at a time, each within a second, because bash 3.2 drops
+# what a longer read got when it times out, which turned Option+Left (ESC b)
+# into Esc and closed whatever was open. ESC [ is read to its last byte
+# (ESC [ A, ESC [ 3 ~, ESC [ 1 ; 5 C), ESC O takes one byte more, any other
+# byte is an Alt or Option chord. Esc twice is Esc. A second ESC that starts
+# a sequence or a chord is an Option chord (some terminals send Option+Up as
+# ESC ESC [ A): it is read whole and marked, never Esc, since a picker takes
+# Esc as cancel and a chord must never throw edits away. Every key reader
+# calls it. No subshell.
+_read_esc_rest() {
+  local b="" n=0
+  _ESC_REST=""
+  IFS= read -rsn1 -t 1 b 2>/dev/null || return 0
+  case "$b" in
+    "") return 0 ;;
+    $'\e')
+      _read_esc_rest
+      [ -n "$_ESC_REST" ] && _ESC_REST="M$_ESC_REST"
+      return 0 ;;
+    "["|O) _ESC_REST="$b" ;;
+    *) _ESC_REST="$b"; return 0 ;;
+  esac
+  # A parameter byte (a digit or ;) means more follows, up to the final byte.
+  while [ "$n" -lt 16 ]; do
+    b=""
+    IFS= read -rsn1 -t 1 b 2>/dev/null || return 0
+    _ESC_REST="$_ESC_REST$b"
+    case "$_ESC_REST" in O?) return 0 ;; esac
+    case "$b" in [0123456789\;]) ;; *) return 0 ;; esac
+    n=$((n + 1))
+  done
+  return 0
+}
+
 _read_keypress() {
   local key
   IFS= read -rsn1 key 2>/dev/null || true
   if [[ "$key" == $'\e' ]]; then
-    # Read the rest of the escape sequence in one call.
-    # Arrow keys send \e[A/B/C/D. Read up to 2 chars with a timeout.
-    # Only a BARE Escape (nothing follows) is ESC. Every unrecognized
-    # sequence (PgUp \e[5~, F-keys, Home/End) must be OTHER: mapping the
-    # unknown to ESC made any stray arrow or function key close the
-    # pickers, because the TUI loops treat ESC as cancel.
-    local seq=""
-    IFS= read -rsn2 -t 1 seq 2>/dev/null || true
-    case "$seq" in
-      "[A") echo "UP" ;;
-      "[B") echo "DOWN" ;;
-      "[C") echo "RIGHT" ;;
-      "[D") echo "LEFT" ;;
+    # Only a BARE Escape (nothing follows within a second, or Esc twice) is
+    # ESC. Every unrecognized sequence (PgUp \e[5~, F-keys, Home/End) and an
+    # Alt or Option chord must be OTHER: mapping the unknown to ESC made any
+    # stray arrow or function key close the pickers, because the TUI loops
+    # treat ESC as cancel.
+    _read_esc_rest
+    case "$_ESC_REST" in
+      "[A"|OA) echo "UP" ;;
+      "[B"|OB) echo "DOWN" ;;
+      "[C"|OC) echo "RIGHT" ;;
+      "[D"|OD) echo "LEFT" ;;
       "")   echo "ESC" ;;
       *)    echo "OTHER" ;;
     esac
@@ -15604,34 +15637,6 @@ _egress_mode_step() {                    # <-1|1>
 
 # ── Keys ──
 
-# After an escape byte, the rest of the key into _EGQ: empty for Esc alone.
-# One byte at a time, each within a second, because bash 3.2 drops what a
-# longer read got when it times out, which turned Option+Left (ESC b) into
-# Esc. ESC [ is read to its last byte (ESC [ A, ESC [ 3 ~, ESC [ 1 ; 5 C),
-# ESC O takes one byte more, any other byte is an Alt or Option chord. A
-# second ESC is an Esc of its own: the sequence it starts is read and
-# dropped, so an arrow pressed just after Esc leaves nothing behind.
-_egress_esc_rest() {
-  local b="" n=0
-  _EGQ=""
-  IFS= read -rsn1 -t 1 b 2>/dev/null || return 0
-  case "$b" in
-    "") return 0 ;;
-    $'\e') _egress_esc_rest; _EGQ=""; return 0 ;;
-    "["|O) _EGQ="$b" ;;
-    *) _EGQ="$b"; return 0 ;;
-  esac
-  while [ "$n" -lt 8 ]; do
-    b=""
-    IFS= read -rsn1 -t 1 b 2>/dev/null || return 0
-    _EGQ="$_EGQ$b"
-    case "$_EGQ" in O?) return 0 ;; esac
-    case "$b" in [0123456789\;]) ;; *) return 0 ;; esac
-    n=$((n + 1))
-  done
-  return 0
-}
-
 # The editor's key reader, in this shell: _KEY gets exactly the words
 # _read_keypress prints, with no subshell. End of input is QUIT, never ENTER:
 # enter saves here.
@@ -15640,8 +15645,8 @@ _egress_key() {
   if ! IFS= read -rsn1 k 2>/dev/null; then _KEY=QUIT; return 0; fi
   case "$k" in
     $'\e')
-      _egress_esc_rest
-      case "$_EGQ" in
+      _read_esc_rest
+      case "$_ESC_REST" in
         "[A"|OA) _KEY=UP ;;
         "[B"|OB) _KEY=DOWN ;;
         "[C"|OC) _KEY=RIGHT ;;
@@ -16564,8 +16569,8 @@ _egress_prompt_line() {                  # <label>
       $'\e')
         # Esc alone goes back. An arrow, another key sequence or an Alt
         # chord is read whole and dropped, so none of it lands in the line.
-        _egress_esc_rest
-        [ -z "$_EGQ" ] && { rc=1; break; } ;;
+        _read_esc_rest
+        [ -z "$_ESC_REST" ] && { rc=1; break; } ;;
       $'\177'|$'\b') _EG_IN="${_EG_IN%?}" ;;
       $'\025') _EG_IN="" ;;
       $'\004') [ -z "$_EG_IN" ] && { rc=1; break; } ;;
@@ -33253,7 +33258,13 @@ _config_picker_draw() {
   # Reserved rather than conditional because the TUI repositions by a constant
   # number of lines, so a note that appeared and vanished would desync the whole
   # redraw. Amber at the top tier, dim below it.
-  local note_line note_i=0
+  # The note is read whole before the first line is drawn. A process
+  # substitution here kept its child running while the lines were written. On
+  # bash 3.2 the signal of that child ending can interrupt a write to the
+  # terminal (no SA_RESTART): echo fails and strict mode ends the editor
+  # halfway through a frame, unsaved toggles lost.
+  local note_line note_i=0 notes
+  notes="$(_config_mem_note "$mem" "$vm_gb")"
   while IFS= read -r note_line; do
     note_i=$((note_i + 1))
     [[ $note_i -le 2 ]] || break
@@ -33263,7 +33274,7 @@ _config_picker_draw() {
       "")        echo "" ;;
       *)         echo -e "  ${DIM}${note_line}${RESET}" ;;
     esac
-  done < <(_config_mem_note "$mem" "$vm_gb")
+  done <<< "$notes"
   while [[ $note_i -lt 2 ]]; do
     note_i=$((note_i + 1))
     printf '\033[2K'; echo ""

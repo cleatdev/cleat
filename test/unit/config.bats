@@ -499,6 +499,35 @@ EOF
   [[ "$result" == "ESC" ]] || { echo "got: $result"; return 1; }
 }
 
+@test "_read_keypress: arrows in either form, Esc alone or twice, chords and longer sequences" {
+  local s
+  for s in $'\e[A:UP' $'\eOA:UP' $'\e[B:DOWN' $'\eOB:DOWN' $'\e[C:RIGHT' $'\eOC:RIGHT' $'\e[D:LEFT' $'\eOD:LEFT' $'\e:ESC' $'\e\e:ESC' $'\e\e[B:OTHER' $'\eb:OTHER' $'\e[1;5C:OTHER' $'\e[15~:OTHER'; do
+    run _read_keypress <<< "${s%:*}"
+    assert_output "${s##*:}"
+  done
+  # A longer sequence is read to its end, so the key after it is the next key.
+  local two
+  two="$( { _read_keypress; _read_keypress; } < <(printf '\033[15~q') )"
+  run printf '%s' "$two"
+  assert_output "OTHER
+QUIT"
+  # A long one too, with nine bytes after the bracket (xterm's
+  # modifyOtherKeys form): none of it is left to read as a key.
+  two="$( { _read_keypress; _read_keypress; } < <(printf '\033[27;5;127~q') )"
+  run printf '%s' "$two"
+  assert_output "OTHER
+QUIT"
+  # Each byte waits a second at most: ESC O with nothing after is a chord,
+  # and the key typed later is a key of its own. fd 7: bats owns fd 3.
+  local k1 k2
+  exec 7< <(printf '\033O'; sleep 2; printf 'q')
+  k1="$(_read_keypress <&7)"
+  k2="$(_read_keypress <&7)"
+  exec 7<&-
+  assert_equal "$k1" OTHER
+  assert_equal "$k2" QUIT
+}
+
 # ── _write_resources_to_file ───────────────────────────────────────────────
 
 @test "write_resources: writes memory and cpus" {

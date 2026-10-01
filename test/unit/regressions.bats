@@ -3064,6 +3064,53 @@ EOF
   assert_output "OTHER"
 }
 
+# The pickers' key reader read the rest of an escape with `read -rsn2 -t 1`.
+# bash 3.2, the macOS default, throws away what such a read got when it
+# times out, so Option+Left (Terminal.app sends ESC b, one byte) read as a
+# bare Esc and closed the picker with nothing saved. And Esc then an arrow
+# inside the second read ESC [ as the sequence and left the arrow's last
+# byte to be read as a key of its own. Fix: _read_esc_rest reads one byte at
+# a time. ESC then a whole sequence is one chord, never Esc. The first part
+# reproduces on bash 3.2 only (bash 5 keeps the partial read), the second on
+# every bash. fd 7: bats owns fd 3.
+@test "regression vNEXT: Option+Left closed the pickers on bash 3.2 and Esc then an arrow left a stray key" {
+  local k1 k2 two
+  exec 7< <(printf '\033b'; sleep 2; printf 'q')
+  k1="$(_read_keypress <&7)"
+  k2="$(_read_keypress <&7)"
+  exec 7<&-
+  assert_equal "$k1" OTHER
+  assert_equal "$k2" QUIT
+  two="$( { _read_keypress; _read_keypress; } < <(printf '\033\033[Bq') )"
+  run printf '%s' "$two"
+  assert_output "OTHER
+QUIT"
+}
+
+# bash 3.2 installs its SIGCHLD handler without SA_RESTART. A child that ends
+# while the shell writes to the terminal makes that write fail with EINTR,
+# echo returns 1 and strict mode ends `cleat config` halfway through a frame
+# with its unsaved toggles. The editor drew its memory note from a process
+# substitution, whose child was still running while the note's lines were
+# written. Found on bash 3.2 in a pseudo-terminal. Here every write fails
+# while the note's process is alive, which is the same race made certain.
+@test "regression vNEXT: the config editor wrote its memory note while the process making it still ran" {
+  _config_mem_note() {
+    : > "$TEST_TEMP/note-alive"
+    printf 'note: first line\n      second line\n'
+    sleep 1
+    rm -f "$TEST_TEMP/note-alive"
+  }
+  echo() {
+    if [ -e "$TEST_TEMP/note-alive" ]; then return 1; fi
+    builtin echo "$@"
+  }
+  run _config_picker_draw 0 "" 8g all 0 0
+  assert_success
+  assert_output --partial "note: first line"
+  assert_output --partial "second line"
+}
+
 # v0.1.0 baked in-box guidance (docker/CLAUDE.md: the clipboard-bridge rules)
 # at /home/coder/.claude/CLAUDE.md in the image, and v0.1.0 also mounted the
 # host's ~/.claude directory over that same path, which shadows everything

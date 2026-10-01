@@ -3988,7 +3988,7 @@ try "vnext_kit_show_usage_note" "usage verification note" "$CLI" "$KITS_BATS"
 # branch to ESC recreates the bug where a stray right-arrow closed both TUI
 # pickers outright (their event loops treat ESC as cancel).
 cat > "$SED_TMP" << 'SED'
-s|"\[C") echo "RIGHT" ;;|"[C") echo "ESC" ;;|
+s@"\[C"|OC) echo "RIGHT" ;;@"[C"|OC) echo "ESC" ;;@
 SED
 try "v1.2.0_keypress_right_not_esc" "never cancel the pickers"
 
@@ -16976,7 +16976,7 @@ try "vnext_egress_offbox_redeny_regr" "a pack shown off for a box stayed allowed
 # Esc goes back from a prompt at once, leaving what is typed next unread.
 cat > "$SED_TMP" << 'SED'
 /^_egress_prompt_line()/,/^}$/{
-  s@^        \[ -z "[$]_EGQ" \] && { rc=1; break; } ;;$@        : ;;@
+  s@^        \[ -z "[$]_ESC_REST" \] && { rc=1; break; } ;;$@        : ;;@
 }
 SED
 try "vnext_egress_prompt_esc_regr" "Esc did not leave the egress editor's add-a-host prompt"
@@ -16996,8 +16996,8 @@ SED
 try "vnext_egress_prompt_ctrl_u" "a prompt edits its line a key at a time" "$CLI" "$EGRESS_UI_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_esc_rest()/,/^}$/{
-  s@^  while \[ "[$]n" -lt 8 \]; do$@  while [ "$n" -lt 0 ]; do@
+/^_read_esc_rest()/,/^}$/{
+  s@^  while \[ "[$]n" -lt 16 \]; do$@  while [ "$n" -lt 0 ]; do@
 }
 SED
 try "vnext_egress_prompt_seq_rest" "a prompt edits its line a key at a time" "$CLI" "$EGRESS_UI_BATS"
@@ -17053,21 +17053,21 @@ try "vnext_egress_hosts_page_lines" "a saturated page draws one line fewer than 
 
 # Esc read one byte at a time: a second Esc is Esc, a chord is not.
 cat > "$SED_TMP" << 'SED'
-/^_egress_esc_rest()/,/^}$/{
-  s@^    [$]'\\e') _egress_esc_rest; _EGQ=""; return 0 ;;$@    $'\\e') _EGQ=x; return 0 ;;@
+/^_read_esc_rest()/,/^}$/{
+  s@^      \[ -n "[$]_ESC_REST" \] && _ESC_REST="M[$]_ESC_REST"$@      _ESC_REST=x@
 }
 SED
-try "vnext_egress_esc_twice" "Esc with a key right after it is still Esc" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_esc_twice" "Esc twice is Esc while Esc with an arrow" "$CLI" "$EGRESS_UI_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_esc_rest()/,/^}$/{
-  s@^    \*) _EGQ="[$]b"; return 0 ;;$@    *) _EGQ=""; return 0 ;;@
+/^_read_esc_rest()/,/^}$/{
+  s@^    \*) _ESC_REST="[$]b"; return 0 ;;$@    *) _ESC_REST=""; return 0 ;;@
 }
 SED
-try "vnext_egress_esc_chord" "Esc with a key right after it is still Esc" "$CLI" "$EGRESS_UI_BATS"
+try "vnext_egress_esc_chord" "Esc twice is Esc while Esc with an arrow" "$CLI" "$EGRESS_UI_BATS"
 
 cat > "$SED_TMP" << 'SED'
-/^_egress_esc_rest()/,/^}$/{
+/^_read_esc_rest()/,/^}$/{
   s@^    case "[$]b" in \[0123456789\\;\]) ;; \*) return 0 ;; esac$@    return 0@
 }
 SED
@@ -17137,6 +17137,64 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_measure_host_room" "a 21 row terminal refuses the TUI and the text picker runs" "$CLI" "$EGRESS_UI_BATS"
+
+# The pickers' key reader reads an escape a byte at a time (_read_esc_rest).
+cat > "$SED_TMP" << 'SED'
+/^_read_keypress()/,/^}$/{
+  s@^    _read_esc_rest$@    IFS= read -rsn2 -t 1 _ESC_REST 2>/dev/null || true@
+}
+SED
+try "vnext_read_keypress_esc_bytes_regr" "Left closed the pickers on bash"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_esc_rest()/,/^}$/{
+  s@^      \[ -n "[$]_ESC_REST" \] && _ESC_REST="M[$]_ESC_REST"$@      _ESC_REST=""@
+}
+SED
+try "vnext_read_keypress_chord_not_esc_regr" "Left closed the pickers on bash"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  done <<< "[$]notes"$@  done < <(_config_mem_note "$mem" "$vm_gb")@
+}
+SED
+try "vnext_config_note_whole_regr" "the config editor wrote its memory note while the process"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_keypress()/,/^}$/{
+  s@^      "\[A"|OA) echo "UP" ;;$@      "[A") echo "UP" ;;@
+}
+SED
+try "vnext_read_keypress_ss3" "arrows in either form, Esc alone or twice" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_keypress()/,/^}$/{
+  s@^      "\[C"|OC) echo "RIGHT" ;;$@      "[C") echo "RIGHT" ;;@
+}
+SED
+try "vnext_read_keypress_ss3_right" "arrows in either form, Esc alone or twice" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_key()/,/^}$/{
+  s@^        "\[C"|OC) _KEY=RIGHT ;;$@        "[C") _KEY=RIGHT ;;@
+}
+SED
+try "vnext_egress_key_ss3_right" "the key reader tells Esc from arrows" "$CLI" "$EGRESS_UI_BATS"
+
+# Each byte after an escape waits a second at most, up to sixteen of them.
+cat > "$SED_TMP" << 'SED'
+/^_read_esc_rest()/,/^}$/{
+  s@^    IFS= read -rsn1 -t 1 b 2>/dev/null || return 0$@    IFS= read -rsn1 b 2>/dev/null || return 0@
+}
+SED
+try "vnext_read_esc_byte_timeout" "arrows in either form, Esc alone or twice" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_read_esc_rest()/,/^}$/{
+  s@^  while \[ "[$]n" -lt 16 \]; do$@  while [ "$n" -lt 4 ]; do@
+}
+SED
+try "vnext_read_esc_long_sequence" "arrows in either form, Esc alone or twice" "$CLI" "$CONFIG_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

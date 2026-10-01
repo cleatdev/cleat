@@ -862,15 +862,14 @@ allow = registry.yarnpkg.com"
   assert_output --partial "Nothing saved."
 }
 
-@test "egress picker: Esc with a key right after it is still Esc and an Alt chord is dropped" {
+@test "egress picker: Esc twice is Esc while Esc with an arrow or a letter types nothing" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   _rows_of 30
   _egress_editor_load ""
   _egress_measure
   local rest rc=0
-  # Esc, then an arrow inside Esc's second: still Esc. The arrow is read
-  # whole, so none of it lands anywhere.
-  exec 7< <(printf 'docs.rs\033\033[B'; sleep 2; printf 'x\n')
+  # Esc twice goes back. What is typed later stays unread.
+  exec 7< <(printf 'docs.rs\033\033'; sleep 2; printf 'x\n')
   _egress_add_prompt <&7 > "$TEST_TEMP/out" || rc=$?
   IFS= read -r rest <&7 || true
   exec 7<&-
@@ -878,6 +877,12 @@ allow = registry.yarnpkg.com"
   assert_equal "$rest" "x"
   run printf '%s' "$_EGE_HOSTS"
   assert_output ""
+  # Esc then an arrow inside Esc's second is how some terminals send
+  # Option+Down. It is read whole and types nothing: no stray B.
+  _egress_add_prompt < <(printf 'docs.rs\033\033[B\n') > "$TEST_TEMP/out"
+  run printf '%s' "$_EGE_HOSTS"
+  assert_output "docs.rs"
+  _egress_editor_load ""
   # Option+Left in Terminal.app sends ESC b. It moves nothing here and must
   # not close the prompt, though no second byte follows within the second:
   # bash 3.2 threw away the b and read it as Esc.
@@ -890,7 +895,7 @@ allow = registry.yarnpkg.com"
 
 @test "egress picker: the key reader tells Esc from arrows, chords and longer sequences" {
   local s want
-  for s in $'\e[A:UP' $'\eOA:UP' $'\eOB:DOWN' $'\e[C:RIGHT' $'\eOD:LEFT' $'\e:ESC' $'\eb:OTHER' $'\e[3~:OTHER' $'\e[1;5C:OTHER' $'\e\e[B:ESC' $'\e\e:ESC'; do
+  for s in $'\e[A:UP' $'\eOA:UP' $'\e[B:DOWN' $'\eOB:DOWN' $'\e[C:RIGHT' $'\eOC:RIGHT' $'\e[D:LEFT' $'\eOD:LEFT' $'\e:ESC' $'\eb:OTHER' $'\e[3~:OTHER' $'\e[1;5C:OTHER' $'\e\e[B:OTHER' $'\e\e:ESC'; do
     want="${s##*:}"
     _egress_key <<< "${s%:*}"
     assert_equal "$_KEY" "$want"
@@ -1139,7 +1144,7 @@ allow = registry.yarnpkg.com"
 
 @test "egress picker: the editor key reader decodes every sequence as _read_keypress does" {
   local s want
-  for s in $'\e[A' $'\e[B' $'\e[C' $'\e[D' $'\e[5~' $'\e' ' ' 'q' 'Q' 'x'; do
+  for s in $'\e[A' $'\e[B' $'\e[C' $'\e[D' $'\eOA' $'\eOB' $'\eOC' $'\eOD' $'\e[5~' $'\e[1;5C' $'\eb' $'\e\e' $'\e\e[B' $'\e' ' ' 'q' 'Q' 'x'; do
     want="$(printf '%s' "$s" | _read_keypress)"
     _KEY=""
     _egress_key < <(printf '%s' "$s")

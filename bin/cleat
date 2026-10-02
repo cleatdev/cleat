@@ -110,6 +110,16 @@ _EGRESS_PROXY_URL="http://127.0.0.1:3128"
 _EGRESS_NO_PROXY="localhost,127.0.0.1,::1"
 _EGRESS_PROXY_ENV=(-e "HTTPS_PROXY=$_EGRESS_PROXY_URL" -e "https_proxy=$_EGRESS_PROXY_URL"
   -e "http_proxy=$_EGRESS_PROXY_URL" -e "NO_PROXY=$_EGRESS_NO_PROXY" -e "no_proxy=$_EGRESS_NO_PROXY")
+# The settings spec 7.3 pairs with the hosts the core pack leaves out, so
+# Claude Code in a caged box never tries them and no session ends on a denial
+# nobody can act on: the usage and error intakes, claude.ai connectors and the
+# Artifact tool. Telemetry off also turns off Claude Code's feature flags,
+# which Remote Control needs. Caged execs only, never an uncaged box. A user
+# [env] or --env value comes later on the exec line and wins, so an empty
+# DISABLE_TELEMETRY= turns telemetry back on. The [setup] exec carries them
+# too, less any the user names (_egress_paired_env_setup).
+_EGRESS_PAIRED_ENV=(-e "DISABLE_TELEMETRY=1" -e "DISABLE_ERROR_REPORTING=1"
+  -e "ENABLE_CLAUDEAI_MCP_SERVERS=false" -e "CLAUDE_CODE_DISABLE_ARTIFACT=1")
 # Anchor for classifying PRE-STAMPING images (built before sh.cleat.image-spec
 # existed, so they carry no spec label): their content is inferred from the
 # version they were built at. v0.16.3 was the LAST docker/ content change before
@@ -4621,6 +4631,10 @@ _fork_preflight() {
     # speak. The refusal below is deliberately NOT gated this way: refusing to
     # silently re-bind the live tree matters whether or not a container exists.
     if container_exists "$cname"; then
+      # The heal removes the box and cmd_run then creates it. A refusal that
+      # create would meet comes first and keeps the box. The caps are not
+      # resolved yet, so the check is handed the project.
+      _egress_refuse_before_teardown "$cname" "${_RESOLVED_PROJECT:-}" || exit 1
       info "Fork workspace is missing, recreating it"
       _egress_teardown "$cname" keep || true
     fi
@@ -6832,10 +6846,32 @@ _resolve_config_drift() {
   fi
 
   if _is_tty; then
+    # Before the offer, never after it: a yes removes the box at once. Either
+    # answer would meet the same refusal, which must destroy nothing.
+    _egress_refuse_before_recreate "$cname" || exit 1
     info "${BOLD}Config changed${RESET} since ${BOLD}${cname}${RESET} was created: ${_why}"
-    local yn=""
-    _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
+    local yn="" _eg_refresh=0
+    # The recreate makes a caged box. A caged create refuses an image older
+    # than the relay, so on one this question carries the image refresh and
+    # the image prompt stays quiet. An upgrade still asks once (ruling 1).
+    if [ "$_EGRESS_FP_CAGED" = 1 ] && image_exists && ! _egress_image_relay_ready; then
+      _eg_refresh=1
+      _REBUILD_PROMPTED=1
+      info "The cleat image predates the egress relay, so the recreate refreshes it first ${DIM}(downloads the prebuilt v${VERSION}, or builds it locally)${RESET}"
+      _ask_yn yn "Refresh the image and recreate ${BOLD}${cname}${RESET} now? [Y/n] "
+    else
+      _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now? [Y/n] "
+    fi
     if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+      # Before the box goes: a refresh that fails or still lacks the relay
+      # leaves it in place and refuses the way the create would.
+      if [ "$_eg_refresh" = 1 ]; then
+        _do_pull "$VERSION" || _do_build
+        _egress_image_has_relay || exit 1
+      fi
+      # The caged create needs the gateway image and refuses a pull that
+      # fails. Made local now, that refusal keeps the box.
+      if [ "$_EG_BEFORE_CAGED" = 1 ]; then _egress_gateway_image_ensure || exit 1; fi
       info "Recreating container..."
       if is_running "$cname"; then
         docker stop "$cname" > /dev/null 2>&1 || true
@@ -6907,6 +6943,8 @@ _maybe_prompt_image_rebuild() {
   # arithmetic error to stderr on the otherwise-silent start path.
   [[ "$stored_spec" =~ ^[0-9]+$ ]] || return 0
   (( 10#$stored_spec < 10#$_IMAGE_SPEC_VERSION )) || return 0
+  # A yes removes the box, so a refusal the launch would meet comes first.
+  _egress_refuse_before_recreate "$cname" || exit 1
   _REBUILD_PROMPTED=1
 
   info "Cleat image is out of date: its setup predates this release ${DIM}(image content changed, not just the version)${RESET}"
@@ -6923,6 +6961,9 @@ _maybe_prompt_image_rebuild() {
     # Drop the existing container so the start flow recreates it from the fresh
     # image (its bind mounts and base layer are baked in at creation time).
     if container_exists "$cname"; then
+      # A caged create also needs the gateway image. A failed pull refuses,
+      # so it comes before the box goes.
+      if [ "$_EG_BEFORE_CAGED" = 1 ]; then _egress_gateway_image_ensure || exit 1; fi
       is_running "$cname" && docker stop "$cname" > /dev/null 2>&1 || true
       _egress_stop "$cname"
       _egress_teardown "$cname" keep || true
@@ -6951,6 +6992,8 @@ _maybe_prompt_init_recreate() {
   hostconfig="$(docker inspect --format '{{json .HostConfig}}' "$cname" 2>/dev/null)" || return 0
   [[ -n "$hostconfig" ]] || return 0
   [[ "$hostconfig" == *'"Init":true'* ]] && return 0
+  # A yes removes the box, so a refusal the launch would meet comes first.
+  _egress_refuse_before_teardown "$cname" || exit 1
   _INIT_RECREATE_PROMPTED=1
 
   info "Box ${BOLD}${cname}${RESET} predates the zombie reaper ${DIM}(long sessions can freeze at the pids cap)${RESET}"
@@ -11369,41 +11412,99 @@ _egress_shim_alive() {
 # The gate's shim step: advisory, never a refusal. A relay the gateway has
 # never heard is a box or gateway that has just started, so that is waited for
 # (the relay beats every second for its first ten), which keeps [setup] and the
-# first exec from racing it. A stale relay prints the one remedy. Always 0: a
-# heartbeat is the box's word, and cleat shell must still open on a broken box.
+# first exec from racing it. So is the relay of a box this launch has just
+# started (<started> 1). A gateway that kept running while that box was down
+# still holds the last run's heartbeat. Once the last heartbeat is more than
+# 90 s old (from about 60 s after the stop, as the relay beats every 30 s) it
+# reads stale, which says nothing about the relay starting now. Sooner than
+# that it still reads alive and nothing is waited on. A stale relay in a box
+# that was already running prints the one remedy at once. No answer is never
+# waited on. Always 0: a heartbeat is the box's word. cleat shell must still
+# open on a broken box.
 _EG_SKIP_SHIM_NOTE=0
-_egress_shim_note() {                    # <cname>
-  local gw ticks=0 max=0
+_egress_shim_note() {                    # <cname> [started]
+  local gw ticks=0 max=0 started="${2:-0}"
   # restart --shim runs the gate first and is itself the remedy.
   [ "$_EG_SKIP_SHIM_NOTE" = 1 ] && return 0
   gw="$(_egress_gateway_name "$1")"
   if _egress_shim_alive "$gw"; then return 0; fi
-  if [ "$_EG_SHIM_AGE" = "-1" ]; then
-    max=$(( _EGRESS_HEALTH_WAIT_SECS * 5 ))
-    while [ "$ticks" -lt "$max" ]; do
-      sleep 0.2
-      if _egress_shim_alive "$gw"; then return 0; fi
-      [ "$_EG_SHIM_AGE" = "-1" ] || break
-      ticks=$(( ticks + 1 ))
-    done
-  fi
-  warn "Shim not listening  ${DIM}the in-box relay has not been heard from${RESET}"
-  echo -e "    ${DIM}Requests fail before they reach the policy. This is not a policy denial.${RESET}"
-  echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart --shim${RESET}"
+  max=$(( _EGRESS_HEALTH_WAIT_SECS * 5 ))
+  while [ "$ticks" -lt "$max" ]; do
+    case "$_EG_SHIM_AGE" in
+      -1) ;;
+      ''|*[!0-9]*) break ;;
+      *) [ "$started" = 1 ] || break ;;
+    esac
+    sleep 0.2
+    if _egress_shim_alive "$gw"; then return 0; fi
+    ticks=$(( ticks + 1 ))
+  done
+  _egress_shim_words
   return 0
 }
 
-# A caged box's execs carry the relay's address (3.1). Only after a gate that
-# passed, and once however many times it is called. The variables carry no
-# security weight: the box has no network, and a user [env] value that
-# overrides them only cuts the box off.
+# A relay the gateway heard once and has not heard for longer than the stale
+# bound (8.6). The surfaces that speak after the fact read only this: the
+# session end and the Egress row of cleat status. -1 is a gateway that has not
+# heard the relay since it started. After an on-failure restart that is a
+# working relay whose next beat is up to 30 s away, so the gate waits on it
+# and these stay quiet. No answer is no reading at all. The raw answer stays
+# in _EG_SHIM_AGE.
+_egress_shim_stale() {                   # <gateway>
+  _egress_shim_alive "$1" && return 1
+  case "$_EG_SHIM_AGE" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+# The advisory for a relay that is not heard from, in one place: the gate
+# prints it before a session and the session-end report after one. A missed
+# heartbeat is all it knows. With only the relay's heartbeat loop down,
+# requests still work, so it never says that they fail.
+_egress_shim_words() {
+  warn "Shim not listening  ${DIM}the in-box relay has not been heard from${RESET}"
+  echo -e "    ${DIM}If requests fail, they fail before they reach the policy.${RESET}"
+  echo -e "    ${DIM}This is not a policy denial.${RESET}"
+  echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart --shim${RESET}"
+}
+
+# A caged box's execs carry the relay's address (3.1) and the settings 7.3
+# pairs with its exclusions. Only after a gate that passed, once however many
+# times it is called. The variables carry no security weight. The box has no
+# network, so a user [env] value that overrides them only cuts the box off or
+# brings a denial back.
 _egress_proxy_env_add() {
   [ "${_EG_CAGED:-0}" = 1 ] || return 0
   local a
   for a in "${CLAUDE_ENV[@]+"${CLAUDE_ENV[@]}"}"; do
     [ "$a" = "HTTPS_PROXY=$_EGRESS_PROXY_URL" ] && return 0
   done
-  CLAUDE_ENV+=("${_EGRESS_PROXY_ENV[@]}")
+  CLAUDE_ENV+=("${_EGRESS_PROXY_ENV[@]}" "${_EGRESS_PAIRED_ENV[@]}")
+}
+
+# The settings 7.3 pairs with the excluded hosts, for the [setup] exec, where a
+# `claude` command in the payload would try those hosts too. Nothing of the
+# user's follows them on that line, so a setting the user's [env] or --env
+# names is left out and the value the box was created with wins, as the user's
+# value wins on a session exec. The user's keys are resolved in a subshell from
+# host files alone, with no docker call. The caller's _RESOLVED_ENV_ARGS and
+# warnings stay as they were. Sets _EG_SETUP_PAIRED.
+_EG_SETUP_PAIRED=()
+_egress_paired_env_setup() {             # <project>
+  local user e kv i=0 n=${#_EGRESS_PAIRED_ENV[@]} nl='
+'
+  user="$(resolve_env_args "$1" >/dev/null 2>&1
+    for e in "${_RESOLVED_ENV_ARGS[@]+"${_RESOLVED_ENV_ARGS[@]}"}"; do
+      [ "$e" = -e ] || printf '%s\n' "${e%%=*}"
+    done)" || user=""
+  _EG_SETUP_PAIRED=()
+  while [ "$i" -lt "$n" ]; do
+    kv="${_EGRESS_PAIRED_ENV[$((i + 1))]}"
+    case "$nl$user$nl" in
+      *"$nl${kv%%=*}$nl"*) ;;
+      *) _EG_SETUP_PAIRED+=(-e "$kv") ;;
+    esac
+    i=$((i + 2))
+  done
 }
 
 # ── The gateway image (8.0) ──
@@ -11624,12 +11725,16 @@ _egress_mark_creating() {                # <cname>
 
 # The relay starts from the box image's entrypoint, so a caged box on an image
 # older than the relay has no way out at all. The refresh prompt is TTY-only
-# and can be declined, so the caged create refuses here instead.
-_egress_image_has_relay() {
+# and can be declined, so the caged create refuses here instead. The silent
+# test alone also tells a caged recreate to refresh the image first.
+_egress_image_relay_ready() {
   local _s
   _s="$(_image_spec_version)"
   case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
-  if [ "$((10#$_s))" -ge "$_EGRESS_SHIM_IMAGE_SPEC" ]; then return 0; fi
+  [ "$((10#$_s))" -ge "$_EGRESS_SHIM_IMAGE_SPEC" ]
+}
+_egress_image_has_relay() {
+  if _egress_image_relay_ready; then return 0; fi
   _egress_refuse box "the cleat image predates the relay a caged box reaches its gateway through." \
     "${BOLD}cleat rebuild${RESET} refreshes the image, then re-run cleat"
   return 1
@@ -11678,12 +11783,19 @@ _egress_refuse() {                       # <code> <reason> <fix>
   echo -e "    ${DIM}Fix:${RESET}  $3"
 }
 
+# A box created under a policy that no longer resolves.
+_egress_refuse_unresolved() {
+  _egress_refuse policy "it was created under an egress policy that no longer resolves." \
+    "${BOLD}cleat egress off${RESET} recreates it with a normal network, or restore the [egress] section"
+}
+
 # The one answer to row three that continues (5.6): on a terminal, from start
 # or resume and never from a subshell, the refused box may be recreated under
 # its policy. A recreate site that keeps the box's own files, like every
-# recreate (8.7). rc 0 once the caged box exists, 1 on no or where no offer
+# recreate (8.7). rc 0 once the caged box exists, 1 on no, on an image older
+# than the relay, on a gateway image that cannot be pulled or where no offer
 # is made. Never from the relaunch gate, shell, login, setup or claude: those
-# reach a running session, and a recreate discards the box's writable layer.
+# reach a running session. A recreate discards the box's writable layer.
 # Never twice in one process: a declined recreate prompt stands.
 _egress_recreate_offer() {               # <cname> <verb>
   local _cname="$1" yn=""
@@ -11699,6 +11811,10 @@ _egress_recreate_offer() {               # <cname> <verb>
     ""|[yY]*) ;;
     *) return 1 ;;
   esac
+  # Before the box goes: the caged create refuses an image older than the
+  # relay and a gateway image it cannot pull. A refusal destroys nothing, so
+  # the box stays. The gate has already run the checks that need no image.
+  _egress_images_before_teardown || return 1
   info "Recreating container..."
   if is_running "$_cname"; then docker stop "$_cname" >/dev/null 2>&1 || true; fi
   _egress_teardown "$_cname" keep || return 1
@@ -11992,6 +12108,71 @@ _egress_precreate_check() {              # <cname> <workspace> <mode>
   return 0
 }
 
+# The same checks, asked by a default-yes recreate prompt before it offers.
+# A yes removes the box at once and the create behind it refuses only after
+# it is gone. A no meets the same refusal at the gate. Either way the launch
+# refuses, so the refusal comes first and the box survives it: a refusal
+# creates and destroys nothing. A recreate that asks nothing (host paths
+# changed, cleat run on a stopped box) asks this before its teardown for the
+# same reason. Prints it and returns 1. Returns 0 under no live policy or with
+# the daemon down, where the gate refuses nothing either, with one exception.
+# A box that carries the egress label was created under a policy. The gate
+# refuses it once none resolves. Every recreate would bring it back with a
+# normal network and no label, which the gate then passes, so this refuses it
+# the same way. The label is read only where a rendered policy says the box was
+# caged here, so a machine that never turned egress on gains no docker call.
+# The workspace is the one cmd_run checks. A caller that has not resolved this
+# launch's caps passes its project. They are resolved here, only once a policy
+# is live, so the interlocks read them and an off machine resolves nothing new.
+# Leaves _EG_BEFORE_CAGED at 1 when the recreate behind it makes a caged box.
+_EG_BEFORE_CAGED=0
+_egress_refuse_before_recreate() {       # <cname> [project]
+  local _ws
+  _EG_BEFORE_CAGED=0
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  _egress_resolve "$1"
+  case "$_EG_MODE" in
+    strict|open) ;;
+    *)
+      [ -d "$(_egress_policy_dir "$1")" ] || return 0
+      _egress_label_read "$1" sh.cleat.egress-hash || return 0
+      [ "$_EG_LABEL_SET" = 1 ] || return 0
+      _egress_refuse_unresolved
+      return 1 ;;
+  esac
+  _daemon_up || return 0
+  _EG_BEFORE_CAGED=1
+  if [ -n "${2:-}" ]; then resolve_caps "$2"; fi
+  _ws="${2:-${_RESOLVED_PROJECT:-}}"
+  if [[ "${_FORK_REQUESTED:-false}" == true ]] || _box_is_fork "$1" 2>/dev/null; then
+    _ws="$(_fork_dir "$1")"
+  fi
+  _egress_precreate_check "$1" "$_ws" "$_EG_MODE"
+}
+
+# The two images a caged create needs, checked before a teardown. The create
+# refuses a box image older than the relay and a gateway image it cannot pull,
+# both only after the box is gone. A refusal destroys nothing, so both come
+# first. A missing box image is no refusal: cmd_run acquires this release's,
+# which carries the relay. The gateway image costs nothing when it is here.
+_egress_images_before_teardown() {
+  if image_exists; then _egress_image_has_relay || return 1; fi
+  _egress_gateway_image_ensure || return 1
+}
+
+# The check before a teardown that refreshes no image: cmd_start and
+# cmd_resume when host paths moved, cleat run on a stopped box, the reaper
+# prompt, the Claude Code upgrade recreate, the fork heal, the kit rebuild and
+# the gate's own recreate offer. Nothing behind those offers the image refresh
+# that fixes an old image, so it refuses one here, with the box intact. The
+# image refresh prompts ask _egress_refuse_before_recreate alone: an old image
+# there is offered its refresh, never refused.
+_egress_refuse_before_teardown() {       # <cname> [project]
+  _egress_refuse_before_recreate "$@" || return 1
+  [ "$_EG_BEFORE_CAGED" = 1 ] || return 0
+  _egress_images_before_teardown
+}
+
 # The gate. Returns 0 when the feature is off for this box (no policy resolves
 # and the box carries no sh.cleat.egress-hash label), when the daemon is down,
 # while enforcement has not shipped and a policy resolves, or when every
@@ -11999,7 +12180,7 @@ _egress_precreate_check() {              # <cname> <workspace> <mode>
 # caller exits 1 (the relaunch loop breaks instead). Runs after the verb's
 # resolve_caps, at statement position, before the verb's first docker exec.
 _EG_CAGED=0
-_egress_require() {                      # <cname> <verb>
+_egress_require() {                      # <cname> <verb> [started]
   local _c="$1" _kind _ws
   _EG_REFUSED=""
   _EG_CAGED=0
@@ -12019,8 +12200,7 @@ _egress_require() {                      # <cname> <verb>
       # fails on the verb's own docker calls.
       _egress_label_read "$_c" sh.cleat.egress-hash || return 0
       [ "$_EG_LABEL_SET" = 1 ] || return 0
-      _egress_refuse policy "it was created under an egress policy that no longer resolves." \
-        "${BOLD}cleat egress off${RESET} recreates it with a normal network, or restore the [egress] section"
+      _egress_refuse_unresolved
       return 1 ;;
   esac
   _ws="${_RESOLVED_PROJECT:-}"
@@ -12036,7 +12216,7 @@ _egress_require() {                      # <cname> <verb>
   _egress_gateway_ok "$_c" || return 1
   _egress_pin_launch "$_c" || return 1
   _egress_live_ok "$_c" "$_EG_MODE" "$_EG_HOSTS" || return 1
-  _egress_shim_note "$_c"
+  _egress_shim_note "$_c" "${3:-0}"
   _EG_CAGED=1
   return 0
 }
@@ -12354,7 +12534,9 @@ _egress_unmeasured_line() {
 # The reason codes a denial row carries (9.2), and the only place one becomes
 # words. A code a newer gateway sends that this CLI does not know prints as
 # itself, sanitised, so a row never vanishes. sni names no command: it is a
-# security event, never something to allow.
+# security event, never something to allow. The gateway writes the same
+# upstream row when the name does not resolve as when no address it resolved
+# to answers, so its words must hold for both.
 _EGRESS_REASON_CODES="policy port sni handshake-flood address upstream gateway"
 _EGRESS_SNI_SUBCODES="no-sni dup-sni sni-mismatch bad-clienthello handshake-timeout no-clienthello"
 _egress_reason_text() {                  # <code>
@@ -12364,7 +12546,7 @@ _egress_reason_text() {                  # <code>
     sni) printf 'the TLS handshake asked for a different name than the tunnel. A security event, not a policy denial' ;;
     handshake-flood) printf 'a client rewrote its handshake inside a tunnel already granted. A security event, not a policy denial' ;;
     address) printf 'the name resolved to a private, loopback or link-local address, refused in every mode' ;;
-    upstream) printf 'allowed, resolved within the last 60 seconds and unreachable' ;;
+    upstream) printf 'allowed, but the name did not resolve, or none of its addresses from the last 60 seconds answered' ;;
     gateway) printf 'the gateway is not serving. This is not a policy denial.' ;;
     *) printf '%s' "$(_sanitize_repo_str "$1")" ;;
   esac
@@ -12956,13 +13138,18 @@ EOF
 # Once a machine-wide policy is live, every box made without egress control
 # refuses to start until it is recreated. Named now, at the write, rather
 # than one at a time at each launch. Each with where its project is, since
-# the recreate runs from there.
+# the recreate runs from there. A box among them that is running keeps the
+# network it was created with until it stops, so its row says running and
+# the note says what that means.
 _egress_refusing_boxes_note() {
-  local kind n meta role lbl src bx rows="" count=0
+  local kind n meta role lbl src bx rows="" count=0 running=0 up mark nl=$'\n'
   [ "$_EGRESS_ENFORCING" = 1 ] || return 0
   _daemon_up || return 0
   kind="$(_egress_engine_kind)"
   _egress_engine_validated "$kind" || return 0
+  # The running boxes, read once and bounded like each probe below. A list
+  # that cannot be read marks none of them, rather than guessing.
+  up="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker ps --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null)" || up=""
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect --format \
@@ -12979,7 +13166,11 @@ _egress_refusing_boxes_note() {
     _egress_resolve "$n"
     case "$_EG_MODE" in strict|open) ;; *) continue ;; esac
     count=$((count + 1))
-    rows+="      $(_sessions_safe_str "$n")   $(_egress_recreate_words "$n" "${bx:-main}")   ${DIM}$(_sessions_safe_str "${src/#${HOME}/~}")${RESET}"$'\n'
+    mark=""
+    case "$nl$up$nl" in
+      *"$nl$n$nl"*) running=$((running + 1)); mark="   ${DIM}running${RESET}" ;;
+    esac
+    rows+="      $(_sessions_safe_str "$n")   $(_egress_recreate_words "$n" "${bx:-main}")   ${DIM}$(_sessions_safe_str "${src/#${HOME}/~}")${RESET}${mark}"$'\n'
   done < <(docker ps -a --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null || true)
   [ "$count" -gt 0 ] || return 0
   if [ "$count" -eq 1 ]; then
@@ -12989,9 +13180,39 @@ _egress_refusing_boxes_note() {
   fi
   echo -e "    until it is recreated:"
   printf '%b' "$rows"
+  _egress_uncaged_running_lines "$running" "$count"
   _EG_REFUSING=$count
 }
 _EG_REFUSING=0
+
+# A policy saved while a box made without egress control runs does not reach
+# it. No gate runs inside a session already open. The box keeps the network
+# Docker gave it at create until it stops. Said at the save, so a policy
+# written beside a long unattended run is not read as caging it.
+_egress_uncaged_running_lines() {        # <running> <listed>
+  [ "${1:-0}" -gt 0 ] || return 0
+  if [ "${2:-1}" -eq 1 ]; then
+    echo -e "    It is running, so it keeps its full network until it stops."
+  elif [ "$1" -eq 1 ]; then
+    echo -e "    One of them is running, so it keeps its full network until it stops."
+  else
+    echo -e "    $1 of them are running. Each keeps its full network until it stops."
+  fi
+  if [ "$1" -eq 1 ]; then
+    echo -e "    A session already open in it is not caged."
+  else
+    echo -e "    A session already open in one is not caged."
+  fi
+}
+
+# One box made without egress control that a policy now reaches: it refuses
+# to start until it is recreated. While it runs it keeps its full network.
+# Said by the box editor's save and by --inherit alike.
+_egress_uncaged_box_lines() {            # <box> <cname>
+  echo -e "    Box $(_sessions_safe_str "$1") was created without egress control and refuses to start until"
+  echo -e "    it is recreated:  $(_egress_recreate_words "$2" "$1")"
+  if is_running "$2"; then _egress_uncaged_running_lines 1 1; fi
+}
 
 # cleat egress restart [box]: replace the gateway of a box that stays. The
 # remedy for a gateway missing, stopped under a running box or displaced. It
@@ -14188,7 +14409,7 @@ _egress_age_words() {                    # <secs>
 # command in the box. It runs on a refused engine, with the gateway down and
 # with Docker down, and never probes the engine when no policy resolves.
 _egress_status_render() {                # <cname>
-  local cname="$1" lbl=0 kind="" gw="" state="" live=0 n packs pinned="" shared h word p bx
+  local cname="$1" lbl=0 kind="" gw="" state="" live=0 n packs typed="" shared h word p bx
   local box="${_BOX:-main}" meta rc_n oom img ups age want got counts
   _egress_resolve "$cname"
   gw="$(_egress_gateway_name "$cname")"
@@ -14283,7 +14504,9 @@ _egress_status_render() {                # <cname>
   fi
   if [ "$_EG_MODE" = strict ]; then
     echo -e "  Packs:     ${packs:-none}"
-    # The hosts no pack brought: the ones typed in directly.
+    # The hosts no pack brought: the ones typed in directly, the editor's Hosts.
+    # Never called pinned: the pin holds the core and the packs (7.5), never
+    # these. The Held row below is the one that speaks of the pin.
     local inpacks="" pk
     while IFS= read -r pk; do
       [ -n "$pk" ] || continue
@@ -14293,12 +14516,12 @@ $_EG_PACKS
 EOF
     while IFS= read -r h; do
       [ -n "$h" ] || continue
-      _egress_in_list "$h" "$inpacks" || pinned+="$h, "
+      _egress_in_list "$h" "$inpacks" || typed+="$h, "
     done <<EOF
 $_EG_HOSTS
 EOF
-    if [ -n "$pinned" ]; then pinned="${pinned%, }"; else pinned=none; fi
-    echo -e "  Pinned:    ${pinned}"
+    if [ -n "$typed" ]; then typed="${typed%, }"; else typed=none; fi
+    echo -e "  Hosts:     ${typed}"
     echo -e "  Allowed:   ${n} hosts, port 443 only"
     shared=""
     while IFS= read -r h; do
@@ -14389,6 +14612,17 @@ _egress_status_summary_row() {           # <cname>
   if [ "$state" = stopped ] && ! is_running "$1"; then return 0; fi
   if [ "$state" != healthy ]; then
     echo -e "             ${AMBER}! gateway ${state}. This is not a policy denial.${RESET}  ${DIM}cleat egress status${RESET}"
+    return 0
+  fi
+  # A healthy gateway behind a relay it has not heard from for longer than
+  # the stale bound is the silent failure (8.6): a dead relay fails every
+  # request before it reaches the gateway. This screen is an advisory verb
+  # (5.7), so it names it the way it names a gateway that is not serving,
+  # with the one fix. A gateway that has not heard the relay since it started
+  # (-1), or no answer, is not a stale relay: _egress_shim_stale. The line
+  # stays inside 80 columns, the width of a default Terminal.app window.
+  if _egress_shim_stale "$(_egress_gateway_name "$1")"; then
+    echo -e "             ${AMBER}! shim not listening (not a denial)${RESET}  ${DIM}cleat egress restart --shim${RESET}"
   fi
   return 0
 }
@@ -14449,7 +14683,9 @@ _egress_status_gateway_row() {           # <cname> <gateway> <state>
 }
 
 # The relay row of status. A heartbeat comes from inside the box, so the row
-# is health only and says so in both shapes.
+# is health only and says so in both shapes. A late heartbeat names no cause:
+# a dead relay and a socket that no longer admits the box's uid look the same
+# from here. restart --shim runs the gate first, which tells them apart.
 _egress_status_shim_row() {              # <gateway>
   local seen
   if _egress_shim_alive "$1"; then
@@ -14460,11 +14696,12 @@ _egress_status_shim_row() {              # <gateway>
   case "$_EG_SHIM_AGE" in
     -1) seen="never seen by this gateway" ;;
     ''|*[!0-9]*) seen="the gateway did not answer" ;;
-    *) seen="last seen $(_egress_age_words "$_EG_SHIM_AGE") ago, the in-box relay did not come back" ;;
+    *) seen="last seen $(_egress_age_words "$_EG_SHIM_AGE") ago, no heartbeat since" ;;
   esac
   echo -e "  ${AMBER}!${RESET} Shim not listening    ${seen}"
   echo -e "                          ${DIM}(health only, not proof)${RESET}"
-  echo -e "    Requests fail before they reach policy. Not a policy denial."
+  echo -e "    If requests fail, they fail before they reach policy."
+  echo -e "    Not a policy denial."
   echo -e "    ${DIM}Fix:${RESET}  ${BOLD}cleat egress restart --shim${RESET}"
 }
 
@@ -14545,6 +14782,7 @@ _egress_cmd_inherit() {                  # <box> <assume_yes>
     fi
     rm -f "$file" "$pin" 2>/dev/null || true
     success "Box ${BOLD}${box}${RESET} now inherits the global egress policy."
+    _egress_inherit_uncaged_note "$box" "$cname"
     return 0
   fi
   _egress_resolve "$cname"
@@ -14575,7 +14813,26 @@ _egress_cmd_inherit() {                  # <box> <assume_yes>
   fi
   rm -f "$file" "$pin" 2>/dev/null || true
   success "Box ${BOLD}${box}${RESET} now inherits the global egress policy."
+  _egress_inherit_uncaged_note "$box" "$cname"
   _egress_apply_now "$cname"
+}
+
+# After --inherit, once enforcement is live: a box made without egress
+# control that the global policy now reaches is told so, as the box editor's
+# save tells it. A reload reaches caged boxes only, so without this a running
+# box under a strict policy would keep its full network and nothing would
+# say so. A label that cannot be read says nothing rather than guess.
+_egress_inherit_uncaged_note() {         # <box> <cname>
+  [ "$_EGRESS_ENFORCING" = 1 ] || return 0
+  _daemon_up || return 0
+  _egress_engine_validated "$(_egress_engine_kind)" || return 0
+  container_exists "$2" || return 0
+  _egress_label_read "$2" sh.cleat.egress-hash || return 0
+  [ "$_EG_LABEL_SET" = 1 ] && return 0
+  ( _egress_resolve "$2" ) >/dev/null 2>&1 || return 0
+  _egress_resolve "$2"
+  case "$_EG_MODE" in strict|open) ;; *) return 0 ;; esac
+  _egress_uncaged_box_lines "$1" "$2"
 }
 
 # ── The editor (6.1, 6.4) ──────────────────────────────────────────────────
@@ -17243,8 +17500,7 @@ _egress_save_consequence() {             # <saved mode>
     return 0
   fi
   if [ -n "$cname" ] && [ "$lbl" = 0 ] && container_exists "$cname"; then
-    echo -e "    Box $(_sessions_safe_str "$_EGE_BOX") was created without egress control and refuses to start until"
-    echo -e "    it is recreated:  $(_egress_recreate_words "$cname")"
+    _egress_uncaged_box_lines "$_EGE_BOX" "$cname"
     return 0
   fi
   _egress_apply_now "$cname"
@@ -17483,7 +17739,8 @@ _EGRESS_CONFIG_ROW_LINES=2
 # The row's state as "<tick>|<words>": tick 1 when the resolved global mode is
 # strict or open, 0 when it is off, x when the section cannot be resolved. In
 # a subshell, because a malformed policy exits the resolver and must not take
-# the config editor down with it.
+# the config editor down with it. The words stay within 63 characters, the
+# room the row has at 80 columns, so its pointer to a verb is never cut there.
 _egress_config_row_state() {
   local out
   out="$( (
@@ -17495,7 +17752,7 @@ _egress_config_row_state() {
     strict\|*) printf '1|strict   %s hosts, %s packs.  cleat egress edits the list' "$(printf '%s' "$out" | cut -d'|' -f2)" "$(( $(printf '%s' "$out" | cut -d'|' -f3) + 1 ))" ;;
     open\|*) printf '1|open     every TLS host allowed and every one logged' ;;
     off\|*) printf '0|off      new boxes reach your whole network' ;;
-    *) printf 'x|invalid  the [egress] section does not resolve.  cleat egress status' ;;
+    *) printf 'x|invalid  [egress] does not resolve.  cleat egress status' ;;
   esac
 }
 
@@ -17511,13 +17768,13 @@ _egress_config_row_text() {              # <on now> <on as loaded> <loaded state
 }
 
 # The typed config picker's line: the state, and the verb that changes it.
+# Apart from off it prints the TUI row's own words, so the two never disagree.
 _egress_config_text_line() {
   local st
   st="$(_egress_config_row_state)"
   case "${st%%|*}" in
     0) echo -e "  ${DIM}Egress: off (new boxes reach your whole network).  Turn it on with: cleat egress${RESET}" ;;
-    1) echo -e "  ${DIM}Egress: ${st#*|}${RESET}" ;;
-    *) echo -e "  ${DIM}Egress: the [egress] section does not resolve.  cleat egress status${RESET}" ;;
+    *) echo -e "  ${DIM}Egress: ${st#*|}${RESET}" ;;
   esac
 }
 
@@ -18959,6 +19216,10 @@ _maybe_run_setup() {
   # gate at the top of this function set _EG_CAGED.
   local _setup_env=(-e HOME=/home/coder)
   if [ "${_EG_CAGED:-0}" = 1 ]; then _setup_env+=("${_EGRESS_PROXY_ENV[@]}"); fi
+  if [ "${_EG_CAGED:-0}" = 1 ]; then
+    _egress_paired_env_setup "$project"
+    _setup_env+=("${_EG_SETUP_PAIRED[@]+"${_EG_SETUP_PAIRED[@]}"}")
+  fi
   docker exec "${_setup_env[@]}" -w /workspace "$cname" \
     runuser -u coder -- bash -e "$runfile" || rc=$?
   docker exec "$cname" runuser -u coder -- rm -f "$runfile" >/dev/null 2>&1 || true
@@ -20319,15 +20580,34 @@ _maybe_report_capped_images() {
 # the session took before it started, the validated rows. Every number is a
 # count taken here, every value is sanitised again before it reaches the
 # terminal, and a refused handshake is a security event, never a host to
-# allow. The claim-void line prints even when nothing was denied. Silent
-# otherwise when there is nothing to say, and when the mark is missing,
-# because a window without its start would re-report earlier sessions.
+# allow. A silent relay and the claim-void line print even when nothing was
+# denied. Silent otherwise when there is nothing to say or when the mark is
+# missing, because a window without its start would re-report earlier sessions.
 _EGRESS_REPORT_MAX=3
+
+# A relay that went silent while the session ran (8.6, residual 22). Its
+# gateway stayed healthy and wrote no denial, so the session met network
+# errors that named no cause. The end of the session names it in the gate's
+# own words with the one fix. Only behind a healthy gateway: a stopped box, a
+# down daemon or a gateway fault is not the relay's. Status names each of those.
+# Only for a heartbeat older than the stale bound: a gateway restarted during
+# the session answers -1 until the relay's next beat. No answer is no reading
+# either (_egress_shim_stale).
+_maybe_report_egress_relay() {           # <cname>
+  [ "$(_egress_gateway_state "$1")" = healthy ] || return 0
+  _egress_shim_stale "$(_egress_gateway_name "$1")" || return 0
+  echo ""
+  _egress_shim_words
+  return 0
+}
+
 _maybe_report_egress_denials() {         # <cname> <mark_gen> <mark_off>
   local cname="$1" mark_gen="$2" mark_off="$3" gw copy off rows sum k a b
   local sec_n=0 sec_sni=1 pol_n=0 port_n=0 srows="" prows="" pairs="" h t p w line shown
   gw="$(_egress_gateway_name "$cname")"
   copy="$CLEAT_RUN_DIR/$cname/egress/denials.log"
+  # A dead relay first: it is why every request of the session failed.
+  _maybe_report_egress_relay "$cname"
   if [ "$(_egress_claim_void "$cname")" = void ]; then
     echo ""
     _egress_claim_void_line "$cname"
@@ -21319,6 +21599,10 @@ cmd_upgrade_claude() {
       local yn=""
       _ask_yn yn "Recreate ${BOLD}${cname}${RESET} now to use it? [Y/n] "
       if [[ -z "$yn" || "$yn" == [yY]* ]]; then
+        # The create in cmd_run refuses what a live policy forbids, so that
+        # refusal comes before the box goes. Only a yes asks it: a no keeps
+        # the box and creates nothing.
+        _egress_refuse_before_teardown "$cname" "$project" || exit 1
         if is_running "$cname"; then
           docker stop "$cname" > /dev/null 2>&1 || true
         fi
@@ -21629,6 +21913,12 @@ cmd_run() {
   fi
 
   if container_exists "$cname"; then
+    # The create below refuses what a live policy forbids, but only after this
+    # removal. A refusal destroys nothing, so it comes first. This path has not
+    # resolved its caps yet, so the check resolves them for the interlocks.
+    # The image prompt below also comes after it, so an image older than the
+    # relay is refused here rather than offered its refresh.
+    _egress_refuse_before_teardown "$cname" "$project" || exit 1
     _egress_teardown "$cname" keep || { error "Could not remove the stopped container ${BOLD}${cname}${RESET}."; exit 1; }
   fi
 
@@ -22469,6 +22759,12 @@ cmd_start() {
       # the name for a link that this start would mount
       # (_history_bind_in_session_dir). Only a recreate changes a bind source.
       if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
+        # The create in cmd_run refuses what a live policy forbids. Some of it
+        # (the engine, the digest tool, where the policy sits, the images) is
+        # in no fingerprint, so no drift prompt asked it first. A refusal
+        # destroys nothing, so it comes before the teardown, on a terminal or
+        # off one.
+        _egress_refuse_before_teardown "$cname" || exit 1
         info "Recreating container ${DIM}(host paths changed)"
         _egress_teardown "$cname" keep || true
         cmd_run "$project"
@@ -22494,6 +22790,9 @@ cmd_start() {
           [[ -s "$_docker_err" ]] && error "${DIM}$(cat "$_docker_err")${RESET}"
           rm -f "$_docker_err"
           if _is_tty; then
+            # A yes removes the box. A refusal its create would meet, such as
+            # a box created under a policy that no longer resolves, comes first.
+            _egress_refuse_before_teardown "$cname" || exit 1
             echo ""
             local yn=""
             _ask_yn yn "Remove container and start fresh? [Y/n] "
@@ -22521,8 +22820,9 @@ cmd_start() {
 
   # The egress gate (EGRESS-SPEC.md 5.7): after resolve_caps, before anything
   # execs into the box and before the summary. A box this start brought up
-  # and the gate refuses is stopped again.
-  if ! _egress_require "$cname" start; then
+  # and the gate refuses is stopped again. Its relay is starting now, which
+  # the gate waits for.
+  if ! _egress_require "$cname" start "$_eg_started"; then
     if [ "$_eg_started" = 1 ]; then _egress_unstart "$cname"; fi
     exit 1
   fi
@@ -22609,6 +22909,9 @@ cmd_resume() {
       # host-only history store is recreated once, as in cmd_start
       # (_history_bind_in_session_dir).
       if ! _settings_overlay_intact "$cname" || ! _container_bind_sources_present "$cname" || _history_bind_in_session_dir "$cname"; then
+        # A refusal the create would meet comes before the teardown, as in
+        # cmd_start.
+        _egress_refuse_before_teardown "$cname" || exit 1
         info "Recreating container ${DIM}(host paths changed)${RESET}"
         _egress_teardown "$cname" keep || true
         cmd_run "$project"
@@ -22644,8 +22947,9 @@ cmd_resume() {
 
   # The egress gate (EGRESS-SPEC.md 5.7): after resolve_caps, before anything
   # execs into the box and before the summary. A box this resume brought up
-  # and the gate refuses is stopped again.
-  if ! _egress_require "$cname" resume; then
+  # and the gate refuses is stopped again. Its relay is starting now, which
+  # the gate waits for.
+  if ! _egress_require "$cname" resume "$_eg_started"; then
     if [ "$_eg_started" = 1 ]; then _egress_unstart "$cname"; fi
     exit 1
   fi
@@ -32925,6 +33229,9 @@ cmd_uninstall() {
 }
 
 # ── cleat config ────────────────────────────────────────────────────────────
+# One line per cap. The editor cuts a row to the window, so a description fits
+# whole at 80 columns only within 69 characters less the cap's name (60 for
+# unsafe-rm). The words that matter most come first.
 _cap_description() {
   case "$1" in
     git)    echo "Mount ~/.gitconfig (read-only) for commit identity" ;;
@@ -32933,7 +33240,7 @@ _cap_description() {
     hooks)  echo "Run the hooks in ~/.claude/settings.json on the host" ;;
     gh)     echo "GitHub CLI auth (persists across rm/nuke/rebuild)" ;;
     docker) echo "Host Docker socket (breaks sandbox) to test Docker apps" ;;
-    unsafe-rm) echo "Run rm without the delete-safety prompt (global/CLI only, disarms a guard)" ;;
+    unsafe-rm) echo "Disarm the rm delete-safety prompt (global/CLI only)" ;;
     *)      echo "(unknown capability)" ;;
   esac
 }
@@ -33171,13 +33478,48 @@ _config_row_kind() {
   fi
 }
 
+# One text cut to <width> columns into _CFGT, with … where it was cut. Empty
+# when not one column is left. It counts characters, so every text it gets is
+# ASCII: a resource value read from a file shows each non-ASCII byte as ?
+# first. No subshell: the draw calls it for every row of every frame.
+_config_fit() {                          # <text> <width>
+  if (( $2 < 1 )); then
+    _CFGT=""
+  elif (( ${#1} <= $2 )); then
+    _CFGT="$1"
+  else
+    _CFGT="${1:0:$(( $2 - 1 ))}…"
+  fi
+}
+
+# A memory or cpus value as the editor draws it, into _CFGV: sanitized, with
+# each byte outside ASCII shown as ?, so a byte is a column. A wide character
+# is two columns and three bytes: cut by characters, it made the row wider
+# than the window. A value of digits, letters and dots (every ring stop, every
+# real value) is already its own display form. That is decided by a pattern
+# of listed characters, never a range, so the locale cannot widen it. No
+# fork: the draw runs on every key. Only a hand-written value with anything
+# else in it pays for the pipeline.
+_config_value_display() {                # <value>
+  case "$1" in
+    *[!0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.]*)
+      _CFGV="$(_sanitize_repo_str "$1" | LC_ALL=C tr '\200-\377' '?')" ;;
+    *) _CFGV="$1" ;;
+  esac
+}
+
 # Draw the whole editor block: a "Capabilities" group, the cap rows, a blank, a
 # "Resources" group, the memory + cpus rows, and (when show_gen=1) a blank plus
 # the generate row. It always emits the SAME number of physical lines for a given
 # scope (deterministic), which is what lets the TUI's cursor-up/down math be a
-# single scope-derived constant. Every row is one physical line; keep labels short
-# so an 80-column terminal never wraps a row (a wrap desyncs the redraw). New
-# params are read with `${n:-}` defaults so both the 2-arg draw tests and the real
+# single scope-derived constant. So every row must stay ONE physical line. A row
+# wider than the window wraps, after which every key draws the frame a line lower
+# with a copy of the Capabilities header left behind (the unsafe-rm row was 93
+# columns, Terminal.app opens at 80). The TUI passes the window width as $10 and
+# every row is cut one column short of it, as the egress editor cuts its own. The
+# fixed labels that are not cut stay under the 40-column floor of _term_cols.
+# Without $10 only a resource value over 16 characters is cut. New params are
+# read with `${n:-}` defaults so both the 2-arg draw tests and the real
 # strict-mode binary are safe.
 _config_picker_draw() {
   local cursor="$1"
@@ -33189,56 +33531,73 @@ _config_picker_draw() {
   local vm_gb="${7:-}"
   local show_eg="${8:-0}"
   local eg_state="${9:-}"
+  local w=9999
+  case "${10:-}" in ''|0*|*[!0-9]*) ;; *) w=$(( ${10} - 1 )) ;; esac
   local ncaps=${#KNOWN_CAPS[@]}
   local i=0 cap marker
 
+  _config_fit "(space toggles host access)" $(( w - 15 ))
   printf '\033[2K'
-  echo -e "  ${DIM}Capabilities${RESET} ${DIM}(space toggles host access)${RESET}"
+  echo -e "  ${DIM}Capabilities${RESET} ${DIM}${_CFGT}${RESET}"
   while [[ $i -lt $ncaps ]]; do
     cap="${KNOWN_CAPS[$i]}"
     marker="${DIM}·${RESET}"
     case ",${toggled}," in *,"$cap",*) marker="${GREEN}✔${RESET}" ;; esac
+    # Both forms of the row put 8 columns before the name and 2 after it.
+    _config_fit "$(_cap_description "$cap")" $(( w - 10 - ${#cap} ))
     printf '\033[2K'
     if [[ $i -eq $cursor ]]; then
-      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}${cap}${RESET}  $(_cap_description "$cap")"
+      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}${cap}${RESET}  ${_CFGT}"
     else
-      echo -e "    [${marker}] ${cap}  ${DIM}$(_cap_description "$cap")${RESET}"
+      echo -e "    [${marker}] ${cap}  ${DIM}${_CFGT}${RESET}"
     fi
     i=$((i + 1))
   done
 
   printf '\033[2K'; echo ""
   # The value can come from a project .cleat the box can write. Rendered
-  # sanitized, while the raw value stays what the editor saves back.
+  # sanitized (_config_value_display), while the raw value stays what the
+  # editor saves back. Then cut at 16 (a real one is under 8), so the hint
+  # after it always keeps room.
   local _mem_d _cpus_d
-  _mem_d="$(_sanitize_repo_str "$mem")"
-  _cpus_d="$(_sanitize_repo_str "$cpus")"
+  _config_value_display "$mem"; _mem_d="$_CFGV"
+  _config_value_display "$cpus"; _cpus_d="$_CFGV"
+  _config_fit "$_mem_d" 16; _mem_d="$_CFGT"
+  _config_fit "$_cpus_d" 16; _cpus_d="$_CFGT"
   printf '\033[2K'
   echo -e "  ${DIM}Resources${RESET} ${DIM}(←/→ changes the value)${RESET}"
+  # The cursor form is 14 columns before the value and 4 after it, the plain
+  # form 12 and 2.
   printf '\033[2K'
   if [[ $cursor -eq $ncaps ]]; then
-    echo -e "  ${CYAN}▸${RESET} memory  ${BOLD}‹ ${_mem_d} ›${RESET}  ${DIM}(per-box RAM ceiling)${RESET}"
+    _config_fit "(per-box RAM ceiling)" $(( w - 18 - ${#_mem_d} ))
+    echo -e "  ${CYAN}▸${RESET} memory  ${BOLD}‹ ${_mem_d} ›${RESET}  ${DIM}${_CFGT}${RESET}"
   else
-    echo -e "    memory  ${_mem_d}  ${DIM}(per-box RAM ceiling)${RESET}"
+    _config_fit "(per-box RAM ceiling)" $(( w - 14 - ${#_mem_d} ))
+    echo -e "    memory  ${_mem_d}  ${DIM}${_CFGT}${RESET}"
   fi
   printf '\033[2K'
   if [[ $cursor -eq $((ncaps + 1)) ]]; then
-    echo -e "  ${CYAN}▸${RESET} cpus    ${BOLD}‹ ${_cpus_d} ›${RESET}  ${DIM}(core limit; all = no cap)${RESET}"
+    _config_fit "(core limit; all = no cap)" $(( w - 18 - ${#_cpus_d} ))
+    echo -e "  ${CYAN}▸${RESET} cpus    ${BOLD}‹ ${_cpus_d} ›${RESET}  ${DIM}${_CFGT}${RESET}"
   else
-    echo -e "    cpus    ${_cpus_d}  ${DIM}(core limit; all = no cap)${RESET}"
+    _config_fit "(core limit; all = no cap)" $(( w - 14 - ${#_cpus_d} ))
+    echo -e "    cpus    ${_cpus_d}  ${DIM}${_CFGT}${RESET}"
   fi
 
   # The Egress row: a blank and one line, _EGRESS_CONFIG_ROW_LINES. eg_state is
-  # "<0|1>|<text>", the tick and the words after the row name.
+  # "<0|1>|<text>", the tick and the words after the row name, which start at
+  # column 16 in both forms of the row.
   if [[ "$show_eg" == "1" ]]; then
     printf '\033[2K'; echo ""
     marker="${DIM}·${RESET}"
     [[ "${eg_state%%|*}" == "1" ]] && marker="${GREEN}✔${RESET}"
+    _config_fit "${eg_state#*|}" $(( w - 16 ))
     printf '\033[2K'
     if [[ $cursor -eq $((ncaps + 2)) ]]; then
-      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}Egress${RESET}  ${eg_state#*|}"
+      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}Egress${RESET}  ${_CFGT}"
     else
-      echo -e "    [${marker}] Egress  ${DIM}${eg_state#*|}${RESET}"
+      echo -e "    [${marker}] Egress  ${DIM}${_CFGT}${RESET}"
     fi
   fi
 
@@ -33246,11 +33605,12 @@ _config_picker_draw() {
     printf '\033[2K'; echo ""
     marker="${DIM}·${RESET}"
     [[ "$gen_on" == "1" ]] && marker="${GREEN}✔${RESET}"
+    _config_fit "Also write these to this project's .cleat" $(( w - 8 ))
     printf '\033[2K'
     if [[ $cursor -eq $((ncaps + 2 + show_eg)) ]]; then
-      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}Also write these to this project's .cleat${RESET}"
+      echo -e "  ${CYAN}▸${RESET} [${marker}] ${BOLD}${_CFGT}${RESET}"
     else
-      echo -e "    [${marker}] ${DIM}Also write these to this project's .cleat${RESET}"
+      echo -e "    [${marker}] ${DIM}${_CFGT}${RESET}"
     fi
   fi
 
@@ -33268,11 +33628,12 @@ _config_picker_draw() {
   while IFS= read -r note_line; do
     note_i=$((note_i + 1))
     [[ $note_i -le 2 ]] || break
+    _config_fit "$note_line" $(( w - 2 ))
     printf '\033[2K'
     case "$note_line" in
-      warning:*) echo -e "  ${AMBER}${note_line}${RESET}" ;;
+      warning:*) echo -e "  ${AMBER}${_CFGT}${RESET}" ;;
       "")        echo "" ;;
-      *)         echo -e "  ${DIM}${note_line}${RESET}" ;;
+      *)         echo -e "  ${DIM}${_CFGT}${RESET}" ;;
     esac
   done <<< "$notes"
   while [[ $note_i -lt 2 ]]; do
@@ -33461,9 +33822,16 @@ _config_picker_tui() {
   local cursor=0
   _cursor_hide
 
-  _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb" "$show_eg" "$(_egress_config_row_text "$eg_on" "$eg_was" "$eg_state")"
+  # The window width, measured once: the draw cuts every row one column short
+  # of it, because the counted cursor-up below cannot allow for a wrapped row.
+  # The footer counts too: the first reposition climbs over it. Its first 39
+  # columns hold every glyph, so only the plain words after them are cut.
+  local cols
+  cols="$(_term_cols)"
+  _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb" "$show_eg" "$(_egress_config_row_text "$eg_on" "$eg_was" "$eg_state")" "$cols"
   echo ""
-  echo -e "  ${DIM}↑/↓ move  space toggle  ←/→ change  ⏎ save  q cancel${RESET}"
+  _config_fit " save  q cancel" $(( cols - 1 - 39 ))
+  echo -e "  ${DIM}↑/↓ move  space toggle  ←/→ change  ⏎${_CFGT}${RESET}"
   printf '\033[%dA' "$((draw_lines + 2))"
 
   while true; do
@@ -33528,7 +33896,7 @@ _config_picker_tui() {
         return ;;
     esac
 
-    _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb" "$show_eg" "$(_egress_config_row_text "$eg_on" "$eg_was" "$eg_state")"
+    _config_picker_draw "$cursor" "$toggled" "$mem" "$cpus" "$show_gen" "$gen_on" "$vm_gb" "$show_eg" "$(_egress_config_row_text "$eg_on" "$eg_was" "$eg_state")" "$cols"
     printf '\033[%dA' "$draw_lines"
   done
 }
@@ -34775,6 +35143,9 @@ _kit_require_box() {
 _kit_prekit_offer() {
   local kit="$1" box="$2" cname="$3"
   if container_exists "$cname" && ! _container_has_kit_mounts "$cname"; then
+    # A yes removes the box and the next cleat creates it again. A refusal
+    # that create would meet comes before the question, so the box stays.
+    _BOX="$box" _egress_refuse_before_teardown "$cname" "$(resolve_project)" || exit 1
     echo ""
     info "This box was created before kits existed and needs a rebuild to gain"
     echo -e "    the kit mount points. ${DIM}Your project, auth, and sessions are safe;${RESET}"

@@ -18,6 +18,7 @@
 load "../setup"
 load "../lib/handoff_helpers"
 load "../lib/egress_fixtures"
+load "../lib/egress_shim"
 
 setup() {
   _common_setup
@@ -44,6 +45,8 @@ teardown() {
   rm -rf $CLEAT_RUN_DIR/cleat-project-*/hooks 2>/dev/null || true
   rm -rf $CLEAT_RUN_DIR/cleat-project-*/clip 2>/dev/null || true
   hb_teardown_pids 2>/dev/null || true
+  # A relay test that failed before its own stop leaves no relay running.
+  if [ -n "${SHIM_DIR:-}" ]; then _shim_stop || true; fi
   # A race test that failed says what its racing command printed and how far the
   # handshake got. One of these failed once on a CI runner and passed in 300
   # local runs, and its log held only the assertion, so the next one has to
@@ -3109,6 +3112,88 @@ QUIT"
   assert_success
   assert_output --partial "note: first line"
   assert_output --partial "second line"
+}
+
+# Pre-existing in v1.5.4. At 80 columns (Terminal.app's default) the unsafe-rm
+# row of cleat config is 93 columns wide and wrapped. The editor repositions by
+# a counted cursor-up that knows nothing of a wrap, so every key drew the frame
+# one line lower and left a copy of the Capabilities header behind. An [egress]
+# section that does not resolve wrapped the Egress row as well (84 columns).
+# Measured at 60 columns too: both rows now fit whole at 80, so 80 alone would
+# stop telling a cut row from an uncut one.
+@test "regression vNEXT: a config editor row wider than the window wrapped and the frame drifted a line per key" {
+  printf '[egress]\nallow = a.example\n' > "$CLEAT_GLOBAL_CONFIG"
+  _box_scope=""
+  _read_keypress() {
+    local n
+    n="$(cat "$TEST_TEMP/kp" 2>/dev/null || echo 0)"
+    echo $(( n + 1 )) > "$TEST_TEMP/kp"
+    case "$n" in 0|1|2) echo DOWN ;; *) echo QUIT ;; esac
+  }
+  local cols
+  for cols in 60 80; do
+    eval "_term_cols() { echo $cols; }"
+    rm -f "$TEST_TEMP/kp"
+    run _config_picker_tui "$CLEAT_GLOBAL_CONFIG" global ""
+    assert_success
+    assert_output --partial "[egress] does not resolve"
+    # From the first frame down: the Scope line above it names a long test path
+    # and is drawn once, outside the counted region. Escapes out, then every
+    # UTF-8 continuation byte, so a C-locale awk counts one byte per column.
+    run awk '/Capabilities/ { f = 1 } f' <<< "$output"
+    assert_output --partial "unsafe-rm"
+    run env LC_ALL=C awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }' \
+      < <(printf '%s\n' "$output" | sed $'s/\033\\[[0-9;?]*[A-Za-z]//g' | LC_ALL=C tr -d '\200-\277')
+    assert [ "$output" -lt "$cols" ]
+  done
+}
+
+# Pre-existing in v1.5.4. A memory or cpus value comes from a .cleat the box can
+# write, which the editor drew as it was. A wide character is two columns and
+# three bytes, so a value of them made its row wider than the window and the
+# frame drifted as above. The 16-character cut that came first counted
+# characters and did not stop it. Each byte outside ASCII now shows as ?, so a
+# byte is a column.
+@test "regression vNEXT: a wide-character memory or cpus value made a config editor row wider than the window" {
+  local wide="ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴ" c
+  for c in 0 "${#KNOWN_CAPS[@]}" $(( ${#KNOWN_CAPS[@]} + 1 )); do
+    run _config_picker_draw "$c" "" "$wide" "$wide" 0 0 "" 0 "" 60
+    assert_success
+    refute_output --partial "Ａ"
+    local frame="$output"
+    # The memory row and the cpus row, each cut at 16 after the mapping.
+    run grep -c '???????????????…' <<< "$frame"
+    assert_output "2"
+    # Every byte left above ASCII belongs to a one-column glyph now, so this
+    # count is the width.
+    run env LC_ALL=C awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }' \
+      < <(printf '%s\n' "$frame" | sed $'s/\033\\[[0-9;?]*[A-Za-z]//g' | LC_ALL=C tr -d '\200-\277')
+    assert [ "$output" -lt 60 ]
+  done
+}
+
+# The fix above mapped each value on every draw. cleat config draws a frame on
+# every key, so each key ran the sanitizer and a tr for the memory value and the
+# cpus value: two more forks a key for values that are ASCII. A ring value is
+# now drawn as it is. Only a hand-written value with any other character pays
+# for the pipeline.
+@test "regression vNEXT: the config editor ran the non-ASCII mapping on every keypress" {
+  local log="$TEST_TEMP/mapped" c ncaps="${#KNOWN_CAPS[@]}"
+  _sanitize_repo_str() { printf '%s\n' "$1" >> "$log"; printf '%s' "$1"; }
+  : > "$log"
+  for (( c = 0; c <= ncaps + 3; c++ )); do
+    run _config_picker_draw "$c" "" 8g 4 1 0 24 1 "1|strict" 80
+    assert_success
+    run _config_picker_draw "$c" "" default all 0 0 "" 0 "" 80
+    assert_success
+  done
+  run cat "$log"
+  assert_output ""
+  # A hand-written value with a byte outside ASCII is still mapped.
+  run _config_picker_draw "$ncaps" "" "8ｇ" 4 0 0 "" 0 "" 80
+  assert_output --partial "‹ 8??? ›"
+  run cat "$log"
+  assert_output "8ｇ"
 }
 
 # v0.1.0 baked in-box guidance (docker/CLAUDE.md: the clipboard-bridge rules)
@@ -10350,6 +10435,347 @@ _caged_run_setup() {
   assert_output ""
 }
 
+@test "regression vNEXT: the drift prompt removed a caged box before the capability refusal" {
+  # cleat config --enable docker under a policy drifts the caged box. On a
+  # terminal the drift prompt, default yes, ran before the interlock. An
+  # Enter removed the box and the create behind it then refused. A refusal
+  # creates and destroys nothing.
+  # This file's setup stubs the drift check out, so the real one is sourced back.
+  source_cli
+  _host_clip_cmd() { echo ""; }
+  check_for_update() { true; }
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf 'desktop-macos'; }
+  use_gw_admin_stub
+  mkdir -p "$TEST_TEMP/project" "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  printf '[caps]\ndocker\n\n[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  mock_docker_images "cleat"
+  mock_docker_ps "$CN"
+  mock_docker_ps_a "$CN"
+  _image_spec_version() { printf 6; }
+  caged_box
+  _container_config_hash() { printf 'v%s:before-the-capability' "$_CONFIG_FP_VERSION"; }
+  _is_tty() { return 0; }
+  exec_claude() { true; }
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project" <<< ""
+  assert_failure
+  assert_output --partial "the docker capability hands the box the Docker daemon"
+  refute_output --partial "Recreate"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+# A caged box under a strict policy for the recreate regressions below, its
+# caps from the global config and not resolved yet. RUNNING= makes it a
+# stopped one.
+_vnext_caged_project_box() {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf 'desktop-macos'; }
+  use_gw_admin_stub
+  mkdir -p "$TEST_TEMP/project" "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  printf '[caps]\n%s\n\n[egress]\nmode = strict\n' "$1" > "$CLEAT_GLOBAL_CONFIG"
+  mock_docker_images "cleat"
+  mock_docker_ps "${RUNNING-$CN}"
+  mock_docker_ps_a "$CN"
+  mock_docker_image_cached "$_GATEWAY_IMAGE"
+  _image_spec_version() { printf 6; }
+  caged_box
+  ACTIVE_CAPS=()
+  exec_claude() { true; }
+  : > "$DOCKER_CALLS"
+}
+
+@test "regression vNEXT: a host-paths recreate removed a stopped caged box before the egress refusal" {
+  # A stopped box whose bind sources moved is recreated with no prompt. The
+  # engine is in no fingerprint, so no drift prompt refused first. The box
+  # was removed and only then did the create refuse the engine.
+  local v
+  for v in cmd_start cmd_resume; do
+    RUNNING="" _vnext_caged_project_box git
+    _container_bind_sources_present() { return 1; }
+    _egress_engine_kind() { printf 'vm-backend'; }
+    _is_tty() { return 0; }
+    run "$v" "$TEST_TEMP/project" <<< ""
+    assert_failure
+    assert_output --partial "Egress control is not available on this Docker engine"
+    refute_output --partial "host paths changed"
+    run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+    assert_failure
+  done
+}
+
+@test "regression vNEXT: cleat run removed a stopped caged box before the capability refusal" {
+  # cleat run removes a stopped box before its create and resolved its caps
+  # only after that. The create then refused the docker capability with the
+  # box already gone. No prompt was involved.
+  RUNNING="" _vnext_caged_project_box docker
+  _is_tty() { return 1; }
+  run cmd_run "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "the docker capability"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "regression vNEXT: the Claude Code upgrade recreate removed a caged box before the capability refusal" {
+  # cleat upgrade-claude offers to recreate the box, default yes. Enter
+  # stopped and removed it, then the create refused the docker capability.
+  _vnext_caged_project_box docker
+  _is_tty() { return 0; }
+  _upgrade_claude_image() { return 0; }
+  cd "$TEST_TEMP/project"
+  run cmd_upgrade_claude latest <<< ""
+  assert_failure
+  assert_output --partial "the docker capability"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+# How many questions a launch asked.
+_launch_prompt_count() { printf '%s' "$1" | grep -o '\[Y/n\]' | wc -l | tr -d ' '; }
+
+# A v1.5.4 user whose image was still spec 4 saved a policy before the first
+# launch after the upgrade. The launch asked to recreate the box for its cage,
+# then asked to refresh the image and recreate it again, where ruling 1
+# promises one question. A yes then a no removed the box and the caged create
+# refused the old image. The cage-on recreate now refreshes the image first.
+@test "regression vNEXT: an upgrade that turned egress on before the first launch asked twice to recreate" {
+  # This file's setup stubs the drift check out, so the real one is sourced back.
+  source_cli
+  mock_egress_caged_launch
+  unset DOCKER_STUB_STRICT
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  _host_clip_cmd() { echo ""; }
+  _is_tty() { return 0; }
+  image_exists() { return 0; }
+  # The hash v1.5.4 stored, from a literal copy of its function.
+  resolve_caps "$TEST_TEMP/project"
+  resolve_env_args "$TEST_TEMP/project"
+  source "$BATS_TEST_DIRNAME/../fixtures/fingerprint_v154.bash"
+  local stored
+  stored="v2:$(_fp_v154 "$TEST_TEMP/project")"
+  eval "_container_config_hash() { echo '$stored'; }"
+  F_HASH="" caged_box
+  container_exists() { [ "$1" = "$CN" ] && ! grep -qx "docker rm -f $CN" "$DOCKER_CALLS"; }
+  is_running() { return 1; }
+  _settings_overlay_intact() { return 0; }
+  _container_bind_sources_present() { return 0; }
+  _history_bind_in_session_dir() { return 1; }
+  # Spec 4 on disk until a refresh lands spec 6.
+  _image_spec_version() { if [ -e "$TEST_TEMP/refreshed" ]; then printf 6; else printf 4; fi; }
+  _do_pull() { : > "$TEST_TEMP/refreshed"; }
+  _do_build() { : > "$TEST_TEMP/refreshed"; }
+  _maybe_prompt_init_recreate() { :; }
+  _maybe_prompt_claude_update() { :; }
+  # The gateway image step, which comes once the image is refreshed and
+  # before the box goes, records the image spec on disk and stops there.
+  _egress_gateway_image_ensure() { _image_spec_version > "$TEST_TEMP/created-on"; return 1; }
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project" <<< $'y\nn'
+  run _launch_prompt_count "$output"
+  assert_output "1"
+  run cat "$TEST_TEMP/created-on"
+  assert_output "6"
+}
+
+# A box whose config-hash label predates the v2 format, or that has none,
+# meets no drift prompt at the same upgrade. The gate refused it and offered
+# its own recreate. A yes removed the box, then the caged create refused the
+# image older than the relay, so nothing stood in its place.
+@test "regression vNEXT: the gate's recreate offer removed a box the caged create then refused for an image older than the relay" {
+  # This file's setup stubs the drift check out, so the real one is sourced back.
+  source_cli
+  mock_egress_caged_launch
+  unset DOCKER_STUB_STRICT
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  _host_clip_cmd() { echo ""; }
+  _is_tty() { return 0; }
+  _egress_on_terminal() { return 0; }
+  image_exists() { return 0; }
+  F_HASH="" caged_box
+  container_exists() { [ "$1" = "$CN" ] && ! grep -qx "docker rm -f $CN" "$DOCKER_CALLS"; }
+  is_running() { return 1; }
+  _settings_overlay_intact() { return 0; }
+  _container_bind_sources_present() { return 0; }
+  _history_bind_in_session_dir() { return 1; }
+  # Spec 4 on disk. The image prompt is declined.
+  _image_spec_version() { printf 4; }
+  _do_pull() { return 0; }
+  _do_build() { return 0; }
+  _maybe_prompt_init_recreate() { :; }
+  _maybe_prompt_claude_update() { :; }
+  local stored rc
+  for stored in "0123456789abcdef" ""; do
+    eval "_container_config_hash() { echo '$stored'; }"
+    : > "$DOCKER_CALLS"
+    rc=0
+    # Never under run, a subshell where the offer is never made. This subshell
+    # takes the launch's exit 1 and reads as the top level.
+    ( BASH_SUBSHELL=0; cmd_start "$TEST_TEMP/project" ) <<< $'n\ny' > "$TEST_TEMP/out" 2>&1 || rc=$?
+    assert_equal "$rc" 1
+    run cat "$TEST_TEMP/out"
+    refute_output --partial "Config changed"
+    assert_output --partial "under the policy now?"
+    assert_output --partial "the cleat image predates the relay"
+    refute_output --partial "Removed"
+    run _plain "$output"
+    assert_output --partial "Fix:  cleat rebuild refreshes the image"
+    run grep -c "^docker rm" "$DOCKER_CALLS"
+    assert_output "0"
+  done
+}
+
+# The launches below stop at the first refusal. A stopped box that predates
+# its policy, under a strict policy over an image with the relay unless a test
+# says otherwise, its bind sources in place and the drift check sourced back.
+_vnext_destroy_box() {
+  source_cli
+  mock_egress_caged_launch
+  unset DOCKER_STUB_STRICT
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  _host_clip_cmd() { echo ""; }
+  image_exists() { return 0; }
+  F_HASH="" caged_box
+  container_exists() { [ "$1" = "$CN" ] && ! grep -qx "docker rm -f $CN" "$DOCKER_CALLS"; }
+  is_running() { return 1; }
+  _settings_overlay_intact() { return 0; }
+  _container_bind_sources_present() { return 0; }
+  _history_bind_in_session_dir() { return 1; }
+  _maybe_prompt_init_recreate() { :; }
+  _maybe_prompt_claude_update() { :; }
+  exec_claude() { true; }
+  : > "$DOCKER_CALLS"
+}
+
+# A v1.5.4 user saved a strict policy and declined the launch's offer to
+# refresh the image and recreate the box. A bind source had moved, so the
+# start recreated the box anyway. It removed the box the user had just kept,
+# then the caged create refused the image older than the relay.
+@test "regression vNEXT: a declined image refresh let a host-paths recreate remove the box the caged create then refused" {
+  _vnext_destroy_box
+  _image_spec_version() { printf 4; }
+  _do_pull() { return 0; }
+  _do_build() { return 0; }
+  _container_config_hash() { printf 'v%s:old' "$_CONFIG_FP_VERSION"; }
+  _container_bind_sources_present() { return 1; }
+  _is_tty() { return 0; }
+  run cmd_start "$TEST_TEMP/project" <<< $'n\nn\nn'
+  assert_failure
+  assert_output --partial "Skipped. Keeping existing container."
+  assert_output --partial "the cleat image predates the relay"
+  refute_output --partial "host paths changed"
+  run grep -c "^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+# The first caged create on a machine pulls the gateway image. Offline, or
+# with ghcr.io out of reach, that pull failed only after the recreate the
+# user had accepted had removed the box.
+@test "regression vNEXT: a gateway image that could not be pulled was refused after the recreate removed the box" {
+  _vnext_destroy_box
+  rm -f "$DOCKER_MOCK_DIR/cached_images"
+  _container_config_hash() { printf 'v%s:old' "$_CONFIG_FP_VERSION"; }
+  _is_tty() { return 0; }
+  run cmd_start "$TEST_TEMP/project" <<< ""
+  assert_failure
+  assert_output --partial "the egress gateway image could not be pulled"
+  refute_output --partial "Removed"
+  run grep -c "^docker pull " "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -c "^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+# The gate refuses a caged box once its policy no longer resolves. It names
+# cleat egress off. A start whose bind sources had moved recreated the box
+# instead, with a normal network and no label. The gate then passed it.
+@test "regression vNEXT: a recreate brought a box back with a normal network after its policy was removed" {
+  _vnext_destroy_box
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+  caged_box
+  mkdir -p "$(_egress_policy_dir "$CN")"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  _container_bind_sources_present() { return 1; }
+  _is_tty() { return 1; }
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "it was created under an egress policy that no longer resolves."
+  refute_output --partial "host paths changed"
+  run grep -E "^docker (rm|run)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+# cleat start <box> --fork on a fork whose copy was deleted drops the box so
+# the create rebuilds copy and mount together. It dropped it before any egress
+# check, then the create refused the docker capability.
+@test "regression vNEXT: the fork heal removed the box before the egress refusal" {
+  _vnext_destroy_box
+  printf '[caps]\ndocker\n\n[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  _fork_mark "$CN"
+  _FORK_REQUESTED=true
+  _is_tty() { return 1; }
+  run cmd_start "$TEST_TEMP/project"
+  assert_failure
+  assert_output --partial "the docker capability hands the box the Docker daemon"
+  refute_output --partial "Fork workspace is missing"
+  run grep -c "^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+# With the cleat image gone (docker rmi), the gate's recreate offer read the
+# missing image's spec as 0 and refused it as older than the relay. No image
+# predates anything. The create would have acquired a current one.
+@test "regression vNEXT: the gate's recreate offer called a missing image older than the relay" {
+  _vnext_destroy_box
+  _is_tty() { return 0; }
+  _egress_on_terminal() { return 0; }
+  image_exists() { [ -e "$TEST_TEMP/acquired" ]; }
+  _image_spec_version() { if [ -e "$TEST_TEMP/acquired" ]; then printf 6; fi; }
+  _do_pull() { : > "$TEST_TEMP/acquired"; }
+  _do_build() { : > "$TEST_TEMP/acquired"; }
+  _container_config_hash() { echo ''; }
+  _egress_mark_creating() { return 1; }
+  local rc=0
+  ( BASH_SUBSHELL=0; cmd_start "$TEST_TEMP/project" ) <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  run cat "$TEST_TEMP/out"
+  assert_output --partial "under the policy now?"
+  refute_output --partial "predates the relay"
+  assert_output --partial "Removed"
+  run test -e "$TEST_TEMP/acquired"
+  assert_success
+}
+
+# cleat kit <kit> on a box made before kits offers to rebuild it. A yes removed
+# the box and said the next cleat would rebuild it with the kit. Under a
+# policy that refuses the create, the next cleat refused and nothing came back.
+@test "regression vNEXT: the kit rebuild removed a box the next launch refused to create" {
+  _vnext_destroy_box
+  printf '[caps]\ndocker\n\n[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  container_exists() { [ "$1" = "$CN" ]; }
+  _container_has_kit_mounts() { return 1; }
+  _is_tty() { return 0; }
+  cd "$TEST_TEMP/project"
+  run _kit_prekit_offer plan-big main "$CN" <<< "y"
+  assert_failure
+  assert_output --partial "the docker capability hands the box the Docker daemon"
+  refute_output --partial "Next"
+  run grep -c "^docker rm" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
 @test "regression vNEXT: a gateway image rebuild forced every box to be recreated" {
   # A CVE rebuild moves the gateway digest. Neither the fingerprint nor the
   # create-time label may move with it, or every caged box would be recreated.
@@ -10362,6 +10788,48 @@ _caged_run_setup() {
   [ "$(_egress_create_digest "$cn" none CAP_NET_RAW 0)" = "$label" ]
 }
 
+@test "regression vNEXT: a caged session left Claude Code telemetry on so every session end named a denied host" {
+  # Spec 7.3 pairs each host the core pack leaves out with the setting that
+  # stops the traffic. None was set, so Claude Code sent its usage events to
+  # a Datadog intake the gateway denies, which put that host in the
+  # session-end report of a caged session. Measured with Claude Code 2.1.282
+  # and a placeholder key behind a proxy that admits only the core five: the
+  # intake was tried in every run and never with DISABLE_TELEMETRY=1.
+  _caged_run_setup
+  caged_box
+  mock_docker_ps "$CN"
+  mock_docker_ps_a "$CN"
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  _is_interactive() { return 0; }
+  _wait_for_coder_remap() { true; }
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run assert_docker_exec_has "$CN" "-e DISABLE_TELEMETRY=1 "
+  assert_success
+}
+
+@test "regression vNEXT: a caged box ran its setup payload with Claude Code telemetry on" {
+  # The settings spec 7.3 pairs with the excluded hosts reached the session,
+  # shell and login execs, but not the [setup] exec, which carries the relay's
+  # address too. A `claude` command in a caged payload (an MCP server or a
+  # plugin added at provisioning) ran with telemetry on, so it would try the
+  # Datadog intake the gateway denies.
+  _caged_run_setup
+  caged_box
+  mock_docker_ps "$CN"
+  mock_docker_ps_a "$CN"
+  _wait_for_coder_remap() { true; }
+  _SETUP_DECLARED=1; _SETUP_TRUSTED=1
+  _build_setup_payload() { printf 'claude mcp list\n'; }
+  _setup_payload_hash() { printf 'h1'; }
+  _trust_lookup_setup() { printf 'h1'; }
+  run _maybe_run_setup "$CN" "$TEST_TEMP/project" main 1
+  assert_success
+  run grep "^docker exec .*-w /workspace $CN runuser -u coder -- bash -e " "$DOCKER_CALLS"
+  assert_success
+  assert_output --partial "-e DISABLE_TELEMETRY=1 "
+}
+
 @test "regression vNEXT: a dead shim reported healthy" {
   # A caged launch whose relay has been silent for five minutes: the gateway
   # is healthy, but nothing in the box reaches it, and the launch must say so.
@@ -10372,6 +10840,145 @@ _caged_run_setup() {
   assert_success
   assert_output --partial "Shim not listening"
   assert_output --partial "cleat egress restart --shim"
+}
+
+@test "regression vNEXT: cleat status was silent about a dead relay" {
+  # A running caged box whose gateway is healthy and whose relay has been
+  # silent for five minutes. cleat status named the gateway's states and not
+  # this one, so the box read as healthy on the screen a user checks first.
+  _caged_run_setup
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  run cmd_status "$TEST_TEMP/project"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "! shim not listening (not a denial)  cleat egress restart --shim"
+}
+
+@test "regression vNEXT: the session end report was silent about a relay that died mid-session" {
+  # The relay answers when the session starts and dies while it runs. The
+  # gateway stays healthy and logs no denial, so Claude Code met only its own
+  # network errors. The end of the session must name the cause and the fix.
+  _caged_run_setup
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  _is_interactive() { return 0; }
+  _wait_for_coder_remap() { true; }
+  cat > "$TEST_TEMP/relaydies.sh" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" claude "*) echo "ok last_shim_seen 300" > "$DOCKER_MOCK_DIR/gwadmin/last_shim_seen" ;;
+esac
+exec "$TEST_TEMP/gwexec.sh" "\$@"
+SH
+  chmod +x "$TEST_TEMP/relaydies.sh"
+  export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/relaydies.sh"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run _plain "$output"
+  # After the session, never the gate's note before it.
+  run bash -c 'printf "%s\n" "$1" | sed -n "/Session ended/,\$p"' _ "$output"
+  assert_output --partial "Shim not listening  the in-box relay has not been heard from"
+  assert_output --partial "Fix:  cleat egress restart --shim"
+}
+
+@test "regression vNEXT: a gateway restart read as a dead relay at the session end" {
+  # The gateway exits mid-session and Docker starts it again (on-failure). The
+  # new process has not heard the relay yet, so it answers -1 until the next
+  # heartbeat, up to 30 s away, while requests go through the working relay.
+  # A user who quits in that window was told the relay was dead and given
+  # restart --shim, which hid the gateway restart. The gate waits on -1.
+  _caged_run_setup
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  _is_interactive() { return 0; }
+  _wait_for_coder_remap() { true; }
+  cat > "$TEST_TEMP/gwrestart.sh" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" claude "*) echo "ok last_shim_seen -1" > "$DOCKER_MOCK_DIR/gwadmin/last_shim_seen" ;;
+esac
+exec "$TEST_TEMP/gwexec.sh" "\$@"
+SH
+  chmod +x "$TEST_TEMP/gwrestart.sh"
+  export DOCKER_STUB_EXEC_SCRIPT="$TEST_TEMP/gwrestart.sh"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run _plain "$output"
+  run bash -c 'printf "%s\n" "$1" | sed -n "/Session ended/,\$p"' _ "$output"
+  assert_output --partial "Session ended"
+  refute_output --partial "Shim not listening"
+  refute_output --partial "restart --shim"
+}
+
+@test "regression vNEXT: a gateway restart read as a dead relay in cleat status" {
+  # The same window seen from cleat status: a healthy gateway that answers -1
+  # has just started and has not heard the relay's next beat yet. The row
+  # named a dead relay and restart --shim.
+  _caged_run_setup
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  mock_gw_admin last_shim_seen "ok last_shim_seen -1"
+  run cmd_status "$TEST_TEMP/project"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Egress:"
+  refute_output --partial "shim not listening"
+  refute_output --partial "restart --shim"
+}
+
+@test "regression vNEXT: the relay advisory said requests fail when only its heartbeat loop was down" {
+  # With the relay's heartbeat loop down and its supervisor up, requests work
+  # while the gateway hears no heartbeat. The gate, the session end and the
+  # relay row of cleat egress status all said requests fail before they reach
+  # the policy. A missed heartbeat is all they know, so they say what holds
+  # either way and keep the heading and the remedy.
+  _caged_run_setup
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  run _egress_require "$CN" shell
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Shim not listening  the in-box relay has not been heard from"
+  assert_output --partial "If requests fail, they fail before they reach the policy."
+  assert_output --partial "This is not a policy denial."
+  assert_output --partial "Fix:  cleat egress restart --shim"
+  refute_output --partial "Requests fail"
+  run _egress_status_shim_row "$GW"
+  run _plain "$output"
+  assert_output --partial "! Shim not listening    last seen 5m00s ago, no heartbeat since"
+  assert_output --partial "If requests fail, they fail before they reach policy."
+  assert_output --partial "Not a policy denial."
+  assert_output --partial "Fix:  cleat egress restart --shim"
+  refute_output --partial "Requests fail"
+}
+
+@test "regression vNEXT: a resume beside an orphaned gateway printed a false Shim not listening" {
+  # The box was stopped behind cleat's back while its gateway kept running. The
+  # last heartbeat is more than 90 s old (from about 60 s after the stop), 125 s
+  # here. cmd_resume starts the box, whose relay beats a moment later. The gate
+  # read the stale age once and named a relay that was fine.
+  _caged_run_setup
+  caged_box
+  container_exists() { return 0; }
+  is_running() { [ "$1" = "$GW" ]; }
+  _settings_overlay_intact() { return 0; }
+  _container_bind_sources_present() { return 0; }
+  _history_bind_in_session_dir() { return 1; }
+  exec_claude() { true; }
+  mock_gw_admin last_shim_seen "ok last_shim_seen 125" "ok last_shim_seen 0"
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  refute_output --partial "Shim not listening"
 }
 
 @test "regression vNEXT: a removal site left a gateway behind" {
@@ -10525,8 +11132,76 @@ mode = off"
   run bash -c 'printf "%s\n" "$1" | grep "Shared:"' _ "$output"
   [ "$(grep -o 'pypi.org (shared)' <<< "$output" | wc -l | tr -d ' ')" = 1 ]
   run cmd_egress status
-  run bash -c 'printf "%s\n" "$1" | grep "Pinned:"' _ "$output"
+  run bash -c 'printf "%s\n" "$1" | grep "Hosts:"' _ "$output"
   [ "$(grep -o 'docs.example.test' <<< "$output" | wc -l | tr -d ' ')" = 1 ]
+}
+
+@test "regression vNEXT: the relay row blamed the relay when the socket refused the box" {
+  # A socket chowned away from the box's uid stops every heartbeat while the
+  # relay keeps listening, yet the row said the in-box relay did not come
+  # back. The age is all status knows, so the row names no cause. The gate
+  # that restart --shim runs first is the check that names the socket.
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")" "$TEST_TEMP/project"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  cd "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project" main)"
+  egress_box_names
+  use_gw_admin_stub
+  F_SELFTEST="" caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  mock_gw_admin last_shim_seen "ok last_shim_seen 95"
+  run cmd_egress status
+  run _plain "$output"
+  assert_output --partial "! Shim not listening    last seen 1m35s ago, no heartbeat since"
+  refute_output --partial "relay did not come back"
+  assert_output --partial "Fix:  cleat egress restart --shim"
+  run _egress_gateway_ok "$CN"
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "its gateway did not answer the box's own connection."
+}
+
+@test "regression vNEXT: the upstream reason claimed a name resolved that did not" {
+  # A lookup that fails, as on a host that lost its network, gets the same
+  # upstream row from the gateway as an address that does not answer. The
+  # words said the name resolved within the last 60 seconds.
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")" "$TEST_TEMP/project"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  cd "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project" main)"
+  egress_box_names
+  use_gw_admin_stub
+  caged_box
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  mkdir -p "$DOCKER_MOCK_DIR/cp/$GW" "$CLEAT_RUN_DIR/$CN/egress"
+  printf '2026-09-26T10:00:02Z code=upstream sub=- origin=box host=api.anthropic.com port=443 trunc=0\n' > "$DOCKER_MOCK_DIR/cp/$GW/denials.log"
+  printf '1:0\n' > "$CLEAT_RUN_DIR/$CN/egress/denials-mark"
+  mock_gw_admin log-state "ok log-state 1 0"
+  run cmd_egress log
+  assert_success
+  run _plain "$output"
+  assert_output --partial "api.anthropic.com:443   allowed, but the name did not resolve, or none of its addresses from the last 60 seconds answered"
+  refute_output --partial "allowed, resolved within"
+}
+
+@test "regression vNEXT: egress status called the hosts typed by name pinned" {
+  # The pin holds the core and the packs, never a host typed by name. A
+  # launch says so: Packs pinned at catalogue rev 1. A Pinned row listing
+  # only the typed hosts said the opposite.
+  mkdir -p "$(dirname "$CLEAT_GLOBAL_CONFIG")"
+  printf '[egress]\nmode = strict\npack = pypi\nallow = docs.example.test\n' > "$CLEAT_GLOBAL_CONFIG"
+  run cmd_egress status
+  run _plain "$output"
+  assert_output --partial "Hosts:     docs.example.test"
+  refute_output --partial "Pinned:"
 }
 
 @test "regression vNEXT: a policy reload copied a file into a read-only mount" {
@@ -10804,4 +11479,200 @@ cleat-site-preview" "name=^${cn}(-[a-z0-9_.-]+)?$"
   assert_success
   assert_output --partial "Gateway healthy"
   assert_output --partial "SURVIVED"
+}
+
+@test "regression vNEXT: a policy save said nothing of the uncaged session still open" {
+  # Egress turned on while an upgraded box made without egress control was
+  # running a session. The save named the box as one that refuses to start.
+  # It never said that the box keeps its full network until it stops, with
+  # the open session in it, so a policy saved beside an unattended run read
+  # as caging it.
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$TEST_TEMP/eg-old"
+  cd "$TEST_TEMP/eg-old"
+  local cn=cleat-eg-old-11111111
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}'
+  printf '%s\n' "$cn" > "$DOCKER_MOCK_DIR/ps_a_output"
+  # It runs. No box carries the egress label, so no reload reaches it.
+  printf '%s\n' "$cn" > "$DOCKER_MOCK_DIR/ps_output"
+  mock_docker_ps_filter "" "label=sh.cleat.egress-hash"
+  mock_docker_inspect_field "$cn" "$fmt" "||$TEST_TEMP/eg-old|main"
+  run cmd_egress allow example.com
+  assert_success
+  run _plain "$output"
+  assert_output --partial "1 box was created without egress control. It refuses to start"
+  assert_output --partial "$cn   cleat rm && cleat   "
+  assert_output --partial "/eg-old   running"
+  assert_output --partial "It is running, so it keeps its full network until it stops."
+  assert_output --partial "A session already open in it is not caged."
+}
+
+@test "regression vNEXT: egress --inherit put a running uncaged box under a strict policy and said nothing" {
+  # A box made without egress control was kept off by its own file while a
+  # session ran in it. Dropping that file put it under the strict global
+  # policy. The verb said only that the box now inherits. It never said that
+  # the box refuses to start until it is recreated, nor that it keeps its
+  # full network until it stops, since a reload reaches caged boxes only.
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$CLEAT_CONFIG_DIR" "$TEST_TEMP/eg-old" "$_EGRESS_BOXES_DIR"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  cd "$TEST_TEMP/eg-old"
+  local cn
+  cn="$(container_name_for "$TEST_TEMP/eg-old" main)"
+  printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/$cn"
+  mock_docker_inspect_field "$cn" "$T_HASH" ""
+  container_exists() { return 0; }
+  is_running() { return 0; }
+  run cmd_egress main --inherit < /dev/null
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Box main now inherits the global egress policy."
+  assert_output --partial "Box main was created without egress control and refuses to start until"
+  assert_output --partial "it is recreated:  cleat rm && cleat"
+  assert_output --partial "It is running, so it keeps its full network until it stops."
+  assert_output --partial "A session already open in it is not caged."
+}
+
+# vNEXT: bash ends a script once a fork has failed for about fifteen seconds.
+# A pid exhaustion in a caged box that long ended the relay's heartbeat loop
+# with its relay still up, so status showed a dead relay that restart --shim
+# could not clear. With traffic it ended the supervisor too. Egress then
+# stayed gone after the pids were free. USR1 ends each shell the way the failed
+# fork does, through its EXIT trap. The fork itself is measured in scenario 2.18.
+@test "regression vNEXT: a pid exhaustion ended the relay supervisor or its heartbeat loop for good" {
+  local sup beats n=0 beats_now beats_after first sup_left=no first_left=no
+  _shim_setup
+  SOCAT_HOLD=30 _shim_start
+  _shim_await "$SOCAT_LOG" '^listen'
+  _shim_await "$SOCAT_LOG" '^beat'
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  beats="$(cat "$TIMEOUT_LOG.ppid")"
+  first="$(head -1 "$SOCAT_LOG.pids")"
+  # The heartbeat loop, its relay still up: it beats again, from the same pid.
+  kill -USR1 "$beats"
+  n="$(grep -c '^beat' "$SOCAT_LOG")" || n=0
+  _shim_await "$SOCAT_LOG" '^beat' "$((n + 2))"
+  beats_after="$(grep -c '^beat' "$SOCAT_LOG")" || beats_after=0
+  beats_now="$(cat "$TIMEOUT_LOG.ppid")"
+  # The supervisor: it starts again in place and starts a relay again.
+  kill -USR1 "$sup"
+  _shim_await "$SHIM_LOG" 'started again in place'
+  _shim_await "$SOCAT_LOG" '^listen' 2
+  kill -0 "$sup" 2>/dev/null && sup_left=yes
+  kill -0 "$first" 2>/dev/null && first_left=yes
+  _shim_stop
+  run test "$beats_after" -ge "$((n + 2))"
+  assert_success
+  run echo "$beats_now"
+  assert_output "$beats"
+  run echo "$sup_left"
+  assert_output "yes"
+  run grep -c '^listen' "$SOCAT_LOG"
+  assert_output "2"
+  # The old relay was stopped before the new one, so the new one can bind.
+  run echo "$first_left"
+  assert_output "no"
+  # The lock was taken once and kept across the restart, never dropped.
+  run cat "$FLOCK_LOG"
+  assert_output "-n 9"
+}
+
+# vNEXT: a relay shell that started itself again in place ran with the full
+# path of bash as argv[0]. A person or a helper looking for the command line
+# "bash /usr/local/bin/cleat-egress-shim" then missed the supervisor and every
+# heartbeat loop it started, so a relay that had healed itself looked gone.
+@test "regression vNEXT: a relay shell started again in place lost the command line that names it" {
+  local sup beats relay first_line beats_line sup_line
+  _shim_setup
+  SOCAT_HOLD=30 _shim_start
+  _shim_await "$SOCAT_LOG" '^listen'
+  _shim_await "$SOCAT_LOG" '^beat'
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  beats="$(cat "$TIMEOUT_LOG.ppid")"
+  relay="$(head -1 "$SOCAT_LOG.pids")"
+  first_line="$(_shim_cmdline "$sup")"
+  kill -USR1 "$beats"
+  # A heartbeat loop reads --beats from its first start, so the restart shows
+  # as its count moving on from 0.
+  _shim_await_cmdline "$beats" "--beats $relay 1"
+  beats_line="$(_shim_cmdline "$beats")"
+  kill -USR1 "$sup"
+  _shim_await "$SHIM_LOG" 'started again in place'
+  sup_line="$(_shim_cmdline "$sup")"
+  _shim_stop
+  run echo "$first_line"
+  assert_output "bash $SHIM"
+  # The last word counts quick ends, so it depends on timing: drop it.
+  run echo "${beats_line% *}"
+  assert_output "bash $SHIM --beats $relay"
+  run echo "${sup_line% *}"
+  assert_output "bash $SHIM --again"
+}
+
+# vNEXT: the supervisor forked its heartbeat loop, so the loop carried the
+# supervisor's count of quick ends and its clock. After three quick supervisor
+# restarts the loop's own first end counted as the fourth in a row. It stayed
+# down with its relay up, so status read a dead relay that restart --shim
+# could not clear. The loop also read --again like its supervisor, so a person
+# counting relay shells saw two supervisors. Every loop now starts afresh as
+# --beats <relay> 0.
+@test "regression vNEXT: a heartbeat loop started after quick supervisor restarts inherited their count and stayed down" {
+  local sup n c i=0 beats relay beats_line after_line
+  _shim_setup
+  SOCAT_HOLD=30 _shim_start
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  for n in 1 2 3; do
+    _shim_await "$SOCAT_LOG" '^listen' "$n"
+    kill -USR1 "$sup"
+    _shim_await "$SHIM_LOG" 'started again in place' "$n"
+  done
+  _shim_await "$SOCAT_LOG" '^listen' 4
+  relay="$(sed -n 4p "$SOCAT_LOG.pids")"
+  # The earlier loops were stopped before each restart, so the first live
+  # shell to beat from here on is the new loop, its trap already set.
+  c="$(grep -c '^beat' "$SOCAT_LOG")" || c=0
+  _shim_await "$SOCAT_LOG" '^beat' "$((c + 1))"
+  beats="$(cat "$TIMEOUT_LOG.ppid")"
+  while ! kill -0 "$beats" 2>/dev/null && [ "$i" -lt 50 ]; do
+    sleep 0.1; i=$((i + 1)); beats="$(cat "$TIMEOUT_LOG.ppid")"
+  done
+  beats_line="$(_shim_cmdline "$beats")"
+  kill -USR1 "$beats"
+  _shim_await_cmdline "$beats" "--beats $relay 1"
+  after_line="$(_shim_cmdline "$beats")"
+  _shim_stop
+  run echo "$beats_line"
+  assert_output "bash $SHIM --beats $relay 0"
+  # Its first end is its own first quick end, so it starts itself again.
+  run echo "$after_line"
+  assert_output "bash $SHIM --beats $relay 1"
+}
+
+# vNEXT: the relay tests' stop sent TERM and gave up after 3 s. A supervisor
+# that outlived TERM (its TERM trap gone, as one harness mutation does) started
+# itself again in place and outlived its test. Once teardown deleted its stubs
+# it ran the host's real socat on 127.0.0.1:3128 for good, one more group left
+# behind by every harness run. The stop now kills such a group outright.
+@test "regression vNEXT: a relay supervisor that outlived its stop leaked past its test" {
+  local sup left=no stop_rc stop_out
+  _shim_setup
+  sed -e "/^trap 'trap - EXIT; exit 0' TERM HUP INT\$/d" "$SHIM" > "$SHIM.new"
+  cat "$SHIM.new" > "$SHIM"
+  SOCAT_HOLD=30 _shim_start
+  _shim_await "$SOCAT_LOG" '^listen'
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  stop_rc=0
+  stop_out="$(_shim_stop)" || stop_rc=$?
+  kill -0 -- "-$sup" 2>/dev/null && left=yes
+  # Never leak it from here, whatever the stop did.
+  kill -KILL -- "-$sup" 2>/dev/null || true
+  # It did outlive TERM, so the stop still fails the test that leaked it.
+  run echo "$stop_rc $stop_out"
+  assert_output "1 the shim's process group $sup outlived its stop"
+  run echo "group left: $left"
+  assert_output "group left: no"
 }

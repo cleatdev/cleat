@@ -96,6 +96,7 @@ EGRESS_SHIM="$REPO_ROOT/docker/cleat-egress-shim"
 TEST_SH="$REPO_ROOT/test.sh"
 MOCK_DOCKER="$REPO_ROOT/test/fixtures/mock_bin/docker"
 EGRESS_INT_TEARDOWN="$REPO_ROOT/test/lib/egress_int_teardown.bash"
+EGRESS_SHIM_LIB="$REPO_ROOT/test/lib/egress_shim.bash"
 BACKUP="/tmp/cleat-regression-mutation-backup-$$"
 INSTALLER_BACKUP="/tmp/cleat-regression-mutation-installer-backup-$$"
 ENTRYPOINT_BACKUP="/tmp/cleat-regression-mutation-entrypoint-backup-$$"
@@ -108,6 +109,7 @@ INT_LIFECYCLE_BACKUP="/tmp/cleat-regression-mutation-intlifecycle-backup-$$"
 SETUP_BASH_BACKUP="/tmp/cleat-regression-mutation-setupbash-backup-$$"
 MOCK_DOCKER_BACKUP="/tmp/cleat-regression-mutation-mockdocker-backup-$$"
 EGRESS_INT_TEARDOWN_BACKUP="/tmp/cleat-regression-mutation-egressintteardown-backup-$$"
+EGRESS_SHIM_LIB_BACKUP="/tmp/cleat-regression-mutation-egressshimlib-backup-$$"
 
 BOLD=$'\033[1m'
 RED=$'\033[0;31m'
@@ -117,7 +119,7 @@ DIM=$'\033[2m'
 RESET=$'\033[0m'
 
 # Mutual exclusion, taken BEFORE the backups and BEFORE the cleanup trap. Both
-# of those WRITE the twelve tracked files this lock exists to protect, so a run
+# of those WRITE the thirteen tracked files this lock exists to protect, so a run
 # that is correctly refused must not have reached them.
 _CLEAT_TEST_LOCK_ROOT="$REPO_ROOT"
 # Optional sharding for CI, the same shape test.sh uses: MUTATION_SHARD_TOTAL=N
@@ -159,6 +161,7 @@ _restore_targets() {
   [[ -f "$SETUP_BASH_BACKUP" ]] && cp "$SETUP_BASH_BACKUP" "$SETUP_BASH"
   [[ -f "$MOCK_DOCKER_BACKUP" ]] && cp "$MOCK_DOCKER_BACKUP" "$MOCK_DOCKER"
   [[ -f "$EGRESS_INT_TEARDOWN_BACKUP" ]] && cp "$EGRESS_INT_TEARDOWN_BACKUP" "$EGRESS_INT_TEARDOWN"
+  [[ -f "$EGRESS_SHIM_LIB_BACKUP" ]] && cp "$EGRESS_SHIM_LIB_BACKUP" "$EGRESS_SHIM_LIB"
   return 0
 }
 
@@ -166,7 +169,8 @@ cleanup() {
   _restore_targets
   rm -f "$BACKUP" "$INSTALLER_BACKUP" "$ENTRYPOINT_BACKUP" \
         "$OPENBRIDGE_BACKUP" "$CLIP_DAEMON_BACKUP" "$CLIP_SHIM_BACKUP" "$EGRESS_SHIM_BACKUP" "$TEST_SH_BACKUP" \
-        "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP" "$MOCK_DOCKER_BACKUP" "$EGRESS_INT_TEARDOWN_BACKUP"
+        "$INT_LIFECYCLE_BACKUP" "$SETUP_BASH_BACKUP" "$MOCK_DOCKER_BACKUP" "$EGRESS_INT_TEARDOWN_BACKUP" \
+        "$EGRESS_SHIM_LIB_BACKUP"
 }
 # A signal only exits, and the EXIT trap does the restoring, exactly once. A
 # trap that ran cleanup on INT or TERM without exiting sent bash back into the
@@ -188,11 +192,12 @@ cp "$INT_LIFECYCLE_BATS" "$INT_LIFECYCLE_BACKUP"
 cp "$SETUP_BASH" "$SETUP_BASH_BACKUP"
 cp "$MOCK_DOCKER" "$MOCK_DOCKER_BACKUP"
 cp "$EGRESS_INT_TEARDOWN" "$EGRESS_INT_TEARDOWN_BACKUP"
+cp "$EGRESS_SHIM_LIB" "$EGRESS_SHIM_LIB_BACKUP"
 filter="${1:-}"
 
 
 # Run a mutation: apply sed, run one regression test by filter, expect failure.
-# Target file defaults to $CLI; pass another of the twelve tracked targets
+# Target file defaults to $CLI; pass another of the thirteen tracked targets
 # ($INSTALLER, $SETUP_BASH, $MOCK_DOCKER, ...) to mutate a companion file. A
 # path with no backup is refused rather than mutated, because nothing could
 # restore it. Returns 0 if mutation caught, 1 if missed, 2 if skipped.
@@ -220,6 +225,8 @@ run_mutation() {
     backup="$MOCK_DOCKER_BACKUP"
   elif [[ "$target" == "$EGRESS_INT_TEARDOWN" ]]; then
     backup="$EGRESS_INT_TEARDOWN_BACKUP"
+  elif [[ "$target" == "$EGRESS_SHIM_LIB" ]]; then
+    backup="$EGRESS_SHIM_LIB_BACKUP"
   elif [[ "$target" == "$CLI" ]]; then
     backup="$BACKUP"
   else
@@ -13226,17 +13233,26 @@ try "v154_render_config_list_cpus" "cleat config shows a project resources value
 
 cat > "$SED_TMP" << 'SED'
 /^_config_picker_draw()/,/^}$/{
-  s@^  _mem_d="[$](_sanitize_repo_str "[$]mem")"$@  _mem_d="$mem"@
+  s@^  _config_value_display "[$]mem"; _mem_d="[$]_CFGV"$@  _mem_d="$mem"@
 }
 SED
 try "v154_render_config_draw_memory" "cleat config shows a project resources value"
 
 cat > "$SED_TMP" << 'SED'
 /^_config_picker_draw()/,/^}$/{
-  s@^  _cpus_d="[$](_sanitize_repo_str "[$]cpus")"$@  _cpus_d="$cpus"@
+  s@^  _config_value_display "[$]cpus"; _cpus_d="[$]_CFGV"$@  _cpus_d="$cpus"@
 }
 SED
 try "v154_render_config_draw_cpus" "cleat config shows a project resources value"
+
+# The draw's values reach the terminal through one helper, which sanitizes
+# whatever is not a plain value.
+cat > "$SED_TMP" << 'SED'
+/^_config_value_display()/,/^}$/{
+  s@_CFGV="[$](_sanitize_repo_str "[$]1" | @_CFGV="$(printf '%s' "$1" | @
+}
+SED
+try "v154_render_config_value_display" "cleat config shows a project resources value"
 
 cat > "$SED_TMP" << 'SED'
 /^_config_picker_text()/,/^}$/{
@@ -14249,6 +14265,113 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_hooks_escape" "an active policy refuses the hooks capability unless the escape is set" "$CLI" "$EGRESS_REQUIRE_BATS"
 
+# A refusal creates and destroys nothing: each default-yes recreate prompt
+# asks the checks that need no box before it offers.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  /^    _egress_refuse_before_recreate "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_drift_prompt" "the drift prompt removed a caged box before the capability refusal"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_prompt_image_rebuild()/,/^}$/{
+  /^  _egress_refuse_before_recreate "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_image_prompt" "the image and reaper recreate prompts refuse first under a refused capability" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_prompt_init_recreate()/,/^}$/{
+  /^  _egress_refuse_before_teardown "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_reaper_prompt" "the image and reaper recreate prompts refuse first under a refused capability" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The check before the prompt is the create's own check, the engine included.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refuse_before_recreate()/,/^}$/{
+  s@^  _egress_precreate_check "[$]1" "[$]_ws" "[$]_EG_MODE"$@  _egress_interlocks "$_EG_MODE"@
+}
+SED
+try "vnext_egress_refuse_before_prompt_engine" "an unvalidated engine on a terminal refuses before the recreate that would cage a box" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refuse_before_recreate()/,/^}$/{
+  s@^  if \[\[ "[$]{_FORK_REQUESTED:-false}" == true \]\] || _box_is_fork@  if _box_is_fork@
+}
+SED
+try "vnext_egress_refuse_before_prompt_fork" "the check before a recreate prompt reads the workspace the create mounts" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A recreate that asks no drift question asks the same check before its
+# teardown: the host-paths recreate in start and resume, cleat run on a
+# stopped box and the Claude Code upgrade recreate after its yes.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /^        _egress_refuse_before_teardown "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_host_paths_start" "a host-paths recreate removed a stopped caged box before the egress refusal"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /^        _egress_refuse_before_teardown "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_host_paths_offtty" "off a terminal a host-paths recreate meets a refused capability before its teardown" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  /^        _egress_refuse_before_teardown "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_host_paths_resume" "a host-paths recreate removed a stopped caged box before the egress refusal"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  /^    _egress_refuse_before_teardown "[$]cname" "[$]project" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_run_teardown" "cleat run removed a stopped caged box before the capability refusal"
+
+# cleat run has not resolved its caps when it asks, so the check resolves
+# the caps of the project it is handed. Without that the interlocks read none.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refuse_before_recreate()/,/^}$/{
+  /^  if \[ -n "[$]{2:-}" \]; then resolve_caps "[$]2"; fi$/d
+}
+SED
+try "vnext_egress_refuse_before_run_caps" "cleat run removed a stopped caged box before the capability refusal"
+
+# An off machine resolves nothing new: the caps are resolved only once a
+# policy is live.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refuse_before_recreate()/,/^}$/{
+  /^  if \[ -n "[$]{2:-}" \]; then resolve_caps "[$]2"; fi$/d
+  /^  local _ws$/a\
+  if [ -n "${2:-}" ]; then resolve_caps "$2"; fi
+}
+SED
+try "vnext_egress_refuse_before_caps_gated" "resolves the caps it is handed only under a live policy" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_upgrade_claude()/,/^}$/{
+  /^        _egress_refuse_before_teardown "[$]cname" "[$]project" || exit 1$/d
+}
+SED
+try "vnext_egress_refuse_before_upgrade_recreate" "the Claude Code upgrade recreate removed a caged box before the capability refusal"
+
+# Only a yes asks it. Asked before the offer, a no would refuse an upgrade
+# that removes nothing.
+cat > "$SED_TMP" << 'SED'
+/^cmd_upgrade_claude()/,/^}$/{
+  /^        _egress_refuse_before_teardown "[$]cname" "[$]project" || exit 1$/d
+  /^      _ask_yn yn "Recreate /i\
+      _egress_refuse_before_teardown "$cname" "$project" || exit 1
+}
+SED
+try "vnext_egress_refuse_before_upgrade_on_yes" "a declined Claude Code upgrade recreate keeps the box and refuses nothing" "$CLI" "$EGRESS_REQUIRE_BATS"
+
 # A policy inside the cage is not a policy.
 cat > "$SED_TMP" << 'SED'
 /^_egress_precreate_check()/,/^}$/{
@@ -14913,17 +15036,121 @@ try "vnext_egress_shim_stale_bound" "the shim assertion fails when the relay is 
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_require()/,/^}$/{
-  /^  _egress_shim_note "[$]_c"$/d
+  /^  _egress_shim_note "[$]_c" "[$][{]3:-0[}]"$/d
 }
 SED
 try "vnext_egress_dead_shim_named" "a dead shim reported healthy" "$CLI"
 
+# cleat status named the gateway's states and never the relay's.
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_summary_row()/,/^}$/{
+  s@^  if _egress_shim_stale "[$](_egress_gateway_name "[$]1")"; then$@  if false; then@
+}
+SED
+try "vnext_egress_status_row_dead_relay" "cleat status was silent about a dead relay" "$CLI"
+
+# A gateway restarted mid-session answers -1 until the relay's next beat, a
+# working relay. The session end and the cleat status row read it as a dead
+# one. Each goes back to reading any answer that is not alive.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_relay()/,/^}$/{
+  s@^  _egress_shim_stale "[$](_egress_gateway_name "[$]1")" || return 0$@  ! _egress_shim_alive "$(_egress_gateway_name "$1")" || return 0@
+}
+SED
+try "vnext_egress_relay_unheard_session_end" "a gateway restart read as a dead relay at the session end" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_summary_row()/,/^}$/{
+  s@^  if _egress_shim_stale @  if ! _egress_shim_alive @
+}
+SED
+try "vnext_egress_relay_unheard_status" "a gateway restart read as a dead relay in cleat status" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_shim_stale()/,/^}$/{
+  /^  case "[$]_EG_SHIM_AGE" in/d
+}
+SED
+try "vnext_egress_relay_unheard_numeric" "a gateway restart read as a dead relay" "$CLI"
+try "vnext_egress_relay_unheard_numeric_unit" "a silent relay is named at session end behind a healthy gateway only" "$CLI" "$EGRESS_UI_BATS"
+
+# The session-end report never asked whether the relay was still heard from.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_report_egress_denials()/,/^}$/{
+  /^  _maybe_report_egress_relay "[$]cname"$/d
+}
+SED
+try "vnext_egress_session_end_dead_relay" "the session end report was silent about a relay that died mid-session" "$CLI"
+
+# With only the relay's heartbeat loop down, requests work, yet the advisory
+# and the relay row of cleat egress status said they fail. Restore each claim.
+cat > "$SED_TMP" << 'SED'
+/^_egress_shim_words()/,/^}$/{
+  s@If requests fail, they fail before they reach the policy.@Requests fail before they reach the policy.@
+}
+SED
+try "vnext_egress_shim_words_no_claim" "the relay advisory said requests fail when only its heartbeat loop was down" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_shim_row()/,/^}$/{
+  s@If requests fail, they fail before they reach policy.@Requests fail before they reach policy.@
+}
+SED
+try "vnext_egress_shim_row_no_claim" "the relay advisory said requests fail when only its heartbeat loop was down" "$CLI"
+
 cat > "$SED_TMP" << 'SED'
 /^_egress_shim_note()/,/^}$/{
-  s@^  if \[ "[$]_EG_SHIM_AGE" = "-1" \]; then$@  if false; then@
+  s@^      -1) ;;$@      -1) break ;;@
 }
 SED
 try "vnext_egress_shim_first_beat_waited" "a shim never seen is waited for" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# A RESUME BESIDE AN ORPHANED GATEWAY: the gateway kept running while its box
+# was down, so it still held the last run's heartbeat. Once the last heartbeat
+# is more than 90 s old (from about 60 s after the stop) the gate read that
+# stale age once and printed Shim not listening while the new relay was coming
+# up.
+# Stop waiting on a stale age for a box this launch started and the false
+# advisory prints again.
+cat > "$SED_TMP" << 'SED'
+/^_egress_shim_note()/,/^}$/{
+  s@^      \*) \[ "[$]started" = 1 \] || break ;;$@      *) break ;;@
+}
+SED
+try "vnext_egress_shim_orphan_wait" "a resume beside an orphaned gateway" "$CLI"
+
+# The same wait, never reached: the gate stops handing the note what the
+# launch told it.
+cat > "$SED_TMP" << 'SED'
+/^_egress_require()/,/^}$/{
+  s@^  _egress_shim_note "[$]_c" "[$][{]3:-0[}]"$@  _egress_shim_note "$_c"@
+}
+SED
+try "vnext_egress_shim_orphan_forward" "a resume beside an orphaned gateway" "$CLI"
+
+# Or cmd_resume or cmd_start stops telling the gate it brought the box up.
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  s@_egress_require "[$]cname" resume "[$]_eg_started"; then@_egress_require "$cname" resume; then@
+}
+SED
+try "vnext_egress_shim_orphan_resume_flag" "a resume beside an orphaned gateway" "$CLI"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  s@_egress_require "[$]cname" start "[$]_eg_started"; then@_egress_require "$cname" start; then@
+}
+SED
+try "vnext_egress_shim_orphan_start_flag" "orphaned gateway waits for its new relay" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# The other side of it: a stale relay in a box that was already running is
+# named at once. Wait on every stale age and each such launch stalls first.
+cat > "$SED_TMP" << 'SED'
+/^_egress_shim_note()/,/^}$/{
+  s@^      \*) \[ "[$]started" = 1 \] || break ;;$@      *) ;;@
+}
+SED
+try "vnext_egress_shim_stale_at_once" "a stale shim warns" "$CLI" "$EGRESS_REQUIRE_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^exec_claude()/,/^}$/{
@@ -14952,6 +15179,66 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_proxy_env_setup" "a caged box's setup payload carries the proxy environment" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# vNEXT: a caged session must carry the settings spec 7.3 pairs with the hosts
+# the core pack leaves out, or Claude Code tries them and every session ends on
+# a denial. Reverting the fix drops the whole array from the caged execs.
+cat > "$SED_TMP" << 'SED'
+/^_egress_proxy_env_add()/,/^}$/{
+  s| "[$]{_EGRESS_PAIRED_ENV\[@\]}"||
+}
+SED
+try "vnext_egress_paired_env_caged" "a caged session left Claude Code telemetry on" "$CLI"
+
+# Each setting is its own exclusion: losing one brings its host's denial back.
+cat > "$SED_TMP" << 'SED'
+s|^  -e "ENABLE_CLAUDEAI_MCP_SERVERS=false" -e "CLAUDE_CODE_DISABLE_ARTIFACT=1")$|  -e "CLAUDE_CODE_DISABLE_ARTIFACT=1")|
+SED
+try "vnext_egress_paired_env_connectors" "carry the settings paired with the excluded hosts" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# An uncaged box never carries them: setting them for every session would
+# change Claude Code for users who never turned egress on.
+cat > "$SED_TMP" << 'SED'
+s|^CLAUDE_ENV=(-e HOME=/home/coder -e DISABLE_AUTOUPDATER=1 |CLAUDE_ENV=(-e HOME=/home/coder -e DISABLE_AUTOUPDATER=1 -e DISABLE_TELEMETRY=1 |
+SED
+try "vnext_egress_paired_env_uncaged" "no egress section means the box is created with a normal network" "$CLI" "$EGRESS_CONFIG_BATS"
+
+# vNEXT: the [setup] exec carries the relay's address, so it carries the
+# paired settings too, or a `claude` command in a caged payload tries the
+# excluded hosts. Reverting the fix drops them from the setup exec.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_run_setup()/,/^}$/{
+  /^    _setup_env+=("[$]{_EG_SETUP_PAIRED/d
+}
+SED
+try "vnext_egress_paired_env_setup" "a caged box ran its setup payload with Claude Code telemetry on" "$CLI"
+
+# Nothing of the user's follows them on the setup exec, so a setting the
+# user's own environment names is left out there or the cage would beat it.
+cat > "$SED_TMP" << 'SED'
+/^_egress_paired_env_setup()/,/^}$/{
+  s|^      \*"[$]nl[$]{kv%%=\*}[$]nl"\*) ;;$|      _never_) ;;|
+}
+SED
+try "vnext_egress_paired_env_setup_user" "carries the paired settings less one the user names" "$CLI" "$EGRESS_GATEWAY_BATS"
+
+# An uncaged setup carries none of them.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_run_setup()/,/^}$/{
+  s|^  if \[ "[$]{_EG_CAGED:-0}" = 1 \]; then$|  if true; then|
+}
+SED
+try "vnext_egress_paired_env_setup_uncaged" "trusted with no run-once marker executes the payload as coder" "$CLI" "$PROVISION_BATS"
+
+# On a session exec the user's [env] and --env come after the cage's settings,
+# so docker's last -e gives the user's value. Settings appended after the
+# user's environment would beat it.
+cat > "$SED_TMP" << 'SED'
+/^exec_claude()/,/^}$/{
+  s|^      "[$]{_ec_extra\[@\]+"[$]{_ec_extra\[@\]}"}" "[$]cname" \\$|      "${_ec_extra[@]+"${_ec_extra[@]}"}" "${_EGRESS_PAIRED_ENV[@]}" "$cname" \\|
+}
+SED
+try "vnext_egress_paired_env_user_wins" "a user value for a paired setting still wins" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_require()/,/^}$/{
@@ -15304,6 +15591,36 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_status_list_once" "cleat egress status printed its shared hosts twice" "$CLI"
 
+# A late heartbeat names no cause: a socket chowned away from the box's uid
+# stops it while the relay lives. Restore the words that blamed the relay.
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_shim_row()/,/^}$/{
+  s@ ago, no heartbeat since" ;;$@ ago, the in-box relay did not come back" ;;@
+}
+SED
+try "vnext_egress_shim_row_names_no_cause" "the relay row blamed the relay when the socket refused the box" "$CLI"
+try "vnext_egress_shim_row_names_no_cause_unit" "a stale last shim seen renders shim not listening" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The gateway writes upstream for a name that did not resolve as well.
+# Restore the words that said it resolved within the last 60 seconds.
+cat > "$SED_TMP" << 'SED'
+/^_egress_reason_text()/,/^}$/{
+  s@^    upstream) printf 'allowed, but the name did not resolve, or none of its addresses from the last 60 seconds answered' ;;$@    upstream) printf 'allowed, resolved within the last 60 seconds and unreachable' ;;@
+}
+SED
+try "vnext_egress_upstream_words_hold" "the upstream reason claimed a name resolved that did not" "$CLI"
+try "vnext_egress_upstream_words_hold_why" "an unreachable host never claims the name resolved" "$CLI" "$EGRESS_UI_BATS"
+
+# The status row of hosts typed by name is not the pin. Restore its old
+# label, which the launch's own words about the pin contradicted.
+cat > "$SED_TMP" << 'SED'
+/^_egress_status_render()/,/^}$/{
+  s@^    echo -e "  Hosts:     [$]{typed}"$@    echo -e "  Pinned:    ${typed}"@
+}
+SED
+try "vnext_egress_status_typed_not_pinned" "egress status called the hosts typed by name pinned" "$CLI"
+try "vnext_egress_status_typed_not_pinned_unit" "status counts hosts from the resolved set and not from a literal" "$CLI" "$EGRESS_UI_BATS"
+
 cat > "$SED_TMP" << 'SED'
 /^_egress_status_gateway_row()/,/^}$/{
   s@The box has no egress at all right now. This is not a policy denial.@The box has no egress at all right now.@
@@ -15568,9 +15885,12 @@ SED
 try "vnext_egress_open_always_keeps_entries" "always writes mode open in the global section and keeps the entries" "$CLI" "$EGRESS_GATEWAY_BATS"
 
 # The in-box relay (EGRESS-SPEC.md 8.6). It runs as coder, so the gateway's
-# socket sees the uid the host chose.
+# socket sees the uid the host chose. The mutant runs it as root through the
+# same stubbed runuser. Dropping runuser instead would run the real
+# /usr/local/bin/cleat-egress-shim, which exists inside a Cleat box. Its
+# supervisor never exits, so bats waited on it with no end.
 cat > "$SED_TMP" << 'SED'
-s@runuser -u coder -- /usr/local/bin/cleat-egress-shim@/usr/local/bin/cleat-egress-shim@
+s@runuser -u coder -- /usr/local/bin/cleat-egress-shim@runuser -u root -- /usr/local/bin/cleat-egress-shim@
 SED
 try "vnext_egress_relay_drops_to_coder" "starts the egress relay as coder when the socket volume is mounted" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
 
@@ -15580,6 +15900,35 @@ s@chown -h "[$]HOST_UID:[$]HOST_GID" /tmp/cleat-egress-shim.log@chown "$HOST_UID
 SED
 try "vnext_egress_relay_log_no_follow" "without following a link" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
 
+# The relay is set up before chown -R walks ~/.claude, whose time grows with
+# what the user keeps there. Put that chown back ahead of the relay and the
+# gate's ten second wait for a first heartbeat depends on it again.
+cat > "$SED_TMP" << 'SED'
+/^chown -R "[$]HOST_UID:[$]HOST_GID" \/home\/coder\/\.claude 2/d
+/^if mountpoint -q \/run\/cleat-egress/i\
+chown -R "$HOST_UID:$HOST_GID" /home/coder/.claude 2>/dev/null || true
+SED
+try "vnext_entrypoint_relay_before_chown" "the relay is set up before the recursive chowns" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# The relay starts after the uid remap. Move the remap below it and the relay
+# runs as the build uid, which the gateway's 0600 socket never admits on a
+# host whose uid is not 1000.
+cat > "$SED_TMP" << 'SED'
+/^if \[ "[$]CURRENT_UID" != "[$]HOST_UID" \]; then$/,/^fi$/d
+/^chown "[$]HOST_UID:[$]HOST_GID" \/home\/coder$/i\
+if [ "$CURRENT_UID" != "$HOST_UID" ]; then\
+sed -i "s/^coder:x:${CURRENT_UID}:/coder:x:${HOST_UID}:/" /etc/passwd\
+fi
+SED
+try "vnext_entrypoint_relay_after_remap" "the relay starts after the uid remap" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# The supervisor never exits. Launched in the foreground it holds up every
+# ownership fixup after it, along with the final su.
+cat > "$SED_TMP" << 'SED'
+s@^  runuser -u coder -- /usr/local/bin/cleat-egress-shim </dev/null >/dev/null 2>&1 &$@  runuser -u coder -- /usr/local/bin/cleat-egress-shim </dev/null >/dev/null 2>\&1@
+SED
+try "vnext_entrypoint_relay_backgrounded" "every ownership fixup while its relay keeps running" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
 # Neither child keeps the lock descriptor, or a dead supervisor's relay keeps
 # every later start out.
 cat > "$SED_TMP" << 'SED'
@@ -15588,7 +15937,7 @@ SED
 try "vnext_egress_shim_relay_drops_lock" "inherits the lock descriptor" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
 
 cat > "$SED_TMP" << 'SED'
-s@_shim_beats "[$]relay" 9>&- &@_shim_beats "$relay" \&@
+s@--beats "[$]relay" 0 9>&- &@--beats "$relay" 0 \&@
 SED
 try "vnext_egress_shim_beats_drop_lock" "inherits the lock descriptor" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
 
@@ -15603,6 +15952,91 @@ cat > "$SED_TMP" << 'SED'
 s@flock -n 9 || exit 0@flock -n 9 || true@
 SED
 try "vnext_egress_shim_one_supervisor" "second supervisor exits" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+# bash ends a shell once a fork has failed for about fifteen seconds. Each
+# shell of the relay starts itself again in place from its EXIT trap, or a pid
+# exhaustion ends it for good.
+cat > "$SED_TMP" << 'SED'
+/_shim_down' EXIT/d
+SED
+try "vnext_egress_shim_supervisor_again" "a pid exhaustion ended the relay supervisor" "$EGRESS_SHIM"
+
+cat > "$SED_TMP" << 'SED'
+/_shim_again --beats/d
+SED
+try "vnext_egress_shim_beats_again" "a pid exhaustion ended the relay supervisor" "$EGRESS_SHIM"
+
+# Started again in place, it keeps the lock on fd 9. Taking it again needs a
+# fork and leaves a gap for a second supervisor.
+cat > "$SED_TMP" << 'SED'
+s/_shim_again --again$/_shim_again/
+SED
+try "vnext_egress_shim_again_keeps_lock" "a pid exhaustion ended the relay supervisor" "$EGRESS_SHIM"
+
+# The old relay is stopped before the restart, or it holds the port.
+cat > "$SED_TMP" << 'SED'
+/then kill "[$]relay"/d
+SED
+try "vnext_egress_shim_again_stops_relay" "a pid exhaustion ended the relay supervisor" "$EGRESS_SHIM"
+
+# A stop signal still ends each of them for good.
+cat > "$SED_TMP" << 'SED'
+/^trap 'trap - EXIT; exit 0' TERM HUP INT$/d
+SED
+try "vnext_egress_shim_supervisor_stop_signal" "a stop signal still ends the supervisor" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^  trap 'trap - EXIT; exit 0' TERM HUP INT$/d
+SED
+try "vnext_egress_shim_beats_stop_signal" "a stop signal still ends the supervisor" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+# Quick ends in a row stop it, or a fork that fails at once spins it.
+cat > "$SED_TMP" << 'SED'
+s/\[ "[$]_shim_quick" -le 3 \] || return 0/:/
+SED
+try "vnext_egress_shim_quick_bound" "the fourth quick end in a row" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+# The heartbeat loop's count rides on its command line from one shell to the
+# next, or a loop whose fork fails at once restarts itself forever.
+cat > "$SED_TMP" << 'SED'
+/_shim_quick="[$]3"/d
+SED
+try "vnext_egress_shim_beats_count_carried" "carries its count of quick ends" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+# Only quick ends in a row count. A shell that lived five seconds or more
+# starts the count again, or the fourth end in a box's life is its last.
+cat > "$SED_TMP" << 'SED'
+s/; else _shim_quick=0; fi$/; else _shim_quick=$((_shim_quick + 1)); fi/
+SED
+try "vnext_egress_shim_quick_in_a_row" "starts the count of quick ends again" "$EGRESS_SHIM" "$ENTRYPOINT_BATS"
+
+# Every heartbeat loop starts as a shell of its own. A fork of the supervisor
+# carried its count and clock, so after quick supervisor restarts the loop's
+# first end was its last. It also read --again like a supervisor.
+cat > "$SED_TMP" << 'SED'
+s@exec -a bash "[$]BASH" "[$]0" --beats "[$]relay" 0 9>&- &@_shim_beats "$relay" 9>\&- \&@
+SED
+try "vnext_egress_shim_beats_own_count" "inherited their count and stayed down" "$EGRESS_SHIM"
+
+cat > "$SED_TMP" << 'SED'
+s/exec -a bash "[$]BASH" "[$]0" --beats/exec "$BASH" "$0" --beats/
+SED
+try "vnext_egress_shim_beats_start_argv0" "inherited their count and stayed down" "$EGRESS_SHIM"
+
+# Started again in place, each shell keeps argv[0] as bash, or its command line
+# no longer starts "bash /usr/local/bin/cleat-egress-shim" and a healed relay
+# looks gone to anyone who looks for it.
+cat > "$SED_TMP" << 'SED'
+/^_shim_again()/,/^}$/s/exec -a bash "[$]BASH"/exec "$BASH"/
+SED
+try "vnext_egress_shim_again_keeps_argv0" "started again in place lost the command line" "$EGRESS_SHIM"
+
+# The relay tests' stop kills a group that outlived TERM. Without it such a
+# supervisor outlived its test and, its stubs deleted, ran the host's socat.
+cat > "$SED_TMP" << 'SED'
+/kill -KILL -- "-[$]pid"/d
+SED
+try "vnext_egress_shim_stop_kills" "outlived its stop leaked past its test" "$EGRESS_SHIM_LIB"
 
 # ── S20: what the agent is told (9.4) ──
 
@@ -16327,6 +16761,201 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_egress_drift_advisory_keeps_file" "the cage-on drift prompt names the policy and its decline keeps" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# ── One question at the upgrade (ruling 1): the cage-on recreate over an image
+# older than the relay refreshes it first and the image prompt stays quiet ──
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@^    if \[ "[$]_EGRESS_FP_CAGED" = 1 \] && image_exists && ! _egress_image_relay_ready; then$@    if false; then@
+}
+SED
+try "vnext_egress_upgrade_one_question" "an upgrade that turned egress on before the first launch asked twice"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  /^        _do_pull "[$]VERSION" || _do_build$/d
+}
+SED
+try "vnext_egress_upgrade_refresh" "an upgrade that turned egress on before the first launch asked twice"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  /^      _REBUILD_PROMPTED=1$/d
+}
+SED
+try "vnext_egress_upgrade_no_image_prompt" "a declined cage-on recreate over an image older than the relay asks nothing more" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  /^        _egress_image_has_relay || exit 1$/d
+}
+SED
+try "vnext_egress_upgrade_refresh_keeps_box" "a refresh that leaves the image older than the relay keeps the box" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@ && image_exists && ! _egress_image_relay_ready; then$@ \&\& image_exists; then@
+}
+SED
+try "vnext_egress_upgrade_refresh_only_pre_relay" "a cage-on recreate over an image with the relay asks the plain question" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The gate's own recreate offer (5.6 row three) reaches a box whose hash
+# label the drift prompt does not read. Over an image older than the relay a
+# yes keeps the box and names cleat rebuild.
+cat > "$SED_TMP" << 'SED'
+/^_egress_recreate_offer()/,/^}$/{
+  /^  _egress_images_before_teardown || return 1$/d
+}
+SED
+try "vnext_egress_offer_pre_relay_keeps_box" "recreate offer removed a box the caged create then refused"
+
+# A teardown that refreshes no image refuses what the caged create would
+# refuse before the box goes: an image older than the relay, a gateway image
+# it cannot pull, a box whose policy no longer resolves. Each site goes back to
+# the check that knows no image.
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  s@^        _egress_refuse_before_teardown "[$]cname" || exit 1$@        _egress_refuse_before_recreate "$cname" || exit 1@
+}
+SED
+try "vnext_egress_teardown_relay_host_paths" "declined image refresh let a host-paths recreate remove the box"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_resume()/,/^}$/{
+  s@^        _egress_refuse_before_teardown "[$]cname" || exit 1$@        _egress_refuse_before_recreate "$cname" || exit 1@
+}
+SED
+try "vnext_egress_teardown_relay_resume" "a teardown that refreshes no image refuses an image older than the relay first" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_run()/,/^}$/{
+  s@^    _egress_refuse_before_teardown "[$]cname" "[$]project" || exit 1$@    _egress_refuse_before_recreate "$cname" "$project" || exit 1@
+}
+SED
+try "vnext_egress_teardown_relay_run" "a teardown that refreshes no image refuses an image older than the relay first" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_upgrade_claude()/,/^}$/{
+  s@^        _egress_refuse_before_teardown "[$]cname" "[$]project" || exit 1$@        _egress_refuse_before_recreate "$cname" "$project" || exit 1@
+}
+SED
+try "vnext_egress_teardown_relay_upgrade" "a teardown that refreshes no image refuses an image older than the relay first" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_prompt_init_recreate()/,/^}$/{
+  s@^  _egress_refuse_before_teardown "[$]cname" || exit 1$@  _egress_refuse_before_recreate "$cname" || exit 1@
+}
+SED
+try "vnext_egress_teardown_relay_reaper" "a teardown that refreshes no image refuses an image older than the relay first" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_images_before_teardown()/,/^}$/{
+  /^  if image_exists; then _egress_image_has_relay || return 1; fi$/d
+}
+SED
+try "vnext_egress_teardown_relay_checked" "declined image refresh let a host-paths recreate remove the box"
+
+# No image predates anything: a missing one is acquired by the create.
+cat > "$SED_TMP" << 'SED'
+/^_egress_images_before_teardown()/,/^}$/{
+  s@^  if image_exists; then _egress_image_has_relay || return 1; fi$@  _egress_image_has_relay || return 1@
+}
+SED
+try "vnext_egress_teardown_missing_image" "called a missing image older than the relay"
+
+# The image checks belong to a caged recreate. An off machine gains no docker
+# call. The label of a box is read only where a rendered policy says it was
+# caged here.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refuse_before_teardown()/,/^}$/{
+  /^  \[ "[$]_EG_BEFORE_CAGED" = 1 \] || return 0$/d
+}
+SED
+try "vnext_egress_teardown_caged_only" "makes no docker call where no policy was rendered" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refuse_before_recreate()/,/^}$/{
+  /^      \[ -d "[$](_egress_policy_dir "[$]1")" \] || return 0$/d
+}
+SED
+try "vnext_egress_teardown_label_read_gated" "makes no docker call where no policy was rendered" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refuse_before_recreate()/,/^}$/{
+  s@^      \[ "[$]_EG_LABEL_SET" = 1 \] || return 0$@      return 0@
+}
+SED
+try "vnext_egress_teardown_unresolved_refused" "brought a box back with a normal network after its policy was removed"
+
+# The gateway image is made local before the box goes, at the refresh prompts
+# and before every other teardown.
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  /^      if \[ "[$]_EG_BEFORE_CAGED" = 1 \]; then _egress_gateway_image_ensure || exit 1; fi$/d
+}
+SED
+try "vnext_egress_gateway_before_drift_teardown" "gateway image that could not be pulled was refused after the recreate"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_prompt_image_rebuild()/,/^}$/{
+  /^      if \[ "[$]_EG_BEFORE_CAGED" = 1 \]; then _egress_gateway_image_ensure || exit 1; fi$/d
+}
+SED
+try "vnext_egress_gateway_before_image_teardown" "a recreate that cannot pull the gateway image refuses before its teardown" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_images_before_teardown()/,/^}$/{
+  /^  _egress_gateway_image_ensure || return 1$/d
+}
+SED
+try "vnext_egress_gateway_before_teardown" "a recreate that cannot pull the gateway image refuses before its teardown" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The refresh prompts are what fix an old image, so they keep the check that
+# knows no image and offer the refresh.
+cat > "$SED_TMP" << 'SED'
+/^_maybe_prompt_image_rebuild()/,/^}$/{
+  s@^  _egress_refuse_before_recreate "[$]cname" || exit 1$@  _egress_refuse_before_teardown "$cname" || exit 1@
+}
+SED
+try "vnext_egress_image_prompt_offers_refresh" "the image refresh prompt still offers its refresh" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_resolve_config_drift()/,/^}$/{
+  s@^    _egress_refuse_before_recreate "[$]cname" || exit 1$@    _egress_refuse_before_teardown "$cname" || exit 1@
+}
+SED
+try "vnext_egress_drift_offers_refresh" "a declined cage-on recreate over an image older than the relay asks nothing more" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+# The other teardowns: the fork heal, the kit rebuild and a failed start's
+# offer to start fresh.
+cat > "$SED_TMP" << 'SED'
+/^_fork_preflight()/,/^}$/{
+  /^      _egress_refuse_before_teardown "[$]cname" "[$]{_RESOLVED_PROJECT:-}" || exit 1$/d
+}
+SED
+try "vnext_egress_fork_heal_refuses_first" "the fork heal removed the box before the egress refusal"
+
+cat > "$SED_TMP" << 'SED'
+/^_kit_prekit_offer()/,/^}$/{
+  /^    _BOX="[$]box" _egress_refuse_before_teardown "[$]cname" "[$](resolve_project)" || exit 1$/d
+}
+SED
+try "vnext_egress_kit_rebuild_refuses_first" "the kit rebuild removed a box the next launch refused to create"
+
+cat > "$SED_TMP" << 'SED'
+/^_kit_prekit_offer()/,/^}$/{
+  s@^    _BOX="[$]box" _egress_refuse_before_teardown@    _egress_refuse_before_teardown@
+}
+SED
+try "vnext_egress_kit_rebuild_names_box" "the kit rebuild refuses before its question" "$CLI" "$EGRESS_REQUIRE_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^cmd_start()/,/^}$/{
+  /^            _egress_refuse_before_teardown "[$]cname" || exit 1$/d
+}
+SED
+try "vnext_egress_start_fresh_refuses_first" "the offer to start a failed box fresh refuses first" "$CLI" "$EGRESS_REQUIRE_BATS"
 
 cat > "$SED_TMP" << 'SED'
 /^_egress_refusing_boxes_note()/,/^}$/{
@@ -17160,6 +17789,165 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_config_note_whole_regr" "the config editor wrote its memory note while the process"
 
+# A config editor row wider than the window wrapped. The counted cursor-up then
+# drifted the frame down a line per key (unsafe-rm is 93 columns at 80). The TUI
+# stops passing the width, then each cut and the one-column margin go in turn.
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_tui()/,/^}$/{
+  s@ "[$]cols"$@@
+}
+SED
+try "vnext_config_row_width_tui_regr" "a config editor row wider than the window wrapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^    _config_fit "[$](_cap_description "[$]cap")" .*@    _CFGT="$(_cap_description "$cap")"@
+}
+SED
+try "vnext_config_row_width_cap_regr" "a config editor row wider than the window wrapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^    _config_fit "[$][{]eg_state#[*]|[}]" .*@    _CFGT="${eg_state#*|}"@
+}
+SED
+try "vnext_config_row_width_egress_regr" "a config editor row wider than the window wrapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@w=[$](( [$][{]10[}] - 1 ))@w=${10}@
+}
+SED
+try "vnext_config_row_width_margin_regr" "a config editor row wider than the window wrapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_fit()/,/^}$/{
+  s@[$](( [$]2 - 1 ))@$2@
+}
+SED
+try "vnext_config_row_width_ellipsis_regr" "a config editor row wider than the window wrapped"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _config_fit "(space toggles host access)" .*@  _CFGT="(space toggles host access)"@
+}
+SED
+try "vnext_config_row_width_header" "every row stays one column short of the window" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _config_fit "[$]_mem_d" 16; _mem_d="[$]_CFGT"$@  :@
+}
+SED
+try "vnext_config_row_width_mem_value" "every row stays one column short of the window" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _config_fit "[$]_cpus_d" 16; _cpus_d="[$]_CFGT"$@  :@
+}
+SED
+try "vnext_config_row_width_cpus_value" "every row stays one column short of the window" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^    _config_fit "(per-box RAM ceiling)" .*@    _CFGT="(per-box RAM ceiling)"@
+}
+SED
+try "vnext_config_row_width_mem_hint" "every row stays one column short of the window" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^    _config_fit "(core limit; all = no cap)" .*@    _CFGT="(core limit; all = no cap)"@
+}
+SED
+try "vnext_config_row_width_cpus_hint" "every row stays one column short of the window" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^    _config_fit "Also write these to this project's .cleat" .*@    _CFGT="Also write these to this project's .cleat"@
+}
+SED
+try "vnext_config_row_width_gen" "every row stays one column short of the window" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^    _config_fit "[$]note_line" .*@    _CFGT="$note_line"@
+}
+SED
+try "vnext_config_row_width_note" "every row stays one column short of the window" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_tui()/,/^}$/{
+  s@^  _config_fit " save  q cancel" .*@  _CFGT=" save  q cancel"@
+}
+SED
+try "vnext_config_row_width_footer" "at 40 columns the footer and every frame stay one column short" "$CLI" "$CONFIG_BATS"
+
+# A hand-written memory or cpus value of wide characters was cut by characters,
+# so its row stayed wider than the window. Each non-ASCII byte shows as ? first.
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _config_value_display "[$]mem"; _mem_d="[$]_CFGV"$@  _mem_d="$(_sanitize_repo_str "$mem")"@
+}
+SED
+try "vnext_config_row_width_mem_ascii" "a wide-character memory or cpus value made a config editor row"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _config_value_display "[$]cpus"; _cpus_d="[$]_CFGV"$@  _cpus_d="$(_sanitize_repo_str "$cpus")"@
+}
+SED
+try "vnext_config_row_width_cpus_ascii" "a wide-character memory or cpus value made a config editor row"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_value_display()/,/^}$/{
+  s@ | LC_ALL=C tr '\\200-\\377' '?')"@)"@
+}
+SED
+try "vnext_config_value_display_ascii" "a wide-character memory or cpus value made a config editor row"
+
+# The mapping ran a sanitizer and a tr for both values on every draw, so on
+# every key. A plain value now takes neither. Send every value through the
+# pipeline, then put each draw line back on its old pipeline.
+cat > "$SED_TMP" << 'SED'
+/^_config_value_display()/,/^}$/{
+  s@^    [*][[]!0123456789abc.*[*])$@    *)@
+}
+SED
+try "vnext_config_value_display_no_fork" "the config editor ran the non-ASCII mapping on every keypress"
+try "vnext_config_value_display_no_fork_unit" "a ring value is shown without a fork" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _config_value_display "[$]mem"; _mem_d="[$]_CFGV"$@  _mem_d="$(_sanitize_repo_str "$mem" | LC_ALL=C tr '\\200-\\377' '?')"@
+}
+SED
+try "vnext_config_draw_mem_no_fork" "the config editor ran the non-ASCII mapping on every keypress"
+
+cat > "$SED_TMP" << 'SED'
+/^_config_picker_draw()/,/^}$/{
+  s@^  _config_value_display "[$]cpus"; _cpus_d="[$]_CFGV"$@  _cpus_d="$(_sanitize_repo_str "$cpus" | LC_ALL=C tr '\\200-\\377' '?')"@
+}
+SED
+try "vnext_config_draw_cpus_no_fork" "the config editor ran the non-ASCII mapping on every keypress"
+
+# At 80 columns the cut hid the last words of two rows. One says unsafe-rm is
+# global or CLI only. The other names the verb that explains an [egress] section
+# that does not resolve. Each text goes back to its longer copy in turn.
+cat > "$SED_TMP" << 'SED'
+/^_cap_description()/,/^}$/{
+  s@^    unsafe-rm) echo "Disarm the rm delete-safety prompt (global/CLI only)" ;;$@    unsafe-rm) echo "Run rm without the delete-safety prompt (global/CLI only, disarms a guard)" ;;@
+}
+SED
+try "vnext_config_row_width_unsafe_rm_copy" "at 80 columns the unsafe-rm row and the invalid egress row keep every word" "$CLI" "$CONFIG_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_config_row_state()/,/^}$/{
+  s@^    [*]) printf 'x|invalid  [[]egress[]] does not resolve.  cleat egress status' ;;$@    *) printf 'x|invalid  the [egress] section does not resolve.  cleat egress status' ;;@
+}
+SED
+try "vnext_config_row_width_egress_copy" "at 80 columns the unsafe-rm row and the invalid egress row keep every word" "$CLI" "$CONFIG_BATS"
+
 cat > "$SED_TMP" << 'SED'
 /^_read_keypress()/,/^}$/{
   s@^      "\[A"|OA) echo "UP" ;;$@      "[A") echo "UP" ;;@
@@ -17195,6 +17983,90 @@ cat > "$SED_TMP" << 'SED'
 }
 SED
 try "vnext_read_esc_long_sequence" "arrows in either form, Esc alone or twice" "$CLI" "$CONFIG_BATS"
+
+# A policy saved while a box made without egress control runs says that box
+# keeps its full network until it stops. Its row is marked running.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  /_egress_uncaged_running_lines/d
+}
+SED
+try "vnext_egress_refusing_note_running" "a policy save said nothing of the uncaged session still open"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  s@running=[$]((running + 1)); @@
+}
+SED
+try "vnext_egress_refusing_note_running_count" "marks each running box and counts them" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  s@mark="   [$]{DIM}running[$]{RESET}"@mark=""@
+}
+SED
+try "vnext_egress_refusing_note_running_mark" "marks each running box and counts them" "$CLI" "$EGRESS_UI_BATS"
+
+# Running means docker ps without -a, matched by whole name.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  s@docker ps --filter "name=^cleat-" --format@docker ps -a --filter "name=^cleat-" --format@
+}
+SED
+try "vnext_egress_refusing_note_running_only" "marks each running box and counts them" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  s@\*"[$]nl[$]n[$]nl"\*)@*"$n"*)@
+}
+SED
+try "vnext_egress_refusing_note_whole_name" "marks each running box and counts them" "$CLI" "$EGRESS_UI_BATS"
+
+# The running boxes are read once, not once a box.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  /^  up="[$](_run_bounded /d
+  s@^    mark=""$@    up="$(docker ps --filter "name=^cleat-" --format '{{.Names}}' 2>/dev/null)"; mark=""@
+}
+SED
+try "vnext_egress_refusing_note_one_ps" "marks each running box and counts them" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_uncaged_box_lines()/,/^}$/{
+  /_egress_uncaged_running_lines 1 1/d
+}
+SED
+try "vnext_egress_box_save_running_uncaged" "a box save to a running box made without egress control" "$CLI" "$EGRESS_UI_BATS"
+
+# --inherit that puts a box made without egress control under a policy says
+# it refuses to start. A running one is also said to keep its full network.
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_inherit()/,/^}$/{
+  /^  _egress_inherit_uncaged_note /d
+}
+SED
+try "vnext_egress_inherit_uncaged_note" "egress --inherit put a running uncaged box under a strict policy"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_cmd_inherit()/,/^}$/{
+  /^    _egress_inherit_uncaged_note /d
+}
+SED
+try "vnext_egress_inherit_unparsed_uncaged_note" "inherit names a box made without egress control" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_inherit_uncaged_note()/,/^}$/{
+  /^  \[ "[$]_EG_LABEL_SET" = 1 \] && return 0$/d
+}
+SED
+try "vnext_egress_inherit_note_uncaged_only" "inherit names a box made without egress control" "$CLI" "$EGRESS_UI_BATS"
+
+cat > "$SED_TMP" << 'SED'
+/^_egress_inherit_uncaged_note()/,/^}$/{
+  s@^  case "[$]_EG_MODE" in strict|open) ;; \*) return 0 ;; esac$@  :@
+}
+SED
+try "vnext_egress_inherit_note_not_off" "inherit names a box made without egress control" "$CLI" "$EGRESS_UI_BATS"
 
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"

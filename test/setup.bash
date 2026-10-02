@@ -425,7 +425,7 @@ mutation_harness_tree() {
   ln -s "$PROJECT_ROOT/test/bats" "$t/test/bats"
   for f in bin/cleat install.sh docker/entrypoint.sh docker/open-bridge docker/clip-daemon \
     docker/clip docker/cleat-egress-shim test.sh test/integration/lifecycle.bats test/setup.bash \
-    test/fixtures/mock_bin/docker test/lib/egress_int_teardown.bash; do
+    test/fixtures/mock_bin/docker test/lib/egress_int_teardown.bash test/lib/egress_shim.bash; do
     printf 'pristine %s\n' "$f" > "$t/$f"
   done
   awk -v reg="$1" '

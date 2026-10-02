@@ -320,14 +320,17 @@ teardown() { _common_teardown; }
 # Called directly, never under run: the offer is never made in a subshell,
 # and run is one. Each call's output goes to a file.
 
-# A box that predates its policy, on a terminal, whose recreate lands a caged
-# box that passes every later check.
+# A box that predates its policy, on a terminal over an image with the relay
+# (spec 6) and the gateway image here, whose recreate lands a caged box that
+# passes every later check.
 offer_box() {
   rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
   F_HASH="" caged_box
+  mock_docker_image_cached "$_GATEWAY_IMAGE"
   _RESOLVED_PROJECT="$TEST_TEMP/project"
   mkdir -p "$TEST_TEMP/project"
   _egress_on_terminal() { return 0; }
+  _image_spec_version() { printf 6; }
   cmd_run() {
     echo "run $1" >> "$TEST_TEMP/recreated"
     rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
@@ -414,6 +417,7 @@ offer_box() {
 
 @test "egress require: declining the config recreate prompt is remembered for the gate" {
   container_exists() { return 0; }
+  mock_docker_image_cached "$_GATEWAY_IMAGE"
   _container_config_hash() { echo "v${_CONFIG_FP_VERSION}:old"; }
   _is_tty() { return 0; }
   _CONFIG_DRIFT_DECLINED=0
@@ -519,6 +523,68 @@ offer_box() {
   run _resolve_config_drift "$CN" "$TEST_TEMP/project"
   run _plain "$output"
   assert_output --partial "Recreate to apply: cleat start on a terminal, then accept the recreate"
+}
+
+# A box made before its policy, on a terminal, over a local image older than
+# the relay: what an upgrade from v1.5.4 meets when the policy is saved first.
+# The image is spec 4 unless $TEST_TEMP/spec names another. A refresh changes
+# nothing. The gateway image is here.
+pre_relay_box() {
+  mock_docker_image_cached "$_GATEWAY_IMAGE"
+  container_exists() { [ "$1" = "$CN" ] && ! grep -qx "docker rm -f $CN" "$DOCKER_CALLS"; }
+  _container_config_hash() { echo "v${_CONFIG_FP_VERSION}:old"; }
+  _is_tty() { return 0; }
+  is_running() { return 1; }
+  image_exists() { return 0; }
+  _image_spec_version() { if [ -f "$TEST_TEMP/spec" ]; then cat "$TEST_TEMP/spec"; else printf 4; fi; }
+  _do_pull() { echo "pull $1" >> "$TEST_TEMP/acquired"; }
+  _do_build() { echo build >> "$TEST_TEMP/acquired"; }
+  F_HASH="" caged_box
+  : > "$DOCKER_CALLS"
+}
+# The two prompts cmd_start and cmd_resume ask, in their order.
+drift_then_image() {
+  _resolve_config_drift "$CN" "$TEST_TEMP/project"
+  _maybe_prompt_image_rebuild "$CN"
+}
+prompt_count() { _plain "$1" | grep -o '\[Y/n\]' | wc -l | tr -d ' '; }
+
+@test "egress require: a declined cage-on recreate over an image older than the relay asks nothing more" {
+  pre_relay_box
+  run drift_then_image <<< $'n\ny'
+  run _plain "$output"
+  assert_output --partial "Refresh the image and recreate $CN now? [Y/n]"
+  refute_output --partial "Refresh the image now?"
+  run prompt_count "$output"
+  assert_output "1"
+  run test -e "$TEST_TEMP/acquired"
+  assert_failure
+  run grep -c "^docker rm -f $CN\$" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress require: a refresh that leaves the image older than the relay keeps the box" {
+  pre_relay_box
+  run _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< "y"
+  assert_failure
+  run _plain "$output"
+  assert_output --partial "the cleat image predates the relay a caged box reaches its gateway through."
+  run cat "$TEST_TEMP/acquired"
+  assert_output "pull $VERSION"
+  run grep -c "^docker rm -f $CN\$" "$DOCKER_CALLS"
+  assert_output "0"
+}
+
+@test "egress require: a cage-on recreate over an image with the relay asks the plain question" {
+  pre_relay_box
+  printf 6 > "$TEST_TEMP/spec"
+  run _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< "y"
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Recreate $CN now? [Y/n]"
+  refute_output --partial "Refresh the image"
+  run test -e "$TEST_TEMP/acquired"
+  assert_failure
 }
 
 @test "egress require: a launch that drops the hooks escape a box was created with names the flag" {
@@ -944,6 +1010,376 @@ egress:hooks=0"
   assert_success
 }
 
+# A caged box on a terminal under a strict policy, its fingerprint taken
+# before the capabilities named were added. The launch verbs resolve the caps
+# from the global config themselves. RUNNING= makes the box a stopped one.
+drifted_caged_box() {
+  mkdir -p "$TEST_TEMP/project"
+  CN="$(container_name_for "$TEST_TEMP/project")"
+  egress_box_names
+  printf '[caps]\n%s\n\n[egress]\nmode = strict\n' "$1" > "$CLEAT_GLOBAL_CONFIG"
+  mock_docker_images "cleat"
+  mock_docker_ps "${RUNNING-$CN}"
+  mock_docker_ps_a "$CN"
+  mock_docker_image_cached "$_GATEWAY_IMAGE"
+  _image_spec_version() { printf 6; }
+  check_for_update() { true; }
+  caged_box
+  _container_config_hash() { printf 'v%s:before-the-capability' "$_CONFIG_FP_VERSION"; }
+  _is_tty() { return 0; }
+  exec_claude() { true; }
+  : > "$DOCKER_CALLS"
+}
+
+@test "egress require: a refused capability on a terminal refuses before the recreate prompt and removes nothing" {
+  # Adding the capability drifts the fingerprint. The drift prompt defaults
+  # to yes. Answered with Enter, it removed the caged box and only then did
+  # the create behind it refuse. A no met the same refusal at the gate.
+  local v
+  for v in "cmd_start docker" "cmd_resume ssh" "cmd_claude hooks"; do
+    drifted_caged_box "${v#* }"
+    run "${v% *}" "$TEST_TEMP/project" <<< ""
+    assert_failure
+    assert_output --partial "the ${v#* } capability"
+    refute_output --partial "Recreate"
+    run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+    assert_failure
+  done
+  # A stopped box is neither removed nor started.
+  RUNNING="" drifted_caged_box ssh
+  run cmd_start "$TEST_TEMP/project" <<< ""
+  assert_failure
+  assert_output --partial "the ssh capability"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress require: the hooks escape still reaches the recreate prompt" {
+  # The check before the prompt refuses only what the create would refuse.
+  drifted_caged_box hooks
+  ACTIVE_CAPS=(hooks)
+  CLEAT_EGRESS_ALLOW_HOOKS=1
+  run _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< "n"
+  assert_success
+  assert_output --partial "Recreate"
+  refute_output --partial "Egress refused"
+}
+
+@test "egress require: an unvalidated engine on a terminal refuses before the recreate that would cage a box" {
+  # A box made before the policy meets the drift prompt that cages it. On an
+  # engine that cannot enforce, a yes removed it and the create then refused.
+  drifted_caged_box git
+  mock_docker_inspect_field "$CN" "$T_HASH" ""
+  _egress_engine_kind() { printf 'vm-backend'; }
+  run cmd_start "$TEST_TEMP/project" <<< ""
+  assert_failure
+  assert_output --partial "Egress control is not available on this Docker engine"
+  refute_output --partial "Recreate"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress require: the check before a recreate prompt reads the workspace the create mounts" {
+  # A fork mounts its own copy, so a policy under the project is no
+  # collision for it. The create checks the copy and so does this check.
+  drifted_caged_box git
+  _RESOLVED_PROJECT="$HOME"
+  run _egress_refuse_before_recreate "$CN"
+  assert_failure
+  assert_output --partial "inside a folder a box can write"
+  _FORK_REQUESTED=true
+  run _egress_refuse_before_recreate "$CN"
+  assert_success
+}
+
+@test "egress require: the image and reaper recreate prompts refuse first under a refused capability" {
+  drifted_caged_box docker
+  ACTIVE_CAPS=(docker)
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  _image_spec_version() { printf 1; }
+  run _maybe_prompt_image_rebuild "$CN" <<< ""
+  assert_failure
+  assert_output --partial "the docker capability"
+  refute_output --partial "Refresh the image now?"
+  mock_docker_inspect_field "$CN" '{{json .HostConfig}}' '{"Init":false}'
+  run _maybe_prompt_init_recreate "$CN" <<< ""
+  assert_failure
+  assert_output --partial "the docker capability"
+  refute_output --partial "Recreate it now?"
+  run grep -E "^docker (stop|rm|pull|build)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress require: off a terminal a host-paths recreate meets a refused capability before its teardown" {
+  # Off a terminal the drift is only advised. A stopped box whose bind
+  # sources moved then went to its teardown. The create behind it refused
+  # the capability with the box already gone.
+  RUNNING="" drifted_caged_box ssh
+  _container_bind_sources_present() { return 1; }
+  _is_tty() { return 1; }
+  run cmd_start "$TEST_TEMP/project" < /dev/null
+  assert_failure
+  assert_output --partial "the ssh capability"
+  refute_output --partial "host paths changed"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress require: a declined Claude Code upgrade recreate keeps the box and refuses nothing" {
+  # Only a yes removes the box, so only a yes asks the check. A no ends the
+  # upgrade as before, even under a capability the create would refuse.
+  drifted_caged_box docker
+  ACTIVE_CAPS=()
+  _upgrade_claude_image() { return 0; }
+  cd "$TEST_TEMP/project"
+  run cmd_upgrade_claude latest <<< "n"
+  assert_success
+  assert_output --partial "to use the new Claude Code"
+  refute_output --partial "Egress refused"
+}
+
+@test "egress require: the check before a recreate resolves the caps it is handed only under a live policy" {
+  # cleat run and the upgrade recreate hand it their project because their
+  # caps are not resolved yet. An off machine must resolve nothing new.
+  resolve_caps() { echo "caps resolved for $1"; }
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_refuse_before_recreate "$CN" "$TEST_TEMP/project"
+  assert_success
+  assert_output ""
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_refuse_before_recreate "$CN" "$TEST_TEMP/project"
+  assert_output --partial "caps resolved for $TEST_TEMP/project"
+}
+
+# A stopped caged box under a strict policy over a local image older than the
+# relay (spec 4), the gateway image here. A refresh changes nothing.
+old_image_box() {
+  rm -rf "$DOCKER_MOCK_DIR/inspect" "$DOCKER_MOCK_DIR/volume_inspect"
+  RUNNING="" drifted_caged_box git
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  _image_spec_version() { printf 4; }
+  _do_pull() { echo "pull $1" >> "$TEST_TEMP/acquired"; }
+  _do_build() { echo build >> "$TEST_TEMP/acquired"; }
+}
+
+@test "egress require: a teardown that refreshes no image refuses an image older than the relay first" {
+  # Nothing behind these offers the image refresh. Each removed the box, then
+  # the caged create refused the image with the box already gone.
+  local v
+  # Host paths moved, off a terminal, where no image prompt is asked.
+  for v in cmd_start cmd_resume; do
+    old_image_box
+    _container_bind_sources_present() { return 1; }
+    _is_tty() { return 1; }
+    run "$v" "$TEST_TEMP/project" < /dev/null
+    assert_failure
+    assert_output --partial "the cleat image predates the relay"
+    refute_output --partial "host paths changed"
+    run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+    assert_failure
+  done
+  # cleat run on the stopped box: its image prompt comes after the removal.
+  old_image_box
+  run cmd_run "$TEST_TEMP/project" <<< "n"
+  assert_failure
+  assert_output --partial "the cleat image predates the relay"
+  refute_output --partial "Refresh the image now?"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+  # The Claude Code upgrade recreate, answered yes.
+  old_image_box
+  _upgrade_claude_image() { return 0; }
+  cd "$TEST_TEMP/project"
+  run cmd_upgrade_claude latest <<< "y"
+  assert_failure
+  assert_output --partial "the cleat image predates the relay"
+  refute_output --partial "Removed"
+  run grep -E "^docker (stop|rm|run|start)" "$DOCKER_CALLS"
+  assert_failure
+  # The reaper prompt refuses before it asks.
+  old_image_box
+  mock_docker_inspect_field "$CN" '{{json .HostConfig}}' '{"Init":false}'
+  run _maybe_prompt_init_recreate "$CN" <<< ""
+  assert_failure
+  assert_output --partial "the cleat image predates the relay"
+  refute_output --partial "Recreate it now?"
+  run grep -E "^docker (stop|rm)" "$DOCKER_CALLS"
+  assert_failure
+  run test -e "$TEST_TEMP/acquired"
+  assert_failure
+}
+
+@test "egress require: the image refresh prompt still offers its refresh over an image older than the relay" {
+  # The refresh is what fixes the image, so the prompt that makes it never
+  # refuses the image it would replace.
+  old_image_box
+  run _maybe_prompt_image_rebuild "$CN" <<< "n"
+  assert_success
+  assert_output --partial "Refresh the image now?"
+  refute_output --partial "predates the relay"
+}
+
+@test "egress require: a recreate that cannot pull the gateway image refuses before its teardown" {
+  # The caged create pulls the gateway image the first time. A pull that
+  # failed refused only once the box was gone.
+  RUNNING="" drifted_caged_box git
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  rm -f "$DOCKER_MOCK_DIR/cached_images"
+  # The drift question, answered with Enter.
+  run _resolve_config_drift "$CN" "$TEST_TEMP/project" <<< ""
+  assert_failure
+  assert_output --partial "the egress gateway image could not be pulled"
+  refute_output --partial "Removed"
+  run grep -E "^docker (stop|rm)" "$DOCKER_CALLS"
+  assert_failure
+  # The image refresh prompt, answered yes: the refresh lands, the box stays.
+  : > "$DOCKER_CALLS"
+  _image_spec_version() { printf 4; }
+  _do_pull() { echo "pull $1" >> "$TEST_TEMP/acquired"; }
+  run _maybe_prompt_image_rebuild "$CN" <<< "y"
+  assert_failure
+  assert_output --partial "the egress gateway image could not be pulled"
+  run grep -E "^docker (stop|rm)" "$DOCKER_CALLS"
+  assert_failure
+  # Host paths moved, off a terminal.
+  _image_spec_version() { printf 6; }
+  _container_bind_sources_present() { return 1; }
+  _is_tty() { return 1; }
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project" < /dev/null
+  assert_failure
+  assert_output --partial "the egress gateway image could not be pulled"
+  refute_output --partial "host paths changed"
+  run grep -E "^docker (stop|rm|run)" "$DOCKER_CALLS"
+  assert_failure
+  # The gate's own recreate offer, answered yes.
+  offer_box
+  rm -f "$DOCKER_MOCK_DIR/cached_images"
+  local rc=0
+  _egress_require "$CN" start <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 1
+  run cat "$TEST_TEMP/out"
+  assert_output --partial "the egress gateway image could not be pulled"
+  run test -e "$TEST_TEMP/recreated"
+  assert_failure
+  run grep -E "^docker (stop|rm)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress require: a box created under a policy that no longer resolves refuses before a recreate" {
+  # The gate refuses such a box. A recreate brought it back with a normal
+  # network and no label, which the gate then passed.
+  RUNNING="" drifted_caged_box git
+  _RESOLVED_PROJECT="$TEST_TEMP/project"
+  mkdir -p "$(_egress_policy_dir "$CN")"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  run _egress_refuse_before_recreate "$CN"
+  assert_failure
+  assert_output --partial "it was created under an egress policy that no longer resolves."
+  # Host paths moved, off a terminal.
+  _container_bind_sources_present() { return 1; }
+  _is_tty() { return 1; }
+  : > "$DOCKER_CALLS"
+  run cmd_start "$TEST_TEMP/project" < /dev/null
+  assert_failure
+  assert_output --partial "no longer resolves"
+  refute_output --partial "host paths changed"
+  run grep -E "^docker (stop|rm|run)" "$DOCKER_CALLS"
+  assert_failure
+  # The image refresh prompt refuses before it asks.
+  _is_tty() { return 0; }
+  _image_spec_version() { printf 4; }
+  run _maybe_prompt_image_rebuild "$CN" <<< "y"
+  assert_failure
+  assert_output --partial "no longer resolves"
+  refute_output --partial "Refresh the image now?"
+  # A box without the label has nothing to refuse.
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  mock_docker_inspect_field "$CN" "$T_HASH" ""
+  run _egress_refuse_before_recreate "$CN"
+  assert_success
+  assert_output ""
+}
+
+@test "egress require: the offer to start a failed box fresh refuses first what its create would refuse" {
+  RUNNING="" drifted_caged_box git
+  mkdir -p "$(_egress_policy_dir "$CN")"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  _container_bind_sources_present() { return 0; }
+  _settings_overlay_intact() { return 0; }
+  _history_bind_in_session_dir() { return 1; }
+  docker() { if [ "$1" = start ]; then return 1; fi; command docker "$@"; }
+  run cmd_start "$TEST_TEMP/project" <<< "y"
+  assert_failure
+  assert_output --partial "Container failed to start"
+  assert_output --partial "no longer resolves"
+  refute_output --partial "start fresh"
+  run grep -E "^docker (rm|run)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress require: the check before a teardown makes no docker call where no policy was rendered" {
+  # A machine that never turned egress on gains no docker call: the label
+  # of a box is read only where a rendered policy says it was caged here.
+  RUNNING="" drifted_caged_box git
+  rm -f "$CLEAT_GLOBAL_CONFIG"
+  : > "$DOCKER_CALLS"
+  run _egress_refuse_before_teardown "$CN" "$TEST_TEMP/project"
+  assert_success
+  assert_output ""
+  run cat "$DOCKER_CALLS"
+  assert_output ""
+}
+
+@test "egress require: the fork heal refuses before its teardown what the create would refuse" {
+  # --fork with the copy gone drops the box so the create rebuilds both. The
+  # create then refused the docker capability with the box already gone.
+  RUNNING="" drifted_caged_box docker
+  _fork_mark "$CN"
+  _FORK_REQUESTED=true
+  _is_tty() { return 1; }
+  run cmd_start "$TEST_TEMP/project" < /dev/null
+  assert_failure
+  assert_output --partial "the docker capability"
+  refute_output --partial "Fork workspace is missing"
+  run grep -E "^docker (stop|rm|run)" "$DOCKER_CALLS"
+  assert_failure
+}
+
+@test "egress require: the recreate offer over a missing image goes on to the create" {
+  # No image predates anything. cmd_run acquires this release's image.
+  offer_box
+  image_exists() { return 1; }
+  _image_spec_version() { printf ''; }
+  local rc=0
+  _egress_require "$CN" start <<< "y" > "$TEST_TEMP/out" 2>&1 || rc=$?
+  assert_equal "$rc" 0
+  run cat "$TEST_TEMP/out"
+  refute_output --partial "predates the relay"
+  run cat "$TEST_TEMP/recreated"
+  assert_output "run $TEST_TEMP/project"
+}
+
+@test "egress require: the kit rebuild refuses before its question what the next create would refuse" {
+  # A yes removed the box and promised the next cleat would rebuild it. That
+  # create refused the docker capability, so the box was simply gone.
+  drifted_caged_box docker
+  CN="$(container_name_for "$TEST_TEMP/project" feat)"
+  container_exists() { [ "$1" = "$CN" ]; }
+  _container_has_kit_mounts() { return 1; }
+  cd "$TEST_TEMP/project"
+  run _kit_prekit_offer plan-big feat "$CN" <<< "y"
+  assert_failure
+  assert_output --partial "the docker capability"
+  refute_output --partial "Rebuild now?"
+  run _plain "$output"
+  assert_output --partial "Egress refused box feat:"
+  run grep -E "^docker (stop|rm)" "$DOCKER_CALLS"
+  assert_failure
+  run _box_kit_read "$CN"
+  assert_output ""
+}
+
 # ── The engine and the digest tool ──────────────────────────────────────────
 
 @test "egress require: an unvalidated engine refuses before reading the box" {
@@ -1134,7 +1570,12 @@ egress:hooks=0"
   assert_success
   assert_output --partial "Shim not listening"
   assert_output --partial "cleat egress restart --shim"
+  assert_output --partial "If requests fail, they fail before they reach the policy."
   assert_output --partial "This is not a policy denial."
+  refute_output --partial "Requests fail"
+  # A box that was already running is named at once, never waited on.
+  run count_calls "gw-admin last_shim_seen"
+  assert_output "1"
 }
 
 @test "egress require: a shim never seen is waited for" {
@@ -1159,7 +1600,10 @@ egress:hooks=0"
   mock_gw_admin last_shim_seen "ok last_shim_seen 300"
   run _egress_status_shim_row "$GW"
   run bash -c 'printf "%s" "$1" | sed $'"'"'s/\x1b\[[0-9;]*m//g'"'"'' _ "$output"
-  assert_output --partial "! Shim not listening    last seen 5m00s ago, the in-box relay did not come back"
+  assert_output --partial "! Shim not listening    last seen 5m00s ago, no heartbeat since"
+  assert_output --partial "If requests fail, they fail before they reach policy."
+  assert_output --partial "Not a policy denial."
+  refute_output --partial "Requests fail"
   assert_output --partial "cleat egress restart --shim"
 }
 

@@ -1,10 +1,11 @@
 # Mutual exclusion for everything that reads or executes the working tree while
 # the mutation harness is rewriting it.
 #
-# WHY THIS EXISTS. The harness rewrites twelve tracked files IN PLACE (bin/cleat,
+# WHY THIS EXISTS. The harness rewrites thirteen tracked files IN PLACE (bin/cleat,
 # install.sh, docker/entrypoint.sh and the four docker/ shims, test.sh,
-# test/setup.bash, test/fixtures/mock_bin/docker, test/integration/lifecycle.bats
-# and test/lib/egress_int_teardown.bash), mutation by mutation. Anything reading them meanwhile sees sabotaged or half-written
+# test/setup.bash, test/fixtures/mock_bin/docker, test/integration/lifecycle.bats,
+# test/lib/egress_int_teardown.bash and test/lib/egress_shim.bash), mutation by
+# mutation. Anything reading them meanwhile sees sabotaged or half-written
 # source and fails for reasons unrelated to any change: the bash32 mutation
 # puts `local -A` on line 2, so every sourced test dies with "local: -A:
 # invalid option" on macOS bash 3.2, and a truncated read gives "syntax error:
@@ -38,8 +39,8 @@ _tl_refuse() {   # owner-record
   echo "" >&2
   echo "  Refusing to start: ${owner:-another run} holds the test lock." >&2
   echo "" >&2
-  echo "  The mutation harness rewrites twelve tracked files (bin/cleat, the shipped" >&2
-  echo "  scripts and five test files) in place, so running anything against" >&2
+  echo "  The mutation harness rewrites thirteen tracked files (bin/cleat, the shipped" >&2
+  echo "  scripts and six test files) in place, so running anything against" >&2
   echo "  this checkout at the same time makes BOTH report failures that are not" >&2
   echo "  real. This checkout may be shared with a container or another machine," >&2
   echo "  which is where it bites hardest: same files, different /tmp, neither" >&2

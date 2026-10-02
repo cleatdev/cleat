@@ -80,6 +80,9 @@ _trusted_setup_project() {
 # in a command substitution, so the position lives in a file. The egress
 # editor reads through _egress_key in its own shell, from the same stream.
 # When the stream runs out it answers QUIT, so a test can never spin.
+# Both editors cut their rows to the window, so a test that never set a width
+# gets 80 columns rather than whatever terminal bats runs in. 80 is what every
+# run without a terminal already measured (./test.sh, the harness and CI).
 _keys() {
   printf '%s\n' "$@" > "$TEST_TEMP/keys"
   echo 0 > "$TEST_TEMP/kp"
@@ -90,10 +93,12 @@ _keys() {
     sed -n "$(( n + 1 ))p" "$TEST_TEMP/keys" | grep . || echo QUIT
   }
   _egress_key() { _KEY="$(_read_keypress)"; }
+  [ -n "${_WIDTH_SET:-}" ] || _term_cols() { echo 80; }
 }
 # A window of <rows> rows and 110 columns, or <cols>. eval, because inside a
 # nested definition $1 is the inner function's own argument, which is empty.
-_rows_of() { eval "_term_rows() { echo $1; }; _term_cols() { echo ${2:-110}; }"; }
+# It marks the width as set, so a later _keys leaves it alone.
+_rows_of() { _WIDTH_SET=1; eval "_term_rows() { echo $1; }; _term_cols() { echo ${2:-110}; }"; }
 _row_index() { _egress_editor_rows | grep -nxF -- "$1" | cut -d: -f1 | awk '{ print $1 - 1 }'; }
 _downs() { local i; for ((i = 0; i < $1; i++)); do printf 'DOWN '; done; }
 _ups() { local i; for ((i = 0; i < $1; i++)); do printf 'UP '; done; }
@@ -2439,6 +2444,15 @@ allow = a.example"
   [ ! -e "$CLEAT_GLOBAL_CONFIG" ] || { cat "$CLEAT_GLOBAL_CONFIG"; return 1; }
 }
 
+@test "egress ui: the config text picker names a section that does not resolve in the row's own words" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nallow = a.example\n' > "$CLEAT_GLOBAL_CONFIG"
+  _box_scope=""
+  run _config_picker_text "$CLEAT_GLOBAL_CONFIG" global "" <<< $'q'
+  assert_success
+  assert_output --partial "Egress: invalid  [egress] does not resolve.  cleat egress status"
+}
+
 @test "egress ui: the config egress row renders the resolved counts" {
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\npack = npm\npack = github\nallow = docs.rs\n' > "$CLEAT_GLOBAL_CONFIG"
@@ -3075,7 +3089,7 @@ plain_status() { run cmd_egress status; run _plain "$output"; }
   printf '[egress]\nmode = strict\npack = pypi\nallow = docs.example.test\n' > "$CLEAT_GLOBAL_CONFIG"
   plain_status
   assert_output --partial "Allowed:   $(( n + 1 )) hosts, port 443 only"
-  assert_output --partial "Pinned:    docs.example.test"
+  assert_output --partial "Hosts:     docs.example.test"
 }
 
 @test "egress status: the allowed count comes from the counters and not from the log" {
@@ -3280,6 +3294,46 @@ plain_status() { run cmd_egress status; run _plain "$output"; }
   assert_output --partial "! gateway missing. This is not a policy denial."
 }
 
+@test "egress status: the cleat status egress row names a relay only behind a healthy gateway" {
+  status_caged
+  # Heard three seconds ago: nothing to say.
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  refute_output --partial "shim"
+  # At the staleness bound it is still heard from.
+  mock_gw_admin last_shim_seen "ok last_shim_seen $_EGRESS_SHIM_STALE"
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  refute_output --partial "shim"
+  # Past it, behind a healthy gateway: the silent failure.
+  mock_gw_admin last_shim_seen "ok last_shim_seen $(( _EGRESS_SHIM_STALE + 1 ))"
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "! shim not listening (not a denial)  cleat egress restart --shim"
+  # Under the Egress row it fits an 80 column terminal without wrapping.
+  run awk 'length($0) > 80' <<<"$output"
+  assert_output ""
+  # Never heard by this gateway is a gateway that has just started, as the
+  # gate reads it. No answer is no reading. The row stays quiet for both.
+  mock_gw_admin last_shim_seen "ok last_shim_seen -1"
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "Egress:"
+  refute_output --partial "shim"
+  mock_gw_admin last_shim_seen "err no answer"
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "Egress:"
+  refute_output --partial "shim"
+  # A gateway fault gets the gateway's line alone, never the relay's as well.
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  mock_gw_admin path_ok "ok path_ok false"
+  run _egress_status_summary_row "$CN"
+  run _plain "$output"
+  assert_output --partial "! gateway displaced. This is not a policy denial."
+  refute_output --partial "shim"
+}
+
 # ── cleat egress why, log and test (6.2, 9.3) ───────────────────────────────
 
 # A caged box with a gateway whose denial log holds <rows>, as docker cp copies
@@ -3394,6 +3448,17 @@ plain() { run _plain "$output"; }
   assert_output --partial "private, loopback or link-local"
   refute_output --partial "cleat egress allow metadata.example"
   refute_output --partial "Allow it:"
+}
+
+@test "egress why: an unreachable host never claims the name resolved" {
+  # The gateway writes one upstream row for a name that did not resolve and
+  # for one whose addresses did not answer, so the words cover both.
+  why_box '2026-09-26T10:00:02Z code=upstream sub=- origin=box host=api.anthropic.com port=443 trunc=0\n'
+  run cmd_egress why api.anthropic.com
+  assert_success
+  plain
+  assert_output --partial "! Unreachable api.anthropic.com:443   allowed, but the name did not resolve, or none of its addresses from the last 60 seconds answered. Not a policy denial."
+  refute_output --partial "allowed, resolved within"
 }
 
 @test "egress why: works with the gateway stopped and with Docker down" {
@@ -3590,6 +3655,116 @@ plain() { run _plain "$output"; }
   refute_output --partial "Applies"
 }
 
+@test "egress save: the refusing boxes note marks each running box and counts them" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf 'cleat-a-11111111\ncleat-b-22222222\ncleat-c-33333333\n' > "$DOCKER_MOCK_DIR/ps_a_output"
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}'
+  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a|main"
+  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b|main"
+  mock_docker_inspect_field cleat-c-33333333 "$fmt" "||/work/c|main"
+  # Two of the three still run: the policy reaches neither until it stops.
+  # A running box that is not in the list is not counted.
+  printf 'cleat-a-11111111\ncleat-b-22222222\ncleat-z-99999999\n' > "$DOCKER_MOCK_DIR/ps_output"
+  : > "$DOCKER_CALLS"
+  run _egress_refusing_boxes_note
+  run _plain "$output"
+  assert_output --partial "3 boxes were created without egress control. Each refuses to start"
+  assert_output --partial "cleat-a-11111111   cleat rm && cleat   /work/a   running"
+  assert_output --partial "cleat-b-22222222   cleat rm && cleat   /work/b   running"
+  assert_output --partial "cleat-c-33333333   cleat rm && cleat   /work/c"
+  refute_output --partial "/work/c   running"
+  assert_output --partial "2 of them are running. Each keeps its full network until it stops."
+  assert_output --partial "A session already open in one is not caged."
+  # The running boxes are read in one docker call, not one a box.
+  run grep -cF "docker ps --filter name=^cleat- " "$DOCKER_CALLS"
+  assert_output "1"
+  run grep -cF 'name=^cleat-a-11111111$' "$DOCKER_CALLS"
+  assert_output "0"
+  # One of them. A name that only begins like a listed one is not a match.
+  printf 'cleat-b-22222222\ncleat-a-11111111-old\n' > "$DOCKER_MOCK_DIR/ps_output"
+  run _egress_refusing_boxes_note
+  run _plain "$output"
+  assert_output --partial "/work/b   running"
+  refute_output --partial "/work/a   running"
+  assert_output --partial "One of them is running, so it keeps its full network until it stops."
+  assert_output --partial "A session already open in it is not caged."
+  # None running: every one of them refuses before it reaches anything.
+  : > "$DOCKER_MOCK_DIR/ps_output"
+  run _egress_refusing_boxes_note
+  run _plain "$output"
+  assert_output --partial "3 boxes were created without egress control. Each refuses to start"
+  refute_output --partial "running"
+  refute_output --partial "keeps its full network"
+  refute_output --partial "not caged"
+}
+
+@test "egress save: a box save to a running box made without egress control says it keeps its network" {
+  status_caged
+  _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  _egress_editor_load main
+  _egress_host_add pypi.org
+  run _egress_save_screen 1
+  run _plain "$output"
+  assert_output --partial "was created without egress control and refuses to start until"
+  assert_output --partial "It is running, so it keeps its full network until it stops."
+  assert_output --partial "A session already open in it is not caged."
+  # Stopped, it has no network to keep.
+  is_running() { return 1; }
+  _egress_editor_load main
+  _egress_host_add files.pythonhosted.org
+  run _egress_save_screen 1
+  run _plain "$output"
+  assert_output --partial "was created without egress control and refuses to start until"
+  refute_output --partial "keeps its full network"
+}
+
+@test "egress ui: --inherit names a box made without egress control that the policy now reaches" {
+  status_caged
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  F_HASH="" caged_box
+  mkdir -p "$_EGRESS_BOXES_DIR"
+  # Stopped, it refuses to start and has no network to keep.
+  is_running() { return 1; }
+  printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/$CN"
+  run cmd_egress main --inherit < /dev/null
+  assert_success
+  run _plain "$output"
+  assert_output --partial "Box main was created without egress control and refuses to start until"
+  refute_output --partial "keeps its full network"
+  # A file that does not parse, dropped, says the same of a running box.
+  is_running() { return 0; }
+  printf '[egress]\nmode = strict\nmode = open\n' > "$_EGRESS_BOXES_DIR/$CN"
+  run cmd_egress main --inherit --yes < /dev/null
+  assert_success
+  run _plain "$output"
+  assert_output --partial "does not parse"
+  assert_output --partial "Box main was created without egress control and refuses to start until"
+  assert_output --partial "It is running, so it keeps its full network until it stops."
+  # A global policy that is off puts no box under a policy.
+  printf '[egress]\nmode = off\n' > "$CLEAT_GLOBAL_CONFIG"
+  printf '[egress]\nallow = docs.rs\n' > "$_EGRESS_BOXES_DIR/$CN"
+  run cmd_egress main --inherit --yes < /dev/null
+  assert_success
+  run _plain "$output"
+  refute_output --partial "created without egress control"
+  # A caged box takes the policy at its reload instead.
+  printf '[egress]\nmode = strict\npack = pypi\n' > "$CLEAT_GLOBAL_CONFIG"
+  rm -rf "$DOCKER_MOCK_DIR/inspect"
+  caged_box
+  printf '[egress]\nmode = off\n' > "$_EGRESS_BOXES_DIR/$CN"
+  run cmd_egress main --inherit < /dev/null
+  assert_success
+  run _plain "$output"
+  refute_output --partial "created without egress control"
+  refute_output --partial "keeps its full network"
+}
+
 @test "egress writer: a policy write refuses a box with the ssh capability and names the way out" {
   _EGRESS_ENFORCING=1
   mkdir -p "$CLEAT_CONFIG_DIR" "$PROJECT"
@@ -3762,6 +3937,51 @@ deny_row() { printf '2026-09-28T14:31:0%sZ code=%s sub=%s origin=box host=%s por
   run _plain "$output"
   assert_output --regexp "registry\.npmjs\.org \(truncated\) +no pack"
   [ ! -f "$TEST_TEMP/lookups" ]
+}
+
+@test "egress report: a silent relay is named at session end behind a healthy gateway only" {
+  report_box ""
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  # Nothing was denied. The relay still leads the report.
+  run _maybe_report_egress_denials "$CN" 1 0
+  assert_success
+  run _plain "$output"
+  assert_output --partial "! Shim not listening  the in-box relay has not been heard from"
+  assert_output --partial "If requests fail, they fail before they reach the policy."
+  assert_output --partial "This is not a policy denial."
+  assert_output --partial "Fix:  cleat egress restart --shim"
+  # A missed heartbeat is all it knows, so it never says requests failed.
+  refute_output --partial "Requests fail"
+  # A relay heard lately: nothing.
+  mock_gw_admin last_shim_seen "ok last_shim_seen 12"
+  run _maybe_report_egress_relay "$CN"
+  assert_output ""
+  # At the staleness bound it is still heard from.
+  mock_gw_admin last_shim_seen "ok last_shim_seen $_EGRESS_SHIM_STALE"
+  run _maybe_report_egress_relay "$CN"
+  assert_output ""
+  # A gateway that has not heard the relay since it started (an on-failure
+  # restart mid-session) is not a dead relay. Nor is no answer.
+  mock_gw_admin last_shim_seen "ok last_shim_seen -1"
+  run _maybe_report_egress_relay "$CN"
+  assert_output ""
+  mock_gw_admin last_shim_seen "err no answer"
+  run _maybe_report_egress_relay "$CN"
+  assert_output ""
+  # A gateway that is not serving is not the relay's fault.
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  mock_gw_admin path_ok "ok path_ok false"
+  run _maybe_report_egress_relay "$CN"
+  assert_output ""
+  # Nor is a box that stopped, or a daemon that went away with it.
+  mock_gw_admin path_ok "ok path_ok true"
+  is_running() { [ "$1" != "$CN" ]; }
+  run _maybe_report_egress_relay "$CN"
+  assert_output ""
+  container_exists() { return 1; }
+  is_running() { return 1; }
+  run _maybe_report_egress_relay "$CN"
+  assert_output ""
 }
 
 @test "egress report: the session end report is silent with nothing to say or no mark" {

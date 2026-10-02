@@ -738,6 +738,13 @@ _create_and_v154_hash() {
   assert_failure
   run grep -Ei 'HTTPS_PROXY=|http_proxy=|NO_PROXY=' "$DOCKER_CALLS"
   assert_failure
+  # Nor the settings 7.3 pairs with the excluded hosts: an uncaged Claude Code
+  # keeps its telemetry, connectors and Artifact tool. The session exec ran,
+  # so the negative reads a real exec line.
+  run grep -E '^docker exec -it -e HOME=/home/coder ' "$DOCKER_CALLS"
+  assert_success
+  run grep -E 'DISABLE_TELEMETRY=|DISABLE_ERROR_REPORTING=|ENABLE_CLAUDEAI_MCP_SERVERS=|CLAUDE_CODE_DISABLE_ARTIFACT=' "$DOCKER_CALLS"
+  assert_failure
   # Nothing of a caged box: no dropped capability, no egress label, no socket
   # mount, no gateway exec or copy, no rendered policy on the host.
   local no

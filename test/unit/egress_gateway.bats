@@ -774,6 +774,32 @@ SH
   proxy_env_on "$CN"
 }
 
+# The settings 7.3 pairs with the hosts the core pack leaves out, so Claude
+# Code never tries them: telemetry, error reports, claude.ai connectors and the
+# Artifact tool.
+paired_env_on() {                        # <cname>
+  local v
+  for v in "DISABLE_TELEMETRY=1" "DISABLE_ERROR_REPORTING=1" \
+    "ENABLE_CLAUDEAI_MCP_SERVERS=false" "CLAUDE_CODE_DISABLE_ARTIFACT=1"; do
+    run assert_docker_exec_has "$1" "-e $v "
+    assert_success
+  done
+}
+
+@test "egress gateway: a caged session, shell and login carry the settings paired with the excluded hosts" {
+  caged_running
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  paired_env_on "$CN"
+  : > "$DOCKER_CALLS"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  paired_env_on "$CN"
+  : > "$DOCKER_CALLS"
+  run cmd_login "$TEST_TEMP/project"
+  paired_env_on "$CN"
+}
+
 @test "egress gateway: the proxy environment is added once however many gates pass" {
   caged_running
   _egress_require "$CN" claude
@@ -802,7 +828,70 @@ SH
   run grep "^docker exec .*-w /workspace $CN runuser -u coder -- bash -e" "$DOCKER_CALLS"
   assert_success
   assert_output --partial "-e HOME=/home/coder -e HTTPS_PROXY=http://127.0.0.1:3128 "
-  [[ "$output" == *"-e no_proxy=localhost,127.0.0.1,::1 -w /workspace "* ]]
+  assert_output --partial "-e no_proxy=localhost,127.0.0.1,::1 "
+}
+
+# The value a session exec ends up with for <key>: docker's last -e wins, so
+# the last occurrence on the box's interactive exec line is the one that runs.
+last_exec_value() {                      # <cname> <key>
+  grep "^docker exec -it .* $1 " "$DOCKER_CALLS" | grep -o -- "-e $2=[^ ]*" | tail -1
+}
+
+@test "egress gateway: a user value for a paired setting still wins on a caged session, shell and login" {
+  caged_running
+  # An empty value turns telemetry back on. It comes from the user, through
+  # --env here and through an env file below, so it follows the cage's own.
+  _CLI_ENVS=("DISABLE_TELEMETRY=")
+  resolve_env_args "$TEST_TEMP/project"
+  run exec_claude "$CN" --dangerously-skip-permissions
+  assert_success
+  run last_exec_value "$CN" DISABLE_TELEMETRY
+  assert_output "-e DISABLE_TELEMETRY="
+  : > "$DOCKER_CALLS"
+  run cmd_shell "$TEST_TEMP/project"
+  assert_success
+  run last_exec_value "$CN" DISABLE_TELEMETRY
+  assert_output "-e DISABLE_TELEMETRY="
+  : > "$DOCKER_CALLS"
+  _CLI_ENVS=()
+  printf 'ENABLE_CLAUDEAI_MCP_SERVERS=true\n' > "$TEST_TEMP/user.env"
+  _CLI_ENV_FILES=("$TEST_TEMP/user.env")
+  run cmd_login "$TEST_TEMP/project"
+  run last_exec_value "$CN" ENABLE_CLAUDEAI_MCP_SERVERS
+  assert_output "-e ENABLE_CLAUDEAI_MCP_SERVERS=true"
+  # The cage's own value is still on the line, before the user's.
+  run assert_docker_exec_has "$CN" "-e ENABLE_CLAUDEAI_MCP_SERVERS=false "
+  assert_success
+}
+
+# The setup run line of the caged box, the one exec that carries no user
+# environment after the cage's.
+setup_exec_line() {
+  grep "^docker exec .*-w /workspace $CN runuser -u coder -- bash -e" "$DOCKER_CALLS"
+}
+
+@test "egress gateway: a caged setup carries the paired settings less one the user names" {
+  caged_running
+  _SETUP_DECLARED=1; _SETUP_TRUSTED=1
+  _build_setup_payload() { printf 'claude mcp list\n'; }
+  _setup_payload_hash() { printf 'h1'; }
+  _trust_lookup_setup() { printf 'h1'; }
+  # The user re-enables telemetry. The box was created with that value, so the
+  # setup exec must not override it. The other three still apply.
+  _CLI_ENVS=("DISABLE_TELEMETRY=")
+  run _maybe_run_setup "$CN" "$TEST_TEMP/project" main 1
+  assert_success
+  run setup_exec_line
+  assert_success
+  assert_output --partial "-e DISABLE_ERROR_REPORTING=1 "
+  assert_output --partial "-e ENABLE_CLAUDEAI_MCP_SERVERS=false "
+  assert_output --partial "-e CLAUDE_CODE_DISABLE_ARTIFACT=1 "
+  refute_output --partial "DISABLE_TELEMETRY="
+  # Looking up the user's keys leaves what the caller resolved alone.
+  _RESOLVED_ENV_ARGS=(-e "KEEP=1")
+  _egress_paired_env_setup "$TEST_TEMP/project"
+  run printf '%s ' "${_RESOLVED_ENV_ARGS[@]}"
+  assert_output "-e KEEP=1 "
 }
 
 # ── Teardown and stop at the removal and stop sites (8.7) ───────────────────
@@ -1058,6 +1147,56 @@ stopped_caged() {
   assert_output --partial "enforcing a different policy"
   run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
   assert_output "0"
+}
+
+# After an unclean Docker restart the daemon starts the gateway again on its
+# own (on-failure:3 sees exit 255) and leaves the box down. A start or resume, or one
+# that started Docker itself, can find that gateway still in its health start
+# period. It is waited for, never started again or made anew.
+@test "egress: a gateway Docker restarted on its own is waited for at start and resume, never started again" {
+  stopped_caged
+  F_HEALTH_SEQ="starting starting healthy" caged_box
+  is_running() { [ "$1" = "$GW" ]; }
+  local v
+  for v in cmd_resume cmd_start; do
+    rm -rf "$DOCKER_MOCK_DIR/inspect/.seq"
+    : > "$DOCKER_CALLS"
+    run "$v" "$TEST_TEMP/project"
+    assert_success
+    refute_output --partial "Egress refused"
+    run grep -c "^docker start $GW\$" "$DOCKER_CALLS"
+    assert_output "0"
+    run docker_run_line_for "$GW"
+    assert_output ""
+    run grep -c "^docker start $CN\$" "$DOCKER_CALLS"
+    assert_output "1"
+  done
+}
+
+@test "egress: a box started beside an orphaned gateway waits for its new relay" {
+  # The gateway kept running while its box was down, so it still holds the
+  # last relay's heartbeat. The last heartbeat is more than 90 s old (from
+  # about 60 s after the stop), 300 s here. The box this launch starts has a
+  # relay of its own that beats a moment later. It is waited for, never named.
+  stopped_caged
+  caged_box
+  is_running() { [ "$1" = "$GW" ]; }
+  local v
+  for v in cmd_start cmd_resume; do
+    mock_gw_admin last_shim_seen "ok last_shim_seen 300" "ok last_shim_seen 300" "ok last_shim_seen 0"
+    : > "$DOCKER_CALLS"
+    run "$v" "$TEST_TEMP/project"
+    assert_success
+    refute_output --partial "Shim not listening"
+    run count_calls "gw-admin last_shim_seen"
+    assert_output "3"
+  done
+  # A new relay that never beats is still named once the wait is over.
+  _EGRESS_HEALTH_WAIT_SECS=1
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  run cmd_resume "$TEST_TEMP/project"
+  assert_success
+  assert_output --partial "Shim not listening"
 }
 
 @test "egress: a box this start brought up and the gate refuses is stopped again" {

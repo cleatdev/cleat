@@ -3583,6 +3583,26 @@ SH
   refute_output "0"
 }
 
+@test "smoke: cleat status names a silent relay on a caged box under strict mode" {
+  load "../lib/egress_fixtures"
+  mkdir -p "$TEST_TEMP/project" "$XDG_CONFIG_HOME/cleat"
+  printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"
+  CN="$(_smoke_resolve "$TEST_TEMP/project")"
+  CN="${CN%%$'\t'*}"
+  source_cli
+  egress_box_names
+  use_gw_admin_stub
+  caged_box
+  mock_gw_admin last_shim_seen "ok last_shim_seen 300"
+  printf '%s\n%s\n' "$CN" "$GW" > "$DOCKER_MOCK_DIR/ps_output"
+  printf '%s\n%s\n' "$CN" "$GW" > "$DOCKER_MOCK_DIR/ps_a_output"
+  run cleat_bin status "$TEST_TEMP/project" < /dev/null
+  assert_success
+  refute_output --partial "unbound variable"
+  run _plain "$output"
+  assert_output --partial "! shim not listening (not a denial)  cleat egress restart --shim"
+}
+
 @test "smoke: cleat egress status runs on a refused engine" {
   mkdir -p "$XDG_CONFIG_HOME/cleat"
   printf '[egress]\nmode = strict\n' > "$XDG_CONFIG_HOME/cleat/config"

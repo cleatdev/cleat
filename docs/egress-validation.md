@@ -15,9 +15,20 @@ validated (`test/integration/egress.bats`).
 
 ## What to record for each run
 
-The date, the engine kind (`cleat egress status` names it on a leg not yet
-validated, the editor's Engine line on one that is), the Docker API version, the host uid, the box uid, the exact CLI version, the image spec
-version and the three normalization strings of step 4.
+The date, the engine kind, the Docker API version, the host uid, the box uid,
+the exact CLI version, the image spec version and the three normalization
+strings of step 4.
+
+The engine kind is the token `_egress_engine_kind` measures, such as
+`desktop-macos`. No screen prints the token itself. Read it at any step from a
+checkout of the candidate with `bash -c '. bin/cleat; _egress_engine_kind; echo'`
+(sourcing runs no command). Step 2 needs it before any caged box can exist.
+Each caged box also carries it as the label its launch compares with the
+engine answering now. Once step 4 has started a box, record it with
+`docker inspect -f '{{index .Config.Labels "sh.cleat.egress-engine"}}' <box>`.
+On a leg not yet validated `cleat egress status` names the engine in words
+(step 1). On a validated leg nothing names it: the editor's amber engine line
+and the status refusal appear only on an engine that refuses.
 
 ## The fifteen steps
 
@@ -27,8 +38,10 @@ of a rule or a config file.
 1. On a leg not yet validated, `cleat egress status` under a policy names the
    engine: `Egress control is not available on <engine>`.
 2. Add the leg's kind to `_EGRESS_VALIDATED_ENGINES` in a local copy of
-   `bin/cleat`, never committed. `cleat egress status` now shows the gateway
-   rows instead.
+   `bin/cleat`, never committed. `cleat egress status` no longer names the
+   engine. With no caged box yet it prints `No box yet. Its gateway is created
+   with it on the next launch.` The gateway rows appear once step 4 has started
+   one.
 3. The `host.docker.internal` probe on the leg's real host:
    `docker run --rm --network none --add-host host.docker.internal:host-gateway alpine cat /etc/hosts`,
    then a five second `curl -sS http://host.docker.internal/` from a box.
@@ -78,12 +91,22 @@ of a rule or a config file.
     `egress-pins`, `egress-notices`) are all gone. `docker volume ls` shows no
     orphan.
 14. Restart the Docker daemon with a box and its gateway running. Record which
-    containers returned, whether `proxy.sock` survived, whether its inode
-    changed, whether the shim needed respawning and the `.State.ExitCode` of
-    both containers. Expected, not yet confirmed: after a clean quit and reopen
-    both stay stopped and the next `cleat start` brings the gateway back before
-    the box. After a daemon killed uncleanly the gateway returns without its
-    box and `cleat egress status` shows it orphaned.
+    containers returned, whether `proxy.sock` survived, the socket volume's
+    `CreatedAt` and labels before and after, whether the shim needed
+    respawning and the `.State.ExitCode` of both containers. Read the volume
+    with `docker volume inspect -f '{{.CreatedAt}} {{json .Labels}}' <volume>`,
+    where `<volume>` is the name on the `Socket:` row of `cleat egress status`.
+    Neither may change. The socket's inode is no evidence about the volume.
+    Every gateway start unlinks `proxy.sock` and binds a new socket, which may
+    get a new inode number or the old one back. Expected, not yet confirmed:
+    after a clean quit and reopen both stay stopped and the next `cleat start`
+    brings the gateway back before the box. After a daemon killed uncleanly the
+    gateway returns without its box and `cleat egress status` shows it
+    orphaned. Read both containers before any cleat command. A gateway the
+    daemon started again reads exit code 0, because a start clears the code.
+    Its return shows as `.State.Running` true with a `.State.StartedAt` later
+    than the reopen. The box tells the two cases apart: 255 means the daemon
+    found it still marked running, which is the unclean case.
 15. The overnight run, below.
 
 ## Step 15, the overnight run
@@ -94,12 +117,14 @@ Desktop quit and reopen. At the end, record:
 
 - the gateway's health and `RestartCount`
 - `gw-admin path_ok`
-- the `proxy.sock` inode before and after (a change means the volume was made
-  again under a live box)
+- the socket volume's `CreatedAt` and labels before and after, read as in
+  step 14 (a change means the volume was made again during the run). Not the
+  `proxy.sock` inode, which a gateway start replaces
 - `last_shim_seen` and how many times the shim was respawned
 - whether the box returned after the daemon restart (expected: no)
 - whether the gateway returned
-- the `.State.ExitCode` of both containers
+- the `.State.ExitCode` of both containers (a gateway that returned reads 0,
+  see step 14)
 - the first request after wake
 - the tunnel count in the gateway log across the sleep boundary
 - whether the VM clock jump disturbed the health check interval
@@ -111,10 +136,28 @@ that keeps the machine awake hides this failure.
 It exists because the worst failure in this design is silent. One failed
 `fork()` kills socat. Its supervisor starts it again about a second later and
 logs `relay exited` in `/tmp/cleat-egress-shim.log` inside the box, so count
-those lines. If the supervisor itself dies, every later request from that box
-fails and the gateway stays healthy throughout. Overnight that is a total loss
-of egress that nothing on the host reports on its own. `cleat egress status`
-shows the relay's last heartbeat. `cleat egress restart --shim` brings it back.
+those lines. A box out of pids for longer than about fifteen seconds makes bash
+give up on a fork, which ends the supervisor or its heartbeat loop. Each starts
+itself again in place. Its command line still starts
+`bash /usr/local/bin/cleat-egress-shim`. A supervisor that started itself again
+goes on with `--again`. A heartbeat loop goes on with `--beats` and its relay's
+pid from its first start, so `--again` is only ever a supervisor. The last word
+of either counts that shell's quick ends in a row. The supervisor logs
+`supervisor started again in place` each time, so count those lines too.
+
+An end can also come within seconds. bash never retries a fork that fails for
+want of memory. A child that exits while bash waits to retry a fork also cuts
+the retry short. The fourth such quick end in a row is the last, so that shell
+stays down. Each shell counts its own, so a heartbeat loop started by a
+supervisor that had quick ends still gets its own three restarts. If the
+supervisor stays down, or is killed, every later request from that box fails
+and the gateway stays healthy throughout. Overnight that is
+a total loss of egress that nothing on the host reports on its own.
+`cleat egress status` shows the relay's last heartbeat.
+`cleat egress restart --shim` brings it back. If only the heartbeat loop stays
+down, requests keep working, but status reads `Shim not listening` until its
+relay or the box restarts. Its supervisor is alive and keeps the lock, so
+`cleat egress restart --shim` sends one heartbeat and the row goes stale again.
 
 ## Results
 

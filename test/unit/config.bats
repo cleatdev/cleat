@@ -1181,6 +1181,146 @@ QUIT"
   refute_output --partial "warning:"
 }
 
+# ── row width (a row that wraps desyncs the redraw) ─────────────────────────
+# The TUI repositions by counting lines, so one row wider than the window moved
+# every later frame down a line and left the old header behind. The draw cuts
+# each row one column short of the width the TUI passes as its tenth argument.
+
+# The widest line in columns: escapes out, then every UTF-8 continuation byte,
+# so each glyph is one byte and a C-locale awk counts columns.
+_cfg_widest() {
+  sed $'s/\033\\[[0-9;?]*[A-Za-z]//g' | LC_ALL=C tr -d '\200-\277' \
+    | LC_ALL=C awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }'
+}
+# A frame with every escape out, so a row reads as it shows.
+_cfg_plain() { sed $'s/\033\\[[0-9;?]*[A-Za-z]//g'; }
+
+# Every row state in one stream at <cols>: every cap ticked, the cursor on each
+# row in turn, the egress and generate rows shown, the egress words of a section
+# that does not resolve, the top-tier memory note and two hand-written values of
+# 40 characters.
+_cfg_all_frames() {
+  local cols="$1" n c all long
+  n="${#KNOWN_CAPS[@]}"
+  all="$(IFS=,; echo "${KNOWN_CAPS[*]}")"
+  long="1234567890123456789012345678901234567890"
+  for (( c = 0; c <= n + 3; c++ )); do
+    _config_picker_draw "$c" "$all" "$long" "$long" 1 1 24 1 "x|invalid  [egress] does not resolve.  cleat egress status" "$cols"
+    _config_picker_draw "$c" "$all" 24g 2 1 1 24 1 "1|strict   12 hosts, 3 packs.  cleat egress edits the list" "$cols"
+  done
+}
+
+@test "config draw: every row stays one column short of the window" {
+  local cols
+  for cols in 40 60 80; do
+    run _cfg_all_frames "$cols"
+    assert_output --partial "unsafe-rm"
+    run _cfg_widest <<< "$output"
+    assert [ "$output" -lt "$cols" ]
+  done
+}
+
+@test "config draw: a cut row ends in an ellipsis and a wide window cuts nothing" {
+  run _config_picker_draw 0 "" default all 0 0 "" 0 "" 60
+  run _cfg_plain <<< "$output"
+  assert_output --partial "unsafe-rm  Disarm the rm delete-safety prompt (glo…"
+  run _config_picker_draw 0 "" default all 0 0 "" 0 "" 200
+  run _cfg_plain <<< "$output"
+  assert_output --partial "unsafe-rm  Disarm the rm delete-safety prompt (global/CLI only)"
+  refute_output --partial "…"
+}
+
+@test "config draw: a ring value is shown without a fork and a hand-written one is sanitized" {
+  trap - DEBUG
+  # The draw runs on every key. A value of digits, letters and dots, which is
+  # every ring stop, is its own display form. The DEBUG trap records any
+  # command substitution, any command run in a child process and any command
+  # that is not a builtin, a keyword or a function, as the egress editor's
+  # fork test does.
+  local words log="$TEST_TEMP/forks" me v vals
+  words=" $(compgen -b | tr '\n' ' ') $(compgen -k | tr '\n' ' ') (( [[ "
+  vals="${_CONFIG_MEM_CHOICES[*]} ${_CONFIG_CPU_CHOICES[*]} 12g 256g 512m 1.5 16 128 default all"
+  me="${BASHPID:-}"
+  : > "$log"
+  _fd_trap() {
+    if [ "$BASH_SUBSHELL" -gt 0 ] || { [ -n "$me" ] && [ "${BASHPID:-$me}" != "$me" ]; }; then
+      printf 'child: %s\n' "$BASH_COMMAND" >> "$log"
+      return 0
+    fi
+    case "${BASH_COMMAND//'$(('/}" in *'$('*|*'`'*|*'<('*|*'>('*|*' | '*) printf 'subst: %s\n' "$BASH_COMMAND" >> "$log" ;; esac
+    local w="${BASH_COMMAND%% *}"
+    case "$w" in *=*) return 0 ;; esac
+    declare -F "$w" >/dev/null 2>&1 && return 0
+    case "$words" in *" $w "*) return 0 ;; esac
+    printf 'external: %s\n' "$BASH_COMMAND" >> "$log"
+  }
+  set -T
+  trap '_fd_trap' DEBUG
+  for v in $vals; do
+    _config_value_display "$v"
+    [ "$_CFGV" = "$v" ] || printf 'shown as: %s\n' "$_CFGV" >> "$log"
+  done
+  trap - DEBUG
+  set +T
+  run cat "$log"
+  assert_output ""
+  # Anything else takes the sanitizer. A control byte goes, a backslash is
+  # doubled for echo -e and each byte outside ASCII shows as ?.
+  _config_value_display "Ａb"
+  run printf '%s' "$_CFGV"
+  assert_output "???b"
+  _config_value_display "$(printf '8\033]0;x\007g')"
+  run printf '%s' "$_CFGV"
+  assert_output "8]0;xg"
+  _config_value_display '8\g'
+  run printf '%s' "$_CFGV"
+  assert_output '8\\g'
+  _config_value_display ""
+  run printf '%s' "$_CFGV"
+  assert_output ""
+}
+
+# Terminal.app opens at 80 columns. There the two rows whose last words carry
+# the point keep every word. The unsafe-rm row says it is global or CLI only.
+# The row of an [egress] section that does not resolve names the verb that says
+# why.
+@test "config draw: at 80 columns the unsafe-rm row and the invalid egress row keep every word" {
+  printf '[egress]\nallow = a.example\n' > "$CLEAT_GLOBAL_CONFIG"
+  _box_scope=""
+  local words c
+  words="$(_egress_config_row_state)"
+  for (( c = 0; c <= ${#KNOWN_CAPS[@]} + 2; c++ )); do
+    run _config_picker_draw "$c" unsafe-rm default all 0 0 "" 1 "$words" 80
+    assert_success
+    run _cfg_plain <<< "$output"
+    assert_output --partial "unsafe-rm  Disarm the rm delete-safety prompt (global/CLI only)"
+    assert_output --partial "Egress  invalid  [egress] does not resolve.  cleat egress status"
+    refute_output --partial "…"
+  done
+}
+
+@test "config editor: at 40 columns the footer and every frame stay one column short" {
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[caps]\nunsafe-rm\n[egress]\nallow = a.example\n' > "$CLEAT_GLOBAL_CONFIG"
+  _box_scope=""
+  _term_cols() { echo 40; }
+  _read_keypress() {
+    local n
+    n="$(cat "$TEST_TEMP/kp" 2>/dev/null || echo 0)"
+    echo $(( n + 1 )) > "$TEST_TEMP/kp"
+    case "$n" in 0|1|2) echo DOWN ;; *) echo QUIT ;; esac
+  }
+  run _config_picker_tui "$CLEAT_GLOBAL_CONFIG" global "$TEST_TEMP"
+  assert_success
+  assert_output --partial "↑/↓ move  space toggle  ←/→ change  ⏎"
+  # From the first frame down: the title and the Scope line above it are drawn
+  # once, outside the counted region.
+  run awk '/Capabilities/ { f = 1 } f' <<< "$output"
+  assert_output --partial "unsafe-rm"
+  run _cfg_widest <<< "$output"
+  assert [ "$output" -lt 40 ]
+}
+
 # ── env scaffolding via the editor save path ───────────────────────────────
 
 @test "config editor: enabling env offers to scaffold .cleat.env on save" {

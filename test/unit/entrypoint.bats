@@ -5,6 +5,7 @@
 # (chown/sed/usermod/id/su), so we can assert behavior without root or a real
 # container.
 load "../setup"
+load "../lib/egress_shim"
 
 setup() { _common_setup; }
 teardown() {
@@ -19,8 +20,10 @@ teardown() {
 #
 # The egress branch's commands are stubbed for EVERY test, so a runner that is
 # root (the WSL2 leg) never writes the real /etc. mountpoint answers
-# $MOUNTPOINT_RC (default 1, an uncaged box) for /run/cleat-egress only. sed and
-# runuser also append to one ORDER_LOG, so a test can read their order.
+# $MOUNTPOINT_RC (default 1, an uncaged box) for /run/cleat-egress only. sed,
+# chown and runuser also append to one ORDER_LOG, so a test can read their order.
+# With RUNUSER_HOLD set the runuser stub stays up like the real supervisor,
+# until that file exists or 3 s pass, then records `runuser end`.
 _run_entrypoint() {
   local stubs="$TEST_TEMP/stubs"
   mkdir -p "$stubs"
@@ -32,12 +35,13 @@ _run_entrypoint() {
   RUNUSER_LOG="$TEST_TEMP/runuser.log"; rm -f "$RUNUSER_LOG"; export RUNUSER_LOG
   ORDER_LOG="$TEST_TEMP/order.log"; : > "$ORDER_LOG"; export ORDER_LOG
   MOUNTPOINT_RC="${MOUNTPOINT_RC:-1}"; export MOUNTPOINT_RC
+  RUNUSER_HOLD="${RUNUSER_HOLD:-}"; export RUNUSER_HOLD
 
-  printf '#!/bin/sh\necho "$@" >> "$CHOWN_LOG"\nexit 0\n' > "$stubs/chown"
+  printf '#!/bin/sh\necho "$@" >> "$CHOWN_LOG"\necho "chown $*" >> "$ORDER_LOG"\nexit 0\n' > "$stubs/chown"
   printf '#!/bin/sh\necho 1000\nexit 0\n'                 > "$stubs/id"
   printf '#!/bin/sh\necho "sed $*" >> "$ORDER_LOG"\nexit 0\n' > "$stubs/sed"
   printf '#!/bin/sh\nfor a; do last="$a"; done\n[ "$last" = /run/cleat-egress ] || exit 1\nexit "$MOUNTPOINT_RC"\n' > "$stubs/mountpoint"
-  printf '#!/bin/sh\necho "runuser $*" >> "$ORDER_LOG"\necho "$@" >> "$RUNUSER_LOG"\nexit 0\n' > "$stubs/runuser"
+  printf '#!/bin/sh\nexec 3>&-\necho "runuser $*" >> "$ORDER_LOG"\necho "$@" >> "$RUNUSER_LOG"\n[ -n "$RUNUSER_HOLD" ] || exit 0\ni=0\nwhile [ ! -e "$RUNUSER_HOLD" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done\necho "runuser end" >> "$ORDER_LOG"\nexit 0\n' > "$stubs/runuser"
   printf '#!/bin/sh\necho "== $*" >> "$TEE_LOG"\ncat >> "$TEE_LOG"\nexit 0\n' > "$stubs/tee"
   printf '#!/bin/sh\necho "$@" >> "$GIT_LOG"\nexit 0\n'   > "$stubs/git"
   printf '#!/bin/sh\necho "$@" >> "$MKDIR_LOG"\nexit 0\n' > "$stubs/mkdir"
@@ -185,11 +189,47 @@ _await_runuser() {
 
 @test "entrypoint: the relay starts after the uid remap" {
   # Before the remap, runuser -u coder would resolve coder to the build uid and
-  # the relay would reach the socket as someone the host never chose.
+  # the relay would reach the socket as someone the host never chose. The
+  # launch is backgrounded, so its own record could race a later sed. The
+  # relay's log is handed over in the foreground just before it, which pins
+  # the block's place.
   MOUNTPOINT_RC=0 _run_entrypoint
   assert_success
   _await_runuser
-  run awk '/^sed .*\/etc\/passwd/ { s = NR } /^runuser / { r = NR } END { print (s > 0 && r > s) ? "ordered" : "s=" s " r=" r }' "$ORDER_LOG"
+  run awk '/^sed .*\/etc\/passwd/ { s = NR } /^chown -h .*cleat-egress-shim[.]log/ { l = NR } /^runuser / { r = NR } END { print (s > 0 && l > s && r > s) ? "ordered" : "s=" s " l=" l " r=" r }' "$ORDER_LOG"
+  assert_output "ordered"
+}
+
+@test "entrypoint: a caged box gets every ownership fixup while its relay keeps running" {
+  # The relay is set up before the ownership fixups. Its supervisor never
+  # exits, so a launch that held the script up would leave every fixup undone
+  # on any host whose uid is not the image's 1000. Here the relay stays up
+  # until the script is over.
+  _run_entrypoint
+  assert_success
+  local plain i=0
+  plain="$(cat "$CHOWN_LOG")"
+  RUNUSER_HOLD="$TEST_TEMP/relay.release" MOUNTPOINT_RC=0 _run_entrypoint
+  assert_success
+  touch "$TEST_TEMP/relay.release"
+  while ! grep -q '^runuser end$' "$ORDER_LOG" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  # The script reached su while the relay was still up.
+  run awk '/^runuser end$/ { e = NR } /^su / { s = NR } END { print (s > 0 && e > s) ? "ordered" : "e=" e " s=" s }' "$ORDER_LOG"
+  assert_output "ordered"
+  # Every fixup an uncaged box gets, with the same remapped ids. The relay's
+  # own log is the one extra.
+  run grep -v -F -- "-h 501:501 /tmp/cleat-egress-shim.log" "$CHOWN_LOG"
+  assert_output "$plain"
+}
+
+@test "entrypoint: the relay is set up before the recursive chowns" {
+  # chown -R walks the whole bind-mounted ~/.claude. On a large one it can
+  # outlast the gate's ten second wait for a first heartbeat. The gate then
+  # names a relay that is only late. The relay's own log is handed over just
+  # before it starts, in the foreground, so its place is deterministic.
+  MOUNTPOINT_RC=0 _run_entrypoint
+  assert_success
+  run awk '/^chown -h .*cleat-egress-shim[.]log/ { l = NR } /^chown -R .*\/home\/coder\/[.]claude$/ { c = NR } END { print (l > 0 && c > l) ? "ordered" : "l=" l " c=" c }' "$ORDER_LOG"
   assert_output "ordered"
 }
 
@@ -230,103 +270,7 @@ proxy=http://127.0.0.1:3128"
 }
 
 # ── The relay supervisor itself (docker/cleat-egress-shim) ──────────────────
-#
-# Executed from a copy with its three paths moved into $TEST_TEMP (rule 7),
-# with socat, timeout and flock stubbed: none of them exist on the macOS legs.
-# The socat stub is a listener unless its first argument is `-`, the heartbeat.
-# Both record whether fd 9, the lock, is open in them. A listener holds for
-# $SOCAT_HOLD seconds (default 3) and exits $SOCAT_RC, so every stub ends on
-# its own. Every supervisor is started with fd 3 closed so bats never waits on
-# it, and teardown kills it.
-
-_shim_setup() {
-  SHIM_DIR="$TEST_TEMP/shim"; mkdir -p "$SHIM_DIR/bin" "$SHIM_DIR/run-egress"
-  SHIM="$SHIM_DIR/cleat-egress-shim"
-  SHIM_LOG="$SHIM_DIR/shim.log"; SHIM_LOCK="$SHIM_DIR/shim.lock"
-  SHIM_SOCK="$SHIM_DIR/run-egress/proxy.sock"
-  sed -e "s#^LOG=.*#LOG=$SHIM_LOG#" -e "s#^LOCK=.*#LOCK=$SHIM_LOCK#" -e "s#^SOCK=.*#SOCK=$SHIM_SOCK#" \
-    "$BATS_TEST_DIRNAME/../../docker/cleat-egress-shim" > "$SHIM"
-  SOCAT_LOG="$SHIM_DIR/socat.log"; BEAT_LOG="$SHIM_DIR/beat.log"
-  FLOCK_LOG="$SHIM_DIR/flock.log"; TIMEOUT_LOG="$SHIM_DIR/timeout.log"
-  export SOCAT_LOG BEAT_LOG FLOCK_LOG TIMEOUT_LOG
-  cat > "$SHIM_DIR/bin/socat" <<'SH'
-#!/usr/bin/env bash
-if { : >&9; } 2>/dev/null; then fd9=open; else fd9=closed; fi
-if [ "$1" = - ]; then
-  echo "beat fd9=$fd9 $*" >> "$SOCAT_LOG"
-  cat >> "$BEAT_LOG"
-  exit 0
-fi
-echo "listen fd9=$fd9 $*" >> "$SOCAT_LOG"
-sleep "${SOCAT_HOLD:-3}"
-exit "${SOCAT_RC:-0}"
-SH
-  cat > "$SHIM_DIR/bin/timeout" <<'SH'
-#!/usr/bin/env bash
-echo "$*" >> "$TIMEOUT_LOG"
-shift
-exec "$@"
-SH
-  cat > "$SHIM_DIR/bin/flock" <<'SH'
-#!/usr/bin/env bash
-echo "$*" >> "$FLOCK_LOG"
-exit "${FLOCK_RC:-0}"
-SH
-  chmod +x "$SHIM_DIR/bin/"*
-}
-
-# The supervisor leads a process group of its own (job control in the
-# subshell), so a stop ends its relay, its heartbeat loop and their sleeps with
-# it. Killing the supervisor alone left the loop beating after the test, and
-# once teardown deleted the stubs it ran the host's real socat.
-_shim_start() {
-  ( set -m
-    PATH="$SHIM_DIR/bin:$PATH" bash "$SHIM" </dev/null >/dev/null 2>&1 3>&- &
-    echo $! > "$SHIM_DIR/sup.pid" )
-}
-
-# Ends the whole group and waits up to 3 s for it to be gone. A group still
-# alive then fails the test rather than leak into the next one.
-_shim_stop() {
-  local pid i=0
-  pid="$(cat "$SHIM_DIR/sup.pid" 2>/dev/null)" || return 0
-  case "$pid" in ""|*[!0-9]*) return 0 ;; esac
-  kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-  while kill -0 -- "-$pid" 2>/dev/null; do
-    [ "$i" -lt 30 ] || { echo "the shim's process group $pid outlived its stop"; return 1; }
-    sleep 0.1; i=$((i + 1))
-  done
-  return 0
-}
-
-# Runs the shim to its end in at most 3 s, rc in SHIM_RC. One still running
-# then (a supervisor that should have exited) is killed and reads as hung, so
-# a broken script fails its test instead of hanging the suite and the harness.
-_shim_run_bounded() {
-  local pid i=0
-  PATH="$SHIM_DIR/bin:$PATH" bash "$SHIM" "$@" </dev/null >/dev/null 2>&1 3>&- &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    SHIM_RC=hung
-    return 0
-  fi
-  SHIM_RC=0
-  wait "$pid" || SHIM_RC=$?
-}
-
-# Waits up to 5 s for <file> to hold at least <n> lines matching <pattern>.
-_shim_await() {
-  local file="$1" pattern="$2" n="${3:-1}" i=0 c
-  while [ "$i" -lt 50 ]; do
-    c="$(grep -c -- "$pattern" "$file" 2>/dev/null)" || true
-    [ "${c:-0}" -ge "$n" ] && return 0
-    sleep 0.1; i=$((i + 1))
-  done
-  return 0
-}
+# The helpers that run it live in test/lib/egress_shim.bash.
 
 @test "egress shim: relays loopback 3128 into the proxy socket with bounded children" {
   _shim_setup
@@ -425,4 +369,107 @@ _shim_await() {
   _shim_stop
   run wc -c < "$SHIM_LOG"
   [ "$(printf '%s' "$output" | tr -d ' ')" -gt 1048576 ]
+}
+
+@test "egress shim: a stop signal still ends the supervisor and its heartbeat loop for good" {
+  # Both start themselves again from an EXIT trap, which bash runs on a signal
+  # too. TERM must still end them and never start them again.
+  local sup beats i=0 sup_left=no beats_left=no
+  _shim_setup
+  SOCAT_HOLD=30 _shim_start
+  _shim_await "$SOCAT_LOG" '^listen'
+  _shim_await "$SOCAT_LOG" '^beat'
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  beats="$(cat "$TIMEOUT_LOG.ppid")"
+  kill -TERM "$beats" "$sup"
+  while { kill -0 "$sup" || kill -0 "$beats"; } 2>/dev/null && [ "$i" -lt 30 ]; do
+    sleep 0.1; i=$((i + 1))
+  done
+  kill -0 "$sup" 2>/dev/null && sup_left=yes
+  kill -0 "$beats" 2>/dev/null && beats_left=yes
+  _shim_stop
+  run echo "supervisor $sup_left, heartbeat loop $beats_left"
+  assert_output "supervisor no, heartbeat loop no"
+  run grep -c 'started again in place' "$SHIM_LOG"
+  assert_output "0"
+}
+
+@test "egress shim: the fourth quick end in a row is the last one, never a spin" {
+  # A fork that fails at once is never retried by bash, so a supervisor that
+  # started itself again after every end could spin. USR1 ends it the way a
+  # failed fork does, through its EXIT trap, well inside five seconds each time.
+  local sup n i=0 left=no
+  _shim_setup
+  SOCAT_HOLD=30 _shim_start
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  for n in 1 2 3; do
+    _shim_await "$SOCAT_LOG" '^listen' "$n"
+    kill -USR1 "$sup"
+    _shim_await "$SHIM_LOG" 'started again in place' "$n"
+  done
+  _shim_await "$SOCAT_LOG" '^listen' 4
+  kill -USR1 "$sup"
+  while kill -0 "$sup" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+  kill -0 "$sup" 2>/dev/null && left=yes
+  _shim_stop
+  run echo "supervisor left: $left"
+  assert_output "supervisor left: no"
+  run grep -c 'started again in place' "$SHIM_LOG"
+  assert_output "3"
+}
+
+@test "egress shim: a heartbeat loop carries its count of quick ends through each restart and stops at the fourth" {
+  # The heartbeat loop starts itself again the way the supervisor does, so it
+  # has the same bound. Its count rides on its command line from one shell to
+  # the next. Dropped there, a loop whose fork fails at once restarts forever.
+  # Each restart is awaited until the new shell beats, so its trap is set.
+  local sup beats relay n c i=0 left=no sup_left=no
+  _shim_setup
+  SOCAT_HOLD=30 _shim_start
+  _shim_await "$SOCAT_LOG" '^beat'
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  beats="$(cat "$TIMEOUT_LOG.ppid")"
+  relay="$(head -1 "$SOCAT_LOG.pids")"
+  for n in 1 2 3; do
+    kill -USR1 "$beats"
+    _shim_await_cmdline "$beats" "--beats $relay $n"
+    c="$(grep -c '^beat' "$SOCAT_LOG")" || c=0
+    _shim_await "$SOCAT_LOG" '^beat' "$((c + 1))"
+  done
+  kill -USR1 "$beats"
+  while kill -0 "$beats" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+  kill -0 "$beats" 2>/dev/null && left=yes
+  kill -0 "$sup" 2>/dev/null && sup_left=yes
+  _shim_stop
+  run echo "heartbeat loop left: $left"
+  assert_output "heartbeat loop left: no"
+  # Only the loop stopped. Its supervisor still holds the lock.
+  run echo "supervisor left: $sup_left"
+  assert_output "supervisor left: yes"
+}
+
+@test "egress shim: an end after five seconds starts the count of quick ends again" {
+  # Only quick ends in a row stop a shell. Without the reset, the fourth pid
+  # exhaustion in a box's life, hours apart, would stop its relay for good.
+  local sup n line
+  _shim_setup
+  SOCAT_HOLD=30 _shim_start
+  sup="$(cat "$SHIM_DIR/sup.pid")"
+  for n in 1 2 3; do
+    _shim_await "$SOCAT_LOG" '^listen' "$n"
+    kill -USR1 "$sup"
+    _shim_await "$SHIM_LOG" 'started again in place' "$n"
+  done
+  _shim_await "$SOCAT_LOG" '^listen' 4
+  # SECONDS counts whole seconds, so 5.5 s is past five whatever the start.
+  sleep 5.5
+  kill -USR1 "$sup"
+  _shim_await "$SHIM_LOG" 'started again in place' 4
+  _shim_await_cmdline "$sup" "--again 0"
+  line="$(_shim_cmdline "$sup")"
+  _shim_stop
+  run echo "$line"
+  assert_output "bash $SHIM --again 0"
+  run grep -c 'started again in place' "$SHIM_LOG"
+  assert_output "4"
 }

@@ -18068,6 +18068,15 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_inherit_note_not_off" "inherit names a box made without egress control" "$CLI" "$EGRESS_UI_BATS"
 
+
+# Only a container created from the cleat image is a box the note lists.
+cat > "$SED_TMP" << 'SED'
+/^_egress_refusing_boxes_note()/,/^}$/{
+  s@^    case "[$]img" in .*) ;; \*) continue ;; esac$@    :@
+}
+SED
+try "vnext_egress_note_boxes_only_regr" "the refusing boxes note listed a container that is not a box"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

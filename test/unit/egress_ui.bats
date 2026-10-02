@@ -3637,13 +3637,13 @@ plain() { run _plain "$output"; }
   _egress_editor_engine() { _EGE_ENGINE=desktop-macos; }
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf 'cleat-a-11111111\ncleat-b-22222222\ncleat-c-33333333\ncleat-gw-0123456789ab\n' > "$DOCKER_MOCK_DIR/ps_a_output"
-  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}'
-  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a|main"
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}|{{.Config.Image}}'
+  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a|main|cleat"
   # A named box's row names that box, whatever box this verb is for.
-  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b|api"
+  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b|api|cleat"
   # A box already caged, and a gateway, are not in the list.
-  mock_docker_inspect_field cleat-c-33333333 "$fmt" "|HASH|/work/c|main"
-  mock_docker_inspect_field cleat-gw-0123456789ab "$fmt" "ROLE=gateway|||"
+  mock_docker_inspect_field cleat-c-33333333 "$fmt" "|HASH|/work/c|main|cleat"
+  mock_docker_inspect_field cleat-gw-0123456789ab "$fmt" "ROLE=gateway||||ghcr.io/cleatdev/cleat-gw@sha256:1111"
   _egress_editor_load ""
   run _egress_save_screen 1
   run _plain "$output"
@@ -3662,10 +3662,10 @@ plain() { run _plain "$output"; }
   mkdir -p "$CLEAT_CONFIG_DIR"
   printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
   printf 'cleat-a-11111111\ncleat-b-22222222\ncleat-c-33333333\n' > "$DOCKER_MOCK_DIR/ps_a_output"
-  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}'
-  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a|main"
-  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b|main"
-  mock_docker_inspect_field cleat-c-33333333 "$fmt" "||/work/c|main"
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}|{{.Config.Image}}'
+  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a|main|cleat"
+  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b|main|cleat"
+  mock_docker_inspect_field cleat-c-33333333 "$fmt" "||/work/c|main|cleat"
   # Two of the three still run: the policy reaches neither until it stops.
   # A running box that is not in the list is not counted.
   printf 'cleat-a-11111111\ncleat-b-22222222\ncleat-z-99999999\n' > "$DOCKER_MOCK_DIR/ps_output"

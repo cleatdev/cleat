@@ -13142,7 +13142,7 @@ EOF
 # network it was created with until it stops, so its row says running and
 # the note says what that means.
 _egress_refusing_boxes_note() {
-  local kind n meta role lbl src bx rows="" count=0 running=0 up mark nl=$'\n'
+  local kind n meta role lbl src bx img rows="" count=0 running=0 up mark nl=$'\n'
   [ "$_EGRESS_ENFORCING" = 1 ] || return 0
   _daemon_up || return 0
   kind="$(_egress_engine_kind)"
@@ -13153,9 +13153,13 @@ _egress_refusing_boxes_note() {
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     meta="$(_run_bounded "$_EGRESS_PROBE_BOUND_S" docker inspect --format \
-      '{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}' "$n" 2>/dev/null)" || continue
+      '{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}|{{.Config.Image}}' "$n" 2>/dev/null)" || continue
     role="${meta%%|*}"; meta="${meta#*|}"
     lbl="${meta%%|*}"; meta="${meta#*|}"
+    # A box is created from the cleat image. Anything else named cleat-* (a
+    # preview server, a user's own container) is not a box and refuses nothing.
+    img="${meta##*|}"; meta="${meta%|*}"
+    case "$img" in "$IMAGE_NAME"|"$IMAGE_NAME":*|"$REGISTRY_BASE"|"$REGISTRY_BASE":*|"$REGISTRY_BASE"@*) ;; *) continue ;; esac
     # The box name last: each row's remedy names its own box, which may not
     # be the one this verb is for.
     src="${meta%|*}"; bx="${meta##*|}"

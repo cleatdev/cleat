@@ -11493,12 +11493,12 @@ cleat-site-preview" "name=^${cn}(-[a-z0-9_.-]+)?$"
   mkdir -p "$TEST_TEMP/eg-old"
   cd "$TEST_TEMP/eg-old"
   local cn=cleat-eg-old-11111111
-  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}'
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}|{{.Config.Image}}'
   printf '%s\n' "$cn" > "$DOCKER_MOCK_DIR/ps_a_output"
   # It runs. No box carries the egress label, so no reload reaches it.
   printf '%s\n' "$cn" > "$DOCKER_MOCK_DIR/ps_output"
   mock_docker_ps_filter "" "label=sh.cleat.egress-hash"
-  mock_docker_inspect_field "$cn" "$fmt" "||$TEST_TEMP/eg-old|main"
+  mock_docker_inspect_field "$cn" "$fmt" "||$TEST_TEMP/eg-old|main|cleat"
   run cmd_egress allow example.com
   assert_success
   run _plain "$output"
@@ -11507,6 +11507,32 @@ cleat-site-preview" "name=^${cn}(-[a-z0-9_.-]+)?$"
   assert_output --partial "/eg-old   running"
   assert_output --partial "It is running, so it keeps its full network until it stops."
   assert_output --partial "A session already open in it is not caged."
+}
+
+# vNEXT: the note that lists boxes made without egress control read every
+# container whose name starts with cleat-. A container that is not a box, a
+# preview server named cleat-site-preview for one, was listed as a box that
+# refuses to start, with a cleat rm remedy. Only a container created from the
+# cleat image is a box.
+@test "regression vNEXT: the refusing boxes note listed a container that is not a box" {
+  _EGRESS_ENFORCING=1
+  _daemon_up() { return 0; }
+  _egress_engine_kind() { printf desktop-macos; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  printf '[egress]\nmode = strict\n' > "$CLEAT_GLOBAL_CONFIG"
+  local fmt='{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.role"}}ROLE={{$v}}{{end}}{{end}}|{{range $k, $v := .Config.Labels}}{{if eq $k "sh.cleat.egress-hash"}}HASH{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}|{{index .Config.Labels "sh.cleat.box"}}|{{.Config.Image}}'
+  printf 'cleat-site-preview\ncleat-a-11111111\ncleat-b-22222222\n' > "$DOCKER_MOCK_DIR/ps_a_output"
+  : > "$DOCKER_MOCK_DIR/ps_output"
+  mock_docker_inspect_field cleat-site-preview "$fmt" "|||main|nginx:alpine"
+  mock_docker_inspect_field cleat-a-11111111 "$fmt" "||/work/a|main|cleat"
+  # A box pulled straight from the registry name is still a box.
+  mock_docker_inspect_field cleat-b-22222222 "$fmt" "||/work/b|main|ghcr.io/cleatdev/cleat:v1.5.4"
+  run _egress_refusing_boxes_note
+  run _plain "$output"
+  assert_output --partial "2 boxes were created without egress control. Each refuses to start"
+  assert_output --partial "cleat-a-11111111   cleat rm && cleat   /work/a"
+  assert_output --partial "cleat-b-22222222   cleat rm && cleat   /work/b"
+  refute_output --partial "cleat-site-preview"
 }
 
 @test "regression vNEXT: egress --inherit put a running uncaged box under a strict policy and said nothing" {

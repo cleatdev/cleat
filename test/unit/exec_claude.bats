@@ -149,10 +149,11 @@ teardown() { _common_teardown; }
 # ── OOM detection + guidance (_maybe_explain_oom) ─────────────────────────────
 # A box that hits its memory ceiling OOM-kills (no swap, by design). The kill
 # is otherwise an unexplained crash; name it and say how to fix it. Two signals:
-# the cgroup OOM flag (State.OOMKilled) or exit 137 (SIGKILL).
+# the cgroup OOM flag (State.OOMKilled) or exit 137 (SIGKILL) while the box
+# keeps running. A 137 from a box that stopped is the stop, never the kernel.
 
 @test "oom: explains an OOM flagged by the container (State.OOMKilled=true)" {
-  docker() { [[ "$1" == "inspect" ]] && { echo "true"; return 0; }; return 0; }
+  docker() { [[ "$1" == "inspect" ]] && { echo "true|false"; return 0; }; return 0; }
   run _maybe_explain_oom "test-ctr" 1 2147483648   # 2 GiB box
   assert_success
   assert_output --partial "Out of memory"
@@ -161,15 +162,21 @@ teardown() { _common_teardown; }
   assert_output --partial "maxWorkers"    # fewer-workers guidance
 }
 
-@test "oom: infers OOM from exit 137 (SIGKILL) even when inspect reports false" {
-  docker() { [[ "$1" == "inspect" ]] && { echo "false"; return 0; }; return 0; }
+@test "oom: infers OOM from exit 137 (SIGKILL) when the box keeps running" {
+  docker() {
+    case "$*" in
+      inspect*OOMKilled*) echo "false|true" ;;
+      inspect*State.Running*) echo "true" ;;
+    esac
+    return 0
+  }
   run _maybe_explain_oom "test-ctr" 137 ""
   assert_success
   assert_output --partial "Out of memory"
 }
 
 @test "oom: stays silent on a non-OOM failure (other non-zero exit, not OOM-killed)" {
-  docker() { [[ "$1" == "inspect" ]] && { echo "false"; return 0; }; return 0; }
+  docker() { [[ "$1" == "inspect" ]] && { echo "false|true"; return 0; }; return 0; }
   run _maybe_explain_oom "test-ctr" 1 2147483648
   assert_success
   assert_output ""
@@ -177,6 +184,14 @@ teardown() { _common_teardown; }
 
 @test "oom: a session SIGKILLed (exit 137) surfaces the guidance through exec_claude" {
   export DOCKER_EXIT_CODE=137
+  # The box is still running after the kill, as it is after a real OOM.
+  docker() {
+    case "$*" in
+      inspect*OOMKilled*) echo "false|true"; return 0 ;;
+      inspect*State.Running*) echo "true"; return 0 ;;
+    esac
+    command docker "$@"
+  }
   run exec_claude "test-ctr" --dangerously-skip-permissions
   assert_output --partial "Out of memory"
 }

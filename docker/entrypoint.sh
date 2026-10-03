@@ -44,6 +44,13 @@ if mountpoint -q /run/cleat-egress 2>/dev/null; then
   printf 'https-proxy=http://127.0.0.1:3128\nproxy=http://127.0.0.1:3128\n' \
     | tee /usr/local/etc/npmrc >/dev/null 2>&1 || true
   git config --system http.proxy http://127.0.0.1:3128 2>/dev/null || true
+  # With no network Docker writes no line for the box's own name, so sudo
+  # warns "unable to resolve host" before every command, [setup] lines
+  # included. The box's root could add the line itself: this only quiets it.
+  _cleat_host="$(hostname 2>/dev/null || true)"
+  if [ -n "$_cleat_host" ] && ! grep -qwF -- "$_cleat_host" /etc/hosts 2>/dev/null; then
+    printf '127.0.1.1\t%s\n' "$_cleat_host" | tee -a /etc/hosts >/dev/null 2>&1 || true
+  fi
   # The relay's lock and log sit in the sticky /tmp, which survives a stop.
   # A lock left by the last run would make the new relay exit as a duplicate.
   # The log is the relay's own, opened as coder: -h, so a link planted in its
@@ -79,6 +86,12 @@ chown -R "$HOST_UID:$HOST_GID" /home/coder/.local 2>/dev/null || true
 # breaking `cleat upgrade-claude`, the on-start update prompt, and a manual
 # in-container `claude update`. Chown it so staging can write.
 chown -R "$HOST_UID:$HOST_GID" /home/coder/.cache 2>/dev/null || true
+
+# npm's cache and logs live in ~/.npm, which the image build creates owned by
+# the build UID and which is NOT host-mounted. After the remap every npm
+# install that reaches the cache dies with EACCES on ~/.npm/_cacache, on any
+# host whose UID is not 1000, which is every macOS host.
+chown -R "$HOST_UID:$HOST_GID" /home/coder/.npm 2>/dev/null || true
 
 # The shell rc files (from useradd's skel) and ~/.config are created at build
 # time owned by the build UID and are NOT host-mounted, so after the remap the

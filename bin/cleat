@@ -11523,7 +11523,9 @@ _egress_gateway_image_ensure() {         # [force]
   arch="$(_daemon_arch)"
   [ -n "$arch" ] && platform_args=(--platform "linux/${arch}")
   # A spinner on a terminal, exactly one line off it.
-  spin "Pulling the egress gateway image ${DIM}(${_GATEWAY_IMAGE%%@*}${arch:+, ${arch}})${RESET}"
+  # spin and spin_stop print their message with %s: a colour code in it shows
+  # as text, so these two lines stay plain.
+  spin "Pulling the egress gateway image (${_GATEWAY_IMAGE%%@*}${arch:+, ${arch}})"
   _run_bounded "$_EGRESS_PULL_BOUND_S" docker pull "${platform_args[@]+"${platform_args[@]}"}" "$_GATEWAY_IMAGE" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     _is_tty && spin_stop "$rc" "" "Egress gateway image pull failed"
@@ -11531,7 +11533,7 @@ _egress_gateway_image_ensure() {         # [force]
       "check the network and that Docker can reach ghcr.io, then re-run cleat"
     return 1
   fi
-  _is_tty && spin_stop 0 "Egress gateway image ready ${DIM}(${_GATEWAY_IMAGE%%@*})${RESET}"
+  _is_tty && spin_stop 0 "Egress gateway image ready (${_GATEWAY_IMAGE%%@*})"
   return 0
 }
 
@@ -17802,15 +17804,16 @@ _egress_project_ignored_note() {         # <project .cleat>
 }
 
 # On: the minimum that means on, through the one writer. mode strict, and any
-# entries already there are kept. Prints what it did.
-_egress_config_enable() {
+# entries already there are kept. Prints what it did. Its Saved line is left
+# out when the caller already printed one for the global config ($1).
+_egress_config_enable() {                # [<file whose Saved line is shown>]
   local canon
   # The writer refuses what the next launch would, at the write (5.7, 16).
   _egress_writer_interlock strict || return 1
   _egress_file_state "$CLEAT_GLOBAL_CONFIG"
   canon="$(_egress_section_canon "$CLEAT_GLOBAL_CONFIG")"
   _write_egress_to_file "$CLEAT_GLOBAL_CONFIG" strict "$_f_packs" "$_f_denies" "$_f_allows" "$canon" || return 1
-  success "Saved to ${CLEAT_GLOBAL_CONFIG/#${HOME}/~}"
+  [ "${1:-}" = "$CLEAT_GLOBAL_CONFIG" ] || success "Saved to ${CLEAT_GLOBAL_CONFIG/#${HOME}/~}"
   echo ""
   if [ -n "$(printf '%s%s' "$_f_packs" "$_f_allows" | tr -d '[:space:]')" ]; then
     echo -e "    Egress control is on, with the Claude Code hosts and the packs and hosts already saved."
@@ -17829,10 +17832,11 @@ _egress_config_enable() {
 _egress_have_tty() { [[ -t 0 && -t 1 ]]; }
 
 # The handoff at the end of the config editor's save. Empty does nothing.
-_egress_config_handoff() {               # <on|off|empty>
+# The second argument is the file whose Saved line the caller printed.
+_egress_config_handoff() {               # <on|off|empty> [<saved file>]
   case "${1:-}" in
     on)
-      _egress_config_enable || return 1
+      _egress_config_enable "${2:-}" || return 1
       _egress_have_tty || return 0
       _EGE_SAVED=0
       _EGS_OUT=""
@@ -20346,9 +20350,19 @@ exec_claude() {
 # unreadable inspect just falls back to the exit-code signal.
 _maybe_explain_oom() {
   local cname="$1" rc="$2" mem_bytes="${3:-}"
-  local oomkilled=""
-  oomkilled="$(docker inspect --format '{{.State.OOMKilled}}' "$cname" 2>/dev/null || true)"
-  [[ "$oomkilled" == "true" || "$rc" == "137" ]] || return 0
+  local state="" oomkilled="" running=""
+  state="$(docker inspect --format '{{.State.OOMKilled}}|{{.State.Running}}' "$cname" 2>/dev/null || true)"
+  oomkilled="${state%%|*}"
+  [[ "$state" == *"|"* ]] && running="${state#*|}"
+  # 137 is any SIGKILL. A session the kernel killed for memory leaves its box
+  # running (or marks it OOMKilled). One whose box was stopped, or whose Docker
+  # quit, does not: that 137 is the stop, never a memory ceiling. A stop's 137
+  # can land before Docker marks the box stopped, so a running box is read again.
+  if [[ "$oomkilled" != "true" && "$rc" == "137" && "$running" == "true" ]]; then
+    sleep 1
+    running="$(docker inspect --format '{{.State.Running}}' "$cname" 2>/dev/null || true)"
+  fi
+  [[ "$oomkilled" == "true" || ( "$rc" == "137" && "$running" == "true" ) ]] || return 0
   local mem_note=""
   if [[ "$mem_bytes" =~ ^[0-9]+$ ]] && (( mem_bytes > 0 )); then
     mem_note=" ${DIM}(box limit: $(( mem_bytes / 1073741824 )) GB)${RESET}"
@@ -33715,9 +33729,9 @@ _config_editor_save() {
   _WRITE_RES_SECTION="$_esec_res" _write_resources_to_file "$config_file" "$mem_w" "$cpu_w" || return 1
   _config_note_sections_version "$config_file"
   if [[ -n "$_ebox" ]]; then
-    success "Saved to ${config_file} ${DIM}(box ${_ebox})${RESET}"
+    success "Saved to ${config_file/#${HOME}/~} ${DIM}(box ${_ebox})${RESET}"
   else
-    success "Saved to ${config_file}"
+    success "Saved to ${config_file/#${HOME}/~}"
   fi
   # The two-line picker note is a nudge. This is the full reason, printed once,
   # only when the ceiling reaches the whole VM.
@@ -33740,8 +33754,9 @@ _config_editor_save() {
     _config_generate_project "$project" "$mem_w" "$cpu_w" "${final_caps[@]+"${final_caps[@]}"}"
   fi
   # Last, because it can open a full-screen editor and nothing may draw after.
-  # $11 is the Egress row's request: on, off or empty.
-  _egress_config_handoff "${11:-}"
+  # $11 is the Egress row's request: on, off or empty. The Saved line above
+  # already names the file the handoff writes, so it does not print another.
+  _egress_config_handoff "${11:-}" "$config_file"
 }
 
 _config_picker_tui() {

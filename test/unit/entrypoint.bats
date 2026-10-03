@@ -35,6 +35,7 @@ _run_entrypoint() {
   RUNUSER_LOG="$TEST_TEMP/runuser.log"; rm -f "$RUNUSER_LOG"; export RUNUSER_LOG
   ORDER_LOG="$TEST_TEMP/order.log"; : > "$ORDER_LOG"; export ORDER_LOG
   MOUNTPOINT_RC="${MOUNTPOINT_RC:-1}"; export MOUNTPOINT_RC
+  HOSTNAME_OUT="${HOSTNAME_OUT:-}"; export HOSTNAME_OUT
   RUNUSER_HOLD="${RUNUSER_HOLD:-}"; export RUNUSER_HOLD
 
   printf '#!/bin/sh\necho "$@" >> "$CHOWN_LOG"\necho "chown $*" >> "$ORDER_LOG"\nexit 0\n' > "$stubs/chown"
@@ -49,6 +50,8 @@ _run_entrypoint() {
   printf '#!/bin/sh\nexit 0\n'                            > "$stubs/groupadd"
   printf '#!/bin/sh\nexit 0\n'                            > "$stubs/getent"
   printf '#!/bin/sh\nexit 0\n'                            > "$stubs/stat"
+  # The box's own name, never one the runner's real /etc/hosts holds.
+  printf '#!/bin/sh\necho "${HOSTNAME_OUT:-0f1e2d3c4b5a}"\n' > "$stubs/hostname"
   printf '#!/bin/sh\necho "su NODE_OPTIONS=${NODE_OPTIONS-unset}" >> "$ORDER_LOG"\nexit 0\n' > "$stubs/su"
   # Stub `rm` so the entrypoint's stale-runtime cleanup is observable AND can't
   # touch the real /tmp during tests (the dev box may have a live clip socket).
@@ -92,6 +95,17 @@ _await_runuser() {
   #   EACCES: permission denied, mkdir '/home/coder/.cache/claude/staging/...'
   # and `cleat upgrade-claude` / the on-start update prompt fail.
   assert_output --partial "/home/coder/.cache"
+}
+
+@test "entrypoint: chowns ~/.npm so npm can write its cache" {
+  _run_entrypoint
+  assert_success
+  run cat "$CHOWN_LOG"
+  # The image build creates ~/.npm owned by the build UID and it is not
+  # host-mounted, so without this chown every npm install that reaches the
+  # cache dies with EACCES on ~/.npm/_cacache on any host whose UID is not
+  # 1000, which is every macOS host.
+  assert_output --partial "-R 501:501 /home/coder/.npm"
 }
 
 @test "entrypoint: chowns the shell rc files so a setup payload can put a tool on PATH" {
@@ -178,6 +192,23 @@ _await_runuser() {
   refute_output --partial "cleat-egress-shim"
 }
 
+@test "entrypoint: a caged box names itself in /etc/hosts so sudo stays quiet" {
+  # With no network Docker writes no line for the box's own name, and sudo
+  # printed "unable to resolve host" before every command, [setup] included.
+  MOUNTPOINT_RC=0 _run_entrypoint
+  assert_success
+  run cat "$TEE_LOG"
+  assert_output --partial "== -a /etc/hosts"
+  assert_output --partial $'127.0.1.1\t0f1e2d3c4b5a'
+}
+
+@test "entrypoint: a caged box adds no hosts line for a name /etc/hosts already holds" {
+  HOSTNAME_OUT=localhost MOUNTPOINT_RC=0 _run_entrypoint
+  assert_success
+  run cat "$TEE_LOG"
+  refute_output --partial "/etc/hosts"
+}
+
 @test "entrypoint: clears a stale relay lock and hands the relay log to coder without following a link" {
   MOUNTPOINT_RC=0 _run_entrypoint
   assert_success
@@ -245,7 +276,9 @@ Acquire::http::Proxy \"http://127.0.0.1:3128\";
 proxy = http://127.0.0.1:3128
 == /usr/local/etc/npmrc
 https-proxy=http://127.0.0.1:3128
-proxy=http://127.0.0.1:3128"
+proxy=http://127.0.0.1:3128
+== -a /etc/hosts
+127.0.1.1	0f1e2d3c4b5a"
   run cat "$GIT_LOG"
   assert_output "config --system http.proxy http://127.0.0.1:3128"
   run cat "$MKDIR_LOG"

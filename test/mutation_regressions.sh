@@ -18077,6 +18077,55 @@ cat > "$SED_TMP" << 'SED'
 SED
 try "vnext_egress_note_boxes_only_regr" "the refusing boxes note listed a container that is not a box"
 
+# The entrypoint hands ~/.npm to the host uid, or npm's cache is EACCES on
+# every host whose uid is not 1000. Drop the chown: the npm test must fail.
+cat > "$SED_TMP" << 'SED'
+/chown -R "\$HOST_UID:\$HOST_GID" \/home\/coder\/.npm/d
+SED
+try "vnext_entrypoint_npm_chown" "so npm can write its cache" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# A caged box names itself in /etc/hosts, or sudo warns before every command.
+cat > "$SED_TMP" << 'SED'
+s@^    printf '127\.0\.1\.1.*@    :@
+SED
+try "vnext_entrypoint_caged_hosts" "names itself in" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# Only a name /etc/hosts lacks is added, so a restart never stacks lines.
+cat > "$SED_TMP" << 'SED'
+s@ && ! grep -qwF -- "[$]_cleat_host" /etc/hosts 2>/dev/null; then@; then@
+SED
+try "vnext_entrypoint_hosts_only_missing" "adds no hosts line for a name" "$ENTRYPOINT" "$ENTRYPOINT_BATS"
+
+# The gateway pull's spinner lines stay plain: spin prints with %s.
+cat > "$SED_TMP" << 'SED'
+s@^  spin "Pulling the egress gateway image (@  spin "Pulling the egress gateway image ${DIM}(@
+SED
+try "vnext_egress_pull_spin_plain" "the gateway image pull printed its colour codes"
+
+cat > "$SED_TMP" << 'SED'
+s@spin_stop 0 "Egress gateway image ready (@spin_stop 0 "Egress gateway image ready ${DIM}(@
+SED
+try "vnext_egress_ready_spin_plain" "the gateway image pull printed its colour codes"
+
+# A 137 from a box that stopped is the stop, never the memory ceiling.
+cat > "$SED_TMP" << 'SED'
+s@^  \[\[ "[$]oomkilled" == "true" || ( "[$]rc" == "137" && "[$]running" == "true" ) \]\] || return 0$@  [[ "$oomkilled" == "true" || "$rc" == "137" ]] || return 0@
+SED
+try "vnext_oom_box_stop_not_oom" "a session ended by a box stop"
+
+cat > "$SED_TMP" << 'SED'
+/^_maybe_explain_oom()/,/^}$/{
+  /^    running="[$](docker inspect --format '{{.State.Running}}'/d
+}
+SED
+try "vnext_oom_recheck_running" "a session ended by a box stop"
+
+# One Saved line for one Enter on the Egress row of cleat config.
+cat > "$SED_TMP" << 'SED'
+s@^  \[ "[$]{1:-}" = "[$]CLEAT_GLOBAL_CONFIG" \] || success "Saved to@  success "Saved to@
+SED
+try "vnext_config_egress_one_saved_line" "printed two Saved lines"
+
 echo ""
 echo "${BOLD}Mutation test summary${RESET}"
 if [[ -n "${MUTATION_SHARD_TOTAL:-}" ]]; then

@@ -11702,3 +11702,70 @@ cleat-site-preview" "name=^${cn}(-[a-z0-9_.-]+)?$"
   run echo "group left: $left"
   assert_output "group left: no"
 }
+
+@test "regression vNEXT: the gateway image pull printed its colour codes as text" {
+  # spin and spin_stop print their message with %s, so a ${DIM} in it reached
+  # the terminal as the characters \033[2m. Seen on every first caged launch.
+  DIM='\033[2m'
+  RESET='\033[0m'
+  _is_tty() { return 0; }
+  _daemon_arch() { printf arm64; }
+  local log="$TEST_TEMP/spin.log"
+  spin() { printf 'spin %s\n' "$1" >> "$log"; }
+  spin_stop() { printf 'stop %s|%s\n' "$2" "${3:-}" >> "$log"; }
+  docker() { [ "$1" = image ] && return 1; return 0; }
+  _run_bounded() { shift; "$@"; }
+  run _egress_gateway_image_ensure
+  assert_success
+  run cat "$log"
+  assert_output --partial "spin Pulling the egress gateway image (ghcr.io/cleatdev/cleat-gw, arm64)"
+  assert_output --partial "stop Egress gateway image ready (ghcr.io/cleatdev/cleat-gw)|"
+  refute_output --partial '\033'
+}
+
+@test "regression vNEXT: a session ended by a box stop was reported as out of memory" {
+  # 137 is any SIGKILL. A docker stop, a cleat stop from another terminal or a
+  # Docker Desktop quit ends the session with 137 too, and each printed the
+  # out-of-memory advice. Only a box still running after the 137, or one
+  # Docker marks OOMKilled, met the kernel's memory ceiling.
+  docker() { [ "$1" = inspect ] && { printf 'false|false\n'; return 0; }; return 0; }
+  run _maybe_explain_oom "test-ctr" 137 ""
+  assert_success
+  assert_output ""
+  # Docker gone, as after a Desktop quit: nothing to read, nothing claimed.
+  docker() { return 1; }
+  run _maybe_explain_oom "test-ctr" 137 ""
+  assert_success
+  assert_output ""
+  # The stop's 137 landed before Docker marked the box stopped: read again.
+  docker() {
+    case "$*" in
+      inspect*OOMKilled*) printf 'false|true\n' ;;
+      inspect*) printf 'false\n' ;;
+    esac
+    return 0
+  }
+  run _maybe_explain_oom "test-ctr" 137 ""
+  assert_success
+  assert_output ""
+}
+
+@test "regression vNEXT: one Enter on the Egress row of cleat config printed two Saved lines" {
+  # The editor printed "Saved to <absolute path>", then the egress handoff
+  # printed "Saved to ~/..." for the same file.
+  _EGRESS_ENFORCING=1
+  _egress_writer_interlock() { return 0; }
+  _egress_refusing_boxes_note() { :; }
+  mkdir -p "$CLEAT_CONFIG_DIR"
+  : > "$CLEAT_GLOBAL_CONFIG"
+  run _config_editor_save "$CLEAT_GLOBAL_CONFIG" global "" "" default default 0 0 "" "" on
+  assert_success
+  run _plain "$output"
+  assert_output --partial "/config"
+  local n
+  n="$(printf '%s\n' "$output" | grep -c 'Saved to')"
+  run printf '%s' "$n"
+  assert_output "1"
+  run grep -c '^mode = strict' "$CLEAT_GLOBAL_CONFIG"
+  assert_output "1"
+}

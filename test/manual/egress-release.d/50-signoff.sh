@@ -68,9 +68,10 @@
 # Constants (functions, so nothing runs at source time)
 # ---------------------------------------------------------------------------------------------
 
-# The CI run and the commit the scenario names (EGRESS-RELEASE-TEST.md, its preamble). The run
-# ran on 68f1153, so on ac6ee85 5.1 reads it as another commit's and says to push and dispatch.
-p50_ci_run() { printf '36996188610'; }
+# The CI run 5.1 reads: the one p50_ci_pick chose, else the run dispatched on 197bfe9 (ac6ee85
+# plus the script, 2026-10-03), which 5.1 then reads as another commit's when HEAD carries other code.
+p50_ci_default() { printf '37105999785'; }
+p50_ci_run() { printf '%s' "${P50_CI_RUN:-$(p50_ci_default)}"; }
 p50_ci_repo() { printf 'cleatdev/cleat'; }
 p50_cert() { printf 'ac6ee85'; }
 
@@ -621,6 +622,32 @@ p50_fix_seen() {
 # The generators (each prints a section to stdout and runs no command)
 # ---------------------------------------------------------------------------------------------
 
+# p50_ci_pick CANDFULL: the newest test.yml run on egress-dev whose commit carries the certified
+# code into P50_CI_RUN and P50_CI_SHA. That is the certified commit itself, or one that differs from
+# it only in the script's own files, either way round (a script fix pushed after the run, or a run
+# dispatched after a script fix). None: the newest run, which 5.1 reads as another commit's. gh
+# unable to list: the default run. Read-only (gh run list), bounded by the probe.
+p50_ci_pick() {
+  local cand="$1" id sha first="" list
+  P50_CI_RUN=""; P50_CI_SHA=""
+  say "\$ gh run list -R $(p50_ci_repo) --branch egress-dev --workflow test.yml   (read-only, at most 60 s)"
+  mt__probe 60 gh run list -R "$(p50_ci_repo)" --branch egress-dev --workflow test.yml --limit 30 \
+    --json databaseId,headSha --jq '.[] | "\(.databaseId)\t\(.headSha)"' || return 0
+  list="$MT__PROBE_OUT"
+  while IFS=$'\t' read -r id sha; do
+    [ -n "$id" ] && [ -n "$sha" ] || continue
+    [ -n "$first" ] || first="$id"
+    if [ "$sha" = "$cand" ] \
+      || cand_plus_script "$MT_WT" "$sha" "$cand" > /dev/null 2>&1 \
+      || cand_plus_script "$MT_WT" "$cand" "$sha" > /dev/null 2>&1; then
+      P50_CI_RUN="$id"; P50_CI_SHA="$sha"
+      return 0
+    fi
+  done < "$list"
+  [ -z "$first" ] || P50_CI_RUN="$first"
+  return 0
+}
+
 # p50_ci_parse FILE CANDFULL: the CI reading into P50_CI_V (green, red, running, other, unread)
 # and P50_CI_TXT. FILE holds gh's lines: run<TAB>status<TAB>conclusion<TAB>sha, job<TAB>name<TAB>status<TAB>conclusion.
 p50_ci_parse() {
@@ -1071,16 +1098,21 @@ st_5_1() {
   cand=$(kv_get cand.sha "")
   [ -n "$cand" ] || cand=$(GIT_OPTIONAL_LOCKS=0 git -C "$MT_WT" rev-parse HEAD 2>/dev/null)
   hdr "CI on the certified commit (read-only: gh run view, never a push or a dispatch)"
-  P50_CI_V=unread; P50_CI_TXT=""
+  P50_CI_V=unread; P50_CI_TXT=""; P50_CI_RUN=""; P50_CI_SHA=""
   if command -v gh > /dev/null 2>&1; then gh_ok=1; fi
   if [ "$gh_ok" = 1 ]; then
+    p50_ci_pick "$cand"
     # A probe, not run_cmd: a slow network or a hung gh then reads "check by hand" (a NOTE), never
     # a TIMEOUT check that would fail this step.
     say "\$ gh run view $(p50_ci_run) -R $(p50_ci_repo) --json status,conclusion,headSha,jobs   (read-only, at most 90 s)"
     if mt__probe 90 gh run view "$(p50_ci_run)" -R "$(p50_ci_repo)" --json status,conclusion,headSha,jobs \
       --jq '"run\t" + .status + "\t" + (.conclusion // "") + "\t" + .headSha, (.jobs[] | "job\t" + .name + "\t" + .status + "\t" + (.conclusion // ""))'; then
       cp "$MT__PROBE_OUT" "$STEP_DIR/ci.txt" 2>/dev/null
-      p50_ci_parse "$STEP_DIR/ci.txt" "$cand"
+      # A run on a commit with the certified code is read as the certified commit's own.
+      p50_ci_parse "$STEP_DIR/ci.txt" "${P50_CI_SHA:-$cand}"
+      if [ -n "$P50_CI_SHA" ] && [ "$P50_CI_SHA" != "$cand" ]; then
+        P50_CI_TXT="$P50_CI_TXT (its commit differs from the certified $(printf '%s' "$cand" | cut -c1-7) only in the script's own files)"
+      fi
     else
       e=$(head -n 1 "${MT__PROBE_OUT%.out}.err" 2>/dev/null | cut -c1-120)
       P50_CI_TXT="check by hand: gh run view read nothing${e:+ ($e)}. gh run view $(p50_ci_run) -R $(p50_ci_repo)"
